@@ -1,0 +1,17 @@
+allowBuilds:
+  esbuild: true
+  workerd: true
+minimumReleaseAgeExclude:
+  - '@better-auth/core@1.6.28'
+  - '@better-auth/drizzle-adapter@1.6.28'
+  - '@better-auth/kysely-adapter@1.6.28'
+  - '@better-auth/memory-adapter@1.6.28'
+  - '@better-auth/mongo-adapter@1.6.28'
+  - '@better-auth/prisma-adapter@1.6.28'
+  - '@better-auth/telemetry@1.6.28'
+  - '@cloudflare/vite-plugin@1.52.1'
+  - '@cloudflare/vitest-pool-workers@0.21.3'
+  - '@cloudflare/workers-types@5.20260814.1'
+  - better-auth@1.6.28
+  - miniflare@5.20260811.1-alpha
+  - wrangler@4.123.0

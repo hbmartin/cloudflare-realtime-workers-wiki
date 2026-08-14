@@ -1,0 +1,374 @@
+import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import type { MemberContext } from "../worker/env";
+import { buildTree } from "../shared/tree-model";
+import type { Page, PageKind, PageNode, Role } from "../shared/types";
+import { ApiClientError, api, authClient, json } from "./api";
+import { EditorPage } from "./EditorPage";
+import { TablePage } from "./TablePage";
+
+type AppState =
+  | { screen: "loading" }
+  | { screen: "bootstrap" }
+  | { screen: "signin" }
+  | { screen: "invite"; token: string }
+  | { screen: "workspace"; member: MemberContext };
+
+export function App() {
+  const [state, setState] = useState<AppState>({ screen: "loading" });
+
+  const load = useCallback(async () => {
+    const invite = new URLSearchParams(window.location.search).get("invite");
+    if (invite) {
+      setState({ screen: "invite", token: invite });
+      return;
+    }
+    const install = await api<{ initialized: boolean }>("/api/install");
+    if (!install.initialized) {
+      setState({ screen: "bootstrap" });
+      return;
+    }
+    try {
+      const member = await api<MemberContext>("/api/me");
+      setState({ screen: "workspace", member });
+    } catch (error) {
+      if (error instanceof ApiClientError && error.status === 401) setState({ screen: "signin" });
+      else throw error;
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  if (state.screen === "loading") return <Splash />;
+  if (state.screen === "bootstrap") return <BootstrapScreen onComplete={load} />;
+  if (state.screen === "invite") return <InviteScreen token={state.token} onComplete={() => {
+    history.replaceState(null, "", "/");
+    void load();
+  }} />;
+  if (state.screen === "signin") return <SignInScreen onComplete={load} />;
+  return <Workspace member={state.member} onSignOut={() => setState({ screen: "signin" })} />;
+}
+
+function Splash() {
+  return (
+    <div className="splash">
+      <div className="brand-mark">N</div>
+      <p>Opening Notes…</p>
+    </div>
+  );
+}
+
+function AuthLayout({ eyebrow, title, copy, children }: { eyebrow: string; title: string; copy: string; children: ReactNode }) {
+  return (
+    <main className="auth-layout">
+      <section className="auth-story">
+        <div className="brand"><span className="brand-mark">N</span> Notes</div>
+        <div>
+          <p className="eyebrow">{eyebrow}</p>
+          <h1>{title}</h1>
+          <p>{copy}</p>
+        </div>
+        <p className="auth-footnote">Realtime and offline-first. Your data stays in your Cloudflare account.</p>
+      </section>
+      <section className="auth-card">{children}</section>
+    </main>
+  );
+}
+
+function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true); setError("");
+    const values = new FormData(event.currentTarget);
+    try {
+      await api("/api/install/bootstrap", { method: "POST", body: json(Object.fromEntries(values)) });
+      await onComplete();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Setup failed.");
+    } finally { setBusy(false); }
+  }
+  return (
+    <AuthLayout eyebrow="First-run setup" title="Make a home for your team’s knowledge." copy="Create the owner account and one private workspace. New members can only join with an invite.">
+      <form className="auth-form" onSubmit={submit}>
+        <h2>Set up Notes</h2>
+        <label>Workspace name<input name="workspaceName" required maxLength={100} autoFocus /></label>
+        <label>Your name<input name="name" required maxLength={100} /></label>
+        <label>Email<input name="email" type="email" required /></label>
+        <label>Password<input name="password" type="password" required minLength={8} /></label>
+        <label>Bootstrap token<input name="bootstrapToken" type="password" required /></label>
+        {error && <p className="form-error">{error}</p>}
+        <button className="primary-button" disabled={busy}>{busy ? "Creating workspace…" : "Create workspace"}</button>
+      </form>
+    </AuthLayout>
+  );
+}
+
+function InviteScreen({ token, onComplete }: { token: string; onComplete: () => void }) {
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError("");
+    try {
+      await api("/api/invites/accept", {
+        method: "POST", body: json({ ...Object.fromEntries(new FormData(event.currentTarget)), token }),
+      });
+      onComplete();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Invite could not be accepted."); }
+    finally { setBusy(false); }
+  }
+  return (
+    <AuthLayout eyebrow="You’re invited" title="Step into the shared notebook." copy="Your role is already set by the workspace owner. Create an account to begin.">
+      <form className="auth-form" onSubmit={submit}>
+        <h2>Join workspace</h2>
+        <label>Your name<input name="name" required autoFocus /></label>
+        <label>Email<input name="email" type="email" required /></label>
+        <label>Password<input name="password" type="password" minLength={8} required /></label>
+        {error && <p className="form-error">{error}</p>}
+        <button className="primary-button" disabled={busy}>{busy ? "Joining…" : "Accept invite"}</button>
+      </form>
+    </AuthLayout>
+  );
+}
+
+function SignInScreen({ onComplete }: { onComplete: () => Promise<void> }) {
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError("");
+    const values = Object.fromEntries(new FormData(event.currentTarget)) as { email: string; password: string };
+    const result = await authClient.signIn.email(values);
+    if (result.error) { setError(result.error.message ?? "Sign in failed."); setBusy(false); return; }
+    await onComplete(); setBusy(false);
+  }
+  return (
+    <AuthLayout eyebrow="Private workspace" title="Pick up where your team left off." copy="Documents sync in realtime, remain available offline, and persist on Cloudflare’s edge.">
+      <form className="auth-form" onSubmit={submit}>
+        <h2>Sign in</h2>
+        <label>Email<input name="email" type="email" required autoFocus /></label>
+        <label>Password<input name="password" type="password" required /></label>
+        {error && <p className="form-error">{error}</p>}
+        <button className="primary-button" disabled={busy}>{busy ? "Signing in…" : "Continue"}</button>
+      </form>
+    </AuthLayout>
+  );
+}
+
+function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: () => void }) {
+  const [pages, setPages] = useState<Page[]>([]);
+  const [trash, setTrash] = useState<Page[]>([]);
+  const [selectedId, setSelectedId] = useState(() => localStorage.getItem("notes:last-page"));
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [view, setView] = useState<"pages" | "search" | "trash" | "settings">("pages");
+  const [search, setSearch] = useState("");
+  const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
+
+  const loadPages = useCallback(async () => {
+    const data = await api<{ pages: Page[] }>("/api/pages/tree");
+    setPages(data.pages);
+    setSelectedId((current) => current && data.pages.some((page) => page.id === current) ? current : data.pages[0]?.id ?? null);
+  }, []);
+  useEffect(() => { void loadPages(); }, [loadPages]);
+  useEffect(() => { if (selectedId) localStorage.setItem("notes:last-page", selectedId); }, [selectedId]);
+
+  const selected = pages.find((page) => page.id === selectedId) ?? null;
+  const tree = useMemo(() => buildTree(pages), [pages]);
+  const breadcrumbs = useMemo(() => {
+    const items: Page[] = [];
+    let cursor = selected;
+    while (cursor) { items.unshift(cursor); cursor = pages.find((page) => page.id === cursor?.parentId) ?? null; }
+    return items;
+  }, [pages, selected]);
+
+  async function createPage(kind: PageKind, parentId: string | null = selected?.parentId ?? null) {
+    const result = await api<{ page: Page }>("/api/pages", { method: "POST", body: json({ kind, parentId }) });
+    setPages((current) => [...current, result.page]);
+    setSelectedId(result.page.id); setView("pages"); setSidebarOpen(false);
+  }
+  async function archive(page: Page) {
+    if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
+    await api(`/api/pages/${page.id}`, { method: "DELETE" });
+    await loadPages();
+  }
+  async function move(pageId: string, parentId: string | null, beforeId: string | null = null, afterId: string | null = null) {
+    const result = await api<{ page: Page }>(`/api/pages/${pageId}/move`, {
+      method: "POST", body: json({ parentId, beforeId, afterId }),
+    });
+    setPages((current) => current.map((page) => page.id === pageId ? result.page : page));
+  }
+  async function runSearch(value: string) {
+    setSearch(value);
+    if (!value.trim()) { setSearchResults([]); return; }
+    const data = await api<{ results: Array<{ page: Page; snippet: string }> }>(`/api/search?q=${encodeURIComponent(value)}`);
+    setSearchResults(data.results);
+  }
+  async function showTrash() {
+    const data = await api<{ pages: Page[] }>("/api/pages/tree?archived=true");
+    setTrash(data.pages); setView("trash");
+  }
+  const updatePage = useCallback((page: Page) => {
+    setPages((current) => current.map((item) => item.id === page.id ? page : item));
+  }, []);
+
+  return (
+    <div className="workspace-shell">
+      <aside className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}>
+        <header className="workspace-header">
+          <span className="workspace-avatar">{member.workspace.name.slice(0, 1).toUpperCase()}</span>
+          <div><strong>{member.workspace.name}</strong><small>{member.user.name} · {member.role}</small></div>
+          <button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)}>×</button>
+        </header>
+        <nav className="sidebar-nav">
+          <button className={view === "search" ? "active" : ""} onClick={() => setView("search")}><span>⌕</span> Search</button>
+          <button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}><span>⚙</span> Members</button>
+        </nav>
+        <div className="sidebar-section-title"><span>Pages</span>{member.role !== "viewer" && <button onClick={() => void createPage("document", null)}>+</button>}</div>
+        <div className="tree-root" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
+          const id = event.dataTransfer.getData("text/page-id"); if (id) void move(id, null);
+        }}>
+          <PageTree
+            nodes={tree}
+            selectedId={selectedId}
+            editable={member.role !== "viewer"}
+            onSelect={(id) => { setSelectedId(id); setView("pages"); setSidebarOpen(false); }}
+            onCreate={(parentId) => void createPage("document", parentId)}
+            onArchive={(page) => void archive(page)}
+            onDropPage={(id, parentId) => void move(id, parentId)}
+            onMove={(id, parentId, beforeId, afterId) => void move(id, parentId, beforeId, afterId)}
+          />
+        </div>
+        <button className="trash-link" onClick={() => void showTrash()}>♲ Trash</button>
+        <footer className="sidebar-footer">
+          <button onClick={async () => { await authClient.signOut(); onSignOut(); }}>Sign out</button>
+          <span>Cloudflare edge-native</span>
+        </footer>
+      </aside>
+
+      <section className="workspace-content">
+        <header className="topbar">
+          <button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}>☰</button>
+          <div className="breadcrumbs">{breadcrumbs.map((page, index) => <span key={page.id}>{index > 0 && <i>/</i>}{page.title}</span>)}</div>
+          {member.role !== "viewer" && (
+            <div className="new-menu">
+              <button className="primary-small" onClick={() => void createPage("document")}>+ Page</button>
+              <button className="quiet-button" onClick={() => void createPage("table")}>+ Table</button>
+            </div>
+          )}
+        </header>
+
+        {view === "search" ? (
+          <SearchView value={search} results={searchResults} onChange={runSearch} onSelect={(id) => { setSelectedId(id); setView("pages"); }} />
+        ) : view === "trash" ? (
+          <TrashView pages={trash} owner={member.role === "owner"} onRestore={async (page) => {
+            await api(`/api/pages/${page.id}/restore`, { method: "POST" }); await loadPages(); await showTrash();
+          }} onDelete={async (page) => {
+            if (!confirm(`Permanently delete “${page.title}”? This cannot be undone.`)) return;
+            await api(`/api/pages/${page.id}/permanent-delete`, { method: "POST" }); await showTrash();
+          }} />
+        ) : view === "settings" ? (
+          <MembersView member={member} />
+        ) : selected ? (
+          selected.kind === "document"
+            ? <EditorPage key={`${selected.id}:${selected.contentEpoch}`} page={selected} member={member} onPageChanged={updatePage} />
+            : <TablePage key={selected.id} page={selected} member={member} onPageChanged={updatePage} />
+        ) : (
+          <EmptyWorkspace canEdit={member.role !== "viewer"} onCreate={() => void createPage("document", null)} />
+        )}
+      </section>
+      {sidebarOpen && <button className="sidebar-scrim" aria-label="Close sidebar" onClick={() => setSidebarOpen(false)} />}
+    </div>
+  );
+}
+
+function PageTree({ nodes, selectedId, editable, onSelect, onCreate, onArchive, onDropPage, onMove, grandparentId = null }: {
+  nodes: PageNode[];
+  selectedId: string | null;
+  editable: boolean;
+  onSelect: (id: string) => void;
+  onCreate: (parentId: string) => void;
+  onArchive: (page: Page) => void;
+  onDropPage: (id: string, parentId: string) => void;
+  onMove: (id: string, parentId: string | null, beforeId: string | null, afterId: string | null) => void;
+  grandparentId?: string | null;
+}) {
+  return nodes.map((node, index) => (
+    <div className="tree-branch" key={node.id}>
+      <div
+        className={`tree-row ${selectedId === node.id ? "selected" : ""}`}
+        draggable={editable}
+        onDragStart={(event) => event.dataTransfer.setData("text/page-id", node.id)}
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => { event.stopPropagation(); const id = event.dataTransfer.getData("text/page-id"); if (id && id !== node.id) onDropPage(id, node.id); }}
+      >
+        <button className="page-link" onClick={() => onSelect(node.id)} onKeyDown={(event) => {
+          if (!event.altKey) return;
+          if (event.key === "ArrowUp" && index > 0) {
+            event.preventDefault();
+            onMove(node.id, node.parentId, nodes[index - 1].id, index > 1 ? nodes[index - 2].id : null);
+          } else if (event.key === "ArrowDown" && index < nodes.length - 1) {
+            event.preventDefault();
+            onMove(node.id, node.parentId, index + 2 < nodes.length ? nodes[index + 2].id : null, nodes[index + 1].id);
+          } else if (event.key === "ArrowRight" && index > 0) {
+            event.preventDefault();
+            onMove(node.id, nodes[index - 1].id, null, null);
+          } else if (event.key === "ArrowLeft" && node.parentId) {
+            event.preventDefault();
+            onMove(node.id, grandparentId, null, null);
+          }
+        }} title="Alt+arrow keys move this page">
+          <span>{node.icon ?? (node.kind === "table" ? "▦" : "□")}</span><span>{node.title}</span>
+        </button>
+        {editable && <div className="tree-actions"><button onClick={() => onCreate(node.id)} aria-label={`Add child to ${node.title}`}>+</button><button onClick={() => onArchive(node)} aria-label={`Archive ${node.title}`}>•••</button></div>}
+      </div>
+      {node.children.length > 0 && <div className="tree-children"><PageTree {...{ nodes: node.children, selectedId, editable, onSelect, onCreate, onArchive, onDropPage, onMove }} grandparentId={node.parentId} /></div>}
+    </div>
+  ));
+}
+
+function SearchView({ value, results, onChange, onSelect }: {
+  value: string; results: Array<{ page: Page; snippet: string }>;
+  onChange: (value: string) => Promise<void>; onSelect: (id: string) => void;
+}) {
+  return (
+    <main className="utility-view">
+      <p className="eyebrow">Workspace search</p><h1>Find anything</h1>
+      <input className="search-input" value={value} onChange={(event) => void onChange(event.target.value)} placeholder="Search titles and documents…" autoFocus />
+      <div className="search-results">
+        {results.map(({ page, snippet }) => <button key={page.id} onClick={() => onSelect(page.id)}><strong>{page.title}</strong><span>{snippet.replace(/<\/?mark>/g, "")}</span></button>)}
+        {value && !results.length && <p className="empty-copy">No matching pages.</p>}
+      </div>
+    </main>
+  );
+}
+
+function TrashView({ pages, owner, onRestore, onDelete }: { pages: Page[]; owner: boolean; onRestore: (page: Page) => void; onDelete: (page: Page) => void }) {
+  return (
+    <main className="utility-view"><p className="eyebrow">Archive</p><h1>Trash</h1><p className="muted">Restoring a parent restores its entire archived subtree.</p>
+      <div className="trash-list">{pages.map((page) => <div key={page.id}><span>{page.kind === "table" ? "▦" : "□"}</span><strong>{page.title}</strong><button onClick={() => onRestore(page)}>Restore</button>{owner && <button className="text-danger" onClick={() => onDelete(page)}>Delete forever</button>}</div>)}</div>
+      {!pages.length && <p className="empty-copy">Trash is empty.</p>}
+    </main>
+  );
+}
+
+type MemberRow = { id: string; name: string; email: string; role: Role; createdAt: number };
+function MembersView({ member }: { member: MemberContext }) {
+  const [members, setMembers] = useState<MemberRow[]>([]);
+  const [inviteUrl, setInviteUrl] = useState("");
+  const load = useCallback(() => api<{ members: MemberRow[] }>("/api/members").then((data) => setMembers(data.members)), []);
+  useEffect(() => { void load(); }, [load]);
+  async function invite(role: "editor" | "viewer") {
+    const result = await api<{ invite: { token: string } }>("/api/invites", { method: "POST", body: json({ role }) });
+    setInviteUrl(`${location.origin}/?invite=${result.invite.token}`);
+  }
+  return (
+    <main className="utility-view"><p className="eyebrow">Workspace access</p><h1>Members</h1>
+      {member.role === "owner" && <div className="invite-card"><div><strong>Invite a teammate</strong><p>Links can be used once and expire after seven days.</p></div><button onClick={() => void invite("editor")}>Invite editor</button><button onClick={() => void invite("viewer")}>Invite viewer</button></div>}
+      {inviteUrl && <div className="invite-link"><input readOnly value={inviteUrl} /><button onClick={() => void navigator.clipboard.writeText(inviteUrl)}>Copy</button></div>}
+      <div className="member-list">{members.map((row) => <div key={row.id}><span className="member-avatar">{row.name[0]?.toUpperCase()}</span><div><strong>{row.name}</strong><small>{row.email}</small></div>{member.role === "owner" ? <select value={row.role} onChange={async (event) => { await api(`/api/members/${row.id}`, { method: "PATCH", body: json({ role: event.target.value }) }); await load(); }}><option value="owner">Owner</option><option value="editor">Editor</option><option value="viewer">Viewer</option></select> : <span>{row.role}</span>}{member.role === "owner" && row.id !== member.user.id && <button className="text-danger" onClick={async () => { if (confirm(`Remove ${row.name}?`)) { await api(`/api/members/${row.id}`, { method: "DELETE" }); await load(); } }}>Remove</button>}</div>)}</div>
+    </main>
+  );
+}
+
+function EmptyWorkspace({ canEdit, onCreate }: { canEdit: boolean; onCreate: () => void }) {
+  return <main className="empty-workspace"><div className="empty-illustration">✦</div><h1>A quiet workspace.</h1><p>{canEdit ? "Create the first page and start writing." : "An editor has not created a page yet."}</p>{canEdit && <button className="primary-button" onClick={onCreate}>Create a page</button>}</main>;
+}
