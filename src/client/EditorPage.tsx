@@ -37,12 +37,14 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
   const [recoveryPreview, setRecoveryPreview] = useState("");
   const [title, setTitle] = useState(page.title);
   const editable = member.role !== "viewer" && !sizeWarning?.readOnly;
+  const commentsVisible = editable && commentsOpen;
 
   useEffect(() => {
     setTitle(page.title);
   }, [page.id, page.title]);
 
   useEffect(() => {
+    setSizeWarning(null);
     const next = createCollaboration(member.workspace.id, page.id, page.contentEpoch, setStatus);
     const customMessage = (message: string) => {
       try {
@@ -53,15 +55,20 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
       }
     };
     next.provider.on("custom-message", customMessage);
+    const quarantine = () => {
+      const value = { key: `${member.workspace.id}:${page.id}:${page.contentEpoch}:1`, epoch: page.contentEpoch };
+      localStorage.setItem(recoveryKey, JSON.stringify(value));
+      setRecovery(value);
+    };
     const connectionClose = async (event: CloseEvent) => {
-      if (event.code !== 4410) return;
-      if (next.hasUnsyncedChanges) {
-        const value = { key: `${member.workspace.id}:${page.id}:${page.contentEpoch}:1`, epoch: page.contentEpoch };
-        localStorage.setItem(recoveryKey, JSON.stringify(value));
-      }
+      if (event.code !== 4410 && event.code !== 1006) return;
+      if (event.code === 4410 && next.hasUnsyncedChanges) quarantine();
       try {
         const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
-        if (result.page.contentEpoch !== page.contentEpoch) onPageChanged(result.page);
+        if (result.page.contentEpoch !== page.contentEpoch) {
+          quarantine();
+          onPageChanged(result.page);
+        }
       } catch { /* The next normal metadata refresh will recover. */ }
     };
     next.provider.on("connection-close", connectionClose);
@@ -94,7 +101,7 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
           const result = await api<{ page: Page }>(`/api/pages/${page.id}`, { method: "PATCH", body: json({ icon: icon || null, revision: page.revision }) });
           onPageChanged(result.page);
         }}>{page.icon ?? "Add icon"}</button>}
-        <button className="quiet-button" onClick={() => { setCommentsOpen((open) => !open); setAttachmentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Comments</button>
+        {editable && <button className="quiet-button" onClick={() => { setCommentsOpen((open) => !open); setAttachmentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Comments</button>}
         <button className="quiet-button" onClick={() => { setAttachmentsOpen((open) => !open); setCommentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Files</button>
         <button className="quiet-button" onClick={() => { setHistoryOpen((open) => !open); setCommentsOpen(false); setAttachmentsOpen(false); setBacklinksOpen(false); }}>History</button>
         <button className="quiet-button" onClick={() => { setBacklinksOpen((open) => !open); setCommentsOpen(false); setAttachmentsOpen(false); setHistoryOpen(false); }}>Backlinks</button>
@@ -125,7 +132,7 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
           {recoveryPreview && <p>{recoveryPreview}</p>}
         </div>
       )}
-      <div className={`document-layout ${commentsOpen || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}>
+      <div className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}>
         <article className="document-paper">
           <input
             className="page-title"
@@ -139,7 +146,7 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
             aria-label="Page title"
           />
           {bundle ? (
-            <CollaborativeEditor bundle={bundle} member={member} editable={editable} commentsOpen={commentsOpen} />
+            <CollaborativeEditor bundle={bundle} member={member} editable={editable} commentsOpen={commentsVisible} />
           ) : (
             <div className="editor-loading">Opening your offline copy…</div>
           )}
@@ -194,11 +201,23 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
 }
 
 function editorOptions(bundle: CollaborationBundle, member: MemberContext, includeComments: boolean) {
-  const threadStore = new YjsThreadStore(
-    member.user.id,
-    bundle.doc.getMap("comments"),
-    new DefaultThreadStoreAuth(member.user.id, "editor"),
-  );
+  const extensions = [];
+  if (includeComments) {
+    const threadStore = new YjsThreadStore(
+      member.user.id,
+      bundle.doc.getMap("comments"),
+      new DefaultThreadStoreAuth(member.user.id, "editor"),
+    );
+    extensions.push(CommentsExtension({
+      threadStore,
+      resolveUsers: async (ids: string[]) => ids.map((id) => ({
+        id,
+        username: id === member.user.id ? member.user.name : "Collaborator",
+        avatarUrl: "",
+        color: userColor(id),
+      })),
+    }));
+  }
   return withCollaboration({
     schema: notesSchema,
     collaboration: {
@@ -207,15 +226,7 @@ function editorOptions(bundle: CollaborationBundle, member: MemberContext, inclu
       user: { name: member.user.name, color: userColor(member.user.id) },
       showCursorLabels: "activity" as const,
     },
-    extensions: includeComments ? [CommentsExtension({
-      threadStore,
-      resolveUsers: async (ids: string[]) => ids.map((id) => ({
-        id,
-        username: id === member.user.id ? member.user.name : "Collaborator",
-        avatarUrl: "",
-        color: userColor(id),
-      })),
-    })] : [],
+    extensions,
   });
 }
 
@@ -225,8 +236,8 @@ function CollaborativeEditor({ bundle, member, editable, commentsOpen }: {
   editable: boolean;
   commentsOpen: boolean;
 }) {
-  const options = useMemo(() => editorOptions(bundle, member, true), [bundle, member]);
-  const editor = useCreateBlockNote(options, [bundle]);
+  const options = useMemo(() => editorOptions(bundle, member, editable), [bundle, editable, member]);
+  const editor = useCreateBlockNote(options, [bundle, editable]);
   const getMentionItems = async (query: string) => {
     const data = await api<{ suggestions: MentionSuggestion[] }>(`/api/mentions/suggestions?q=${encodeURIComponent(query)}`);
     return data.suggestions.map((suggestion) => ({

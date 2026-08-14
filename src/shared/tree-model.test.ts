@@ -15,6 +15,11 @@ describe("page tree", () => {
     expect(source[0]).not.toHaveProperty("children");
   });
 
+  it("uses SQLite BINARY-compatible ordering for mixed-case positions", () => {
+    const tree = buildTree([page("lower", null, "a"), page("upper", null, "A")]);
+    expect(tree.map((item) => item.id)).toEqual(["upper", "lower"]);
+  });
+
   it("finds descendants for cycle prevention", () => {
     const tree = buildTree([page("root", null, "a"), page("child", "root", "a"), page("leaf", "child", "a")]);
     expect(findNode(tree, "leaf")?.id).toBe("leaf");

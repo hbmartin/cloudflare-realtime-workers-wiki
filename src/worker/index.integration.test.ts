@@ -71,6 +71,7 @@ type TestDocument = {
   document: Y.Doc;
   onSave(): Promise<void>;
   compact(forceVersion?: boolean): Promise<void>;
+  restoreVersion(versionId: string, userId: string): Promise<Response>;
   scheduleAlarm(when: number): Promise<void>;
   bindings: Cloudflare.Env;
 };
@@ -157,6 +158,59 @@ describe("Worker integration", () => {
     }));
     expect(changed.status).toBe(200);
     expect(await changed.text()).toBe("0123456789");
+  });
+
+  it("allows JSON uploads, rejects executable extensions, and ignores punctuation-only search terms", async () => {
+    const installed = await bootstrap();
+    const jsonForm = new FormData();
+    jsonForm.set("file", new File(["{}"], "settings.json", { type: "application/json" }));
+    expect((await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/attachments`, {
+      method: "POST",
+      body: jsonForm,
+    }))).status).toBe(201);
+
+    const scriptForm = new FormData();
+    scriptForm.set("file", new File(["alert(1)"], "payload.js", { type: "application/octet-stream" }));
+    expect((await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/attachments`, {
+      method: "POST",
+      body: scriptForm,
+    }))).status).toBe(415);
+
+    const renamed = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "JSON Guide", revision: 1 }),
+    }));
+    expect(renamed.status).toBe(200);
+    const search = await SELF.fetch(authenticatedRequest(installed.cookie, "/api/search?q=JSON%20!!!"));
+    expect((await search.json<{ results: Array<{ page: { id: string } }> }>()).results.map((item) => item.page.id))
+      .toContain(installed.pageId);
+    expect((await SELF.fetch(authenticatedRequest(installed.cookie, "/api/search?q=!!!"))).status).toBe(200);
+  });
+
+  it("accepts a redundant invite for an existing workspace member without failing the membership constraint", async () => {
+    const installed = await bootstrap();
+    const inviteResponse = await SELF.fetch(authenticatedRequest(installed.cookie, "/api/invites", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ role: "viewer" }),
+    }));
+    const invite = await inviteResponse.json<{ invite: { id: string; token: string } }>();
+    const accepted = await SELF.fetch("http://example.test/api/invites/accept", {
+      method: "POST",
+      headers: { origin: "http://example.test", "content-type": "application/json" },
+      body: JSON.stringify({
+        token: invite.invite.token,
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    });
+    expect(accepted.status).toBe(200);
+    expect((await env.DB.prepare(
+      `SELECT COUNT(*) count FROM workspace_members WHERE workspace_id = ? AND user_id = ?`,
+    ).bind(installed.workspaceId, installed.userId).first<{ count: number }>())?.count).toBe(1);
+    expect((await env.DB.prepare(`SELECT used_at FROM invites WHERE id = ?`)
+      .bind(invite.invite.id).first<{ used_at: number | null }>())?.used_at).toBeNull();
   });
 
   it("coalesces document updates and never reuses a drained sequence", async () => {
@@ -259,6 +313,146 @@ describe("Worker integration", () => {
       ).one().dirty).toBe(1);
       expect(await state.storage.getAlarm()).not.toBeNull();
     });
+  });
+
+  it("does not retire the current room when a restore commit fails, then retires it after a successful restore", async () => {
+    const installed = await bootstrap();
+    const room = `${installed.pageId}~1`;
+    const stub = env.DOCUMENT.getByName(room);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      const fragment = document.document.getXmlFragment("document-store");
+      const paragraph = new Y.XmlElement("paragraph");
+      const text = new Y.XmlText();
+      text.insert(0, "Restorable content");
+      paragraph.insert(0, [text]);
+      fragment.insert(0, [paragraph]);
+      await document.onSave();
+      await document.compact(true);
+    });
+    const version = await env.DB.prepare(
+      `SELECT id FROM page_versions WHERE page_id = ? ORDER BY created_at DESC LIMIT 1`,
+    ).bind(installed.pageId).first<{ id: string }>();
+    expect(version).toBeTruthy();
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      const originalBindings = document.bindings;
+      const failingDatabase = new Proxy(originalBindings.DB, {
+        get(target, property) {
+          if (property === "batch") return async () => { throw new Error("D1 unavailable"); };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property === "DB") return failingDatabase;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const failed = await document.restoreVersion(version!.id, installed.userId);
+      document.bindings = originalBindings;
+      expect(failed.status).toBe(503);
+      expect(state.storage.sql.exec<{ retired: number }>(
+        `SELECT retired FROM document_meta WHERE id = 1`,
+      ).one().retired).toBe(0);
+    });
+    expect((await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ?`)
+      .bind(installed.pageId).first<{ content_epoch: number }>())?.content_epoch).toBe(1);
+
+    const restored = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/restore-version`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ versionId: version!.id }),
+    }));
+    expect(restored.status).toBe(200);
+    expect(await restored.json()).toMatchObject({ pageId: installed.pageId, contentEpoch: 2 });
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(state.storage.sql.exec<{ retired: number }>(
+        `SELECT retired FROM document_meta WHERE id = 1`,
+      ).one().retired).toBe(1);
+    });
+  });
+
+  it("flushes an archived document without resurrecting its search row", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      const fragment = document.document.getXmlFragment("document-store");
+      const paragraph = new Y.XmlElement("paragraph");
+      const text = new Y.XmlText();
+      text.insert(0, "Tail edit before archive");
+      paragraph.insert(0, [text]);
+      fragment.insert(0, [paragraph]);
+      await document.onSave();
+    });
+
+    expect((await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+      method: "DELETE",
+    }))).status).toBe(200);
+    expect((await env.DB.prepare(`SELECT COUNT(*) count FROM page_search WHERE page_id = ?`)
+      .bind(installed.pageId).first<{ count: number }>())?.count).toBe(0);
+    expect((await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`)
+      .bind(installed.pageId).first<{ plain_text: string }>())?.plain_text).toContain("Tail edit before archive");
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(state.storage.sql.exec<{ dirty: number }>(`SELECT dirty FROM document_meta WHERE id = 1`).one().dirty).toBe(0);
+      expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM update_events`).one().count).toBe(0);
+    });
+  });
+
+  it("does not mutate rows or options belonging to another table through a held lease", async () => {
+    const installed = await bootstrap();
+    const tableA = await createPage(installed.cookie, "table");
+    const tableB = await createPage(installed.cookie, "table");
+    const columnA = crypto.randomUUID();
+    const columnB = crypto.randomUUID();
+    const rowB = crypto.randomUUID();
+    const optionB = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Text', 'text', 0)`)
+        .bind(columnA, tableA.id),
+      env.DB.prepare(`INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Choice', 'select', 0)`)
+        .bind(columnB, tableB.id),
+      env.DB.prepare(`INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`)
+        .bind(rowB, tableB.id, installed.userId, timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO table_select_options (id, column_id, label, position) VALUES (?, ?, 'Foreign', 0)`)
+        .bind(optionB, columnB),
+    ]);
+    const lease = await (await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tables/${tableA.id}/lease`, {
+      method: "POST",
+    }))).json<{ leaseToken: string }>();
+    const mutationBody = JSON.stringify({ leaseToken: lease.leaseToken, expectedRevision: 1 });
+
+    const deleteOption = await SELF.fetch(authenticatedRequest(
+      installed.cookie,
+      `/api/tables/${tableA.id}/columns/${columnB}/options/${optionB}`,
+      { method: "DELETE", headers: { "content-type": "application/json" }, body: mutationBody },
+    ));
+    expect(deleteOption.status).toBe(404);
+    const putCell = await SELF.fetch(authenticatedRequest(
+      installed.cookie,
+      `/api/tables/${tableA.id}/cells/${rowB}/${columnA}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ leaseToken: lease.leaseToken, expectedRevision: 1, value: "cross-table" }),
+      },
+    ));
+    expect(putCell.status).toBe(404);
+    expect(await env.DB.prepare(`SELECT id FROM table_select_options WHERE id = ?`).bind(optionB).first()).not.toBeNull();
+    expect((await env.DB.prepare(`SELECT COUNT(*) count FROM table_cells`).first<{ count: number }>())?.count).toBe(0);
+    expect((await env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
+      .bind(tableA.id).first<{ revision: number }>())?.revision).toBe(1);
   });
 
   it("materializes only same-workspace references and applies mention read cursors", async () => {

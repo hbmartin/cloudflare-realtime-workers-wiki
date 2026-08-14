@@ -22,6 +22,7 @@ interface ConnectionAuth {
 
 interface MetaRow extends Record<string, SqlStorageValue> {
   snapshot_seq: number;
+  snapshot_bytes: number;
   dirty: number;
   retired: number;
   read_only: number;
@@ -32,6 +33,7 @@ interface MetaRow extends Record<string, SqlStorageValue> {
 interface PageProjectionRow {
   workspace_id: string;
   title: string;
+  archived_at: number | null;
 }
 
 export class Document extends YServer {
@@ -44,6 +46,7 @@ export class Document extends YServer {
   private pendingUpdates: Uint8Array[] = [];
   private pendingAuthorId: string | null = null;
   private purged = false;
+  private transition: "archive" | "restore" | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -65,12 +68,17 @@ export class Document extends YServer {
     sql.exec(`CREATE TABLE IF NOT EXISTS document_meta (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       snapshot_seq INTEGER NOT NULL DEFAULT 0,
+      snapshot_bytes INTEGER NOT NULL DEFAULT 0,
       dirty INTEGER NOT NULL DEFAULT 0,
       retired INTEGER NOT NULL DEFAULT 0,
       read_only INTEGER NOT NULL DEFAULT 0,
       last_version_at INTEGER NOT NULL DEFAULT 0,
       last_editor_id TEXT
     )`);
+    const metaColumns = sql.exec<{ name: string }>(`PRAGMA table_info(document_meta)`).toArray();
+    if (!metaColumns.some((column) => column.name === "snapshot_bytes")) {
+      sql.exec(`ALTER TABLE document_meta ADD COLUMN snapshot_bytes INTEGER NOT NULL DEFAULT 0`);
+    }
     sql.exec(`INSERT OR IGNORE INTO document_meta (id) VALUES (1)`);
     sql.exec(`CREATE TABLE IF NOT EXISTS update_events (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +93,21 @@ export class Document extends YServer {
     )`);
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_update_chunks_seq ON update_chunks(seq, chunk_index)`);
     this.metadata = sql.exec<MetaRow>(`SELECT * FROM document_meta WHERE id = 1`).one();
+
+    const { pageId, epoch } = this.ids;
+    const current = await this.bindings.DB.prepare(
+      `SELECT content_epoch FROM pages WHERE id = ?`,
+    ).bind(pageId).first<{ content_epoch: number }>();
+    if (!current || current.content_epoch !== epoch) {
+      this.metadata.retired = 1;
+      sql.exec(`UPDATE document_meta SET retired = 1 WHERE id = 1`);
+    } else if (this.metadata.retired) {
+      // A restore can crash after making this room temporarily terminal but
+      // before the guarded D1 epoch change. In that case this is still the
+      // authoritative room and must recover on restart.
+      this.metadata.retired = 0;
+      sql.exec(`UPDATE document_meta SET retired = 0 WHERE id = 1`);
+    }
 
     await super.onStart();
     this.document.on("update", (update: Uint8Array, origin: unknown) => {
@@ -133,11 +156,19 @@ export class Document extends YServer {
     connection.setState({ userId, role, expiresAt });
     await this.scheduleAlarm(expiresAt);
     await super.onConnect(connection, context);
+    if (this.metadata.read_only || this.metadata.snapshot_bytes >= WARN_BYTES) {
+      this.sendCustomMessage(connection, JSON.stringify({
+        type: "document-size",
+        bytes: this.metadata.snapshot_bytes || READ_ONLY_BYTES,
+        readOnly: Boolean(this.metadata.read_only),
+      }));
+    }
   }
 
   isReadOnly(connection: Connection<ConnectionAuth>) {
     return Boolean(
       this.metadata.retired ||
+        this.transition ||
         this.metadata.read_only ||
         connection.state?.role === "viewer" ||
         !connection.state ||
@@ -151,8 +182,12 @@ export class Document extends YServer {
       connection.close(4401, "Authorization expired. Reconnect to continue.");
       return;
     }
-    if (this.metadata.retired || this.purged) {
+    if (this.metadata.retired || this.purged || this.transition === "restore") {
       connection.close(4410, "This document version has been retired.");
+      return;
+    }
+    if (this.transition === "archive") {
+      connection.close(4412, "This page was archived.");
       return;
     }
     return super.onMessage(connection, message);
@@ -187,15 +222,33 @@ export class Document extends YServer {
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
     }
-    if (request.method === "POST" && url.pathname.endsWith("/retire")) {
-      this.flushPendingUpdates();
-      this.metadata.retired = 1;
-      this.state.storage.sql.exec(`UPDATE document_meta SET retired = 1 WHERE id = 1`);
-      if (this.metadata.dirty) await this.compact(true);
-      for (const connection of this.getConnections()) {
-        connection.close(4410, "A restored version replaced this document.");
+    if (request.method === "POST" && url.pathname.endsWith("/archive")) {
+      if (this.transition || this.metadata.retired || this.purged) {
+        return Response.json({ error: "Document transition already in progress." }, { status: 409 });
       }
-      return Response.json({ retired: true });
+      this.transition = "archive";
+      for (const connection of this.getConnections()) {
+        connection.close(4412, "This page was archived.");
+      }
+      this.flushPendingUpdates();
+      try {
+        if (this.metadata.dirty) await this.compact(true);
+        return Response.json({ archived: true });
+      } finally {
+        this.transition = null;
+      }
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/restore-version")) {
+      let body: { versionId?: unknown; userId?: unknown };
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "Invalid restore request." }, { status: 400 });
+      }
+      if (typeof body.versionId !== "string" || typeof body.userId !== "string") {
+        return Response.json({ error: "Invalid restore request." }, { status: 400 });
+      }
+      return this.restoreVersion(body.versionId, body.userId);
     }
     if (request.method === "POST" && url.pathname.endsWith("/purge")) {
       this.purged = true;
@@ -212,7 +265,7 @@ export class Document extends YServer {
   }
 
   private bufferUpdate(update: Uint8Array, origin: Connection<ConnectionAuth> | null) {
-    if (this.metadata.retired || this.purged) return;
+    if (this.metadata.retired || this.purged || this.transition) return;
     this.pendingUpdates.push(update);
     this.pendingAuthorId = origin?.state?.userId ?? this.pendingAuthorId;
   }
@@ -278,11 +331,15 @@ export class Document extends YServer {
 
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(
-        `UPDATE document_meta SET dirty = 0, read_only = CASE WHEN ? THEN 1 ELSE read_only END WHERE id = 1`,
+        `UPDATE document_meta
+            SET dirty = 0, snapshot_bytes = ?, read_only = CASE WHEN ? THEN 1 ELSE read_only END
+          WHERE id = 1`,
+        snapshot.byteLength,
         readOnly ? 1 : 0,
       );
     });
     this.metadata.dirty = 0;
+    this.metadata.snapshot_bytes = snapshot.byteLength;
     if (readOnly) this.metadata.read_only = 1;
 
     try {
@@ -292,7 +349,7 @@ export class Document extends YServer {
       });
 
       const page = await this.bindings.DB.prepare(
-        `SELECT workspace_id, title FROM pages WHERE id = ? AND content_epoch = ?`,
+        `SELECT workspace_id, title, archived_at FROM pages WHERE id = ? AND content_epoch = ?`,
       ).bind(pageId, epoch).first<PageProjectionRow>();
       let versionAt = metadataAtStart.last_version_at;
       let versionKey: string | null = null;
@@ -324,7 +381,8 @@ export class Document extends YServer {
           ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
             `INSERT INTO page_search (page_id, workspace_id, title, body)
-              SELECT id, workspace_id, title, ? FROM pages WHERE id = ? AND content_epoch = ?`,
+              SELECT id, workspace_id, title, ? FROM pages
+               WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
           ).bind(projection.plainText, pageId, epoch),
           this.bindings.DB.prepare(
             `UPDATE page_references SET projection_seq = -1 WHERE source_page_id = ?
@@ -466,6 +524,101 @@ export class Document extends YServer {
     for (const version of expired) {
       await this.bindings.DB.prepare(`DELETE FROM page_versions WHERE id = ?`).bind(version.id).run();
       await this.bindings.BUCKET.delete(version.r2_key);
+    }
+  }
+
+  private async restoreVersion(versionId: string, userId: string) {
+    if (this.transition || this.metadata.retired || this.purged) {
+      return Response.json({ error: "Document transition already in progress." }, { status: 409 });
+    }
+    const { pageId, epoch } = this.ids;
+    const version = await this.bindings.DB.prepare(
+      `SELECT r2_key FROM page_versions WHERE id = ? AND page_id = ?`,
+    ).bind(versionId, pageId).first<{ r2_key: string }>();
+    if (!version) return Response.json({ error: "Version not found." }, { status: 404 });
+    const selected = await this.bindings.BUCKET.get(version.r2_key);
+    if (!selected) return Response.json({ error: "Version snapshot is missing." }, { status: 404 });
+    const selectedBytes = new Uint8Array(await selected.arrayBuffer());
+
+    this.transition = "restore";
+    for (const connection of this.getConnections()) {
+      connection.close(4410, "A restored version replaced this document.");
+    }
+    this.flushPendingUpdates();
+
+    const hadPendingLog = Boolean(this.metadata.dirty);
+    const newEpoch = epoch + 1;
+    const newKey = this.snapshotKey(pageId, newEpoch);
+    let preKey: string | null = null;
+    let committed = false;
+    try {
+      if (hadPendingLog) await this.compact(true);
+
+      const statements: D1PreparedStatement[] = [];
+      if (!hadPendingLog) {
+        const currentSnapshot = Y.encodeStateAsUpdate(this.document);
+        const preId = crypto.randomUUID();
+        preKey = `documents/${pageId}/versions/${preId}.bin`;
+        await this.bindings.BUCKET.put(preKey, currentSnapshot, {
+          httpMetadata: { contentType: "application/octet-stream" },
+          customMetadata: { pageId, epoch: String(epoch), sequence: String(this.metadata.snapshot_seq) },
+        });
+        statements.push(this.bindings.DB.prepare(
+          `INSERT INTO page_versions
+            (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
+           SELECT ?, id, ?, ?, title, ?, ?, ?, ? FROM pages
+            WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
+        ).bind(
+          preId,
+          epoch,
+          this.metadata.snapshot_seq,
+          preKey,
+          currentSnapshot.byteLength,
+          userId,
+          Date.now(),
+          pageId,
+          epoch,
+        ));
+      }
+
+      await this.bindings.BUCKET.put(newKey, selectedBytes, {
+        httpMetadata: { contentType: "application/octet-stream" },
+        customMetadata: { pageId, epoch: String(newEpoch), restoredFrom: versionId },
+      });
+      statements.push(this.bindings.DB.prepare(
+        `UPDATE pages
+            SET content_epoch = ?, revision = revision + 1, indexed_seq = 0, updated_at = ?
+          WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
+      ).bind(newEpoch, Date.now(), pageId, epoch));
+      const results = await this.bindings.DB.batch(statements);
+      if (!results.at(-1)?.meta.changes) {
+        await Promise.all([
+          this.bindings.BUCKET.delete(newKey),
+          preKey ? this.bindings.BUCKET.delete(preKey) : Promise.resolve(),
+        ]);
+        return Response.json({ error: "The page epoch changed during restore." }, { status: 409 });
+      }
+      committed = true;
+      this.metadata.retired = 1;
+      try {
+        this.state.storage.sql.exec(`UPDATE document_meta SET retired = 1 WHERE id = 1`);
+      } catch (error) {
+        // D1 is authoritative for routing. A restarted old room also reconciles
+        // its retired state from the committed epoch before accepting clients.
+        console.error("Failed to persist retired document state", error);
+      }
+      return Response.json({ pageId, contentEpoch: newEpoch });
+    } catch (error) {
+      if (!committed) {
+        await Promise.allSettled([
+          this.bindings.BUCKET.delete(newKey),
+          ...(preKey ? [this.bindings.BUCKET.delete(preKey)] : []),
+        ]);
+      }
+      console.error("Document restore failed", error);
+      return Response.json({ error: "The version could not be restored." }, { status: 503 });
+    } finally {
+      this.transition = null;
     }
   }
 

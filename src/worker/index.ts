@@ -17,11 +17,21 @@ import {
 } from "./http";
 import { columnType, nullableId, object, pageKind, role, text } from "../shared/validation";
 import type { Page, WorkspaceEvent } from "../shared/types";
+import { compareBinaryText } from "../shared/tree-model";
 import { normalizeR2Range } from "./r2";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 
 const app = new Hono<{ Bindings: Env }>();
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const UNSAFE_MIME_TYPES = new Set([
+  "text/html",
+  "image/svg+xml",
+  "application/xhtml+xml",
+  "application/javascript",
+  "application/x-javascript",
+  "text/javascript",
+]);
+const UNSAFE_FILE_EXTENSIONS = new Set([".html", ".htm", ".svg", ".js", ".mjs", ".cjs"]);
 
 type PageRow = {
   id: string;
@@ -205,6 +215,10 @@ app.post("/api/invites/accept", async (c) => {
         password: text(body.password, "password", 200),
       });
   if (!signup.user) return signup.response;
+  const existingMembership = await c.env.DB.prepare(
+    `SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?`,
+  ).bind(invite.workspace_id, signup.user.id).first();
+  if (existingMembership) return signup.response;
   const timestamp = now();
   const result = await c.env.DB.batch([
     c.env.DB.prepare(
@@ -384,7 +398,7 @@ app.post("/api/pages/:id/move", async (c) => {
   const after = neighbors.results.find((item) => item.id === afterId)?.position ?? null;
   if (beforeId && !before) throw new HttpError(422, "invalid_neighbor", "beforeId is not a sibling in the destination.");
   if (afterId && !after) throw new HttpError(422, "invalid_neighbor", "afterId is not a sibling in the destination.");
-  const lower = after ?? (before ? null : neighbors.results.sort((a, b) => a.position.localeCompare(b.position)).at(-1)?.position ?? null);
+  const lower = after ?? (before ? null : neighbors.results.sort((a, b) => compareBinaryText(a.position, b.position)).at(-1)?.position ?? null);
   const upper = before;
   if (lower && upper && lower >= upper) throw new HttpError(422, "invalid_order", "afterId must come before beforeId.");
   await c.env.DB.prepare(
@@ -398,23 +412,39 @@ app.post("/api/pages/:id/move", async (c) => {
 app.delete("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const page = await pageForMember(c.env, member, c.req.param("id"), true);
   const timestamp = now();
-  await c.env.DB.prepare(
-    `WITH RECURSIVE subtree(id) AS (
-       SELECT id FROM pages WHERE id = ? AND workspace_id = ?
-       UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-     ) UPDATE pages SET archived_at = ?, archived_by = ?, updated_at = ? WHERE id IN subtree`,
-  ).bind(page.id, member.workspace.id, timestamp, member.user.id, timestamp).run();
-  await c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
-    WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
-    SELECT id FROM subtree
-  )`).bind(page.id).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT id FROM pages WHERE id = ? AND workspace_id = ?
+         UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       ) UPDATE pages SET archived_at = ?, archived_by = ?, updated_at = ? WHERE id IN subtree`,
+    ).bind(page.id, member.workspace.id, timestamp, member.user.id, timestamp),
+    c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
+      WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
+      SELECT id FROM subtree
+    )`).bind(page.id),
+  ]);
   const archived = await c.env.DB.prepare(
     `WITH RECURSIVE subtree(id) AS (
        SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-     ) SELECT id FROM pages WHERE id IN subtree`,
-  ).bind(page.id).all<{ id: string }>();
+     ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
+  ).bind(page.id).all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
+  const hint = locationHint(member.workspace.locationHint ?? undefined);
+  const archiveResponses = await Promise.all(archived.results
+    .filter((item) => item.kind === "document")
+    .map(async (item) => {
+      const room = `${item.id}~${item.content_epoch}`;
+      const stub = c.env.DOCUMENT.getByName(room, hint ? { locationHint: hint } : undefined);
+      return stub.fetch(new Request("https://document.internal/archive", {
+        method: "POST",
+        headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET },
+      }));
+    }));
+  if (archiveResponses.some((response) => !response.ok)) {
+    throw new HttpError(503, "archive_incomplete", "The page was archived, but an active editor could not be disconnected. Retry the archive.");
+  }
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
     pageIds: archived.results.map((item) => item.id),
@@ -511,7 +541,9 @@ app.get("/api/search", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const query = (c.req.query("q") ?? "").trim().slice(0, 200);
   if (!query) return c.json({ results: [] });
-  const match = query.split(/\s+/).filter(Boolean).map((word) => `"${word.replaceAll('"', '""')}"*`).join(" AND ");
+  const terms = query.match(/[\p{L}\p{N}_]+/gu)?.slice(0, 20) ?? [];
+  if (!terms.length) return c.json({ results: [] });
+  const match = terms.map((word) => `"${word.replaceAll('"', '""')}"*`).join(" AND ");
   const rows = await c.env.DB.prepare(
     `SELECT p.*, snippet(page_search, 3, '<mark>', '</mark>', '…', 20) snippet
        FROM page_search JOIN pages p ON p.id = page_search.page_id
@@ -762,48 +794,26 @@ app.post("/api/pages/:id/restore-version", async (c) => {
   if (page.kind !== "document") throw new HttpError(422, "document_required", "Only documents can be restored.");
   const body = await jsonBody(c.req.raw);
   const versionId = text(body.versionId, "versionId", 100);
-  const version = await c.env.DB.prepare(
-    `SELECT * FROM page_versions WHERE id = ? AND page_id = ?`,
-  ).bind(versionId, page.id).first<{ r2_key: string }>();
-  if (!version) throw new HttpError(404, "version_not_found", "Version not found.");
-  const selected = await c.env.BUCKET.get(version.r2_key);
-  if (!selected) throw new HttpError(404, "version_missing", "The version snapshot is missing.");
-  const selectedBytes = await selected.arrayBuffer();
   const hint = locationHint(member.workspace.locationHint ?? undefined);
   const oldRoom = `${page.id}~${page.content_epoch}`;
   const oldStub = c.env.DOCUMENT.getByName(oldRoom, hint ? { locationHint: hint } : undefined);
-  await oldStub.fetch(new Request("https://document.internal/retire", {
-    method: "POST", headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET },
+  const response = await oldStub.fetch(new Request("https://document.internal/restore-version", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-notes-internal": c.env.BETTER_AUTH_SECRET,
+    },
+    body: JSON.stringify({ versionId, userId: member.user.id }),
   }));
-
-  const oldCurrent = await c.env.BUCKET.get(`documents/${page.id}/epochs/${page.content_epoch}/current.bin`);
-  const timestamp = now();
-  const statements: D1PreparedStatement[] = [];
-  if (oldCurrent) {
-    const preId = crypto.randomUUID();
-    const preKey = `documents/${page.id}/versions/${preId}.bin`;
-    const oldBytes = await oldCurrent.arrayBuffer();
-    await c.env.BUCKET.put(preKey, oldBytes, { httpMetadata: { contentType: "application/octet-stream" } });
-    statements.push(c.env.DB.prepare(
-      `INSERT INTO page_versions
-       (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(preId, page.id, page.content_epoch, 0, page.title, preKey, oldBytes.byteLength, member.user.id, timestamp));
+  const result = await response.json<{ pageId?: string; contentEpoch?: number; error?: string }>();
+  if (!response.ok || !result.contentEpoch) {
+    if (response.status === 404) throw new HttpError(404, "version_not_found", result.error ?? "Version not found.");
+    if (response.status === 409) throw new HttpError(409, "stale_epoch", result.error ?? "The page epoch changed during restore.");
+    throw new HttpError(503, "restore_failed", result.error ?? "The version could not be restored.");
   }
-  const newEpoch = page.content_epoch + 1;
-  await c.env.BUCKET.put(`documents/${page.id}/epochs/${newEpoch}/current.bin`, selectedBytes, {
-    httpMetadata: { contentType: "application/octet-stream" },
-    customMetadata: { pageId: page.id, epoch: String(newEpoch), restoredFrom: versionId },
-  });
-  statements.push(c.env.DB.prepare(
-    `UPDATE pages SET content_epoch = ?, revision = revision + 1, indexed_seq = 0, updated_at = ?
-      WHERE id = ? AND content_epoch = ?`,
-  ).bind(newEpoch, timestamp, page.id, page.content_epoch));
-  const results = await c.env.DB.batch(statements);
-  if (!results.at(-1)?.meta.changes) throw new HttpError(409, "stale_epoch", "The page epoch changed during restore.");
   const restored = pageJson(await pageForMember(c.env, member, page.id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [restored] });
-  return c.json({ pageId: page.id, contentEpoch: newEpoch });
+  return c.json({ pageId: page.id, contentEpoch: result.contentEpoch });
 });
 
 app.get("/api/tables/:pageId", async (c) => {
@@ -957,6 +967,12 @@ app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) 
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const input = await leaseInputs(c.req.raw, member);
+  const option = await c.env.DB.prepare(
+    `SELECT 1 FROM table_select_options option
+      JOIN table_columns column ON column.id = option.column_id
+     WHERE option.id = ? AND option.column_id = ? AND column.page_id = ?`,
+  ).bind(c.req.param("optionId"), c.req.param("columnId"), c.req.param("pageId")).first();
+  if (!option) throw new HttpError(404, "option_not_found", "Option not found.");
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
     c.env.DB.prepare(
       `DELETE FROM table_select_options WHERE id = ? AND column_id = ? AND ${leaseGuards()}`,
@@ -1002,6 +1018,9 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
   const column = await c.env.DB.prepare(`SELECT type FROM table_columns WHERE id = ? AND page_id = ?`)
     .bind(c.req.param("columnId"), pageId).first<{ type: string }>();
   if (!column) throw new HttpError(404, "column_not_found", "Column not found.");
+  const row = await c.env.DB.prepare(`SELECT 1 FROM table_rows WHERE id = ? AND page_id = ?`)
+    .bind(c.req.param("rowId"), pageId).first();
+  if (!row) throw new HttpError(404, "row_not_found", "Row not found.");
   if (column.type === "select" && input.body.value !== null && input.body.value !== "") {
     const option = await c.env.DB.prepare(
       `SELECT 1 FROM table_select_options WHERE id = ? AND column_id = ?`,
@@ -1049,9 +1068,9 @@ async function currentPlainText(env: Env, pageId: string) {
 }
 
 function isUnsafeMime(mime: string, name: string) {
-  const lower = `${mime} ${name}`.toLowerCase();
-  return ["text/html", "image/svg", "javascript", "application/xhtml", ".html", ".htm", ".svg", ".js", ".mjs"]
-    .some((part) => lower.includes(part));
+  const normalizedMime = mime.toLowerCase().split(";", 1)[0].trim();
+  const extension = name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
+  return UNSAFE_MIME_TYPES.has(normalizedMime) || UNSAFE_FILE_EXTENSIONS.has(extension);
 }
 
 function isInlineMime(mime: string) {

@@ -1,5 +1,9 @@
 import type { Page, PageNode } from "./types";
 
+export function compareBinaryText(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export function buildTree(pages: Page[]): PageNode[] {
   const nodes = new Map(pages.map((page) => [page.id, { ...page, children: [] } satisfies PageNode]));
   const roots: PageNode[] = [];
@@ -10,7 +14,7 @@ export function buildTree(pages: Page[]): PageNode[] {
   }
 
   const sort = (items: PageNode[]) => {
-    items.sort((a, b) => a.position.localeCompare(b.position) || a.id.localeCompare(b.id));
+    items.sort((a, b) => compareBinaryText(a.position, b.position) || compareBinaryText(a.id, b.id));
     items.forEach((item) => sort(item.children));
   };
   sort(roots);

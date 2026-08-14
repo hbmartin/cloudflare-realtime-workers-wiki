@@ -39,10 +39,15 @@ export function createCollaboration(
   provider.on("status", handleStatus);
   provider.on("sync", (synced: boolean) => { if (synced) hasUnsyncedChanges = false; });
   doc.on("update", (_update: Uint8Array, origin: unknown) => {
-    if (origin !== provider && origin !== indexeddb && !provider.synced) hasUnsyncedChanges = true;
+    if (origin !== provider && origin !== indexeddb) hasUnsyncedChanges = true;
   });
   indexeddb.whenSynced.then(() => {
-    if (!destroyed) provider.connect();
+    if (!destroyed) {
+      // Until the server sync completes, conservatively treat a persisted copy
+      // as recoverable offline work. An epoch rejection happens before sync.
+      hasUnsyncedChanges = Y.encodeStateVector(doc).byteLength > 1;
+      provider.connect();
+    }
   });
 
   const visibility = () => {
