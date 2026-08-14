@@ -1,0 +1,40 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-realtime-notes",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-08-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  "preview_urls": true,
+  "observability": { "enabled": true },
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/parties/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cloudflare-realtime-notes",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "cloudflare-realtime-notes",
+      "preview_bucket_name": "cloudflare-realtime-notes-preview"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "DOCUMENT", "class_name": "Document" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Document"] }
+  ],
+  "vars": {
+    "BETTER_AUTH_URL": "http://localhost:5173"
+  }
+}

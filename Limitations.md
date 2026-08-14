@@ -1,0 +1,25 @@
+Short version: the DO/Workers architecture buys you excellent per-document realtime at near-zero idle cost, and pays for it in **document size, geography, and everything that isn't a live document** — search, exports, imports, and background work.
+
+**Per-page ceilings your users will actually hit**
+
+- **Long, heavy pages degrade or fail.** A Durable Object gets 10 GB of storage but the runtime memory ceiling is 128 MB, and the whole Y.Doc plus its update log has to live in that during merge. Pages with hundreds of images, giant tables, or years of edit history are where this bites — you'll be forced to compact aggressively, which means **capped version history depth** as a visible product decision, not a choice.
+- **Concurrent editors per page are limited.** Each object is inherently single-threaded, and Cloudflare explicitly warns that many small WebSocket messages can overwhelm a single Durable Object even when total data volume is small, recommending you batch messages into single frames. Practically: ~30 live collaborators per page is comfortable (tldraw's own guidance), and you'll throttle awareness updates — so cursors and presence feel slightly laggier than Figma/Notion.
+- **Uploads cap at 100 MB** unless you build direct-to-R2 multipart. Request body size is set by your Cloudflare account plan — 100 MB on Free and Pro, 200 MB Business, 500 MB Enterprise. Users see "file too large" on a video or big PDF.
+
+**Geography — the sharpest one**
+
+- A Durable Object is placed based on its first requester; if later users are in distant regions, every request crosses continents, and Durable Objects do not currently change location after creation, though dynamic relocation is planned. A doc first opened in LA stays in LA forever. Yjs local echo hides typing latency, but **initial page load, presence, and cursor sync are visibly worse for the remote half of a distributed team** — and it's per-document, so it feels arbitrary to users ("why is this page slow and that one fast?"). The first name-based lookup also does a round-the-world uniqueness check that can add a few hundred milliseconds.
+- **Data residency is only eu / us / fedramp.** The `us` jurisdiction landed June 2026, joining `eu` and `fedramp`. If a customer demands Canada, Australia, India, or Japan residency, you can't offer it. For enterprise/regulated buyers that's a hard no, not a roadmap item.
+- **Single DO per doc = per-doc blast radius.** No multi-region failover for a live document. Occasionally one page is unavailable while the rest of the workspace is fine.
+
+**Features that get quietly downgraded or dropped**
+
+- **Search is the weakest link.** D1 caps at 10 GB per database, is single-threaded, allows 1,000 queries per Worker invocation, and 30 seconds per query. Worse, FTS5 availability in D1 is genuinely contested in current sources — one recent guide states flatly that SQLite's FTS5 extension is not available in D1 and recommends Vectorize or an external service, while Cloudflare's own materials imply full-text support. **Verify this yourself before designing around it.** Either way you're shipping worse search than Notion/Outline: weaker ranking, no typo tolerance, sharding pain past 10 GB, and cross-workspace search that needs its own index.
+- **Backlinks, "recently edited", and search results lag edits.** Each doc's state lives in its own isolated DO, so anything reading *across* documents needs a separate index updated out-of-band. Users see a few seconds of staleness on backlinks and search after an edit — noticeable if they expect Obsidian-like immediacy.
+- **PDF/DOCX export, thumbnails, OCR, LaTeX.** Workers give you 128 MB memory and 30 seconds CPU by default (5 minutes max on paid), with no native binaries. Export of a long document, image processing at scale, and office-file previews all need Browser Rendering, Containers, or an external service. Most likely user-facing outcome: **no export-to-PDF for large docs at launch.**
+- **Bulk Notion/Confluence import** — the single most requested migration path — is a long-running batch job that doesn't fit the Workers execution model. Needs Workflows/Queues/Containers, and users experience it as a slow, partial, or unavailable importer.
+- **Email digests, scheduled notifications, mention reminders** all need queues plus an external email provider; nothing long-running lives on Workers.
+
+**The honest framing** None of these are fatal for a wiki — they're fatal for a *Notion competitor pitched on parity*. The architecture is excellent if your product is "fast collaborative pages for a team in roughly one region," and it fights you if your users expect global teams, deep search, heavy exports, and one-click migration.
+
+The two that would make me reconsider before writing code: **document placement being permanent** (test it with a real transatlantic pair before committing), and **D1 full-text search** (confirm FTS5 status directly — it determines whether search is a weekend or a separate service).
