@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { MemberContext } from "../worker/env";
 import { buildTree } from "../shared/tree-model";
-import type { Page, PageKind, PageNode, Role } from "../shared/types";
+import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent } from "../shared/types";
 import { ApiClientError, api, authClient, json } from "./api";
+import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
+import { invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
 import { TablePage } from "./TablePage";
 
 type AppState =
@@ -156,20 +158,90 @@ function SignInScreen({ onComplete }: { onComplete: () => Promise<void> }) {
 
 function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: () => void }) {
   const [pages, setPages] = useState<Page[]>([]);
+  const [pagesLoaded, setPagesLoaded] = useState(false);
   const [trash, setTrash] = useState<Page[]>([]);
   const [selectedId, setSelectedId] = useState(() => localStorage.getItem("notes:last-page"));
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [view, setView] = useState<"pages" | "search" | "trash" | "settings">("pages");
+  const [view, setView] = useState<"pages" | "search" | "mentions" | "trash" | "settings">("pages");
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
+  const [unreadMentions, setUnreadMentions] = useState(0);
+  const [backlinksRevision, setBacklinksRevision] = useState(0);
+  const pageStateGeneration = useRef(0);
 
   const loadPages = useCallback(async () => {
+    const generation = pageStateGeneration.current;
     const data = await api<{ pages: Page[] }>("/api/pages/tree");
-    setPages(data.pages);
+    if (generation !== pageStateGeneration.current) {
+      await loadPages();
+      return;
+    }
+    setPages((current) => mergePageSnapshot(current, data.pages));
+    setPagesLoaded(true);
     setSelectedId((current) => current && data.pages.some((page) => page.id === current) ? current : data.pages[0]?.id ?? null);
   }, []);
+  const loadTrash = useCallback(async () => {
+    const data = await api<{ pages: Page[] }>("/api/pages/tree?archived=true");
+    setTrash(data.pages);
+  }, []);
+  const loadUnreadMentions = useCallback(async () => {
+    const data = await api<{ unreadCount: number }>("/api/mentions/unread-count");
+    setUnreadMentions(data.unreadCount);
+  }, []);
+  const handleMentionsRead = useCallback((unreadCount: number) => setUnreadMentions(unreadCount), []);
   useEffect(() => { void loadPages(); }, [loadPages]);
+  useEffect(() => { void loadUnreadMentions(); }, [loadUnreadMentions]);
   useEffect(() => { if (selectedId) localStorage.setItem("notes:last-page", selectedId); }, [selectedId]);
+
+  const handleWorkspaceEvent = useCallback((event: WorkspaceEvent) => {
+    if (event.type === "pages-upserted") {
+      pageStateGeneration.current += 1;
+      for (const page of event.pages) invalidatePagePreview(page.id);
+      setPages((current) => mergePages(current, event.pages));
+      setTrash((current) => current.filter((page) => !event.pages.some((updated) => updated.id === page.id)));
+      return;
+    }
+    if (event.type === "pages-removed") {
+      pageStateGeneration.current += 1;
+      for (const pageId of event.pageIds) invalidatePagePreview(pageId);
+      setPages((current) => current.filter((page) => !event.pageIds.includes(page.id)));
+      if (event.permanently) {
+        setTrash((current) => current.filter((page) => !event.pageIds.includes(page.id)));
+      } else {
+        void loadTrash();
+      }
+      return;
+    }
+    invalidatePagePreview(event.pageId);
+    setBacklinksRevision((current) => current + 1);
+    if (event.mentionTargetUserIds.includes(member.user.id)) void loadUnreadMentions();
+  }, [loadTrash, loadUnreadMentions, member.user.id]);
+
+  useEffect(() => {
+    const bundle = createWorkspaceEvents(member.workspace.id, handleWorkspaceEvent, () => {
+      void loadPages();
+      void loadUnreadMentions();
+    });
+    return () => bundle.destroy();
+  }, [handleWorkspaceEvent, loadPages, loadUnreadMentions, member.workspace.id]);
+
+  useEffect(() => {
+    const navigate = (event: Event) => {
+      const pageId = (event as CustomEvent<string>).detail;
+      if (!pageId) return;
+      setSelectedId(pageId);
+      setView("pages");
+      setSidebarOpen(false);
+    };
+    window.addEventListener(PAGE_NAVIGATE_EVENT, navigate);
+    return () => window.removeEventListener(PAGE_NAVIGATE_EVENT, navigate);
+  }, []);
+
+  useEffect(() => {
+    if (pagesLoaded && selectedId && !pages.some((page) => page.id === selectedId)) {
+      setSelectedId(pages[0]?.id ?? null);
+    }
+  }, [pages, pagesLoaded, selectedId]);
 
   const selected = pages.find((page) => page.id === selectedId) ?? null;
   const tree = useMemo(() => buildTree(pages), [pages]);
@@ -182,7 +254,8 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
 
   async function createPage(kind: PageKind, parentId: string | null = selected?.parentId ?? null) {
     const result = await api<{ page: Page }>("/api/pages", { method: "POST", body: json({ kind, parentId }) });
-    setPages((current) => [...current, result.page]);
+    pageStateGeneration.current += 1;
+    setPages((current) => mergePages(current, [result.page]));
     setSelectedId(result.page.id); setView("pages"); setSidebarOpen(false);
   }
   async function archive(page: Page) {
@@ -194,6 +267,7 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
     const result = await api<{ page: Page }>(`/api/pages/${pageId}/move`, {
       method: "POST", body: json({ parentId, beforeId, afterId }),
     });
+    pageStateGeneration.current += 1;
     setPages((current) => current.map((page) => page.id === pageId ? result.page : page));
   }
   async function runSearch(value: string) {
@@ -203,10 +277,10 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
     setSearchResults(data.results);
   }
   async function showTrash() {
-    const data = await api<{ pages: Page[] }>("/api/pages/tree?archived=true");
-    setTrash(data.pages); setView("trash");
+    await loadTrash(); setView("trash");
   }
   const updatePage = useCallback((page: Page) => {
+    pageStateGeneration.current += 1;
     setPages((current) => current.map((item) => item.id === page.id ? page : item));
   }, []);
 
@@ -220,6 +294,9 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
         </header>
         <nav className="sidebar-nav">
           <button className={view === "search" ? "active" : ""} onClick={() => setView("search")}><span>⌕</span> Search</button>
+          <button className={view === "mentions" ? "active" : ""} onClick={() => setView("mentions")}>
+            <span>@</span> Mentions {unreadMentions > 0 && <b className="mention-badge">{unreadMentions}</b>}
+          </button>
           <button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}><span>⚙</span> Members</button>
         </nav>
         <div className="sidebar-section-title"><span>Pages</span>{member.role !== "viewer" && <button onClick={() => void createPage("document", null)}>+</button>}</div>
@@ -258,6 +335,8 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
 
         {view === "search" ? (
           <SearchView value={search} results={searchResults} onChange={runSearch} onSelect={(id) => { setSelectedId(id); setView("pages"); }} />
+        ) : view === "mentions" ? (
+          <MentionsView onSelect={(id) => { setSelectedId(id); setView("pages"); }} onRead={handleMentionsRead} />
         ) : view === "trash" ? (
           <TrashView pages={trash} owner={member.role === "owner"} onRestore={async (page) => {
             await api(`/api/pages/${page.id}/restore`, { method: "POST" }); await loadPages(); await showTrash();
@@ -269,8 +348,8 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
           <MembersView member={member} />
         ) : selected ? (
           selected.kind === "document"
-            ? <EditorPage key={`${selected.id}:${selected.contentEpoch}`} page={selected} member={member} onPageChanged={updatePage} />
-            : <TablePage key={selected.id} page={selected} member={member} onPageChanged={updatePage} />
+            ? <EditorPage key={`${selected.id}:${selected.contentEpoch}`} page={selected} member={member} onPageChanged={updatePage} onSelectPage={(id) => { setSelectedId(id); setView("pages"); }} backlinksRevision={backlinksRevision} />
+            : <TablePage key={selected.id} page={selected} member={member} onPageChanged={updatePage} onSelectPage={(id) => { setSelectedId(id); setView("pages"); }} backlinksRevision={backlinksRevision} />
         ) : (
           <EmptyWorkspace canEdit={member.role !== "viewer"} onCreate={() => void createPage("document", null)} />
         )}
@@ -278,6 +357,20 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
       {sidebarOpen && <button className="sidebar-scrim" aria-label="Close sidebar" onClick={() => setSidebarOpen(false)} />}
     </div>
   );
+}
+
+function mergePages(current: Page[], incoming: Page[]) {
+  const pages = new Map(current.map((page) => [page.id, page]));
+  for (const page of incoming) pages.set(page.id, page);
+  return [...pages.values()];
+}
+
+function mergePageSnapshot(current: Page[], snapshot: Page[]) {
+  const existing = new Map(current.map((page) => [page.id, page]));
+  return snapshot.map((page) => {
+    const previous = existing.get(page.id);
+    return previous && previous.revision > page.revision ? previous : page;
+  });
 }
 
 function PageTree({ nodes, selectedId, editable, onSelect, onCreate, onArchive, onDropPage, onMove, grandparentId = null }: {
@@ -336,6 +429,42 @@ function SearchView({ value, results, onChange, onSelect }: {
       <div className="search-results">
         {results.map(({ page, snippet }) => <button key={page.id} onClick={() => onSelect(page.id)}><strong>{page.title}</strong><span>{snippet.replace(/<\/?mark>/g, "")}</span></button>)}
         {value && !results.length && <p className="empty-copy">No matching pages.</p>}
+      </div>
+    </main>
+  );
+}
+
+function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; onRead: (unreadCount: number) => void }) {
+  const [mentions, setMentions] = useState<MentionInboxItem[]>([]);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let active = true;
+    void api<{ mentions: MentionInboxItem[]; asOf: number }>("/api/mentions").then(async (data) => {
+      if (!active) return;
+      setMentions(data.mentions);
+      const read = await api<{ unreadCount: number }>("/api/mentions/read", {
+        method: "POST",
+        body: json({ through: data.asOf }),
+      });
+      if (active) onRead(read.unreadCount);
+    }).catch(() => {
+      if (active) setError("Mentions could not be loaded. Try again.");
+    });
+    return () => { active = false; };
+  }, [onRead]);
+  return (
+    <main className="utility-view">
+      <p className="eyebrow">Inbox</p><h1>Mentions</h1>
+      {error && <p className="form-error">{error}</p>}
+      <div className="mention-inbox">
+        {mentions.map((mention) => (
+          <button key={mention.page.id} className={mention.unread ? "unread" : ""} onClick={() => onSelect(mention.page.id)}>
+            <strong>{mention.page.icon ?? "□"} {mention.page.title}</strong>
+            <span>{mention.excerpt || "You were mentioned on this page."}</span>
+            <small>{new Date(mention.firstSeenAt).toLocaleString()}</small>
+          </button>
+        ))}
+        {!mentions.length && <p className="empty-copy">No one has mentioned you yet.</p>}
       </div>
     </main>
   );

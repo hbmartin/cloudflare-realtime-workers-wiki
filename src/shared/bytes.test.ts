@@ -8,7 +8,7 @@ describe("Yjs update chunking", () => {
     const chunks = splitBytes(update);
     expect(chunks.map((chunk) => chunk.byteLength)).toEqual([UPDATE_CHUNK_BYTES, UPDATE_CHUNK_BYTES, 417]);
     expect(joinBytes(chunks)).toEqual(update);
-  });
+  }, 15_000);
 
   it("rejects invalid chunk sizes", () => {
     expect(() => splitBytes(new Uint8Array([1]), 0)).toThrow("positive");

@@ -31,6 +31,43 @@ export type Page = {
 
 export type PageNode = Page & { children: PageNode[] };
 
+export type MentionEntityType = "page" | "user";
+
+export type MentionSuggestion = {
+  entityType: MentionEntityType;
+  entityId: string;
+  label: string;
+  detail: string;
+  icon: string | null;
+};
+
+export type PagePreview = {
+  page: Page;
+  excerpt: string;
+};
+
+export type Backlink = {
+  page: Page;
+  excerpt: string;
+};
+
+export type MentionInboxItem = {
+  page: Page;
+  excerpt: string;
+  firstSeenAt: number;
+  unread: boolean;
+};
+
+export type WorkspaceEvent =
+  | { type: "pages-upserted"; pages: Page[] }
+  | { type: "pages-removed"; pageIds: string[]; permanently: boolean }
+  | {
+      type: "projection-updated";
+      pageId: string;
+      backlinkTargetIds: string[];
+      mentionTargetUserIds: string[];
+    };
+
 export type TableColumn = {
   id: string;
   name: string;

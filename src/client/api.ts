@@ -13,9 +13,16 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (init?.body && !(init.body instanceof FormData)) headers.set("content-type", "application/json");
   const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
-    const fallback = { error: { code: "request_failed", message: `Request failed (${response.status}).` } };
-    const payload = await response.json().catch(() => fallback) as typeof fallback;
-    throw new ApiClientError(response.status, payload.error.code, payload.error.message);
+    const fallback = { code: "request_failed", message: `Request failed (${response.status}).` };
+    const payload = await response.json().catch(() => null) as {
+      code?: unknown;
+      message?: unknown;
+      error?: { code?: unknown; message?: unknown };
+    } | null;
+    const error = payload?.error ?? payload;
+    const code = typeof error?.code === "string" ? error.code : fallback.code;
+    const message = typeof error?.message === "string" ? error.message : fallback.message;
+    throw new ApiClientError(response.status, code, message);
   }
   return response.json() as Promise<T>;
 }

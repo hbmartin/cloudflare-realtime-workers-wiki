@@ -1,9 +1,11 @@
 import type { Document } from "./document";
+import type { WorkspaceEvents } from "./workspace-events";
 
 export interface AppBindings {
   DB: D1Database;
   BUCKET: R2Bucket;
   DOCUMENT: DurableObjectNamespace<Document>;
+  WORKSPACE_EVENTS: DurableObjectNamespace<WorkspaceEvents>;
   ASSETS: Fetcher;
   BETTER_AUTH_SECRET: string;
   BETTER_AUTH_URL: string;

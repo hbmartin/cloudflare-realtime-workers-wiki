@@ -1,27 +1,34 @@
 import { CommentsExtension, DefaultThreadStoreAuth } from "@blocknote/core/comments";
 import { withCollaboration, YjsThreadStore } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
-import { ThreadsSidebar, useCreateBlockNote } from "@blocknote/react";
+import { SuggestionMenuController, ThreadsSidebar, useCreateBlockNote } from "@blocknote/react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
 import type { MemberContext } from "../worker/env";
-import type { Page } from "../shared/types";
-import { diffBlockIds, plainVersion } from "../shared/block-diff";
+import type { MentionSuggestion, Page } from "../shared/types";
+import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { diffBlockIds } from "../shared/block-diff";
 import { api, json } from "./api";
+import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
+import { notesSchema } from "./mentions";
 
 type Props = {
   page: Page;
   member: MemberContext;
   onPageChanged: (page: Page) => void;
+  onSelectPage: (pageId: string) => void;
+  backlinksRevision: number;
 };
 
-export function EditorPage({ page, member, onPageChanged }: Props) {
+export function EditorPage({ page, member, onPageChanged, onSelectPage, backlinksRevision }: Props) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [attachmentsOpen, setAttachmentsOpen] = useState(false);
+  const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
   const recoveryKey = `notes:recovery:${member.workspace.id}:${page.id}`;
   const [recovery, setRecovery] = useState<{ key: string; epoch: number } | null>(() => {
@@ -30,12 +37,14 @@ export function EditorPage({ page, member, onPageChanged }: Props) {
   const [recoveryPreview, setRecoveryPreview] = useState("");
   const [title, setTitle] = useState(page.title);
   const editable = member.role !== "viewer" && !sizeWarning?.readOnly;
+  const commentsVisible = editable && commentsOpen;
 
   useEffect(() => {
     setTitle(page.title);
   }, [page.id, page.title]);
 
   useEffect(() => {
+    setSizeWarning(null);
     const next = createCollaboration(member.workspace.id, page.id, page.contentEpoch, setStatus);
     const customMessage = (message: string) => {
       try {
@@ -46,15 +55,20 @@ export function EditorPage({ page, member, onPageChanged }: Props) {
       }
     };
     next.provider.on("custom-message", customMessage);
+    const quarantine = () => {
+      const value = { key: `${member.workspace.id}:${page.id}:${page.contentEpoch}:1`, epoch: page.contentEpoch };
+      localStorage.setItem(recoveryKey, JSON.stringify(value));
+      setRecovery(value);
+    };
     const connectionClose = async (event: CloseEvent) => {
-      if (event.code !== 4410) return;
-      if (next.hasUnsyncedChanges) {
-        const value = { key: `${member.workspace.id}:${page.id}:${page.contentEpoch}:1`, epoch: page.contentEpoch };
-        localStorage.setItem(recoveryKey, JSON.stringify(value));
-      }
+      if (event.code !== 4410 && event.code !== 1006) return;
+      if (event.code === 4410 && next.hasUnsyncedChanges) quarantine();
       try {
         const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
-        if (result.page.contentEpoch !== page.contentEpoch) onPageChanged(result.page);
+        if (result.page.contentEpoch !== page.contentEpoch) {
+          quarantine();
+          onPageChanged(result.page);
+        }
       } catch { /* The next normal metadata refresh will recover. */ }
     };
     next.provider.on("connection-close", connectionClose);
@@ -87,9 +101,10 @@ export function EditorPage({ page, member, onPageChanged }: Props) {
           const result = await api<{ page: Page }>(`/api/pages/${page.id}`, { method: "PATCH", body: json({ icon: icon || null, revision: page.revision }) });
           onPageChanged(result.page);
         }}>{page.icon ?? "Add icon"}</button>}
-        <button className="quiet-button" onClick={() => { setCommentsOpen((open) => !open); setAttachmentsOpen(false); setHistoryOpen(false); }}>Comments</button>
-        <button className="quiet-button" onClick={() => { setAttachmentsOpen((open) => !open); setCommentsOpen(false); setHistoryOpen(false); }}>Files</button>
-        <button className="quiet-button" onClick={() => { setHistoryOpen((open) => !open); setCommentsOpen(false); setAttachmentsOpen(false); }}>History</button>
+        {editable && <button className="quiet-button" onClick={() => { setCommentsOpen((open) => !open); setAttachmentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Comments</button>}
+        <button className="quiet-button" onClick={() => { setAttachmentsOpen((open) => !open); setCommentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Files</button>
+        <button className="quiet-button" onClick={() => { setHistoryOpen((open) => !open); setCommentsOpen(false); setAttachmentsOpen(false); setBacklinksOpen(false); }}>History</button>
+        <button className="quiet-button" onClick={() => { setBacklinksOpen((open) => !open); setCommentsOpen(false); setAttachmentsOpen(false); setHistoryOpen(false); }}>Backlinks</button>
       </div>
       {sizeWarning && (
         <div className={`notice ${sizeWarning.readOnly ? "notice-danger" : ""}`}>
@@ -102,7 +117,7 @@ export function EditorPage({ page, member, onPageChanged }: Props) {
           <div><strong>Offline copy quarantined</strong><span>Edits from epoch {recovery.epoch} were not merged after this page was restored.</span></div>
           <button className="quiet-button" onClick={async () => {
             const doc = await loadOfflineCopy(recovery.key);
-            setRecoveryPreview(doc.getXmlFragment("document-store").toString().replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim() || "Empty copy");
+            setRecoveryPreview(plainYDoc(doc));
             doc.destroy();
           }}>Preview</button>
           <button className="quiet-button" onClick={async () => {
@@ -117,7 +132,7 @@ export function EditorPage({ page, member, onPageChanged }: Props) {
           {recoveryPreview && <p>{recoveryPreview}</p>}
         </div>
       )}
-      <div className={`document-layout ${commentsOpen || historyOpen || attachmentsOpen ? "with-panel" : ""}`}>
+      <div className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}>
         <article className="document-paper">
           <input
             className="page-title"
@@ -131,7 +146,7 @@ export function EditorPage({ page, member, onPageChanged }: Props) {
             aria-label="Page title"
           />
           {bundle ? (
-            <CollaborativeEditor bundle={bundle} member={member} editable={editable} commentsOpen={commentsOpen} />
+            <CollaborativeEditor bundle={bundle} member={member} editable={editable} commentsOpen={commentsVisible} />
           ) : (
             <div className="editor-loading">Opening your offline copy…</div>
           )}
@@ -145,6 +160,7 @@ export function EditorPage({ page, member, onPageChanged }: Props) {
           />
         )}
         {attachmentsOpen && <AttachmentsPanel page={page} editable={editable} />}
+        {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
       </div>
     </main>
   );
@@ -185,19 +201,14 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
 }
 
 function editorOptions(bundle: CollaborationBundle, member: MemberContext, includeComments: boolean) {
-  const threadStore = new YjsThreadStore(
-    member.user.id,
-    bundle.doc.getMap("comments"),
-    new DefaultThreadStoreAuth(member.user.id, "editor"),
-  );
-  return withCollaboration({
-    collaboration: {
-      fragment: bundle.doc.getXmlFragment("document-store"),
-      provider: bundle.provider,
-      user: { name: member.user.name, color: userColor(member.user.id) },
-      showCursorLabels: "activity" as const,
-    },
-    extensions: includeComments ? [CommentsExtension({
+  const extensions = [];
+  if (includeComments) {
+    const threadStore = new YjsThreadStore(
+      member.user.id,
+      bundle.doc.getMap("comments"),
+      new DefaultThreadStoreAuth(member.user.id, "editor"),
+    );
+    extensions.push(CommentsExtension({
       threadStore,
       resolveUsers: async (ids: string[]) => ids.map((id) => ({
         id,
@@ -205,7 +216,17 @@ function editorOptions(bundle: CollaborationBundle, member: MemberContext, inclu
         avatarUrl: "",
         color: userColor(id),
       })),
-    })] : [],
+    }));
+  }
+  return withCollaboration({
+    schema: notesSchema,
+    collaboration: {
+      fragment: bundle.doc.getXmlFragment("document-store"),
+      provider: bundle.provider,
+      user: { name: member.user.name, color: userColor(member.user.id) },
+      showCursorLabels: "activity" as const,
+    },
+    extensions,
   });
 }
 
@@ -215,10 +236,31 @@ function CollaborativeEditor({ bundle, member, editable, commentsOpen }: {
   editable: boolean;
   commentsOpen: boolean;
 }) {
-  const options = useMemo(() => editorOptions(bundle, member, true), [bundle, member]);
-  const editor = useCreateBlockNote(options, [bundle]);
+  const options = useMemo(() => editorOptions(bundle, member, editable), [bundle, editable, member]);
+  const editor = useCreateBlockNote(options, [bundle, editable]);
+  const getMentionItems = async (query: string) => {
+    const data = await api<{ suggestions: MentionSuggestion[] }>(`/api/mentions/suggestions?q=${encodeURIComponent(query)}`);
+    return data.suggestions.map((suggestion) => ({
+      title: suggestion.label,
+      subtext: suggestion.detail,
+      group: suggestion.entityType === "page" ? "Pages" : "People",
+      icon: <span>{suggestion.icon ?? (suggestion.entityType === "page" ? "□" : "@")}</span>,
+      onItemClick: () => editor.insertInlineContent([
+        {
+          type: "mention",
+          props: {
+            entityType: suggestion.entityType,
+            entityId: suggestion.entityId,
+            label: suggestion.label,
+          },
+        },
+        " ",
+      ], { updateSelection: true }),
+    }));
+  };
   return (
     <BlockNoteView editor={editor} editable={editable} className="notes-editor" theme="light">
+      {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
       {commentsOpen && (
         <aside className="side-panel comments-panel">
           <h2>Comments</h2>
@@ -305,9 +347,14 @@ function BlockDiff({ oldDoc, currentDoc }: { oldDoc: Y.Doc; currentDoc: Y.Doc })
       <span className="diff-removed">−{diff.removed.length} blocks</span>
       <span>{diff.identical ? "No content changes" : "Changed blocks are shown by stable block ID"}</span>
       <div className="diff-columns">
-        <pre>{plainVersion(oldXml)}</pre>
-        <pre>{plainVersion(currentXml)}</pre>
+        <pre>{plainYDoc(oldDoc)}</pre>
+        <pre>{plainYDoc(currentDoc)}</pre>
       </div>
     </div>
   );
+}
+
+function plainYDoc(doc: Y.Doc) {
+  const json = yXmlFragmentToProsemirrorJSON(doc.getXmlFragment("document-store")) as ProseMirrorJson;
+  return projectDocument(json).plainText || "Empty document";
 }

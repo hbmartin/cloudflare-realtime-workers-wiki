@@ -1,21 +1,33 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MemberContext } from "../worker/env";
 import type { ColumnType, Page, TableColumn, TableData, TableRow } from "../shared/types";
 import { ApiClientError, api, json } from "./api";
+import { BacklinksPanel } from "./BacklinksPanel";
 
-type Props = { page: Page; member: MemberContext; onPageChanged: (page: Page) => void };
+type Props = {
+  page: Page;
+  member: MemberContext;
+  onPageChanged: (page: Page) => void;
+  onSelectPage: (pageId: string) => void;
+  backlinksRevision: number;
+};
 
-export function TablePage({ page, member, onPageChanged }: Props) {
+export function TablePage({ page, member, onPageChanged, onSelectPage, backlinksRevision }: Props) {
   const [table, setTable] = useState<TableData | null>(null);
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [sortColumn, setSortColumn] = useState<string | null>(null);
   const [title, setTitle] = useState(page.title);
+  const [backlinksOpen, setBacklinksOpen] = useState(false);
+  const revisionRef = useRef<number | null>(null);
+  const leaseTokenRef = useRef<string | null>(null);
+  const mutationQueue = useRef<Promise<void>>(Promise.resolve());
   const canEdit = member.role !== "viewer";
 
   const load = useCallback(async () => {
     const result = await api<{ table: TableData }>(`/api/tables/${page.id}`);
+    revisionRef.current = result.table.revision;
     setTable(result.table);
   }, [page.id]);
 
@@ -23,11 +35,13 @@ export function TablePage({ page, member, onPageChanged }: Props) {
     if (!canEdit) return;
     try {
       const result = await api<{ leaseToken: string }>(`/api/tables/${page.id}/lease`, { method: "POST" });
+      leaseTokenRef.current = result.leaseToken;
       setLeaseToken(result.leaseToken);
       setError(null);
       await load();
     } catch (cause) {
       if (cause instanceof ApiClientError && cause.code === "lease_conflict") {
+        leaseTokenRef.current = null;
         setLeaseToken(null);
         setError("Another editor has this table open for editing.");
         await load();
@@ -54,6 +68,7 @@ export function TablePage({ page, member, onPageChanged }: Props) {
           method: "PATCH", body: json({ leaseToken }),
         });
       } catch {
+        leaseTokenRef.current = null;
         setLeaseToken(null);
         setError("The editing lease was lost. Reloaded the authoritative table.");
         await load();
@@ -80,23 +95,32 @@ export function TablePage({ page, member, onPageChanged }: Props) {
   }
 
   async function mutation<T>(path: string, method: string, body: Record<string, unknown>) {
-    if (!table || !leaseToken) return null;
-    try {
-      const result = await api<T & { revision: number }>(path, {
-        method,
-        body: json({ ...body, leaseToken, expectedRevision: table.revision }),
-      });
-      setTable((current) => current ? { ...current, revision: result.revision } : current);
-      return result;
-    } catch (cause) {
-      if (cause instanceof ApiClientError && cause.status === 409) {
-        setLeaseToken(null);
-        setError(cause.message);
-        await load();
-        return null;
+    const execute = async () => {
+      const currentLease = leaseTokenRef.current;
+      const currentRevision = revisionRef.current;
+      if (!currentLease || currentRevision === null) return null;
+      try {
+        const result = await api<T & { revision: number }>(path, {
+          method,
+          body: json({ ...body, leaseToken: currentLease, expectedRevision: currentRevision }),
+        });
+        revisionRef.current = result.revision;
+        setTable((current) => current ? { ...current, revision: result.revision } : current);
+        return result;
+      } catch (cause) {
+        if (cause instanceof ApiClientError && cause.status === 409) {
+          leaseTokenRef.current = null;
+          setLeaseToken(null);
+          setError(cause.message);
+          await load();
+          return null;
+        }
+        throw cause;
       }
-      throw cause;
-    }
+    };
+    const pending = mutationQueue.current.then(execute, execute);
+    mutationQueue.current = pending.then(() => undefined, () => undefined);
+    return pending;
   }
 
   async function addColumn() {
@@ -172,6 +196,7 @@ export function TablePage({ page, member, onPageChanged }: Props) {
             await acquire();
           }}>Force unlock</button>
         )}
+        <button className="quiet-button" onClick={() => setBacklinksOpen((open) => !open)}>Backlinks</button>
       </div>
       {error && <div className="notice">{error}</div>}
       <article className="table-paper">
@@ -229,6 +254,7 @@ export function TablePage({ page, member, onPageChanged }: Props) {
           </div>
         )}
       </article>
+      {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
     </main>
   );
 }

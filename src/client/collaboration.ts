@@ -1,12 +1,18 @@
 import { IndexeddbPersistence } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
+import type { WorkspaceEvent } from "../shared/types";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
   indexeddb: IndexeddbPersistence;
   provider: YProvider;
   readonly hasUnsyncedChanges: boolean;
+  destroy: () => void;
+};
+
+export type WorkspaceEventsBundle = {
+  provider: YProvider;
   destroy: () => void;
 };
 
@@ -33,10 +39,15 @@ export function createCollaboration(
   provider.on("status", handleStatus);
   provider.on("sync", (synced: boolean) => { if (synced) hasUnsyncedChanges = false; });
   doc.on("update", (_update: Uint8Array, origin: unknown) => {
-    if (origin !== provider && origin !== indexeddb && !provider.synced) hasUnsyncedChanges = true;
+    if (origin !== provider && origin !== indexeddb) hasUnsyncedChanges = true;
   });
   indexeddb.whenSynced.then(() => {
-    if (!destroyed) provider.connect();
+    if (!destroyed) {
+      // Until the server sync completes, conservatively treat a persisted copy
+      // as recoverable offline work. An epoch rejection happens before sync.
+      hasUnsyncedChanges = Y.encodeStateVector(doc).byteLength > 1;
+      provider.connect();
+    }
   });
 
   const visibility = () => {
@@ -73,6 +84,39 @@ export async function loadOfflineCopy(key: string) {
   await persistence.whenSynced;
   await persistence.destroy();
   return doc;
+}
+
+export function createWorkspaceEvents(
+  workspaceId: string,
+  onEvent: (event: WorkspaceEvent) => void,
+  onConnected: () => void,
+): WorkspaceEventsBundle {
+  const doc = new Y.Doc();
+  const provider = new YProvider(window.location.host, workspaceId, doc, {
+    party: "workspace-events",
+  });
+  const customMessage = (message: string) => {
+    try {
+      onEvent(JSON.parse(message) as WorkspaceEvent);
+    } catch {
+      // Ignore messages from future server versions.
+    }
+  };
+  const status = ({ status: next }: { status: string }) => {
+    if (next === "connected") onConnected();
+  };
+  provider.on("custom-message", customMessage);
+  provider.on("status", status);
+  return {
+    provider,
+    destroy() {
+      provider.off("custom-message", customMessage);
+      provider.off("status", status);
+      provider.awareness.setLocalState(null);
+      provider.destroy();
+      doc.destroy();
+    },
+  };
 }
 
 export function userColor(id: string) {
