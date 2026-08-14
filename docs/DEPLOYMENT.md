@@ -42,7 +42,7 @@ Open the deployment, bootstrap the owner, then verify `/api/health`. Do not expo
 
 1. Export D1 and back up R2 as described in `BACKUP_AND_RECOVERY.md`.
 2. Build and test the exact revision locally.
-3. Apply additive D1 migrations before deploying code that requires them.
+3. Run `pnpm db:remote` and verify `migrations/0004_realtime_knowledge_cleanup.sql` completes before `pnpm deploy`; this Worker requires its projection, mention, and deletion-job tables.
 4. Deploy the Worker.
 5. Test sign-in, page metadata, document and workspace-event WebSockets, attachment range/conditional download, table lease, and version listing.
 
@@ -59,8 +59,8 @@ Durable Object migrations are append-only in `wrangler.jsonc`. Never rename or d
 - Edits arriving during compaction remain dirty and are included by the next compaction.
 - Rename or move a page in one browser and observe the other browser update without reload.
 - Matching attachment `If-None-Match` returns a bodyless `304`; bounded, open-ended, and suffix ranges return correct lengths.
-- Permanently delete a disposable multi-epoch page, then confirm its deletion job completes and its `documents/{pageId}/` prefix is empty.
-- The hourly scheduled handler runs successfully and no old deletion jobs remain perpetually due.
+- Permanently delete a disposable multi-epoch page, then confirm `deletion_jobs` is empty, no unfinished `deletion_targets` remain, and its `documents/{pageId}/` prefix is empty.
+- The hourly scheduled handler runs successfully and no deletion jobs or unfinished targets remain.
 - Idle connected rooms stop accruing billed duration in Cloudflare analytics.
 - D1/R2/DO metrics and Worker structured logs are visible.
 

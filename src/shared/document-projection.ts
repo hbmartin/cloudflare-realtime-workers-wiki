@@ -25,58 +25,57 @@ function stringAttr(node: ProseMirrorJson, name: string) {
   return typeof value === "string" ? value : null;
 }
 
-function referenceKey(entityType: string, entityId: string) {
-  return `\u0000${entityType}:${entityId}\u0000`;
+function normalizeText(text: string) {
+  return text.replace(/\s+/g, " ").trim();
 }
 
-function excerptAround(text: string, marker: string) {
-  const index = text.indexOf(marker);
-  if (index < 0) return text.replace(/\u0000[^\u0000]+\u0000/g, " ").replace(/\s+/g, " ").trim().slice(0, EXCERPT_CHARS);
-  const withoutMarkers = text.replaceAll(marker, " ").replace(/\u0000[^\u0000]+\u0000/g, " ");
-  const markerlessIndex = text.slice(0, index).replace(/\u0000[^\u0000]+\u0000/g, " ").length;
-  const start = Math.max(0, markerlessIndex - Math.floor(EXCERPT_CHARS / 2));
-  return withoutMarkers.slice(start, start + EXCERPT_CHARS).replace(/\s+/g, " ").trim();
+function excerptAround(text: string, offset: number) {
+  const start = Math.max(0, offset - Math.floor(EXCERPT_CHARS / 2));
+  return normalizeText(text.slice(start, start + EXCERPT_CHARS * 2)).slice(0, EXCERPT_CHARS);
 }
 
 export function projectDocument(root: ProseMirrorJson): DocumentProjection {
   const parts: string[] = [];
-  const pageIds = new Set<string>();
-  const userIds = new Set<string>();
+  const pageOffsets = new Map<string, number>();
+  const userOffsets = new Map<string, number>();
+  let textLength = 0;
+
+  const append = (text: string) => {
+    parts.push(text);
+    textLength += text.length;
+  };
 
   const visit = (node: ProseMirrorJson) => {
-    if (typeof node.text === "string") parts.push(node.text);
+    if (typeof node.text === "string") append(node.text);
 
     if (node.type === "mention") {
       const entityType = stringAttr(node, "entityType");
       const entityId = stringAttr(node, "entityId");
-      const label = stringAttr(node, "label") ?? "Mention";
-      if (entityType && entityId) {
-        parts.push(referenceKey(entityType, entityId), label, " ");
-        if (entityType === "page") pageIds.add(entityId);
-        if (entityType === "user") userIds.add(entityId);
+      const label = stringAttr(node, "label");
+      if (entityId && label && (entityType === "page" || entityType === "user")) {
+        const offsets = entityType === "page" ? pageOffsets : userOffsets;
+        if (!offsets.has(entityId)) offsets.set(entityId, textLength);
+        append(label);
+        append(" ");
       }
     }
 
     for (const child of node.content ?? []) visit(child);
-    if (node.type && !["text", "mention"].includes(node.type)) parts.push(" ");
+    if (node.type && !["text", "mention"].includes(node.type)) append(" ");
   };
 
   visit(root);
-  const markedText = parts.join("");
-  const plainText = markedText
-    .replace(/\u0000[^\u0000]+\u0000/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, MAX_PLAIN_TEXT);
+  const text = parts.join("");
+  const plainText = normalizeText(text).slice(0, MAX_PLAIN_TEXT);
   return {
     plainText,
-    pageReferences: [...pageIds].map((targetId) => ({
+    pageReferences: [...pageOffsets].map(([targetId, offset]) => ({
       targetId,
-      excerpt: excerptAround(markedText, referenceKey("page", targetId)),
+      excerpt: excerptAround(text, offset),
     })),
-    memberMentions: [...userIds].map((targetId) => ({
+    memberMentions: [...userOffsets].map(([targetId, offset]) => ({
       targetId,
-      excerpt: excerptAround(markedText, referenceKey("user", targetId)),
+      excerpt: excerptAround(text, offset),
     })),
   };
 }

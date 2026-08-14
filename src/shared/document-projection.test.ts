@@ -50,6 +50,26 @@ describe("structured document projection", () => {
     expect(projection.plainText).toBe("first line second line");
   });
 
+  it("preserves text around literal null characters", () => {
+    const projection = projectDocument(document({
+      type: "paragraph",
+      content: [{ type: "text", text: "before\u0000keep this searchable\u0000after" }],
+    }));
+    expect(projection.plainText).toContain("before\u0000keep this searchable\u0000after");
+  });
+
+  it("ignores incomplete mention nodes", () => {
+    const projection = projectDocument(document({
+      type: "paragraph",
+      content: [
+        { type: "mention", attrs: { entityType: "page", label: "Missing id" } },
+        { type: "mention", attrs: { entityType: "page", entityId: "missing-label" } },
+      ],
+    }));
+    expect(projection.pageReferences).toEqual([]);
+    expect(projection.memberMentions).toEqual([]);
+  });
+
   it("retains the text limit while still discovering later references", () => {
     const projection = projectDocument(document({
       type: "paragraph",

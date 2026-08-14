@@ -113,6 +113,17 @@ export class Document extends YServer {
     this.document.on("update", (update: Uint8Array, origin: unknown) => {
       this.bufferUpdate(update, origin as Connection<ConnectionAuth> | null);
     });
+    const pendingLog = sql.exec<{ pending: number }>(
+      `SELECT EXISTS(SELECT 1 FROM update_events WHERE seq > ?) pending`,
+      this.metadata.snapshot_seq,
+    ).one().pending;
+    if (pendingLog) {
+      if (!this.metadata.dirty) {
+        this.metadata.dirty = 1;
+        sql.exec(`UPDATE document_meta SET dirty = 1 WHERE id = 1`);
+      }
+      await this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS);
+    }
   }
 
   async onLoad() {
@@ -510,7 +521,11 @@ export class Document extends YServer {
     } catch (error) {
       this.metadata.dirty = 1;
       this.state.storage.sql.exec(`UPDATE document_meta SET dirty = 1 WHERE id = 1`);
-      this.state.waitUntil(this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS));
+      try {
+        await this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS);
+      } catch (alarmError) {
+        console.error("Failed to schedule compaction retry", alarmError);
+      }
       throw error;
     }
   }

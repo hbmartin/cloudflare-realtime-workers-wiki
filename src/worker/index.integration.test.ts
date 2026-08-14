@@ -1,5 +1,6 @@
 import {
   applyD1Migrations,
+  abortAllDurableObjects,
   createExecutionContext,
   createScheduledController,
   env,
@@ -11,6 +12,7 @@ import {
 import { beforeEach, describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
+import { processDeletionJob } from "./cleanup";
 import worker from "./index";
 
 type InstalledWorkspace = {
@@ -130,6 +132,7 @@ describe("Worker integration", () => {
     expect(normal.headers.get("cache-control")).toBe("private, max-age=0, must-revalidate");
     const etag = normal.headers.get("etag");
     expect(etag).toBeTruthy();
+    await env.DB.prepare(`UPDATE attachments SET size = 999 WHERE id = ?`).bind(attachmentId).run();
 
     for (const [range, contentRange, body] of [
       ["bytes=2-5", "bytes 2-5/10", "2345"],
@@ -158,6 +161,26 @@ describe("Worker integration", () => {
     }));
     expect(changed.status).toBe(200);
     expect(await changed.text()).toBe("0123456789");
+
+    const failedPrecondition = await SELF.fetch(authenticatedRequest(installed.cookie, path, {
+      headers: { "if-match": '"not-this-object"', "if-none-match": etag! },
+    }));
+    expect(failedPrecondition.status).toBe(412);
+    expect(await failedPrecondition.text()).toBe("");
+  });
+
+  it("rejects malformed internal workspace events", async () => {
+    const installed = await bootstrap();
+    const stub = env.WORKSPACE_EVENTS.getByName(installed.workspaceId);
+    const malformed = await stub.fetch(new Request("https://workspace-events.internal/broadcast", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-notes-internal": env.BETTER_AUTH_SECRET,
+      },
+      body: JSON.stringify({ type: "pages-removed", permanently: false }),
+    }));
+    expect(malformed.status).toBe(400);
   });
 
   it("allows JSON uploads, rejects executable extensions, and ignores punctuation-only search terms", async () => {
@@ -308,6 +331,34 @@ describe("Worker integration", () => {
       await expect(document.compact()).rejects.toThrow("R2 unavailable");
       document.bindings = originalBindings;
 
+      expect(state.storage.sql.exec<{ dirty: number }>(
+        `SELECT dirty FROM document_meta WHERE id = 1`,
+      ).one().dirty).toBe(1);
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it("recovers a pending update log when an instance restarts after dirty was cleared", async () => {
+    const installed = await bootstrap();
+    const room = `${installed.pageId}~1`;
+    const stub = env.DOCUMENT.getByName(room);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      document.document.getMap("restart-content").set("value", 1);
+      await document.onSave();
+      state.storage.sql.exec(`UPDATE document_meta SET dirty = 0 WHERE id = 1`);
+      await state.storage.deleteAlarm();
+    });
+
+    await abortAllDurableObjects();
+    const restarted = env.DOCUMENT.getByName(room);
+    await restarted.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+    await runInDurableObject(restarted, async (_instance, state) => {
       expect(state.storage.sql.exec<{ dirty: number }>(
         `SELECT dirty FROM document_meta WHERE id = 1`,
       ).one().dirty).toBe(1);
@@ -532,20 +583,18 @@ describe("Worker integration", () => {
       mentions: Array<{ page: { id: string }; unread: boolean }>;
     }>();
     expect(inbox.mentions).toMatchObject([{ page: { id: installed.pageId }, unread: true }]);
-    await SELF.fetch(authenticatedRequest(installed.cookie, "/api/mentions/read", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ through: inbox.asOf }),
-    }));
-    expect(await (await SELF.fetch(authenticatedRequest(installed.cookie, "/api/mentions/unread-count"))).json())
-      .toEqual({ unreadCount: 0 });
-
     const laterSource = await createPage(installed.cookie);
     await env.DB.prepare(
       `INSERT INTO member_mentions
         (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, projection_seq)
        VALUES (?, ?, ?, 'Later mention', ?, 1)`,
     ).bind(installed.workspaceId, laterSource.id, installed.userId, inbox.asOf + 1).run();
+    const read = await SELF.fetch(authenticatedRequest(installed.cookie, "/api/mentions/read", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ through: inbox.asOf }),
+    }));
+    expect(await read.json()).toEqual({ unreadCount: 1 });
     expect(await (await SELF.fetch(authenticatedRequest(installed.cookie, "/api/mentions/unread-count"))).json())
       .toEqual({ unreadCount: 1 });
 
@@ -592,6 +641,21 @@ describe("Worker integration", () => {
       await env.BUCKET.put(`documents/${pageId}/epochs/1/current.bin`, emptySnapshot);
       await env.BUCKET.put(`documents/${pageId}/versions/old.bin`, emptySnapshot);
     }
+    const attachmentKeys = Array.from({ length: 55 }, (_, index) => `assets/${installed.workspaceId}/batch-${index}`);
+    await Promise.all(attachmentKeys.map((key) => env.BUCKET.put(key, "attachment")));
+    await env.DB.batch(attachmentKeys.map((key, index) => env.DB.prepare(
+      `INSERT INTO attachments
+        (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, 'text/plain', 10, ?, ?)`,
+    ).bind(
+      crypto.randomUUID(),
+      installed.workspaceId,
+      installed.pageId,
+      key,
+      `batch-${index}.txt`,
+      installed.userId,
+      Date.now(),
+    )));
 
     expect((await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
       method: "DELETE",
@@ -612,6 +676,8 @@ describe("Worker integration", () => {
     for (const pageId of [installed.pageId, child.id]) {
       expect((await env.BUCKET.list({ prefix: `documents/${pageId}/` })).objects).toHaveLength(0);
     }
+    expect(await Promise.all(attachmentKeys.map((key) => env.BUCKET.get(key))))
+      .toEqual(attachmentKeys.map(() => null));
     for (const room of rooms) {
       const sentinel = await runInDurableObject(env.DOCUMENT.getByName(room), async (_instance, state) => (
         state.storage.get("sentinel")
@@ -641,5 +707,25 @@ describe("Worker integration", () => {
     await waitOnExecutionContext(scheduledContext);
     expect(await env.BUCKET.get(`${retryPrefix}current.bin`)).toBeNull();
     expect(await env.DB.prepare(`SELECT id FROM deletion_jobs WHERE id = ?`).bind(retryJob).first()).toBeNull();
+  });
+
+  it("claims a due deletion job only once across concurrent processors", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const target = `assets/${installed.workspaceId}/claim-once`;
+    const timestamp = Date.now();
+    await env.BUCKET.put(target, "delete me");
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO deletion_jobs (id, workspace_id, root_page_id, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, 'claim-root', ?, ?, ?)`,
+      ).bind(jobId, installed.workspaceId, timestamp, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO deletion_targets (job_id, kind, target) VALUES (?, 'r2_object', ?)`,
+      ).bind(jobId, target),
+    ]);
+    await Promise.all([processDeletionJob(env, jobId), processDeletionJob(env, jobId)]);
+    expect(await env.BUCKET.get(target)).toBeNull();
+    expect(await env.DB.prepare(`SELECT id FROM deletion_jobs WHERE id = ?`).bind(jobId).first()).toBeNull();
   });
 });

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { MemberContext } from "../worker/env";
 import { buildTree } from "../shared/tree-model";
 import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent } from "../shared/types";
@@ -167,10 +167,16 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
   const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
+  const pageStateGeneration = useRef(0);
 
   const loadPages = useCallback(async () => {
+    const generation = pageStateGeneration.current;
     const data = await api<{ pages: Page[] }>("/api/pages/tree");
-    setPages(data.pages);
+    if (generation !== pageStateGeneration.current) {
+      await loadPages();
+      return;
+    }
+    setPages((current) => mergePageSnapshot(current, data.pages));
     setPagesLoaded(true);
     setSelectedId((current) => current && data.pages.some((page) => page.id === current) ? current : data.pages[0]?.id ?? null);
   }, []);
@@ -182,19 +188,22 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
     const data = await api<{ unreadCount: number }>("/api/mentions/unread-count");
     setUnreadMentions(data.unreadCount);
   }, []);
-  const handleMentionsRead = useCallback(() => setUnreadMentions(0), []);
+  const handleMentionsRead = useCallback((unreadCount: number) => setUnreadMentions(unreadCount), []);
   useEffect(() => { void loadPages(); }, [loadPages]);
   useEffect(() => { void loadUnreadMentions(); }, [loadUnreadMentions]);
   useEffect(() => { if (selectedId) localStorage.setItem("notes:last-page", selectedId); }, [selectedId]);
 
   const handleWorkspaceEvent = useCallback((event: WorkspaceEvent) => {
     if (event.type === "pages-upserted") {
+      pageStateGeneration.current += 1;
       for (const page of event.pages) invalidatePagePreview(page.id);
       setPages((current) => mergePages(current, event.pages));
       setTrash((current) => current.filter((page) => !event.pages.some((updated) => updated.id === page.id)));
       return;
     }
     if (event.type === "pages-removed") {
+      pageStateGeneration.current += 1;
+      for (const pageId of event.pageIds) invalidatePagePreview(pageId);
       setPages((current) => current.filter((page) => !event.pageIds.includes(page.id)));
       if (event.permanently) {
         setTrash((current) => current.filter((page) => !event.pageIds.includes(page.id)));
@@ -245,6 +254,7 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
 
   async function createPage(kind: PageKind, parentId: string | null = selected?.parentId ?? null) {
     const result = await api<{ page: Page }>("/api/pages", { method: "POST", body: json({ kind, parentId }) });
+    pageStateGeneration.current += 1;
     setPages((current) => mergePages(current, [result.page]));
     setSelectedId(result.page.id); setView("pages"); setSidebarOpen(false);
   }
@@ -257,6 +267,7 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
     const result = await api<{ page: Page }>(`/api/pages/${pageId}/move`, {
       method: "POST", body: json({ parentId, beforeId, afterId }),
     });
+    pageStateGeneration.current += 1;
     setPages((current) => current.map((page) => page.id === pageId ? result.page : page));
   }
   async function runSearch(value: string) {
@@ -269,6 +280,7 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
     await loadTrash(); setView("trash");
   }
   const updatePage = useCallback((page: Page) => {
+    pageStateGeneration.current += 1;
     setPages((current) => current.map((item) => item.id === page.id ? page : item));
   }, []);
 
@@ -353,6 +365,14 @@ function mergePages(current: Page[], incoming: Page[]) {
   return [...pages.values()];
 }
 
+function mergePageSnapshot(current: Page[], snapshot: Page[]) {
+  const existing = new Map(current.map((page) => [page.id, page]));
+  return snapshot.map((page) => {
+    const previous = existing.get(page.id);
+    return previous && previous.revision > page.revision ? previous : page;
+  });
+}
+
 function PageTree({ nodes, selectedId, editable, onSelect, onCreate, onArchive, onDropPage, onMove, grandparentId = null }: {
   nodes: PageNode[];
   selectedId: string | null;
@@ -414,21 +434,28 @@ function SearchView({ value, results, onChange, onSelect }: {
   );
 }
 
-function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; onRead: () => void }) {
+function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; onRead: (unreadCount: number) => void }) {
   const [mentions, setMentions] = useState<MentionInboxItem[]>([]);
+  const [error, setError] = useState("");
   useEffect(() => {
     let active = true;
     void api<{ mentions: MentionInboxItem[]; asOf: number }>("/api/mentions").then(async (data) => {
       if (!active) return;
       setMentions(data.mentions);
-      await api("/api/mentions/read", { method: "POST", body: json({ through: data.asOf }) });
-      if (active) onRead();
+      const read = await api<{ unreadCount: number }>("/api/mentions/read", {
+        method: "POST",
+        body: json({ through: data.asOf }),
+      });
+      if (active) onRead(read.unreadCount);
+    }).catch(() => {
+      if (active) setError("Mentions could not be loaded. Try again.");
     });
     return () => { active = false; };
   }, [onRead]);
   return (
     <main className="utility-view">
       <p className="eyebrow">Inbox</p><h1>Mentions</h1>
+      {error && <p className="form-error">{error}</p>}
       <div className="mention-inbox">
         {mentions.map((mention) => (
           <button key={mention.page.id} className={mention.unread ? "unread" : ""} onClick={() => onSelect(mention.page.id)}>

@@ -9,6 +9,49 @@ interface EventConnectionAuth {
   __ypsAwarenessIds?: number[];
 }
 
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function validPage(value: unknown) {
+  const page = record(value);
+  if (!page) return false;
+  return typeof page.id === "string" &&
+    typeof page.workspaceId === "string" &&
+    (page.parentId === null || typeof page.parentId === "string") &&
+    (page.kind === "document" || page.kind === "table") &&
+    typeof page.position === "string" &&
+    typeof page.title === "string" &&
+    (page.icon === null || typeof page.icon === "string") &&
+    typeof page.revision === "number" &&
+    typeof page.contentEpoch === "number" &&
+    (page.archivedAt === null || typeof page.archivedAt === "number") &&
+    typeof page.createdAt === "number" &&
+    typeof page.updatedAt === "number";
+}
+
+function workspaceEvent(value: unknown): WorkspaceEvent | null {
+  const event = record(value);
+  if (!event) return null;
+  if (event.type === "pages-upserted" && Array.isArray(event.pages) && event.pages.every(validPage)) {
+    return event as WorkspaceEvent;
+  }
+  if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
+    return event as WorkspaceEvent;
+  }
+  if (event.type === "projection-updated" && typeof event.pageId === "string" &&
+    stringList(event.backlinkTargetIds) && stringList(event.mentionTargetUserIds)) {
+    return event as WorkspaceEvent;
+  }
+  return null;
+}
+
 export class WorkspaceEvents extends YServer {
   static options = { hibernate: true };
 
@@ -64,8 +107,15 @@ export class WorkspaceEvents extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method !== "POST") return new Response("Not found", { status: 404 });
-    const event = await request.text();
-    this.broadcastCustomMessage(event);
+    let value: unknown;
+    try {
+      value = await request.json();
+    } catch {
+      return Response.json({ error: "Invalid workspace event." }, { status: 400 });
+    }
+    const event = workspaceEvent(value);
+    if (!event) return Response.json({ error: "Invalid workspace event." }, { status: 400 });
+    this.broadcastCustomMessage(JSON.stringify(event));
     return Response.json({ delivered: true });
   }
 

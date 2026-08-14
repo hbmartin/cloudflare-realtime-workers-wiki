@@ -56,4 +56,4 @@ Permanent deletion removes page metadata and commits a D1 cleanup job before ret
 - Verify backlinks, mention inbox counts/read cursors, and page previews for an authorized member.
 - Open version history and restore a disposable page.
 - Acquire, renew, release, expire, and force-release a table lease.
-- Confirm no due deletion jobs remain and sample deleted page prefixes in R2.
+- Confirm `deletion_jobs` is empty, no `deletion_targets` rows have `completed_at IS NULL`, and deleted page prefixes are empty in R2.

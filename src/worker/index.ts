@@ -23,6 +23,7 @@ import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 
 const app = new Hono<{ Bindings: Env }>();
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const DELETION_TARGET_BATCH_SIZE = 50;
 const UNSAFE_MIME_TYPES = new Set([
   "text/html",
   "image/svg+xml",
@@ -43,6 +44,7 @@ type PageRow = {
   icon: string | null;
   revision: number;
   content_epoch: number;
+  plain_text: string;
   archived_at: number | null;
   created_at: number;
   updated_at: number;
@@ -468,11 +470,11 @@ app.post("/api/pages/:id/restore", async (c) => {
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
       SELECT id FROM subtree
     )`,
-  ).bind(page.id).all<PageRow & { plain_text: string }>();
+  ).bind(page.id).all<PageRow>();
   await c.env.DB.batch(restored.results.flatMap((item) => [
     c.env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(item.id),
     c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, ?)`)
-      .bind(item.id, item.workspace_id, item.title, item.plain_text),
+      .bind(item.id, item.workspace_id, item.title, item.plain_text ?? ""),
   ]));
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-upserted",
@@ -511,24 +513,42 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   for (const attachment of attachments.results) {
     targets.set(`r2_object:${attachment.r2_key}`, { kind: "r2_object", target: attachment.r2_key });
   }
-  await c.env.DB.batch([
-    c.env.DB.prepare(
+  const targetValues = [...targets.values()];
+  try {
+    await c.env.DB.prepare(
       `INSERT INTO deletion_jobs
         (id, workspace_id, root_page_id, next_attempt_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
-    ).bind(jobId, member.workspace.id, page.id, timestamp, timestamp, timestamp),
-    ...[...targets.values()].map((target) => c.env.DB.prepare(
-      `INSERT INTO deletion_targets (job_id, kind, target) VALUES (?, ?, ?)`,
-    ).bind(jobId, target.kind, target.target)),
-    c.env.DB.prepare(
-      `DELETE FROM page_search WHERE page_id IN (
-         WITH RECURSIVE subtree(id) AS (
-           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-         ) SELECT id FROM subtree
-       )`,
-    ).bind(page.id),
-    c.env.DB.prepare(`DELETE FROM pages WHERE id = ? AND workspace_id = ?`).bind(page.id, member.workspace.id),
-  ]);
+    ).bind(jobId, member.workspace.id, page.id, Number.MAX_SAFE_INTEGER, timestamp, timestamp).run();
+    for (let index = 0; index < targetValues.length; index += DELETION_TARGET_BATCH_SIZE) {
+      await c.env.DB.batch(targetValues.slice(index, index + DELETION_TARGET_BATCH_SIZE).map((target) => (
+        c.env.DB.prepare(
+          `INSERT INTO deletion_targets (job_id, kind, target) VALUES (?, ?, ?)`,
+        ).bind(jobId, target.kind, target.target)
+      )));
+    }
+    const results = await c.env.DB.batch([
+      c.env.DB.prepare(
+        `UPDATE deletion_jobs SET next_attempt_at = ?, updated_at = ? WHERE id = ?`,
+      ).bind(timestamp, timestamp, jobId),
+      c.env.DB.prepare(
+        `DELETE FROM page_search WHERE page_id IN (
+           WITH RECURSIVE subtree(id) AS (
+             SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+           ) SELECT id FROM subtree
+         )`,
+      ).bind(page.id),
+      c.env.DB.prepare(`DELETE FROM pages WHERE id = ? AND workspace_id = ?`).bind(page.id, member.workspace.id),
+    ]);
+    if (!results[2]?.meta.changes) throw new Error("Page metadata changed during permanent deletion.");
+  } catch (error) {
+    try {
+      await c.env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ?`).bind(jobId).run();
+    } catch (cleanupError) {
+      console.error("Failed to discard staged deletion job", cleanupError);
+    }
+    throw error;
+  }
   const pageIds = subtree.results.map((item) => item.id);
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: true });
   c.executionCtx.waitUntil(processDeletionJob(c.env, jobId).catch((error) => {
@@ -594,9 +614,9 @@ app.get("/api/pages/:id/preview", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const row = await c.env.DB.prepare(
     `SELECT * FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
-  ).bind(c.req.param("id"), member.workspace.id).first<PageRow & { plain_text: string }>();
+  ).bind(c.req.param("id"), member.workspace.id).first<PageRow>();
   if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
-  return c.json({ preview: { page: pageJson(row), excerpt: row.plain_text.slice(0, 280) } });
+  return c.json({ preview: { page: pageJson(row), excerpt: (row.plain_text ?? "").slice(0, 280) } });
 });
 
 app.get("/api/pages/:id/backlinks", async (c) => {
@@ -663,7 +683,16 @@ app.post("/api/mentions/read", async (c) => {
     `INSERT INTO mention_reads (workspace_id, user_id, read_at) VALUES (?, ?, ?)
       ON CONFLICT(workspace_id, user_id) DO UPDATE SET read_at = MAX(read_at, excluded.read_at)`,
   ).bind(member.workspace.id, member.user.id, through).run();
-  return c.json({ unreadCount: 0 });
+  const unread = await c.env.DB.prepare(
+    `SELECT COUNT(DISTINCT mention.source_page_id) count
+       FROM member_mentions mention
+       JOIN pages source ON source.id = mention.source_page_id AND source.archived_at IS NULL
+       LEFT JOIN mention_reads reads
+         ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
+      WHERE mention.workspace_id = ? AND mention.target_user_id = ?
+        AND mention.first_seen_at > COALESCE(reads.read_at, 0)`,
+  ).bind(member.workspace.id, member.user.id).first<{ count: number }>();
+  return c.json({ unreadCount: unread?.count ?? 0 });
 });
 
 app.get("/api/pages/:id/attachments", async (c) => {
@@ -730,16 +759,17 @@ app.get("/api/attachments/:id", async (c) => {
   headers.set("content-disposition", attachmentDisposition(attachment.name, isInlineMime(attachment.mime)));
   if (!("body" in object)) {
     return new Response(null, {
-      status: c.req.header("if-none-match") ? 304 : 412,
+      status: c.req.header("if-match") ? 412 : c.req.header("if-none-match") ? 304 : 412,
       headers,
     });
   }
-  if (rangeRequested && object.range) {
-    const range = normalizeR2Range(object.range, attachment.size);
-    headers.set("content-range", `bytes ${range.offset}-${range.offset + range.length - 1}/${attachment.size}`);
+  const range = rangeRequested && object.range ? normalizeR2Range(object.range, object.size) : null;
+  if (range && range.length > 0) {
+    headers.set("content-range", `bytes ${range.offset}-${range.offset + range.length - 1}/${object.size}`);
     headers.set("content-length", String(range.length));
+    return new Response(object.body, { status: 206, headers });
   }
-  return new Response(object.body, { status: rangeRequested ? 206 : 200, headers });
+  return new Response(object.body, { status: 200, headers });
 });
 
 app.delete("/api/attachments/:id", async (c) => {
@@ -1179,7 +1209,9 @@ export default {
     return app.fetch(request, env, context);
   },
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext) {
-    context.waitUntil(processDueDeletionJobs(env));
+    context.waitUntil(processDueDeletionJobs(env).catch((error) => {
+      console.error("Scheduled deletion cleanup failed", error);
+    }));
   },
 };
 
