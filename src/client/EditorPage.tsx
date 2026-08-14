@@ -36,12 +36,13 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
   });
   const [recoveryPreview, setRecoveryPreview] = useState("");
   const [title, setTitle] = useState(page.title);
+  const titleRef = useRef<HTMLInputElement>(null);
   const editable = member.role !== "viewer" && !sizeWarning?.readOnly;
   const commentsVisible = editable && commentsOpen;
 
   useEffect(() => {
-    setTitle(page.title);
-  }, [page.id, page.title]);
+    if (document.activeElement !== titleRef.current) setTitle(page.title);
+  }, [page.id]);
 
   useEffect(() => {
     setSizeWarning(null);
@@ -135,6 +136,7 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
       <div className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}>
         <article className="document-paper">
           <input
+            ref={titleRef}
             className="page-title"
             value={title}
             onChange={(event) => setTitle(event.target.value)}

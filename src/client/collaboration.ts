@@ -31,6 +31,7 @@ export function createCollaboration(
   });
   let hiddenTimer: number | undefined;
   let destroyed = false;
+  let indexeddbSynced = false;
   let hasUnsyncedChanges = false;
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
@@ -46,6 +47,7 @@ export function createCollaboration(
       // Until the server sync completes, conservatively treat a persisted copy
       // as recoverable offline work. An epoch rejection happens before sync.
       hasUnsyncedChanges = Y.encodeStateVector(doc).byteLength > 1;
+      indexeddbSynced = true;
       provider.connect();
     }
   });
@@ -55,7 +57,7 @@ export function createCollaboration(
       hiddenTimer = window.setTimeout(() => provider.disconnect(), 30_000);
     } else {
       if (hiddenTimer) window.clearTimeout(hiddenTimer);
-      provider.connect();
+      if (indexeddbSynced) provider.connect();
     }
   };
   document.addEventListener("visibilitychange", visibility);

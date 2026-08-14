@@ -23,6 +23,7 @@ import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 
 const app = new Hono<{ Bindings: Env }>();
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const ARCHIVE_DISCONNECT_BATCH_SIZE = 25;
 const DELETION_TARGET_BATCH_SIZE = 50;
 const UNSAFE_MIME_TYPES = new Set([
   "text/html",
@@ -32,7 +33,9 @@ const UNSAFE_MIME_TYPES = new Set([
   "application/x-javascript",
   "text/javascript",
 ]);
-const UNSAFE_FILE_EXTENSIONS = new Set([".html", ".htm", ".svg", ".js", ".mjs", ".cjs"]);
+const UNSAFE_FILE_EXTENSIONS = new Set([
+  ".html", ".htm", ".htx", ".xhtml", ".xht", ".svg", ".svgz", ".xml", ".js", ".jse", ".mjs", ".cjs",
+]);
 
 type PageRow = {
   id: string;
@@ -434,18 +437,32 @@ app.delete("/api/pages/:id", async (c) => {
      ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
   ).bind(page.id).all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
   const hint = locationHint(member.workspace.locationHint ?? undefined);
-  const archiveResponses = await Promise.all(archived.results
-    .filter((item) => item.kind === "document")
-    .map(async (item) => {
-      const room = `${item.id}~${item.content_epoch}`;
-      const stub = c.env.DOCUMENT.getByName(room, hint ? { locationHint: hint } : undefined);
-      return stub.fetch(new Request("https://document.internal/archive", {
-        method: "POST",
-        headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET },
-      }));
+  const documents = archived.results.filter((item) => item.kind === "document");
+  const pendingPageIds: string[] = [];
+  for (let offset = 0; offset < documents.length; offset += ARCHIVE_DISCONNECT_BATCH_SIZE) {
+    const batch = documents.slice(offset, offset + ARCHIVE_DISCONNECT_BATCH_SIZE);
+    const pending = await Promise.all(batch.map(async (item) => {
+      try {
+        const room = `${item.id}~${item.content_epoch}`;
+        const stub = c.env.DOCUMENT.getByName(room, hint ? { locationHint: hint } : undefined);
+        const response = await stub.fetch(new Request("https://document.internal/archive", {
+          method: "POST",
+          headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET },
+        }));
+        return response.ok ? null : item.id;
+      } catch {
+        return item.id;
+      }
     }));
-  if (archiveResponses.some((response) => !response.ok)) {
-    throw new HttpError(503, "archive_incomplete", "The page was archived, but an active editor could not be disconnected. Retry the archive.");
+    pendingPageIds.push(...pending.filter((pageId): pageId is string => pageId !== null));
+  }
+  if (pendingPageIds.length) {
+    throw new HttpError(
+      503,
+      "archive_incomplete",
+      "The page was archived, but an active editor could not be disconnected. Retry the archive.",
+      { pendingPageIds },
+    );
   }
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
@@ -835,7 +852,8 @@ app.post("/api/pages/:id/restore-version", async (c) => {
     },
     body: JSON.stringify({ versionId, userId: member.user.id }),
   }));
-  const result = await response.json<{ pageId?: string; contentEpoch?: number; error?: string }>();
+  type RestoreResult = { pageId?: string; contentEpoch?: number; error?: string };
+  const result: RestoreResult = await response.json<RestoreResult>().catch(() => ({}));
   if (!response.ok || !result.contentEpoch) {
     if (response.status === 404) throw new HttpError(404, "version_not_found", result.error ?? "Version not found.");
     if (response.status === 409) throw new HttpError(409, "stale_epoch", result.error ?? "The page epoch changed during restore.");

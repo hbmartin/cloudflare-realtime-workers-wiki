@@ -406,12 +406,15 @@ describe("Worker integration", () => {
           return Reflect.get(target, property, receiver);
         },
       });
-      const failed = await document.restoreVersion(version!.id, installed.userId);
-      document.bindings = originalBindings;
-      expect(failed.status).toBe(503);
-      expect(state.storage.sql.exec<{ retired: number }>(
-        `SELECT retired FROM document_meta WHERE id = 1`,
-      ).one().retired).toBe(0);
+      try {
+        const failed = await document.restoreVersion(version!.id, installed.userId);
+        expect(failed.status).toBe(503);
+        expect(state.storage.sql.exec<{ retired: number }>(
+          `SELECT retired FROM document_meta WHERE id = 1`,
+        ).one().retired).toBe(0);
+      } finally {
+        document.bindings = originalBindings;
+      }
     });
     expect((await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ?`)
       .bind(installed.pageId).first<{ content_epoch: number }>())?.content_epoch).toBe(1);
