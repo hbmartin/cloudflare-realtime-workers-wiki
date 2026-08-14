@@ -2,16 +2,24 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { MemberContext } from "../worker/env";
 import type { ColumnType, Page, TableColumn, TableData, TableRow } from "../shared/types";
 import { ApiClientError, api, json } from "./api";
+import { BacklinksPanel } from "./BacklinksPanel";
 
-type Props = { page: Page; member: MemberContext; onPageChanged: (page: Page) => void };
+type Props = {
+  page: Page;
+  member: MemberContext;
+  onPageChanged: (page: Page) => void;
+  onSelectPage: (pageId: string) => void;
+  backlinksRevision: number;
+};
 
-export function TablePage({ page, member, onPageChanged }: Props) {
+export function TablePage({ page, member, onPageChanged, onSelectPage, backlinksRevision }: Props) {
   const [table, setTable] = useState<TableData | null>(null);
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [sortColumn, setSortColumn] = useState<string | null>(null);
   const [title, setTitle] = useState(page.title);
+  const [backlinksOpen, setBacklinksOpen] = useState(false);
   const canEdit = member.role !== "viewer";
 
   const load = useCallback(async () => {
@@ -172,6 +180,7 @@ export function TablePage({ page, member, onPageChanged }: Props) {
             await acquire();
           }}>Force unlock</button>
         )}
+        <button className="quiet-button" onClick={() => setBacklinksOpen((open) => !open)}>Backlinks</button>
       </div>
       {error && <div className="notice">{error}</div>}
       <article className="table-paper">
@@ -229,6 +238,7 @@ export function TablePage({ page, member, onPageChanged }: Props) {
           </div>
         )}
       </article>
+      {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
     </main>
   );
 }

@@ -1,8 +1,11 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
+import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
+import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { joinBytes, splitBytes } from "../shared/bytes";
 import type { Env } from "./env";
+import { broadcastWorkspaceEvent } from "./workspace-events";
 
 const COMPACTION_DELAY_MS = 30_000;
 const VERSION_INTERVAL_MS = 15 * 60_000;
@@ -26,12 +29,21 @@ interface MetaRow extends Record<string, SqlStorageValue> {
   last_editor_id: string | null;
 }
 
+interface PageProjectionRow {
+  workspace_id: string;
+  title: string;
+}
+
 export class Document extends YServer {
   static options = { hibernate: true };
   static callbackOptions = { debounceWait: 1_000, debounceMaxWait: 5_000 };
 
   private readonly state: DurableObjectState;
   private readonly bindings: Env;
+  private metadata!: MetaRow;
+  private pendingUpdates: Uint8Array[] = [];
+  private pendingAuthorId: string | null = null;
+  private purged = false;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -72,24 +84,24 @@ export class Document extends YServer {
       PRIMARY KEY (seq, chunk_index)
     )`);
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_update_chunks_seq ON update_chunks(seq, chunk_index)`);
+    this.metadata = sql.exec<MetaRow>(`SELECT * FROM document_meta WHERE id = 1`).one();
 
     await super.onStart();
     this.document.on("update", (update: Uint8Array, origin: unknown) => {
-      this.recordUpdate(update, origin as Connection<ConnectionAuth> | null);
+      this.bufferUpdate(update, origin as Connection<ConnectionAuth> | null);
     });
   }
 
   async onLoad() {
     const { pageId, epoch } = this.ids;
     const doc = new Y.Doc();
-    const meta = this.meta();
     const snapshot = await this.bindings.BUCKET.get(this.snapshotKey(pageId, epoch));
     if (snapshot) Y.applyUpdate(doc, new Uint8Array(await snapshot.arrayBuffer()));
 
     const events = this.state.storage.sql
       .exec<{ seq: number }>(
         `SELECT seq FROM update_events WHERE seq > ? ORDER BY seq`,
-        meta.snapshot_seq,
+        this.metadata.snapshot_seq,
       )
       .toArray();
     for (const event of events) {
@@ -104,7 +116,7 @@ export class Document extends YServer {
     return doc;
   }
 
-  onConnect(connection: Connection<ConnectionAuth>, context: ConnectionContext) {
+  async onConnect(connection: Connection<ConnectionAuth>, context: ConnectionContext) {
     const connections = Array.from(this.getConnections());
     if (connections.length > 30) {
       connection.close(4429, "This page already has 30 collaborators.");
@@ -119,15 +131,14 @@ export class Document extends YServer {
       return;
     }
     connection.setState({ userId, role, expiresAt });
-    this.scheduleAlarm(expiresAt);
-    return super.onConnect(connection, context);
+    await this.scheduleAlarm(expiresAt);
+    await super.onConnect(connection, context);
   }
 
   isReadOnly(connection: Connection<ConnectionAuth>) {
-    const meta = this.meta();
     return Boolean(
-      meta.retired ||
-        meta.read_only ||
+      this.metadata.retired ||
+        this.metadata.read_only ||
         connection.state?.role === "viewer" ||
         !connection.state ||
         connection.state.expiresAt <= Date.now(),
@@ -140,7 +151,7 @@ export class Document extends YServer {
       connection.close(4401, "Authorization expired. Reconnect to continue.");
       return;
     }
-    if (this.meta().retired) {
+    if (this.metadata.retired || this.purged) {
       connection.close(4410, "This document version has been retired.");
       return;
     }
@@ -148,23 +159,27 @@ export class Document extends YServer {
   }
 
   async onSave() {
-    await this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS);
+    if (this.purged) return;
+    this.flushPendingUpdates();
+    if (this.metadata.dirty) await this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS);
   }
 
   async onAlarm() {
+    if (this.purged) return;
+    this.flushPendingUpdates();
     const time = Date.now();
     for (const connection of this.getConnections<ConnectionAuth>()) {
       if (!connection.state || connection.state.expiresAt <= time) {
         connection.close(4401, "Authorization expired. Reconnect to continue.");
       }
     }
-    if (this.meta().dirty) await this.compact();
+    if (this.metadata.dirty) await this.compact();
 
     const nextExpiry = Array.from(this.getConnections<ConnectionAuth>())
       .map((connection) => connection.state?.expiresAt ?? 0)
       .filter((expiry) => expiry > Date.now())
-      .sort((a, b) => a - b)[0];
-    if (nextExpiry) await this.state.storage.setAlarm(nextExpiry);
+      .sort((left, right) => left - right)[0];
+    if (nextExpiry) await this.scheduleAlarm(nextExpiry);
   }
 
   async onRequest(request: Request) {
@@ -173,23 +188,42 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "POST" && url.pathname.endsWith("/retire")) {
+      this.flushPendingUpdates();
+      this.metadata.retired = 1;
       this.state.storage.sql.exec(`UPDATE document_meta SET retired = 1 WHERE id = 1`);
-      if (this.meta().dirty) await this.compact(true);
+      if (this.metadata.dirty) await this.compact(true);
       for (const connection of this.getConnections()) {
         connection.close(4410, "A restored version replaced this document.");
       }
       return Response.json({ retired: true });
     }
+    if (request.method === "POST" && url.pathname.endsWith("/purge")) {
+      this.purged = true;
+      this.metadata.retired = 1;
+      this.pendingUpdates = [];
+      this.pendingAuthorId = null;
+      for (const connection of this.getConnections()) {
+        connection.close(4411, "This page was permanently deleted.");
+      }
+      await this.state.storage.deleteAll();
+      return Response.json({ purged: true });
+    }
     return new Response("Not found", { status: 404 });
   }
 
-  private meta() {
-    return this.state.storage.sql.exec<MetaRow>(`SELECT * FROM document_meta WHERE id = 1`).one();
+  private bufferUpdate(update: Uint8Array, origin: Connection<ConnectionAuth> | null) {
+    if (this.metadata.retired || this.purged) return;
+    this.pendingUpdates.push(update);
+    this.pendingAuthorId = origin?.state?.userId ?? this.pendingAuthorId;
   }
 
-  private recordUpdate(update: Uint8Array, origin: Connection<ConnectionAuth> | null) {
-    if (this.meta().retired) return;
-    const authorId = origin?.state?.userId ?? null;
+  private flushPendingUpdates() {
+    if (!this.pendingUpdates.length || this.purged) return;
+    const updates = this.pendingUpdates;
+    const authorId = this.pendingAuthorId;
+    this.pendingUpdates = [];
+    this.pendingAuthorId = null;
+    const merged = updates.length === 1 ? updates[0] : Y.mergeUpdates(updates);
     this.state.storage.transactionSync(() => {
       const row = this.state.storage.sql
         .exec<{ seq: number }>(
@@ -198,7 +232,7 @@ export class Document extends YServer {
           Date.now(),
         )
         .one();
-      for (const [index, bytes] of splitBytes(update).entries()) {
+      for (const [index, bytes] of splitBytes(merged).entries()) {
         this.state.storage.sql.exec(
           `INSERT INTO update_chunks (seq, chunk_index, data) VALUES (?, ?, ?)`,
           row.seq,
@@ -211,83 +245,216 @@ export class Document extends YServer {
         authorId,
       );
     });
-    this.state.waitUntil(this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS));
+    this.metadata.dirty = 1;
+    if (authorId) this.metadata.last_editor_id = authorId;
   }
 
   private async compact(forceVersion = false) {
+    this.flushPendingUpdates();
     const { pageId, epoch } = this.ids;
-    const meta = this.meta();
     const maximum = this.state.storage.sql
       .exec<{ seq: number | null }>(`SELECT MAX(seq) seq FROM update_events`)
       .one().seq;
-    if (!maximum) return;
+    if (maximum === null) {
+      this.metadata.dirty = 0;
+      this.state.storage.sql.exec(`UPDATE document_meta SET dirty = 0 WHERE id = 1`);
+      return;
+    }
 
+    const metadataAtStart = { ...this.metadata };
     const snapshot = Y.encodeStateAsUpdate(this.document);
+    const json = yXmlFragmentToProsemirrorJSON(
+      this.document.getXmlFragment("document-store"),
+    ) as ProseMirrorJson;
+    const projection = projectDocument(json);
+    const readOnly = snapshot.byteLength >= READ_ONLY_BYTES;
     if (snapshot.byteLength >= WARN_BYTES) {
       this.broadcastCustomMessage(JSON.stringify({
         type: "document-size",
         bytes: snapshot.byteLength,
-        readOnly: snapshot.byteLength >= READ_ONLY_BYTES,
+        readOnly,
       }));
     }
-    if (snapshot.byteLength >= READ_ONLY_BYTES) {
-      this.state.storage.sql.exec(`UPDATE document_meta SET read_only = 1 WHERE id = 1`);
-    }
 
-    await this.bindings.BUCKET.put(this.snapshotKey(pageId, epoch), snapshot, {
-      httpMetadata: { contentType: "application/octet-stream" },
-      customMetadata: { pageId, epoch: String(epoch), sequence: String(maximum) },
-    });
-
-    const page = await this.bindings.DB.prepare(
-      `SELECT workspace_id, title FROM pages WHERE id = ? AND content_epoch = ?`,
-    ).bind(pageId, epoch).first<{ workspace_id: string; title: string }>();
-    const body = this.plainText();
-    const makeVersion = Boolean(page && (forceVersion || !meta.last_version_at || Date.now() - meta.last_version_at >= VERSION_INTERVAL_MS));
-    let versionAt = meta.last_version_at;
-
-    if (page) {
-      const statements = [
-        this.bindings.DB.prepare(
-          `UPDATE pages SET plain_text = ?, indexed_seq = ?, oversized = ?, updated_at = ?
-            WHERE id = ? AND content_epoch = ?`,
-        ).bind(body, maximum, snapshot.byteLength >= READ_ONLY_BYTES ? 1 : 0, Date.now(), pageId, epoch),
-        this.bindings.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(pageId),
-        this.bindings.DB.prepare(
-          `INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, ?)`,
-        ).bind(pageId, page.workspace_id, page.title, body),
-      ];
-      if (makeVersion) {
-        const id = crypto.randomUUID();
-        const key = `documents/${pageId}/versions/${id}.bin`;
-        await this.bindings.BUCKET.put(key, snapshot, {
-          httpMetadata: { contentType: "application/octet-stream" },
-          customMetadata: { pageId, epoch: String(epoch), sequence: String(maximum) },
-        });
-        versionAt = Date.now();
-        statements.push(this.bindings.DB.prepare(
-          `INSERT INTO page_versions
-            (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).bind(id, pageId, epoch, maximum, page.title, key, snapshot.byteLength, meta.last_editor_id, versionAt));
-      }
-      await this.bindings.DB.batch(statements);
-      if (makeVersion) await this.pruneVersions(pageId);
-    }
-
-    // R2 was durable before the log is acknowledged. Replaying duplicate Yjs
-    // updates after a crash between these two steps is safe.
     this.state.storage.transactionSync(() => {
-      this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
-      this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
       this.state.storage.sql.exec(
-        `UPDATE document_meta
-            SET snapshot_seq = ?, dirty = 0, last_version_at = ?
-          WHERE id = 1`,
-        maximum,
-        versionAt,
+        `UPDATE document_meta SET dirty = 0, read_only = CASE WHEN ? THEN 1 ELSE read_only END WHERE id = 1`,
+        readOnly ? 1 : 0,
       );
     });
+    this.metadata.dirty = 0;
+    if (readOnly) this.metadata.read_only = 1;
+
+    try {
+      await this.bindings.BUCKET.put(this.snapshotKey(pageId, epoch), snapshot, {
+        httpMetadata: { contentType: "application/octet-stream" },
+        customMetadata: { pageId, epoch: String(epoch), sequence: String(maximum) },
+      });
+
+      const page = await this.bindings.DB.prepare(
+        `SELECT workspace_id, title FROM pages WHERE id = ? AND content_epoch = ?`,
+      ).bind(pageId, epoch).first<PageProjectionRow>();
+      let versionAt = metadataAtStart.last_version_at;
+      let versionKey: string | null = null;
+      let versionStatementIndex = -1;
+      let pageProjected = false;
+
+      if (page) {
+        const [oldPageTargets, oldUserTargets] = await Promise.all([
+          this.bindings.DB.prepare(
+            `SELECT target_page_id id FROM page_references WHERE source_page_id = ?`,
+          ).bind(pageId).all<{ id: string }>(),
+          this.bindings.DB.prepare(
+            `SELECT target_user_id id FROM member_mentions WHERE source_page_id = ?`,
+          ).bind(pageId).all<{ id: string }>(),
+        ]);
+        const timestamp = Date.now();
+        const makeVersion = Boolean(
+          forceVersion || !metadataAtStart.last_version_at ||
+          timestamp - metadataAtStart.last_version_at >= VERSION_INTERVAL_MS,
+        );
+        const statements = [
+          this.bindings.DB.prepare(
+            `UPDATE pages SET plain_text = ?, indexed_seq = ?, oversized = ?, updated_at = ?
+              WHERE id = ? AND content_epoch = ?`,
+          ).bind(projection.plainText, maximum, readOnly ? 1 : 0, timestamp, pageId, epoch),
+          this.bindings.DB.prepare(
+            `DELETE FROM page_search WHERE page_id = ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, pageId, epoch),
+          this.bindings.DB.prepare(
+            `INSERT INTO page_search (page_id, workspace_id, title, body)
+              SELECT id, workspace_id, title, ? FROM pages WHERE id = ? AND content_epoch = ?`,
+          ).bind(projection.plainText, pageId, epoch),
+          this.bindings.DB.prepare(
+            `UPDATE page_references SET projection_seq = -1 WHERE source_page_id = ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, pageId, epoch),
+          this.bindings.DB.prepare(
+            `INSERT INTO page_references (source_page_id, target_page_id, excerpt, projection_seq)
+              SELECT ?, target.id, json_extract(item.value, '$.excerpt'), ?
+                FROM json_each(?) item
+                JOIN pages target ON target.id = json_extract(item.value, '$.targetId')
+               WHERE target.workspace_id = ? AND target.archived_at IS NULL AND target.id <> ?
+                 AND EXISTS (SELECT 1 FROM pages source WHERE source.id = ? AND source.content_epoch = ?)
+              ON CONFLICT(source_page_id, target_page_id) DO UPDATE SET
+                excerpt = excluded.excerpt, projection_seq = excluded.projection_seq`,
+          ).bind(pageId, maximum, JSON.stringify(projection.pageReferences), page.workspace_id, pageId, pageId, epoch),
+          this.bindings.DB.prepare(
+            `DELETE FROM page_references WHERE source_page_id = ? AND projection_seq <> ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, maximum, pageId, epoch),
+          this.bindings.DB.prepare(
+            `UPDATE member_mentions SET projection_seq = -1 WHERE source_page_id = ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, pageId, epoch),
+          this.bindings.DB.prepare(
+            `INSERT INTO member_mentions
+              (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, projection_seq)
+              SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?, ?
+                FROM json_each(?) item
+                JOIN workspace_members member
+                  ON member.workspace_id = ? AND member.user_id = json_extract(item.value, '$.targetId')
+               WHERE EXISTS (SELECT 1 FROM pages source WHERE source.id = ? AND source.content_epoch = ?)
+              ON CONFLICT(source_page_id, target_user_id) DO UPDATE SET
+                excerpt = excluded.excerpt, projection_seq = excluded.projection_seq`,
+          ).bind(page.workspace_id, pageId, timestamp, maximum, JSON.stringify(projection.memberMentions), page.workspace_id, pageId, epoch),
+          this.bindings.DB.prepare(
+            `DELETE FROM member_mentions WHERE source_page_id = ? AND projection_seq <> ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, maximum, pageId, epoch),
+        ];
+        const currentPageTargetsIndex = statements.length;
+        statements.push(this.bindings.DB.prepare(
+          `SELECT target_page_id id FROM page_references
+            WHERE source_page_id = ? AND projection_seq = ?`,
+        ).bind(pageId, maximum));
+        const currentUserTargetsIndex = statements.length;
+        statements.push(this.bindings.DB.prepare(
+          `SELECT target_user_id id FROM member_mentions
+            WHERE source_page_id = ? AND projection_seq = ?`,
+        ).bind(pageId, maximum));
+
+        if (makeVersion) {
+          const versionId = crypto.randomUUID();
+          versionKey = `documents/${pageId}/versions/${versionId}.bin`;
+          await this.bindings.BUCKET.put(versionKey, snapshot, {
+            httpMetadata: { contentType: "application/octet-stream" },
+            customMetadata: { pageId, epoch: String(epoch), sequence: String(maximum) },
+          });
+          versionAt = timestamp;
+          versionStatementIndex = statements.length;
+          statements.push(this.bindings.DB.prepare(
+            `INSERT INTO page_versions
+              (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
+              SELECT ?, id, ?, ?, ?, ?, ?, ?, ? FROM pages WHERE id = ? AND content_epoch = ?`,
+          ).bind(
+            versionId,
+            epoch,
+            maximum,
+            page.title,
+            versionKey,
+            snapshot.byteLength,
+            metadataAtStart.last_editor_id,
+            versionAt,
+            pageId,
+            epoch,
+          ));
+        }
+
+        const results = await this.bindings.DB.batch(statements);
+        pageProjected = Boolean(results[0]?.meta.changes);
+        if (versionStatementIndex >= 0 && !results[versionStatementIndex]?.meta.changes && versionKey) {
+          await this.bindings.BUCKET.delete(versionKey);
+          versionKey = null;
+          versionAt = metadataAtStart.last_version_at;
+        }
+
+        if (pageProjected) {
+          const currentPageTargets = results[currentPageTargetsIndex]?.results as Array<{ id: string }> ?? [];
+          const currentUserTargets = results[currentUserTargetsIndex]?.results as Array<{ id: string }> ?? [];
+          const backlinkTargetIds = [...new Set([
+            ...oldPageTargets.results.map((row) => row.id),
+            ...currentPageTargets.map((row) => row.id),
+          ])];
+          const mentionTargetUserIds = [...new Set([
+            ...oldUserTargets.results.map((row) => row.id),
+            ...currentUserTargets.map((row) => row.id),
+          ])];
+          this.state.waitUntil(broadcastWorkspaceEvent(this.bindings, page.workspace_id, {
+            type: "projection-updated",
+            pageId,
+            backlinkTargetIds,
+            mentionTargetUserIds,
+          }).catch((error) => console.error("Failed to broadcast projection update", error)));
+        }
+      }
+
+      // R2 was durable before the log is acknowledged. Replaying duplicate Yjs
+      // updates after a crash between these two steps is safe.
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
+        this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
+        this.state.storage.sql.exec(
+          `UPDATE document_meta SET snapshot_seq = ?, last_version_at = ? WHERE id = 1`,
+          maximum,
+          versionAt,
+        );
+      });
+      this.metadata.snapshot_seq = maximum;
+      this.metadata.last_version_at = versionAt;
+
+      if (pageProjected && versionKey) {
+        this.state.waitUntil(this.pruneVersions(pageId).catch((error) => {
+          console.error("Failed to prune document versions", error);
+        }));
+      }
+    } catch (error) {
+      this.metadata.dirty = 1;
+      this.state.storage.sql.exec(`UPDATE document_meta SET dirty = 1 WHERE id = 1`);
+      this.state.waitUntil(this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS));
+      throw error;
+    }
   }
 
   private async pruneVersions(pageId: string) {
@@ -300,16 +467,6 @@ export class Document extends YServer {
       await this.bindings.DB.prepare(`DELETE FROM page_versions WHERE id = ?`).bind(version.id).run();
       await this.bindings.BUCKET.delete(version.r2_key);
     }
-  }
-
-  private plainText() {
-    return this.document
-      .getXmlFragment("document-store")
-      .toString()
-      .replace(/<[^>]*>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 500_000);
   }
 
   private snapshotKey(pageId: string, epoch: number) {

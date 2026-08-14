@@ -2,11 +2,11 @@
 
 The system has three durable data planes:
 
-- D1: accounts, sessions, workspace/page metadata, search projection, attachments, versions, and tables.
+- D1: accounts, sessions, workspace/page metadata, search/reference/mention projections, mention read cursors, deletion jobs, attachments, versions, and tables.
 - R2: current document snapshots, immutable history snapshots, and attachments.
-- Durable Object SQLite: the current post-snapshot Yjs update log and room manifest.
+- Durable Object SQLite: the current post-snapshot Yjs update log and room manifest; workspace event rooms contain no authoritative page state.
 
-Normal document recovery loads the current R2 snapshot and replays ordered Durable Object SQLite chunks. R2 is deliberately never allowed to acknowledge/deletes those chunks after a failed snapshot write.
+Normal document recovery loads the current R2 snapshot and replays ordered Durable Object SQLite chunks. Incoming updates are merged and flushed after a 1–5 second debounce. Compaction clears the dirty flag it owns before external writes, deletes only log sequences captured by that compaction, and re-dirties the room after any failed R2/D1 write.
 
 ## Backup
 
@@ -18,7 +18,7 @@ pnpm wrangler d1 export DB --remote --output backup.sql
 
 Use Cloudflare R2 tooling or an S3-compatible client to copy both `assets/` and `documents/`. Preserve object metadata.
 
-Cloudflare does not expose a bulk user-managed export of each Durable Object’s SQLite database. Therefore an R2 copy can lag active editing by up to the 30-second compaction interval. Durable Object storage itself remains the primary recovery source for that tail. For a maintenance-window backup, stop writes, wait at least one compaction interval, confirm document versions/current objects were updated, then copy R2 and D1.
+Cloudflare does not expose a bulk user-managed export of each Durable Object’s SQLite database. Therefore an R2 copy can lag active editing by up to the 30-second compaction interval. Durable Object storage remains the primary recovery source for its flushed tail. A process crash inside the configured five-second debounce can lose the server’s in-memory copy; connected browsers retain local Yjs state in IndexedDB and resynchronize it. For a maintenance-window backup, stop writes, wait at least one compaction interval, confirm document versions/current objects were updated, then copy R2 and D1.
 
 ## Recovery cases
 
@@ -42,11 +42,18 @@ Do not delete or recreate the Durable Object. Its SQLite update log may still co
 
 Restore the exact `r2_key` from backup. D1 authorization metadata is intentionally separate. If it cannot be recovered, delete the attachment record through the application so users no longer receive a broken link.
 
+### Permanent deletion cleanup is incomplete
+
+Permanent deletion removes page metadata and commits a D1 cleanup job before returning `202`. Each document epoch Durable Object is purged with `storage.deleteAll()` before the job deletes exact attachment keys and complete `documents/{pageId}/` prefixes. Inspect `deletion_jobs` and unfinished `deletion_targets`; the hourly cron retries them idempotently with backoff. Do not remove a job manually unless every target has been independently verified. Pages deleted before this queue existed cannot be enumerated if no D1/R2/operator identifier remains; use operator records to seed targeted cleanup.
+
 ## Recovery validation
 
 - Compare D1 workspace/page/member counts with the source export.
 - Open representative documents from old and recent epochs.
 - Verify current snapshot plus update replay converges in two clients.
 - Download a full attachment and a byte range; compare ETag/size.
+- Revalidate that attachment with `If-None-Match` and require a bodyless `304`.
+- Verify backlinks, mention inbox counts/read cursors, and page previews for an authorized member.
 - Open version history and restore a disposable page.
 - Acquire, renew, release, expire, and force-release a table lease.
+- Confirm no due deletion jobs remain and sample deleted page prefixes in R2.

@@ -28,12 +28,15 @@
   ],
   "durable_objects": {
     "bindings": [
-      { "name": "DOCUMENT", "class_name": "Document" }
+      { "name": "DOCUMENT", "class_name": "Document" },
+      { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["Document"] }
+    { "tag": "v1", "new_sqlite_classes": ["Document"] },
+    { "tag": "v2", "new_sqlite_classes": ["WorkspaceEvents"] }
   ],
+  "triggers": { "crons": ["0 * * * *"] },
   "vars": {
     "BETTER_AUTH_URL": "http://localhost:5173"
   }

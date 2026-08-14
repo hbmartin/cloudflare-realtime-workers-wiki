@@ -53,6 +53,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .sidebar-nav { display: grid; gap: 2px; margin: 8px 0 18px; }
 .sidebar-nav button, .trash-link, .sidebar-footer button { border: 0; background: transparent; text-align: left; border-radius: 7px; padding: 7px 9px; cursor: pointer; font-size: 13px; }
 .sidebar-nav button span { display: inline-block; width: 24px; color: var(--muted); font-size: 18px; vertical-align: -1px; }
+.sidebar-nav .mention-badge { width: auto; min-width: 18px; margin-left: 6px; padding: 1px 5px; border-radius: 999px; background: var(--accent); color: white; font-size: 10px; line-height: 16px; text-align: center; vertical-align: 1px; }
 .sidebar-nav button:hover, .sidebar-nav button.active, .trash-link:hover, .sidebar-footer button:hover { background: #e5e2d9; }
 .sidebar-section-title { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 5px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; font-size: 10px; font-weight: 800; }
 .sidebar-section-title button { border: 0; background: transparent; border-radius: 5px; cursor: pointer; font-size: 16px; }
@@ -99,6 +100,13 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .editor-loading { color: var(--muted); padding: 30px 0; font-size: 14px; }
 .notes-editor { --bn-colors-editor-background: transparent; --bn-colors-editor-text: var(--ink); }
 .notes-editor .bn-editor { padding-inline: 0; min-height: 360px; font-family: Inter, sans-serif; }
+.mention-wrap { position: relative; display: inline; }
+.mention-chip { border: 0; border-radius: 5px; background: var(--accent-soft); color: #44429b; padding: 1px 4px; cursor: default; font: inherit; }
+button.mention-chip { cursor: pointer; }
+button.mention-chip:hover, button.mention-chip:focus-visible { background: #d9d7ff; }
+.mention-preview { position: absolute; z-index: 30; left: 0; top: calc(100% + 6px); width: min(320px, 75vw); border: 1px solid var(--line); border-radius: 9px; background: white; padding: 13px; box-shadow: 0 12px 36px #25231f24; color: var(--ink); text-align: left; white-space: normal; }
+.mention-preview strong { display: block; margin-bottom: 5px; }
+.mention-preview > span { display: block; color: var(--muted); font-size: 12px; line-height: 1.45; }
 .notice { background: #fff7d7; color: #675515; border: 1px solid #ead98c; border-radius: 8px; padding: 10px 13px; font-size: 12px; margin: 8px 0 12px; }
 .notice-danger { background: #fff0ed; border-color: #e9b8b0; color: #84382f; }
 .recovery-notice { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
@@ -113,6 +121,11 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .muted { color: var(--muted); font-size: 13px; }
 .history-panel { right: 0; }
 .attachments-panel { right: 0; }
+.backlink-list, .mention-inbox { display: grid; gap: 5px; margin-top: 14px; }
+.backlink-list button, .mention-inbox button { display: grid; gap: 5px; width: 100%; border: 0; border-radius: 7px; background: transparent; padding: 9px; cursor: pointer; text-align: left; }
+.backlink-list button:hover, .mention-inbox button:hover { background: #f0eee7; }
+.backlink-list span, .mention-inbox span { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.mention-inbox small { color: var(--muted); font-size: 10px; }
 .attachment-list { display: grid; gap: 5px; margin-top: 15px; }
 .attachment-list > div { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; border-bottom: 1px solid var(--line); padding: 8px 2px; }
 .attachment-list a { color: var(--ink); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
@@ -127,7 +140,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .diff-columns { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
 .diff-columns pre { white-space: pre-wrap; font: 9px/1.4 Inter, sans-serif; background: #f7f5ef; border-radius: 4px; padding: 6px; max-height: 120px; overflow: auto; }
 
-.table-canvas { max-width: 1400px; }
+.table-canvas { position: relative; max-width: 1400px; }
+.table-canvas > .side-panel { right: 44px; top: 60px; z-index: 10; }
 .table-paper { padding-inline: clamp(24px, 5vw, 70px); }
 .table-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .table-toolbar input { border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; min-width: 230px; }
@@ -174,7 +188,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 
 @media (max-width: 1050px) {
   .document-layout.with-panel .document-paper { margin-right: 0; }
-  .document-layout.with-panel .side-panel { position: fixed; z-index: 20; top: 62px; right: 18px; bottom: 18px; max-height: none; }
+  .document-layout.with-panel .side-panel, .table-canvas > .side-panel { position: fixed; z-index: 20; top: 62px; right: 18px; bottom: 18px; max-height: none; }
 }
 
 @media (max-width: 760px) {
@@ -195,6 +209,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   .document-paper, .table-paper { padding: 46px 25px 70px; min-height: calc(100vh - 120px); border-inline: 0; }
   .page-title { font-size: 38px; }
   .utility-view { padding: 50px 22px; }
-  .side-panel, .document-layout.with-panel .side-panel { position: fixed; inset: 58px 8px 8px; width: auto; max-height: none; z-index: 20; }
+  .side-panel, .document-layout.with-panel .side-panel, .table-canvas > .side-panel { position: fixed; inset: 58px 8px 8px; width: auto; max-height: none; z-index: 20; }
   .invite-card { align-items: flex-start; flex-wrap: wrap; }.invite-card > div { width: 100%; }
 }

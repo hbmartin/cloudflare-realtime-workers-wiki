@@ -1,12 +1,18 @@
 import { IndexeddbPersistence } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
+import type { WorkspaceEvent } from "../shared/types";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
   indexeddb: IndexeddbPersistence;
   provider: YProvider;
   readonly hasUnsyncedChanges: boolean;
+  destroy: () => void;
+};
+
+export type WorkspaceEventsBundle = {
+  provider: YProvider;
   destroy: () => void;
 };
 
@@ -73,6 +79,39 @@ export async function loadOfflineCopy(key: string) {
   await persistence.whenSynced;
   await persistence.destroy();
   return doc;
+}
+
+export function createWorkspaceEvents(
+  workspaceId: string,
+  onEvent: (event: WorkspaceEvent) => void,
+  onConnected: () => void,
+): WorkspaceEventsBundle {
+  const doc = new Y.Doc();
+  const provider = new YProvider(window.location.host, workspaceId, doc, {
+    party: "workspace-events",
+  });
+  const customMessage = (message: string) => {
+    try {
+      onEvent(JSON.parse(message) as WorkspaceEvent);
+    } catch {
+      // Ignore messages from future server versions.
+    }
+  };
+  const status = ({ status: next }: { status: string }) => {
+    if (next === "connected") onConnected();
+  };
+  provider.on("custom-message", customMessage);
+  provider.on("status", status);
+  return {
+    provider,
+    destroy() {
+      provider.off("custom-message", customMessage);
+      provider.off("status", status);
+      provider.awareness.setLocalState(null);
+      provider.destroy();
+      doc.destroy();
+    },
+  };
 }
 
 export function userColor(id: string) {
