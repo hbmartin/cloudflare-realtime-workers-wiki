@@ -14,13 +14,23 @@ export function normalizeR2Range(range: R2Range, size: number) {
   return { offset, length };
 }
 
-function normalizeEtag(value: string) {
+function normalizeWeakEtag(value: string) {
   return value.trim().replace(/^W\//i, "");
 }
 
-function etagMatches(condition: string, etag: string) {
+function weakEtagMatches(condition: string, etag: string) {
   return condition.trim() === "*"
-    || condition.split(",").some((candidate) => normalizeEtag(candidate) === normalizeEtag(etag));
+    || condition.split(",").some((candidate) => normalizeWeakEtag(candidate) === normalizeWeakEtag(etag));
+}
+
+function strongEtagMatches(condition: string, etag: string) {
+  const normalizedEtag = etag.trim();
+  if (condition.trim() === "*") return true;
+  if (/^W\//i.test(normalizedEtag)) return false;
+  return condition.split(",").some((candidate) => {
+    const normalizedCandidate = candidate.trim();
+    return !/^W\//i.test(normalizedCandidate) && normalizedCandidate === normalizedEtag;
+  });
 }
 
 function validHttpDate(value: string | null) {
@@ -32,7 +42,7 @@ function validHttpDate(value: string | null) {
 export function conditionalGetStatus(headers: Headers, object: Pick<R2Object, "httpEtag" | "uploaded">) {
   const uploadedAtSeconds = Math.floor(object.uploaded.getTime() / 1_000);
   const ifMatch = headers.get("if-match");
-  if (ifMatch && !etagMatches(ifMatch, object.httpEtag)) return 412;
+  if (ifMatch && !strongEtagMatches(ifMatch, object.httpEtag)) return 412;
 
   if (!ifMatch) {
     const unmodifiedSince = validHttpDate(headers.get("if-unmodified-since"));
@@ -40,9 +50,9 @@ export function conditionalGetStatus(headers: Headers, object: Pick<R2Object, "h
   }
 
   const ifNoneMatch = headers.get("if-none-match");
-  if (ifNoneMatch) return etagMatches(ifNoneMatch, object.httpEtag) ? 304 : 412;
+  if (ifNoneMatch) return weakEtagMatches(ifNoneMatch, object.httpEtag) ? 304 : 200;
 
   const modifiedSince = validHttpDate(headers.get("if-modified-since"));
   if (modifiedSince !== null && uploadedAtSeconds <= Math.floor(modifiedSince / 1_000)) return 304;
-  return 412;
+  return 200;
 }

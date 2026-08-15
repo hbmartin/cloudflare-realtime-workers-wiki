@@ -30,15 +30,30 @@ describe("R2 conditional response status", () => {
 
   it("returns 304 for matching cache validators", () => {
     expect(conditionalGetStatus(new Headers({ "if-none-match": '"current"' }), object)).toBe(304);
+    expect(conditionalGetStatus(new Headers({ "if-none-match": 'W/"current"' }), object)).toBe(304);
     expect(conditionalGetStatus(new Headers({
       "if-modified-since": "Fri, 14 Aug 2026 12:00:00 GMT",
     }), object)).toBe(304);
+  });
+
+  it("continues a GET when cache validators do not match", () => {
+    expect(conditionalGetStatus(new Headers({ "if-none-match": '"different"' }), object)).toBe(200);
+    expect(conditionalGetStatus(new Headers({
+      "if-modified-since": "Fri, 14 Aug 2026 11:00:00 GMT",
+    }), object)).toBe(200);
   });
 
   it("returns 412 for failed preconditions", () => {
     expect(conditionalGetStatus(new Headers({ "if-match": '"different"' }), object)).toBe(412);
     expect(conditionalGetStatus(new Headers({
       "if-unmodified-since": "Fri, 14 Aug 2026 11:00:00 GMT",
+    }), object)).toBe(412);
+  });
+
+  it("uses strong comparison for If-Match before evaluating cache validators", () => {
+    expect(conditionalGetStatus(new Headers({
+      "if-match": 'W/"current"',
+      "if-none-match": '"current"',
     }), object)).toBe(412);
   });
 });

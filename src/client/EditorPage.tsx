@@ -43,8 +43,6 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
   const titleRevisionRef = useRef(page.revision);
   const titleDirtyRef = useRef(false);
   const editable = member.role !== "viewer" && !sizeWarning?.readOnly;
-  const editableRef = useRef(editable);
-  editableRef.current = editable;
   const commentsVisible = commentsOpen;
 
   useEffect(() => {
@@ -84,21 +82,21 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
       if (event.code === 4410 || event.code === 4411 || event.code === 4412) {
         next.provider.disconnect();
       }
-      if (event.code === 4411 || event.code === 4412) {
+      if (event.code === 4411) {
         onPageUnavailable(page.id);
         return;
       }
-      if (event.code !== 4410 && event.code !== 1006) return;
-      if (event.code === 4410 && editableRef.current && next.hasUnsyncedChanges) quarantine();
+      if (event.code !== 4410 && event.code !== 4412 && event.code !== 1006) return;
+      if (event.code === 4410 && next.hasUnsyncedChanges) quarantine();
       try {
         const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
         if (!active) return;
         if (result.page.contentEpoch !== page.contentEpoch) {
-          if (editableRef.current && next.hasUnsyncedChanges) quarantine();
+          if (next.hasUnsyncedChanges) quarantine();
           onPageChanged(result.page);
-        } else if (event.code === 4410) {
-          // A restore can fail after taking the transition lock and closing the
-          // room. Reconnect when D1 still says this epoch is authoritative.
+        } else if (event.code === 4410 || event.code === 4412) {
+          // Restore and archive requests can lose a race after closing the room.
+          // Reconnect when D1 still says this epoch is live.
           next.provider.connect();
         }
       } catch (error) {
@@ -106,6 +104,8 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
         if (error instanceof ApiClientError && error.status === 404) {
           next.provider.disconnect();
           onPageUnavailable(page.id);
+        } else if (event.code === 4410 || event.code === 4412) {
+          next.provider.connect();
         }
       }
     };
@@ -144,10 +144,14 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
       onPageChanged(result.page);
     } catch (error) {
       if (error instanceof ApiClientError && error.status === 409) {
-        titleDirtyRef.current = false;
-        titleRevisionRef.current = page.revision;
-        setTitle(page.title);
-        setTitleError("A collaborator changed this title. Their newer title was kept.");
+        try {
+          const latest = await api<{ page: Page }>(`/api/pages/${page.id}`);
+          titleRevisionRef.current = latest.page.revision;
+          onPageChanged(latest.page);
+        } catch {
+          // Keep the draft even when refreshing the conflicting metadata fails.
+        }
+        setTitleError("Page metadata changed. Your title was kept; review it and try again.");
         return;
       }
       setTitleError(error instanceof Error ? error.message : "The title could not be saved.");
@@ -202,7 +206,6 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
             className="page-title"
             value={title}
             onChange={(event) => {
-              if (!titleDirtyRef.current) titleRevisionRef.current = page.revision;
               titleDirtyRef.current = true;
               setTitleError("");
               setTitle(event.target.value);
