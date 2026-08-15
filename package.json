@@ -31,7 +31,7 @@
     "analyze": "fallow dead-code --type-aware --fail-on-issues",
     "analyze:audit": "fallow audit --type-aware --brief --format compact",
     "load:realtime": "node scripts/realtime-load.mjs",
-    "cf-typegen": "wrangler types --env-interface CloudflareBindings --include-runtime false",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings --include-runtime false --env-file worker-typegen.env",
     "cf-typegen:check": "node scripts/check-worker-types.mjs",
     "db:local": "wrangler d1 migrations apply DB --local",
     "db:remote": "wrangler d1 migrations apply DB --remote",

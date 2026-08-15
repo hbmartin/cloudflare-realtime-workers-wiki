@@ -14,7 +14,18 @@ function portable(source) {
 try {
   const result = spawnSync(
     pnpm,
-    ["exec", "wrangler", "types", generatedPath, "--env-interface", "CloudflareBindings", "--include-runtime", "false"],
+    [
+      "exec",
+      "wrangler",
+      "types",
+      generatedPath,
+      "--env-interface",
+      "CloudflareBindings",
+      "--include-runtime",
+      "false",
+      "--env-file",
+      "worker-typegen.env",
+    ],
     { cwd: root, encoding: "utf8", stdio: "pipe" },
   );
   if (result.status !== 0) {

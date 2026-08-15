@@ -80,10 +80,17 @@ test("creates, renames, archives, and restores a page through the UI", async ({ 
   await pageLink.locator("..").hover();
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: `Archive ${title}` }).click();
+  await expect(pageLink).toHaveCount(0, { timeout: 10_000 });
   await openSidebar(page);
   await page.getByRole("button", { name: /Trash/ }).click();
-  await expect(page.getByText(title, { exact: true })).toBeVisible();
-  await page.getByText(title, { exact: true }).locator("..").getByRole("button", { name: "Restore" }).click();
+  const trashEntry = page.locator(".trash-list > div").filter({ hasText: title });
+  await expect(trashEntry).toBeVisible();
+  const restored = page.waitForResponse(
+    (response) => /\/api\/pages\/[^/]+\/restore$/.test(response.url()) && response.request().method() === "POST",
+  );
+  await trashEntry.getByRole("button", { name: "Restore" }).click();
+  expect((await restored).ok()).toBe(true);
+  await expect(trashEntry).toHaveCount(0, { timeout: 10_000 });
   await expect(page.getByText("Trash is empty.")).toBeVisible();
 });
 
