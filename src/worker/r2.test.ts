@@ -36,6 +36,13 @@ describe("R2 conditional response status", () => {
     }), object)).toBe(304);
   });
 
+  it("continues a GET when cache validators do not match", () => {
+    expect(conditionalGetStatus(new Headers({ "if-none-match": '"different"' }), object)).toBe(200);
+    expect(conditionalGetStatus(new Headers({
+      "if-modified-since": "Fri, 14 Aug 2026 11:00:00 GMT",
+    }), object)).toBe(200);
+  });
+
   it("returns 412 for failed preconditions", () => {
     expect(conditionalGetStatus(new Headers({ "if-match": '"different"' }), object)).toBe(412);
     expect(conditionalGetStatus(new Headers({

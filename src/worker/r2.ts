@@ -50,9 +50,9 @@ export function conditionalGetStatus(headers: Headers, object: Pick<R2Object, "h
   }
 
   const ifNoneMatch = headers.get("if-none-match");
-  if (ifNoneMatch) return weakEtagMatches(ifNoneMatch, object.httpEtag) ? 304 : 412;
+  if (ifNoneMatch) return weakEtagMatches(ifNoneMatch, object.httpEtag) ? 304 : 200;
 
   const modifiedSince = validHttpDate(headers.get("if-modified-since"));
   if (modifiedSince !== null && uploadedAtSeconds <= Math.floor(modifiedSince / 1_000)) return 304;
-  return 412;
+  return 200;
 }

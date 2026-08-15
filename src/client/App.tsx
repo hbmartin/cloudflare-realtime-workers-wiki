@@ -203,6 +203,10 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
       setSelectedId((current) => current && authoritativeIds.has(current)
         ? current
         : [...authoritativeIds][0] ?? null);
+    }).catch((error) => {
+      pendingPageUpserts.current.clear();
+      pendingPageRemovals.current.clear();
+      throw error;
     }).finally(() => {
       if (pageLoadPromise.current === loading) pageLoadPromise.current = null;
     });
@@ -311,7 +315,7 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
       method: "POST", body: json({ parentId, beforeId, afterId }),
     });
     recordPageUpserts([result.page]);
-    setPages((current) => current.map((page) => page.id === pageId ? result.page : page));
+    setPages((current) => mergePages(current, [result.page]));
   }
   async function runSearch(value: string) {
     setSearch(value);

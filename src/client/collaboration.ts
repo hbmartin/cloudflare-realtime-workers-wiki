@@ -31,15 +31,22 @@ export function createCollaboration(
     connect: false,
   });
   let hiddenTimer: number | undefined;
+  let barrierTimer: number | undefined;
   let destroyed = false;
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
 
   const sendDurabilityBarrier = () => {
+    if (barrierTimer) window.clearTimeout(barrierTimer);
+    barrierTimer = undefined;
     const generation = durability.barrierGeneration();
-    if (generation !== null && provider.wsconnected) {
+    if (generation !== null && provider.synced) {
       provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
     }
+  };
+  const scheduleDurabilityBarrier = () => {
+    if (barrierTimer) window.clearTimeout(barrierTimer);
+    barrierTimer = window.setTimeout(sendDurabilityBarrier, 1_000);
   };
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
@@ -63,7 +70,7 @@ export function createCollaboration(
   doc.on("update", (_update: Uint8Array, origin: unknown) => {
     if (origin === provider || origin === indexeddb) return;
     durability.markChanged();
-    sendDurabilityBarrier();
+    scheduleDurabilityBarrier();
   });
   indexeddb.whenSynced.then(() => {
     if (!destroyed) {
@@ -77,6 +84,7 @@ export function createCollaboration(
 
   const visibility = () => {
     if (document.visibilityState === "hidden") {
+      sendDurabilityBarrier();
       hiddenTimer = window.setTimeout(() => provider.disconnect(), 30_000);
     } else {
       if (hiddenTimer) window.clearTimeout(hiddenTimer);
@@ -93,6 +101,7 @@ export function createCollaboration(
     destroy() {
       destroyed = true;
       if (hiddenTimer) window.clearTimeout(hiddenTimer);
+      if (barrierTimer) window.clearTimeout(barrierTimer);
       document.removeEventListener("visibilitychange", visibility);
       provider.off("status", handleStatus);
       provider.off("sync", handleSync);

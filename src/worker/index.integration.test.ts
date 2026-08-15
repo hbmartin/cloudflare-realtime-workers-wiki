@@ -9,7 +9,7 @@ import {
   SELF,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
 import { processDeletionJob } from "./cleanup";
@@ -76,6 +76,9 @@ type TestDocument = {
   compact(forceVersion?: boolean): Promise<void>;
   restoreVersion(versionId: string, userId: string): Promise<Response>;
   scheduleAlarm(when: number): Promise<void>;
+  flushPendingUpdates(): void;
+  transition: "archive" | "restore" | null;
+  getConnections(): Array<{ close(code: number, reason: string): void }>;
   bindings: Cloudflare.Env;
 };
 
@@ -292,6 +295,63 @@ describe("Worker integration", () => {
     });
   });
 
+  it("retires newly-created room state when its page no longer exists", async () => {
+    const stub = env.DOCUMENT.getByName(`${crypto.randomUUID()}~1`);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(state.storage.sql.exec<{ retired: number }>(
+        `SELECT retired FROM document_meta WHERE id = 1`,
+      ).one().retired).toBe(1);
+    });
+  });
+
+  it("validates a restore before closing collaborators", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      const close = vi.fn();
+      document.getConnections = () => [{ close }];
+      const response = await document.restoreVersion(crypto.randomUUID(), installed.userId);
+
+      expect(response.status).toBe(404);
+      expect(close).not.toHaveBeenCalled();
+      expect(document.transition).toBeNull();
+    });
+  });
+
+  it("releases an archive transition when flushing storage fails", async () => {
+    const installed = await bootstrap();
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`)
+      .bind(Date.now(), installed.pageId).run();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      const originalFlush = document.flushPendingUpdates;
+      document.flushPendingUpdates = () => { throw new Error("storage unavailable"); };
+      try {
+        await expect(document.onRequest(new Request("https://document.internal/archive", {
+          method: "POST",
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        }))).rejects.toThrow("storage unavailable");
+        expect(document.transition).toBeNull();
+      } finally {
+        document.flushPendingUpdates = originalFlush;
+      }
+    });
+  });
+
   it("preserves updates and alarms that arrive while compaction is awaiting storage", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
@@ -331,6 +391,8 @@ describe("Worker integration", () => {
 
   it("serializes an archive compaction behind an in-flight alarm compaction", async () => {
     const installed = await bootstrap();
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`)
+      .bind(Date.now(), installed.pageId).run();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
     await stub.fetch(new Request("https://document.internal/noop", {
       headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },

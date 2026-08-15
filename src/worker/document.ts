@@ -48,6 +48,7 @@ export class Document extends YServer {
   private pendingAuthorId: string | null = null;
   private purged = false;
   private transition: "archive" | "restore" | null = null;
+  private restoreValidation = false;
   private compaction: Promise<void> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
@@ -85,6 +86,9 @@ export class Document extends YServer {
     if (!metaColumns.some((column) => column.name === "restore_pending")) {
       sql.exec(`ALTER TABLE document_meta ADD COLUMN restore_pending INTEGER NOT NULL DEFAULT 0`);
     }
+    const hadMetadata = Boolean(sql.exec<{ present: number }>(
+      `SELECT EXISTS(SELECT 1 FROM document_meta WHERE id = 1) present`,
+    ).one().present);
     sql.exec(`INSERT OR IGNORE INTO document_meta (id) VALUES (1)`);
     sql.exec(`CREATE TABLE IF NOT EXISTS update_events (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,9 +104,9 @@ export class Document extends YServer {
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_update_chunks_seq ON update_chunks(seq, chunk_index)`);
     this.metadata = sql.exec<MetaRow>(`SELECT * FROM document_meta WHERE id = 1`).one();
 
-    // Normal hibernation wakes stay independent of D1. Only a crash in the
-    // narrow window around an epoch commit needs an authoritative reconciliation.
-    if (this.metadata.restore_pending) {
+    // Normal hibernation wakes stay independent of D1. New state still needs
+    // an authoritative check so a purged room cannot restart without its tombstone.
+    if (!hadMetadata || this.metadata.restore_pending) {
       const { pageId, epoch } = this.ids;
       const current = await this.bindings.DB.prepare(
         `SELECT content_epoch FROM pages WHERE id = ?`,
@@ -263,15 +267,25 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "POST" && url.pathname.endsWith("/archive")) {
-      if (this.transition || this.metadata.retired || this.purged) {
+      if (this.restoreValidation || this.transition || this.metadata.retired || this.purged) {
+        return Response.json({ error: "Document transition already in progress." }, { status: 409 });
+      }
+      const { pageId, epoch } = this.ids;
+      const page = await this.bindings.DB.prepare(
+        `SELECT content_epoch, archived_at FROM pages WHERE id = ?`,
+      ).bind(pageId).first<{ content_epoch: number; archived_at: number | null }>();
+      if (!page || page.content_epoch !== epoch || page.archived_at === null) {
+        return Response.json({ error: "The page is no longer archived." }, { status: 409 });
+      }
+      if (this.restoreValidation || this.transition || this.metadata.retired || this.purged) {
         return Response.json({ error: "Document transition already in progress." }, { status: 409 });
       }
       this.transition = "archive";
-      for (const connection of this.getConnections()) {
-        connection.close(4412, "This page was archived.");
-      }
-      this.flushPendingUpdates();
       try {
+        for (const connection of this.getConnections()) {
+          connection.close(4412, "This page was archived.");
+        }
+        this.flushPendingUpdates();
         if (this.metadata.dirty) await this.compact(true);
         return Response.json({ archived: true });
       } finally {
@@ -315,8 +329,6 @@ export class Document extends YServer {
     if (!this.pendingUpdates.length || this.purged) return;
     const updates = this.pendingUpdates;
     const authorId = this.pendingAuthorId;
-    this.pendingUpdates = [];
-    this.pendingAuthorId = null;
     const merged = updates.length === 1 ? updates[0] : Y.mergeUpdates(updates);
     this.state.storage.transactionSync(() => {
       const row = this.state.storage.sql
@@ -339,6 +351,8 @@ export class Document extends YServer {
         authorId,
       );
     });
+    this.pendingUpdates = [];
+    this.pendingAuthorId = null;
     this.metadata.dirty = 1;
     if (authorId) this.metadata.last_editor_id = authorId;
   }
@@ -584,113 +598,128 @@ export class Document extends YServer {
   }
 
   private async restoreVersion(versionId: string, userId: string) {
-    if (this.transition || this.metadata.retired || this.purged) {
+    if (this.restoreValidation || this.transition || this.metadata.retired || this.purged) {
       return Response.json({ error: "Document transition already in progress." }, { status: 409 });
     }
-    this.transition = "restore";
-    for (const connection of this.getConnections()) {
-      connection.close(4410, "A restored version replaced this document.");
-    }
-    this.flushPendingUpdates();
-
-    const { pageId, epoch } = this.ids;
-    let newKey: string | null = null;
-    let preKey: string | null = null;
-    let committed = false;
+    this.restoreValidation = true;
     try {
-      const version = await this.bindings.DB.prepare(
-        `SELECT r2_key FROM page_versions WHERE id = ? AND page_id = ?`,
-      ).bind(versionId, pageId).first<{ r2_key: string }>();
-      if (!version) return Response.json({ error: "Version not found." }, { status: 404 });
-      const selected = await this.bindings.BUCKET.get(version.r2_key);
-      if (!selected) return Response.json({ error: "Version snapshot is missing." }, { status: 404 });
-      const selectedBytes = new Uint8Array(await selected.arrayBuffer());
+      const { pageId, epoch } = this.ids;
+      let selectedBytes: Uint8Array;
+      try {
+        const version = await this.bindings.DB.prepare(
+          `SELECT r2_key FROM page_versions WHERE id = ? AND page_id = ?`,
+        ).bind(versionId, pageId).first<{ r2_key: string }>();
+        if (!version) return Response.json({ error: "Version not found." }, { status: 404 });
+        const selected = await this.bindings.BUCKET.get(version.r2_key);
+        if (!selected) return Response.json({ error: "Version snapshot is missing." }, { status: 404 });
+        selectedBytes = new Uint8Array(await selected.arrayBuffer());
+      } catch (error) {
+        console.error("Document restore validation failed", error);
+        return Response.json({ error: "The version could not be restored." }, { status: 503 });
+      }
 
-      const hadPendingLog = Boolean(this.metadata.dirty);
-      const newEpoch = epoch + 1;
-      newKey = this.snapshotKey(pageId, newEpoch);
-      if (hadPendingLog) await this.compact(true);
+      if (this.transition || this.metadata.retired || this.purged) {
+        return Response.json({ error: "Document transition already in progress." }, { status: 409 });
+      }
+      this.transition = "restore";
+      this.restoreValidation = false;
+      let newKey: string | null = null;
+      let preKey: string | null = null;
+      let committed = false;
+      try {
+        for (const connection of this.getConnections()) {
+          connection.close(4410, "A restored version replaced this document.");
+        }
+        this.flushPendingUpdates();
 
-      const statements: D1PreparedStatement[] = [];
-      if (!hadPendingLog) {
-        const currentSnapshot = Y.encodeStateAsUpdate(this.document);
-        const preId = crypto.randomUUID();
-        preKey = `documents/${pageId}/versions/${preId}.bin`;
-        await this.bindings.BUCKET.put(preKey, currentSnapshot, {
+        const hadPendingLog = Boolean(this.metadata.dirty);
+        const newEpoch = epoch + 1;
+        newKey = this.snapshotKey(pageId, newEpoch);
+        if (hadPendingLog) await this.compact(true);
+
+        const statements: D1PreparedStatement[] = [];
+        if (!hadPendingLog) {
+          const currentSnapshot = Y.encodeStateAsUpdate(this.document);
+          const preId = crypto.randomUUID();
+          preKey = `documents/${pageId}/versions/${preId}.bin`;
+          await this.bindings.BUCKET.put(preKey, currentSnapshot, {
+            httpMetadata: { contentType: "application/octet-stream" },
+            customMetadata: { pageId, epoch: String(epoch), sequence: String(this.metadata.snapshot_seq) },
+          });
+          statements.push(this.bindings.DB.prepare(
+            `INSERT INTO page_versions
+              (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
+             SELECT ?, id, ?, ?, title, ?, ?, ?, ? FROM pages
+              WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
+          ).bind(
+            preId,
+            epoch,
+            this.metadata.snapshot_seq,
+            preKey,
+            currentSnapshot.byteLength,
+            userId,
+            Date.now(),
+            pageId,
+            epoch,
+          ));
+        }
+
+        this.metadata.restore_pending = 1;
+        this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
+        await this.bindings.BUCKET.put(newKey, selectedBytes, {
           httpMetadata: { contentType: "application/octet-stream" },
-          customMetadata: { pageId, epoch: String(epoch), sequence: String(this.metadata.snapshot_seq) },
+          customMetadata: { pageId, epoch: String(newEpoch), restoredFrom: versionId },
         });
         statements.push(this.bindings.DB.prepare(
-          `INSERT INTO page_versions
-            (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
-           SELECT ?, id, ?, ?, title, ?, ?, ?, ? FROM pages
+          `UPDATE pages
+              SET content_epoch = ?, revision = revision + 1, indexed_seq = 0, updated_at = ?
             WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
-        ).bind(
-          preId,
-          epoch,
-          this.metadata.snapshot_seq,
-          preKey,
-          currentSnapshot.byteLength,
-          userId,
-          Date.now(),
-          pageId,
-          epoch,
-        ));
-      }
-
-      this.metadata.restore_pending = 1;
-      this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
-      await this.bindings.BUCKET.put(newKey, selectedBytes, {
-        httpMetadata: { contentType: "application/octet-stream" },
-        customMetadata: { pageId, epoch: String(newEpoch), restoredFrom: versionId },
-      });
-      statements.push(this.bindings.DB.prepare(
-        `UPDATE pages
-            SET content_epoch = ?, revision = revision + 1, indexed_seq = 0, updated_at = ?
-          WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
-      ).bind(newEpoch, Date.now(), pageId, epoch));
-      const results = await this.bindings.DB.batch(statements);
-      if (!results.at(-1)?.meta.changes) {
-        await Promise.all([
-          this.bindings.BUCKET.delete(newKey),
-          preKey ? this.bindings.BUCKET.delete(preKey) : Promise.resolve(),
-        ]);
-        newKey = null;
-        preKey = null;
-        this.metadata.restore_pending = 0;
-        this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 0 WHERE id = 1`);
-        return Response.json({ error: "The page epoch changed during restore." }, { status: 409 });
-      }
-      committed = true;
-      this.metadata.retired = 1;
-      this.metadata.restore_pending = 0;
-      try {
-        this.state.storage.sql.exec(
-          `UPDATE document_meta SET retired = 1, restore_pending = 0 WHERE id = 1`,
-        );
-      } catch (error) {
-        // D1 is authoritative for routing. A restarted old room also reconciles
-        // its retired state from the committed epoch before accepting clients.
-        console.error("Failed to persist retired document state", error);
-      }
-      return Response.json({ pageId, contentEpoch: newEpoch });
-    } catch (error) {
-      if (!committed) {
-        await Promise.allSettled([
-          ...(newKey ? [this.bindings.BUCKET.delete(newKey)] : []),
-          ...(preKey ? [this.bindings.BUCKET.delete(preKey)] : []),
-        ]);
+        ).bind(newEpoch, Date.now(), pageId, epoch));
+        const results = await this.bindings.DB.batch(statements);
+        if (!results.at(-1)?.meta.changes) {
+          await Promise.all([
+            this.bindings.BUCKET.delete(newKey),
+            preKey ? this.bindings.BUCKET.delete(preKey) : Promise.resolve(),
+          ]);
+          newKey = null;
+          preKey = null;
+          this.metadata.restore_pending = 0;
+          this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 0 WHERE id = 1`);
+          return Response.json({ error: "The page epoch changed during restore." }, { status: 409 });
+        }
+        committed = true;
+        this.metadata.retired = 1;
         this.metadata.restore_pending = 0;
         try {
-          this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 0 WHERE id = 1`);
-        } catch (storageError) {
-          console.error("Failed to clear pending restore state", storageError);
+          this.state.storage.sql.exec(
+            `UPDATE document_meta SET retired = 1, restore_pending = 0 WHERE id = 1`,
+          );
+        } catch (error) {
+          // D1 is authoritative for routing. A restarted old room also reconciles
+          // its retired state from the committed epoch before accepting clients.
+          console.error("Failed to persist retired document state", error);
         }
+        return Response.json({ pageId, contentEpoch: newEpoch });
+      } catch (error) {
+        if (!committed) {
+          await Promise.allSettled([
+            ...(newKey ? [this.bindings.BUCKET.delete(newKey)] : []),
+            ...(preKey ? [this.bindings.BUCKET.delete(preKey)] : []),
+          ]);
+          this.metadata.restore_pending = 0;
+          try {
+            this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 0 WHERE id = 1`);
+          } catch (storageError) {
+            console.error("Failed to clear pending restore state", storageError);
+          }
+        }
+        console.error("Document restore failed", error);
+        return Response.json({ error: "The version could not be restored." }, { status: 503 });
+      } finally {
+        this.transition = null;
       }
-      console.error("Document restore failed", error);
-      return Response.json({ error: "The version could not be restored." }, { status: 503 });
     } finally {
-      this.transition = null;
+      this.restoreValidation = false;
     }
   }
 

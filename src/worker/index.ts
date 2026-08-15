@@ -461,10 +461,7 @@ app.delete("/api/pages/:id", async (c) => {
   });
   const pendingPageIds = await processArchiveDisconnectTargets(c.env, documents.map((item) => ({
     page_id: item.id,
-    workspace_id: member.workspace.id,
     content_epoch: item.content_epoch,
-    room: `${item.id}~${item.content_epoch}`,
-    attempts: 0,
   })));
   return c.json({ ok: true, cleanupPending: pendingPageIds.length > 0, pendingPageIds }, pendingPageIds.length ? 202 : 200);
 });
@@ -786,7 +783,7 @@ app.get("/api/attachments/:id", async (c) => {
   }>();
   if (!attachment) throw new HttpError(404, "attachment_not_found", "Attachment not found.");
   const rangeRequested = Boolean(c.req.header("range"));
-  const object = await c.env.BUCKET.get(attachment.r2_key, {
+  let object = await c.env.BUCKET.get(attachment.r2_key, {
     ...(rangeRequested ? { range: c.req.raw.headers } : {}),
     onlyIf: c.req.raw.headers,
   });
@@ -799,10 +796,16 @@ app.get("/api/attachments/:id", async (c) => {
   headers.set("x-content-type-options", "nosniff");
   headers.set("content-disposition", attachmentDisposition(attachment.name, isInlineMime(attachment.mime)));
   if (!("body" in object)) {
-    return new Response(null, {
-      status: conditionalGetStatus(c.req.raw.headers, object),
-      headers,
+    const status = conditionalGetStatus(c.req.raw.headers, object);
+    if (status !== 200) {
+      return new Response(null, { status, headers });
+    }
+    object = await c.env.BUCKET.get(attachment.r2_key, {
+      ...(rangeRequested ? { range: c.req.raw.headers } : {}),
     });
+    if (!object || !("body" in object)) {
+      throw new HttpError(404, "attachment_missing", "The attachment data is missing.");
+    }
   }
   const range = rangeRequested && object.range ? normalizeR2Range(object.range, object.size) : null;
   if (range && range.length > 0) {
