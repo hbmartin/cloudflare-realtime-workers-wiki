@@ -32,21 +32,28 @@ export function createCollaboration(
   });
   let hiddenTimer: number | undefined;
   let barrierTimer: number | undefined;
+  let barrierDeadline: number | undefined;
   let destroyed = false;
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
 
   const sendDurabilityBarrier = () => {
-    if (barrierTimer) window.clearTimeout(barrierTimer);
+    if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
     barrierTimer = undefined;
+    barrierDeadline = undefined;
     const generation = durability.barrierGeneration();
     if (generation !== null && provider.synced) {
       provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
     }
   };
   const scheduleDurabilityBarrier = () => {
-    if (barrierTimer) window.clearTimeout(barrierTimer);
-    barrierTimer = window.setTimeout(sendDurabilityBarrier, 1_000);
+    const now = Date.now();
+    barrierDeadline ??= now + 5_000;
+    if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
+    barrierTimer = window.setTimeout(
+      sendDurabilityBarrier,
+      Math.max(0, Math.min(1_000, barrierDeadline - now)),
+    );
   };
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
@@ -101,7 +108,7 @@ export function createCollaboration(
     destroy() {
       destroyed = true;
       if (hiddenTimer) window.clearTimeout(hiddenTimer);
-      if (barrierTimer) window.clearTimeout(barrierTimer);
+      if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
       document.removeEventListener("visibilitychange", visibility);
       provider.off("status", handleStatus);
       provider.off("sync", handleSync);

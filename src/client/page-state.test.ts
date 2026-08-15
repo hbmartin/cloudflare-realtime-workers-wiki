@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Page } from "../shared/types";
-import { mergePages, reconcilePageSnapshot } from "./page-state";
+import { mergePages, PageLoadEventBuffer, reconcilePageSnapshot } from "./page-state";
 
 function page(id: string, revision: number, title = id): Page {
   return {
@@ -45,5 +45,23 @@ describe("page state reconciliation", () => {
 
     expect(result.pages).toEqual([page("a", 1)]);
     expect([...result.authoritativeIds]).toEqual(["a"]);
+  });
+
+  it("records events between a failed load and its successful retry", () => {
+    const events = new PageLoadEventBuffer();
+    events.start();
+    events.recordRemovals(["restored"]);
+    events.recordUpserts([page("removed", 1)]);
+
+    // The load fails without consuming the buffer. Later events must supersede
+    // the retained state even before the retry begins.
+    events.recordUpserts([page("restored", 2)]);
+    events.recordRemovals(["removed"]);
+    events.start();
+
+    expect(events.consume()).toEqual({
+      upserts: [page("restored", 2)],
+      removals: new Set(["removed"]),
+    });
   });
 });

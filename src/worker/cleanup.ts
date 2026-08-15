@@ -1,10 +1,12 @@
 import type { Env } from "./env";
+import { locationHint } from "./http";
 
 type DeletionTargetKind = "document_do" | "r2_object" | "r2_prefix";
 
 interface DeletionJobRow {
   id: string;
   attempts: number;
+  workspace_id: string;
 }
 
 interface DeletionTargetRow {
@@ -13,6 +15,7 @@ interface DeletionTargetRow {
 }
 
 const CLEANUP_LEASE_MS = 15 * 60_000;
+const DOCUMENT_PURGE_TIMEOUT_MS = 30_000;
 
 async function deletePrefix(bucket: R2Bucket, prefix: string) {
   let cursor: string | undefined;
@@ -23,7 +26,11 @@ async function deletePrefix(bucket: R2Bucket, prefix: string) {
   } while (cursor);
 }
 
-async function processTarget(env: Env, target: DeletionTargetRow) {
+async function processTarget(
+  env: Env,
+  target: DeletionTargetRow,
+  hint?: DurableObjectLocationHint,
+) {
   if (target.kind === "r2_object") {
     await env.BUCKET.delete(target.target);
     return;
@@ -32,10 +39,11 @@ async function processTarget(env: Env, target: DeletionTargetRow) {
     await deletePrefix(env.BUCKET, target.target);
     return;
   }
-  const stub = env.DOCUMENT.getByName(target.target);
+  const stub = env.DOCUMENT.getByName(target.target, hint ? { locationHint: hint } : undefined);
   const response = await stub.fetch(new Request("https://document.internal/purge", {
     method: "POST",
     headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
   }));
   if (!response.ok) throw new Error(`Document purge failed with ${response.status}`);
 }
@@ -47,9 +55,14 @@ export async function processDeletionJob(env: Env, jobId: string) {
     `UPDATE deletion_jobs
         SET next_attempt_at = ?, updated_at = ?
       WHERE id = ? AND next_attempt_at <= ?
-      RETURNING id, attempts`,
+      RETURNING id, attempts, workspace_id`,
   ).bind(leaseUntil, claimedAt, jobId, claimedAt).first<DeletionJobRow>();
   if (!job) return;
+
+  const workspace = await env.DB.prepare(
+    `SELECT location_hint FROM workspaces WHERE id = ?`,
+  ).bind(job.workspace_id).first<{ location_hint: string | null }>();
+  const hint = locationHint(workspace?.location_hint ?? undefined);
 
   const targets = await env.DB.prepare(
     `SELECT kind, target FROM deletion_targets
@@ -59,7 +72,7 @@ export async function processDeletionJob(env: Env, jobId: string) {
 
   for (const target of targets.results) {
     try {
-      await processTarget(env, target);
+      await processTarget(env, target, hint);
       await env.DB.prepare(
         `UPDATE deletion_targets
             SET completed_at = ?, attempts = attempts + 1, last_error = NULL

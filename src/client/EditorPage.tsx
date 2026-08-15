@@ -2,7 +2,7 @@ import { CommentsExtension, DefaultThreadStoreAuth, ThreadStoreAuth } from "@blo
 import { withCollaboration, YjsThreadStore } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
 import { SuggestionMenuController, ThreadsSidebar, useCreateBlockNote } from "@blocknote/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
 import type { MemberContext } from "../worker/env";
@@ -43,6 +43,7 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
   const titleRevisionRef = useRef(page.revision);
   const titleDirtyRef = useRef(false);
   const editable = member.role !== "viewer" && !sizeWarning?.readOnly;
+  const isEditable = useEffectEvent(() => editable);
   const commentsVisible = commentsOpen;
 
   useEffect(() => {
@@ -72,13 +73,45 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
       }
     };
     let active = true;
+    let closeCheck = 0;
+    let recheckTimer: number | undefined;
     next.provider.on("custom-message", customMessage);
     const quarantine = () => {
       const value = { key: `${member.workspace.id}:${page.id}:${page.contentEpoch}:1`, epoch: page.contentEpoch };
-      localStorage.setItem(recoveryKey, JSON.stringify(value));
-      setRecovery(value);
+      const serialized = JSON.stringify(value);
+      if (localStorage.getItem(recoveryKey) !== serialized) localStorage.setItem(recoveryKey, serialized);
+      setRecovery((current) => current?.key === value.key && current.epoch === value.epoch ? current : value);
     };
-    const connectionClose = async (event: CloseEvent) => {
+    const reconcileClose = async (code: number, check: number, attempt = 0): Promise<void> => {
+      try {
+        const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
+        if (!active || check !== closeCheck) return;
+        if (result.page.contentEpoch !== page.contentEpoch && isEditable() && next.hasUnsyncedChanges) {
+          quarantine();
+        }
+        if (result.page.archivedAt !== null) {
+          onPageUnavailable(page.id);
+        } else if (result.page.contentEpoch !== page.contentEpoch) {
+          onPageChanged(result.page);
+        } else if (code === 4410 || code === 4412) {
+          next.provider.connect();
+        }
+      } catch (error) {
+        if (!active || check !== closeCheck) return;
+        if (error instanceof ApiClientError && error.status === 404) {
+          onPageUnavailable(page.id);
+          return;
+        }
+        const retryable = !(error instanceof ApiClientError) || error.status === 429 || error.status >= 500;
+        if ((code === 4410 || code === 4412) && retryable && attempt < 3) {
+          recheckTimer = window.setTimeout(() => {
+            recheckTimer = undefined;
+            void reconcileClose(code, check, attempt + 1);
+          }, 1_000 * 2 ** attempt);
+        }
+      }
+    };
+    const connectionClose = (event: CloseEvent) => {
       if (event.code === 4410 || event.code === 4411 || event.code === 4412) {
         next.provider.disconnect();
       }
@@ -87,32 +120,16 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
         return;
       }
       if (event.code !== 4410 && event.code !== 4412 && event.code !== 1006) return;
-      if (event.code === 4410 && next.hasUnsyncedChanges) quarantine();
-      try {
-        const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
-        if (!active) return;
-        if (result.page.contentEpoch !== page.contentEpoch) {
-          if (next.hasUnsyncedChanges) quarantine();
-          onPageChanged(result.page);
-        } else if (event.code === 4410 || event.code === 4412) {
-          // Restore and archive requests can lose a race after closing the room.
-          // Reconnect when D1 still says this epoch is live.
-          next.provider.connect();
-        }
-      } catch (error) {
-        if (!active) return;
-        if (error instanceof ApiClientError && error.status === 404) {
-          next.provider.disconnect();
-          onPageUnavailable(page.id);
-        } else if (event.code === 4410 || event.code === 4412) {
-          next.provider.connect();
-        }
-      }
+      if (recheckTimer !== undefined) window.clearTimeout(recheckTimer);
+      const check = ++closeCheck;
+      if (event.code === 4410 && isEditable() && next.hasUnsyncedChanges) quarantine();
+      void reconcileClose(event.code, check);
     };
     next.provider.on("connection-close", connectionClose);
     setBundle(next);
     return () => {
       active = false;
+      if (recheckTimer !== undefined) window.clearTimeout(recheckTimer);
       next.provider.off("custom-message", customMessage);
       next.provider.off("connection-close", connectionClose);
       next.destroy();
@@ -206,6 +223,7 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
             className="page-title"
             value={title}
             onChange={(event) => {
+              if (!titleDirtyRef.current && title === page.title) titleRevisionRef.current = page.revision;
               titleDirtyRef.current = true;
               setTitleError("");
               setTitle(event.target.value);

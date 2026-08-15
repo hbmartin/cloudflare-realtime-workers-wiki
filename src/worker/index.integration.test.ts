@@ -318,12 +318,17 @@ describe("Worker integration", () => {
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
       const close = vi.fn();
+      const originalGetConnections = document.getConnections;
       document.getConnections = () => [{ close }];
-      const response = await document.restoreVersion(crypto.randomUUID(), installed.userId);
+      try {
+        const response = await document.restoreVersion(crypto.randomUUID(), installed.userId);
 
-      expect(response.status).toBe(404);
-      expect(close).not.toHaveBeenCalled();
-      expect(document.transition).toBeNull();
+        expect(response.status).toBe(404);
+        expect(close).not.toHaveBeenCalled();
+        expect(document.transition).toBeNull();
+      } finally {
+        document.getConnections = originalGetConnections;
+      }
     });
   });
 
@@ -551,6 +556,58 @@ describe("Worker integration", () => {
         `SELECT retired FROM document_meta WHERE id = 1`,
       ).one().retired).toBe(1);
     });
+  });
+
+  it("keeps the new snapshot when a restore batch commits before its response fails", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      document.document.getMap("ambiguous-restore").set("value", 1);
+      await document.onSave();
+      await document.compact(true);
+    });
+    const version = await env.DB.prepare(
+      `SELECT id FROM page_versions WHERE page_id = ? ORDER BY created_at DESC LIMIT 1`,
+    ).bind(installed.pageId).first<{ id: string }>();
+    expect(version).toBeTruthy();
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      const originalBindings = document.bindings;
+      const ambiguousDatabase = new Proxy(originalBindings.DB, {
+        get(target, property) {
+          if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+            await target.batch(statements);
+            throw new Error("D1 response lost after commit");
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property === "DB") return ambiguousDatabase;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      try {
+        const response = await document.restoreVersion(version!.id, installed.userId);
+        expect(response.status).toBe(503);
+        expect(state.storage.sql.exec<{ retired: number; restore_pending: number }>(
+          `SELECT retired, restore_pending FROM document_meta WHERE id = 1`,
+        ).one()).toEqual({ retired: 1, restore_pending: 0 });
+      } finally {
+        document.bindings = originalBindings;
+      }
+    });
+
+    expect((await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ?`)
+      .bind(installed.pageId).first<{ content_epoch: number }>())?.content_epoch).toBe(2);
+    expect(await env.BUCKET.get(`documents/${installed.pageId}/epochs/2/current.bin`)).toBeTruthy();
   });
 
   it("rejects a concurrent restore before it can share the next epoch snapshot key", async () => {

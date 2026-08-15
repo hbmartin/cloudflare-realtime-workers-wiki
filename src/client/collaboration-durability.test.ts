@@ -17,11 +17,15 @@ describe("collaboration durability", () => {
     expect(durability.hasUnsyncedChanges).toBe(false);
   });
 
-  it("assigns a barrier generation to recoverable IndexedDB state", () => {
+  it("reports no barrier until a change is recorded", () => {
     const durability = new CollaborationDurability();
+    expect(durability.hasUnsyncedChanges).toBe(false);
+    expect(durability.barrierGeneration()).toBeNull();
     durability.markChanged();
 
     expect(durability.hasUnsyncedChanges).toBe(true);
     expect(durability.barrierGeneration()).toBe(1);
+    durability.acknowledge(1);
+    expect(durability.barrierGeneration()).toBeNull();
   });
 });

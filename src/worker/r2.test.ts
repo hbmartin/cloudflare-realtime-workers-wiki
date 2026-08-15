@@ -56,4 +56,18 @@ describe("R2 conditional response status", () => {
       "if-none-match": '"current"',
     }), object)).toBe(412);
   });
+
+  it("does not split commas inside entity tags", () => {
+    const commaObject = { ...object, httpEtag: '"revision,2"' };
+
+    expect(conditionalGetStatus(new Headers({
+      "if-none-match": '"different", W/"revision,2"',
+    }), commaObject)).toBe(304);
+    expect(conditionalGetStatus(new Headers({
+      "if-match": '"different", "revision,2"',
+    }), commaObject)).toBe(200);
+    expect(conditionalGetStatus(new Headers({
+      "if-match": '"different", W/"revision,2"',
+    }), commaObject)).toBe(412);
+  });
 });

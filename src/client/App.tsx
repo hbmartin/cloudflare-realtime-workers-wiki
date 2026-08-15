@@ -6,7 +6,7 @@ import { ApiClientError, api, authClient, json } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
 import { invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
-import { mergePages, reconcilePageSnapshot } from "./page-state";
+import { mergePages, PageLoadEventBuffer, reconcilePageSnapshot } from "./page-state";
 import { TablePage } from "./TablePage";
 
 type AppState =
@@ -169,33 +169,21 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
   const [workspaceError, setWorkspaceError] = useState("");
-  const pendingPageUpserts = useRef(new Map<string, Page>());
-  const pendingPageRemovals = useRef(new Set<string>());
+  const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const pageLoadPromise = useRef<Promise<void> | null>(null);
 
   const recordPageUpserts = useCallback((incoming: Page[]) => {
-    if (!pageLoadPromise.current) return;
-    for (const page of incoming) {
-      const previous = pendingPageUpserts.current.get(page.id);
-      if (!previous || page.revision >= previous.revision) pendingPageUpserts.current.set(page.id, page);
-      pendingPageRemovals.current.delete(page.id);
-    }
+    pendingPageEvents.current.recordUpserts(incoming);
   }, []);
   const recordPageRemovals = useCallback((pageIds: string[]) => {
-    if (!pageLoadPromise.current) return;
-    for (const pageId of pageIds) {
-      pendingPageUpserts.current.delete(pageId);
-      pendingPageRemovals.current.add(pageId);
-    }
+    pendingPageEvents.current.recordRemovals(pageIds);
   }, []);
 
   const loadPages = useCallback(() => {
     if (pageLoadPromise.current) return pageLoadPromise.current;
+    pendingPageEvents.current.start();
     const loading = api<{ pages: Page[] }>("/api/pages/tree").then((data) => {
-      const upserts = [...pendingPageUpserts.current.values()];
-      const removals = new Set(pendingPageRemovals.current);
-      pendingPageUpserts.current.clear();
-      pendingPageRemovals.current.clear();
+      const { upserts, removals } = pendingPageEvents.current.consume();
       const authoritative = mergePages(data.pages, upserts).filter((page) => !removals.has(page.id));
       const authoritativeIds = new Set(authoritative.map((page) => page.id));
       setPages((current) => reconcilePageSnapshot(current, data.pages, upserts, removals).pages);
@@ -203,10 +191,6 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
       setSelectedId((current) => current && authoritativeIds.has(current)
         ? current
         : [...authoritativeIds][0] ?? null);
-    }).catch((error) => {
-      pendingPageUpserts.current.clear();
-      pendingPageRemovals.current.clear();
-      throw error;
     }).finally(() => {
       if (pageLoadPromise.current === loading) pageLoadPromise.current = null;
     });

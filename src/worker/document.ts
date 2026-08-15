@@ -267,7 +267,7 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "POST" && url.pathname.endsWith("/archive")) {
-      if (this.restoreValidation || this.transition || this.metadata.retired || this.purged) {
+      if (this.restoreValidation || this.transition) {
         return Response.json({ error: "Document transition already in progress." }, { status: 409 });
       }
       const { pageId, epoch } = this.ids;
@@ -275,7 +275,10 @@ export class Document extends YServer {
         `SELECT content_epoch, archived_at FROM pages WHERE id = ?`,
       ).bind(pageId).first<{ content_epoch: number; archived_at: number | null }>();
       if (!page || page.content_epoch !== epoch || page.archived_at === null) {
-        return Response.json({ error: "The page is no longer archived." }, { status: 409 });
+        return Response.json(
+          { error: "The page is no longer archived.", code: "archive_no_longer_applicable" },
+          { status: 410 },
+        );
       }
       if (this.restoreValidation || this.transition || this.metadata.retired || this.purged) {
         return Response.json({ error: "Document transition already in progress." }, { status: 409 });
@@ -623,9 +626,23 @@ export class Document extends YServer {
       }
       this.transition = "restore";
       this.restoreValidation = false;
+      const newEpoch = epoch + 1;
       let newKey: string | null = null;
       let preKey: string | null = null;
-      let committed = false;
+      let commitState: "committed" | "not-committed" | "unknown" = "unknown";
+      const markRestoreCommitted = () => {
+        this.metadata.retired = 1;
+        this.metadata.restore_pending = 0;
+        try {
+          this.state.storage.sql.exec(
+            `UPDATE document_meta SET retired = 1, restore_pending = 0 WHERE id = 1`,
+          );
+        } catch (error) {
+          // D1 is authoritative for routing. A restarted old room also reconciles
+          // its retired state from the committed epoch before accepting clients.
+          console.error("Failed to persist retired document state", error);
+        }
+      };
       try {
         for (const connection of this.getConnections()) {
           connection.close(4410, "A restored version replaced this document.");
@@ -633,7 +650,6 @@ export class Document extends YServer {
         this.flushPendingUpdates();
 
         const hadPendingLog = Boolean(this.metadata.dirty);
-        const newEpoch = epoch + 1;
         newKey = this.snapshotKey(pageId, newEpoch);
         if (hadPendingLog) await this.compact(true);
 
@@ -687,21 +703,22 @@ export class Document extends YServer {
           this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 0 WHERE id = 1`);
           return Response.json({ error: "The page epoch changed during restore." }, { status: 409 });
         }
-        committed = true;
-        this.metadata.retired = 1;
-        this.metadata.restore_pending = 0;
-        try {
-          this.state.storage.sql.exec(
-            `UPDATE document_meta SET retired = 1, restore_pending = 0 WHERE id = 1`,
-          );
-        } catch (error) {
-          // D1 is authoritative for routing. A restarted old room also reconciles
-          // its retired state from the committed epoch before accepting clients.
-          console.error("Failed to persist retired document state", error);
-        }
+        commitState = "committed";
+        markRestoreCommitted();
         return Response.json({ pageId, contentEpoch: newEpoch });
       } catch (error) {
-        if (!committed) {
+        if (commitState === "unknown") {
+          try {
+            const current = await this.bindings.DB.prepare(
+              `SELECT content_epoch FROM pages WHERE id = ?`,
+            ).bind(pageId).first<{ content_epoch: number }>();
+            if (current?.content_epoch === newEpoch) commitState = "committed";
+            else if (current?.content_epoch === epoch) commitState = "not-committed";
+          } catch (lookupError) {
+            console.error("Failed to confirm restore commit state", lookupError);
+          }
+        }
+        if (commitState === "not-committed") {
           await Promise.allSettled([
             ...(newKey ? [this.bindings.BUCKET.delete(newKey)] : []),
             ...(preKey ? [this.bindings.BUCKET.delete(preKey)] : []),
@@ -712,6 +729,8 @@ export class Document extends YServer {
           } catch (storageError) {
             console.error("Failed to clear pending restore state", storageError);
           }
+        } else if (commitState === "committed") {
+          markRestoreCommitted();
         }
         console.error("Document restore failed", error);
         return Response.json({ error: "The version could not be restored." }, { status: 503 });
