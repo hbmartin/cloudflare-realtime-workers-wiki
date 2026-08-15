@@ -7,3 +7,6 @@ playwright-report
 test-results
 coverage
 .fallow
+review_triage/
+reviews_triage/
+triage_decisions.db
