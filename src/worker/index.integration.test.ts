@@ -318,12 +318,17 @@ describe("Worker integration", () => {
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
       const close = vi.fn();
+      const originalGetConnections = document.getConnections;
       document.getConnections = () => [{ close }];
-      const response = await document.restoreVersion(crypto.randomUUID(), installed.userId);
+      try {
+        const response = await document.restoreVersion(crypto.randomUUID(), installed.userId);
 
-      expect(response.status).toBe(404);
-      expect(close).not.toHaveBeenCalled();
-      expect(document.transition).toBeNull();
+        expect(response.status).toBe(404);
+        expect(close).not.toHaveBeenCalled();
+        expect(document.transition).toBeNull();
+      } finally {
+        document.getConnections = originalGetConnections;
+      }
     });
   });
 
