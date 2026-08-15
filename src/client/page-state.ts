@@ -1,5 +1,43 @@
 import type { Page } from "../shared/types";
 
+export class PageLoadEventBuffer {
+  private recording = false;
+  private readonly upserts = new Map<string, Page>();
+  private readonly removals = new Set<string>();
+
+  start() {
+    this.recording = true;
+  }
+
+  recordUpserts(incoming: Page[]) {
+    if (!this.recording) return;
+    for (const page of incoming) {
+      const previous = this.upserts.get(page.id);
+      if (!previous || page.revision >= previous.revision) this.upserts.set(page.id, page);
+      this.removals.delete(page.id);
+    }
+  }
+
+  recordRemovals(pageIds: string[]) {
+    if (!this.recording) return;
+    for (const pageId of pageIds) {
+      this.upserts.delete(pageId);
+      this.removals.add(pageId);
+    }
+  }
+
+  consume() {
+    const result = {
+      upserts: [...this.upserts.values()],
+      removals: new Set(this.removals),
+    };
+    this.upserts.clear();
+    this.removals.clear();
+    this.recording = false;
+    return result;
+  }
+}
+
 export function mergePages(current: Page[], incoming: Page[]) {
   const pages = new Map(current.map((page) => [page.id, page]));
   for (const page of incoming) {

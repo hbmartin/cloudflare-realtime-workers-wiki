@@ -18,16 +18,32 @@ function normalizeWeakEtag(value: string) {
   return value.trim().replace(/^W\//i, "");
 }
 
+function splitEntityTags(condition: string) {
+  const tags: string[] = [];
+  let start = 0;
+  let quoted = false;
+  for (let index = 0; index < condition.length; index += 1) {
+    const character = condition[index];
+    if (character === '"') quoted = !quoted;
+    if (character === "," && !quoted) {
+      tags.push(condition.slice(start, index));
+      start = index + 1;
+    }
+  }
+  tags.push(condition.slice(start));
+  return tags;
+}
+
 function weakEtagMatches(condition: string, etag: string) {
   return condition.trim() === "*"
-    || condition.split(",").some((candidate) => normalizeWeakEtag(candidate) === normalizeWeakEtag(etag));
+    || splitEntityTags(condition).some((candidate) => normalizeWeakEtag(candidate) === normalizeWeakEtag(etag));
 }
 
 function strongEtagMatches(condition: string, etag: string) {
   const normalizedEtag = etag.trim();
   if (condition.trim() === "*") return true;
   if (/^W\//i.test(normalizedEtag)) return false;
-  return condition.split(",").some((candidate) => {
+  return splitEntityTags(condition).some((candidate) => {
     const normalizedCandidate = candidate.trim();
     return !/^W\//i.test(normalizedCandidate) && normalizedCandidate === normalizedEtag;
   });

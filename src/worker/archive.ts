@@ -27,6 +27,13 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
     }>();
     if (!claimed) return false;
     attempts = claimed.attempts;
+    const completeClaim = async () => {
+      await env.DB.prepare(
+        `DELETE FROM archive_disconnect_targets
+          WHERE page_id = ? AND content_epoch = ? AND next_attempt_at = ?`,
+      ).bind(target.page_id, target.content_epoch, leaseUntil).run();
+      return true;
+    };
 
     const page = await env.DB.prepare(
       `SELECT p.content_epoch, p.archived_at, w.location_hint
@@ -38,11 +45,7 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
       location_hint: string | null;
     }>();
     if (!page || page.archived_at === null || page.content_epoch !== target.content_epoch) {
-      await env.DB.prepare(
-        `DELETE FROM archive_disconnect_targets
-          WHERE page_id = ? AND content_epoch = ? AND next_attempt_at = ?`,
-      ).bind(target.page_id, target.content_epoch, leaseUntil).run();
-      return true;
+      return await completeClaim();
     }
 
     const hint = locationHint(page.location_hint ?? undefined);
@@ -55,12 +58,9 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
       headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
       signal: AbortSignal.timeout(ARCHIVE_DISCONNECT_TIMEOUT_MS),
     }));
+    if (response.status === 410) return await completeClaim();
     if (!response.ok) throw new Error(`Document archive failed with ${response.status}`);
-    await env.DB.prepare(
-      `DELETE FROM archive_disconnect_targets
-        WHERE page_id = ? AND content_epoch = ? AND next_attempt_at = ?`,
-    ).bind(target.page_id, target.content_epoch, leaseUntil).run();
-    return true;
+    return await completeClaim();
   } catch (error) {
     const nextAttempts = attempts + 1;
     const delay = Math.min(60 * 60_000, 10_000 * 2 ** Math.min(nextAttempts - 1, 8));
