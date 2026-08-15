@@ -8,6 +8,7 @@ import type { Env } from "./env";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
 const COMPACTION_DELAY_MS = 30_000;
+const RESTORE_RECONCILE_DELAY_MS = 5_000;
 const VERSION_INTERVAL_MS = 15 * 60_000;
 const VERSION_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const WARN_BYTES = 16 * 1024 * 1024;
@@ -37,6 +38,13 @@ interface PageProjectionRow {
   archived_at: number | null;
 }
 
+interface RestoreRecoveryRow extends Record<string, SqlStorageValue> {
+  old_epoch: number;
+  new_epoch: number;
+  new_key: string;
+  pre_key: string | null;
+}
+
 export class Document extends YServer {
   static options = { hibernate: true };
   static callbackOptions = { debounceWait: 1_000, debounceMaxWait: 5_000 };
@@ -48,7 +56,7 @@ export class Document extends YServer {
   private pendingAuthorId: string | null = null;
   private purged = false;
   private transition: "archive" | "restore" | null = null;
-  private restoreValidation = false;
+  private validatingTransition = false;
   private compaction: Promise<void> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
@@ -101,12 +109,19 @@ export class Document extends YServer {
       data BLOB NOT NULL,
       PRIMARY KEY (seq, chunk_index)
     )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS restore_recovery (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      old_epoch INTEGER NOT NULL,
+      new_epoch INTEGER NOT NULL,
+      new_key TEXT NOT NULL,
+      pre_key TEXT
+    )`);
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_update_chunks_seq ON update_chunks(seq, chunk_index)`);
     this.metadata = sql.exec<MetaRow>(`SELECT * FROM document_meta WHERE id = 1`).one();
 
     // Normal hibernation wakes stay independent of D1. New state still needs
     // an authoritative check so a purged room cannot restart without its tombstone.
-    if (!hadMetadata || this.metadata.restore_pending) {
+    if (!hadMetadata) {
       const { pageId, epoch } = this.ids;
       const current = await this.bindings.DB.prepare(
         `SELECT content_epoch FROM pages WHERE id = ?`,
@@ -119,6 +134,8 @@ export class Document extends YServer {
           WHERE id = 1`,
         this.metadata.retired,
       );
+    } else if (this.metadata.restore_pending) {
+      await this.reconcilePendingRestore();
     }
 
     await super.onStart();
@@ -191,11 +208,12 @@ export class Document extends YServer {
   isReadOnly(connection: Connection<ConnectionAuth>) {
     return Boolean(
       this.metadata.retired ||
-        this.transition ||
-        this.metadata.read_only ||
-        connection.state?.role === "viewer" ||
-        !connection.state ||
-        connection.state.expiresAt <= Date.now(),
+      this.metadata.restore_pending ||
+      this.transition ||
+      this.metadata.read_only ||
+      connection.state?.role === "viewer" ||
+      !connection.state ||
+      connection.state.expiresAt <= Date.now(),
     );
   }
 
@@ -205,7 +223,7 @@ export class Document extends YServer {
       connection.close(4401, "Authorization expired. Reconnect to continue.");
       return;
     }
-    if (this.metadata.retired || this.purged || this.transition === "restore") {
+    if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition === "restore") {
       connection.close(4410, "This document version has been retired.");
       return;
     }
@@ -244,7 +262,8 @@ export class Document extends YServer {
   }
 
   async onAlarm() {
-    if (this.purged) return;
+    if (this.metadata.restore_pending) await this.reconcilePendingRestore();
+    if (this.purged || this.metadata.retired || this.metadata.restore_pending) return;
     this.flushPendingUpdates();
     const time = Date.now();
     for (const connection of this.getConnections<ConnectionAuth>()) {
@@ -267,32 +286,38 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "POST" && url.pathname.endsWith("/archive")) {
-      if (this.restoreValidation || this.transition) {
+      if (this.validatingTransition || this.transition || this.metadata.restore_pending) {
         return Response.json({ error: "Document transition already in progress." }, { status: 409 });
       }
-      const { pageId, epoch } = this.ids;
-      const page = await this.bindings.DB.prepare(
-        `SELECT content_epoch, archived_at FROM pages WHERE id = ?`,
-      ).bind(pageId).first<{ content_epoch: number; archived_at: number | null }>();
-      if (!page || page.content_epoch !== epoch || page.archived_at === null) {
-        return Response.json(
-          { error: "The page is no longer archived.", code: "archive_no_longer_applicable" },
-          { status: 410 },
-        );
-      }
-      if (this.restoreValidation || this.transition || this.metadata.retired || this.purged) {
-        return Response.json({ error: "Document transition already in progress." }, { status: 409 });
-      }
-      this.transition = "archive";
+      this.validatingTransition = true;
       try {
-        for (const connection of this.getConnections()) {
-          connection.close(4412, "This page was archived.");
+        const { pageId, epoch } = this.ids;
+        const page = await this.bindings.DB.prepare(`SELECT content_epoch, archived_at FROM pages WHERE id = ?`)
+          .bind(pageId)
+          .first<{ content_epoch: number; archived_at: number | null }>();
+        if (!page || page.content_epoch !== epoch || page.archived_at === null) {
+          return Response.json(
+            { error: "The page is no longer archived.", code: "archive_no_longer_applicable" },
+            { status: 410 },
+          );
         }
-        this.flushPendingUpdates();
-        if (this.metadata.dirty) await this.compact(true);
-        return Response.json({ archived: true });
+        if (this.transition || this.metadata.restore_pending || this.metadata.retired || this.purged) {
+          return Response.json({ error: "Document transition already in progress." }, { status: 409 });
+        }
+        this.transition = "archive";
+        this.validatingTransition = false;
+        try {
+          for (const connection of this.getConnections()) {
+            connection.close(4412, "This page was archived.");
+          }
+          this.flushPendingUpdates();
+          if (this.metadata.dirty) await this.compact(true);
+          return Response.json({ archived: true });
+        } finally {
+          this.transition = null;
+        }
       } finally {
-        this.transition = null;
+        this.validatingTransition = false;
       }
     }
     if (request.method === "POST" && url.pathname.endsWith("/restore-version")) {
@@ -323,7 +348,7 @@ export class Document extends YServer {
   }
 
   private bufferUpdate(update: Uint8Array, origin: Connection<ConnectionAuth> | null) {
-    if (this.metadata.retired || this.purged || this.transition) return;
+    if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) return;
     this.pendingUpdates.push(update);
     this.pendingAuthorId = origin?.state?.userId ?? this.pendingAuthorId;
   }
@@ -600,11 +625,100 @@ export class Document extends YServer {
     }
   }
 
+  private restoreRecovery() {
+    return (
+      this.state.storage.sql
+        .exec<RestoreRecoveryRow>(`SELECT old_epoch, new_epoch, new_key, pre_key FROM restore_recovery WHERE id = 1`)
+        .toArray()[0] ?? null
+    );
+  }
+
+  private recordRestoreRecovery(recovery: RestoreRecoveryRow) {
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO restore_recovery
+        (id, old_epoch, new_epoch, new_key, pre_key)
+       VALUES (1, ?, ?, ?, ?)`,
+      recovery.old_epoch,
+      recovery.new_epoch,
+      recovery.new_key,
+      recovery.pre_key,
+    );
+    this.metadata.restore_pending = 1;
+    this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
+  }
+
+  private clearRestoreRecovery(retired: boolean) {
+    this.metadata.retired = retired ? 1 : 0;
+    this.metadata.restore_pending = 0;
+    this.state.storage.sql.exec(
+      `UPDATE document_meta SET retired = ?, restore_pending = 0 WHERE id = 1`,
+      this.metadata.retired,
+    );
+    this.state.storage.sql.exec(`DELETE FROM restore_recovery WHERE id = 1`);
+  }
+
+  private async deleteRestoreObjects(recovery: Pick<RestoreRecoveryRow, "new_key" | "pre_key">) {
+    await Promise.all([
+      this.bindings.BUCKET.delete(recovery.new_key),
+      ...(recovery.pre_key ? [this.bindings.BUCKET.delete(recovery.pre_key)] : []),
+    ]);
+  }
+
+  private async deferRestoreReconciliation(error: unknown) {
+    console.error("Failed to reconcile pending document restore", error);
+    try {
+      await this.scheduleAlarm(Date.now() + RESTORE_RECONCILE_DELAY_MS);
+    } catch (alarmError) {
+      console.error("Failed to schedule restore reconciliation", alarmError);
+    }
+  }
+
+  private async reconcilePendingRestore() {
+    const recovery = this.restoreRecovery();
+    const { pageId, epoch } = this.ids;
+    let current: { content_epoch: number } | null;
+    try {
+      current = await this.bindings.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ?`)
+        .bind(pageId)
+        .first<{ content_epoch: number }>();
+    } catch (error) {
+      await this.deferRestoreReconciliation(error);
+      return false;
+    }
+
+    if (!recovery) {
+      this.clearRestoreRecovery(!current || current.content_epoch !== epoch);
+      return true;
+    }
+
+    if (current?.content_epoch === recovery.old_epoch) {
+      try {
+        await this.deleteRestoreObjects(recovery);
+      } catch (error) {
+        await this.deferRestoreReconciliation(error);
+        return false;
+      }
+      this.clearRestoreRecovery(false);
+      return true;
+    }
+
+    // The new epoch, a later epoch, or a deleted page all retire this room.
+    // The restore objects must be retained because the D1 batch may reference them.
+    this.clearRestoreRecovery(true);
+    return true;
+  }
+
   private async restoreVersion(versionId: string, userId: string) {
-    if (this.restoreValidation || this.transition || this.metadata.retired || this.purged) {
+    if (
+      this.validatingTransition ||
+      this.transition ||
+      this.metadata.restore_pending ||
+      this.metadata.retired ||
+      this.purged
+    ) {
       return Response.json({ error: "Document transition already in progress." }, { status: 409 });
     }
-    this.restoreValidation = true;
+    this.validatingTransition = true;
     try {
       const { pageId, epoch } = this.ids;
       let selectedBytes: Uint8Array;
@@ -621,26 +735,30 @@ export class Document extends YServer {
         return Response.json({ error: "The version could not be restored." }, { status: 503 });
       }
 
-      if (this.transition || this.metadata.retired || this.purged) {
+      if (this.transition || this.metadata.restore_pending || this.metadata.retired || this.purged) {
         return Response.json({ error: "Document transition already in progress." }, { status: 409 });
       }
       this.transition = "restore";
-      this.restoreValidation = false;
+      this.validatingTransition = false;
       const newEpoch = epoch + 1;
-      let newKey: string | null = null;
+      const newKey = this.snapshotKey(pageId, newEpoch);
       let preKey: string | null = null;
       let commitState: "committed" | "not-committed" | "unknown" = "unknown";
       const markRestoreCommitted = () => {
-        this.metadata.retired = 1;
-        this.metadata.restore_pending = 0;
         try {
-          this.state.storage.sql.exec(
-            `UPDATE document_meta SET retired = 1, restore_pending = 0 WHERE id = 1`,
-          );
+          this.clearRestoreRecovery(true);
         } catch (error) {
           // D1 is authoritative for routing. A restarted old room also reconciles
           // its retired state from the committed epoch before accepting clients.
           console.error("Failed to persist retired document state", error);
+        }
+      };
+      const cleanupUncommittedRestore = async () => {
+        try {
+          await this.deleteRestoreObjects({ new_key: newKey, pre_key: preKey });
+          this.clearRestoreRecovery(false);
+        } catch (error) {
+          await this.deferRestoreReconciliation(error);
         }
       };
       try {
@@ -650,15 +768,25 @@ export class Document extends YServer {
         this.flushPendingUpdates();
 
         const hadPendingLog = Boolean(this.metadata.dirty);
-        newKey = this.snapshotKey(pageId, newEpoch);
         if (hadPendingLog) await this.compact(true);
 
         const statements: D1PreparedStatement[] = [];
+        let preVersion: { id: string; snapshot: Uint8Array } | null = null;
         if (!hadPendingLog) {
           const currentSnapshot = Y.encodeStateAsUpdate(this.document);
           const preId = crypto.randomUUID();
           preKey = `documents/${pageId}/versions/${preId}.bin`;
-          await this.bindings.BUCKET.put(preKey, currentSnapshot, {
+          preVersion = { id: preId, snapshot: currentSnapshot };
+        }
+
+        this.recordRestoreRecovery({
+          old_epoch: epoch,
+          new_epoch: newEpoch,
+          new_key: newKey,
+          pre_key: preKey,
+        });
+        if (preVersion && preKey) {
+          await this.bindings.BUCKET.put(preKey, preVersion.snapshot, {
             httpMetadata: { contentType: "application/octet-stream" },
             customMetadata: { pageId, epoch: String(epoch), sequence: String(this.metadata.snapshot_seq) },
           });
@@ -667,21 +795,20 @@ export class Document extends YServer {
               (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
              SELECT ?, id, ?, ?, title, ?, ?, ?, ? FROM pages
               WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
-          ).bind(
-            preId,
-            epoch,
-            this.metadata.snapshot_seq,
-            preKey,
-            currentSnapshot.byteLength,
-            userId,
-            Date.now(),
-            pageId,
-            epoch,
-          ));
+            ).bind(
+              preVersion.id,
+              epoch,
+              this.metadata.snapshot_seq,
+              preKey,
+              preVersion.snapshot.byteLength,
+              userId,
+              Date.now(),
+              pageId,
+              epoch,
+            ),
+          );
         }
 
-        this.metadata.restore_pending = 1;
-        this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
         await this.bindings.BUCKET.put(newKey, selectedBytes, {
           httpMetadata: { contentType: "application/octet-stream" },
           customMetadata: { pageId, epoch: String(newEpoch), restoredFrom: versionId },
@@ -693,14 +820,8 @@ export class Document extends YServer {
         ).bind(newEpoch, Date.now(), pageId, epoch));
         const results = await this.bindings.DB.batch(statements);
         if (!results.at(-1)?.meta.changes) {
-          await Promise.all([
-            this.bindings.BUCKET.delete(newKey),
-            preKey ? this.bindings.BUCKET.delete(preKey) : Promise.resolve(),
-          ]);
-          newKey = null;
-          preKey = null;
-          this.metadata.restore_pending = 0;
-          this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 0 WHERE id = 1`);
+          commitState = "not-committed";
+          await cleanupUncommittedRestore();
           return Response.json({ error: "The page epoch changed during restore." }, { status: 409 });
         }
         commitState = "committed";
@@ -719,18 +840,11 @@ export class Document extends YServer {
           }
         }
         if (commitState === "not-committed") {
-          await Promise.allSettled([
-            ...(newKey ? [this.bindings.BUCKET.delete(newKey)] : []),
-            ...(preKey ? [this.bindings.BUCKET.delete(preKey)] : []),
-          ]);
-          this.metadata.restore_pending = 0;
-          try {
-            this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 0 WHERE id = 1`);
-          } catch (storageError) {
-            console.error("Failed to clear pending restore state", storageError);
-          }
+          await cleanupUncommittedRestore();
         } else if (commitState === "committed") {
           markRestoreCommitted();
+        } else {
+          await this.deferRestoreReconciliation(error);
         }
         console.error("Document restore failed", error);
         return Response.json({ error: "The version could not be restored." }, { status: 503 });
@@ -738,7 +852,7 @@ export class Document extends YServer {
         this.transition = null;
       }
     } finally {
-      this.restoreValidation = false;
+      this.validatingTransition = false;
     }
   }
 

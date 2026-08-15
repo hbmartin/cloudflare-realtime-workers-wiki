@@ -98,16 +98,23 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
         }
       } catch (error) {
         if (!active || check !== closeCheck) return;
-        if (error instanceof ApiClientError && error.status === 404) {
+        if (error instanceof ApiClientError && [401, 403, 404].includes(error.status)) {
           onPageUnavailable(page.id);
           return;
         }
         const retryable = !(error instanceof ApiClientError) || error.status === 429 || error.status >= 500;
-        if ((code === 4410 || code === 4412) && retryable && attempt < 3) {
-          recheckTimer = window.setTimeout(() => {
-            recheckTimer = undefined;
-            void reconcileClose(code, check, attempt + 1);
-          }, 1_000 * 2 ** attempt);
+        if (code === 4410 || code === 4412) {
+          if (!retryable) {
+            onPageUnavailable(page.id);
+            return;
+          }
+          recheckTimer = window.setTimeout(
+            () => {
+              recheckTimer = undefined;
+              void reconcileClose(code, check, attempt + 1);
+            },
+            Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5)),
+          );
         }
       }
     };

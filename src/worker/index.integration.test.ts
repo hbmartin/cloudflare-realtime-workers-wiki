@@ -71,6 +71,7 @@ async function createPage(cookie: string, kind: "document" | "table" = "document
 
 type TestDocument = {
   document: Y.Doc;
+  onAlarm(): Promise<void>;
   onSave(): Promise<void>;
   onRequest(request: Request): Promise<Response>;
   compact(forceVersion?: boolean): Promise<void>;
@@ -332,6 +333,74 @@ describe("Worker integration", () => {
     });
   });
 
+  it("claims archive validation before awaiting D1", async () => {
+    const installed = await bootstrap();
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), installed.pageId).run();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(
+      new Request("https://document.internal/noop", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      const originalBindings = document.bindings;
+      let releaseLookup!: () => void;
+      let markLookupStarted!: () => void;
+      const lookupGate = new Promise<void>((resolve) => {
+        releaseLookup = resolve;
+      });
+      const lookupStarted = new Promise<void>((resolve) => {
+        markLookupStarted = resolve;
+      });
+      const database = new Proxy(originalBindings.DB, {
+        get(target, property, receiver) {
+          if (property !== "prepare") return Reflect.get(target, property, receiver);
+          return (query: string) => {
+            const statement = target.prepare(query);
+            if (!query.includes("SELECT content_epoch, archived_at FROM pages")) return statement;
+            return {
+              bind: (...args: unknown[]) => {
+                const bound = statement.bind(...args);
+                return {
+                  first: async <T>() => {
+                    markLookupStarted();
+                    await lookupGate;
+                    return bound.first<T>();
+                  },
+                };
+              },
+            };
+          };
+        },
+      });
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property === "DB") return database;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+
+      const request = () =>
+        new Request("https://document.internal/archive", {
+          method: "POST",
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        });
+      try {
+        const first = document.onRequest(request());
+        await lookupStarted;
+        expect((await document.onRequest(request())).status).toBe(409);
+        expect((await document.restoreVersion(crypto.randomUUID(), installed.userId)).status).toBe(409);
+        releaseLookup();
+        expect((await first).status).toBe(200);
+      } finally {
+        document.bindings = originalBindings;
+        releaseLookup();
+      }
+    });
+  });
+
   it("releases an archive transition when flushing storage fails", async () => {
     const installed = await bootstrap();
     await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`)
@@ -346,14 +415,24 @@ describe("Worker integration", () => {
       const originalFlush = document.flushPendingUpdates;
       document.flushPendingUpdates = () => { throw new Error("storage unavailable"); };
       try {
-        await expect(document.onRequest(new Request("https://document.internal/archive", {
-          method: "POST",
-          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-        }))).rejects.toThrow("storage unavailable");
-        expect(document.transition).toBeNull();
+        await expect(
+          document.onRequest(
+            new Request("https://document.internal/archive", {
+              method: "POST",
+              headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+            }),
+          ),
+        ).rejects.toThrow("storage unavailable");
       } finally {
         document.flushPendingUpdates = originalFlush;
       }
+      const retried = await document.onRequest(
+        new Request("https://document.internal/archive", {
+          method: "POST",
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        }),
+      );
+      expect(retried.status).toBe(200);
     });
   });
 
@@ -608,6 +687,113 @@ describe("Worker integration", () => {
     expect((await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ?`)
       .bind(installed.pageId).first<{ content_epoch: number }>())?.content_epoch).toBe(2);
     expect(await env.BUCKET.get(`documents/${installed.pageId}/epochs/2/current.bin`)).toBeTruthy();
+    const preRestore = await env.DB.prepare(
+      `SELECT r2_key FROM page_versions WHERE page_id = ? AND epoch = 1 AND id <> ?`,
+    )
+      .bind(installed.pageId, version!.id)
+      .first<{ r2_key: string }>();
+    expect(preRestore).toBeTruthy();
+    expect(await env.BUCKET.get(preRestore!.r2_key)).toBeTruthy();
+  });
+
+  it("reconciles an unresolved restore from an alarm", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(
+      new Request("https://document.internal/noop", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      document.document.getMap("unknown-restore").set("value", 1);
+      await document.onSave();
+      await document.compact(true);
+    });
+    const version = await env.DB.prepare(
+      `SELECT id FROM page_versions WHERE page_id = ? ORDER BY created_at DESC LIMIT 1`,
+    )
+      .bind(installed.pageId)
+      .first<{ id: string }>();
+    expect(version).toBeTruthy();
+
+    let recovery!: { new_key: string; pre_key: string | null };
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      const originalBindings = document.bindings;
+      const unavailableDatabase = new Proxy(originalBindings.DB, {
+        get(target, property, receiver) {
+          if (property === "batch")
+            return async () => {
+              throw new Error("D1 batch unavailable");
+            };
+          if (property !== "prepare") return Reflect.get(target, property, receiver);
+          return (query: string) => {
+            const statement = target.prepare(query);
+            if (!query.includes("SELECT content_epoch FROM pages WHERE id = ?")) return statement;
+            return {
+              bind: (...args: unknown[]) => {
+                statement.bind(...args);
+                return {
+                  first: async () => {
+                    throw new Error("D1 confirmation unavailable");
+                  },
+                };
+              },
+            };
+          };
+        },
+      });
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property === "DB") return unavailableDatabase;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      try {
+        const response = await document.restoreVersion(version!.id, installed.userId);
+        expect(response.status).toBe(503);
+        expect(
+          state.storage.sql
+            .exec<{ retired: number; restore_pending: number }>(
+              `SELECT retired, restore_pending FROM document_meta WHERE id = 1`,
+            )
+            .one(),
+        ).toEqual({ retired: 0, restore_pending: 1 });
+        recovery = state.storage.sql
+          .exec<{ new_key: string; pre_key: string | null }>(
+            `SELECT new_key, pre_key FROM restore_recovery WHERE id = 1`,
+          )
+          .one();
+        expect(await state.storage.getAlarm()).not.toBeNull();
+        expect(await env.BUCKET.get(recovery.new_key)).toBeTruthy();
+        expect(await env.BUCKET.get(recovery.pre_key!)).toBeTruthy();
+      } finally {
+        document.bindings = originalBindings;
+      }
+
+      await document.onAlarm();
+      expect(
+        state.storage.sql
+          .exec<{ retired: number; restore_pending: number }>(
+            `SELECT retired, restore_pending FROM document_meta WHERE id = 1`,
+          )
+          .one(),
+      ).toEqual({ retired: 0, restore_pending: 0 });
+      expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count).toBe(
+        0,
+      );
+    });
+
+    expect(
+      (
+        await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ?`)
+          .bind(installed.pageId)
+          .first<{ content_epoch: number }>()
+      )?.content_epoch,
+    ).toBe(1);
+    expect(await env.BUCKET.get(recovery.new_key)).toBeNull();
+    expect(await env.BUCKET.get(recovery.pre_key!)).toBeNull();
   });
 
   it("rejects a concurrent restore before it can share the next epoch snapshot key", async () => {

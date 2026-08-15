@@ -70,4 +70,16 @@ describe("R2 conditional response status", () => {
       "if-match": '"different", W/"revision,2"',
     }), commaObject)).toBe(412);
   });
+
+  it("treats wildcard conditions as a match", () => {
+    expect(conditionalGetStatus(new Headers({ "if-match": "*" }), object)).toBe(200);
+    expect(conditionalGetStatus(new Headers({ "if-none-match": "*" }), object)).toBe(304);
+  });
+
+  it("ignores empty entity-tag list members", () => {
+    expect(conditionalGetStatus(new Headers({ "if-none-match": `"current",` }), object)).toBe(304);
+    expect(conditionalGetStatus(new Headers({ "if-match": `"current",` }), object)).toBe(200);
+    expect(conditionalGetStatus(new Headers({ "if-match": " , " }), object)).toBe(412);
+    expect(conditionalGetStatus(new Headers({ "if-none-match": " , " }), object)).toBe(200);
+  });
 });

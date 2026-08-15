@@ -17,7 +17,7 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
   try {
     const claimed = await env.DB.prepare(
       `UPDATE archive_disconnect_targets
-          SET next_attempt_at = ?, updated_at = ?
+          SET attempts = attempts + 1, next_attempt_at = ?, updated_at = ?
         WHERE page_id = ? AND content_epoch = ? AND next_attempt_at <= ?
         RETURNING workspace_id, room, attempts`,
     ).bind(leaseUntil, claimedAt, target.page_id, target.content_epoch, claimedAt).first<{
@@ -62,23 +62,25 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
     if (!response.ok) throw new Error(`Document archive failed with ${response.status}`);
     return await completeClaim();
   } catch (error) {
-    const nextAttempts = attempts + 1;
-    const delay = Math.min(60 * 60_000, 10_000 * 2 ** Math.min(nextAttempts - 1, 8));
+    const recordedAttempts = Math.max(1, attempts);
+    const delay = Math.min(60 * 60_000, 10_000 * 2 ** Math.min(recordedAttempts - 1, 8));
     const message = error instanceof Error ? error.message : "Unknown document archive failure";
     try {
       await env.DB.prepare(
         `UPDATE archive_disconnect_targets
             SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
           WHERE page_id = ? AND content_epoch = ? AND next_attempt_at = ?`,
-      ).bind(
-        nextAttempts,
-        Date.now() + delay,
-        message.slice(0, 1_000),
-        Date.now(),
-        target.page_id,
-        target.content_epoch,
-        leaseUntil,
-      ).run();
+      )
+        .bind(
+          recordedAttempts,
+          Date.now() + delay,
+          message.slice(0, 1_000),
+          Date.now(),
+          target.page_id,
+          target.content_epoch,
+          leaseUntil,
+        )
+        .run();
     } catch (retryError) {
       // The original target row remains due and can be retried by the next cron.
       console.error("Failed to reschedule archive disconnect", retryError);
