@@ -661,27 +661,32 @@ export class Document extends YServer {
   }
 
   private recordRestoreRecovery(recovery: RestoreRecoveryRow) {
-    this.state.storage.sql.exec(
-      `INSERT OR REPLACE INTO restore_recovery
-        (id, old_epoch, new_epoch, new_key, pre_key)
-       VALUES (1, ?, ?, ?, ?)`,
-      recovery.old_epoch,
-      recovery.new_epoch,
-      recovery.new_key,
-      recovery.pre_key,
-    );
-    this.metadata.restore_pending = 1;
-    this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO restore_recovery
+          (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, ?, ?, ?, ?)`,
+        recovery.old_epoch,
+        recovery.new_epoch,
+        recovery.new_key,
+        recovery.pre_key,
+      );
+      this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
+      this.metadata.restore_pending = 1;
+    });
   }
 
   private clearRestoreRecovery(retired: boolean) {
-    this.metadata.retired = retired ? 1 : 0;
-    this.metadata.restore_pending = 0;
-    this.state.storage.sql.exec(
-      `UPDATE document_meta SET retired = ?, restore_pending = 0 WHERE id = 1`,
-      this.metadata.retired,
-    );
-    this.state.storage.sql.exec(`DELETE FROM restore_recovery WHERE id = 1`);
+    const retiredFlag = retired ? 1 : 0;
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(
+        `UPDATE document_meta SET retired = ?, restore_pending = 0 WHERE id = 1`,
+        retiredFlag,
+      );
+      this.state.storage.sql.exec(`DELETE FROM restore_recovery WHERE id = 1`);
+      this.metadata.retired = retiredFlag;
+      this.metadata.restore_pending = 0;
+    });
   }
 
   private async deleteRestoreObjects(recovery: Pick<RestoreRecoveryRow, "new_key" | "pre_key">) {

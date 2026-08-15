@@ -29,6 +29,12 @@ function authenticatedRequest(cookie: string, path: string, init: RequestInit = 
   return new Request(`http://example.test${path}`, { ...init, headers });
 }
 
+function internalWarmupRequest() {
+  return new Request("https://document.internal/noop", {
+    headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+  });
+}
+
 async function bootstrap(): Promise<InstalledWorkspace> {
   const response = await SELF.fetch("http://example.test/api/install/bootstrap", {
     method: "POST",
@@ -311,11 +317,7 @@ describe("Worker integration", () => {
   it("coalesces document updates and never reuses a drained sequence", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
 
     await runInDurableObject(stub, async (instance, state) => {
       const document = instance as unknown as TestDocument;
@@ -349,11 +351,7 @@ describe("Worker integration", () => {
 
   it("retires newly-created room state when its page no longer exists", async () => {
     const stub = env.DOCUMENT.getByName(`${crypto.randomUUID()}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
 
     await runInDurableObject(stub, async (_instance, state) => {
       expect(
@@ -365,11 +363,7 @@ describe("Worker integration", () => {
   it("validates a restore before closing collaborators", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
 
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
@@ -392,11 +386,7 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), installed.pageId).run();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
 
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
@@ -460,11 +450,7 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), installed.pageId).run();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
 
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
@@ -497,11 +483,7 @@ describe("Worker integration", () => {
   it("preserves updates and alarms that arrive while compaction is awaiting storage", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
 
     await runInDurableObject(stub, async (instance, state) => {
       const document = instance as unknown as TestDocument;
@@ -537,11 +519,7 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), installed.pageId).run();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
 
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
@@ -613,11 +591,7 @@ describe("Worker integration", () => {
   it("re-dirties and reschedules a document after failed compaction", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
 
     await runInDurableObject(stub, async (instance, state) => {
       const document = instance as unknown as TestDocument;
@@ -649,11 +623,7 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     const room = `${installed.pageId}~1`;
     const stub = env.DOCUMENT.getByName(room);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
 
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
@@ -729,11 +699,7 @@ describe("Worker integration", () => {
   it("keeps the new snapshot when a restore batch commits before its response fails", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
       document.document.getMap("ambiguous-restore").set("value", 1);
@@ -802,11 +768,7 @@ describe("Worker integration", () => {
   it("reconciles an unresolved restore from an alarm", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
       document.document.getMap("unknown-restore").set("value", 1);
@@ -903,11 +865,7 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     const room = `${installed.pageId}~1`;
     const stub = env.DOCUMENT.getByName(room);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
       document.document.getMap("restore-race").set("value", 1);
@@ -972,11 +930,7 @@ describe("Worker integration", () => {
   it("flushes an archived document without resurrecting its search row", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
       const fragment = document.document.getXmlFragment("document-store");
@@ -1023,11 +977,7 @@ describe("Worker integration", () => {
   it("keeps an archived page committed and retries a failed room disconnect", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
     let originalBindings!: Cloudflare.Env;
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
@@ -1259,11 +1209,7 @@ describe("Worker integration", () => {
     ]);
 
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
       const fragment = document.document.getXmlFragment("document-store");
@@ -1512,11 +1458,7 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     const room = `${installed.pageId}~1`;
     const stub = env.DOCUMENT.getByName(room);
-    await stub.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await stub.fetch(internalWarmupRequest());
     await runInDurableObject(stub, async (instance, state) => {
       const document = instance as unknown as TestDocument;
       document.document.getMap("restart-content").set("value", 1);
@@ -1527,11 +1469,7 @@ describe("Worker integration", () => {
 
     await abortAllDurableObjects();
     const restarted = env.DOCUMENT.getByName(room);
-    await restarted.fetch(
-      new Request("https://document.internal/noop", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-      }),
-    );
+    await restarted.fetch(internalWarmupRequest());
     await runInDurableObject(restarted, async (_instance, state) => {
       expect(
         state.storage.sql.exec<{ dirty: number }>(`SELECT dirty FROM document_meta WHERE id = 1`).one().dirty,

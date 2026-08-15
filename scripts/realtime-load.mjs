@@ -72,7 +72,7 @@ try {
   await waitForHealth();
   const cookie = await authenticate();
   if (!cookie) throw new Error("Authentication did not return a session cookie.");
-  const treeResponse = await fetch(`${baseURL}/api/pages/tree`, { headers: { cookie } });
+  const treeResponse = await fetch(`${baseURL}/api/pages/tree`, { headers: { cookie, origin: baseURL } });
   if (!treeResponse.ok) throw new Error(`Page tree failed (${treeResponse.status}).`);
   const { pages } = await treeResponse.json();
   const page = pages.find((item) => item.kind === "document");
@@ -97,7 +97,10 @@ try {
   await Promise.all(
     sockets.map(async (socket) => {
       socket.close(1000, "load check complete");
-      await Promise.race([once(socket, "close"), delay(5_000)]);
+      await Promise.race([
+        once(socket, "close"),
+        delay(5_000).then(() => Promise.reject(new Error("A realtime connection did not close."))),
+      ]);
     }),
   );
 } finally {

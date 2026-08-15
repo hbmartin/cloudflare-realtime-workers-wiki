@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import type { MemberContext } from "../shared/types";
+import type { MemberContext, MemberContextWire } from "../shared/types";
 import { buildTree } from "../shared/tree-model";
 import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent } from "../shared/types";
 import { ApiClientError, api, authClient, json } from "./api";
@@ -31,8 +31,11 @@ export function App() {
       return;
     }
     try {
-      const member = await api<MemberContext>("/api/me");
-      setState({ screen: "workspace", member });
+      const member = await api<MemberContextWire>("/api/me");
+      setState({
+        screen: "workspace",
+        member: { ...member, session: { ...member.session, expiresAt: new Date(member.session.expiresAt) } },
+      });
     } catch (error) {
       if (error instanceof ApiClientError && error.status === 401) setState({ screen: "signin" });
       else throw error;
@@ -207,14 +210,18 @@ function SignInScreen({ onComplete }: { onComplete: () => Promise<void> }) {
     setBusy(true);
     setError("");
     const values = Object.fromEntries(new FormData(event.currentTarget)) as { email: string; password: string };
-    const result = await authClient.signIn.email(values);
-    if (result.error) {
-      setError(result.error.message ?? "Sign in failed.");
+    try {
+      const result = await authClient.signIn.email(values);
+      if (result.error) {
+        setError(result.error.message ?? "Sign in failed.");
+        return;
+      }
+      await onComplete();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Sign in failed.");
+    } finally {
       setBusy(false);
-      return;
     }
-    await onComplete();
-    setBusy(false);
   }
   return (
     <AuthLayout

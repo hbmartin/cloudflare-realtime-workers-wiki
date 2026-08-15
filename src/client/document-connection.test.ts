@@ -27,7 +27,7 @@ const page: Page = {
   updatedAt: 1,
 };
 
-function setup() {
+function setup(hasUnsyncedChanges = false) {
   const provider = { connect: vi.fn(), disconnect: vi.fn() };
   const quarantine = vi.fn();
   const onPageChanged = vi.fn();
@@ -36,7 +36,7 @@ function setup() {
     page,
     provider,
     canQuarantine: true,
-    hasUnsyncedChanges: () => false,
+    hasUnsyncedChanges: () => hasUnsyncedChanges,
     quarantine,
     onPageChanged,
     onPageUnavailable,
@@ -78,6 +78,27 @@ describe("document close reconciliation", () => {
     expect(provider.connect).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1);
     expect(provider.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("quarantines unsynced changes when a restore transition closes the room", async () => {
+    mocks.api.mockResolvedValue({ page });
+    const { quarantine, reconciler } = setup(true);
+
+    reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
+    await flushPromises();
+
+    expect(quarantine).toHaveBeenCalledOnce();
+  });
+
+  it("quarantines unsynced changes when reconciliation discovers a new epoch", async () => {
+    mocks.api.mockResolvedValue({ page: { ...page, contentEpoch: 2 } });
+    const { quarantine, onPageChanged, reconciler } = setup(true);
+
+    reconciler.handleClose(new CloseEvent("close", { code: 1006 }));
+    await flushPromises();
+
+    expect(quarantine).toHaveBeenCalledOnce();
+    expect(onPageChanged).toHaveBeenCalledWith({ ...page, contentEpoch: 2 });
   });
 
   it("cancels an earlier retry when the room is permanently deleted", async () => {

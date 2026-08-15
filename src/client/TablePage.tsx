@@ -57,9 +57,13 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
 
   useEffect(() => {
     let active = true;
-    void load().then(() => {
-      if (active) void acquire();
-    });
+    void load()
+      .then(() => {
+        return active ? acquire() : undefined;
+      })
+      .catch((cause) => {
+        if (active) setError(cause instanceof Error ? cause.message : "Table could not be loaded.");
+      });
     return () => {
       active = false;
     };
@@ -67,8 +71,18 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
 
   useEffect(() => {
     if (!leaseToken) {
-      const poll = window.setInterval(() => void load(), 5_000);
-      return () => window.clearInterval(poll);
+      let active = true;
+      const poll = window.setInterval(
+        () =>
+          void load().catch((cause) => {
+            if (active) setError(cause instanceof Error ? cause.message : "Table could not be loaded.");
+          }),
+        5_000,
+      );
+      return () => {
+        active = false;
+        window.clearInterval(poll);
+      };
     }
     const renewLease = async () => {
       try {
@@ -80,7 +94,9 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         leaseTokenRef.current = null;
         setLeaseToken(null);
         setError("The editing lease was lost. Reloaded the authoritative table.");
-        await load();
+        await load().catch((cause) => {
+          setError(cause instanceof Error ? cause.message : "Table could not be loaded.");
+        });
       }
     };
     const renew = window.setInterval(() => void renewLease(), 20_000);
@@ -91,7 +107,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         headers: { "content-type": "application/json" },
         body: json({ leaseToken }),
         keepalive: true,
-      });
+      }).catch((cause) => console.error("Failed to release table lease", cause));
     };
   }, [leaseToken, load, page.id]);
 
@@ -415,6 +431,7 @@ function CellInput({
   if (column.type === "checkbox") {
     return (
       <input
+        aria-label={column.name}
         type="checkbox"
         checked={Boolean(value)}
         disabled={disabled}
@@ -425,6 +442,7 @@ function CellInput({
   if (column.type === "select") {
     return (
       <select
+        aria-label={column.name}
         value={String(value ?? "")}
         disabled={disabled}
         onChange={(event) => onCommit(event.target.value || null)}
@@ -440,6 +458,7 @@ function CellInput({
   }
   return (
     <input
+      aria-label={column.name}
       type={column.type === "number" ? "number" : column.type === "date" ? "date" : "text"}
       defaultValue={value === null ? "" : String(value)}
       disabled={disabled}
