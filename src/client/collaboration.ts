@@ -33,14 +33,38 @@ export function createCollaboration(
   let destroyed = false;
   let indexeddbSynced = false;
   let hasUnsyncedChanges = false;
+  let localGeneration = 0;
+  let acknowledgedGeneration = 0;
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
     onStatus(status === "disconnected" ? "offline" : status);
   };
   provider.on("status", handleStatus);
-  provider.on("sync", (synced: boolean) => { if (synced) hasUnsyncedChanges = false; });
+  const handleSync = (synced: boolean) => {
+    if (synced) {
+      acknowledgedGeneration = localGeneration;
+      hasUnsyncedChanges = false;
+    }
+  };
+  const handleCustomMessage = (message: string) => {
+    try {
+      const value = JSON.parse(message) as { type?: unknown; generation?: unknown };
+      if (value.type !== "document-update-ack" || !Number.isInteger(value.generation)) return;
+      acknowledgedGeneration = Math.max(acknowledgedGeneration, Number(value.generation));
+      hasUnsyncedChanges = acknowledgedGeneration < localGeneration;
+    } catch {
+      // Ignore custom messages from future server versions.
+    }
+  };
+  provider.on("sync", handleSync);
+  provider.on("custom-message", handleCustomMessage);
   doc.on("update", (_update: Uint8Array, origin: unknown) => {
-    if (origin !== provider && origin !== indexeddb) hasUnsyncedChanges = true;
+    if (origin === provider || origin === indexeddb) return;
+    localGeneration += 1;
+    hasUnsyncedChanges = true;
+    if (provider.wsconnected) {
+      provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation: localGeneration }));
+    }
   });
   indexeddb.whenSynced.then(() => {
     if (!destroyed) {
@@ -72,6 +96,8 @@ export function createCollaboration(
       if (hiddenTimer) window.clearTimeout(hiddenTimer);
       document.removeEventListener("visibilitychange", visibility);
       provider.off("status", handleStatus);
+      provider.off("sync", handleSync);
+      provider.off("custom-message", handleCustomMessage);
       provider.awareness.setLocalState(null);
       provider.destroy();
       indexeddb.destroy();

@@ -25,6 +25,7 @@ interface MetaRow extends Record<string, SqlStorageValue> {
   snapshot_bytes: number;
   dirty: number;
   retired: number;
+  restore_pending: number;
   read_only: number;
   last_version_at: number;
   last_editor_id: string | null;
@@ -47,6 +48,7 @@ export class Document extends YServer {
   private pendingAuthorId: string | null = null;
   private purged = false;
   private transition: "archive" | "restore" | null = null;
+  private compaction: Promise<void> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -71,6 +73,7 @@ export class Document extends YServer {
       snapshot_bytes INTEGER NOT NULL DEFAULT 0,
       dirty INTEGER NOT NULL DEFAULT 0,
       retired INTEGER NOT NULL DEFAULT 0,
+      restore_pending INTEGER NOT NULL DEFAULT 0,
       read_only INTEGER NOT NULL DEFAULT 0,
       last_version_at INTEGER NOT NULL DEFAULT 0,
       last_editor_id TEXT
@@ -78,6 +81,9 @@ export class Document extends YServer {
     const metaColumns = sql.exec<{ name: string }>(`PRAGMA table_info(document_meta)`).toArray();
     if (!metaColumns.some((column) => column.name === "snapshot_bytes")) {
       sql.exec(`ALTER TABLE document_meta ADD COLUMN snapshot_bytes INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!metaColumns.some((column) => column.name === "restore_pending")) {
+      sql.exec(`ALTER TABLE document_meta ADD COLUMN restore_pending INTEGER NOT NULL DEFAULT 0`);
     }
     sql.exec(`INSERT OR IGNORE INTO document_meta (id) VALUES (1)`);
     sql.exec(`CREATE TABLE IF NOT EXISTS update_events (
@@ -94,19 +100,21 @@ export class Document extends YServer {
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_update_chunks_seq ON update_chunks(seq, chunk_index)`);
     this.metadata = sql.exec<MetaRow>(`SELECT * FROM document_meta WHERE id = 1`).one();
 
-    const { pageId, epoch } = this.ids;
-    const current = await this.bindings.DB.prepare(
-      `SELECT content_epoch FROM pages WHERE id = ?`,
-    ).bind(pageId).first<{ content_epoch: number }>();
-    if (!current || current.content_epoch !== epoch) {
-      this.metadata.retired = 1;
-      sql.exec(`UPDATE document_meta SET retired = 1 WHERE id = 1`);
-    } else if (this.metadata.retired) {
-      // A restore can crash after making this room temporarily terminal but
-      // before the guarded D1 epoch change. In that case this is still the
-      // authoritative room and must recover on restart.
-      this.metadata.retired = 0;
-      sql.exec(`UPDATE document_meta SET retired = 0 WHERE id = 1`);
+    // Normal hibernation wakes stay independent of D1. Only a crash in the
+    // narrow window around an epoch commit needs an authoritative reconciliation.
+    if (this.metadata.restore_pending) {
+      const { pageId, epoch } = this.ids;
+      const current = await this.bindings.DB.prepare(
+        `SELECT content_epoch FROM pages WHERE id = ?`,
+      ).bind(pageId).first<{ content_epoch: number }>();
+      this.metadata.retired = !current || current.content_epoch !== epoch ? 1 : 0;
+      this.metadata.restore_pending = 0;
+      sql.exec(
+        `UPDATE document_meta
+            SET retired = ?, restore_pending = 0
+          WHERE id = 1`,
+        this.metadata.retired,
+      );
     }
 
     await super.onStart();
@@ -204,6 +212,27 @@ export class Document extends YServer {
     return super.onMessage(connection, message);
   }
 
+  onCustomMessage(connection: Connection<ConnectionAuth>, message: string) {
+    let value: { type?: unknown; generation?: unknown };
+    try {
+      value = JSON.parse(message);
+    } catch {
+      return;
+    }
+    if (value.type !== "document-update-barrier"
+      || !Number.isInteger(value.generation)
+      || Number(value.generation) < 1
+      || this.isReadOnly(connection)) return;
+    // Client custom messages share the WebSocket's ordering with Yjs updates.
+    // Reaching this barrier means every preceding update from that client has
+    // been applied; flushing before the reply turns the reply into a durable ack.
+    this.flushPendingUpdates();
+    this.sendCustomMessage(connection, JSON.stringify({
+      type: "document-update-ack",
+      generation: value.generation,
+    }));
+  }
+
   async onSave() {
     if (this.purged) return;
     this.flushPendingUpdates();
@@ -269,6 +298,7 @@ export class Document extends YServer {
       for (const connection of this.getConnections()) {
         connection.close(4411, "This page was permanently deleted.");
       }
+      await this.state.storage.deleteAlarm();
       await this.state.storage.deleteAll();
       return Response.json({ purged: true });
     }
@@ -313,7 +343,18 @@ export class Document extends YServer {
     if (authorId) this.metadata.last_editor_id = authorId;
   }
 
-  private async compact(forceVersion = false) {
+  private compact(forceVersion = false): Promise<void> {
+    const active = this.compaction;
+    if (active) return active.catch(() => undefined).then(() => this.compact(forceVersion));
+    const compacting = this.compactOnce(forceVersion);
+    const tracked = compacting.finally(() => {
+      if (this.compaction === tracked) this.compaction = null;
+    });
+    this.compaction = tracked;
+    return tracked;
+  }
+
+  private async compactOnce(forceVersion = false) {
     this.flushPendingUpdates();
     const { pageId, epoch } = this.ids;
     const maximum = this.state.storage.sql
@@ -546,27 +587,28 @@ export class Document extends YServer {
     if (this.transition || this.metadata.retired || this.purged) {
       return Response.json({ error: "Document transition already in progress." }, { status: 409 });
     }
-    const { pageId, epoch } = this.ids;
-    const version = await this.bindings.DB.prepare(
-      `SELECT r2_key FROM page_versions WHERE id = ? AND page_id = ?`,
-    ).bind(versionId, pageId).first<{ r2_key: string }>();
-    if (!version) return Response.json({ error: "Version not found." }, { status: 404 });
-    const selected = await this.bindings.BUCKET.get(version.r2_key);
-    if (!selected) return Response.json({ error: "Version snapshot is missing." }, { status: 404 });
-    const selectedBytes = new Uint8Array(await selected.arrayBuffer());
-
     this.transition = "restore";
     for (const connection of this.getConnections()) {
       connection.close(4410, "A restored version replaced this document.");
     }
     this.flushPendingUpdates();
 
-    const hadPendingLog = Boolean(this.metadata.dirty);
-    const newEpoch = epoch + 1;
-    const newKey = this.snapshotKey(pageId, newEpoch);
+    const { pageId, epoch } = this.ids;
+    let newKey: string | null = null;
     let preKey: string | null = null;
     let committed = false;
     try {
+      const version = await this.bindings.DB.prepare(
+        `SELECT r2_key FROM page_versions WHERE id = ? AND page_id = ?`,
+      ).bind(versionId, pageId).first<{ r2_key: string }>();
+      if (!version) return Response.json({ error: "Version not found." }, { status: 404 });
+      const selected = await this.bindings.BUCKET.get(version.r2_key);
+      if (!selected) return Response.json({ error: "Version snapshot is missing." }, { status: 404 });
+      const selectedBytes = new Uint8Array(await selected.arrayBuffer());
+
+      const hadPendingLog = Boolean(this.metadata.dirty);
+      const newEpoch = epoch + 1;
+      newKey = this.snapshotKey(pageId, newEpoch);
       if (hadPendingLog) await this.compact(true);
 
       const statements: D1PreparedStatement[] = [];
@@ -596,6 +638,8 @@ export class Document extends YServer {
         ));
       }
 
+      this.metadata.restore_pending = 1;
+      this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
       await this.bindings.BUCKET.put(newKey, selectedBytes, {
         httpMetadata: { contentType: "application/octet-stream" },
         customMetadata: { pageId, epoch: String(newEpoch), restoredFrom: versionId },
@@ -611,12 +655,19 @@ export class Document extends YServer {
           this.bindings.BUCKET.delete(newKey),
           preKey ? this.bindings.BUCKET.delete(preKey) : Promise.resolve(),
         ]);
+        newKey = null;
+        preKey = null;
+        this.metadata.restore_pending = 0;
+        this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 0 WHERE id = 1`);
         return Response.json({ error: "The page epoch changed during restore." }, { status: 409 });
       }
       committed = true;
       this.metadata.retired = 1;
+      this.metadata.restore_pending = 0;
       try {
-        this.state.storage.sql.exec(`UPDATE document_meta SET retired = 1 WHERE id = 1`);
+        this.state.storage.sql.exec(
+          `UPDATE document_meta SET retired = 1, restore_pending = 0 WHERE id = 1`,
+        );
       } catch (error) {
         // D1 is authoritative for routing. A restarted old room also reconciles
         // its retired state from the committed epoch before accepting clients.
@@ -626,9 +677,15 @@ export class Document extends YServer {
     } catch (error) {
       if (!committed) {
         await Promise.allSettled([
-          this.bindings.BUCKET.delete(newKey),
+          ...(newKey ? [this.bindings.BUCKET.delete(newKey)] : []),
           ...(preKey ? [this.bindings.BUCKET.delete(preKey)] : []),
         ]);
+        this.metadata.restore_pending = 0;
+        try {
+          this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 0 WHERE id = 1`);
+        } catch (storageError) {
+          console.error("Failed to clear pending restore state", storageError);
+        }
       }
       console.error("Document restore failed", error);
       return Response.json({ error: "The version could not be restored." }, { status: 503 });

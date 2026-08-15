@@ -6,6 +6,7 @@ import { ApiClientError, api, authClient, json } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
 import { invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
+import { mergePages, reconcilePageSnapshot } from "./page-state";
 import { TablePage } from "./TablePage";
 
 type AppState =
@@ -167,18 +168,46 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
   const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
-  const pageStateGeneration = useRef(0);
+  const [workspaceError, setWorkspaceError] = useState("");
+  const pendingPageUpserts = useRef(new Map<string, Page>());
+  const pendingPageRemovals = useRef(new Set<string>());
+  const pageLoadPromise = useRef<Promise<void> | null>(null);
 
-  const loadPages = useCallback(async () => {
-    const generation = pageStateGeneration.current;
-    const data = await api<{ pages: Page[] }>("/api/pages/tree");
-    if (generation !== pageStateGeneration.current) {
-      await loadPages();
-      return;
+  const recordPageUpserts = useCallback((incoming: Page[]) => {
+    if (!pageLoadPromise.current) return;
+    for (const page of incoming) {
+      const previous = pendingPageUpserts.current.get(page.id);
+      if (!previous || page.revision >= previous.revision) pendingPageUpserts.current.set(page.id, page);
+      pendingPageRemovals.current.delete(page.id);
     }
-    setPages((current) => mergePageSnapshot(current, data.pages));
-    setPagesLoaded(true);
-    setSelectedId((current) => current && data.pages.some((page) => page.id === current) ? current : data.pages[0]?.id ?? null);
+  }, []);
+  const recordPageRemovals = useCallback((pageIds: string[]) => {
+    if (!pageLoadPromise.current) return;
+    for (const pageId of pageIds) {
+      pendingPageUpserts.current.delete(pageId);
+      pendingPageRemovals.current.add(pageId);
+    }
+  }, []);
+
+  const loadPages = useCallback(() => {
+    if (pageLoadPromise.current) return pageLoadPromise.current;
+    const loading = api<{ pages: Page[] }>("/api/pages/tree").then((data) => {
+      const upserts = [...pendingPageUpserts.current.values()];
+      const removals = new Set(pendingPageRemovals.current);
+      pendingPageUpserts.current.clear();
+      pendingPageRemovals.current.clear();
+      const authoritative = mergePages(data.pages, upserts).filter((page) => !removals.has(page.id));
+      const authoritativeIds = new Set(authoritative.map((page) => page.id));
+      setPages((current) => reconcilePageSnapshot(current, data.pages, upserts, removals).pages);
+      setPagesLoaded(true);
+      setSelectedId((current) => current && authoritativeIds.has(current)
+        ? current
+        : [...authoritativeIds][0] ?? null);
+    }).finally(() => {
+      if (pageLoadPromise.current === loading) pageLoadPromise.current = null;
+    });
+    pageLoadPromise.current = loading;
+    return loading;
   }, []);
   const loadTrash = useCallback(async () => {
     const data = await api<{ pages: Page[] }>("/api/pages/tree?archived=true");
@@ -189,20 +218,24 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
     setUnreadMentions(data.unreadCount);
   }, []);
   const handleMentionsRead = useCallback((unreadCount: number) => setUnreadMentions(unreadCount), []);
-  useEffect(() => { void loadPages(); }, [loadPages]);
+  useEffect(() => {
+    void loadPages().catch((error) => {
+      setWorkspaceError(error instanceof Error ? error.message : "The page tree could not be loaded.");
+    });
+  }, [loadPages]);
   useEffect(() => { void loadUnreadMentions(); }, [loadUnreadMentions]);
   useEffect(() => { if (selectedId) localStorage.setItem("notes:last-page", selectedId); }, [selectedId]);
 
   const handleWorkspaceEvent = useCallback((event: WorkspaceEvent) => {
     if (event.type === "pages-upserted") {
-      pageStateGeneration.current += 1;
+      recordPageUpserts(event.pages);
       for (const page of event.pages) invalidatePagePreview(page.id);
       setPages((current) => mergePages(current, event.pages));
       setTrash((current) => current.filter((page) => !event.pages.some((updated) => updated.id === page.id)));
       return;
     }
     if (event.type === "pages-removed") {
-      pageStateGeneration.current += 1;
+      recordPageRemovals(event.pageIds);
       for (const pageId of event.pageIds) invalidatePagePreview(pageId);
       setPages((current) => current.filter((page) => !event.pageIds.includes(page.id)));
       if (event.permanently) {
@@ -215,11 +248,13 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
     invalidatePagePreview(event.pageId);
     setBacklinksRevision((current) => current + 1);
     if (event.mentionTargetUserIds.includes(member.user.id)) void loadUnreadMentions();
-  }, [loadTrash, loadUnreadMentions, member.user.id]);
+  }, [loadTrash, loadUnreadMentions, member.user.id, recordPageRemovals, recordPageUpserts]);
 
   useEffect(() => {
     const bundle = createWorkspaceEvents(member.workspace.id, handleWorkspaceEvent, () => {
-      void loadPages();
+      void loadPages().catch((error) => {
+        setWorkspaceError(error instanceof Error ? error.message : "The page tree could not be refreshed.");
+      });
       void loadUnreadMentions();
     });
     return () => bundle.destroy();
@@ -254,20 +289,28 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
 
   async function createPage(kind: PageKind, parentId: string | null = selected?.parentId ?? null) {
     const result = await api<{ page: Page }>("/api/pages", { method: "POST", body: json({ kind, parentId }) });
-    pageStateGeneration.current += 1;
+    recordPageUpserts([result.page]);
     setPages((current) => mergePages(current, [result.page]));
     setSelectedId(result.page.id); setView("pages"); setSidebarOpen(false);
   }
   async function archive(page: Page) {
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
-    await api(`/api/pages/${page.id}`, { method: "DELETE" });
-    await loadPages();
+    setWorkspaceError("");
+    try {
+      await api(`/api/pages/${page.id}`, { method: "DELETE" });
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "The page could not be archived.");
+    } finally {
+      await loadPages().catch((error) => {
+        setWorkspaceError(error instanceof Error ? error.message : "The page tree could not be refreshed.");
+      });
+    }
   }
   async function move(pageId: string, parentId: string | null, beforeId: string | null = null, afterId: string | null = null) {
     const result = await api<{ page: Page }>(`/api/pages/${pageId}/move`, {
       method: "POST", body: json({ parentId, beforeId, afterId }),
     });
-    pageStateGeneration.current += 1;
+    recordPageUpserts([result.page]);
     setPages((current) => current.map((page) => page.id === pageId ? result.page : page));
   }
   async function runSearch(value: string) {
@@ -280,9 +323,16 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
     await loadTrash(); setView("trash");
   }
   const updatePage = useCallback((page: Page) => {
-    pageStateGeneration.current += 1;
-    setPages((current) => current.map((item) => item.id === page.id ? page : item));
-  }, []);
+    recordPageUpserts([page]);
+    setPages((current) => mergePages(current, [page]));
+  }, [recordPageUpserts]);
+  const pageUnavailable = useCallback((pageId: string) => {
+    recordPageRemovals([pageId]);
+    setPages((current) => current.filter((page) => page.id !== pageId));
+    void loadPages().catch((error) => {
+      setWorkspaceError(error instanceof Error ? error.message : "The page tree could not be refreshed.");
+    });
+  }, [loadPages, recordPageRemovals]);
 
   return (
     <div className="workspace-shell">
@@ -322,6 +372,7 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
       </aside>
 
       <section className="workspace-content">
+        {workspaceError && <p className="form-error workspace-error">{workspaceError}</p>}
         <header className="topbar">
           <button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}>☰</button>
           <div className="breadcrumbs">{breadcrumbs.map((page, index) => <span key={page.id}>{index > 0 && <i>/</i>}{page.title}</span>)}</div>
@@ -348,7 +399,7 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
           <MembersView member={member} />
         ) : selected ? (
           selected.kind === "document"
-            ? <EditorPage key={`${selected.id}:${selected.contentEpoch}`} page={selected} member={member} onPageChanged={updatePage} onSelectPage={(id) => { setSelectedId(id); setView("pages"); }} backlinksRevision={backlinksRevision} />
+            ? <EditorPage key={`${selected.id}:${selected.contentEpoch}`} page={selected} member={member} onPageChanged={updatePage} onPageUnavailable={pageUnavailable} onSelectPage={(id) => { setSelectedId(id); setView("pages"); }} backlinksRevision={backlinksRevision} />
             : <TablePage key={selected.id} page={selected} member={member} onPageChanged={updatePage} onSelectPage={(id) => { setSelectedId(id); setView("pages"); }} backlinksRevision={backlinksRevision} />
         ) : (
           <EmptyWorkspace canEdit={member.role !== "viewer"} onCreate={() => void createPage("document", null)} />
@@ -357,20 +408,6 @@ function Workspace({ member, onSignOut }: { member: MemberContext; onSignOut: ()
       {sidebarOpen && <button className="sidebar-scrim" aria-label="Close sidebar" onClick={() => setSidebarOpen(false)} />}
     </div>
   );
-}
-
-function mergePages(current: Page[], incoming: Page[]) {
-  const pages = new Map(current.map((page) => [page.id, page]));
-  for (const page of incoming) pages.set(page.id, page);
-  return [...pages.values()];
-}
-
-function mergePageSnapshot(current: Page[], snapshot: Page[]) {
-  const existing = new Map(current.map((page) => [page.id, page]));
-  return snapshot.map((page) => {
-    const previous = existing.get(page.id);
-    return previous && previous.revision > page.revision ? previous : page;
-  });
 }
 
 function PageTree({ nodes, selectedId, editable, onSelect, onCreate, onArchive, onDropPage, onMove, grandparentId = null }: {
@@ -437,21 +474,52 @@ function SearchView({ value, results, onChange, onSelect }: {
 function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; onRead: (unreadCount: number) => void }) {
   const [mentions, setMentions] = useState<MentionInboxItem[]>([]);
   const [error, setError] = useState("");
-  useEffect(() => {
-    let active = true;
-    void api<{ mentions: MentionInboxItem[]; asOf: number }>("/api/mentions").then(async (data) => {
-      if (!active) return;
-      setMentions(data.mentions);
-      const read = await api<{ unreadCount: number }>("/api/mentions/read", {
-        method: "POST",
-        body: json({ through: data.asOf }),
-      });
-      if (active) onRead(read.unreadCount);
-    }).catch(() => {
-      if (active) setError("Mentions could not be loaded. Try again.");
-    });
-    return () => { active = false; };
+  const [asOf, setAsOf] = useState<number | null>(null);
+  const [nextCursor, setNextCursor] = useState<{ firstSeenAt: number; pageId: string } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const active = useRef(true);
+
+  const loadMentionPage = useCallback(async (
+    cursor: { firstSeenAt: number; pageId: string } | null = null,
+    traversalAsOf: number | null = null,
+  ) => {
+    setLoading(true);
+    setError("");
+    const query = new URLSearchParams();
+    if (traversalAsOf !== null) query.set("asOf", String(traversalAsOf));
+    if (cursor) {
+      query.set("beforeAt", String(cursor.firstSeenAt));
+      query.set("beforeId", cursor.pageId);
+    }
+    try {
+      const data = await api<{
+        mentions: MentionInboxItem[];
+        asOf: number;
+        nextCursor: { firstSeenAt: number; pageId: string } | null;
+      }>(`/api/mentions${query.size ? `?${query}` : ""}`);
+      if (!active.current) return;
+      setMentions((current) => cursor ? [...current, ...data.mentions] : data.mentions);
+      setAsOf(data.asOf);
+      setNextCursor(data.nextCursor);
+      if (!data.nextCursor) {
+        const read = await api<{ unreadCount: number }>("/api/mentions/read", {
+          method: "POST",
+          body: json({ through: data.asOf }),
+        });
+        if (active.current) onRead(read.unreadCount);
+      }
+    } catch {
+      if (active.current) setError("Mentions could not be loaded. Try again.");
+    } finally {
+      if (active.current) setLoading(false);
+    }
   }, [onRead]);
+
+  useEffect(() => {
+    active.current = true;
+    void loadMentionPage();
+    return () => { active.current = false; };
+  }, [loadMentionPage]);
   return (
     <main className="utility-view">
       <p className="eyebrow">Inbox</p><h1>Mentions</h1>
@@ -464,6 +532,9 @@ function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; on
             <small>{new Date(mention.firstSeenAt).toLocaleString()}</small>
           </button>
         ))}
+        {nextCursor && <button className="quiet-button" disabled={loading} onClick={() => {
+          void loadMentionPage(nextCursor, asOf);
+        }}>{loading ? "Loading…" : "Load older mentions"}</button>}
         {!mentions.length && <p className="empty-copy">No one has mentioned you yet.</p>}
       </div>
     </main>

@@ -2,6 +2,7 @@ import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { Hono } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, getMember, requireEditor, requireMember, requireOwner } from "./auth";
+import { processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
 import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
 import { Document } from "./document";
 import type { Env, MemberContext } from "./env";
@@ -18,12 +19,11 @@ import {
 import { columnType, nullableId, object, pageKind, role, text } from "../shared/validation";
 import type { Page, WorkspaceEvent } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
-import { normalizeR2Range } from "./r2";
+import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 
 const app = new Hono<{ Bindings: Env }>();
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-const ARCHIVE_DISCONNECT_BATCH_SIZE = 25;
 const DELETION_TARGET_BATCH_SIZE = 50;
 const UNSAFE_MIME_TYPES = new Set([
   "text/html",
@@ -430,46 +430,43 @@ app.delete("/api/pages/:id", async (c) => {
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
       SELECT id FROM subtree
     )`).bind(page.id),
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       )
+       INSERT INTO archive_disconnect_targets
+        (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
+       SELECT id, workspace_id, content_epoch, id || '~' || content_epoch, ?, ?, ?
+         FROM pages WHERE id IN subtree AND kind = 'document'
+       ON CONFLICT(page_id) DO UPDATE SET
+         workspace_id = excluded.workspace_id,
+         content_epoch = excluded.content_epoch,
+         room = excluded.room,
+         attempts = 0,
+         next_attempt_at = excluded.next_attempt_at,
+         last_error = NULL,
+         updated_at = excluded.updated_at`,
+    ).bind(page.id, timestamp, timestamp, timestamp),
   ]);
   const archived = await c.env.DB.prepare(
     `WITH RECURSIVE subtree(id) AS (
        SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
      ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
   ).bind(page.id).all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
-  const hint = locationHint(member.workspace.locationHint ?? undefined);
   const documents = archived.results.filter((item) => item.kind === "document");
-  const pendingPageIds: string[] = [];
-  for (let offset = 0; offset < documents.length; offset += ARCHIVE_DISCONNECT_BATCH_SIZE) {
-    const batch = documents.slice(offset, offset + ARCHIVE_DISCONNECT_BATCH_SIZE);
-    const pending = await Promise.all(batch.map(async (item) => {
-      try {
-        const room = `${item.id}~${item.content_epoch}`;
-        const stub = c.env.DOCUMENT.getByName(room, hint ? { locationHint: hint } : undefined);
-        const response = await stub.fetch(new Request("https://document.internal/archive", {
-          method: "POST",
-          headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET },
-        }));
-        return response.ok ? null : item.id;
-      } catch {
-        return item.id;
-      }
-    }));
-    pendingPageIds.push(...pending.filter((pageId): pageId is string => pageId !== null));
-  }
-  if (pendingPageIds.length) {
-    throw new HttpError(
-      503,
-      "archive_incomplete",
-      "The page was archived, but an active editor could not be disconnected. Retry the archive.",
-      { pendingPageIds },
-    );
-  }
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
     pageIds: archived.results.map((item) => item.id),
     permanently: false,
   });
-  return c.json({ ok: true });
+  const pendingPageIds = await processArchiveDisconnectTargets(c.env, documents.map((item) => ({
+    page_id: item.id,
+    workspace_id: member.workspace.id,
+    content_epoch: item.content_epoch,
+    room: `${item.id}~${item.content_epoch}`,
+    attempts: 0,
+  })));
+  return c.json({ ok: true, cleanupPending: pendingPageIds.length > 0, pendingPageIds }, pendingPageIds.length ? 202 : 200);
 });
 
 app.post("/api/pages/:id/restore", async (c) => {
@@ -482,6 +479,13 @@ app.post("/api/pages/:id/restore", async (c) => {
        UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
      ) UPDATE pages SET archived_at = NULL, archived_by = NULL, updated_at = ? WHERE id IN subtree`,
   ).bind(page.id, member.workspace.id, now()).run();
+  await c.env.DB.prepare(
+    `DELETE FROM archive_disconnect_targets WHERE page_id IN (
+       WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       ) SELECT id FROM subtree
+     )`,
+  ).bind(page.id).run();
   const restored = await c.env.DB.prepare(
     `SELECT * FROM pages WHERE id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
@@ -593,13 +597,14 @@ app.get("/api/search", async (c) => {
 app.get("/api/mentions/suggestions", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const query = (c.req.query("q") ?? "").trim().slice(0, 100);
-  const pattern = `%${query.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+  const escapedQuery = escapeLike(query);
+  const pattern = `%${escapedQuery}%`;
   const [pages, members] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, title, icon FROM pages
         WHERE workspace_id = ? AND archived_at IS NULL AND title LIKE ? ESCAPE '\\'
         ORDER BY CASE WHEN title LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END, title, id LIMIT 10`,
-    ).bind(member.workspace.id, pattern, `${query.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`)
+    ).bind(member.workspace.id, pattern, `${escapedQuery}%`)
       .all<{ id: string; title: string; icon: string | null }>(),
     c.env.DB.prepare(
       `SELECT u.id, u.name, u.email, wm.role
@@ -664,9 +669,21 @@ app.get("/api/mentions/unread-count", async (c) => {
 
 app.get("/api/mentions", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  // Use the previous millisecond so a projection committed after this read can
-  // never share the cursor timestamp and be marked read without being shown.
-  const asOf = now() - 1;
+  const requestedAsOf = c.req.query("asOf");
+  // Use the previous millisecond for a new traversal so a projection committed
+  // after this read can never share the cursor and be marked read unseen.
+  const asOf = requestedAsOf === undefined ? now() - 1 : Number(requestedAsOf);
+  const beforeAtValue = c.req.query("beforeAt");
+  const beforeId = c.req.query("beforeId");
+  const beforeAt = beforeAtValue === undefined ? null : Number(beforeAtValue);
+  if (!Number.isInteger(asOf) || asOf < 0 || asOf > now() + 1_000) {
+    throw new HttpError(422, "invalid_mentions_cursor", "asOf must be a valid server timestamp.");
+  }
+  if ((beforeAtValue === undefined) !== (beforeId === undefined)
+    || (beforeAt !== null && (!Number.isInteger(beforeAt) || beforeAt < 0))
+    || (beforeId !== undefined && (!beforeId || beforeId.length > 100))) {
+    throw new HttpError(422, "invalid_mentions_cursor", "The mention page cursor is invalid.");
+  }
   const rows = await c.env.DB.prepare(
     `SELECT source.*, mention.excerpt, mention.first_seen_at,
             CASE WHEN mention.first_seen_at > COALESCE(reads.read_at, 0) THEN 1 ELSE 0 END unread
@@ -675,12 +692,19 @@ app.get("/api/mentions", async (c) => {
        LEFT JOIN mention_reads reads
          ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
       WHERE mention.workspace_id = ? AND mention.target_user_id = ? AND mention.first_seen_at <= ?
-      ORDER BY mention.first_seen_at DESC, source.id LIMIT 100`,
-  ).bind(member.workspace.id, member.user.id, asOf)
+        AND (? IS NULL OR mention.first_seen_at < ?
+          OR (mention.first_seen_at = ? AND source.id > ?))
+      ORDER BY mention.first_seen_at DESC, source.id LIMIT 101`,
+  ).bind(member.workspace.id, member.user.id, asOf, beforeAt, beforeAt, beforeAt, beforeId ?? null)
     .all<PageRow & { excerpt: string; first_seen_at: number; unread: number }>();
+  const pageRows = rows.results.slice(0, 100);
+  const last = pageRows.at(-1);
   return c.json({
     asOf,
-    mentions: rows.results.map((row) => ({
+    nextCursor: rows.results.length > pageRows.length && last
+      ? { firstSeenAt: last.first_seen_at, pageId: last.id }
+      : null,
+    mentions: pageRows.map((row) => ({
       page: pageJson(row),
       excerpt: row.excerpt,
       firstSeenAt: row.first_seen_at,
@@ -776,7 +800,7 @@ app.get("/api/attachments/:id", async (c) => {
   headers.set("content-disposition", attachmentDisposition(attachment.name, isInlineMime(attachment.mime)));
   if (!("body" in object)) {
     return new Response(null, {
-      status: c.req.header("if-match") ? 412 : c.req.header("if-none-match") ? 304 : 412,
+      status: conditionalGetStatus(c.req.raw.headers, object),
       headers,
     });
   }
@@ -1121,6 +1145,10 @@ function isUnsafeMime(mime: string, name: string) {
   return UNSAFE_MIME_TYPES.has(normalizedMime) || UNSAFE_FILE_EXTENSIONS.has(extension);
 }
 
+function escapeLike(value: string) {
+  return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
+}
+
 function isInlineMime(mime: string) {
   return /^image\/(png|jpeg|gif|webp|avif)$/.test(mime) || mime === "application/pdf" || mime === "text/plain" || mime === "text/markdown";
 }
@@ -1227,6 +1255,9 @@ export default {
     return app.fetch(request, env, context);
   },
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext) {
+    context.waitUntil(processDueArchiveDisconnects(env).catch((error) => {
+      console.error("Scheduled archive disconnect failed", error);
+    }));
     context.waitUntil(processDueDeletionJobs(env).catch((error) => {
       console.error("Scheduled deletion cleanup failed", error);
     }));

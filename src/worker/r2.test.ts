@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeR2Range } from "./r2";
+import { conditionalGetStatus, normalizeR2Range } from "./r2";
 
 describe("R2 range normalization", () => {
   it("normalizes bounded ranges", () => {
@@ -22,5 +22,23 @@ describe("R2 range normalization", () => {
   it("clamps oversized suffixes and bounded ranges to the object", () => {
     expect(normalizeR2Range({ suffix: 5_000 }, 1_000)).toEqual({ offset: 0, length: 1_000 });
     expect(normalizeR2Range({ offset: 900, length: 500 }, 1_000)).toEqual({ offset: 900, length: 100 });
+  });
+});
+
+describe("R2 conditional response status", () => {
+  const object = { httpEtag: '"current"', uploaded: new Date("2026-08-14T12:00:00Z") };
+
+  it("returns 304 for matching cache validators", () => {
+    expect(conditionalGetStatus(new Headers({ "if-none-match": '"current"' }), object)).toBe(304);
+    expect(conditionalGetStatus(new Headers({
+      "if-modified-since": "Fri, 14 Aug 2026 12:00:00 GMT",
+    }), object)).toBe(304);
+  });
+
+  it("returns 412 for failed preconditions", () => {
+    expect(conditionalGetStatus(new Headers({ "if-match": '"different"' }), object)).toBe(412);
+    expect(conditionalGetStatus(new Headers({
+      "if-unmodified-since": "Fri, 14 Aug 2026 11:00:00 GMT",
+    }), object)).toBe(412);
   });
 });
