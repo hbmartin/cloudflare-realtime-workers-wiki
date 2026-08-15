@@ -2,6 +2,7 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
 import type { WorkspaceEvent } from "../shared/types";
+import { CollaborationDurability } from "./collaboration-durability";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -32,26 +33,27 @@ export function createCollaboration(
   let hiddenTimer: number | undefined;
   let destroyed = false;
   let indexeddbSynced = false;
-  let hasUnsyncedChanges = false;
-  let localGeneration = 0;
-  let acknowledgedGeneration = 0;
+  const durability = new CollaborationDurability();
+
+  const sendDurabilityBarrier = () => {
+    const generation = durability.barrierGeneration();
+    if (generation !== null && provider.wsconnected) {
+      provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
+    }
+  };
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
     onStatus(status === "disconnected" ? "offline" : status);
   };
   provider.on("status", handleStatus);
   const handleSync = (synced: boolean) => {
-    if (synced) {
-      acknowledgedGeneration = localGeneration;
-      hasUnsyncedChanges = false;
-    }
+    if (synced) sendDurabilityBarrier();
   };
   const handleCustomMessage = (message: string) => {
     try {
       const value = JSON.parse(message) as { type?: unknown; generation?: unknown };
       if (value.type !== "document-update-ack" || !Number.isInteger(value.generation)) return;
-      acknowledgedGeneration = Math.max(acknowledgedGeneration, Number(value.generation));
-      hasUnsyncedChanges = acknowledgedGeneration < localGeneration;
+      durability.acknowledge(Number(value.generation));
     } catch {
       // Ignore custom messages from future server versions.
     }
@@ -60,17 +62,14 @@ export function createCollaboration(
   provider.on("custom-message", handleCustomMessage);
   doc.on("update", (_update: Uint8Array, origin: unknown) => {
     if (origin === provider || origin === indexeddb) return;
-    localGeneration += 1;
-    hasUnsyncedChanges = true;
-    if (provider.wsconnected) {
-      provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation: localGeneration }));
-    }
+    durability.markChanged();
+    sendDurabilityBarrier();
   });
   indexeddb.whenSynced.then(() => {
     if (!destroyed) {
       // Until the server sync completes, conservatively treat a persisted copy
       // as recoverable offline work. An epoch rejection happens before sync.
-      hasUnsyncedChanges = Y.encodeStateVector(doc).byteLength > 1;
+      if (Y.encodeStateVector(doc).byteLength > 1) durability.markChanged();
       indexeddbSynced = true;
       provider.connect();
     }
@@ -90,7 +89,7 @@ export function createCollaboration(
     doc,
     indexeddb,
     provider,
-    get hasUnsyncedChanges() { return hasUnsyncedChanges; },
+    get hasUnsyncedChanges() { return durability.hasUnsyncedChanges; },
     destroy() {
       destroyed = true;
       if (hiddenTimer) window.clearTimeout(hiddenTimer);

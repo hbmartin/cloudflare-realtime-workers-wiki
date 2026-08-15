@@ -615,25 +615,27 @@ describe("Worker integration", () => {
       });
     });
 
-    const archived = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
-      method: "DELETE",
-    }));
-    expect(archived.status).toBe(202);
-    expect(await archived.json()).toEqual({
-      ok: true,
-      cleanupPending: true,
-      pendingPageIds: [installed.pageId],
-    });
-    expect((await env.DB.prepare(`SELECT archived_at FROM pages WHERE id = ?`)
-      .bind(installed.pageId).first<{ archived_at: number | null }>())?.archived_at).not.toBeNull();
-    expect(await env.DB.prepare(`SELECT page_id FROM archive_disconnect_targets WHERE page_id = ?`)
-      .bind(installed.pageId).first()).not.toBeNull();
-
-    await runInDurableObject(stub, async (instance) => {
-      const document = instance as unknown as TestDocument;
-      // Recover the real test bindings after the injected R2 outage.
-      document.bindings = originalBindings;
-    });
+    try {
+      const archived = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+        method: "DELETE",
+      }));
+      expect(archived.status).toBe(202);
+      expect(await archived.json()).toEqual({
+        ok: true,
+        cleanupPending: true,
+        pendingPageIds: [installed.pageId],
+      });
+      expect((await env.DB.prepare(`SELECT archived_at FROM pages WHERE id = ?`)
+        .bind(installed.pageId).first<{ archived_at: number | null }>())?.archived_at).not.toBeNull();
+      expect(await env.DB.prepare(`SELECT page_id FROM archive_disconnect_targets WHERE page_id = ?`)
+        .bind(installed.pageId).first()).not.toBeNull();
+    } finally {
+      await runInDurableObject(stub, async (instance) => {
+        const document = instance as unknown as TestDocument;
+        // Recover the real test bindings after the injected R2 outage.
+        document.bindings = originalBindings;
+      });
+    }
     await env.DB.prepare(
       `UPDATE archive_disconnect_targets SET next_attempt_at = 0 WHERE page_id = ?`,
     ).bind(installed.pageId).run();

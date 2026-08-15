@@ -2,7 +2,7 @@ import { CommentsExtension, DefaultThreadStoreAuth, ThreadStoreAuth } from "@blo
 import { withCollaboration, YjsThreadStore } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
 import { SuggestionMenuController, ThreadsSidebar, useCreateBlockNote } from "@blocknote/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
 import type { MemberContext } from "../worker/env";
@@ -43,8 +43,7 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
   const titleRevisionRef = useRef(page.revision);
   const titleDirtyRef = useRef(false);
   const editable = member.role !== "viewer" && !sizeWarning?.readOnly;
-  const editableRef = useRef(editable);
-  editableRef.current = editable;
+  const isEditable = useEffectEvent(() => editable);
   const commentsVisible = commentsOpen;
 
   useEffect(() => {
@@ -89,12 +88,12 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
         return;
       }
       if (event.code !== 4410 && event.code !== 1006) return;
-      if (event.code === 4410 && editableRef.current && next.hasUnsyncedChanges) quarantine();
+      if (event.code === 4410 && isEditable() && next.hasUnsyncedChanges) quarantine();
       try {
         const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
         if (!active) return;
         if (result.page.contentEpoch !== page.contentEpoch) {
-          if (editableRef.current && next.hasUnsyncedChanges) quarantine();
+          if (isEditable() && next.hasUnsyncedChanges) quarantine();
           onPageChanged(result.page);
         } else if (event.code === 4410) {
           // A restore can fail after taking the transition lock and closing the

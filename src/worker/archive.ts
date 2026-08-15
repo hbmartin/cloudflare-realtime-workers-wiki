@@ -9,6 +9,7 @@ interface ArchiveDisconnectTarget {
 }
 
 const ARCHIVE_DISCONNECT_BATCH_SIZE = 25;
+const ARCHIVE_DISCONNECT_TIMEOUT_MS = 30_000;
 
 async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnectTarget) {
   try {
@@ -29,6 +30,7 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
     const response = await stub.fetch(new Request("https://document.internal/archive", {
       method: "POST",
       headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      signal: AbortSignal.timeout(ARCHIVE_DISCONNECT_TIMEOUT_MS),
     }));
     if (!response.ok) throw new Error(`Document archive failed with ${response.status}`);
     await env.DB.prepare(

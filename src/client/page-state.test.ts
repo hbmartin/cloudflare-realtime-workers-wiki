@@ -34,4 +34,16 @@ describe("page state reconciliation", () => {
     );
     expect(result.pages).toEqual([page("a", 3, "new"), page("created", 1)]);
   });
+
+  it("drops a local page that the authoritative snapshot no longer lists", () => {
+    const result = reconcilePageSnapshot(
+      [page("a", 1), page("stale", 9)],
+      [page("a", 1)],
+      [],
+      new Set(),
+    );
+
+    expect(result.pages).toEqual([page("a", 1)]);
+    expect([...result.authoritativeIds]).toEqual(["a"]);
+  });
 });
