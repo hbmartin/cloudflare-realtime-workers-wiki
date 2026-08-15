@@ -20,17 +20,13 @@ const DOCUMENT_PURGE_TIMEOUT_MS = 30_000;
 async function deletePrefix(bucket: R2Bucket, prefix: string) {
   let cursor: string | undefined;
   do {
-    const listed = await bucket.list({ prefix, cursor, limit: 1_000 });
+    const listed = await bucket.list({ prefix, limit: 1_000, ...(cursor ? { cursor } : {}) });
     if (listed.objects.length) await bucket.delete(listed.objects.map((object) => object.key));
     cursor = listed.truncated ? listed.cursor : undefined;
   } while (cursor);
 }
 
-async function processTarget(
-  env: Env,
-  target: DeletionTargetRow,
-  hint?: DurableObjectLocationHint,
-) {
+async function processTarget(env: Env, target: DeletionTargetRow, hint?: DurableObjectLocationHint) {
   if (target.kind === "r2_object") {
     await env.BUCKET.delete(target.target);
     return;
@@ -40,11 +36,13 @@ async function processTarget(
     return;
   }
   const stub = env.DOCUMENT.getByName(target.target, hint ? { locationHint: hint } : undefined);
-  const response = await stub.fetch(new Request("https://document.internal/purge", {
-    method: "POST",
-    headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-    signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
-  }));
+  const response = await stub.fetch(
+    new Request("https://document.internal/purge", {
+      method: "POST",
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
+    }),
+  );
   if (!response.ok) throw new Error(`Document purge failed with ${response.status}`);
 }
 
@@ -56,19 +54,26 @@ export async function processDeletionJob(env: Env, jobId: string) {
         SET next_attempt_at = ?, updated_at = ?
       WHERE id = ? AND next_attempt_at <= ?
       RETURNING id, attempts, workspace_id`,
-  ).bind(leaseUntil, claimedAt, jobId, claimedAt).first<DeletionJobRow>();
+  )
+    .bind(leaseUntil, claimedAt, jobId, claimedAt)
+    .first<DeletionJobRow>();
   if (!job) return;
-
-  const workspace = await env.DB.prepare(
-    `SELECT location_hint FROM workspaces WHERE id = ?`,
-  ).bind(job.workspace_id).first<{ location_hint: string | null }>();
-  const hint = locationHint(workspace?.location_hint ?? undefined);
 
   const targets = await env.DB.prepare(
     `SELECT kind, target FROM deletion_targets
       WHERE job_id = ? AND completed_at IS NULL
       ORDER BY CASE kind WHEN 'document_do' THEN 0 WHEN 'r2_object' THEN 1 ELSE 2 END, target`,
-  ).bind(job.id).all<DeletionTargetRow>();
+  )
+    .bind(job.id)
+    .all<DeletionTargetRow>();
+
+  let hint: DurableObjectLocationHint | undefined;
+  if (targets.results.some((target) => target.kind === "document_do")) {
+    const workspace = await env.DB.prepare(`SELECT location_hint FROM workspaces WHERE id = ?`)
+      .bind(job.workspace_id)
+      .first<{ location_hint: string | null }>();
+    hint = locationHint(workspace?.location_hint ?? undefined);
+  }
 
   for (const target of targets.results) {
     try {
@@ -80,7 +85,9 @@ export async function processDeletionJob(env: Env, jobId: string) {
             AND EXISTS (
               SELECT 1 FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?
             )`,
-      ).bind(Date.now(), job.id, target.kind, target.target, job.id, leaseUntil).run();
+      )
+        .bind(Date.now(), job.id, target.kind, target.target, job.id, leaseUntil)
+        .run();
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown cleanup failure";
       await env.DB.prepare(
@@ -90,16 +97,21 @@ export async function processDeletionJob(env: Env, jobId: string) {
             AND EXISTS (
               SELECT 1 FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?
             )`,
-      ).bind(message.slice(0, 1_000), job.id, target.kind, target.target, job.id, leaseUntil).run();
+      )
+        .bind(message.slice(0, 1_000), job.id, target.kind, target.target, job.id, leaseUntil)
+        .run();
     }
   }
 
   const pending = await env.DB.prepare(
     `SELECT COUNT(*) count FROM deletion_targets WHERE job_id = ? AND completed_at IS NULL`,
-  ).bind(job.id).first<{ count: number }>();
+  )
+    .bind(job.id)
+    .first<{ count: number }>();
   if (!pending?.count) {
     await env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?`)
-      .bind(job.id, leaseUntil).run();
+      .bind(job.id, leaseUntil)
+      .run();
     return;
   }
 
@@ -108,24 +120,23 @@ export async function processDeletionJob(env: Env, jobId: string) {
   const failed = await env.DB.prepare(
     `SELECT last_error FROM deletion_targets
       WHERE job_id = ? AND completed_at IS NULL AND last_error IS NOT NULL LIMIT 1`,
-  ).bind(job.id).first<{ last_error: string }>();
+  )
+    .bind(job.id)
+    .first<{ last_error: string }>();
   await env.DB.prepare(
     `UPDATE deletion_jobs
         SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
       WHERE id = ? AND next_attempt_at = ?`,
-  ).bind(
-    attempts,
-    Date.now() + delay,
-    failed?.last_error ?? "Cleanup incomplete",
-    Date.now(),
-    job.id,
-    leaseUntil,
-  ).run();
+  )
+    .bind(attempts, Date.now() + delay, failed?.last_error ?? "Cleanup incomplete", Date.now(), job.id, leaseUntil)
+    .run();
 }
 
 export async function processDueDeletionJobs(env: Env, limit = 10) {
   const jobs = await env.DB.prepare(
     `SELECT id FROM deletion_jobs WHERE next_attempt_at <= ? ORDER BY created_at LIMIT ?`,
-  ).bind(Date.now(), limit).all<{ id: string }>();
+  )
+    .bind(Date.now(), limit)
+    .all<{ id: string }>();
   for (const job of jobs.results) await processDeletionJob(env, job.id);
 }

@@ -1,0 +1,47 @@
+{
+  "$schema": "./node_modules/fallow/schema.json",
+  "entry": [
+    "src/client/main.tsx",
+    "src/worker/index.ts",
+    "vite.config.ts",
+    "vitest.config.ts",
+    "vitest.worker.config.ts",
+    "playwright.config.ts",
+    "scripts/*.mjs"
+  ],
+  "ignorePatterns": ["worker-configuration.d.ts", "reviews_triage/**"],
+  "typeAware": {
+    "enabled": true,
+    "projects": [
+      "tsconfig.client.json",
+      "tsconfig.worker.json",
+      "tsconfig.unit-test.json",
+      "tsconfig.worker-test.json",
+      "tsconfig.config.json"
+    ],
+    "require": "best-effort"
+  },
+  "rules": {
+    "unused-dev-dependencies": "error",
+    "unused-optional-dependencies": "error",
+    "dev-dependencies-in-production": "off",
+    "private-type-leaks": "warn",
+    "require-suppression-reason": "warn"
+  },
+  "usedClassMembers": ["options", "callbackOptions"],
+  "duplicates": {
+    "enabled": true,
+    "mode": "mild",
+    "minTokens": 50,
+    "minLines": 5,
+    "minOccurrences": 3,
+    "ignore": ["src/**/*.test.ts", "src/**/*.test.tsx", "tests/**"]
+  },
+  "health": {
+    "ignore": ["src/**/*.test.ts", "src/**/*.test.tsx", "tests/**"]
+  },
+  "audit": {
+    "gate": "new-only",
+    "typeAware": true
+  }
+}

@@ -1,9 +1,4 @@
-import {
-  BlockNoteSchema,
-  defaultBlockSpecs,
-  defaultInlineContentSpecs,
-  defaultStyleSpecs,
-} from "@blocknote/core";
+import { BlockNoteSchema, defaultBlockSpecs, defaultInlineContentSpecs, defaultStyleSpecs } from "@blocknote/core";
 import { createReactInlineContentSpec } from "@blocknote/react";
 import { useState } from "react";
 import type { PagePreview } from "../shared/types";
@@ -27,7 +22,12 @@ function loadPreview(pageId: string) {
   return pending;
 }
 
-function MentionChip({ entityType, entityId, label, contentRef }: {
+function MentionChip({
+  entityType,
+  entityId,
+  label,
+  contentRef,
+}: {
   entityType: "page" | "user";
   entityId: string;
   label: string;
@@ -39,11 +39,17 @@ function MentionChip({ entityType, entityId, label, contentRef }: {
   const showPreview = () => {
     if (entityType !== "page") return;
     setOpen(true);
-    void loadPreview(entityId).then(setPreview).catch(() => setPreview(null));
+    void loadPreview(entityId)
+      .then(setPreview)
+      .catch(() => setPreview(null));
   };
 
   if (entityType === "user") {
-    return <span ref={contentRef} className="mention-chip mention-user">@{label}</span>;
+    return (
+      <span ref={contentRef} className="mention-chip mention-user">
+        @{label}
+      </span>
+    );
   }
 
   return (
@@ -60,15 +66,22 @@ function MentionChip({ entityType, entityId, label, contentRef }: {
       {open && (
         <span className="mention-preview" role="tooltip">
           {preview ? (
-            <><strong>{preview.page.icon ?? "□"} {preview.page.title}</strong><span>{preview.excerpt || "No preview yet."}</span></>
-          ) : <span>Loading preview…</span>}
+            <>
+              <strong>
+                {preview.page.icon ?? "□"} {preview.page.title}
+              </strong>
+              <span>{preview.excerpt || "No preview yet."}</span>
+            </>
+          ) : (
+            <span>Loading preview…</span>
+          )}
         </span>
       )}
     </span>
   );
 }
 
-export const mentionInlineSpec = createReactInlineContentSpec(
+const mentionInlineSpec = createReactInlineContentSpec(
   {
     type: "mention",
     content: "none",
@@ -87,9 +100,7 @@ export const mentionInlineSpec = createReactInlineContentSpec(
         contentRef={contentRef}
       />
     ),
-    toExternalHTML: ({ inlineContent, contentRef }) => (
-      <span ref={contentRef}>@{inlineContent.props.label}</span>
-    ),
+    toExternalHTML: ({ inlineContent, contentRef }) => <span ref={contentRef}>@{inlineContent.props.label}</span>,
   },
 );
 

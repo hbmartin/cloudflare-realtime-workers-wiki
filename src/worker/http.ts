@@ -17,16 +17,10 @@ export function errorResponse(c: Context, error: unknown) {
     return c.json({ error: { code: "invalid_input", message: error.message } }, 422);
   }
   if (error instanceof HttpError) {
-    return c.json(
-      { error: { code: error.code, message: error.message, details: error.details } },
-      error.status,
-    );
+    return c.json({ error: { code: error.code, message: error.message, details: error.details } }, error.status);
   }
   console.error(error);
-  return c.json(
-    { error: { code: "internal_error", message: "Something went wrong." } },
-    500,
-  );
+  return c.json({ error: { code: "internal_error", message: "Something went wrong." } }, 500);
 }
 
 export async function sha256(value: string) {
@@ -47,7 +41,12 @@ export function assertSameOrigin(request: Request, _baseUrl: string) {
 }
 
 export function normalizeFilename(name: string) {
-  return name.replace(/[\r\n"\\/]/g, "_").trim().slice(0, 180) || "download";
+  return (
+    name
+      .replace(/[\r\n"\\/]/g, "_")
+      .trim()
+      .slice(0, 180) || "download"
+  );
 }
 
 export function attachmentDisposition(name: string, inline: boolean) {
@@ -56,10 +55,6 @@ export function attachmentDisposition(name: string, inline: boolean) {
 }
 
 export function locationHint(value: string | undefined): DurableObjectLocationHint | undefined {
-  const allowed: DurableObjectLocationHint[] = [
-    "wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me",
-  ];
-  return allowed.includes(value as DurableObjectLocationHint)
-    ? (value as DurableObjectLocationHint)
-    : undefined;
+  const allowed: DurableObjectLocationHint[] = ["wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"];
+  return allowed.includes(value as DurableObjectLocationHint) ? (value as DurableObjectLocationHint) : undefined;
 }

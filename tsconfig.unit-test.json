@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
+    "types": ["vite/client", "vitest/globals", "@cloudflare/workers-types", "@testing-library/jest-dom"],
+    "exactOptionalPropertyTypes": false
+  },
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/client/test-setup.ts",
+    "src/shared/**/*.ts",
+    "src/client/**/*.ts",
+    "src/client/**/*.tsx",
+    "src/worker/**/*.ts"
+  ],
+  "exclude": ["src/**/*.integration.test.ts", "src/worker/worker-test.d.ts"]
+}

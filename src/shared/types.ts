@@ -14,6 +14,13 @@ export type Workspace = {
   locationHint: string | null;
 };
 
+export type MemberContext = {
+  user: SessionUser;
+  session: { id: string; expiresAt: Date };
+  workspace: Workspace;
+  role: Role;
+};
+
 export type Page = {
   id: string;
   workspaceId: string;
@@ -89,11 +96,3 @@ export type TableData = {
   rows: TableRow[];
   lease: { heldByMe: boolean; holderName: string | null; expiresAt: number | null };
 };
-
-export type ApiError = {
-  error: { code: string; message: string; details?: unknown };
-};
-
-export function canEdit(role: Role): boolean {
-  return role === "owner" || role === "editor";
-}

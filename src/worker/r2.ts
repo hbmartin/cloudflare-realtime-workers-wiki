@@ -35,8 +35,10 @@ function splitEntityTags(condition: string) {
 }
 
 function weakEtagMatches(condition: string, etag: string) {
-  return condition.trim() === "*"
-    || splitEntityTags(condition).some((candidate) => normalizeWeakEtag(candidate) === normalizeWeakEtag(etag));
+  return (
+    condition.trim() === "*" ||
+    splitEntityTags(condition).some((candidate) => normalizeWeakEtag(candidate) === normalizeWeakEtag(etag))
+  );
 }
 
 function strongEtagMatches(condition: string, etag: string) {

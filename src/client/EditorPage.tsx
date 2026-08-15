@@ -2,19 +2,20 @@ import { CommentsExtension, DefaultThreadStoreAuth, ThreadStoreAuth } from "@blo
 import { withCollaboration, YjsThreadStore } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
 import { SuggestionMenuController, ThreadsSidebar, useCreateBlockNote } from "@blocknote/react";
-import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
-import type { MemberContext } from "../worker/env";
+import type { MemberContext } from "../shared/types";
 import type { MentionSuggestion, Page } from "../shared/types";
 import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { diffBlockIds } from "../shared/block-diff";
 import { ApiClientError, api, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
+import { createDocumentCloseReconciler } from "./document-connection";
 import { notesSchema } from "./mentions";
 
-type Props = {
+export type EditorPageProps = {
   page: Page;
   member: MemberContext;
   onPageChanged: (page: Page) => void;
@@ -23,7 +24,14 @@ type Props = {
   backlinksRevision: number;
 };
 
-export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onSelectPage, backlinksRevision }: Props) {
+export function EditorPage({
+  page,
+  member,
+  onPageChanged,
+  onPageUnavailable,
+  onSelectPage,
+  backlinksRevision,
+}: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
   const [commentsOpen, setCommentsOpen] = useState(false);
@@ -33,7 +41,11 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
   const recoveryKey = `notes:recovery:${member.workspace.id}:${page.id}`;
   const [recovery, setRecovery] = useState<{ key: string; epoch: number } | null>(() => {
-    try { return JSON.parse(localStorage.getItem(recoveryKey) ?? "null"); } catch { return null; }
+    try {
+      return JSON.parse(localStorage.getItem(recoveryKey) ?? "null");
+    } catch {
+      return null;
+    }
   });
   const [recoveryPreview, setRecoveryPreview] = useState("");
   const [title, setTitle] = useState(page.title);
@@ -43,7 +55,6 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
   const titleRevisionRef = useRef(page.revision);
   const titleDirtyRef = useRef(false);
   const editable = member.role !== "viewer" && !sizeWarning?.readOnly;
-  const isEditable = useEffectEvent(() => editable);
   const commentsVisible = commentsOpen;
 
   useEffect(() => {
@@ -72,70 +83,36 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
         // Ignore custom messages from future server versions.
       }
     };
-    let active = true;
-    let closeCheck = 0;
-    let recheckTimer: number | undefined;
     next.provider.on("custom-message", customMessage);
     const quarantine = () => {
       const value = { key: `${member.workspace.id}:${page.id}:${page.contentEpoch}:1`, epoch: page.contentEpoch };
       const serialized = JSON.stringify(value);
       if (localStorage.getItem(recoveryKey) !== serialized) localStorage.setItem(recoveryKey, serialized);
-      setRecovery((current) => current?.key === value.key && current.epoch === value.epoch ? current : value);
+      setRecovery((current) => (current?.key === value.key && current.epoch === value.epoch ? current : value));
     };
-    const reconcileClose = async (code: number, check: number, attempt = 0): Promise<void> => {
-      try {
-        const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
-        if (!active || check !== closeCheck) return;
-        if (result.page.contentEpoch !== page.contentEpoch && isEditable() && next.hasUnsyncedChanges) {
-          quarantine();
-        }
-        if (result.page.archivedAt !== null) {
-          onPageUnavailable(page.id);
-        } else if (result.page.contentEpoch !== page.contentEpoch) {
-          onPageChanged(result.page);
-        } else if (code === 4410 || code === 4412) {
-          next.provider.connect();
-        }
-      } catch (error) {
-        if (!active || check !== closeCheck) return;
-        if (error instanceof ApiClientError && error.status === 404) {
-          onPageUnavailable(page.id);
-          return;
-        }
-        const retryable = !(error instanceof ApiClientError) || error.status === 429 || error.status >= 500;
-        if ((code === 4410 || code === 4412) && retryable && attempt < 3) {
-          recheckTimer = window.setTimeout(() => {
-            recheckTimer = undefined;
-            void reconcileClose(code, check, attempt + 1);
-          }, 1_000 * 2 ** attempt);
-        }
-      }
-    };
-    const connectionClose = (event: CloseEvent) => {
-      if (event.code === 4410 || event.code === 4411 || event.code === 4412) {
-        next.provider.disconnect();
-      }
-      if (event.code === 4411) {
-        onPageUnavailable(page.id);
-        return;
-      }
-      if (event.code !== 4410 && event.code !== 4412 && event.code !== 1006) return;
-      if (recheckTimer !== undefined) window.clearTimeout(recheckTimer);
-      const check = ++closeCheck;
-      if (event.code === 4410 && isEditable() && next.hasUnsyncedChanges) quarantine();
-      void reconcileClose(event.code, check);
-    };
+    const closeReconciler = createDocumentCloseReconciler({
+      page: { id: page.id, contentEpoch: page.contentEpoch },
+      provider: next.provider,
+      canQuarantine: member.role !== "viewer",
+      hasUnsyncedChanges: () => next.hasUnsyncedChanges,
+      quarantine,
+      onPageChanged,
+      onPageUnavailable,
+    });
+    const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
+    const connectionSync = (synced: boolean) => closeReconciler.handleSync(synced);
     next.provider.on("connection-close", connectionClose);
+    next.provider.on("sync", connectionSync);
     setBundle(next);
     return () => {
-      active = false;
-      if (recheckTimer !== undefined) window.clearTimeout(recheckTimer);
+      closeReconciler.destroy();
       next.provider.off("custom-message", customMessage);
       next.provider.off("connection-close", connectionClose);
+      next.provider.off("sync", connectionSync);
       next.destroy();
       setBundle(null);
     };
-  }, [member.workspace.id, onPageChanged, onPageUnavailable, page.id, page.contentEpoch, recoveryKey]);
+  }, [member.role, member.workspace.id, onPageChanged, onPageUnavailable, page.id, page.contentEpoch, recoveryKey]);
 
   async function saveTitle() {
     if (!titleDirtyRef.current) {
@@ -178,45 +155,131 @@ export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onS
   return (
     <main className="page-canvas">
       <div className="page-tools">
-        <span className={`sync-state sync-${status}`}><i />{status}</span>
-        {editable && <button className="quiet-button" onClick={async () => {
-          const icon = prompt("Page icon (one emoji, or leave blank to remove)", page.icon ?? "")?.trim();
-          if (icon === undefined) return;
-          const result = await api<{ page: Page }>(`/api/pages/${page.id}`, { method: "PATCH", body: json({ icon: icon || null, revision: page.revision }) });
-          onPageChanged(result.page);
-        }}>{page.icon ?? "Add icon"}</button>}
-        <button className="quiet-button" onClick={() => { setCommentsOpen((open) => !open); setAttachmentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Comments</button>
-        <button className="quiet-button" onClick={() => { setAttachmentsOpen((open) => !open); setCommentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Files</button>
-        <button className="quiet-button" onClick={() => { setHistoryOpen((open) => !open); setCommentsOpen(false); setAttachmentsOpen(false); setBacklinksOpen(false); }}>History</button>
-        <button className="quiet-button" onClick={() => { setBacklinksOpen((open) => !open); setCommentsOpen(false); setAttachmentsOpen(false); setHistoryOpen(false); }}>Backlinks</button>
+        <span className={`sync-state sync-${status}`}>
+          <i />
+          {status}
+        </span>
+        {editable && (
+          <button
+            className="quiet-button"
+            onClick={async () => {
+              const icon = prompt("Page icon (one emoji, or leave blank to remove)", page.icon ?? "")?.trim();
+              if (icon === undefined) return;
+              const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
+                method: "PATCH",
+                body: json({ icon: icon || null, revision: page.revision }),
+              });
+              onPageChanged(result.page);
+            }}
+          >
+            {page.icon ?? "Add icon"}
+          </button>
+        )}
+        <button
+          className="quiet-button"
+          onClick={() => {
+            setCommentsOpen((open) => !open);
+            setAttachmentsOpen(false);
+            setHistoryOpen(false);
+            setBacklinksOpen(false);
+          }}
+        >
+          Comments
+        </button>
+        <button
+          className="quiet-button"
+          onClick={() => {
+            setAttachmentsOpen((open) => !open);
+            setCommentsOpen(false);
+            setHistoryOpen(false);
+            setBacklinksOpen(false);
+          }}
+        >
+          Files
+        </button>
+        <button
+          className="quiet-button"
+          onClick={() => {
+            setHistoryOpen((open) => !open);
+            setCommentsOpen(false);
+            setAttachmentsOpen(false);
+            setBacklinksOpen(false);
+          }}
+        >
+          History
+        </button>
+        <button
+          className="quiet-button"
+          onClick={() => {
+            setBacklinksOpen((open) => !open);
+            setCommentsOpen(false);
+            setAttachmentsOpen(false);
+            setHistoryOpen(false);
+          }}
+        >
+          Backlinks
+        </button>
       </div>
       {sizeWarning && (
         <div className={`notice ${sizeWarning.readOnly ? "notice-danger" : ""}`}>
           This document is {(sizeWarning.bytes / 1024 / 1024).toFixed(1)} MiB.
-          {sizeWarning.readOnly ? " It is read-only at the 24 MiB safety limit." : " Consider splitting it before it reaches 24 MiB."}
+          {sizeWarning.readOnly
+            ? " It is read-only at the 24 MiB safety limit."
+            : " Consider splitting it before it reaches 24 MiB."}
         </div>
       )}
       {recovery && recovery.epoch !== page.contentEpoch && (
         <div className="notice recovery-notice">
-          <div><strong>Offline copy quarantined</strong><span>Edits from epoch {recovery.epoch} were not merged after this page was restored.</span></div>
-          <button className="quiet-button" onClick={async () => {
-            const doc = await loadOfflineCopy(recovery.key);
-            setRecoveryPreview(plainYDoc(doc));
-            doc.destroy();
-          }}>Preview</button>
-          <button className="quiet-button" onClick={async () => {
-            const doc = await loadOfflineCopy(recovery.key);
-            const bytes = Y.encodeStateAsUpdate(doc);
-            const blob = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], { type: "application/vnd.yjs" });
-            const url = URL.createObjectURL(blob); const anchor = document.createElement("a");
-            anchor.href = url; anchor.download = `${page.title}-offline-epoch-${recovery.epoch}.yjs`; anchor.click();
-            URL.revokeObjectURL(url); doc.destroy();
-          }}>Export</button>
-          <button className="quiet-button" onClick={() => { localStorage.removeItem(recoveryKey); setRecovery(null); setRecoveryPreview(""); }}>Dismiss</button>
+          <div>
+            <strong>Offline copy quarantined</strong>
+            <span>Edits from epoch {recovery.epoch} were not merged after this page was restored.</span>
+          </div>
+          <button
+            className="quiet-button"
+            onClick={async () => {
+              const doc = await loadOfflineCopy(recovery.key);
+              setRecoveryPreview(plainYDoc(doc));
+              doc.destroy();
+            }}
+          >
+            Preview
+          </button>
+          <button
+            className="quiet-button"
+            onClick={async () => {
+              const doc = await loadOfflineCopy(recovery.key);
+              const bytes = Y.encodeStateAsUpdate(doc);
+              const blob = new Blob(
+                [bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer],
+                { type: "application/vnd.yjs" },
+              );
+              const url = URL.createObjectURL(blob);
+              const anchor = document.createElement("a");
+              anchor.href = url;
+              anchor.download = `${page.title}-offline-epoch-${recovery.epoch}.yjs`;
+              anchor.click();
+              URL.revokeObjectURL(url);
+              doc.destroy();
+            }}
+          >
+            Export
+          </button>
+          <button
+            className="quiet-button"
+            onClick={() => {
+              localStorage.removeItem(recoveryKey);
+              setRecovery(null);
+              setRecoveryPreview("");
+            }}
+          >
+            Dismiss
+          </button>
           {recoveryPreview && <p>{recoveryPreview}</p>}
         </div>
       )}
-      <div className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}>
+      <div
+        className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}
+      >
         <article className="document-paper">
           <input
             ref={titleRef}
@@ -263,28 +326,69 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [busy, setBusy] = useState(false);
   const input = useRef<HTMLInputElement>(null);
-  const load = () => api<{ attachments: Attachment[] }>(`/api/pages/${page.id}/attachments`).then((data) => setAttachments(data.attachments));
-  useEffect(() => { void load(); }, [page.id]);
+  const load = useCallback(
+    () =>
+      api<{ attachments: Attachment[] }>(`/api/pages/${page.id}/attachments`).then((data) =>
+        setAttachments(data.attachments),
+      ),
+    [page.id],
+  );
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   async function upload(file: File) {
     setBusy(true);
-    const body = new FormData(); body.set("file", file);
+    const body = new FormData();
+    body.set("file", file);
     try {
       await api(`/api/pages/${page.id}/attachments`, { method: "POST", body });
       await load();
-    } finally { setBusy(false); }
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
     <aside className="side-panel attachments-panel">
       <h2>Files</h2>
       <p className="muted">Private workspace files, up to 10 MiB each.</p>
-      {editable && <>
-        <input ref={input} hidden type="file" onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file); event.target.value = ""; }} />
-        <button className="quiet-button" disabled={busy} onClick={() => input.current?.click()}>{busy ? "Uploading…" : "Upload file"}</button>
-      </>}
+      {editable && (
+        <>
+          <input
+            ref={input}
+            hidden
+            type="file"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void upload(file);
+              event.target.value = "";
+            }}
+          />
+          <button className="quiet-button" disabled={busy} onClick={() => input.current?.click()}>
+            {busy ? "Uploading…" : "Upload file"}
+          </button>
+        </>
+      )}
       <div className="attachment-list">
-        {attachments.map((attachment) => <div key={attachment.id}><a href={`/api/attachments/${attachment.id}`} target="_blank" rel="noreferrer">{attachment.name}</a><span>{(attachment.size / 1024).toFixed(1)} KiB</span>{editable && <button onClick={async () => { await api(`/api/attachments/${attachment.id}`, { method: "DELETE" }); await load(); }}>×</button>}</div>)}
+        {attachments.map((attachment) => (
+          <div key={attachment.id}>
+            <a href={`/api/attachments/${attachment.id}`} target="_blank" rel="noreferrer">
+              {attachment.name}
+            </a>
+            <span>{(attachment.size / 1024).toFixed(1)} KiB</span>
+            {editable && (
+              <button
+                onClick={async () => {
+                  await api(`/api/attachments/${attachment.id}`, { method: "DELETE" });
+                  await load();
+                }}
+              >
+                ×
+              </button>
+            )}
+          </div>
+        ))}
         {!attachments.length && <p className="empty-copy">No files on this page.</p>}
       </div>
     </aside>
@@ -292,15 +396,33 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
 }
 
 class ReadOnlyThreadStoreAuth extends ThreadStoreAuth {
-  canCreateThread() { return false; }
-  canAddComment() { return false; }
-  canUpdateComment() { return false; }
-  canDeleteComment() { return false; }
-  canDeleteThread() { return false; }
-  canResolveThread() { return false; }
-  canUnresolveThread() { return false; }
-  canAddReaction() { return false; }
-  canDeleteReaction() { return false; }
+  canCreateThread() {
+    return false;
+  }
+  canAddComment() {
+    return false;
+  }
+  canUpdateComment() {
+    return false;
+  }
+  canDeleteComment() {
+    return false;
+  }
+  canDeleteThread() {
+    return false;
+  }
+  canResolveThread() {
+    return false;
+  }
+  canUnresolveThread() {
+    return false;
+  }
+  canAddReaction() {
+    return false;
+  }
+  canDeleteReaction() {
+    return false;
+  }
 }
 
 function editorOptions(bundle: CollaborationBundle, member: MemberContext, editable: boolean) {
@@ -317,19 +439,27 @@ function editorOptions(bundle: CollaborationBundle, member: MemberContext, edita
       user: { name: member.user.name, color: userColor(member.user.id) },
       showCursorLabels: "activity" as const,
     },
-    extensions: [CommentsExtension({
-      threadStore,
-      resolveUsers: async (ids: string[]) => ids.map((id) => ({
-        id,
-        username: id === member.user.id ? member.user.name : "Collaborator",
-        avatarUrl: "",
-        color: userColor(id),
-      })),
-    })],
+    extensions: [
+      CommentsExtension({
+        threadStore,
+        resolveUsers: async (ids: string[]) =>
+          ids.map((id) => ({
+            id,
+            username: id === member.user.id ? member.user.name : "Collaborator",
+            avatarUrl: "",
+            color: userColor(id),
+          })),
+      }),
+    ],
   });
 }
 
-function CollaborativeEditor({ bundle, member, editable, commentsOpen }: {
+function CollaborativeEditor({
+  bundle,
+  member,
+  editable,
+  commentsOpen,
+}: {
   bundle: CollaborationBundle;
   member: MemberContext;
   editable: boolean;
@@ -338,23 +468,29 @@ function CollaborativeEditor({ bundle, member, editable, commentsOpen }: {
   const options = useMemo(() => editorOptions(bundle, member, editable), [bundle, editable, member]);
   const editor = useCreateBlockNote(options, [bundle, editable]);
   const getMentionItems = async (query: string) => {
-    const data = await api<{ suggestions: MentionSuggestion[] }>(`/api/mentions/suggestions?q=${encodeURIComponent(query)}`);
+    const data = await api<{ suggestions: MentionSuggestion[] }>(
+      `/api/mentions/suggestions?q=${encodeURIComponent(query)}`,
+    );
     return data.suggestions.map((suggestion) => ({
       title: suggestion.label,
       subtext: suggestion.detail,
       group: suggestion.entityType === "page" ? "Pages" : "People",
       icon: <span>{suggestion.icon ?? (suggestion.entityType === "page" ? "□" : "@")}</span>,
-      onItemClick: () => editor.insertInlineContent([
-        {
-          type: "mention",
-          props: {
-            entityType: suggestion.entityType,
-            entityId: suggestion.entityId,
-            label: suggestion.label,
-          },
-        },
-        " ",
-      ], { updateSelection: true }),
+      onItemClick: () =>
+        editor.insertInlineContent(
+          [
+            {
+              type: "mention",
+              props: {
+                entityType: suggestion.entityType,
+                entityId: suggestion.entityId,
+                label: suggestion.label,
+              },
+            },
+            " ",
+          ],
+          { updateSelection: true },
+        ),
     }));
   };
   return (
@@ -363,9 +499,11 @@ function CollaborativeEditor({ bundle, member, editable, commentsOpen }: {
       {commentsOpen && (
         <aside className="side-panel comments-panel">
           <h2>Comments</h2>
-          <p className="muted">{editable
-            ? "Select text and use the formatting toolbar to start a thread."
-            : "Comments are read-only while this document is not editable."}</p>
+          <p className="muted">
+            {editable
+              ? "Select text and use the formatting toolbar to start a thread."
+              : "Comments are read-only while this document is not editable."}
+          </p>
           <ThreadsSidebar filter="all" sort="position" />
         </aside>
       )}
@@ -375,7 +513,12 @@ function CollaborativeEditor({ bundle, member, editable, commentsOpen }: {
 
 type Version = { id: string; title: string; epoch: number; sequence: number; byteSize: number; createdAt: number };
 
-function HistoryPanel({ page, member, current, onRestored }: {
+function HistoryPanel({
+  page,
+  member,
+  current,
+  onRestored,
+}: {
   page: Page;
   member: MemberContext;
   current: Y.Doc | null;
@@ -387,7 +530,7 @@ function HistoryPanel({ page, member, current, onRestored }: {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    api<{ versions: Version[] }>(`/api/pages/${page.id}/versions`).then((data) => setVersions(data.versions));
+    void api<{ versions: Version[] }>(`/api/pages/${page.id}/versions`).then((data) => setVersions(data.versions));
   }, [page.id]);
 
   async function choose(version: Version) {
@@ -403,11 +546,13 @@ function HistoryPanel({ page, member, current, onRestored }: {
   }
 
   async function restore() {
-    if (!selected || !confirm(`Restore “${selected.title}” from ${new Date(selected.createdAt).toLocaleString()}?`)) return;
+    if (!selected || !confirm(`Restore “${selected.title}” from ${new Date(selected.createdAt).toLocaleString()}?`))
+      return;
     setBusy(true);
     try {
       const result = await api<{ contentEpoch: number }>(`/api/pages/${page.id}/restore-version`, {
-        method: "POST", body: json({ versionId: selected.id }),
+        method: "POST",
+        body: json({ versionId: selected.id }),
       });
       onRestored(result.contentEpoch);
     } finally {
@@ -421,9 +566,15 @@ function HistoryPanel({ page, member, current, onRestored }: {
       <p className="muted">Automatic snapshots are kept for 30 days, up to 200.</p>
       <div className="version-list">
         {versions.map((version) => (
-          <button key={version.id} className={selected?.id === version.id ? "selected" : ""} onClick={() => void choose(version)}>
+          <button
+            key={version.id}
+            className={selected?.id === version.id ? "selected" : ""}
+            onClick={() => void choose(version)}
+          >
             <strong>{new Date(version.createdAt).toLocaleString()}</strong>
-            <span>{(version.byteSize / 1024).toFixed(1)} KiB · epoch {version.epoch}</span>
+            <span>
+              {(version.byteSize / 1024).toFixed(1)} KiB · epoch {version.epoch}
+            </span>
           </button>
         ))}
         {!versions.length && <p className="empty-copy">No compacted versions yet.</p>}
@@ -456,6 +607,6 @@ function BlockDiff({ oldDoc, currentDoc }: { oldDoc: Y.Doc; currentDoc: Y.Doc })
 }
 
 function plainYDoc(doc: Y.Doc) {
-  const json = yXmlFragmentToProsemirrorJSON(doc.getXmlFragment("document-store")) as ProseMirrorJson;
-  return projectDocument(json).plainText || "Empty document";
+  const projection = yXmlFragmentToProsemirrorJSON(doc.getXmlFragment("document-store")) as ProseMirrorJson;
+  return projectDocument(projection).plainText || "Empty document";
 }

@@ -1,0 +1,59 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint", "typescript", "unicorn", "oxc", "react", "jsx-a11y", "vitest", "import", "promise"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "options": {
+    "typeAware": true,
+    "maxWarnings": 0
+  },
+  "ignorePatterns": [
+    "dist/**",
+    "coverage/**",
+    "node_modules/**",
+    "playwright-report/**",
+    "test-results/**",
+    "reviews_triage/**",
+    "worker-configuration.d.ts",
+    "src/worker/worker-test.d.ts"
+  ],
+  "rules": {
+    "eqeqeq": "error",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": [
+      "error",
+      {
+        "checksVoidReturn": {
+          "attributes": false
+        }
+      }
+    ],
+    "typescript/no-unsafe-type-assertion": "off",
+    "typescript/no-unnecessary-type-assertion": "off",
+    "typescript/no-base-to-string": "off",
+    "typescript/no-unnecessary-type-conversion": "off",
+    "typescript/no-unnecessary-type-arguments": "off",
+    "react/rules-of-hooks": "error",
+    "react/exhaustive-deps": "error",
+    "react/react-in-jsx-scope": "off",
+    "jsx-a11y/control-has-associated-label": "error",
+    "jsx-a11y/no-autofocus": "off",
+    "import/no-unassigned-import": "off",
+    "import/no-named-as-default": "off",
+    "promise/always-return": "off",
+    "unicorn/no-array-sort": "off",
+    "vitest/require-mock-type-parameters": "off"
+  },
+  "overrides": [
+    {
+      "files": ["src/**/*.test.ts", "src/**/*.test.tsx", "tests/**/*.ts"],
+      "rules": {
+        "typescript/no-extraneous-class": "off",
+        "typescript/unbound-method": "off",
+        "unicorn/consistent-function-scoping": "off"
+      }
+    }
+  ]
+}

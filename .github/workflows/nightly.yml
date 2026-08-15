@@ -1,0 +1,59 @@
+name: Nightly checks
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extended:
+    name: Cross-browser UI and realtime load
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      NOTES_LOAD_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+      NOTES_LOAD_EMAIL: ${{ secrets.STAGING_LOAD_EMAIL }}
+      NOTES_LOAD_PASSWORD: ${{ secrets.STAGING_LOAD_PASSWORD }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 11.18.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps
+      - name: Cross-browser and mobile UI checks
+        env:
+          NOTES_LOAD_BASE_URL: ""
+          NOTES_LOAD_EMAIL: ""
+          NOTES_LOAD_PASSWORD: ""
+        run: pnpm test:e2e:nightly
+      - name: Local 30-connection realtime load check
+        env:
+          NOTES_LOAD_BASE_URL: ""
+          NOTES_LOAD_EMAIL: ""
+          NOTES_LOAD_PASSWORD: ""
+        run: pnpm load:realtime
+      - name: Staging realtime load check
+        if: env.NOTES_LOAD_BASE_URL != '' && env.NOTES_LOAD_EMAIL != '' && env.NOTES_LOAD_PASSWORD != ''
+        run: pnpm load:realtime
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: nightly-playwright-report
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: ignore

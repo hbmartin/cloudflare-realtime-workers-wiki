@@ -21,5 +21,18 @@ export default defineConfig({
   test: {
     include: ["src/worker/**/*.integration.test.ts"],
     testTimeout: 20_000,
+    coverage: {
+      provider: "istanbul",
+      reporter: ["text", "json", "json-summary"],
+      reportsDirectory: "coverage/worker",
+      include: ["src/worker/**/*.ts"],
+      exclude: ["src/worker/**/*.test.ts", "src/worker/worker-test.d.ts"],
+      thresholds: {
+        lines: 68,
+        functions: 73,
+        statements: 65,
+        branches: 49,
+      },
+    },
   },
 });

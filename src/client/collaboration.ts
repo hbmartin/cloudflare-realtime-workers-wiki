@@ -40,20 +40,20 @@ export function createCollaboration(
   const sendDurabilityBarrier = () => {
     if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
     barrierTimer = undefined;
-    barrierDeadline = undefined;
     const generation = durability.barrierGeneration();
-    if (generation !== null && provider.synced) {
-      provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
+    if (generation === null) {
+      barrierDeadline = undefined;
+      return;
     }
+    if (!provider.synced) return;
+    barrierDeadline = undefined;
+    provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
   };
   const scheduleDurabilityBarrier = () => {
     const now = Date.now();
     barrierDeadline ??= now + 5_000;
     if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
-    barrierTimer = window.setTimeout(
-      sendDurabilityBarrier,
-      Math.max(0, Math.min(1_000, barrierDeadline - now)),
-    );
+    barrierTimer = window.setTimeout(sendDurabilityBarrier, Math.max(0, Math.min(1_000, barrierDeadline - now)));
   };
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
@@ -79,23 +79,27 @@ export function createCollaboration(
     durability.markChanged();
     scheduleDurabilityBarrier();
   });
-  indexeddb.whenSynced.then(() => {
+  void indexeddb.whenSynced.then(() => {
     if (!destroyed) {
       // Until the server sync completes, conservatively treat a persisted copy
       // as recoverable offline work. An epoch rejection happens before sync.
       if (Y.encodeStateVector(doc).byteLength > 1) durability.markChanged();
       indexeddbSynced = true;
-      provider.connect();
+      void provider.connect();
     }
   });
 
   const visibility = () => {
     if (document.visibilityState === "hidden") {
       sendDurabilityBarrier();
-      hiddenTimer = window.setTimeout(() => provider.disconnect(), 30_000);
+      hiddenTimer = window.setTimeout(() => {
+        hiddenTimer = undefined;
+        provider.disconnect();
+      }, 30_000);
     } else {
-      if (hiddenTimer) window.clearTimeout(hiddenTimer);
-      if (indexeddbSynced) provider.connect();
+      if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
+      hiddenTimer = undefined;
+      if (indexeddbSynced) void provider.connect();
     }
   };
   document.addEventListener("visibilitychange", visibility);
@@ -104,10 +108,12 @@ export function createCollaboration(
     doc,
     indexeddb,
     provider,
-    get hasUnsyncedChanges() { return durability.hasUnsyncedChanges; },
+    get hasUnsyncedChanges() {
+      return durability.hasUnsyncedChanges;
+    },
     destroy() {
       destroyed = true;
-      if (hiddenTimer) window.clearTimeout(hiddenTimer);
+      if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
       if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
       document.removeEventListener("visibilitychange", visibility);
       provider.off("status", handleStatus);
@@ -115,7 +121,7 @@ export function createCollaboration(
       provider.off("custom-message", handleCustomMessage);
       provider.awareness.setLocalState(null);
       provider.destroy();
-      indexeddb.destroy();
+      void indexeddb.destroy();
       doc.destroy();
     },
   };
@@ -162,9 +168,9 @@ export function createWorkspaceEvents(
   };
 }
 
-export function userColor(id: string) {
+export function userColor(id: string): string {
   const palette = ["#2563eb", "#7c3aed", "#db2777", "#dc2626", "#d97706", "#059669", "#0891b2"];
   let hash = 0;
   for (const char of id) hash = (hash * 31 + char.charCodeAt(0)) | 0;
-  return palette[Math.abs(hash) % palette.length];
+  return palette[Math.abs(hash) % palette.length]!;
 }

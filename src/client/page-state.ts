@@ -36,6 +36,12 @@ export class PageLoadEventBuffer {
     this.recording = false;
     return result;
   }
+
+  cancel() {
+    this.upserts.clear();
+    this.removals.clear();
+    this.recording = false;
+  }
 }
 
 export function mergePages(current: Page[], incoming: Page[]) {
@@ -55,16 +61,27 @@ export function mergePageSnapshot(current: Page[], snapshot: Page[]) {
   });
 }
 
+export function authoritativePageSnapshot(
+  snapshot: Page[],
+  pendingUpserts: Page[],
+  pendingRemovals: ReadonlySet<string>,
+) {
+  const pages = mergePages(snapshot, pendingUpserts).filter((page) => !pendingRemovals.has(page.id));
+  return {
+    pages,
+    ids: new Set(pages.map((page) => page.id)),
+  };
+}
+
 export function reconcilePageSnapshot(
   current: Page[],
   snapshot: Page[],
   pendingUpserts: Page[],
   pendingRemovals: ReadonlySet<string>,
 ) {
-  const reconciled = mergePages(snapshot, pendingUpserts)
-    .filter((page) => !pendingRemovals.has(page.id));
+  const authoritative = authoritativePageSnapshot(snapshot, pendingUpserts, pendingRemovals);
   return {
-    pages: mergePageSnapshot(current, reconciled),
-    authoritativeIds: new Set(reconciled.map((page) => page.id)),
+    pages: mergePageSnapshot(current, authoritative.pages),
+    authoritativeIds: authoritative.ids,
   };
 }
