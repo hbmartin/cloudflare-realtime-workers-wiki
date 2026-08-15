@@ -3,7 +3,7 @@
 import { act, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
-import type { MemberContext } from "../shared/types";
+import type { ClientMemberContext } from "../shared/types";
 import { ApiClientError } from "./api";
 import { EditorPage } from "./EditorPage";
 
@@ -90,9 +90,8 @@ const page: Page = {
   updatedAt: 1,
 };
 
-const member: MemberContext = {
+const member: ClientMemberContext = {
   user: { id: "user-1", name: "Owner", email: "owner@example.test" },
-  session: { id: "session-1", expiresAt: new Date(Date.now() + 60_000) },
   workspace: { id: "workspace-1", name: "Workspace", locationHint: null },
   role: "owner",
 };
@@ -139,6 +138,7 @@ describe("EditorPage close reconciliation", () => {
         member={member}
         onPageChanged={vi.fn()}
         onPageUnavailable={unavailable}
+        onAuthorizationError={vi.fn()}
         onSelectPage={vi.fn()}
         backlinksRevision={0}
       />,
@@ -173,6 +173,7 @@ describe("EditorPage close reconciliation", () => {
         member={member}
         onPageChanged={vi.fn()}
         onPageUnavailable={vi.fn()}
+        onAuthorizationError={vi.fn()}
         onSelectPage={vi.fn()}
         backlinksRevision={0}
       />,

@@ -111,6 +111,9 @@ describe("collaboration durability barriers", () => {
 
     expect(onStatus).toHaveBeenCalledWith("offline");
     expect(logged).toHaveBeenCalledWith("Failed to connect document collaboration", error);
+    expect(provider.connect).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(provider.connect).toHaveBeenCalledTimes(2);
     bundle.destroy();
   });
 });

@@ -94,15 +94,15 @@ try {
   );
   console.log(`Opened ${sockets.length} authenticated realtime connections.`);
   await delay(holdMilliseconds);
-  await Promise.all(
+  const closed = await Promise.all(
     sockets.map(async (socket) => {
       socket.close(1000, "load check complete");
-      await Promise.race([
-        once(socket, "close"),
-        delay(5_000).then(() => Promise.reject(new Error("A realtime connection did not close."))),
-      ]);
+      return Promise.race([once(socket, "close").then(() => true), delay(5_000).then(() => false)]);
     }),
   );
+  const lingering = sockets.filter((_, index) => !closed[index]);
+  for (const socket of lingering) socket.terminate();
+  if (lingering.length) console.warn(`Force-closed ${lingering.length} realtime connections after cleanup timed out.`);
 } finally {
   server?.kill("SIGTERM");
 }

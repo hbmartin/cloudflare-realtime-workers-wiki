@@ -679,7 +679,7 @@ export class Document extends YServer {
 
   private clearRestoreRecovery(retired: boolean) {
     if (this.purged) return;
-    const retiredFlag = retired || this.metadata.retired ? 1 : 0;
+    const retiredFlag = retired ? 1 : 0;
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(
         `UPDATE document_meta SET retired = ?, restore_pending = 0 WHERE id = 1`,
@@ -696,9 +696,8 @@ export class Document extends YServer {
       this.bindings.BUCKET.delete(recovery.new_key),
       ...(recovery.pre_key ? [this.bindings.BUCKET.delete(recovery.pre_key)] : []),
     ]);
-    for (const result of results) {
-      if (result.status === "rejected") console.error("Failed to delete a restore recovery object", result.reason);
-    }
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
   }
 
   private async deferRestoreReconciliation(error: unknown) {
@@ -730,18 +729,28 @@ export class Document extends YServer {
     }
 
     if (current?.content_epoch === recovery.old_epoch) {
-      await this.deleteRestoreObjects(recovery);
+      try {
+        await this.deleteRestoreObjects(recovery);
+      } catch (error) {
+        await this.deferRestoreReconciliation(error);
+        return false;
+      }
       if (this.purged) return false;
       this.clearRestoreRecovery(false);
       return true;
     }
 
-    if (!current) {
-      await this.deleteRestoreObjects(recovery);
-    } else if (current.content_epoch > recovery.new_epoch) {
-      // The pre-restore version may still be referenced by page_versions, but
-      // a superseded epoch snapshot is no longer reachable from D1.
-      await this.deleteRestoreObjects({ new_key: recovery.new_key, pre_key: null });
+    try {
+      if (!current) {
+        await this.deleteRestoreObjects(recovery);
+      } else if (current.content_epoch > recovery.new_epoch) {
+        // The pre-restore version may still be referenced by page_versions, but
+        // a superseded epoch snapshot is no longer reachable from D1.
+        await this.deleteRestoreObjects({ new_key: recovery.new_key, pre_key: null });
+      }
+    } catch (error) {
+      await this.deferRestoreReconciliation(error);
+      return false;
     }
     if (this.purged) return false;
 

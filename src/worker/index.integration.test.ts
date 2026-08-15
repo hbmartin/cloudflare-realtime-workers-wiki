@@ -862,7 +862,7 @@ describe("Worker integration", () => {
     expect(await env.BUCKET.get(recovery.pre_key!)).toBeNull();
   });
 
-  it("clears restore recovery after best-effort R2 cleanup without clearing a retirement tombstone", async () => {
+  it("retries failed restore cleanup and then follows the authoritative epoch", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
     await stub.fetch(internalWarmupRequest());
@@ -905,7 +905,20 @@ describe("Worker integration", () => {
             `SELECT retired, restore_pending FROM document_meta WHERE id = 1`,
           )
           .one(),
-      ).toEqual({ retired: 1, restore_pending: 0 });
+      ).toEqual({ retired: 1, restore_pending: 1 });
+      expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count).toBe(
+        1,
+      );
+      expect(await state.storage.getAlarm()).not.toBeNull();
+
+      await document.onAlarm();
+      expect(
+        state.storage.sql
+          .exec<{ retired: number; restore_pending: number }>(
+            `SELECT retired, restore_pending FROM document_meta WHERE id = 1`,
+          )
+          .one(),
+      ).toEqual({ retired: 0, restore_pending: 0 });
       expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count).toBe(
         0,
       );

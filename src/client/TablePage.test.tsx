@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MemberContext } from "../shared/types";
+import type { ClientMemberContext } from "../shared/types";
 import type { Page, TableData } from "../shared/types";
 import { ApiClientError, api } from "./api";
 import { TablePage } from "./TablePage";
@@ -35,11 +35,26 @@ const table: TableData = {
   lease: { heldByMe: false, holderName: null, expiresAt: null },
 };
 
-function member(role: MemberContext["role"]): MemberContext {
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
+function tableWithValue(value: string, revision: number): TableData {
+  return {
+    ...table,
+    revision,
+    rows: [{ ...table.rows[0]!, cells: { status: value } }],
+  };
+}
+
+function member(role: ClientMemberContext["role"]): ClientMemberContext {
   return {
     role,
     user: { id: `${role}-user`, name: role, email: `${role}@example.test` },
-    session: { id: `${role}-session`, expiresAt: new Date(Date.now() + 60_000) },
     workspace: { id: "workspace", name: "Notes", locationHint: null },
   };
 }
@@ -52,6 +67,7 @@ describe("TablePage", () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -92,6 +108,7 @@ describe("TablePage", () => {
     expect(await screen.findByText("Editing lease active")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "+ Property" })).toBeInTheDocument();
     expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", { method: "POST" });
+    expect(api).toHaveBeenCalledTimes(2);
   });
 
   it("recovers from a lease conflict in read-only mode", async () => {
@@ -113,8 +130,53 @@ describe("TablePage", () => {
 
     expect(await screen.findByText("Another editor has this table open for editing.")).toBeInTheDocument();
     expect(screen.getByText("Read-only")).toBeInTheDocument();
-    await waitFor(() => expect(api).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(api).toHaveBeenCalledTimes(2));
     fireEvent.click(screen.getByRole("button", { name: "Try edit lock" }));
-    await waitFor(() => expect(api).toHaveBeenCalledTimes(5));
+    await waitFor(() => expect(api).toHaveBeenCalledTimes(4));
+  });
+
+  it("ignores a stale read-only poll after acquiring a lease", async () => {
+    vi.useFakeTimers();
+    const lease = deferred<{ leaseToken: string }>();
+    const staleLoad = deferred<{ table: TableData }>();
+    const currentLoad = deferred<{ table: TableData }>();
+    let loadCount = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return lease.promise;
+      loadCount += 1;
+      return loadCount === 1 ? staleLoad.promise : currentLoad.promise;
+    });
+
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(loadCount).toBe(1);
+
+    await act(async () => {
+      lease.resolve({ leaseToken: "lease-token" });
+      await Promise.resolve();
+    });
+    expect(loadCount).toBe(2);
+
+    await act(async () => {
+      currentLoad.resolve({ table: tableWithValue("Current", 2) });
+      await Promise.resolve();
+    });
+    expect(screen.getByDisplayValue("Current")).toBeInTheDocument();
+
+    await act(async () => {
+      staleLoad.resolve({ table: tableWithValue("Stale", 1) });
+      await Promise.resolve();
+    });
+    expect(screen.getByDisplayValue("Current")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Stale")).not.toBeInTheDocument();
   });
 });

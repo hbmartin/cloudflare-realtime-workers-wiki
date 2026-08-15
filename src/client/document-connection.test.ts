@@ -32,6 +32,7 @@ function setup(hasUnsyncedChanges = false) {
   const quarantine = vi.fn();
   const onPageChanged = vi.fn();
   const onPageUnavailable = vi.fn();
+  const onAuthorizationError = vi.fn();
   const reconciler = createDocumentCloseReconciler({
     page,
     provider,
@@ -40,8 +41,9 @@ function setup(hasUnsyncedChanges = false) {
     quarantine,
     onPageChanged,
     onPageUnavailable,
+    onAuthorizationError,
   });
-  return { provider, quarantine, onPageChanged, onPageUnavailable, reconciler };
+  return { provider, quarantine, onPageChanged, onPageUnavailable, onAuthorizationError, reconciler };
 }
 
 async function flushPromises() {
@@ -93,6 +95,10 @@ describe("document close reconciliation", () => {
     await vi.advanceTimersByTimeAsync(1_000);
 
     expect(logged).toHaveBeenCalledWith("Failed to reconnect document collaboration", error);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(provider.connect).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(provider.connect).toHaveBeenCalledTimes(2);
   });
 
   it("quarantines unsynced changes when a restore transition closes the room", async () => {
@@ -141,14 +147,15 @@ describe("document close reconciliation", () => {
     expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
   });
 
-  it.each([401, 403])("does not remove the page when reconciliation returns %i", async (status) => {
+  it.each([401, 403])("reports an authorization failure when reconciliation returns %i", async (status) => {
     mocks.api.mockRejectedValue(new ApiClientError(status, "access_error", "Access failed"));
-    const { provider, onPageUnavailable, reconciler } = setup();
+    const { provider, onPageUnavailable, onAuthorizationError, reconciler } = setup();
 
     reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
     await flushPromises();
 
-    expect(provider.disconnect).toHaveBeenCalledOnce();
+    expect(provider.disconnect).toHaveBeenCalledTimes(2);
     expect(onPageUnavailable).not.toHaveBeenCalled();
+    expect(onAuthorizationError).toHaveBeenCalledWith(page.id, expect.objectContaining({ status }));
   });
 });

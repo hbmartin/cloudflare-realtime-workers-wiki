@@ -21,9 +21,7 @@ export type MemberContext = {
   role: Role;
 };
 
-export type MemberContextWire = Omit<MemberContext, "session"> & {
-  session: { id: string; expiresAt: string };
-};
+export type ClientMemberContext = Omit<MemberContext, "session">;
 
 export type Page = {
   id: string;

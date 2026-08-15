@@ -4,6 +4,10 @@ import * as Y from "yjs";
 import type { WorkspaceEvent } from "../shared/types";
 import { CollaborationDurability } from "./collaboration-durability";
 
+function connectionRetryDelay(attempt: number) {
+  return Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
+}
+
 export type CollaborationBundle = {
   doc: Y.Doc;
   indexeddb: IndexeddbPersistence;
@@ -33,15 +37,28 @@ export function createCollaboration(
   let hiddenTimer: number | undefined;
   let barrierTimer: number | undefined;
   let barrierDeadline: number | undefined;
+  let connectionTimer: number | undefined;
+  let connectionAttempt = 0;
   let destroyed = false;
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
   const connect = () => {
-    void provider.connect().catch((error) => {
-      if (destroyed) return;
-      onStatus("offline");
-      console.error("Failed to connect document collaboration", error);
-    });
+    if (destroyed) return;
+    if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
+    connectionTimer = undefined;
+    void provider.connect().then(
+      () => {
+        connectionAttempt = 0;
+      },
+      (error) => {
+        if (destroyed) return;
+        onStatus("offline");
+        console.error("Failed to connect document collaboration", error);
+        if (document.visibilityState !== "hidden") {
+          connectionTimer = window.setTimeout(connect, connectionRetryDelay(connectionAttempt++));
+        }
+      },
+    );
   };
 
   const sendDurabilityBarrier = () => {
@@ -102,6 +119,8 @@ export function createCollaboration(
 
   const visibility = () => {
     if (document.visibilityState === "hidden") {
+      if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
+      connectionTimer = undefined;
       sendDurabilityBarrier();
       hiddenTimer = window.setTimeout(() => {
         hiddenTimer = undefined;
@@ -126,6 +145,7 @@ export function createCollaboration(
       destroyed = true;
       if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
       if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
+      if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
       document.removeEventListener("visibilitychange", visibility);
       provider.off("status", handleStatus);
       provider.off("sync", handleSync);
