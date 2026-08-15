@@ -44,7 +44,11 @@ Restore the exact `r2_key` from backup. D1 authorization metadata is intentional
 
 ### Permanent deletion cleanup is incomplete
 
-Permanent deletion removes page metadata and commits a D1 cleanup job before returning `202`. Each document epoch Durable Object is purged with `storage.deleteAll()` before the job deletes exact attachment keys and complete `documents/{pageId}/` prefixes. Inspect `deletion_jobs` and unfinished `deletion_targets`; the hourly cron retries them idempotently with backoff. Do not remove a job manually unless every target has been independently verified. Pages deleted before this queue existed cannot be enumerated if no D1/R2/operator identifier remains; use operator records to seed targeted cleanup.
+Permanent deletion removes page metadata and commits a D1 cleanup job before returning `202`. Each document epoch Durable Object has its alarm canceled and is purged with `storage.deleteAll()` before the job deletes exact attachment keys and complete `documents/{pageId}/` prefixes. Inspect `deletion_jobs` and unfinished `deletion_targets`; the hourly cron retries them idempotently with backoff. Do not remove a job manually unless every target has been independently verified. Pages deleted before this queue existed cannot be enumerated if no D1/R2/operator identifier remains; use operator records to seed targeted cleanup.
+
+### Archived editors remain connected
+
+Archiving commits page metadata and an `archive_disconnect_targets` row before contacting each document room. The page disappears from clients immediately; the hourly cron retries any room that could not be closed. Inspect `archive_disconnect_targets.last_error` and allow the retry to finish, or restore the page to cancel its pending target.
 
 ## Recovery validation
 
@@ -57,3 +61,4 @@ Permanent deletion removes page metadata and commits a D1 cleanup job before ret
 - Open version history and restore a disposable page.
 - Acquire, renew, release, expire, and force-release a table lease.
 - Confirm `deletion_jobs` is empty, no `deletion_targets` rows have `completed_at IS NULL`, and deleted page prefixes are empty in R2.
+- Confirm `archive_disconnect_targets` is empty after archive-disconnect retries have run.

@@ -72,6 +72,7 @@ async function createPage(cookie: string, kind: "document" | "table" = "document
 type TestDocument = {
   document: Y.Doc;
   onSave(): Promise<void>;
+  onRequest(request: Request): Promise<Response>;
   compact(forceVersion?: boolean): Promise<void>;
   restoreVersion(versionId: string, userId: string): Promise<Response>;
   scheduleAlarm(when: number): Promise<void>;
@@ -156,6 +157,12 @@ describe("Worker integration", () => {
     expect(await unchanged.text()).toBe("");
     expect(unchanged.headers.get("etag")).toBe(etag);
 
+    const unchangedSince = await SELF.fetch(authenticatedRequest(installed.cookie, path, {
+      headers: { "if-modified-since": new Date(Date.now() + 60_000).toUTCString() },
+    }));
+    expect(unchangedSince.status).toBe(304);
+    expect(await unchangedSince.text()).toBe("");
+
     const changed = await SELF.fetch(authenticatedRequest(installed.cookie, path, {
       headers: { "if-none-match": '"not-this-object"' },
     }));
@@ -209,6 +216,18 @@ describe("Worker integration", () => {
     expect((await search.json<{ results: Array<{ page: { id: string } }> }>()).results.map((item) => item.page.id))
       .toContain(installed.pageId);
     expect((await SELF.fetch(authenticatedRequest(installed.cookie, "/api/search?q=!!!"))).status).toBe(200);
+
+    const backslashTitle = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Back\\Slash", revision: 2 }),
+    }));
+    expect(backslashTitle.status).toBe(200);
+    const suggestions = await (await SELF.fetch(authenticatedRequest(
+      installed.cookie,
+      `/api/mentions/suggestions?q=${encodeURIComponent("Back\\")}`,
+    ))).json<{ suggestions: Array<{ entityId: string }> }>();
+    expect(suggestions.suggestions.map((item) => item.entityId)).toContain(installed.pageId);
   });
 
   it("accepts a redundant invite for an existing workspace member without failing the membership constraint", async () => {
@@ -310,6 +329,73 @@ describe("Worker integration", () => {
     });
   });
 
+  it("serializes an archive compaction behind an in-flight alarm compaction", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      const content = document.document.getMap<number>("serialized-content");
+      content.set("before", 1);
+      await document.onSave();
+
+      let releaseFirstPut!: () => void;
+      let markFirstPutStarted!: () => void;
+      const firstPutGate = new Promise<void>((resolve) => { releaseFirstPut = resolve; });
+      const firstPutStarted = new Promise<void>((resolve) => { markFirstPutStarted = resolve; });
+      const originalBindings = document.bindings;
+      const bucket = originalBindings.BUCKET;
+      let currentPuts = 0;
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property !== "BUCKET") return Reflect.get(target, property, receiver);
+          return new Proxy(bucket, {
+            get(bucketTarget, bucketProperty) {
+              if (bucketProperty === "put") return async (...args: any[]) => {
+                if (String(args[0]).endsWith("/current.bin") && ++currentPuts === 1) {
+                  markFirstPutStarted();
+                  await firstPutGate;
+                }
+                return Reflect.apply(bucketTarget.put, bucketTarget, args);
+              };
+              const value = Reflect.get(bucketTarget, bucketProperty, bucketTarget);
+              return typeof value === "function" ? value.bind(bucketTarget) : value;
+            },
+          });
+        },
+      });
+
+      try {
+        const firstCompaction = document.compact();
+        await firstPutStarted;
+        content.set("during", 2);
+        await document.onSave();
+        const archiving = document.onRequest(new Request("https://document.internal/archive", {
+          method: "POST",
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        }));
+        await Promise.resolve();
+        expect(currentPuts).toBe(1);
+        releaseFirstPut();
+        const [, archived] = await Promise.all([firstCompaction, archiving]);
+        expect(archived.status).toBe(200);
+      } finally {
+        document.bindings = originalBindings;
+        releaseFirstPut();
+      }
+
+      const stored = await env.BUCKET.get(`documents/${installed.pageId}/epochs/1/current.bin`);
+      expect(stored).toBeTruthy();
+      const replica = new Y.Doc();
+      Y.applyUpdate(replica, new Uint8Array(await stored!.arrayBuffer()));
+      expect(replica.getMap("serialized-content").toJSON()).toEqual({ before: 1, during: 2 });
+      replica.destroy();
+    });
+  });
+
   it("re-dirties and reschedules a document after failed compaction", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
@@ -331,34 +417,6 @@ describe("Worker integration", () => {
       await expect(document.compact()).rejects.toThrow("R2 unavailable");
       document.bindings = originalBindings;
 
-      expect(state.storage.sql.exec<{ dirty: number }>(
-        `SELECT dirty FROM document_meta WHERE id = 1`,
-      ).one().dirty).toBe(1);
-      expect(await state.storage.getAlarm()).not.toBeNull();
-    });
-  });
-
-  it("recovers a pending update log when an instance restarts after dirty was cleared", async () => {
-    const installed = await bootstrap();
-    const room = `${installed.pageId}~1`;
-    const stub = env.DOCUMENT.getByName(room);
-    await stub.fetch(new Request("https://document.internal/noop", {
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-    }));
-    await runInDurableObject(stub, async (instance, state) => {
-      const document = instance as unknown as TestDocument;
-      document.document.getMap("restart-content").set("value", 1);
-      await document.onSave();
-      state.storage.sql.exec(`UPDATE document_meta SET dirty = 0 WHERE id = 1`);
-      await state.storage.deleteAlarm();
-    });
-
-    await abortAllDurableObjects();
-    const restarted = env.DOCUMENT.getByName(room);
-    await restarted.fetch(new Request("https://document.internal/noop", {
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-    }));
-    await runInDurableObject(restarted, async (_instance, state) => {
       expect(state.storage.sql.exec<{ dirty: number }>(
         `SELECT dirty FROM document_meta WHERE id = 1`,
       ).one().dirty).toBe(1);
@@ -406,12 +464,15 @@ describe("Worker integration", () => {
           return Reflect.get(target, property, receiver);
         },
       });
-      const failed = await document.restoreVersion(version!.id, installed.userId);
-      document.bindings = originalBindings;
-      expect(failed.status).toBe(503);
-      expect(state.storage.sql.exec<{ retired: number }>(
-        `SELECT retired FROM document_meta WHERE id = 1`,
-      ).one().retired).toBe(0);
+      try {
+        const failed = await document.restoreVersion(version!.id, installed.userId);
+        expect(failed.status).toBe(503);
+        expect(state.storage.sql.exec<{ retired: number }>(
+          `SELECT retired FROM document_meta WHERE id = 1`,
+        ).one().retired).toBe(0);
+      } finally {
+        document.bindings = originalBindings;
+      }
     });
     expect((await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ?`)
       .bind(installed.pageId).first<{ content_epoch: number }>())?.content_epoch).toBe(1);
@@ -428,6 +489,67 @@ describe("Worker integration", () => {
         `SELECT retired FROM document_meta WHERE id = 1`,
       ).one().retired).toBe(1);
     });
+  });
+
+  it("rejects a concurrent restore before it can share the next epoch snapshot key", async () => {
+    const installed = await bootstrap();
+    const room = `${installed.pageId}~1`;
+    const stub = env.DOCUMENT.getByName(room);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      document.document.getMap("restore-race").set("value", 1);
+      await document.onSave();
+      await document.compact(true);
+    });
+    const version = await env.DB.prepare(
+      `SELECT id, r2_key FROM page_versions WHERE page_id = ? ORDER BY created_at DESC LIMIT 1`,
+    ).bind(installed.pageId).first<{ id: string; r2_key: string }>();
+    expect(version).toBeTruthy();
+
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      const originalBindings = document.bindings;
+      const bucket = originalBindings.BUCKET;
+      let releaseVersionRead!: () => void;
+      let markVersionReadStarted!: () => void;
+      const versionReadGate = new Promise<void>((resolve) => { releaseVersionRead = resolve; });
+      const versionReadStarted = new Promise<void>((resolve) => { markVersionReadStarted = resolve; });
+      let versionReads = 0;
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property !== "BUCKET") return Reflect.get(target, property, receiver);
+          return new Proxy(bucket, {
+            get(bucketTarget, bucketProperty) {
+              if (bucketProperty === "get") return async (...args: any[]) => {
+                if (args[0] === version!.r2_key && ++versionReads === 1) {
+                  markVersionReadStarted();
+                  await versionReadGate;
+                }
+                return Reflect.apply(bucketTarget.get, bucketTarget, args);
+              };
+              const value = Reflect.get(bucketTarget, bucketProperty, bucketTarget);
+              return typeof value === "function" ? value.bind(bucketTarget) : value;
+            },
+          });
+        },
+      });
+
+      try {
+        const first = document.restoreVersion(version!.id, installed.userId);
+        await versionReadStarted;
+        const second = await document.restoreVersion(version!.id, installed.userId);
+        expect(second.status).toBe(409);
+        releaseVersionRead();
+        expect((await first).status).toBe(200);
+      } finally {
+        document.bindings = originalBindings;
+        releaseVersionRead();
+      }
+    });
+    expect(await env.BUCKET.get(`documents/${installed.pageId}/epochs/2/current.bin`)).toBeTruthy();
   });
 
   it("flushes an archived document without resurrecting its search row", async () => {
@@ -447,9 +569,11 @@ describe("Worker integration", () => {
       await document.onSave();
     });
 
-    expect((await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+    const archived = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
       method: "DELETE",
-    }))).status).toBe(200);
+    }));
+    expect(archived.status).toBe(200);
+    expect(await archived.json()).toEqual({ ok: true, cleanupPending: false, pendingPageIds: [] });
     expect((await env.DB.prepare(`SELECT COUNT(*) count FROM page_search WHERE page_id = ?`)
       .bind(installed.pageId).first<{ count: number }>())?.count).toBe(0);
     expect((await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`)
@@ -458,6 +582,66 @@ describe("Worker integration", () => {
       expect(state.storage.sql.exec<{ dirty: number }>(`SELECT dirty FROM document_meta WHERE id = 1`).one().dirty).toBe(0);
       expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM update_events`).one().count).toBe(0);
     });
+    expect((await env.DB.prepare(
+      `SELECT COUNT(*) count FROM archive_disconnect_targets`,
+    ).first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("keeps an archived page committed and retries a failed room disconnect", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+    let originalBindings!: Cloudflare.Env;
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      document.document.getMap("archive-retry").set("value", 1);
+      await document.onSave();
+      originalBindings = document.bindings;
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property === "BUCKET") {
+            return new Proxy(originalBindings.BUCKET, {
+              get(bucket, bucketProperty, bucketReceiver) {
+                if (bucketProperty === "put") return async () => { throw new Error("R2 unavailable"); };
+                const value = Reflect.get(bucket, bucketProperty, bucketReceiver);
+                return typeof value === "function" ? value.bind(bucket) : value;
+              },
+            });
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+    });
+
+    const archived = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+      method: "DELETE",
+    }));
+    expect(archived.status).toBe(202);
+    expect(await archived.json()).toEqual({
+      ok: true,
+      cleanupPending: true,
+      pendingPageIds: [installed.pageId],
+    });
+    expect((await env.DB.prepare(`SELECT archived_at FROM pages WHERE id = ?`)
+      .bind(installed.pageId).first<{ archived_at: number | null }>())?.archived_at).not.toBeNull();
+    expect(await env.DB.prepare(`SELECT page_id FROM archive_disconnect_targets WHERE page_id = ?`)
+      .bind(installed.pageId).first()).not.toBeNull();
+
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      // Recover the real test bindings after the injected R2 outage.
+      document.bindings = originalBindings;
+    });
+    await env.DB.prepare(
+      `UPDATE archive_disconnect_targets SET next_attempt_at = 0 WHERE page_id = ?`,
+    ).bind(installed.pageId).run();
+    const scheduledContext = createExecutionContext();
+    await worker.scheduled(createScheduledController(), env, scheduledContext);
+    await waitOnExecutionContext(scheduledContext);
+    expect(await env.DB.prepare(`SELECT page_id FROM archive_disconnect_targets WHERE page_id = ?`)
+      .bind(installed.pageId).first()).toBeNull();
   });
 
   it("does not mutate rows or options belonging to another table through a held lease", async () => {
@@ -504,6 +688,69 @@ describe("Worker integration", () => {
     expect((await env.DB.prepare(`SELECT COUNT(*) count FROM table_cells`).first<{ count: number }>())?.count).toBe(0);
     expect((await env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
       .bind(tableA.id).first<{ revision: number }>())?.revision).toBe(1);
+  });
+
+  it("paginates mention traversal before advancing the read watermark", async () => {
+    const installed = await bootstrap();
+    const extraPageIds = Array.from({ length: 100 }, () => crypto.randomUUID());
+    const timestamp = Date.now() - 10_000;
+    for (let offset = 0; offset < extraPageIds.length; offset += 50) {
+      await env.DB.batch(extraPageIds.slice(offset, offset + 50).map((pageId, index) => env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES (?, ?, 'document', ?, ?, ?, ?, ?)`,
+      ).bind(
+        pageId,
+        installed.workspaceId,
+        `mention-${offset + index}`,
+        `Mention page ${offset + index}`,
+        installed.userId,
+        timestamp,
+        timestamp,
+      )));
+    }
+    const sourcePageIds = [installed.pageId, ...extraPageIds];
+    for (let offset = 0; offset < sourcePageIds.length; offset += 50) {
+      await env.DB.batch(sourcePageIds.slice(offset, offset + 50).map((pageId, index) => env.DB.prepare(
+        `INSERT INTO member_mentions
+          (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, projection_seq)
+         VALUES (?, ?, ?, 'Mention', ?, 1)`,
+      ).bind(installed.workspaceId, pageId, installed.userId, timestamp + offset + index)));
+    }
+
+    const first = await (await SELF.fetch(authenticatedRequest(installed.cookie, "/api/mentions"))).json<{
+      asOf: number;
+      mentions: Array<{ page: { id: string } }>;
+      nextCursor: { firstSeenAt: number; pageId: string } | null;
+    }>();
+    expect(first.mentions).toHaveLength(100);
+    expect(first.nextCursor).toBeTruthy();
+    expect((await env.DB.prepare(
+      `SELECT read_at FROM mention_reads WHERE workspace_id = ? AND user_id = ?`,
+    ).bind(installed.workspaceId, installed.userId).first())).toBeNull();
+
+    const query = new URLSearchParams({
+      asOf: String(first.asOf),
+      beforeAt: String(first.nextCursor!.firstSeenAt),
+      beforeId: first.nextCursor!.pageId,
+    });
+    const second = await (await SELF.fetch(authenticatedRequest(
+      installed.cookie,
+      `/api/mentions?${query}`,
+    ))).json<{
+      mentions: Array<{ page: { id: string } }>;
+      nextCursor: { firstSeenAt: number; pageId: string } | null;
+    }>();
+    expect(second.mentions).toHaveLength(1);
+    expect(second.nextCursor).toBeNull();
+    expect(new Set([...first.mentions, ...second.mentions].map((item) => item.page.id)).size).toBe(101);
+
+    const read = await SELF.fetch(authenticatedRequest(installed.cookie, "/api/mentions/read", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ through: first.asOf }),
+    }));
+    expect(await read.json()).toEqual({ unreadCount: 0 });
   });
 
   it("materializes only same-workspace references and applies mention read cursors", async () => {
@@ -679,10 +926,12 @@ describe("Worker integration", () => {
     expect(await Promise.all(attachmentKeys.map((key) => env.BUCKET.get(key))))
       .toEqual(attachmentKeys.map(() => null));
     for (const room of rooms) {
-      const sentinel = await runInDurableObject(env.DOCUMENT.getByName(room), async (_instance, state) => (
-        state.storage.get("sentinel")
-      ));
-      expect(sentinel).toBeUndefined();
+      const stateAfterPurge = await runInDurableObject(env.DOCUMENT.getByName(room), async (_instance, state) => ({
+        sentinel: await state.storage.get("sentinel"),
+        alarm: await state.storage.getAlarm(),
+      }));
+      expect(stateAfterPurge.sentinel).toBeUndefined();
+      expect(stateAfterPurge.alarm).toBeNull();
     }
 
     const retryJob = crypto.randomUUID();
@@ -727,5 +976,36 @@ describe("Worker integration", () => {
     await Promise.all([processDeletionJob(env, jobId), processDeletionJob(env, jobId)]);
     expect(await env.BUCKET.get(target)).toBeNull();
     expect(await env.DB.prepare(`SELECT id FROM deletion_jobs WHERE id = ?`).bind(jobId).first()).toBeNull();
+  });
+
+  // abortAllDurableObjects simulates a crash rather than a graceful eviction and
+  // intentionally invalidates the test isolate, so keep this destructive restart
+  // scenario last in the file.
+  it("recovers a pending update log when an instance restarts after dirty was cleared", async () => {
+    const installed = await bootstrap();
+    const room = `${installed.pageId}~1`;
+    const stub = env.DOCUMENT.getByName(room);
+    await stub.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      document.document.getMap("restart-content").set("value", 1);
+      await document.onSave();
+      state.storage.sql.exec(`UPDATE document_meta SET dirty = 0 WHERE id = 1`);
+      await state.storage.deleteAlarm();
+    });
+
+    await abortAllDurableObjects();
+    const restarted = env.DOCUMENT.getByName(room);
+    await restarted.fetch(new Request("https://document.internal/noop", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }));
+    await runInDurableObject(restarted, async (_instance, state) => {
+      expect(state.storage.sql.exec<{ dirty: number }>(
+        `SELECT dirty FROM document_meta WHERE id = 1`,
+      ).one().dirty).toBe(1);
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
   });
 });

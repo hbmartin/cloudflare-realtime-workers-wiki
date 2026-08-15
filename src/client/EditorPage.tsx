@@ -1,4 +1,4 @@
-import { CommentsExtension, DefaultThreadStoreAuth } from "@blocknote/core/comments";
+import { CommentsExtension, DefaultThreadStoreAuth, ThreadStoreAuth } from "@blocknote/core/comments";
 import { withCollaboration, YjsThreadStore } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
 import { SuggestionMenuController, ThreadsSidebar, useCreateBlockNote } from "@blocknote/react";
@@ -9,7 +9,7 @@ import type { MemberContext } from "../worker/env";
 import type { MentionSuggestion, Page } from "../shared/types";
 import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { diffBlockIds } from "../shared/block-diff";
-import { api, json } from "./api";
+import { ApiClientError, api, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
 import { notesSchema } from "./mentions";
@@ -18,11 +18,12 @@ type Props = {
   page: Page;
   member: MemberContext;
   onPageChanged: (page: Page) => void;
+  onPageUnavailable: (pageId: string) => void;
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
 };
 
-export function EditorPage({ page, member, onPageChanged, onSelectPage, backlinksRevision }: Props) {
+export function EditorPage({ page, member, onPageChanged, onPageUnavailable, onSelectPage, backlinksRevision }: Props) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
   const [commentsOpen, setCommentsOpen] = useState(false);
@@ -36,12 +37,30 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
   });
   const [recoveryPreview, setRecoveryPreview] = useState("");
   const [title, setTitle] = useState(page.title);
+  const [titleError, setTitleError] = useState("");
+  const titleRef = useRef<HTMLInputElement>(null);
+  const titlePageIdRef = useRef(page.id);
+  const titleRevisionRef = useRef(page.revision);
+  const titleDirtyRef = useRef(false);
   const editable = member.role !== "viewer" && !sizeWarning?.readOnly;
-  const commentsVisible = editable && commentsOpen;
+  const editableRef = useRef(editable);
+  editableRef.current = editable;
+  const commentsVisible = commentsOpen;
 
   useEffect(() => {
-    setTitle(page.title);
-  }, [page.id, page.title]);
+    if (titlePageIdRef.current !== page.id) {
+      titlePageIdRef.current = page.id;
+      titleDirtyRef.current = false;
+      titleRevisionRef.current = page.revision;
+      setTitle(page.title);
+      setTitleError("");
+      return;
+    }
+    if (!titleDirtyRef.current && document.activeElement !== titleRef.current) {
+      titleRevisionRef.current = page.revision;
+      setTitle(page.title);
+    }
+  }, [page.id, page.revision, page.title]);
 
   useEffect(() => {
     setSizeWarning(null);
@@ -54,6 +73,7 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
         // Ignore custom messages from future server versions.
       }
     };
+    let active = true;
     next.provider.on("custom-message", customMessage);
     const quarantine = () => {
       const value = { key: `${member.workspace.id}:${page.id}:${page.contentEpoch}:1`, epoch: page.contentEpoch };
@@ -61,34 +81,77 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
       setRecovery(value);
     };
     const connectionClose = async (event: CloseEvent) => {
+      if (event.code === 4410 || event.code === 4411 || event.code === 4412) {
+        next.provider.disconnect();
+      }
+      if (event.code === 4411 || event.code === 4412) {
+        onPageUnavailable(page.id);
+        return;
+      }
       if (event.code !== 4410 && event.code !== 1006) return;
-      if (event.code === 4410 && next.hasUnsyncedChanges) quarantine();
+      if (event.code === 4410 && editableRef.current && next.hasUnsyncedChanges) quarantine();
       try {
         const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
+        if (!active) return;
         if (result.page.contentEpoch !== page.contentEpoch) {
-          quarantine();
+          if (editableRef.current && next.hasUnsyncedChanges) quarantine();
           onPageChanged(result.page);
+        } else if (event.code === 4410) {
+          // A restore can fail after taking the transition lock and closing the
+          // room. Reconnect when D1 still says this epoch is authoritative.
+          next.provider.connect();
         }
-      } catch { /* The next normal metadata refresh will recover. */ }
+      } catch (error) {
+        if (!active) return;
+        if (error instanceof ApiClientError && error.status === 404) {
+          next.provider.disconnect();
+          onPageUnavailable(page.id);
+        }
+      }
     };
     next.provider.on("connection-close", connectionClose);
     setBundle(next);
     return () => {
+      active = false;
       next.provider.off("custom-message", customMessage);
       next.provider.off("connection-close", connectionClose);
       next.destroy();
       setBundle(null);
     };
-  }, [member.workspace.id, page.id, page.contentEpoch, onPageChanged, recoveryKey]);
+  }, [member.workspace.id, onPageChanged, onPageUnavailable, page.id, page.contentEpoch, recoveryKey]);
 
   async function saveTitle() {
+    if (!titleDirtyRef.current) {
+      titleRevisionRef.current = page.revision;
+      setTitle(page.title);
+      return;
+    }
     const normalized = title.trim() || "Untitled";
-    if (normalized === page.title) return;
-    const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
-      method: "PATCH",
-      body: json({ title: normalized, revision: page.revision }),
-    });
-    onPageChanged(result.page);
+    if (normalized === page.title) {
+      titleDirtyRef.current = false;
+      titleRevisionRef.current = page.revision;
+      setTitle(page.title);
+      return;
+    }
+    try {
+      const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
+        method: "PATCH",
+        body: json({ title: normalized, revision: titleRevisionRef.current }),
+      });
+      titleDirtyRef.current = false;
+      titleRevisionRef.current = result.page.revision;
+      setTitleError("");
+      onPageChanged(result.page);
+    } catch (error) {
+      if (error instanceof ApiClientError && error.status === 409) {
+        titleDirtyRef.current = false;
+        titleRevisionRef.current = page.revision;
+        setTitle(page.title);
+        setTitleError("A collaborator changed this title. Their newer title was kept.");
+        return;
+      }
+      setTitleError(error instanceof Error ? error.message : "The title could not be saved.");
+    }
   }
 
   return (
@@ -101,7 +164,7 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
           const result = await api<{ page: Page }>(`/api/pages/${page.id}`, { method: "PATCH", body: json({ icon: icon || null, revision: page.revision }) });
           onPageChanged(result.page);
         }}>{page.icon ?? "Add icon"}</button>}
-        {editable && <button className="quiet-button" onClick={() => { setCommentsOpen((open) => !open); setAttachmentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Comments</button>}
+        <button className="quiet-button" onClick={() => { setCommentsOpen((open) => !open); setAttachmentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Comments</button>
         <button className="quiet-button" onClick={() => { setAttachmentsOpen((open) => !open); setCommentsOpen(false); setHistoryOpen(false); setBacklinksOpen(false); }}>Files</button>
         <button className="quiet-button" onClick={() => { setHistoryOpen((open) => !open); setCommentsOpen(false); setAttachmentsOpen(false); setBacklinksOpen(false); }}>History</button>
         <button className="quiet-button" onClick={() => { setBacklinksOpen((open) => !open); setCommentsOpen(false); setAttachmentsOpen(false); setHistoryOpen(false); }}>Backlinks</button>
@@ -135,9 +198,15 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
       <div className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}>
         <article className="document-paper">
           <input
+            ref={titleRef}
             className="page-title"
             value={title}
-            onChange={(event) => setTitle(event.target.value)}
+            onChange={(event) => {
+              if (!titleDirtyRef.current) titleRevisionRef.current = page.revision;
+              titleDirtyRef.current = true;
+              setTitleError("");
+              setTitle(event.target.value);
+            }}
             onBlur={() => void saveTitle()}
             onKeyDown={(event) => {
               if (event.key === "Enter") event.currentTarget.blur();
@@ -145,6 +214,7 @@ export function EditorPage({ page, member, onPageChanged, onSelectPage, backlink
             readOnly={!editable}
             aria-label="Page title"
           />
+          {titleError && <p className="form-error">{titleError}</p>}
           {bundle ? (
             <CollaborativeEditor bundle={bundle} member={member} editable={editable} commentsOpen={commentsVisible} />
           ) : (
@@ -200,24 +270,24 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
   );
 }
 
-function editorOptions(bundle: CollaborationBundle, member: MemberContext, includeComments: boolean) {
-  const extensions = [];
-  if (includeComments) {
-    const threadStore = new YjsThreadStore(
-      member.user.id,
-      bundle.doc.getMap("comments"),
-      new DefaultThreadStoreAuth(member.user.id, "editor"),
-    );
-    extensions.push(CommentsExtension({
-      threadStore,
-      resolveUsers: async (ids: string[]) => ids.map((id) => ({
-        id,
-        username: id === member.user.id ? member.user.name : "Collaborator",
-        avatarUrl: "",
-        color: userColor(id),
-      })),
-    }));
-  }
+class ReadOnlyThreadStoreAuth extends ThreadStoreAuth {
+  canCreateThread() { return false; }
+  canAddComment() { return false; }
+  canUpdateComment() { return false; }
+  canDeleteComment() { return false; }
+  canDeleteThread() { return false; }
+  canResolveThread() { return false; }
+  canUnresolveThread() { return false; }
+  canAddReaction() { return false; }
+  canDeleteReaction() { return false; }
+}
+
+function editorOptions(bundle: CollaborationBundle, member: MemberContext, editable: boolean) {
+  const threadStore = new YjsThreadStore(
+    member.user.id,
+    bundle.doc.getMap("comments"),
+    editable ? new DefaultThreadStoreAuth(member.user.id, "editor") : new ReadOnlyThreadStoreAuth(),
+  );
   return withCollaboration({
     schema: notesSchema,
     collaboration: {
@@ -226,7 +296,15 @@ function editorOptions(bundle: CollaborationBundle, member: MemberContext, inclu
       user: { name: member.user.name, color: userColor(member.user.id) },
       showCursorLabels: "activity" as const,
     },
-    extensions,
+    extensions: [CommentsExtension({
+      threadStore,
+      resolveUsers: async (ids: string[]) => ids.map((id) => ({
+        id,
+        username: id === member.user.id ? member.user.name : "Collaborator",
+        avatarUrl: "",
+        color: userColor(id),
+      })),
+    })],
   });
 }
 
@@ -264,7 +342,9 @@ function CollaborativeEditor({ bundle, member, editable, commentsOpen }: {
       {commentsOpen && (
         <aside className="side-panel comments-panel">
           <h2>Comments</h2>
-          <p className="muted">Select text and use the formatting toolbar to start a thread.</p>
+          <p className="muted">{editable
+            ? "Select text and use the formatting toolbar to start a thread."
+            : "Comments are read-only while this document is not editable."}</p>
           <ThreadsSidebar filter="all" sort="position" />
         </aside>
       )}

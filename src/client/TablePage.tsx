@@ -22,12 +22,16 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const revisionRef = useRef<number | null>(null);
   const leaseTokenRef = useRef<string | null>(null);
+  const columnCountRef = useRef(0);
+  const rowCountRef = useRef(0);
   const mutationQueue = useRef<Promise<void>>(Promise.resolve());
   const canEdit = member.role !== "viewer";
 
   const load = useCallback(async () => {
     const result = await api<{ table: TableData }>(`/api/tables/${page.id}`);
     revisionRef.current = result.table.revision;
+    columnCountRef.current = result.table.columns.length;
+    rowCountRef.current = result.table.rows.length;
     setTable(result.table);
   }, [page.id]);
 
@@ -94,7 +98,13 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     onPageChanged(result.page);
   }
 
-  async function mutation<T>(path: string, method: string, body: Record<string, unknown>) {
+  async function mutation<T>(
+    path: string,
+    method: string,
+    body: Record<string, unknown>,
+    position?: () => number,
+    onSuccess?: () => void,
+  ) {
     const execute = async () => {
       const currentLease = leaseTokenRef.current;
       const currentRevision = revisionRef.current;
@@ -102,9 +112,15 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       try {
         const result = await api<T & { revision: number }>(path, {
           method,
-          body: json({ ...body, leaseToken: currentLease, expectedRevision: currentRevision }),
+          body: json({
+            ...body,
+            ...(position ? { position: position() } : {}),
+            leaseToken: currentLease,
+            expectedRevision: currentRevision,
+          }),
         });
         revisionRef.current = result.revision;
+        onSuccess?.();
         setTable((current) => current ? { ...current, revision: result.revision } : current);
         return result;
       } catch (cause) {
@@ -129,15 +145,20 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     if (!name) return;
     const type = (prompt("Type: text, number, checkbox, date, or select", "text") ?? "") as ColumnType;
     if (!["text", "number", "checkbox", "date", "select"].includes(type)) return;
-    const result = await mutation<{ column: TableColumn }>(`/api/tables/${page.id}/columns`, "POST", {
-      name, type, position: table.columns.length,
-    });
+    const result = await mutation<{ column: TableColumn }>(
+      `/api/tables/${page.id}/columns`, "POST", { name, type },
+      () => columnCountRef.current,
+      () => { columnCountRef.current += 1; },
+    );
     if (result) setTable((current) => current ? { ...current, columns: [...current.columns, { ...result.column, options: [] }] } : current);
   }
 
   async function removeColumn(column: TableColumn) {
     if (!confirm(`Delete “${column.name}” and every value in it?`)) return;
-    const result = await mutation(`/api/tables/${page.id}/columns/${column.id}`, "DELETE", {});
+    const result = await mutation(
+      `/api/tables/${page.id}/columns/${column.id}`, "DELETE", {}, undefined,
+      () => { columnCountRef.current = Math.max(0, columnCountRef.current - 1); },
+    );
     if (result) setTable((current) => current ? { ...current, columns: current.columns.filter((item) => item.id !== column.id) } : current);
   }
 
@@ -152,12 +173,19 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
 
   async function addRow() {
     if (!table) return;
-    const result = await mutation<{ row: TableRow }>(`/api/tables/${page.id}/rows`, "POST", { position: table.rows.length });
+    const result = await mutation<{ row: TableRow }>(
+      `/api/tables/${page.id}/rows`, "POST", {},
+      () => rowCountRef.current,
+      () => { rowCountRef.current += 1; },
+    );
     if (result) setTable((current) => current ? { ...current, rows: [...current.rows, result.row] } : current);
   }
 
   async function removeRow(row: TableRow) {
-    const result = await mutation(`/api/tables/${page.id}/rows/${row.id}`, "DELETE", {});
+    const result = await mutation(
+      `/api/tables/${page.id}/rows/${row.id}`, "DELETE", {}, undefined,
+      () => { rowCountRef.current = Math.max(0, rowCountRef.current - 1); },
+    );
     if (result) setTable((current) => current ? { ...current, rows: current.rows.filter((item) => item.id !== row.id) } : current);
   }
 
