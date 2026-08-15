@@ -28,6 +28,10 @@ try {
     ],
     { cwd: root, encoding: "utf8", stdio: "pipe" },
   );
+  if (result.error) {
+    console.error(`Failed to start ${pnpm}: ${result.error.message}`);
+    process.exit(1);
+  }
   if (result.status !== 0) {
     process.stderr.write(result.stderr);
     process.exit(result.status ?? 1);
