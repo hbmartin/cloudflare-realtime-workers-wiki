@@ -16,7 +16,7 @@ export function createAuth(env: Env) {
   });
 }
 
-export async function getMember(request: Request, env: Env): Promise<MemberContext | null> {
+async function getMember(request: Request, env: Env): Promise<MemberContext | null> {
   const session = await createAuth(env).api.getSession({ headers: request.headers });
   if (!session) return null;
 
@@ -26,12 +26,14 @@ export async function getMember(request: Request, env: Env): Promise<MemberConte
        JOIN workspaces w ON w.id = wm.workspace_id
       WHERE wm.user_id = ?
       LIMIT 1`,
-  ).bind(session.user.id).first<{
-    workspace_id: string;
-    workspace_name: string;
-    location_hint: string | null;
-    role: MemberContext["role"];
-  }>();
+  )
+    .bind(session.user.id)
+    .first<{
+      workspace_id: string;
+      workspace_name: string;
+      location_hint: string | null;
+      role: MemberContext["role"];
+    }>();
 
   if (!row) return null;
   return {

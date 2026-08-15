@@ -9,35 +9,63 @@
   "observability": { "enabled": true },
   "assets": {
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/parties/*"]
+    "run_worker_first": ["/api/*", "/parties/*"],
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "cloudflare-realtime-notes",
       "database_id": "00000000-0000-0000-0000-000000000000",
-      "migrations_dir": "migrations"
-    }
+      "migrations_dir": "migrations",
+    },
   ],
   "r2_buckets": [
     {
       "binding": "BUCKET",
       "bucket_name": "cloudflare-realtime-notes",
-      "preview_bucket_name": "cloudflare-realtime-notes-preview"
-    }
+      "preview_bucket_name": "cloudflare-realtime-notes-preview",
+    },
   ],
   "durable_objects": {
     "bindings": [
       { "name": "DOCUMENT", "class_name": "Document" },
-      { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" }
-    ]
+      { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
+    ],
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Document"] },
-    { "tag": "v2", "new_sqlite_classes": ["WorkspaceEvents"] }
+    { "tag": "v2", "new_sqlite_classes": ["WorkspaceEvents"] },
   ],
   "triggers": { "crons": ["0 * * * *"] },
   "vars": {
-    "BETTER_AUTH_URL": "http://localhost:5173"
-  }
+    "BETTER_AUTH_URL": "http://localhost:5173",
+  },
+  "env": {
+    "notes-checks-e2e": {
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "cloudflare-realtime-notes-e2e",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "migrations",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "BUCKET",
+          "bucket_name": "cloudflare-realtime-notes-e2e",
+          "preview_bucket_name": "cloudflare-realtime-notes-e2e",
+        },
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "DOCUMENT", "class_name": "Document" },
+          { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
+        ],
+      },
+      "vars": {
+        "BETTER_AUTH_URL": "http://127.0.0.1:4173",
+      },
+    },
+  },
 }

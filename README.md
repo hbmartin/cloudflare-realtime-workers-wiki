@@ -32,10 +32,28 @@ Set a strong local `BETTER_AUTH_SECRET` and choose a `BOOTSTRAP_TOKEN` in `.dev.
 Useful checks:
 
 ```sh
-pnpm test
-pnpm build
-pnpm cf-typegen
+pnpm check                 # formatting, lint, types, tests, dead code, generated types, Worker dry run
+pnpm test:unit             # fast unit and React component tests
+pnpm test:worker           # isolated Workers, D1, R2, and Durable Object integration tests
+pnpm test:e2e              # Chromium UI integration suite against a fresh local D1 state
+pnpm test:e2e:nightly      # Chromium, Firefox, WebKit, and mobile Chromium
+pnpm load:realtime         # 30 authenticated local realtime connections
 ```
+
+`pnpm lint` uses Oxlint with type-aware rules, `pnpm format:check` uses Oxfmt, and `pnpm analyze` uses
+Fallow for unused dependencies and dead code. `pnpm analyze:audit` adds a changed-code review of duplication and
+maintainability findings without treating the repository's inherited complexity as a new gate. TypeScript is checked
+separately for the browser, Worker, unit tests, Worker integration tests, and build configuration. Coverage thresholds are
+enforced by `pnpm test:coverage` and `pnpm test:worker:coverage`.
+
+The E2E server deletes only `.wrangler/e2e`, reapplies every D1 migration, and injects dedicated local test bindings. To
+run the realtime load check against a deployed environment, set `NOTES_LOAD_BASE_URL`, `NOTES_LOAD_EMAIL`, and
+`NOTES_LOAD_PASSWORD`. `NOTES_LOAD_CONNECTIONS` and `NOTES_LOAD_HOLD_MS` tune the connection count and hold time.
+
+Pull requests run static checks, coverage suites, production builds, a Wrangler deployment dry run, and Chromium UI
+checks in separate CI jobs. The scheduled workflow adds the full browser/mobile matrix and realtime load checks. Configure
+the `STAGING_BASE_URL` repository variable plus `STAGING_LOAD_EMAIL` and `STAGING_LOAD_PASSWORD` secrets to include a
+deployed staging target in that load check.
 
 ## Architecture
 

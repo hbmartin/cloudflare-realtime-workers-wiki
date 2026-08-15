@@ -1,4 +1,4 @@
-export function blockIds(xml: string) {
+function blockIds(xml: string) {
   return new Set([...xml.matchAll(/(?:id|blockId)=['"]([^'"]+)/g)].map((match) => match[1]));
 }
 
@@ -13,5 +13,10 @@ export function diffBlockIds(oldXml: string, currentXml: string) {
 }
 
 export function plainVersion(xml: string) {
-  return xml.replace(/<[^>]*>/g, "\n").replace(/\n{2,}/g, "\n").trim() || "Empty document";
+  return (
+    xml
+      .replace(/<[^>]*>/g, "\n")
+      .replace(/\n{2,}/g, "\n")
+      .trim() || "Empty document"
+  );
 }

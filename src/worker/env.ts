@@ -1,6 +1,8 @@
 import type { Document } from "./document";
 import type { WorkspaceEvents } from "./workspace-events";
 
+export type { MemberContext } from "../shared/types";
+
 export interface AppBindings {
   DB: D1Database;
   BUCKET: R2Bucket;
@@ -19,11 +21,4 @@ declare global {
   namespace Cloudflare {
     interface Env extends AppBindings {}
   }
-}
-
-export interface MemberContext {
-  user: { id: string; name: string; email: string };
-  session: { id: string; expiresAt: Date };
-  workspace: { id: string; name: string; locationHint: string | null };
-  role: "owner" | "editor" | "viewer";
 }

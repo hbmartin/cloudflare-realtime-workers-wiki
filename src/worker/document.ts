@@ -14,7 +14,7 @@ const VERSION_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const WARN_BYTES = 16 * 1024 * 1024;
 const READ_ONLY_BYTES = 24 * 1024 * 1024;
 
-interface ConnectionAuth {
+export interface ConnectionAuth {
   userId: string;
   role: "owner" | "editor" | "viewer";
   expiresAt: number;
@@ -94,9 +94,9 @@ export class Document extends YServer {
     if (!metaColumns.some((column) => column.name === "restore_pending")) {
       sql.exec(`ALTER TABLE document_meta ADD COLUMN restore_pending INTEGER NOT NULL DEFAULT 0`);
     }
-    const hadMetadata = Boolean(sql.exec<{ present: number }>(
-      `SELECT EXISTS(SELECT 1 FROM document_meta WHERE id = 1) present`,
-    ).one().present);
+    const hadMetadata = Boolean(
+      sql.exec<{ present: number }>(`SELECT EXISTS(SELECT 1 FROM document_meta WHERE id = 1) present`).one().present,
+    );
     sql.exec(`INSERT OR IGNORE INTO document_meta (id) VALUES (1)`);
     sql.exec(`CREATE TABLE IF NOT EXISTS update_events (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,9 +123,9 @@ export class Document extends YServer {
     // an authoritative check so a purged room cannot restart without its tombstone.
     if (!hadMetadata) {
       const { pageId, epoch } = this.ids;
-      const current = await this.bindings.DB.prepare(
-        `SELECT content_epoch FROM pages WHERE id = ?`,
-      ).bind(pageId).first<{ content_epoch: number }>();
+      const current = await this.bindings.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ?`)
+        .bind(pageId)
+        .first<{ content_epoch: number }>();
       this.metadata.retired = !current || current.content_epoch !== epoch ? 1 : 0;
       this.metadata.restore_pending = 0;
       sql.exec(
@@ -142,10 +142,12 @@ export class Document extends YServer {
     this.document.on("update", (update: Uint8Array, origin: unknown) => {
       this.bufferUpdate(update, origin as Connection<ConnectionAuth> | null);
     });
-    const pendingLog = sql.exec<{ pending: number }>(
-      `SELECT EXISTS(SELECT 1 FROM update_events WHERE seq > ?) pending`,
-      this.metadata.snapshot_seq,
-    ).one().pending;
+    const pendingLog = sql
+      .exec<{ pending: number }>(
+        `SELECT EXISTS(SELECT 1 FROM update_events WHERE seq > ?) pending`,
+        this.metadata.snapshot_seq,
+      )
+      .one().pending;
     if (pendingLog) {
       if (!this.metadata.dirty) {
         this.metadata.dirty = 1;
@@ -162,17 +164,11 @@ export class Document extends YServer {
     if (snapshot) Y.applyUpdate(doc, new Uint8Array(await snapshot.arrayBuffer()));
 
     const events = this.state.storage.sql
-      .exec<{ seq: number }>(
-        `SELECT seq FROM update_events WHERE seq > ? ORDER BY seq`,
-        this.metadata.snapshot_seq,
-      )
+      .exec<{ seq: number }>(`SELECT seq FROM update_events WHERE seq > ? ORDER BY seq`, this.metadata.snapshot_seq)
       .toArray();
     for (const event of events) {
       const chunks = this.state.storage.sql
-        .exec<{ data: ArrayBuffer }>(
-          `SELECT data FROM update_chunks WHERE seq = ? ORDER BY chunk_index`,
-          event.seq,
-        )
+        .exec<{ data: ArrayBuffer }>(`SELECT data FROM update_chunks WHERE seq = ? ORDER BY chunk_index`, event.seq)
         .toArray();
       Y.applyUpdate(doc, joinBytes(chunks.map((chunk) => new Uint8Array(chunk.data))));
     }
@@ -197,11 +193,14 @@ export class Document extends YServer {
     await this.scheduleAlarm(expiresAt);
     await super.onConnect(connection, context);
     if (this.metadata.read_only || this.metadata.snapshot_bytes >= WARN_BYTES) {
-      this.sendCustomMessage(connection, JSON.stringify({
-        type: "document-size",
-        bytes: this.metadata.snapshot_bytes || READ_ONLY_BYTES,
-        readOnly: Boolean(this.metadata.read_only),
-      }));
+      this.sendCustomMessage(
+        connection,
+        JSON.stringify({
+          type: "document-size",
+          bytes: this.metadata.snapshot_bytes || READ_ONLY_BYTES,
+          readOnly: Boolean(this.metadata.read_only),
+        }),
+      );
     }
   }
 
@@ -241,18 +240,24 @@ export class Document extends YServer {
     } catch {
       return;
     }
-    if (value.type !== "document-update-barrier"
-      || !Number.isInteger(value.generation)
-      || Number(value.generation) < 1
-      || this.isReadOnly(connection)) return;
+    if (
+      value.type !== "document-update-barrier" ||
+      !Number.isInteger(value.generation) ||
+      Number(value.generation) < 1 ||
+      this.isReadOnly(connection)
+    )
+      return;
     // Client custom messages share the WebSocket's ordering with Yjs updates.
     // Reaching this barrier means every preceding update from that client has
     // been applied; flushing before the reply turns the reply into a durable ack.
     this.flushPendingUpdates();
-    this.sendCustomMessage(connection, JSON.stringify({
-      type: "document-update-ack",
-      generation: value.generation,
-    }));
+    this.sendCustomMessage(
+      connection,
+      JSON.stringify({
+        type: "document-update-ack",
+        generation: value.generation,
+      }),
+    );
   }
 
   async onSave() {
@@ -357,7 +362,7 @@ export class Document extends YServer {
     if (!this.pendingUpdates.length || this.purged) return;
     const updates = this.pendingUpdates;
     const authorId = this.pendingAuthorId;
-    const merged = updates.length === 1 ? updates[0] : Y.mergeUpdates(updates);
+    const merged = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
     this.state.storage.transactionSync(() => {
       const row = this.state.storage.sql
         .exec<{ seq: number }>(
@@ -410,17 +415,17 @@ export class Document extends YServer {
 
     const metadataAtStart = { ...this.metadata };
     const snapshot = Y.encodeStateAsUpdate(this.document);
-    const json = yXmlFragmentToProsemirrorJSON(
-      this.document.getXmlFragment("document-store"),
-    ) as ProseMirrorJson;
+    const json = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
     const projection = projectDocument(json);
     const readOnly = snapshot.byteLength >= READ_ONLY_BYTES;
     if (snapshot.byteLength >= WARN_BYTES) {
-      this.broadcastCustomMessage(JSON.stringify({
-        type: "document-size",
-        bytes: snapshot.byteLength,
-        readOnly,
-      }));
+      this.broadcastCustomMessage(
+        JSON.stringify({
+          type: "document-size",
+          bytes: snapshot.byteLength,
+          readOnly,
+        }),
+      );
     }
 
     this.state.storage.transactionSync(() => {
@@ -444,7 +449,9 @@ export class Document extends YServer {
 
       const page = await this.bindings.DB.prepare(
         `SELECT workspace_id, title, archived_at FROM pages WHERE id = ? AND content_epoch = ?`,
-      ).bind(pageId, epoch).first<PageProjectionRow>();
+      )
+        .bind(pageId, epoch)
+        .first<PageProjectionRow>();
       let versionAt = metadataAtStart.last_version_at;
       let versionKey: string | null = null;
       let versionStatementIndex = -1;
@@ -452,16 +459,17 @@ export class Document extends YServer {
 
       if (page) {
         const [oldPageTargets, oldUserTargets] = await Promise.all([
-          this.bindings.DB.prepare(
-            `SELECT target_page_id id FROM page_references WHERE source_page_id = ?`,
-          ).bind(pageId).all<{ id: string }>(),
-          this.bindings.DB.prepare(
-            `SELECT target_user_id id FROM member_mentions WHERE source_page_id = ?`,
-          ).bind(pageId).all<{ id: string }>(),
+          this.bindings.DB.prepare(`SELECT target_page_id id FROM page_references WHERE source_page_id = ?`)
+            .bind(pageId)
+            .all<{ id: string }>(),
+          this.bindings.DB.prepare(`SELECT target_user_id id FROM member_mentions WHERE source_page_id = ?`)
+            .bind(pageId)
+            .all<{ id: string }>(),
         ]);
         const timestamp = Date.now();
         const makeVersion = Boolean(
-          forceVersion || !metadataAtStart.last_version_at ||
+          forceVersion ||
+          !metadataAtStart.last_version_at ||
           timestamp - metadataAtStart.last_version_at >= VERSION_INTERVAL_MS,
         );
         const statements = [
@@ -510,22 +518,35 @@ export class Document extends YServer {
                WHERE EXISTS (SELECT 1 FROM pages source WHERE source.id = ? AND source.content_epoch = ?)
               ON CONFLICT(source_page_id, target_user_id) DO UPDATE SET
                 excerpt = excluded.excerpt, projection_seq = excluded.projection_seq`,
-          ).bind(page.workspace_id, pageId, timestamp, maximum, JSON.stringify(projection.memberMentions), page.workspace_id, pageId, epoch),
+          ).bind(
+            page.workspace_id,
+            pageId,
+            timestamp,
+            maximum,
+            JSON.stringify(projection.memberMentions),
+            page.workspace_id,
+            pageId,
+            epoch,
+          ),
           this.bindings.DB.prepare(
             `DELETE FROM member_mentions WHERE source_page_id = ? AND projection_seq <> ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, maximum, pageId, epoch),
         ];
         const currentPageTargetsIndex = statements.length;
-        statements.push(this.bindings.DB.prepare(
-          `SELECT target_page_id id FROM page_references
+        statements.push(
+          this.bindings.DB.prepare(
+            `SELECT target_page_id id FROM page_references
             WHERE source_page_id = ? AND projection_seq = ?`,
-        ).bind(pageId, maximum));
+          ).bind(pageId, maximum),
+        );
         const currentUserTargetsIndex = statements.length;
-        statements.push(this.bindings.DB.prepare(
-          `SELECT target_user_id id FROM member_mentions
+        statements.push(
+          this.bindings.DB.prepare(
+            `SELECT target_user_id id FROM member_mentions
             WHERE source_page_id = ? AND projection_seq = ?`,
-        ).bind(pageId, maximum));
+          ).bind(pageId, maximum),
+        );
 
         if (makeVersion) {
           const versionId = crypto.randomUUID();
@@ -536,22 +557,24 @@ export class Document extends YServer {
           });
           versionAt = timestamp;
           versionStatementIndex = statements.length;
-          statements.push(this.bindings.DB.prepare(
-            `INSERT INTO page_versions
+          statements.push(
+            this.bindings.DB.prepare(
+              `INSERT INTO page_versions
               (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
               SELECT ?, id, ?, ?, ?, ?, ?, ?, ? FROM pages WHERE id = ? AND content_epoch = ?`,
-          ).bind(
-            versionId,
-            epoch,
-            maximum,
-            page.title,
-            versionKey,
-            snapshot.byteLength,
-            metadataAtStart.last_editor_id,
-            versionAt,
-            pageId,
-            epoch,
-          ));
+            ).bind(
+              versionId,
+              epoch,
+              maximum,
+              page.title,
+              versionKey,
+              snapshot.byteLength,
+              metadataAtStart.last_editor_id,
+              versionAt,
+              pageId,
+              epoch,
+            ),
+          );
         }
 
         const results = await this.bindings.DB.batch(statements);
@@ -563,22 +586,22 @@ export class Document extends YServer {
         }
 
         if (pageProjected) {
-          const currentPageTargets = results[currentPageTargetsIndex]?.results as Array<{ id: string }> ?? [];
-          const currentUserTargets = results[currentUserTargetsIndex]?.results as Array<{ id: string }> ?? [];
-          const backlinkTargetIds = [...new Set([
-            ...oldPageTargets.results.map((row) => row.id),
-            ...currentPageTargets.map((row) => row.id),
-          ])];
-          const mentionTargetUserIds = [...new Set([
-            ...oldUserTargets.results.map((row) => row.id),
-            ...currentUserTargets.map((row) => row.id),
-          ])];
-          this.state.waitUntil(broadcastWorkspaceEvent(this.bindings, page.workspace_id, {
-            type: "projection-updated",
-            pageId,
-            backlinkTargetIds,
-            mentionTargetUserIds,
-          }).catch((error) => console.error("Failed to broadcast projection update", error)));
+          const currentPageTargets = (results[currentPageTargetsIndex]?.results as Array<{ id: string }>) ?? [];
+          const currentUserTargets = (results[currentUserTargetsIndex]?.results as Array<{ id: string }>) ?? [];
+          const backlinkTargetIds = [
+            ...new Set([...oldPageTargets.results.map((row) => row.id), ...currentPageTargets.map((row) => row.id)]),
+          ];
+          const mentionTargetUserIds = [
+            ...new Set([...oldUserTargets.results.map((row) => row.id), ...currentUserTargets.map((row) => row.id)]),
+          ];
+          this.state.waitUntil(
+            broadcastWorkspaceEvent(this.bindings, page.workspace_id, {
+              type: "projection-updated",
+              pageId,
+              backlinkTargetIds,
+              mentionTargetUserIds,
+            }).catch((error) => console.error("Failed to broadcast projection update", error)),
+          );
         }
       }
 
@@ -597,9 +620,11 @@ export class Document extends YServer {
       this.metadata.last_version_at = versionAt;
 
       if (pageProjected && versionKey) {
-        this.state.waitUntil(this.pruneVersions(pageId).catch((error) => {
-          console.error("Failed to prune document versions", error);
-        }));
+        this.state.waitUntil(
+          this.pruneVersions(pageId).catch((error) => {
+            console.error("Failed to prune document versions", error);
+          }),
+        );
       }
     } catch (error) {
       this.metadata.dirty = 1;
@@ -617,7 +642,9 @@ export class Document extends YServer {
     const cutoff = Date.now() - VERSION_RETENTION_MS;
     const versions = await this.bindings.DB.prepare(
       `SELECT id, r2_key, created_at FROM page_versions WHERE page_id = ? ORDER BY created_at DESC`,
-    ).bind(pageId).all<{ id: string; r2_key: string; created_at: number }>();
+    )
+      .bind(pageId)
+      .all<{ id: string; r2_key: string; created_at: number }>();
     const expired = versions.results.filter((version, index) => index >= 200 || version.created_at < cutoff);
     for (const version of expired) {
       await this.bindings.DB.prepare(`DELETE FROM page_versions WHERE id = ?`).bind(version.id).run();
@@ -723,9 +750,9 @@ export class Document extends YServer {
       const { pageId, epoch } = this.ids;
       let selectedBytes: Uint8Array;
       try {
-        const version = await this.bindings.DB.prepare(
-          `SELECT r2_key FROM page_versions WHERE id = ? AND page_id = ?`,
-        ).bind(versionId, pageId).first<{ r2_key: string }>();
+        const version = await this.bindings.DB.prepare(`SELECT r2_key FROM page_versions WHERE id = ? AND page_id = ?`)
+          .bind(versionId, pageId)
+          .first<{ r2_key: string }>();
         if (!version) return Response.json({ error: "Version not found." }, { status: 404 });
         const selected = await this.bindings.BUCKET.get(version.r2_key);
         if (!selected) return Response.json({ error: "Version snapshot is missing." }, { status: 404 });
@@ -790,8 +817,9 @@ export class Document extends YServer {
             httpMetadata: { contentType: "application/octet-stream" },
             customMetadata: { pageId, epoch: String(epoch), sequence: String(this.metadata.snapshot_seq) },
           });
-          statements.push(this.bindings.DB.prepare(
-            `INSERT INTO page_versions
+          statements.push(
+            this.bindings.DB.prepare(
+              `INSERT INTO page_versions
               (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
              SELECT ?, id, ?, ?, title, ?, ?, ?, ? FROM pages
               WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
@@ -813,11 +841,13 @@ export class Document extends YServer {
           httpMetadata: { contentType: "application/octet-stream" },
           customMetadata: { pageId, epoch: String(newEpoch), restoredFrom: versionId },
         });
-        statements.push(this.bindings.DB.prepare(
-          `UPDATE pages
+        statements.push(
+          this.bindings.DB.prepare(
+            `UPDATE pages
               SET content_epoch = ?, revision = revision + 1, indexed_seq = 0, updated_at = ?
             WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
-        ).bind(newEpoch, Date.now(), pageId, epoch));
+          ).bind(newEpoch, Date.now(), pageId, epoch),
+        );
         const results = await this.bindings.DB.batch(statements);
         if (!results.at(-1)?.meta.changes) {
           commitState = "not-committed";
@@ -830,9 +860,9 @@ export class Document extends YServer {
       } catch (error) {
         if (commitState === "unknown") {
           try {
-            const current = await this.bindings.DB.prepare(
-              `SELECT content_epoch FROM pages WHERE id = ?`,
-            ).bind(pageId).first<{ content_epoch: number }>();
+            const current = await this.bindings.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ?`)
+              .bind(pageId)
+              .first<{ content_epoch: number }>();
             if (current?.content_epoch === newEpoch) commitState = "committed";
             else if (current?.content_epoch === epoch) commitState = "not-committed";
           } catch (lookupError) {

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { MemberContext } from "../worker/env";
+import type { MemberContext } from "../shared/types";
 import type { ColumnType, Page, TableColumn, TableData, TableRow } from "../shared/types";
 import { ApiClientError, api, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 
-type Props = {
+export type TablePageProps = {
   page: Page;
   member: MemberContext;
   onPageChanged: (page: Page) => void;
@@ -12,7 +12,7 @@ type Props = {
   backlinksRevision: number;
 };
 
-export function TablePage({ page, member, onPageChanged, onSelectPage, backlinksRevision }: Props) {
+export function TablePage({ page, member, onPageChanged, onSelectPage, backlinksRevision }: TablePageProps) {
   const [table, setTable] = useState<TableData | null>(null);
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -57,8 +57,12 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
 
   useEffect(() => {
     let active = true;
-    void load().then(() => { if (active) return acquire(); });
-    return () => { active = false; };
+    void load().then(() => {
+      if (active) void acquire();
+    });
+    return () => {
+      active = false;
+    };
   }, [load, acquire]);
 
   useEffect(() => {
@@ -66,10 +70,11 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       const poll = window.setInterval(() => void load(), 5_000);
       return () => window.clearInterval(poll);
     }
-    const renew = window.setInterval(async () => {
+    const renewLease = async () => {
       try {
         await api(`/api/tables/${page.id}/lease`, {
-          method: "PATCH", body: json({ leaseToken }),
+          method: "PATCH",
+          body: json({ leaseToken }),
         });
       } catch {
         leaseTokenRef.current = null;
@@ -77,7 +82,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         setError("The editing lease was lost. Reloaded the authoritative table.");
         await load();
       }
-    }, 20_000);
+    };
+    const renew = window.setInterval(() => void renewLease(), 20_000);
     return () => {
       window.clearInterval(renew);
       void fetch(`/api/tables/${page.id}/lease`, {
@@ -93,7 +99,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     const normalized = title.trim() || "Untitled";
     if (normalized === page.title) return;
     const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
-      method: "PATCH", body: json({ title: normalized, revision: page.revision }),
+      method: "PATCH",
+      body: json({ title: normalized, revision: page.revision }),
     });
     onPageChanged(result.page);
   }
@@ -121,7 +128,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         });
         revisionRef.current = result.revision;
         onSuccess?.();
-        setTable((current) => current ? { ...current, revision: result.revision } : current);
+        setTable((current) => (current ? { ...current, revision: result.revision } : current));
         return result;
       } catch (cause) {
         if (cause instanceof ApiClientError && cause.status === 409) {
@@ -135,7 +142,10 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       }
     };
     const pending = mutationQueue.current.then(execute, execute);
-    mutationQueue.current = pending.then(() => undefined, () => undefined);
+    mutationQueue.current = pending.then(
+      () => undefined,
+      () => undefined,
+    );
     return pending;
   }
 
@@ -146,85 +156,153 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     const type = (prompt("Type: text, number, checkbox, date, or select", "text") ?? "") as ColumnType;
     if (!["text", "number", "checkbox", "date", "select"].includes(type)) return;
     const result = await mutation<{ column: TableColumn }>(
-      `/api/tables/${page.id}/columns`, "POST", { name, type },
+      `/api/tables/${page.id}/columns`,
+      "POST",
+      { name, type },
       () => columnCountRef.current,
-      () => { columnCountRef.current += 1; },
+      () => {
+        columnCountRef.current += 1;
+      },
     );
-    if (result) setTable((current) => current ? { ...current, columns: [...current.columns, { ...result.column, options: [] }] } : current);
+    if (result)
+      setTable((current) =>
+        current ? { ...current, columns: [...current.columns, { ...result.column, options: [] }] } : current,
+      );
   }
 
   async function removeColumn(column: TableColumn) {
     if (!confirm(`Delete “${column.name}” and every value in it?`)) return;
-    const result = await mutation(
-      `/api/tables/${page.id}/columns/${column.id}`, "DELETE", {}, undefined,
-      () => { columnCountRef.current = Math.max(0, columnCountRef.current - 1); },
-    );
-    if (result) setTable((current) => current ? { ...current, columns: current.columns.filter((item) => item.id !== column.id) } : current);
+    const result = await mutation(`/api/tables/${page.id}/columns/${column.id}`, "DELETE", {}, undefined, () => {
+      columnCountRef.current = Math.max(0, columnCountRef.current - 1);
+    });
+    if (result)
+      setTable((current) =>
+        current ? { ...current, columns: current.columns.filter((item) => item.id !== column.id) } : current,
+      );
   }
 
   async function addOption(column: TableColumn) {
     const label = prompt(`New option for “${column.name}”`)?.trim();
     if (!label) return;
     const result = await mutation<{ option: { id: string; label: string; position: number } }>(
-      `/api/tables/${page.id}/columns/${column.id}/options`, "POST", { label, position: column.options.length },
+      `/api/tables/${page.id}/columns/${column.id}/options`,
+      "POST",
+      { label, position: column.options.length },
     );
-    if (result) setTable((current) => current ? { ...current, columns: current.columns.map((item) => item.id === column.id ? { ...item, options: [...item.options, result.option] } : item) } : current);
+    if (result)
+      setTable((current) =>
+        current
+          ? {
+              ...current,
+              columns: current.columns.map((item) =>
+                item.id === column.id ? { ...item, options: [...item.options, result.option] } : item,
+              ),
+            }
+          : current,
+      );
   }
 
   async function addRow() {
     if (!table) return;
     const result = await mutation<{ row: TableRow }>(
-      `/api/tables/${page.id}/rows`, "POST", {},
+      `/api/tables/${page.id}/rows`,
+      "POST",
+      {},
       () => rowCountRef.current,
-      () => { rowCountRef.current += 1; },
+      () => {
+        rowCountRef.current += 1;
+      },
     );
-    if (result) setTable((current) => current ? { ...current, rows: [...current.rows, result.row] } : current);
+    if (result) setTable((current) => (current ? { ...current, rows: [...current.rows, result.row] } : current));
   }
 
   async function removeRow(row: TableRow) {
-    const result = await mutation(
-      `/api/tables/${page.id}/rows/${row.id}`, "DELETE", {}, undefined,
-      () => { rowCountRef.current = Math.max(0, rowCountRef.current - 1); },
-    );
-    if (result) setTable((current) => current ? { ...current, rows: current.rows.filter((item) => item.id !== row.id) } : current);
+    const result = await mutation(`/api/tables/${page.id}/rows/${row.id}`, "DELETE", {}, undefined, () => {
+      rowCountRef.current = Math.max(0, rowCountRef.current - 1);
+    });
+    if (result)
+      setTable((current) =>
+        current ? { ...current, rows: current.rows.filter((item) => item.id !== row.id) } : current,
+      );
   }
 
   async function setCell(rowId: string, columnId: string, value: string | number | boolean | null) {
     const result = await mutation(`/api/tables/${page.id}/cells/${rowId}/${columnId}`, "PUT", { value });
-    if (result) setTable((current) => current ? {
-      ...current,
-      rows: current.rows.map((row) => row.id === rowId ? { ...row, cells: { ...row.cells, [columnId]: value } } : row),
-    } : current);
+    if (result)
+      setTable((current) =>
+        current
+          ? {
+              ...current,
+              rows: current.rows.map((row) =>
+                row.id === rowId ? { ...row, cells: { ...row.cells, [columnId]: value } } : row,
+              ),
+            }
+          : current,
+      );
   }
 
   const visibleRows = useMemo(() => {
     if (!table) return [];
     const normalized = filter.toLowerCase();
     const rows = normalized
-      ? table.rows.filter((row) => Object.values(row.cells).some((value) => String(value ?? "").toLowerCase().includes(normalized)))
+      ? table.rows.filter((row) =>
+          Object.values(row.cells).some((value) =>
+            String(value ?? "")
+              .toLowerCase()
+              .includes(normalized),
+          ),
+        )
       : [...table.rows];
-    if (sortColumn) rows.sort((left, right) => String(left.cells[sortColumn] ?? "").localeCompare(String(right.cells[sortColumn] ?? ""), undefined, { numeric: true }));
+    if (sortColumn)
+      rows.sort((left, right) =>
+        String(left.cells[sortColumn] ?? "").localeCompare(String(right.cells[sortColumn] ?? ""), undefined, {
+          numeric: true,
+        }),
+      );
     return rows;
   }, [filter, sortColumn, table]);
 
   return (
     <main className="page-canvas table-canvas">
       <div className="page-tools">
-        <span className={`lease-state ${leaseToken ? "lease-active" : ""}`}>{leaseToken ? "Editing lease active" : "Read-only"}</span>
-        {canEdit && <button className="quiet-button" onClick={async () => {
-          const icon = prompt("Page icon (one emoji, or leave blank to remove)", page.icon ?? "")?.trim();
-          if (icon === undefined) return;
-          const result = await api<{ page: Page }>(`/api/pages/${page.id}`, { method: "PATCH", body: json({ icon: icon || null, revision: page.revision }) });
-          onPageChanged(result.page);
-        }}>{page.icon ?? "Add icon"}</button>}
-        {!leaseToken && canEdit && <button className="quiet-button" onClick={() => void acquire()}>Try edit lock</button>}
-        {member.role === "owner" && !leaseToken && (
-          <button className="quiet-button" onClick={async () => {
-            await api(`/api/tables/${page.id}/force-unlock`, { method: "POST" });
-            await acquire();
-          }}>Force unlock</button>
+        <span className={`lease-state ${leaseToken ? "lease-active" : ""}`}>
+          {leaseToken ? "Editing lease active" : "Read-only"}
+        </span>
+        {canEdit && (
+          <button
+            className="quiet-button"
+            onClick={async () => {
+              const icon = prompt("Page icon (one emoji, or leave blank to remove)", page.icon ?? "")?.trim();
+              if (icon === undefined) return;
+              const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
+                method: "PATCH",
+                body: json({ icon: icon || null, revision: page.revision }),
+              });
+              onPageChanged(result.page);
+            }}
+          >
+            {page.icon ?? "Add icon"}
+          </button>
         )}
-        <button className="quiet-button" onClick={() => setBacklinksOpen((open) => !open)}>Backlinks</button>
+        {!leaseToken && canEdit && (
+          <button className="quiet-button" onClick={() => void acquire()}>
+            Try edit lock
+          </button>
+        )}
+        {member.role === "owner" && !leaseToken && (
+          <button
+            className="quiet-button"
+            onClick={async () => {
+              await api(`/api/tables/${page.id}/force-unlock`, { method: "POST" });
+              await acquire();
+            }}
+          >
+            Force unlock
+          </button>
+        )}
+        <button className="quiet-button" onClick={() => setBacklinksOpen((open) => !open)}>
+          Backlinks
+        </button>
       </div>
       {error && <div className="notice">{error}</div>}
       <article className="table-paper">
@@ -233,29 +311,55 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           value={title}
           onChange={(event) => setTitle(event.target.value)}
           onBlur={() => void saveTitle()}
-          onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") event.currentTarget.blur();
+          }}
           readOnly={!canEdit}
         />
         <div className="table-toolbar">
           <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter rows…" />
-          <span>{visibleRows.length} / {table?.rows.length ?? 0} rows</span>
+          <span>
+            {visibleRows.length} / {table?.rows.length ?? 0} rows
+          </span>
           {leaseToken && <button onClick={() => void addColumn()}>+ Property</button>}
         </div>
-        {!table ? <div className="editor-loading">Loading table…</div> : (
+        {!table ? (
+          <div className="editor-loading">Loading table…</div>
+        ) : (
           <div className="data-table-wrap">
             <table className="data-table">
               <thead>
                 <tr>
                   {table.columns.map((column) => (
                     <th key={column.id}>
-                      <button className="column-sort" onClick={() => setSortColumn(sortColumn === column.id ? null : column.id)}>
-                      {column.name} <small>{column.type}</small>{sortColumn === column.id ? " ↑" : ""}
+                      <button
+                        className="column-sort"
+                        onClick={() => setSortColumn(sortColumn === column.id ? null : column.id)}
+                      >
+                        {column.name} <small>{column.type}</small>
+                        {sortColumn === column.id ? " ↑" : ""}
                       </button>
-                      {leaseToken && column.type === "select" && <button className="add-option" onClick={() => void addOption(column)} aria-label={`Add option to ${column.name}`}>+</button>}
-                      {leaseToken && <button className="delete-column" onClick={() => void removeColumn(column)} aria-label={`Delete ${column.name}`}>×</button>}
+                      {leaseToken && column.type === "select" && (
+                        <button
+                          className="add-option"
+                          onClick={() => void addOption(column)}
+                          aria-label={`Add option to ${column.name}`}
+                        >
+                          +
+                        </button>
+                      )}
+                      {leaseToken && (
+                        <button
+                          className="delete-column"
+                          onClick={() => void removeColumn(column)}
+                          aria-label={`Delete ${column.name}`}
+                        >
+                          ×
+                        </button>
+                      )}
                     </th>
                   ))}
-                  {leaseToken && <th className="row-actions" />}
+                  {leaseToken && <th className="row-actions" aria-label="Row actions" />}
                 </tr>
               </thead>
               <tbody>
@@ -272,12 +376,22 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
                         />
                       </td>
                     ))}
-                    {leaseToken && <td className="row-actions"><button onClick={() => void removeRow(row)} aria-label="Delete row">×</button></td>}
+                    {leaseToken && (
+                      <td className="row-actions">
+                        <button onClick={() => void removeRow(row)} aria-label="Delete row">
+                          ×
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
             </table>
-            {leaseToken && <button className="add-row" onClick={() => void addRow()} disabled={table.rows.length >= 500}>+ New row</button>}
+            {leaseToken && (
+              <button className="add-row" onClick={() => void addRow()} disabled={table.rows.length >= 500}>
+                + New row
+              </button>
+            )}
             {!table.columns.length && <p className="empty-copy">Add a property to start this table.</p>}
           </div>
         )}
@@ -287,20 +401,40 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   );
 }
 
-function CellInput({ column, value, disabled, onCommit }: {
+function CellInput({
+  column,
+  value,
+  disabled,
+  onCommit,
+}: {
   column: TableColumn;
   value: string | number | boolean | null;
   disabled: boolean;
   onCommit: (value: string | number | boolean | null) => void;
 }) {
   if (column.type === "checkbox") {
-    return <input type="checkbox" checked={Boolean(value)} disabled={disabled} onChange={(event) => onCommit(event.target.checked)} />;
+    return (
+      <input
+        type="checkbox"
+        checked={Boolean(value)}
+        disabled={disabled}
+        onChange={(event) => onCommit(event.target.checked)}
+      />
+    );
   }
   if (column.type === "select") {
     return (
-      <select value={String(value ?? "")} disabled={disabled} onChange={(event) => onCommit(event.target.value || null)}>
+      <select
+        value={String(value ?? "")}
+        disabled={disabled}
+        onChange={(event) => onCommit(event.target.value || null)}
+      >
         <option value="">—</option>
-        {column.options.map((option) => <option value={option.id} key={option.id}>{option.label}</option>)}
+        {column.options.map((option) => (
+          <option value={option.id} key={option.id}>
+            {option.label}
+          </option>
+        ))}
       </select>
     );
   }
@@ -309,7 +443,15 @@ function CellInput({ column, value, disabled, onCommit }: {
       type={column.type === "number" ? "number" : column.type === "date" ? "date" : "text"}
       defaultValue={value === null ? "" : String(value)}
       disabled={disabled}
-      onBlur={(event) => onCommit(column.type === "number" ? (event.target.value === "" ? null : Number(event.target.value)) : event.target.value || null)}
+      onBlur={(event) =>
+        onCommit(
+          column.type === "number"
+            ? event.target.value === ""
+              ? null
+              : Number(event.target.value)
+            : event.target.value || null,
+        )
+      }
     />
   );
 }

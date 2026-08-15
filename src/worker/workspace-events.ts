@@ -3,7 +3,7 @@ import { YServer } from "y-partyserver";
 import type { WorkspaceEvent } from "../shared/types";
 import type { Env } from "./env";
 
-interface EventConnectionAuth {
+export interface EventConnectionAuth {
   userId: string;
   expiresAt: number;
   __ypsAwarenessIds?: number[];
@@ -11,7 +11,7 @@ interface EventConnectionAuth {
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
+    ? (value as Record<string, unknown>)
     : null;
 }
 
@@ -22,7 +22,8 @@ function stringList(value: unknown): value is string[] {
 function validPage(value: unknown) {
   const page = record(value);
   if (!page) return false;
-  return typeof page.id === "string" &&
+  return (
+    typeof page.id === "string" &&
     typeof page.workspaceId === "string" &&
     (page.parentId === null || typeof page.parentId === "string") &&
     (page.kind === "document" || page.kind === "table") &&
@@ -33,7 +34,8 @@ function validPage(value: unknown) {
     typeof page.contentEpoch === "number" &&
     (page.archivedAt === null || typeof page.archivedAt === "number") &&
     typeof page.createdAt === "number" &&
-    typeof page.updatedAt === "number";
+    typeof page.updatedAt === "number"
+  );
 }
 
 function workspaceEvent(value: unknown): WorkspaceEvent | null {
@@ -45,8 +47,12 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
   if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
     return event as WorkspaceEvent;
   }
-  if (event.type === "projection-updated" && typeof event.pageId === "string" &&
-    stringList(event.backlinkTargetIds) && stringList(event.mentionTargetUserIds)) {
+  if (
+    event.type === "projection-updated" &&
+    typeof event.pageId === "string" &&
+    stringList(event.backlinkTargetIds) &&
+    stringList(event.mentionTargetUserIds)
+  ) {
     return event as WorkspaceEvent;
   }
   return null;
@@ -127,10 +133,12 @@ export class WorkspaceEvents extends YServer {
 
 export async function broadcastWorkspaceEvent(env: Env, workspaceId: string, event: WorkspaceEvent) {
   const stub = env.WORKSPACE_EVENTS.getByName(workspaceId);
-  const response = await stub.fetch(new Request("https://workspace-events.internal/broadcast", {
-    method: "POST",
-    headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-    body: JSON.stringify(event),
-  }));
+  const response = await stub.fetch(
+    new Request("https://workspace-events.internal/broadcast", {
+      method: "POST",
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      body: JSON.stringify(event),
+    }),
+  );
   if (!response.ok) throw new Error(`Workspace event delivery failed with ${response.status}`);
 }

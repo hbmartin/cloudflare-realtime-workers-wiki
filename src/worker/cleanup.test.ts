@@ -64,4 +64,37 @@ describe("deletion job cleanup", () => {
     expect(deletion?.query).toMatch(/next_attempt_at = \?/);
     expect(deletion?.args).toEqual(["job-1", claim?.args[0]]);
   });
+
+  it("skips the workspace location lookup for R2-only jobs", async () => {
+    const queries: string[] = [];
+    const prepare = vi.fn((query: string) => {
+      queries.push(query);
+      return {
+        bind: vi.fn(() => ({
+          first: vi.fn(async () => {
+            if (query.includes("RETURNING id, attempts, workspace_id")) {
+              return { id: "job-1", attempts: 0, workspace_id: "workspace-1" };
+            }
+            if (query.includes("SELECT COUNT(*) count")) return { count: 0 };
+            return null;
+          }),
+          all: vi.fn(async () =>
+            query.includes("FROM deletion_targets")
+              ? { results: [{ kind: "r2_object", target: "attachments/file" }] }
+              : { results: [] },
+          ),
+          run: vi.fn(async () => undefined),
+        })),
+      };
+    });
+    const env = {
+      DB: { prepare },
+      BUCKET: { delete: vi.fn(async () => undefined) },
+    } as unknown as Env;
+
+    await processDeletionJob(env, "job-1");
+
+    expect(env.BUCKET.delete).toHaveBeenCalledWith("attachments/file");
+    expect(queries.some((query) => query.includes("SELECT location_hint FROM workspaces"))).toBe(false);
+  });
 });

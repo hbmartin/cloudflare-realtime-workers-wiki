@@ -1,7 +1,7 @@
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { Hono } from "hono";
 import { routePartykitRequest } from "partyserver";
-import { createAuth, getMember, requireEditor, requireMember, requireOwner } from "./auth";
+import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
 import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
 import { Document } from "./document";
@@ -34,7 +34,18 @@ const UNSAFE_MIME_TYPES = new Set([
   "text/javascript",
 ]);
 const UNSAFE_FILE_EXTENSIONS = new Set([
-  ".html", ".htm", ".htx", ".xhtml", ".xht", ".svg", ".svgz", ".xml", ".js", ".jse", ".mjs", ".cjs",
+  ".html",
+  ".htm",
+  ".htx",
+  ".xhtml",
+  ".xht",
+  ".svg",
+  ".svgz",
+  ".xml",
+  ".js",
+  ".jse",
+  ".mjs",
+  ".cjs",
 ]);
 
 type PageRow = {
@@ -86,7 +97,13 @@ function defaultLocation(request: Request, override?: string) {
   if (locationHint(override)) return override!;
   const continent = String(request.cf?.continent ?? "");
   const map: Record<string, DurableObjectLocationHint> = {
-    AF: "afr", AN: "sam", AS: "apac", EU: "weur", NA: "wnam", OC: "oc", SA: "sam",
+    AF: "afr",
+    AN: "sam",
+    AS: "apac",
+    EU: "weur",
+    NA: "wnam",
+    OC: "oc",
+    SA: "sam",
   };
   return map[continent] ?? "wnam";
 }
@@ -110,11 +127,13 @@ async function authEmail(
   const headers = new Headers(request.headers);
   headers.set("content-type", "application/json");
   headers.set("origin", new URL(env.BETTER_AUTH_URL).origin);
-  const response = await createAuth(env).handler(new Request(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  }));
+  const response = await createAuth(env).handler(
+    new Request(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    }),
+  );
   if (!response.ok) return { response, user: null };
   const payload = await response.clone().json<{ user?: { id: string } }>();
   if (!payload.user) throw new HttpError(500, "signup_failed", "The account was created without a user record.");
@@ -128,7 +147,9 @@ async function signUp(env: Env, request: Request, body: { name: string; email: s
 async function pageForMember(env: Env, member: MemberContext, pageId: string, includeArchived = false) {
   const row = await env.DB.prepare(
     `SELECT * FROM pages WHERE id = ? AND workspace_id = ? ${includeArchived ? "" : "AND archived_at IS NULL"}`,
-  ).bind(pageId, member.workspace.id).first<PageRow>();
+  )
+    .bind(pageId, member.workspace.id)
+    .first<PageRow>();
   if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
   return row;
 }
@@ -180,18 +201,27 @@ app.post("/api/install/bootstrap", async (c) => {
   const timestamp = now();
   const hint = defaultLocation(c.req.raw, c.env.DO_LOCATION_HINT);
   await c.env.DB.batch([
-    c.env.DB.prepare(`INSERT INTO workspaces (id, name, location_hint, created_at) VALUES (?, ?, ?, ?)`)
-      .bind(workspaceId, workspaceName, hint, timestamp),
-    c.env.DB.prepare(`INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)`)
-      .bind(workspaceId, signup.user.id, timestamp),
-    c.env.DB.prepare(`INSERT INTO install_state (id, workspace_id, initialized_at) VALUES (1, ?, ?)`)
-      .bind(workspaceId, timestamp),
+    c.env.DB.prepare(`INSERT INTO workspaces (id, name, location_hint, created_at) VALUES (?, ?, ?, ?)`).bind(
+      workspaceId,
+      workspaceName,
+      hint,
+      timestamp,
+    ),
+    c.env.DB.prepare(
+      `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)`,
+    ).bind(workspaceId, signup.user.id, timestamp),
+    c.env.DB.prepare(`INSERT INTO install_state (id, workspace_id, initialized_at) VALUES (1, ?, ?)`).bind(
+      workspaceId,
+      timestamp,
+    ),
     c.env.DB.prepare(
       `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
        VALUES (?, ?, NULL, 'document', ?, 'Welcome', ?, ?, ?)`,
     ).bind(pageId, workspaceId, generateJitteredKeyBetween(null, null), signup.user.id, timestamp, timestamp),
-    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, 'Welcome', '')`)
-      .bind(pageId, workspaceId),
+    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, 'Welcome', '')`).bind(
+      pageId,
+      workspaceId,
+    ),
   ]);
   return signup.response;
 });
@@ -204,7 +234,9 @@ app.post("/api/invites/accept", async (c) => {
   const invite = await c.env.DB.prepare(
     `SELECT id, workspace_id, role FROM invites
       WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`,
-  ).bind(tokenHash, now()).first<{ id: string; workspace_id: string; role: "editor" | "viewer" }>();
+  )
+    .bind(tokenHash, now())
+    .first<{ id: string; workspace_id: string; role: "editor" | "viewer" }>();
   if (!invite) throw new HttpError(404, "invite_invalid", "This invite is invalid, expired, or already used.");
 
   const inviteEmail = text(body.email, "email", 320).toLowerCase();
@@ -222,7 +254,9 @@ app.post("/api/invites/accept", async (c) => {
   if (!signup.user) return signup.response;
   const existingMembership = await c.env.DB.prepare(
     `SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?`,
-  ).bind(invite.workspace_id, signup.user.id).first();
+  )
+    .bind(invite.workspace_id, signup.user.id)
+    .first();
   if (existingMembership) return signup.response;
   const timestamp = now();
   const result = await c.env.DB.batch([
@@ -230,11 +264,13 @@ app.post("/api/invites/accept", async (c) => {
       `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
        SELECT workspace_id, ?, role, ? FROM invites WHERE id = ? AND used_at IS NULL`,
     ).bind(signup.user.id, timestamp, invite.id),
-    c.env.DB.prepare(
-      `UPDATE invites SET used_by = ?, used_at = ? WHERE id = ? AND used_at IS NULL`,
-    ).bind(signup.user.id, timestamp, invite.id),
+    c.env.DB.prepare(`UPDATE invites SET used_by = ?, used_at = ? WHERE id = ? AND used_at IS NULL`).bind(
+      signup.user.id,
+      timestamp,
+      invite.id,
+    ),
   ]);
-  if (!result[1].meta.changes) throw new HttpError(409, "invite_used", "This invite was used by another request.");
+  if (!result[1]!.meta.changes) throw new HttpError(409, "invite_used", "This invite was used by another request.");
   return signup.response;
 });
 
@@ -261,7 +297,9 @@ app.get("/api/members", async (c) => {
     `SELECT u.id, u.name, u.email, wm.role, wm.created_at createdAt
        FROM workspace_members wm JOIN user u ON u.id = wm.user_id
       WHERE wm.workspace_id = ? ORDER BY u.name, u.id`,
-  ).bind(member.workspace.id).all();
+  )
+    .bind(member.workspace.id)
+    .all();
   return c.json({ members: rows.results });
 });
 
@@ -277,7 +315,9 @@ app.post("/api/invites", async (c) => {
   await c.env.DB.prepare(
     `INSERT INTO invites (id, workspace_id, token_hash, role, expires_at, created_by, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(id, member.workspace.id, await sha256(token), inviteRole, expiresAt, member.user.id, now()).run();
+  )
+    .bind(id, member.workspace.id, await sha256(token), inviteRole, expiresAt, member.user.id, now())
+    .run();
   return c.json({ invite: { id, token, role: inviteRole, expiresAt } }, 201);
 });
 
@@ -288,14 +328,14 @@ app.patch("/api/members/:id", async (c) => {
   const nextRole = role(body.role);
   const targetId = c.req.param("id");
   if (nextRole !== "owner") {
-    const target = await c.env.DB.prepare(
-      `SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?`,
-    ).bind(member.workspace.id, targetId).first<{ role: string }>();
+    const target = await c.env.DB.prepare(`SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?`)
+      .bind(member.workspace.id, targetId)
+      .first<{ role: string }>();
     if (target?.role === "owner") await assertAnotherOwner(c.env, member.workspace.id, targetId);
   }
-  const result = await c.env.DB.prepare(
-    `UPDATE workspace_members SET role = ? WHERE workspace_id = ? AND user_id = ?`,
-  ).bind(nextRole, member.workspace.id, targetId).run();
+  const result = await c.env.DB.prepare(`UPDATE workspace_members SET role = ? WHERE workspace_id = ? AND user_id = ?`)
+    .bind(nextRole, member.workspace.id, targetId)
+    .run();
   if (!result.meta.changes) throw new HttpError(404, "member_not_found", "Member not found.");
   return c.json({ ok: true });
 });
@@ -304,13 +344,14 @@ app.delete("/api/members/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   const targetId = c.req.param("id");
-  const target = await c.env.DB.prepare(
-    `SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?`,
-  ).bind(member.workspace.id, targetId).first<{ role: string }>();
+  const target = await c.env.DB.prepare(`SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?`)
+    .bind(member.workspace.id, targetId)
+    .first<{ role: string }>();
   if (!target) throw new HttpError(404, "member_not_found", "Member not found.");
   if (target.role === "owner") await assertAnotherOwner(c.env, member.workspace.id, targetId);
   await c.env.DB.prepare(`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?`)
-    .bind(member.workspace.id, targetId).run();
+    .bind(member.workspace.id, targetId)
+    .run();
   return c.json({ ok: true });
 });
 
@@ -319,7 +360,9 @@ app.get("/api/pages/tree", async (c) => {
   const archived = c.req.query("archived") === "true";
   const rows = await c.env.DB.prepare(
     `SELECT * FROM pages WHERE workspace_id = ? AND archived_at IS ${archived ? "NOT " : ""}NULL ORDER BY position, id`,
-  ).bind(member.workspace.id).all<PageRow>();
+  )
+    .bind(member.workspace.id)
+    .all<PageRow>();
   return c.json({ pages: rows.results.map(pageJson) });
 });
 
@@ -331,7 +374,9 @@ app.post("/api/pages", async (c) => {
   if (parentId) await pageForMember(c.env, member, parentId);
   const last = await c.env.DB.prepare(
     `SELECT position FROM pages WHERE workspace_id = ? AND parent_id IS ? AND archived_at IS NULL ORDER BY position DESC, id DESC LIMIT 1`,
-  ).bind(member.workspace.id, parentId).first<{ position: string }>();
+  )
+    .bind(member.workspace.id, parentId)
+    .first<{ position: string }>();
   const id = crypto.randomUUID();
   const kind = pageKind(body.kind ?? "document");
   const title = typeof body.title === "string" ? text(body.title, "title", 200) : "Untitled";
@@ -340,9 +385,22 @@ app.post("/api/pages", async (c) => {
     c.env.DB.prepare(
       `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(id, member.workspace.id, parentId, kind, generateJitteredKeyBetween(last?.position ?? null, null), title, member.user.id, timestamp, timestamp),
-    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`)
-      .bind(id, member.workspace.id, title),
+    ).bind(
+      id,
+      member.workspace.id,
+      parentId,
+      kind,
+      generateJitteredKeyBetween(last?.position ?? null, null),
+      title,
+      member.user.id,
+      timestamp,
+      timestamp,
+    ),
+    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
+      id,
+      member.workspace.id,
+      title,
+    ),
     ...(kind === "table" ? [c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(id)] : []),
   ]);
   const created = pageJson(await pageForMember(c.env, member, id));
@@ -366,12 +424,19 @@ app.patch("/api/pages/:id", async (c) => {
   const result = await c.env.DB.prepare(
     `UPDATE pages SET title = ?, icon = ?, revision = revision + 1, updated_at = ?
       WHERE id = ? AND workspace_id = ? AND revision = ?`,
-  ).bind(titleValue, iconValue, now(), page.id, member.workspace.id, revision).run();
-  if (!result.meta.changes) throw new HttpError(409, "stale_revision", "The page metadata changed. Reload and try again.");
+  )
+    .bind(titleValue, iconValue, now(), page.id, member.workspace.id, revision)
+    .run();
+  if (!result.meta.changes)
+    throw new HttpError(409, "stale_revision", "The page metadata changed. Reload and try again.");
   await c.env.DB.batch([
     c.env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(page.id),
-    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, ?)`)
-      .bind(page.id, member.workspace.id, titleValue, await currentPlainText(c.env, page.id)),
+    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, ?)`).bind(
+      page.id,
+      member.workspace.id,
+      titleValue,
+      await currentPlainText(c.env, page.id),
+    ),
   ]);
   const updated = pageJson(await pageForMember(c.env, member, page.id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [updated] });
@@ -391,24 +456,35 @@ app.post("/api/pages/:id/move", async (c) => {
          SELECT id FROM pages WHERE id = ?
          UNION ALL SELECT p.id FROM pages p JOIN descendants d ON p.parent_id = d.id
        ) SELECT 1 cycle FROM descendants WHERE id = ? LIMIT 1`,
-    ).bind(page.id, parentId).first();
+    )
+      .bind(page.id, parentId)
+      .first();
     if (cycle) throw new HttpError(409, "page_cycle", "A page cannot be moved beneath itself or a descendant.");
   }
   const beforeId = nullableId(body.beforeId, "beforeId");
   const afterId = nullableId(body.afterId, "afterId");
   const neighbors = await c.env.DB.prepare(
     `SELECT id, position FROM pages WHERE workspace_id = ? AND parent_id IS ? AND archived_at IS NULL`,
-  ).bind(member.workspace.id, parentId).all<{ id: string; position: string }>();
+  )
+    .bind(member.workspace.id, parentId)
+    .all<{ id: string; position: string }>();
   const before = neighbors.results.find((item) => item.id === beforeId)?.position ?? null;
   const after = neighbors.results.find((item) => item.id === afterId)?.position ?? null;
-  if (beforeId && !before) throw new HttpError(422, "invalid_neighbor", "beforeId is not a sibling in the destination.");
+  if (beforeId && !before)
+    throw new HttpError(422, "invalid_neighbor", "beforeId is not a sibling in the destination.");
   if (afterId && !after) throw new HttpError(422, "invalid_neighbor", "afterId is not a sibling in the destination.");
-  const lower = after ?? (before ? null : neighbors.results.sort((a, b) => compareBinaryText(a.position, b.position)).at(-1)?.position ?? null);
+  const lower =
+    after ??
+    (before
+      ? null
+      : (neighbors.results.sort((a, b) => compareBinaryText(a.position, b.position)).at(-1)?.position ?? null));
   const upper = before;
   if (lower && upper && lower >= upper) throw new HttpError(422, "invalid_order", "afterId must come before beforeId.");
   await c.env.DB.prepare(
     `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ? WHERE id = ?`,
-  ).bind(parentId, generateJitteredKeyBetween(lower, upper), now(), page.id).run();
+  )
+    .bind(parentId, generateJitteredKeyBetween(lower, upper), now(), page.id)
+    .run();
   const moved = pageJson(await pageForMember(c.env, member, page.id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
   return c.json({ page: moved });
@@ -452,18 +528,26 @@ app.delete("/api/pages/:id", async (c) => {
     `WITH RECURSIVE subtree(id) AS (
        SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
      ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
-  ).bind(page.id).all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
+  )
+    .bind(page.id)
+    .all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
   const documents = archived.results.filter((item) => item.kind === "document");
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
     pageIds: archived.results.map((item) => item.id),
     permanently: false,
   });
-  const pendingPageIds = await processArchiveDisconnectTargets(c.env, documents.map((item) => ({
-    page_id: item.id,
-    content_epoch: item.content_epoch,
-  })));
-  return c.json({ ok: true, cleanupPending: pendingPageIds.length > 0, pendingPageIds }, pendingPageIds.length ? 202 : 200);
+  const pendingPageIds = await processArchiveDisconnectTargets(
+    c.env,
+    documents.map((item) => ({
+      page_id: item.id,
+      content_epoch: item.content_epoch,
+    })),
+  );
+  return c.json(
+    { ok: true, cleanupPending: pendingPageIds.length > 0, pendingPageIds },
+    pendingPageIds.length ? 202 : 200,
+  );
 });
 
 app.post("/api/pages/:id/restore", async (c) => {
@@ -475,25 +559,37 @@ app.post("/api/pages/:id/restore", async (c) => {
        SELECT id FROM pages WHERE id = ? AND workspace_id = ?
        UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
      ) UPDATE pages SET archived_at = NULL, archived_by = NULL, updated_at = ? WHERE id IN subtree`,
-  ).bind(page.id, member.workspace.id, now()).run();
+  )
+    .bind(page.id, member.workspace.id, now())
+    .run();
   await c.env.DB.prepare(
     `DELETE FROM archive_disconnect_targets WHERE page_id IN (
        WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) SELECT id FROM subtree
      )`,
-  ).bind(page.id).run();
+  )
+    .bind(page.id)
+    .run();
   const restored = await c.env.DB.prepare(
     `SELECT * FROM pages WHERE id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
       SELECT id FROM subtree
     )`,
-  ).bind(page.id).all<PageRow>();
-  await c.env.DB.batch(restored.results.flatMap((item) => [
-    c.env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(item.id),
-    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, ?)`)
-      .bind(item.id, item.workspace_id, item.title, item.plain_text ?? ""),
-  ]));
+  )
+    .bind(page.id)
+    .all<PageRow>();
+  await c.env.DB.batch(
+    restored.results.flatMap((item) => [
+      c.env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(item.id),
+      c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, ?)`).bind(
+        item.id,
+        item.workspace_id,
+        item.title,
+        item.plain_text ?? "",
+      ),
+    ]),
+  );
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-upserted",
     pages: restored.results.map(pageJson),
@@ -511,12 +607,16 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
       `WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) SELECT * FROM pages WHERE id IN subtree`,
-    ).bind(page.id).all<PageRow>(),
+    )
+      .bind(page.id)
+      .all<PageRow>(),
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) SELECT r2_key FROM attachments WHERE page_id IN subtree`,
-    ).bind(page.id).all<{ r2_key: string }>(),
+    )
+      .bind(page.id)
+      .all<{ r2_key: string }>(),
   ]);
   const jobId = crypto.randomUUID();
   const timestamp = now();
@@ -537,18 +637,28 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
       `INSERT INTO deletion_jobs
         (id, workspace_id, root_page_id, next_attempt_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
-    ).bind(jobId, member.workspace.id, page.id, Number.MAX_SAFE_INTEGER, timestamp, timestamp).run();
+    )
+      .bind(jobId, member.workspace.id, page.id, Number.MAX_SAFE_INTEGER, timestamp, timestamp)
+      .run();
     for (let index = 0; index < targetValues.length; index += DELETION_TARGET_BATCH_SIZE) {
-      await c.env.DB.batch(targetValues.slice(index, index + DELETION_TARGET_BATCH_SIZE).map((target) => (
-        c.env.DB.prepare(
-          `INSERT INTO deletion_targets (job_id, kind, target) VALUES (?, ?, ?)`,
-        ).bind(jobId, target.kind, target.target)
-      )));
+      await c.env.DB.batch(
+        targetValues
+          .slice(index, index + DELETION_TARGET_BATCH_SIZE)
+          .map((target) =>
+            c.env.DB.prepare(`INSERT INTO deletion_targets (job_id, kind, target) VALUES (?, ?, ?)`).bind(
+              jobId,
+              target.kind,
+              target.target,
+            ),
+          ),
+      );
     }
     const results = await c.env.DB.batch([
-      c.env.DB.prepare(
-        `UPDATE deletion_jobs SET next_attempt_at = ?, updated_at = ? WHERE id = ?`,
-      ).bind(timestamp, timestamp, jobId),
+      c.env.DB.prepare(`UPDATE deletion_jobs SET next_attempt_at = ?, updated_at = ? WHERE id = ?`).bind(
+        timestamp,
+        timestamp,
+        jobId,
+      ),
       c.env.DB.prepare(
         `DELETE FROM page_search WHERE page_id IN (
            WITH RECURSIVE subtree(id) AS (
@@ -569,9 +679,11 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   }
   const pageIds = subtree.results.map((item) => item.id);
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: true });
-  c.executionCtx.waitUntil(processDeletionJob(c.env, jobId).catch((error) => {
-    console.error("Immediate deletion cleanup failed", error);
-  }));
+  c.executionCtx.waitUntil(
+    processDeletionJob(c.env, jobId).catch((error) => {
+      console.error("Immediate deletion cleanup failed", error);
+    }),
+  );
   return c.json({ ok: true, cleanupPending: true }, 202);
 });
 
@@ -587,7 +699,9 @@ app.get("/api/search", async (c) => {
        FROM page_search JOIN pages p ON p.id = page_search.page_id
       WHERE page_search MATCH ? AND page_search.workspace_id = ? AND p.archived_at IS NULL
       ORDER BY bm25(page_search) LIMIT 30`,
-  ).bind(match, member.workspace.id).all<PageRow & { snippet: string }>();
+  )
+    .bind(match, member.workspace.id)
+    .all<PageRow & { snippet: string }>();
   return c.json({ results: rows.results.map((row) => ({ page: pageJson(row), snippet: row.snippet })) });
 });
 
@@ -601,39 +715,43 @@ app.get("/api/mentions/suggestions", async (c) => {
       `SELECT id, title, icon FROM pages
         WHERE workspace_id = ? AND archived_at IS NULL AND title LIKE ? ESCAPE '\\'
         ORDER BY CASE WHEN title LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END, title, id LIMIT 10`,
-    ).bind(member.workspace.id, pattern, `${escapedQuery}%`)
+    )
+      .bind(member.workspace.id, pattern, `${escapedQuery}%`)
       .all<{ id: string; title: string; icon: string | null }>(),
     c.env.DB.prepare(
       `SELECT u.id, u.name, u.email, wm.role
          FROM workspace_members wm JOIN user u ON u.id = wm.user_id
         WHERE wm.workspace_id = ? AND (u.name LIKE ? ESCAPE '\\' OR u.email LIKE ? ESCAPE '\\')
         ORDER BY u.name, u.id LIMIT 10`,
-    ).bind(member.workspace.id, pattern, pattern)
+    )
+      .bind(member.workspace.id, pattern, pattern)
       .all<{ id: string; name: string; email: string; role: string }>(),
   ]);
-  return c.json({ suggestions: [
-    ...pages.results.map((page) => ({
-      entityType: "page" as const,
-      entityId: page.id,
-      label: page.title,
-      detail: "Page",
-      icon: page.icon,
-    })),
-    ...members.results.map((item) => ({
-      entityType: "user" as const,
-      entityId: item.id,
-      label: item.name,
-      detail: `${item.email} · ${item.role}`,
-      icon: null,
-    })),
-  ] });
+  return c.json({
+    suggestions: [
+      ...pages.results.map((page) => ({
+        entityType: "page" as const,
+        entityId: page.id,
+        label: page.title,
+        detail: "Page",
+        icon: page.icon,
+      })),
+      ...members.results.map((item) => ({
+        entityType: "user" as const,
+        entityId: item.id,
+        label: item.name,
+        detail: `${item.email} · ${item.role}`,
+        icon: null,
+      })),
+    ],
+  });
 });
 
 app.get("/api/pages/:id/preview", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const row = await c.env.DB.prepare(
-    `SELECT * FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
-  ).bind(c.req.param("id"), member.workspace.id).first<PageRow>();
+  const row = await c.env.DB.prepare(`SELECT * FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`)
+    .bind(c.req.param("id"), member.workspace.id)
+    .first<PageRow>();
   if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
   return c.json({ preview: { page: pageJson(row), excerpt: (row.plain_text ?? "").slice(0, 280) } });
 });
@@ -646,7 +764,9 @@ app.get("/api/pages/:id/backlinks", async (c) => {
        FROM page_references reference JOIN pages source ON source.id = reference.source_page_id
       WHERE reference.target_page_id = ? AND source.workspace_id = ? AND source.archived_at IS NULL
       ORDER BY source.updated_at DESC, source.id`,
-  ).bind(page.id, member.workspace.id).all<PageRow & { excerpt: string }>();
+  )
+    .bind(page.id, member.workspace.id)
+    .all<PageRow & { excerpt: string }>();
   return c.json({ backlinks: rows.results.map((row) => ({ page: pageJson(row), excerpt: row.excerpt })) });
 });
 
@@ -660,7 +780,9 @@ app.get("/api/mentions/unread-count", async (c) => {
          ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
       WHERE mention.workspace_id = ? AND mention.target_user_id = ?
         AND mention.first_seen_at > COALESCE(reads.read_at, 0)`,
-  ).bind(member.workspace.id, member.user.id).first<{ count: number }>();
+  )
+    .bind(member.workspace.id, member.user.id)
+    .first<{ count: number }>();
   return c.json({ unreadCount: row?.count ?? 0 });
 });
 
@@ -676,9 +798,11 @@ app.get("/api/mentions", async (c) => {
   if (!Number.isInteger(asOf) || asOf < 0 || asOf > now() + 1_000) {
     throw new HttpError(422, "invalid_mentions_cursor", "asOf must be a valid server timestamp.");
   }
-  if ((beforeAtValue === undefined) !== (beforeId === undefined)
-    || (beforeAt !== null && (!Number.isInteger(beforeAt) || beforeAt < 0))
-    || (beforeId !== undefined && (!beforeId || beforeId.length > 100))) {
+  if (
+    (beforeAtValue === undefined) !== (beforeId === undefined) ||
+    (beforeAt !== null && (!Number.isInteger(beforeAt) || beforeAt < 0)) ||
+    (beforeId !== undefined && (!beforeId || beforeId.length > 100))
+  ) {
     throw new HttpError(422, "invalid_mentions_cursor", "The mention page cursor is invalid.");
   }
   const rows = await c.env.DB.prepare(
@@ -692,15 +816,15 @@ app.get("/api/mentions", async (c) => {
         AND (? IS NULL OR mention.first_seen_at < ?
           OR (mention.first_seen_at = ? AND source.id > ?))
       ORDER BY mention.first_seen_at DESC, source.id LIMIT 101`,
-  ).bind(member.workspace.id, member.user.id, asOf, beforeAt, beforeAt, beforeAt, beforeId ?? null)
+  )
+    .bind(member.workspace.id, member.user.id, asOf, beforeAt, beforeAt, beforeAt, beforeId ?? null)
     .all<PageRow & { excerpt: string; first_seen_at: number; unread: number }>();
   const pageRows = rows.results.slice(0, 100);
   const last = pageRows.at(-1);
   return c.json({
     asOf,
-    nextCursor: rows.results.length > pageRows.length && last
-      ? { firstSeenAt: last.first_seen_at, pageId: last.id }
-      : null,
+    nextCursor:
+      rows.results.length > pageRows.length && last ? { firstSeenAt: last.first_seen_at, pageId: last.id } : null,
     mentions: pageRows.map((row) => ({
       page: pageJson(row),
       excerpt: row.excerpt,
@@ -720,7 +844,9 @@ app.post("/api/mentions/read", async (c) => {
   await c.env.DB.prepare(
     `INSERT INTO mention_reads (workspace_id, user_id, read_at) VALUES (?, ?, ?)
       ON CONFLICT(workspace_id, user_id) DO UPDATE SET read_at = MAX(read_at, excluded.read_at)`,
-  ).bind(member.workspace.id, member.user.id, through).run();
+  )
+    .bind(member.workspace.id, member.user.id, through)
+    .run();
   const unread = await c.env.DB.prepare(
     `SELECT COUNT(DISTINCT mention.source_page_id) count
        FROM member_mentions mention
@@ -729,7 +855,9 @@ app.post("/api/mentions/read", async (c) => {
          ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
       WHERE mention.workspace_id = ? AND mention.target_user_id = ?
         AND mention.first_seen_at > COALESCE(reads.read_at, 0)`,
-  ).bind(member.workspace.id, member.user.id).first<{ count: number }>();
+  )
+    .bind(member.workspace.id, member.user.id)
+    .first<{ count: number }>();
   return c.json({ unreadCount: unread?.count ?? 0 });
 });
 
@@ -739,7 +867,9 @@ app.get("/api/pages/:id/attachments", async (c) => {
   const attachments = await c.env.DB.prepare(
     `SELECT id, page_id pageId, name, mime, size, created_by createdBy, created_at createdAt
        FROM attachments WHERE page_id = ? AND workspace_id = ? ORDER BY created_at DESC`,
-  ).bind(page.id, member.workspace.id).all();
+  )
+    .bind(page.id, member.workspace.id)
+    .all();
   return c.json({ attachments: attachments.results });
 });
 
@@ -748,13 +878,15 @@ app.post("/api/pages/:id/attachments", async (c) => {
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"));
   const contentLength = Number(c.req.header("content-length") ?? 0);
-  if (contentLength > MAX_UPLOAD_BYTES + 100_000) throw new HttpError(413, "upload_too_large", "Uploads are limited to 10 MiB.");
+  if (contentLength > MAX_UPLOAD_BYTES + 100_000)
+    throw new HttpError(413, "upload_too_large", "Uploads are limited to 10 MiB.");
   const form = await c.req.formData();
   const file = form.get("file");
   if (!(file instanceof File)) throw new HttpError(422, "file_required", "Attach one file in the file field.");
   if (file.size > MAX_UPLOAD_BYTES) throw new HttpError(413, "upload_too_large", "Uploads are limited to 10 MiB.");
   const mime = file.type || "application/octet-stream";
-  if (isUnsafeMime(mime, file.name)) throw new HttpError(415, "unsafe_file_type", "HTML, SVG, and executable web content cannot be uploaded.");
+  if (isUnsafeMime(mime, file.name))
+    throw new HttpError(415, "unsafe_file_type", "HTML, SVG, and executable web content cannot be uploaded.");
   const id = crypto.randomUUID();
   const key = `assets/${member.workspace.id}/${crypto.randomUUID()}`;
   await c.env.BUCKET.put(key, file.stream(), {
@@ -765,12 +897,17 @@ app.post("/api/pages/:id/attachments", async (c) => {
     await c.env.DB.prepare(
       `INSERT INTO attachments (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(id, member.workspace.id, page.id, key, normalizeFilename(file.name), mime, file.size, member.user.id, now()).run();
+    )
+      .bind(id, member.workspace.id, page.id, key, normalizeFilename(file.name), mime, file.size, member.user.id, now())
+      .run();
   } catch (error) {
     await c.env.BUCKET.delete(key);
     throw error;
   }
-  return c.json({ attachment: { id, pageId: page.id, name: normalizeFilename(file.name), mime, size: file.size } }, 201);
+  return c.json(
+    { attachment: { id, pageId: page.id, name: normalizeFilename(file.name), mime, size: file.size } },
+    201,
+  );
 });
 
 app.get("/api/attachments/:id", async (c) => {
@@ -778,50 +915,53 @@ app.get("/api/attachments/:id", async (c) => {
   const attachment = await c.env.DB.prepare(
     `SELECT a.* FROM attachments a JOIN pages p ON p.id = a.page_id
       WHERE a.id = ? AND a.workspace_id = ? AND p.archived_at IS NULL`,
-  ).bind(c.req.param("id"), member.workspace.id).first<{
-    r2_key: string; name: string; mime: string; size: number;
-  }>();
+  )
+    .bind(c.req.param("id"), member.workspace.id)
+    .first<{
+      r2_key: string;
+      name: string;
+      mime: string;
+      size: number;
+    }>();
   if (!attachment) throw new HttpError(404, "attachment_not_found", "Attachment not found.");
   const rangeRequested = Boolean(c.req.header("range"));
-  let object = await c.env.BUCKET.get(attachment.r2_key, {
+  let r2Object = await c.env.BUCKET.get(attachment.r2_key, {
     ...(rangeRequested ? { range: c.req.raw.headers } : {}),
     onlyIf: c.req.raw.headers,
   });
-  if (!object) throw new HttpError(404, "attachment_missing", "The attachment data is missing.");
+  if (!r2Object) throw new HttpError(404, "attachment_missing", "The attachment data is missing.");
   const headers = new Headers();
-  object.writeHttpMetadata(headers);
-  headers.set("etag", object.httpEtag);
+  r2Object.writeHttpMetadata(headers);
+  headers.set("etag", r2Object.httpEtag);
   headers.set("accept-ranges", "bytes");
   headers.set("cache-control", "private, max-age=0, must-revalidate");
   headers.set("x-content-type-options", "nosniff");
   headers.set("content-disposition", attachmentDisposition(attachment.name, isInlineMime(attachment.mime)));
-  if (!("body" in object)) {
-    const status = conditionalGetStatus(c.req.raw.headers, object);
+  if (!("body" in r2Object)) {
+    const status = conditionalGetStatus(c.req.raw.headers, r2Object);
     if (status !== 200) {
       return new Response(null, { status, headers });
     }
-    object = await c.env.BUCKET.get(attachment.r2_key, {
-      ...(rangeRequested ? { range: c.req.raw.headers } : {}),
-    });
-    if (!object || !("body" in object)) {
+    r2Object = await c.env.BUCKET.get(attachment.r2_key, rangeRequested ? { range: c.req.raw.headers } : {});
+    if (!r2Object || !("body" in r2Object)) {
       throw new HttpError(404, "attachment_missing", "The attachment data is missing.");
     }
   }
-  const range = rangeRequested && object.range ? normalizeR2Range(object.range, object.size) : null;
+  const range = rangeRequested && r2Object.range ? normalizeR2Range(r2Object.range, r2Object.size) : null;
   if (range && range.length > 0) {
-    headers.set("content-range", `bytes ${range.offset}-${range.offset + range.length - 1}/${object.size}`);
+    headers.set("content-range", `bytes ${range.offset}-${range.offset + range.length - 1}/${r2Object.size}`);
     headers.set("content-length", String(range.length));
-    return new Response(object.body, { status: 206, headers });
+    return new Response(r2Object.body, { status: 206, headers });
   }
-  return new Response(object.body, { status: 200, headers });
+  return new Response(r2Object.body, { status: 200, headers });
 });
 
 app.delete("/api/attachments/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const attachment = await c.env.DB.prepare(
-    `SELECT r2_key FROM attachments WHERE id = ? AND workspace_id = ?`,
-  ).bind(c.req.param("id"), member.workspace.id).first<{ r2_key: string }>();
+  const attachment = await c.env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ? AND workspace_id = ?`)
+    .bind(c.req.param("id"), member.workspace.id)
+    .first<{ r2_key: string }>();
   if (!attachment) throw new HttpError(404, "attachment_not_found", "Attachment not found.");
   await c.env.DB.prepare(`DELETE FROM attachments WHERE id = ?`).bind(c.req.param("id")).run();
   await c.env.BUCKET.delete(attachment.r2_key);
@@ -831,12 +971,15 @@ app.delete("/api/attachments/:id", async (c) => {
 app.get("/api/pages/:id/versions", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
-  if (page.kind !== "document") throw new HttpError(422, "document_required", "Tables do not have version history in v1.");
+  if (page.kind !== "document")
+    throw new HttpError(422, "document_required", "Tables do not have version history in v1.");
   const versions = await c.env.DB.prepare(
     `SELECT id, page_id pageId, epoch, sequence, title, byte_size byteSize,
             last_editor_id lastEditorId, created_at createdAt
        FROM page_versions WHERE page_id = ? ORDER BY created_at DESC`,
-  ).bind(page.id).all();
+  )
+    .bind(page.id)
+    .all();
   return c.json({ versions: versions.results });
 });
 
@@ -845,20 +988,27 @@ app.get("/api/versions/:id", async (c) => {
   const version = await c.env.DB.prepare(
     `SELECT v.*, p.workspace_id FROM page_versions v JOIN pages p ON p.id = v.page_id
       WHERE v.id = ? AND p.workspace_id = ?`,
-  ).bind(c.req.param("id"), member.workspace.id).first<{
-    r2_key: string; title: string; epoch: number; sequence: number;
-  }>();
+  )
+    .bind(c.req.param("id"), member.workspace.id)
+    .first<{
+      r2_key: string;
+      title: string;
+      epoch: number;
+      sequence: number;
+    }>();
   if (!version) throw new HttpError(404, "version_not_found", "Version not found.");
   const snapshot = await c.env.BUCKET.get(version.r2_key);
   if (!snapshot) throw new HttpError(404, "version_missing", "The version snapshot is missing.");
-  return new Response(snapshot.body, { headers: {
-    "content-type": "application/vnd.yjs",
-    "content-length": String(snapshot.size),
-    "x-version-title": encodeURIComponent(version.title),
-    "x-version-epoch": String(version.epoch),
-    "x-version-sequence": String(version.sequence),
-    "cache-control": "private, no-store",
-  } });
+  return new Response(snapshot.body, {
+    headers: {
+      "content-type": "application/vnd.yjs",
+      "content-length": String(snapshot.size),
+      "x-version-title": encodeURIComponent(version.title),
+      "x-version-epoch": String(version.epoch),
+      "x-version-sequence": String(version.sequence),
+      "cache-control": "private, no-store",
+    },
+  });
 });
 
 app.post("/api/pages/:id/restore-version", async (c) => {
@@ -871,19 +1021,22 @@ app.post("/api/pages/:id/restore-version", async (c) => {
   const hint = locationHint(member.workspace.locationHint ?? undefined);
   const oldRoom = `${page.id}~${page.content_epoch}`;
   const oldStub = c.env.DOCUMENT.getByName(oldRoom, hint ? { locationHint: hint } : undefined);
-  const response = await oldStub.fetch(new Request("https://document.internal/restore-version", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-notes-internal": c.env.BETTER_AUTH_SECRET,
-    },
-    body: JSON.stringify({ versionId, userId: member.user.id }),
-  }));
+  const response = await oldStub.fetch(
+    new Request("https://document.internal/restore-version", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-notes-internal": c.env.BETTER_AUTH_SECRET,
+      },
+      body: JSON.stringify({ versionId, userId: member.user.id }),
+    }),
+  );
   type RestoreResult = { pageId?: string; contentEpoch?: number; error?: string };
   const result: RestoreResult = await response.json<RestoreResult>().catch(() => ({}));
   if (!response.ok || !result.contentEpoch) {
     if (response.status === 404) throw new HttpError(404, "version_not_found", result.error ?? "Version not found.");
-    if (response.status === 409) throw new HttpError(409, "stale_epoch", result.error ?? "The page epoch changed during restore.");
+    if (response.status === 409)
+      throw new HttpError(409, "stale_epoch", result.error ?? "The page epoch changed during restore.");
     throw new HttpError(503, "restore_failed", result.error ?? "The version could not be restored.");
   }
   const restored = pageJson(await pageForMember(c.env, member, page.id));
@@ -895,47 +1048,70 @@ app.get("/api/tables/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("pageId"));
   if (page.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
-  const state = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`).bind(page.id).first<{ revision: number }>();
-  const columns = await c.env.DB.prepare(`SELECT * FROM table_columns WHERE page_id = ? ORDER BY position, id`).bind(page.id).all<{
-    id: string; name: string; type: string; position: number;
-  }>();
+  const state = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
+    .bind(page.id)
+    .first<{ revision: number }>();
+  const columns = await c.env.DB.prepare(`SELECT * FROM table_columns WHERE page_id = ? ORDER BY position, id`)
+    .bind(page.id)
+    .all<{
+      id: string;
+      name: string;
+      type: string;
+      position: number;
+    }>();
   const options = await c.env.DB.prepare(
     `SELECT o.* FROM table_select_options o JOIN table_columns c ON c.id = o.column_id WHERE c.page_id = ? ORDER BY o.position, o.id`,
-  ).bind(page.id).all<{ id: string; column_id: string; label: string; position: number }>();
+  )
+    .bind(page.id)
+    .all<{ id: string; column_id: string; label: string; position: number }>();
   // ponytail: 500 rows are loaded and sorted in the client; graduate to server-side
   // querying and a realtime table Durable Object only when this boundary is exceeded.
-  const rows = await c.env.DB.prepare(`SELECT id, position FROM table_rows WHERE page_id = ? ORDER BY position, id LIMIT 501`)
-    .bind(page.id).all<{ id: string; position: number }>();
-  if (rows.results.length > 500) throw new HttpError(422, "table_row_limit", "This table has exceeded the 500-row v1 limit.");
+  const rows = await c.env.DB.prepare(
+    `SELECT id, position FROM table_rows WHERE page_id = ? ORDER BY position, id LIMIT 501`,
+  )
+    .bind(page.id)
+    .all<{ id: string; position: number }>();
+  if (rows.results.length > 500)
+    throw new HttpError(422, "table_row_limit", "This table has exceeded the 500-row v1 limit.");
   const cells = await c.env.DB.prepare(
     `SELECT c.* FROM table_cells c JOIN table_rows r ON r.id = c.row_id WHERE r.page_id = ?`,
-  ).bind(page.id).all<Record<string, unknown>>();
+  )
+    .bind(page.id)
+    .all<Record<string, unknown>>();
   const lease = await c.env.DB.prepare(
     `SELECT l.expires_at, l.holder_session_id, u.name holder_name
        FROM table_leases l JOIN user u ON u.id = l.holder_user_id WHERE l.page_id = ? AND l.expires_at > ?`,
-  ).bind(page.id, now()).first<{ expires_at: number; holder_session_id: string; holder_name: string }>();
+  )
+    .bind(page.id, now())
+    .first<{ expires_at: number; holder_session_id: string; holder_name: string }>();
   const cellMap = new Map<string, Record<string, string | number | boolean | null>>();
   for (const cell of cells.results) {
     const row = cellMap.get(String(cell.row_id)) ?? {};
     row[String(cell.column_id)] = cellValue(cell);
     cellMap.set(String(cell.row_id), row);
   }
-  return c.json({ table: {
-    pageId: page.id,
-    revision: state?.revision ?? 1,
-    columns: columns.results.map((column) => ({
-      ...column,
-      options: options.results.filter((option) => option.column_id === column.id).map((option) => ({
-        id: option.id, label: option.label, position: option.position,
+  return c.json({
+    table: {
+      pageId: page.id,
+      revision: state?.revision ?? 1,
+      columns: columns.results.map((column) => ({
+        ...column,
+        options: options.results
+          .filter((option) => option.column_id === column.id)
+          .map((option) => ({
+            id: option.id,
+            label: option.label,
+            position: option.position,
+          })),
       })),
-    })),
-    rows: rows.results.map((row) => ({ ...row, cells: cellMap.get(row.id) ?? {} })),
-    lease: {
-      heldByMe: lease?.holder_session_id === member.session.id,
-      holderName: lease?.holder_name ?? null,
-      expiresAt: lease?.expires_at ?? null,
+      rows: rows.results.map((row) => ({ ...row, cells: cellMap.get(row.id) ?? {} })),
+      lease: {
+        heldByMe: lease?.holder_session_id === member.session.id,
+        holderName: lease?.holder_name ?? null,
+        expiresAt: lease?.expires_at ?? null,
+      },
     },
-  } });
+  });
 });
 
 app.post("/api/tables/:pageId/lease", async (c) => {
@@ -952,8 +1128,11 @@ app.post("/api/tables/:pageId/lease", async (c) => {
        holder_user_id = excluded.holder_user_id, holder_session_id = excluded.holder_session_id,
        expires_at = excluded.expires_at
      WHERE table_leases.expires_at <= ? OR table_leases.holder_session_id = ?`,
-  ).bind(page.id, await sha256(token), member.user.id, member.session.id, expiresAt, now(), member.session.id).run();
-  if (!result.meta.changes) throw new HttpError(409, "lease_conflict", "Another editor currently holds this table lease.");
+  )
+    .bind(page.id, await sha256(token), member.user.id, member.session.id, expiresAt, now(), member.session.id)
+    .run();
+  if (!result.meta.changes)
+    throw new HttpError(409, "lease_conflict", "Another editor currently holds this table lease.");
   return c.json({ leaseToken: token, expiresAt });
 });
 
@@ -965,7 +1144,15 @@ app.patch("/api/tables/:pageId/lease", async (c) => {
   const result = await c.env.DB.prepare(
     `UPDATE table_leases SET expires_at = ?
       WHERE page_id = ? AND holder_session_id = ? AND token_hash = ? AND expires_at > ?`,
-  ).bind(expiresAt, c.req.param("pageId"), member.session.id, await sha256(text(body.leaseToken, "leaseToken", 200)), now()).run();
+  )
+    .bind(
+      expiresAt,
+      c.req.param("pageId"),
+      member.session.id,
+      await sha256(text(body.leaseToken, "leaseToken", 200)),
+      now(),
+    )
+    .run();
   if (!result.meta.changes) throw new HttpError(409, "lease_lost", "The table lease has expired or been replaced.");
   return c.json({ expiresAt });
 });
@@ -973,9 +1160,9 @@ app.patch("/api/tables/:pageId/lease", async (c) => {
 app.delete("/api/tables/:pageId/lease", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const body = await jsonBody(c.req.raw);
-  await c.env.DB.prepare(
-    `DELETE FROM table_leases WHERE page_id = ? AND holder_session_id = ? AND token_hash = ?`,
-  ).bind(c.req.param("pageId"), member.session.id, await sha256(text(body.leaseToken, "leaseToken", 200))).run();
+  await c.env.DB.prepare(`DELETE FROM table_leases WHERE page_id = ? AND holder_session_id = ? AND token_hash = ?`)
+    .bind(c.req.param("pageId"), member.session.id, await sha256(text(body.leaseToken, "leaseToken", 200)))
+    .run();
   return c.json({ ok: true });
 });
 
@@ -996,7 +1183,8 @@ app.post("/api/tables/:pageId/columns", async (c) => {
   const name = text(input.body.name, "name", 100);
   const type = columnType(input.body.type);
   const position = Number(input.body.position);
-  if (!Number.isInteger(position) || position < 0) throw new HttpError(422, "invalid_position", "position must be a non-negative integer.");
+  if (!Number.isInteger(position) || position < 0)
+    throw new HttpError(422, "invalid_position", "position must be a non-negative integer.");
   const result = await guardedBatch(c.env, page.id, input, [
     c.env.DB.prepare(
       `INSERT INTO table_columns (id, page_id, name, type, position)
@@ -1011,9 +1199,15 @@ app.delete("/api/tables/:pageId/columns/:columnId", async (c) => {
   requireEditor(member);
   const input = await leaseInputs(c.req.raw, member);
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
-    c.env.DB.prepare(
-      `DELETE FROM table_columns WHERE id = ? AND page_id = ? AND ${leaseGuards()}`,
-    ).bind(c.req.param("columnId"), c.req.param("pageId"), c.req.param("pageId"), input.expectedRevision, input.tokenHash, input.sessionId, now()),
+    c.env.DB.prepare(`DELETE FROM table_columns WHERE id = ? AND page_id = ? AND ${leaseGuards()}`).bind(
+      c.req.param("columnId"),
+      c.req.param("pageId"),
+      c.req.param("pageId"),
+      input.expectedRevision,
+      input.tokenHash,
+      input.sessionId,
+      now(),
+    ),
   ]);
   return c.json({ revision });
 });
@@ -1025,15 +1219,27 @@ app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
   const id = crypto.randomUUID();
   const label = text(input.body.label, "label", 100);
   const position = Number(input.body.position);
-  if (!Number.isInteger(position) || position < 0) throw new HttpError(422, "invalid_position", "position must be a non-negative integer.");
+  if (!Number.isInteger(position) || position < 0)
+    throw new HttpError(422, "invalid_position", "position must be a non-negative integer.");
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
     c.env.DB.prepare(
       `INSERT INTO table_select_options (id, column_id, label, position)
        SELECT ?, ?, ?, ? WHERE EXISTS (
          SELECT 1 FROM table_columns WHERE id = ? AND page_id = ? AND type = 'select'
        ) AND ${leaseGuards()}`,
-    ).bind(id, c.req.param("columnId"), label, position, c.req.param("columnId"), c.req.param("pageId"),
-      c.req.param("pageId"), input.expectedRevision, input.tokenHash, input.sessionId, now()),
+    ).bind(
+      id,
+      c.req.param("columnId"),
+      label,
+      position,
+      c.req.param("columnId"),
+      c.req.param("pageId"),
+      c.req.param("pageId"),
+      input.expectedRevision,
+      input.tokenHash,
+      input.sessionId,
+      now(),
+    ),
   ]);
   return c.json({ option: { id, label, position }, revision }, 201);
 });
@@ -1046,12 +1252,20 @@ app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) 
     `SELECT 1 FROM table_select_options option
       JOIN table_columns column ON column.id = option.column_id
      WHERE option.id = ? AND option.column_id = ? AND column.page_id = ?`,
-  ).bind(c.req.param("optionId"), c.req.param("columnId"), c.req.param("pageId")).first();
+  )
+    .bind(c.req.param("optionId"), c.req.param("columnId"), c.req.param("pageId"))
+    .first();
   if (!option) throw new HttpError(404, "option_not_found", "Option not found.");
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
-    c.env.DB.prepare(
-      `DELETE FROM table_select_options WHERE id = ? AND column_id = ? AND ${leaseGuards()}`,
-    ).bind(c.req.param("optionId"), c.req.param("columnId"), c.req.param("pageId"), input.expectedRevision, input.tokenHash, input.sessionId, now()),
+    c.env.DB.prepare(`DELETE FROM table_select_options WHERE id = ? AND column_id = ? AND ${leaseGuards()}`).bind(
+      c.req.param("optionId"),
+      c.req.param("columnId"),
+      c.req.param("pageId"),
+      input.expectedRevision,
+      input.tokenHash,
+      input.sessionId,
+      now(),
+    ),
   ]);
   return c.json({ revision });
 });
@@ -1060,16 +1274,31 @@ app.post("/api/tables/:pageId/rows", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const input = await leaseInputs(c.req.raw, member);
-  const count = await c.env.DB.prepare(`SELECT COUNT(*) count FROM table_rows WHERE page_id = ?`).bind(c.req.param("pageId")).first<{ count: number }>();
+  const count = await c.env.DB.prepare(`SELECT COUNT(*) count FROM table_rows WHERE page_id = ?`)
+    .bind(c.req.param("pageId"))
+    .first<{ count: number }>();
   if ((count?.count ?? 0) >= 500) throw new HttpError(422, "table_row_limit", "Tables are limited to 500 rows in v1.");
   const id = crypto.randomUUID();
   const position = Number(input.body.position);
-  if (!Number.isInteger(position) || position < 0) throw new HttpError(422, "invalid_position", "position must be a non-negative integer.");
+  if (!Number.isInteger(position) || position < 0)
+    throw new HttpError(422, "invalid_position", "position must be a non-negative integer.");
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
     c.env.DB.prepare(
       `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
        SELECT ?, ?, ?, ?, ?, ? WHERE ${leaseGuards()}`,
-    ).bind(id, c.req.param("pageId"), position, member.user.id, now(), now(), c.req.param("pageId"), input.expectedRevision, input.tokenHash, input.sessionId, now()),
+    ).bind(
+      id,
+      c.req.param("pageId"),
+      position,
+      member.user.id,
+      now(),
+      now(),
+      c.req.param("pageId"),
+      input.expectedRevision,
+      input.tokenHash,
+      input.sessionId,
+      now(),
+    ),
   ]);
   return c.json({ row: { id, position, cells: {} }, revision }, 201);
 });
@@ -1079,8 +1308,15 @@ app.delete("/api/tables/:pageId/rows/:rowId", async (c) => {
   requireEditor(member);
   const input = await leaseInputs(c.req.raw, member);
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
-    c.env.DB.prepare(`DELETE FROM table_rows WHERE id = ? AND page_id = ? AND ${leaseGuards()}`)
-      .bind(c.req.param("rowId"), c.req.param("pageId"), c.req.param("pageId"), input.expectedRevision, input.tokenHash, input.sessionId, now()),
+    c.env.DB.prepare(`DELETE FROM table_rows WHERE id = ? AND page_id = ? AND ${leaseGuards()}`).bind(
+      c.req.param("rowId"),
+      c.req.param("pageId"),
+      c.req.param("pageId"),
+      input.expectedRevision,
+      input.tokenHash,
+      input.sessionId,
+      now(),
+    ),
   ]);
   return c.json({ revision });
 });
@@ -1091,15 +1327,17 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
   const input = await leaseInputs(c.req.raw, member);
   const pageId = c.req.param("pageId");
   const column = await c.env.DB.prepare(`SELECT type FROM table_columns WHERE id = ? AND page_id = ?`)
-    .bind(c.req.param("columnId"), pageId).first<{ type: string }>();
+    .bind(c.req.param("columnId"), pageId)
+    .first<{ type: string }>();
   if (!column) throw new HttpError(404, "column_not_found", "Column not found.");
   const row = await c.env.DB.prepare(`SELECT 1 FROM table_rows WHERE id = ? AND page_id = ?`)
-    .bind(c.req.param("rowId"), pageId).first();
+    .bind(c.req.param("rowId"), pageId)
+    .first();
   if (!row) throw new HttpError(404, "row_not_found", "Row not found.");
   if (column.type === "select" && input.body.value !== null && input.body.value !== "") {
-    const option = await c.env.DB.prepare(
-      `SELECT 1 FROM table_select_options WHERE id = ? AND column_id = ?`,
-    ).bind(input.body.value, c.req.param("columnId")).first();
+    const option = await c.env.DB.prepare(`SELECT 1 FROM table_select_options WHERE id = ? AND column_id = ?`)
+      .bind(input.body.value, c.req.param("columnId"))
+      .first();
     if (!option) throw new HttpError(422, "invalid_cell", "The selected option does not belong to this column.");
   }
   const values = typedCell(column.type, input.body.value);
@@ -1112,7 +1350,17 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
          text_value = excluded.text_value, number_value = excluded.number_value,
          boolean_value = excluded.boolean_value, date_value = excluded.date_value,
          select_value = excluded.select_value, updated_at = excluded.updated_at`,
-    ).bind(c.req.param("rowId"), c.req.param("columnId"), ...values, now(), pageId, input.expectedRevision, input.tokenHash, input.sessionId, now()),
+    ).bind(
+      c.req.param("rowId"),
+      c.req.param("columnId"),
+      ...values,
+      now(),
+      pageId,
+      input.expectedRevision,
+      input.tokenHash,
+      input.sessionId,
+      now(),
+    ),
   ]);
   return c.json({ revision });
 });
@@ -1127,8 +1375,11 @@ app.notFound(async (c) => {
 async function assertAnotherOwner(env: Env, workspaceId: string, excludedId: string) {
   const other = await env.DB.prepare(
     `SELECT 1 FROM workspace_members WHERE workspace_id = ? AND role = 'owner' AND user_id <> ? LIMIT 1`,
-  ).bind(workspaceId, excludedId).first();
-  if (!other) throw new HttpError(409, "final_owner", "Promote another owner before removing or demoting the final owner.");
+  )
+    .bind(workspaceId, excludedId)
+    .first();
+  if (!other)
+    throw new HttpError(409, "final_owner", "Promote another owner before removing or demoting the final owner.");
 }
 
 function constantTimeEqual(left: string, right: string) {
@@ -1139,11 +1390,14 @@ function constantTimeEqual(left: string, right: string) {
 }
 
 async function currentPlainText(env: Env, pageId: string) {
-  return (await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`).bind(pageId).first<{ plain_text: string }>())?.plain_text ?? "";
+  return (
+    (await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`).bind(pageId).first<{ plain_text: string }>())
+      ?.plain_text ?? ""
+  );
 }
 
 function isUnsafeMime(mime: string, name: string) {
-  const normalizedMime = mime.toLowerCase().split(";", 1)[0].trim();
+  const normalizedMime = mime.toLowerCase().split(";", 1)[0]!.trim();
   const extension = name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
   return UNSAFE_MIME_TYPES.has(normalizedMime) || UNSAFE_FILE_EXTENSIONS.has(extension);
 }
@@ -1153,7 +1407,12 @@ function escapeLike(value: string) {
 }
 
 function isInlineMime(mime: string) {
-  return /^image\/(png|jpeg|gif|webp|avif)$/.test(mime) || mime === "application/pdf" || mime === "text/plain" || mime === "text/markdown";
+  return (
+    /^image\/(png|jpeg|gif|webp|avif)$/.test(mime) ||
+    mime === "application/pdf" ||
+    mime === "text/plain" ||
+    mime === "text/markdown"
+  );
 }
 
 function cellValue(cell: Record<string, unknown>) {
@@ -1165,7 +1424,10 @@ function cellValue(cell: Record<string, unknown>) {
   return null;
 }
 
-function typedCell(type: string, value: unknown): [string | null, number | null, number | null, string | null, string | null] {
+function typedCell(
+  type: string,
+  value: unknown,
+): [string | null, number | null, number | null, string | null, string | null] {
   if (value === null || value === "") return [null, null, null, null, null];
   if (type === "text") return [text(value, "value", 10_000), null, null, null, null];
   if (type === "number") {
@@ -1203,7 +1465,11 @@ async function guardedBatch(
     ).bind(pageId, input.expectedRevision, pageId, input.expectedRevision, input.tokenHash, input.sessionId, updatedAt),
   ]);
   if (!results.at(-1)?.meta.changes) {
-    throw new HttpError(409, "lease_or_revision_conflict", "The table lease or revision changed. Reload before editing.");
+    throw new HttpError(
+      409,
+      "lease_or_revision_conflict",
+      "The table lease or revision changed. Reload before editing.",
+    );
   }
   return input.expectedRevision + 1;
 }
@@ -1232,11 +1498,13 @@ async function handlePartyRequest(request: Request, env: Env) {
       throw new HttpError(404, "room_not_found", "Workspace event room not found.");
     }
     const expiresAt = Math.min(member.session.expiresAt.getTime(), now() + 5 * 60_000);
+    const placement = locationHint(member.workspace.locationHint ?? undefined);
     return routePartykitRequest(request, env, {
-      locationHint: locationHint(member.workspace.locationHint ?? undefined),
+      ...(placement ? { locationHint: placement } : {}),
       onBeforeConnect(incoming) {
         const headers = new Headers(incoming.headers);
-        for (const name of ["x-notes-user-id", "x-notes-role", "x-notes-expires-at", "x-notes-internal"]) headers.delete(name);
+        for (const name of ["x-notes-user-id", "x-notes-role", "x-notes-expires-at", "x-notes-internal"])
+          headers.delete(name);
         headers.set("x-notes-user-id", member.user.id);
         headers.set("x-notes-role", member.role);
         headers.set("x-notes-expires-at", String(expiresAt));
@@ -1258,12 +1526,16 @@ export default {
     return app.fetch(request, env, context);
   },
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext) {
-    context.waitUntil(processDueArchiveDisconnects(env).catch((error) => {
-      console.error("Scheduled archive disconnect failed", error);
-    }));
-    context.waitUntil(processDueDeletionJobs(env).catch((error) => {
-      console.error("Scheduled deletion cleanup failed", error);
-    }));
+    context.waitUntil(
+      processDueArchiveDisconnects(env).catch((error) => {
+        console.error("Scheduled archive disconnect failed", error);
+      }),
+    );
+    context.waitUntil(
+      processDueDeletionJobs(env).catch((error) => {
+        console.error("Scheduled deletion cleanup failed", error);
+      }),
+    );
   },
 };
 
