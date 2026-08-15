@@ -4,16 +4,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createCollaboration } from "./collaboration";
 
 const mocks = vi.hoisted(() => ({
+  whenSynced: new Promise<void>(() => undefined),
   providers: [] as Array<{
     synced: boolean;
     sendMessage: ReturnType<typeof vi.fn>;
+    connect: ReturnType<typeof vi.fn>;
   }>,
 }));
 
 vi.mock("y-indexeddb", () => ({
   IndexeddbPersistence: class {
-    whenSynced = new Promise<void>(() => undefined);
-    destroy = vi.fn();
+    whenSynced = mocks.whenSynced;
+    destroy = vi.fn(async () => undefined);
   },
 }));
 
@@ -21,7 +23,7 @@ vi.mock("y-partyserver/provider", () => ({
   default: class {
     synced = false;
     sendMessage = vi.fn();
-    connect = vi.fn();
+    connect = vi.fn(async () => undefined);
     disconnect = vi.fn();
     destroy = vi.fn();
     awareness = { setLocalState: vi.fn() };
@@ -66,12 +68,14 @@ describe("collaboration durability barriers", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
+    mocks.whenSynced = new Promise<void>(() => undefined);
     mocks.providers.length = 0;
   });
 
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it("preserves the original deadline when a barrier cannot yet be sent", async () => {
@@ -89,6 +93,24 @@ describe("collaboration durability barriers", () => {
     await vi.advanceTimersByTimeAsync(500);
 
     expect(provider.sendMessage).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
+  it("handles collaboration connection failures after IndexedDB sync", async () => {
+    mocks.whenSynced = Promise.resolve();
+    const onStatus = vi.fn();
+    const error = new Error("token refresh failed");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const bundle = createCollaboration("workspace", "page", 1, onStatus);
+    const provider = mocks.providers[0]!;
+    provider.connect.mockRejectedValueOnce(error);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onStatus).toHaveBeenCalledWith("offline");
+    expect(logged).toHaveBeenCalledWith("Failed to connect document collaboration", error);
     bundle.destroy();
   });
 });

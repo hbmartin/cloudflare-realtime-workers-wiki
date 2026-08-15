@@ -3,6 +3,7 @@
   "compilerOptions": {
     "lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
     "types": ["vite/client", "vitest/globals", "@cloudflare/workers-types", "@testing-library/jest-dom"],
+    // This project includes client code and inherits its BlockNote 0.52 limitation.
     "exactOptionalPropertyTypes": false
   },
   "include": [

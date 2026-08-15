@@ -57,6 +57,13 @@ export function createDocumentCloseReconciler({
       callback();
     }, delay);
   };
+  const connect = async () => {
+    try {
+      await provider.connect();
+    } catch (error) {
+      if (active) console.error("Failed to reconnect document collaboration", error);
+    }
+  };
 
   const reconcileClose = async (code: number, check: number, attempt = 0): Promise<void> => {
     try {
@@ -74,14 +81,17 @@ export function createDocumentCloseReconciler({
       } else if (TRANSITION_CLOSE_CODES.has(code)) {
         const delay = retryDelay(reconnectAttempt++);
         schedule(() => {
-          if (active && check === closeCheck) void provider.connect();
+          if (active && check === closeCheck) void connect();
         }, delay);
       }
     } catch (error) {
       if (!active || check !== closeCheck) return;
-      if (error instanceof ApiClientError && [401, 403, 404].includes(error.status)) {
-        unavailable();
-        return;
+      if (error instanceof ApiClientError) {
+        if (error.status === 404) {
+          unavailable();
+          return;
+        }
+        if (error.status === 401 || error.status === 403) return;
       }
       const retryable = !(error instanceof ApiClientError) || error.status === 429 || error.status >= 500;
       if (!TRANSITION_CLOSE_CODES.has(code)) return;

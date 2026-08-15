@@ -4,12 +4,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
 
 const localBaseURL = "http://127.0.0.1:4173";
-const baseURL = process.env.NOTES_LOAD_BASE_URL ?? localBaseURL;
-const connectionCount = Number.parseInt(process.env.NOTES_LOAD_CONNECTIONS ?? "30", 10);
-const holdMilliseconds = Number.parseInt(process.env.NOTES_LOAD_HOLD_MS ?? "5000", 10);
-const email = process.env.NOTES_LOAD_EMAIL ?? "owner@example.test";
-const password = process.env.NOTES_LOAD_PASSWORD ?? "password123";
-const token = process.env.NOTES_LOAD_BOOTSTRAP_TOKEN ?? "e2e-bootstrap-token";
+const baseURL = process.env.NOTES_LOAD_BASE_URL || localBaseURL;
+const connectionCount = Number.parseInt(process.env.NOTES_LOAD_CONNECTIONS || "30", 10);
+const holdMilliseconds = Number.parseInt(process.env.NOTES_LOAD_HOLD_MS || "5000", 10);
+const email = process.env.NOTES_LOAD_EMAIL || "owner@example.test";
+const password = process.env.NOTES_LOAD_PASSWORD || "password123";
+const token = process.env.NOTES_LOAD_BOOTSTRAP_TOKEN || "e2e-bootstrap-token";
 let server;
 
 if (!Number.isInteger(connectionCount) || connectionCount < 1 || connectionCount > 100) {

@@ -93,6 +93,7 @@ type TestDocument = {
   transition: "archive" | "restore" | null;
   getConnections(): Array<{ close(code: number, reason: string): void }>;
   bindings: Cloudflare.Env;
+  metadata: { retired: number; restore_pending: number };
 };
 
 beforeEach(async () => {
@@ -859,6 +860,118 @@ describe("Worker integration", () => {
     ).toBe(1);
     expect(await env.BUCKET.get(recovery.new_key)).toBeNull();
     expect(await env.BUCKET.get(recovery.pre_key!)).toBeNull();
+  });
+
+  it("clears restore recovery after best-effort R2 cleanup without clearing a retirement tombstone", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      state.storage.sql.exec(
+        `INSERT INTO restore_recovery (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, 1, 2, 'restore-new', 'restore-pre')`,
+      );
+      state.storage.sql.exec(`UPDATE document_meta SET retired = 1, restore_pending = 1 WHERE id = 1`);
+      document.metadata.retired = 1;
+      document.metadata.restore_pending = 1;
+
+      const originalBindings = document.bindings;
+      const deleteObject = vi.fn(async () => {
+        throw new Error("R2 delete unavailable");
+      });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property === "BUCKET")
+            return new Proxy(target.BUCKET, {
+              get: (bucket, key) => (key === "delete" ? deleteObject : Reflect.get(bucket, key, bucket)),
+            });
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      try {
+        await document.onAlarm();
+      } finally {
+        document.bindings = originalBindings;
+        error.mockRestore();
+      }
+
+      expect(deleteObject).toHaveBeenCalledTimes(2);
+      expect(
+        state.storage.sql
+          .exec<{ retired: number; restore_pending: number }>(
+            `SELECT retired, restore_pending FROM document_meta WHERE id = 1`,
+          )
+          .one(),
+      ).toEqual({ retired: 1, restore_pending: 0 });
+      expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count).toBe(
+        0,
+      );
+    });
+  });
+
+  it("does not query deleted Durable Object storage when an alarm follows a purge", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      state.storage.sql.exec(
+        `INSERT INTO restore_recovery (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, 1, 2, 'restore-new', NULL)`,
+      );
+      state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
+      document.metadata.restore_pending = 1;
+
+      const purged = await document.onRequest(
+        new Request("https://document.internal/purge", {
+          method: "POST",
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        }),
+      );
+
+      expect(purged.status).toBe(200);
+      await expect(document.onAlarm()).resolves.toBeUndefined();
+    });
+  });
+
+  it("deletes only the superseded epoch snapshot when restore recovery finds a later epoch", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    const newKey = `documents/${installed.pageId}/epochs/2/current.bin`;
+    const preKey = `documents/${installed.pageId}/versions/pre-restore.bin`;
+    await env.BUCKET.put(newKey, "new epoch");
+    await env.BUCKET.put(preKey, "pre restore");
+    await env.DB.prepare(`UPDATE pages SET content_epoch = 3 WHERE id = ?`).bind(installed.pageId).run();
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      state.storage.sql.exec(
+        `INSERT INTO restore_recovery (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, 1, 2, ?, ?)`,
+        newKey,
+        preKey,
+      );
+      state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
+      document.metadata.restore_pending = 1;
+
+      await document.onAlarm();
+
+      expect(
+        state.storage.sql
+          .exec<{ retired: number; restore_pending: number }>(
+            `SELECT retired, restore_pending FROM document_meta WHERE id = 1`,
+          )
+          .one(),
+      ).toEqual({ retired: 1, restore_pending: 0 });
+    });
+
+    expect(await env.BUCKET.get(newKey)).toBeNull();
+    expect(await env.BUCKET.get(preKey)).toBeTruthy();
   });
 
   it("rejects a concurrent restore before it can share the next epoch snapshot key", async () => {

@@ -72,16 +72,3 @@ export function authoritativePageSnapshot(
     ids: new Set(pages.map((page) => page.id)),
   };
 }
-
-export function reconcilePageSnapshot(
-  current: Page[],
-  snapshot: Page[],
-  pendingUpserts: Page[],
-  pendingRemovals: ReadonlySet<string>,
-) {
-  const authoritative = authoritativePageSnapshot(snapshot, pendingUpserts, pendingRemovals);
-  return {
-    pages: mergePageSnapshot(current, authoritative.pages),
-    authoritativeIds: authoritative.ids,
-  };
-}

@@ -36,6 +36,13 @@ export function createCollaboration(
   let destroyed = false;
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
+  const connect = () => {
+    void provider.connect().catch((error) => {
+      if (destroyed) return;
+      onStatus("offline");
+      console.error("Failed to connect document collaboration", error);
+    });
+  };
 
   const sendDurabilityBarrier = () => {
     if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
@@ -79,15 +86,19 @@ export function createCollaboration(
     durability.markChanged();
     scheduleDurabilityBarrier();
   });
-  void indexeddb.whenSynced.then(() => {
-    if (!destroyed) {
-      // Until the server sync completes, conservatively treat a persisted copy
-      // as recoverable offline work. An epoch rejection happens before sync.
-      if (Y.encodeStateVector(doc).byteLength > 1) durability.markChanged();
-      indexeddbSynced = true;
-      void provider.connect();
-    }
-  });
+  void indexeddb.whenSynced
+    .then(() => {
+      if (!destroyed) {
+        // Until the server sync completes, conservatively treat a persisted copy
+        // as recoverable offline work. An epoch rejection happens before sync.
+        if (Y.encodeStateVector(doc).byteLength > 1) durability.markChanged();
+        indexeddbSynced = true;
+        connect();
+      }
+    })
+    .catch((error) => {
+      if (!destroyed) console.error("Failed to load offline document state", error);
+    });
 
   const visibility = () => {
     if (document.visibilityState === "hidden") {
@@ -99,7 +110,7 @@ export function createCollaboration(
     } else {
       if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
       hiddenTimer = undefined;
-      if (indexeddbSynced) void provider.connect();
+      if (indexeddbSynced) connect();
     }
   };
   document.addEventListener("visibilitychange", visibility);
@@ -121,7 +132,7 @@ export function createCollaboration(
       provider.off("custom-message", handleCustomMessage);
       provider.awareness.setLocalState(null);
       provider.destroy();
-      void indexeddb.destroy();
+      void indexeddb.destroy().catch((error) => console.error("Failed to close offline document storage", error));
       doc.destroy();
     },
   };

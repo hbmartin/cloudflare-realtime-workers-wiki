@@ -267,6 +267,7 @@ export class Document extends YServer {
   }
 
   async onAlarm() {
+    if (this.purged) return;
     if (this.metadata.restore_pending) await this.reconcilePendingRestore();
     if (this.purged || this.metadata.retired || this.metadata.restore_pending) return;
     this.flushPendingUpdates();
@@ -677,7 +678,8 @@ export class Document extends YServer {
   }
 
   private clearRestoreRecovery(retired: boolean) {
-    const retiredFlag = retired ? 1 : 0;
+    if (this.purged) return;
+    const retiredFlag = retired || this.metadata.retired ? 1 : 0;
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(
         `UPDATE document_meta SET retired = ?, restore_pending = 0 WHERE id = 1`,
@@ -690,10 +692,13 @@ export class Document extends YServer {
   }
 
   private async deleteRestoreObjects(recovery: Pick<RestoreRecoveryRow, "new_key" | "pre_key">) {
-    await Promise.all([
+    const results = await Promise.allSettled([
       this.bindings.BUCKET.delete(recovery.new_key),
       ...(recovery.pre_key ? [this.bindings.BUCKET.delete(recovery.pre_key)] : []),
     ]);
+    for (const result of results) {
+      if (result.status === "rejected") console.error("Failed to delete a restore recovery object", result.reason);
+    }
   }
 
   private async deferRestoreReconciliation(error: unknown) {
@@ -717,6 +722,7 @@ export class Document extends YServer {
       await this.deferRestoreReconciliation(error);
       return false;
     }
+    if (this.purged) return false;
 
     if (!recovery) {
       this.clearRestoreRecovery(!current || current.content_epoch !== epoch);
@@ -724,18 +730,23 @@ export class Document extends YServer {
     }
 
     if (current?.content_epoch === recovery.old_epoch) {
-      try {
-        await this.deleteRestoreObjects(recovery);
-      } catch (error) {
-        await this.deferRestoreReconciliation(error);
-        return false;
-      }
+      await this.deleteRestoreObjects(recovery);
+      if (this.purged) return false;
       this.clearRestoreRecovery(false);
       return true;
     }
 
-    // The new epoch, a later epoch, or a deleted page all retire this room.
-    // The restore objects must be retained because the D1 batch may reference them.
+    if (!current) {
+      await this.deleteRestoreObjects(recovery);
+    } else if (current.content_epoch > recovery.new_epoch) {
+      // The pre-restore version may still be referenced by page_versions, but
+      // a superseded epoch snapshot is no longer reachable from D1.
+      await this.deleteRestoreObjects({ new_key: recovery.new_key, pre_key: null });
+    }
+    if (this.purged) return false;
+
+    // At the committed new epoch, the epoch snapshot is current and the
+    // pre-restore version may be referenced by page_versions.
     this.clearRestoreRecovery(true);
     return true;
   }

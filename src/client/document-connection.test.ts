@@ -28,7 +28,7 @@ const page: Page = {
 };
 
 function setup(hasUnsyncedChanges = false) {
-  const provider = { connect: vi.fn(), disconnect: vi.fn() };
+  const provider = { connect: vi.fn(async () => undefined), disconnect: vi.fn() };
   const quarantine = vi.fn();
   const onPageChanged = vi.fn();
   const onPageUnavailable = vi.fn();
@@ -58,6 +58,7 @@ describe("document close reconciliation", () => {
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it("backs off before reconnecting a transition room whose epoch has not changed", async () => {
@@ -78,6 +79,20 @@ describe("document close reconciliation", () => {
     expect(provider.connect).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1);
     expect(provider.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("handles a rejected transition reconnect", async () => {
+    mocks.api.mockResolvedValue({ page });
+    const { provider, reconciler } = setup();
+    const error = new Error("connection parameters unavailable");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    provider.connect.mockRejectedValueOnce(error);
+
+    reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(logged).toHaveBeenCalledWith("Failed to reconnect document collaboration", error);
   });
 
   it("quarantines unsynced changes when a restore transition closes the room", async () => {
@@ -124,5 +139,16 @@ describe("document close reconciliation", () => {
 
     expect(provider.disconnect).toHaveBeenCalledOnce();
     expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
+  });
+
+  it.each([401, 403])("does not remove the page when reconciliation returns %i", async (status) => {
+    mocks.api.mockRejectedValue(new ApiClientError(status, "access_error", "Access failed"));
+    const { provider, onPageUnavailable, reconciler } = setup();
+
+    reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
+    await flushPromises();
+
+    expect(provider.disconnect).toHaveBeenCalledOnce();
+    expect(onPageUnavailable).not.toHaveBeenCalled();
   });
 });
