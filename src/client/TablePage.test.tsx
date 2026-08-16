@@ -2,7 +2,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { Page, TableData } from "../shared/types";
 import { ApiClientError, api } from "./api";
@@ -36,6 +36,8 @@ const table: TableData = {
   lease: { heldByMe: false, holderName: null, expiresAt: null },
 };
 
+const LEASE_DURATION_MS = 60_000;
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -62,7 +64,7 @@ function tableWithLease(): TableData {
 }
 
 function leaseResult(leaseToken = "lease-token") {
-  return { leaseToken, expiresAt: Date.now() + 60_000 };
+  return { leaseToken, expiresAt: Date.now() + LEASE_DURATION_MS, leaseDurationMs: LEASE_DURATION_MS };
 }
 
 function member(role: ClientMemberContext["role"]): ClientMemberContext {
@@ -100,6 +102,23 @@ describe("TablePage", () => {
     expect(screen.queryByRole("button", { name: "+ Property" })).not.toBeInTheDocument();
     expect(api).toHaveBeenCalledTimes(1);
     expect(api).toHaveBeenCalledWith("/api/tables/table-page", { signal: expect.any(AbortSignal) });
+  });
+
+  it("uses the table-load fallback when a request times out", async () => {
+    vi.mocked(api).mockRejectedValue(new DOMException("The operation timed out.", "TimeoutError"));
+
+    render(
+      <TablePage
+        page={page}
+        member={member("viewer")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    expect(await screen.findByText("Table could not be loaded.")).toBeInTheDocument();
+    expect(screen.queryByText("The operation timed out.")).not.toBeInTheDocument();
   });
 
   it("acquires an editor lease and exposes table mutations", async () => {
@@ -184,6 +203,38 @@ describe("TablePage", () => {
     await waitFor(() => expect(api).toHaveBeenCalledTimes(3));
     fireEvent.click(screen.getByRole("button", { name: "Try edit lock" }));
     await waitFor(() => expect(api).toHaveBeenCalledTimes(5));
+  });
+
+  it("does not let an older load clear a newer lease conflict", async () => {
+    const initialLoad = deferred<{ table: TableData }>();
+    let loads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") {
+        return Promise.reject(new ApiClientError(409, "lease_conflict", "held"));
+      }
+      loads += 1;
+      return loads === 1 ? initialLoad.promise : Promise.resolve({ table: tableWithLease() });
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    expect(await screen.findByText("Another editor has this table open for editing.")).toBeInTheDocument();
+
+    await act(async () => {
+      initialLoad.resolve({ table });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(loads).toBe(2));
+    expect(screen.getByText("Another editor has this table open for editing.")).toBeInTheDocument();
   });
 
   it("keeps the successful initial load when the post-acquisition load fails", async () => {
@@ -458,15 +509,15 @@ describe("TablePage", () => {
     });
   });
 
-  it("keeps a lease through a transient renewal failure and clears the notice after retry", async () => {
+  it("keeps a lease through a renewal timeout and clears the contextual notice after retry", async () => {
     vi.useFakeTimers();
     let renewals = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.endsWith("/lease") && init?.method === "PATCH") {
         renewals += 1;
-        if (renewals === 1) throw new ApiClientError(503, "lease_unavailable", "Lease service unavailable.");
-        return { expiresAt: Date.now() + 60_000 };
+        if (renewals === 1) throw new DOMException("The operation timed out.", "TimeoutError");
+        return { expiresAt: Date.now() + LEASE_DURATION_MS, leaseDurationMs: LEASE_DURATION_MS };
       }
       return { table };
     });
@@ -487,18 +538,63 @@ describe("TablePage", () => {
 
     await act(() => vi.advanceTimersByTimeAsync(20_000));
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
-    expect(screen.getByText("Lease service unavailable. Retrying.")).toBeInTheDocument();
+    expect(screen.getByText("The editing lease could not be renewed. Retrying.")).toBeInTheDocument();
+    expect(screen.queryByText("The operation timed out. Retrying.")).not.toBeInTheDocument();
+    expect(api).toHaveBeenCalledWith(
+      "/api/tables/table-page/lease",
+      expect.objectContaining({ method: "PATCH", signal: expect.any(AbortSignal) }),
+    );
     expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "DELETE" }));
 
     await act(() => vi.advanceTimersByTimeAsync(20_000));
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
-    expect(screen.queryByText("Lease service unavailable. Retrying.")).not.toBeInTheDocument();
+    expect(screen.queryByText("The editing lease could not be renewed. Retrying.")).not.toBeInTheDocument();
   });
 
-  it("drops the local lease when renewal failures outlive the server deadline", async () => {
+  it("does not overlap lease renewals when a request stalls", async () => {
+    vi.useFakeTimers();
+    const renewal = deferred<{ leaseDurationMs: number }>();
+    let renewals = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/lease") && init?.method === "PATCH") {
+        renewals += 1;
+        return renewal.promise;
+      }
+      return Promise.resolve({ table });
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(() => vi.advanceTimersByTimeAsync(40_000));
+    expect(renewals).toBe(1);
+
+    await act(async () => {
+      renewal.resolve({ leaseDurationMs: LEASE_DURATION_MS });
+      await Promise.resolve();
+    });
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+    expect(renewals).toBe(2);
+  });
+
+  it("uses the relative lease duration when the server and client clocks disagree", async () => {
     vi.useFakeTimers();
     vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "POST") {
+        return { ...leaseResult(), expiresAt: 1 };
+      }
       if (path.endsWith("/lease") && init?.method === "PATCH") {
         throw new ApiClientError(503, "lease_unavailable", "Lease service unavailable.");
       }
@@ -519,6 +615,9 @@ describe("TablePage", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(60_000));
 
@@ -597,7 +696,7 @@ describe("TablePage", () => {
       if (path.endsWith("/lease") && init?.method === "POST") {
         throw new ApiClientError(409, "lease_conflict", "held");
       }
-      if (path.endsWith("/force-unlock")) throw "offline";
+      if (path.endsWith("/force-unlock")) throw new DOMException("The operation timed out.", "TimeoutError");
       return { table };
     });
     render(
@@ -653,6 +752,7 @@ describe("TablePage", () => {
       window.setTimeout(() => controller.abort(), milliseconds);
       return controller.signal;
     });
+    onTestFinished(() => timeout.mockRestore());
     let loads = 0;
     vi.mocked(api).mockImplementation((_path, init) => {
       loads += 1;
@@ -675,6 +775,5 @@ describe("TablePage", () => {
 
     expect(loads).toBeGreaterThan(1);
     expect(screen.getByDisplayValue("Ready")).toBeInTheDocument();
-    timeout.mockRestore();
   });
 });

@@ -25,6 +25,7 @@ import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 const app = new Hono<{ Bindings: Env }>();
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const DELETION_TARGET_BATCH_SIZE = 50;
+const TABLE_LEASE_DURATION_MS = 60_000;
 const UNSAFE_MIME_TYPES = new Set([
   "text/html",
   "image/svg+xml",
@@ -1125,7 +1126,7 @@ app.post("/api/tables/:pageId/lease", async (c) => {
   const page = await pageForMember(c.env, member, c.req.param("pageId"));
   if (page.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
   const token = `${crypto.randomUUID()}${crypto.randomUUID()}`;
-  const expiresAt = now() + 60_000;
+  const expiresAt = now() + TABLE_LEASE_DURATION_MS;
   const result = await c.env.DB.prepare(
     `INSERT INTO table_leases (page_id, token_hash, holder_user_id, holder_session_id, expires_at)
      VALUES (?, ?, ?, ?, ?)
@@ -1138,14 +1139,14 @@ app.post("/api/tables/:pageId/lease", async (c) => {
     .run();
   if (!result.meta.changes)
     throw new HttpError(409, "lease_conflict", "Another editor currently holds this table lease.");
-  return c.json({ leaseToken: token, expiresAt });
+  return c.json({ leaseToken: token, expiresAt, leaseDurationMs: TABLE_LEASE_DURATION_MS });
 });
 
 app.patch("/api/tables/:pageId/lease", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const body = await jsonBody(c.req.raw);
-  const expiresAt = now() + 60_000;
+  const expiresAt = now() + TABLE_LEASE_DURATION_MS;
   const result = await c.env.DB.prepare(
     `UPDATE table_leases SET expires_at = ?
       WHERE page_id = ? AND holder_session_id = ? AND token_hash = ? AND expires_at > ?`,
@@ -1159,7 +1160,7 @@ app.patch("/api/tables/:pageId/lease", async (c) => {
     )
     .run();
   if (!result.meta.changes) throw new HttpError(409, "lease_lost", "The table lease has expired or been replaced.");
-  return c.json({ expiresAt });
+  return c.json({ expiresAt, leaseDurationMs: TABLE_LEASE_DURATION_MS });
 });
 
 app.delete("/api/tables/:pageId/lease", async (c) => {

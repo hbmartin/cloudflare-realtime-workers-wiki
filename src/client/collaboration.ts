@@ -9,6 +9,11 @@ export type CollaborationBundle = {
   doc: Y.Doc;
   indexeddb: IndexeddbPersistence;
   provider: YProvider;
+  /**
+   * Resolves after offline state loads and, unless destroyed, connection
+   * startup begins. Rejects if offline storage fails while the bundle is
+   * active; failures after destroy are suppressed.
+   */
   ready: Promise<void>;
   readonly hasUnsyncedChanges: boolean;
   destroy: () => void;

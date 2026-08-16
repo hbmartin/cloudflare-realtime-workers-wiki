@@ -56,8 +56,6 @@ export class Document extends YServer {
   private pendingAuthorId: string | null = null;
   private purged = false;
   private transition: "archive" | "restore" | null = null;
-  private transitionAlarmDeferred = false;
-  private transitionAlarmRearm: Promise<void> | null = null;
   private validatingTransition = false;
   private compaction: Promise<void> | null = null;
 
@@ -271,14 +269,7 @@ export class Document extends YServer {
   async onAlarm() {
     if (this.purged) return;
     if (this.transition) {
-      this.transitionAlarmDeferred = true;
-      const rearm = this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
-      this.transitionAlarmRearm = rearm;
-      try {
-        await rearm;
-      } finally {
-        if (this.transitionAlarmRearm === rearm) this.transitionAlarmRearm = null;
-      }
+      await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
       return;
     }
     if (this.metadata.restore_pending) await this.reconcilePendingRestore();
@@ -333,7 +324,7 @@ export class Document extends YServer {
           if (this.metadata.dirty) await this.compact(true);
           return Response.json({ archived: true });
         } finally {
-          await this.finishTransition();
+          this.transition = null;
         }
       } finally {
         this.validatingTransition = false;
@@ -917,7 +908,7 @@ export class Document extends YServer {
         console.error("Document restore failed", error);
         return Response.json({ error: "The version could not be restored." }, { status: 503 });
       } finally {
-        await this.finishTransition();
+        this.transition = null;
       }
     } finally {
       this.validatingTransition = false;
@@ -926,18 +917,6 @@ export class Document extends YServer {
 
   private snapshotKey(pageId: string, epoch: number) {
     return `documents/${pageId}/epochs/${epoch}/current.bin`;
-  }
-
-  private async finishTransition() {
-    this.transition = null;
-    if (!this.transitionAlarmDeferred || this.purged) return;
-    this.transitionAlarmDeferred = false;
-    await this.transitionAlarmRearm?.catch(() => undefined);
-    try {
-      await this.scheduleAlarm(Date.now());
-    } catch (error) {
-      console.error("Failed to resume document alarm after transition", error);
-    }
   }
 
   private async scheduleAlarm(when: number) {

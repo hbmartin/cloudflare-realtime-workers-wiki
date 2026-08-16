@@ -1050,12 +1050,10 @@ describe("Worker integration", () => {
         await state.storage.deleteAlarm();
         await document.onAlarm();
         expect(await env.BUCKET.get(newKey)).toBeTruthy();
-        const deferredAlarm = await state.storage.getAlarm();
-        expect(deferredAlarm).not.toBeNull();
+        expect(await state.storage.getAlarm()).not.toBeNull();
 
         releaseNewSnapshot();
         expect((await restoring).status).toBe(200);
-        expect(await state.storage.getAlarm()).toBeLessThan(deferredAlarm!);
       } finally {
         document.bindings = originalBindings;
         releaseNewSnapshot();
@@ -1280,7 +1278,8 @@ describe("Worker integration", () => {
           method: "POST",
         }),
       )
-    ).json<{ leaseToken: string }>();
+    ).json<{ leaseToken: string; leaseDurationMs: number }>();
+    expect(lease.leaseDurationMs).toBe(60_000);
     const mutationBody = JSON.stringify({ leaseToken: lease.leaseToken, expectedRevision: 1 });
 
     const deleteOption = await SELF.fetch(
