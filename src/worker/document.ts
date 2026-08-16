@@ -58,6 +58,7 @@ export class Document extends YServer {
   private transition: "archive" | "restore" | null = null;
   private transitionAlarmDeferred = false;
   private transitionAlarmRearm: Promise<void> | null = null;
+  private transitionRetryAt: number | null = null;
   private validatingTransition = false;
   private compaction: Promise<void> | null = null;
 
@@ -715,8 +716,12 @@ export class Document extends YServer {
 
   private async deferRestoreReconciliation(error: unknown) {
     console.error("Failed to reconcile pending document restore", error);
+    const retryAt = Date.now() + ALARM_RETRY_DELAY_MS;
+    // Remember the backoff so finishTransition does not pull the alarm forward
+    // and retry immediately against the dependency that just failed.
+    if (this.transition) this.transitionRetryAt = Math.max(this.transitionRetryAt ?? 0, retryAt);
     try {
-      await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
+      await this.scheduleAlarm(retryAt);
     } catch (alarmError) {
       console.error("Failed to schedule restore reconciliation", alarmError);
     }
@@ -930,12 +935,17 @@ export class Document extends YServer {
 
   private async finishTransition() {
     this.transition = null;
+    const retryAt = this.transitionRetryAt;
+    this.transitionRetryAt = null;
     if (!this.transitionAlarmDeferred) return;
     this.transitionAlarmDeferred = false;
     if (this.purged) return;
     await this.transitionAlarmRearm?.catch(() => undefined);
     try {
-      await this.scheduleAlarm(Date.now());
+      // The alarm deferred during the transition runs now, unless the
+      // transition itself scheduled a retry — that backoff exists because the
+      // work the alarm would do is the work that just failed.
+      await this.scheduleAlarm(retryAt ?? Date.now());
     } catch (error) {
       console.error("Failed to resume document alarm after transition", error);
     }
