@@ -128,19 +128,19 @@ describe("collaboration durability barriers", () => {
     bundle.destroy();
   });
 
-  it("connects to the server when offline storage fails to open", async () => {
+  it("fails closed when offline storage fails to open", async () => {
     const error = new Error("IndexedDB unavailable");
     mocks.whenSynced = Promise.reject(error);
+    const onStatus = vi.fn();
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const bundle = createCollaboration("workspace", "page", 1, vi.fn());
+    const bundle = createCollaboration("workspace", "page", 1, onStatus);
     const provider = mocks.providers[0]!;
 
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await expect(bundle.ready).rejects.toBe(error);
 
     expect(logged).toHaveBeenCalledWith("Failed to load offline document state", error);
-    expect(provider.connect).toHaveBeenCalledOnce();
+    expect(onStatus).toHaveBeenCalledWith("offline");
+    expect(provider.connect).not.toHaveBeenCalled();
     bundle.destroy();
   });
 

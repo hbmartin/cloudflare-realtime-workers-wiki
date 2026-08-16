@@ -16,6 +16,7 @@ export type DocumentCloseReconcilerOptions = {
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
   onAccessDenied: (pageId: string, error: ApiClientError) => void;
+  onSessionExpired: (error: ApiClientError) => void;
 };
 
 const TRANSITION_CLOSE_CODES = new Set([4410, 4412]);
@@ -30,6 +31,7 @@ export function createDocumentCloseReconciler({
   onPageChanged,
   onPageUnavailable,
   onAccessDenied,
+  onSessionExpired,
 }: DocumentCloseReconcilerOptions) {
   let active = true;
   let closeCheck = 0;
@@ -93,8 +95,10 @@ export function createDocumentCloseReconciler({
           return;
         }
         if (error.status === 401) {
+          active = false;
           invalidate();
           provider.disconnect();
+          onSessionExpired(error);
           return;
         }
         if (error.status === 403) {

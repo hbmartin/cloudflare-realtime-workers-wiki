@@ -267,7 +267,11 @@ export class Document extends YServer {
   }
 
   async onAlarm() {
-    if (this.purged || this.transition) return;
+    if (this.purged) return;
+    if (this.transition) {
+      await this.scheduleAlarm(Date.now() + RESTORE_RECONCILE_DELAY_MS);
+      return;
+    }
     if (this.metadata.restore_pending) await this.reconcilePendingRestore();
     if (this.purged || this.metadata.retired || this.metadata.restore_pending) return;
     this.flushPendingUpdates();

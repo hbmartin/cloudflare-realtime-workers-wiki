@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, render } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
 import type { ClientMemberContext } from "../shared/types";
@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => {
     destroy: vi.fn(),
     handlers,
     provider,
+    ready: Promise.resolve() as Promise<void>,
     unsynced: false,
   };
 });
@@ -42,6 +43,7 @@ vi.mock("./collaboration", () => ({
       getXmlFragment: vi.fn(() => ({})),
     },
     provider: mocks.provider,
+    ready: mocks.ready,
     get hasUnsyncedChanges() {
       return mocks.unsynced;
     },
@@ -121,6 +123,7 @@ describe("EditorPage close reconciliation", () => {
     mocks.provider.connect.mockReset();
     mocks.provider.disconnect.mockReset();
     mocks.provider.on.mockClear();
+    mocks.ready = Promise.resolve();
     mocks.unsynced = false;
     Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
     localStorage.clear();
@@ -141,6 +144,7 @@ describe("EditorPage close reconciliation", () => {
         onPageChanged={vi.fn()}
         onPageUnavailable={unavailable}
         onAccessDenied={vi.fn()}
+        onSessionExpired={vi.fn()}
         onSelectPage={vi.fn()}
         backlinksRevision={0}
       />,
@@ -176,6 +180,7 @@ describe("EditorPage close reconciliation", () => {
         onPageChanged={vi.fn()}
         onPageUnavailable={vi.fn()}
         onAccessDenied={vi.fn()}
+        onSessionExpired={vi.fn()}
         onSelectPage={vi.fn()}
         backlinksRevision={0}
       />,
@@ -194,5 +199,31 @@ describe("EditorPage close reconciliation", () => {
     expect(localStorage.getItem("notes:recovery:workspace-1:page-1")).toBe(
       JSON.stringify({ key: "workspace-1:page-1:1:1", epoch: 1 }),
     );
+  });
+
+  it("keeps the editor closed when offline storage is unavailable", async () => {
+    mocks.ready = Promise.reject(new Error("IndexedDB unavailable"));
+
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSessionExpired={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByText("Offline storage is unavailable, so editing and collaboration are disabled for this page."),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Page title")).toHaveAttribute("readonly");
+    expect(screen.queryByText("Opening your offline copy…")).not.toBeInTheDocument();
   });
 });

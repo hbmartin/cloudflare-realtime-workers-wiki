@@ -84,4 +84,29 @@ describe("api", () => {
 
     unsubscribe();
   });
+
+  it("isolates unauthorized subscribers and preserves the API error", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: { code: "session_expired", message: "Sign in again." } }), {
+          status: 401,
+        }),
+      ),
+    );
+    const subscriberError = new Error("subscriber failed");
+    const laterSubscriber = vi.fn();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const unsubscribeThrowing = onApiUnauthorized(() => {
+      throw subscriberError;
+    });
+    const unsubscribeLater = onApiUnauthorized(laterSubscriber);
+
+    await expect(api("/api/private")).rejects.toMatchObject({ status: 401, code: "session_expired" });
+    expect(laterSubscriber).toHaveBeenCalledWith(expect.objectContaining({ status: 401 }));
+    expect(logged).toHaveBeenCalledWith("API unauthorized handler failed", subscriberError);
+
+    unsubscribeThrowing();
+    unsubscribeLater();
+  });
 });
