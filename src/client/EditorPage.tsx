@@ -21,7 +21,6 @@ export type EditorPageProps = {
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
   onAccessDenied: (pageId: string, error: ApiClientError) => void;
-  onSessionExpired: (error: ApiClientError) => void;
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
 };
@@ -32,7 +31,6 @@ export function EditorPage({
   onPageChanged,
   onPageUnavailable,
   onAccessDenied,
-  onSessionExpired,
   onSelectPage,
   backlinksRevision,
 }: EditorPageProps) {
@@ -106,7 +104,6 @@ export function EditorPage({
       onPageChanged,
       onPageUnavailable,
       onAccessDenied,
-      onSessionExpired,
     });
     const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
     const connectionSync = (synced: boolean) => closeReconciler.handleSync(synced);
@@ -118,7 +115,6 @@ export function EditorPage({
         if (active) setBundle(next);
       } catch {
         if (!active) return;
-        setBundle(null);
         setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
       }
     })();
@@ -135,7 +131,6 @@ export function EditorPage({
     member.role,
     member.workspace.id,
     onAccessDenied,
-    onSessionExpired,
     onPageChanged,
     onPageUnavailable,
     page.id,
