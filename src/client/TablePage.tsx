@@ -6,15 +6,16 @@ import { BacklinksPanel } from "./BacklinksPanel";
 
 type IsCurrent = () => boolean;
 
-const alwaysCurrent = () => true;
-
 function releaseTableLease(pageId: string, leaseToken: string) {
-  void fetch(`/api/tables/${pageId}/lease`, {
+  void api(`/api/tables/${pageId}/lease`, {
     method: "DELETE",
-    headers: { "content-type": "application/json" },
     body: json({ leaseToken }),
     keepalive: true,
   }).catch((cause) => console.error("Failed to release table lease", cause));
+}
+
+function errorMessage(cause: unknown, fallback: string) {
+  return cause instanceof Error ? cause.message : fallback;
 }
 
 export type TablePageProps = {
@@ -28,7 +29,8 @@ export type TablePageProps = {
 export function TablePage({ page, member, onPageChanged, onSelectPage, backlinksRevision }: TablePageProps) {
   const [table, setTable] = useState<TableData | null>(null);
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [leaseError, setLeaseError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [sortColumn, setSortColumn] = useState<string | null>(null);
   const [title, setTitle] = useState(page.title);
@@ -38,77 +40,97 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   const columnCountRef = useRef(0);
   const rowCountRef = useRef(0);
   const mutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const mountedRef = useRef(true);
+  const loadGenerationRef = useRef(0);
   const canEdit = member.role !== "viewer";
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      const currentLease = leaseTokenRef.current;
+      leaseTokenRef.current = null;
+      if (currentLease) releaseTableLease(page.id, currentLease);
+    };
+  }, [page.id]);
+
+  const isMounted = useCallback(() => mountedRef.current, []);
+
   const load = useCallback(
-    async (isCurrent: IsCurrent = alwaysCurrent) => {
-      const result = await api<{ table: TableData }>(`/api/tables/${page.id}`);
-      if (!isCurrent()) return;
-      revisionRef.current = result.table.revision;
-      columnCountRef.current = result.table.columns.length;
-      rowCountRef.current = result.table.rows.length;
-      setTable(result.table);
+    async (isCurrent: IsCurrent) => {
+      const generation = ++loadGenerationRef.current;
+      try {
+        const result = await api<{ table: TableData }>(`/api/tables/${page.id}`);
+        if (!isCurrent() || generation !== loadGenerationRef.current) return;
+        revisionRef.current = result.table.revision;
+        columnCountRef.current = result.table.columns.length;
+        rowCountRef.current = result.table.rows.length;
+        setTable(result.table);
+        setLoadError(null);
+      } catch (cause) {
+        if (isCurrent() && generation === loadGenerationRef.current) {
+          setLoadError(errorMessage(cause, "Table could not be loaded."));
+        }
+        throw cause;
+      }
     },
     [page.id],
   );
 
   const acquire = useCallback(
-    async (isCurrent: IsCurrent = alwaysCurrent) => {
+    async (isCurrent: IsCurrent) => {
       if (!canEdit) return;
+      let result: { leaseToken: string };
       try {
-        const result = await api<{ leaseToken: string }>(`/api/tables/${page.id}/lease`, { method: "POST" });
-        if (!isCurrent()) {
-          releaseTableLease(page.id, result.leaseToken);
-          return;
-        }
-        leaseTokenRef.current = result.leaseToken;
-        setLeaseToken(result.leaseToken);
-        setError(null);
-        await load(isCurrent);
+        result = await api<{ leaseToken: string }>(`/api/tables/${page.id}/lease`, { method: "POST" });
       } catch (cause) {
         if (!isCurrent()) return;
         if (cause instanceof ApiClientError && cause.code === "lease_conflict") {
           leaseTokenRef.current = null;
           setLeaseToken(null);
-          setError("Another editor has this table open for editing.");
-          await load(isCurrent);
+          setLeaseError("Another editor has this table open for editing.");
+          await load(isCurrent).catch(() => undefined);
           return;
         }
         throw cause;
       }
+      if (!isCurrent()) {
+        releaseTableLease(page.id, result.leaseToken);
+        return;
+      }
+      leaseTokenRef.current = result.leaseToken;
+      setLeaseToken(result.leaseToken);
+      setLeaseError(null);
+      await load(isCurrent).catch(() => undefined);
     },
     [canEdit, load, page.id],
   );
 
+  const reportLeaseError = useCallback((cause: unknown) => {
+    if (mountedRef.current) setLeaseError(errorMessage(cause, "The editing lease could not be acquired."));
+  }, []);
+
   useEffect(() => {
     let active = true;
-    const isCurrent = () => active;
-    void (canEdit ? acquire(isCurrent) : load(isCurrent)).catch((cause) => {
-      if (active) setError(cause instanceof Error ? cause.message : "Table could not be loaded.");
-    });
+    const isCurrent = () => active && mountedRef.current;
+    void load(isCurrent).catch(() => undefined);
+    if (canEdit) void acquire(isCurrent).catch(reportLeaseError);
     return () => {
       active = false;
     };
-  }, [load, acquire, canEdit]);
+  }, [load, acquire, canEdit, reportLeaseError]);
 
   useEffect(() => {
     if (!leaseToken) {
       let active = true;
-      const isCurrent = () => active;
-      const poll = window.setInterval(
-        () =>
-          void load(isCurrent).catch((cause) => {
-            if (active) setError(cause instanceof Error ? cause.message : "Table could not be loaded.");
-          }),
-        5_000,
-      );
+      const isCurrent = () => active && mountedRef.current;
+      const poll = window.setInterval(() => void load(isCurrent).catch(() => undefined), 5_000);
       return () => {
         active = false;
         window.clearInterval(poll);
       };
     }
     let active = true;
-    const isCurrent = () => active;
     const renewLease = async () => {
       try {
         await api(`/api/tables/${page.id}/lease`, {
@@ -119,19 +141,17 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         if (!active) return;
         leaseTokenRef.current = null;
         setLeaseToken(null);
-        setError("The editing lease was lost. Reloaded the authoritative table.");
-        await load(isCurrent).catch((cause) => {
-          if (active) setError(cause instanceof Error ? cause.message : "Table could not be loaded.");
-        });
+        setLeaseError("The editing lease was lost. Reloaded the authoritative table.");
+        releaseTableLease(page.id, leaseToken);
+        await load(isMounted).catch(() => undefined);
       }
     };
     const renew = window.setInterval(() => void renewLease(), 20_000);
     return () => {
       active = false;
       window.clearInterval(renew);
-      releaseTableLease(page.id, leaseToken);
     };
-  }, [leaseToken, load, page.id]);
+  }, [isMounted, leaseToken, load, page.id]);
 
   async function saveTitle() {
     const normalized = title.trim() || "Untitled";
@@ -164,16 +184,19 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
             expectedRevision: currentRevision,
           }),
         });
+        if (!isMounted()) return null;
         revisionRef.current = result.revision;
         onSuccess?.();
         setTable((current) => (current ? { ...current, revision: result.revision } : current));
         return result;
       } catch (cause) {
+        if (!isMounted()) return null;
         if (cause instanceof ApiClientError && cause.status === 409) {
           leaseTokenRef.current = null;
           setLeaseToken(null);
-          setError(cause.message);
-          await load();
+          setLeaseError(cause.message);
+          releaseTableLease(page.id, currentLease);
+          await load(isMounted).catch(() => undefined);
           return null;
         }
         throw cause;
@@ -299,6 +322,20 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       );
     return rows;
   }, [filter, sortColumn, table]);
+  const error = leaseError ?? loadError;
+
+  const tryAcquire = async () => {
+    await acquire(isMounted).catch(reportLeaseError);
+  };
+
+  const forceUnlock = async () => {
+    try {
+      await api(`/api/tables/${page.id}/force-unlock`, { method: "POST" });
+      if (isMounted()) await acquire(isMounted);
+    } catch (cause) {
+      reportLeaseError(cause);
+    }
+  };
 
   return (
     <main className="page-canvas table-canvas">
@@ -323,18 +360,12 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           </button>
         )}
         {!leaseToken && canEdit && (
-          <button className="quiet-button" onClick={() => void acquire()}>
+          <button className="quiet-button" onClick={() => void tryAcquire()}>
             Try edit lock
           </button>
         )}
         {member.role === "owner" && !leaseToken && (
-          <button
-            className="quiet-button"
-            onClick={async () => {
-              await api(`/api/tables/${page.id}/force-unlock`, { method: "POST" });
-              await acquire();
-            }}
-          >
+          <button className="quiet-button" onClick={() => void forceUnlock()}>
             Force unlock
           </button>
         )}

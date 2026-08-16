@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, json } from "./api";
+import { api, json, onApiUnauthorized } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -63,5 +63,25 @@ describe("api", () => {
         message: "Request failed (502).",
       }),
     );
+  });
+
+  it("notifies subscribers when an API request is unauthorized", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: { code: "session_expired", message: "Sign in again." } }), {
+          status: 401,
+        }),
+      ),
+    );
+    const unauthorized = vi.fn();
+    const unsubscribe = onApiUnauthorized(unauthorized);
+
+    await expect(api("/api/private")).rejects.toMatchObject({ status: 401, code: "session_expired" });
+    expect(unauthorized).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 401, code: "session_expired", message: "Sign in again." }),
+    );
+
+    unsubscribe();
   });
 });

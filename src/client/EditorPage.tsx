@@ -20,7 +20,7 @@ export type EditorPageProps = {
   member: ClientMemberContext;
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
-  onAuthorizationError: (pageId: string, error: ApiClientError) => void;
+  onAccessDenied: (pageId: string, error: ApiClientError) => void;
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
 };
@@ -30,7 +30,7 @@ export function EditorPage({
   member,
   onPageChanged,
   onPageUnavailable,
-  onAuthorizationError,
+  onAccessDenied,
   onSelectPage,
   backlinksRevision,
 }: EditorPageProps) {
@@ -100,7 +100,7 @@ export function EditorPage({
       quarantine,
       onPageChanged,
       onPageUnavailable,
-      onAuthorizationError,
+      onAccessDenied,
     });
     const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
     const connectionSync = (synced: boolean) => closeReconciler.handleSync(synced);
@@ -118,7 +118,7 @@ export function EditorPage({
   }, [
     member.role,
     member.workspace.id,
-    onAuthorizationError,
+    onAccessDenied,
     onPageChanged,
     onPageUnavailable,
     page.id,

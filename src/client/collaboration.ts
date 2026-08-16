@@ -3,10 +3,7 @@ import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
 import type { WorkspaceEvent } from "../shared/types";
 import { CollaborationDurability } from "./collaboration-durability";
-
-function connectionRetryDelay(attempt: number) {
-  return Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
-}
+import { connectionRetryDelay } from "./retry";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -48,6 +45,10 @@ export function createCollaboration(
     connectionTimer = undefined;
     void provider.connect().then(
       () => {
+        if (destroyed) {
+          provider.disconnect();
+          return;
+        }
         connectionAttempt = 0;
       },
       (error) => {
@@ -114,7 +115,10 @@ export function createCollaboration(
       }
     })
     .catch((error) => {
-      if (!destroyed) console.error("Failed to load offline document state", error);
+      if (destroyed) return;
+      console.error("Failed to load offline document state", error);
+      indexeddbSynced = true;
+      connect();
     });
 
   const visibility = () => {

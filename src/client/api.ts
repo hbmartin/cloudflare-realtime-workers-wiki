@@ -12,6 +12,17 @@ export class ApiClientError extends Error {
   }
 }
 
+export type UnauthorizedHandler = (error: ApiClientError) => void;
+
+const unauthorizedHandlers = new Set<UnauthorizedHandler>();
+
+export function onApiUnauthorized(handler: UnauthorizedHandler) {
+  unauthorizedHandlers.add(handler);
+  return () => {
+    unauthorizedHandlers.delete(handler);
+  };
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !(init.body instanceof FormData)) headers.set("content-type", "application/json");
@@ -26,7 +37,11 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     const error = payload?.error ?? payload;
     const code = typeof error?.code === "string" ? error.code : fallback.code;
     const message = typeof error?.message === "string" ? error.message : fallback.message;
-    throw new ApiClientError(response.status, code, message);
+    const clientError = new ApiClientError(response.status, code, message);
+    if (response.status === 401) {
+      for (const handler of unauthorizedHandlers) handler(clientError);
+    }
+    throw clientError;
   }
   return response.json() as Promise<T>;
 }

@@ -114,6 +114,7 @@ async function advanceRetry(milliseconds: number) {
 describe("EditorPage close reconciliation", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1);
     mocks.api.mockReset();
     mocks.destroy.mockReset();
     mocks.handlers.clear();
@@ -127,6 +128,7 @@ describe("EditorPage close reconciliation", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it("continues metadata reconciliation after the initial retry budget", async () => {
@@ -138,7 +140,7 @@ describe("EditorPage close reconciliation", () => {
         member={member}
         onPageChanged={vi.fn()}
         onPageUnavailable={unavailable}
-        onAuthorizationError={vi.fn()}
+        onAccessDenied={vi.fn()}
         onSelectPage={vi.fn()}
         backlinksRevision={0}
       />,
@@ -173,7 +175,7 @@ describe("EditorPage close reconciliation", () => {
         member={member}
         onPageChanged={vi.fn()}
         onPageUnavailable={vi.fn()}
-        onAuthorizationError={vi.fn()}
+        onAccessDenied={vi.fn()}
         onSelectPage={vi.fn()}
         backlinksRevision={0}
       />,
