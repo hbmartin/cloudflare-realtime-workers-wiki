@@ -62,7 +62,7 @@ export function App() {
       />
     );
   if (state.screen === "signin") return <SignInScreen onComplete={load} initialError={state.message} />;
-  return <Workspace member={state.member} onSignOut={signOut} onSessionExpired={sessionExpired} />;
+  return <Workspace member={state.member} onSignOut={signOut} />;
 }
 
 function Splash() {
@@ -251,15 +251,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
   );
 }
 
-function Workspace({
-  member,
-  onSignOut,
-  onSessionExpired,
-}: {
-  member: ClientMemberContext;
-  onSignOut: () => void;
-  onSessionExpired: (error: ApiClientError) => void;
-}) {
+function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
   const [pages, setPages] = useState<Page[]>([]);
   const [pagesLoaded, setPagesLoaded] = useState(false);
   const [trash, setTrash] = useState<Page[]>([]);
@@ -605,7 +597,6 @@ function Workspace({
               onPageChanged={updatePage}
               onPageUnavailable={pageUnavailable}
               onAccessDenied={documentAccessDenied}
-              onSessionExpired={onSessionExpired}
               onSelectPage={(id) => {
                 setSelectedId(id);
                 setView("pages");

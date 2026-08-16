@@ -144,7 +144,6 @@ describe("EditorPage close reconciliation", () => {
         onPageChanged={vi.fn()}
         onPageUnavailable={unavailable}
         onAccessDenied={vi.fn()}
-        onSessionExpired={vi.fn()}
         onSelectPage={vi.fn()}
         backlinksRevision={0}
       />,
@@ -180,7 +179,6 @@ describe("EditorPage close reconciliation", () => {
         onPageChanged={vi.fn()}
         onPageUnavailable={vi.fn()}
         onAccessDenied={vi.fn()}
-        onSessionExpired={vi.fn()}
         onSelectPage={vi.fn()}
         backlinksRevision={0}
       />,
@@ -211,7 +209,6 @@ describe("EditorPage close reconciliation", () => {
         onPageChanged={vi.fn()}
         onPageUnavailable={vi.fn()}
         onAccessDenied={vi.fn()}
-        onSessionExpired={vi.fn()}
         onSelectPage={vi.fn()}
         backlinksRevision={0}
       />,

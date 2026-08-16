@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { Page, TableData } from "../shared/types";
@@ -53,6 +54,17 @@ function tableWithValue(value: string, revision: number): TableData {
   };
 }
 
+function tableWithLease(): TableData {
+  return {
+    ...table,
+    lease: { heldByMe: false, holderName: "Another editor", expiresAt: Date.now() + 60_000 },
+  };
+}
+
+function leaseResult(leaseToken = "lease-token") {
+  return { leaseToken, expiresAt: Date.now() + 60_000 };
+}
+
 function member(role: ClientMemberContext["role"]): ClientMemberContext {
   return {
     role,
@@ -87,12 +99,12 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Roadmap")).toHaveAttribute("readonly");
     expect(screen.queryByRole("button", { name: "+ Property" })).not.toBeInTheDocument();
     expect(api).toHaveBeenCalledTimes(1);
-    expect(api).toHaveBeenCalledWith("/api/tables/table-page");
+    expect(api).toHaveBeenCalledWith("/api/tables/table-page", { signal: expect.any(AbortSignal) });
   });
 
   it("acquires an editor lease and exposes table mutations", async () => {
     vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path.endsWith("/lease") && init?.method === "POST") return { leaseToken: "lease-token" };
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       return { table };
     });
     render(
@@ -107,8 +119,47 @@ describe("TablePage", () => {
 
     expect(await screen.findByText("Editing lease active")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "+ Property" })).toBeInTheDocument();
-    expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", { method: "POST" });
+    expect(api).toHaveBeenCalledWith(
+      "/api/tables/table-page/lease",
+      expect.objectContaining({ method: "POST", signal: expect.any(AbortSignal) }),
+    );
     expect(api).toHaveBeenCalledTimes(3);
+  });
+
+  it("restarts automatic lease acquisition after Strict Mode replays the effect", async () => {
+    const firstLease = deferred<ReturnType<typeof leaseResult>>();
+    let leaseAttempts = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") {
+        leaseAttempts += 1;
+        return leaseAttempts === 1 ? firstLease.promise : Promise.resolve(leaseResult("current-token"));
+      }
+      if (path.endsWith("/lease") && init?.method === "DELETE") return Promise.resolve({ ok: true });
+      return Promise.resolve({ table });
+    });
+
+    render(
+      <StrictMode>
+        <TablePage
+          page={page}
+          member={member("editor")}
+          onPageChanged={vi.fn()}
+          onSelectPage={vi.fn()}
+          backlinksRevision={0}
+        />
+      </StrictMode>,
+    );
+    expect(leaseAttempts).toBe(1);
+
+    firstLease.resolve(leaseResult("superseded-token"));
+
+    await waitFor(() => expect(leaseAttempts).toBe(2));
+    expect(await screen.findByText("Editing lease active")).toBeInTheDocument();
+    expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
+      method: "DELETE",
+      body: JSON.stringify({ leaseToken: "superseded-token" }),
+      keepalive: true,
+    });
   });
 
   it("recovers from a lease conflict in read-only mode", async () => {
@@ -116,7 +167,7 @@ describe("TablePage", () => {
       if (path.endsWith("/lease") && init?.method === "POST") {
         throw new ApiClientError(409, "lease_conflict", "held");
       }
-      return { table };
+      return { table: tableWithLease() };
     });
     render(
       <TablePage
@@ -137,7 +188,7 @@ describe("TablePage", () => {
 
   it("keeps the successful initial load when the post-acquisition load fails", async () => {
     vi.useFakeTimers();
-    const lease = deferred<{ leaseToken: string }>();
+    const lease = deferred<ReturnType<typeof leaseResult>>();
     const initialLoad = deferred<{ table: TableData }>();
     const acquiredLoad = deferred<{ table: TableData }>();
     let loadCount = 0;
@@ -160,7 +211,7 @@ describe("TablePage", () => {
     expect(loadCount).toBe(1);
 
     await act(async () => {
-      lease.resolve({ leaseToken: "lease-token" });
+      lease.resolve(leaseResult());
       await Promise.resolve();
     });
     expect(loadCount).toBe(1);
@@ -181,7 +232,7 @@ describe("TablePage", () => {
   });
 
   it("does not start a second lease request while automatic acquisition is pending", async () => {
-    const lease = deferred<{ leaseToken: string }>();
+    const lease = deferred<ReturnType<typeof leaseResult>>();
     let leaseAttempts = 0;
     vi.mocked(api).mockImplementation((path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") {
@@ -206,7 +257,7 @@ describe("TablePage", () => {
     expect(leaseAttempts).toBe(1);
 
     await act(async () => {
-      lease.resolve({ leaseToken: "lease-token" });
+      lease.resolve(leaseResult());
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -214,7 +265,7 @@ describe("TablePage", () => {
 
   it("serializes force unlock and acquisition behind one lease action", async () => {
     const unlocked = deferred<{ ok: boolean }>();
-    const lease = deferred<{ leaseToken: string }>();
+    const lease = deferred<ReturnType<typeof leaseResult>>();
     let forceAttempts = 0;
     let leaseAttempts = 0;
     vi.mocked(api).mockImplementation((path, init) => {
@@ -265,7 +316,7 @@ describe("TablePage", () => {
     expect(leaseAttempts).toBe(2);
 
     await act(async () => {
-      lease.resolve({ leaseToken: "lease-token" });
+      lease.resolve(leaseResult());
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -273,7 +324,7 @@ describe("TablePage", () => {
   });
 
   it("releases a button-acquired lease that resolves after unmount", async () => {
-    const lateLease = deferred<{ leaseToken: string }>();
+    const lateLease = deferred<ReturnType<typeof leaseResult>>();
     let leaseAttempts = 0;
     vi.mocked(api).mockImplementation((path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") {
@@ -298,7 +349,7 @@ describe("TablePage", () => {
     await waitFor(() => expect(button).toBeEnabled());
     fireEvent.click(button);
     rendered.unmount();
-    lateLease.resolve({ leaseToken: "late-token" });
+    lateLease.resolve(leaseResult("late-token"));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -342,7 +393,7 @@ describe("TablePage", () => {
     vi.useFakeTimers();
     let loadCount = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path.endsWith("/lease") && init?.method === "POST") return { leaseToken: "lease-token" };
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.endsWith("/lease") && init?.method === "PATCH") {
         throw new ApiClientError(409, "lease_lost", "lost");
       }
@@ -372,11 +423,46 @@ describe("TablePage", () => {
     expect(screen.getByText("The editing lease was lost. Reloaded the authoritative table.")).toBeInTheDocument();
   });
 
+  it("releases the server lease after a terminal renewal failure", async () => {
+    vi.useFakeTimers();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "PATCH") {
+        throw new ApiClientError(403, "role_changed", "Editing permission was removed.");
+      }
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      return { table };
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
+      method: "DELETE",
+      body: JSON.stringify({ leaseToken: "lease-token" }),
+      keepalive: true,
+    });
+  });
+
   it("keeps a lease through a transient renewal failure and clears the notice after retry", async () => {
     vi.useFakeTimers();
     let renewals = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path.endsWith("/lease") && init?.method === "POST") return { leaseToken: "lease-token" };
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.endsWith("/lease") && init?.method === "PATCH") {
         renewals += 1;
         if (renewals === 1) throw new ApiClientError(503, "lease_unavailable", "Lease service unavailable.");
@@ -401,12 +487,77 @@ describe("TablePage", () => {
 
     await act(() => vi.advanceTimersByTimeAsync(20_000));
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
-    expect(screen.getByText("Lease service unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("Lease service unavailable. Retrying.")).toBeInTheDocument();
     expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "DELETE" }));
 
     await act(() => vi.advanceTimersByTimeAsync(20_000));
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
-    expect(screen.queryByText("Lease service unavailable.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Lease service unavailable. Retrying.")).not.toBeInTheDocument();
+  });
+
+  it("drops the local lease when renewal failures outlive the server deadline", async () => {
+    vi.useFakeTimers();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "PATCH") {
+        throw new ApiClientError(503, "lease_unavailable", "Lease service unavailable.");
+      }
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      return { table };
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(
+      screen.getByText("The editing lease expired after renewal failures. Reloaded the authoritative table."),
+    ).toBeInTheDocument();
+  });
+
+  it("clears a lease-conflict notice once polling observes that the lease was released", async () => {
+    vi.useFakeTimers();
+    let loads = 0;
+    const heldTable = tableWithLease();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") {
+        throw new ApiClientError(409, "lease_conflict", "held");
+      }
+      loads += 1;
+      return { table: loads < 3 ? heldTable : table };
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Another editor has this table open for editing.")).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+
+    expect(screen.queryByText("Another editor has this table open for editing.")).not.toBeInTheDocument();
   });
 
   it("shows lease status without hiding a later table load failure", async () => {
@@ -418,7 +569,7 @@ describe("TablePage", () => {
       }
       loads += 1;
       if (loads === 3) throw new ApiClientError(503, "table_unavailable", "Table temporarily unavailable.");
-      return { table };
+      return { table: loads < 3 ? tableWithLease() : table };
     });
     render(
       <TablePage
@@ -493,5 +644,37 @@ describe("TablePage", () => {
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(screen.queryByText("Table temporarily unavailable.")).not.toBeInTheDocument();
+  });
+
+  it("resumes polling after a table load times out", async () => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+      const controller = new AbortController();
+      window.setTimeout(() => controller.abort(), milliseconds);
+      return controller.signal;
+    });
+    let loads = 0;
+    vi.mocked(api).mockImplementation((_path, init) => {
+      loads += 1;
+      if (loads > 1) return Promise.resolve({ table });
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("Table load timed out.")), { once: true });
+      });
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("viewer")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+
+    expect(loads).toBeGreaterThan(1);
+    expect(screen.getByDisplayValue("Ready")).toBeInTheDocument();
+    timeout.mockRestore();
   });
 });

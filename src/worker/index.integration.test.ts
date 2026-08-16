@@ -1050,10 +1050,12 @@ describe("Worker integration", () => {
         await state.storage.deleteAlarm();
         await document.onAlarm();
         expect(await env.BUCKET.get(newKey)).toBeTruthy();
-        expect(await state.storage.getAlarm()).not.toBeNull();
+        const deferredAlarm = await state.storage.getAlarm();
+        expect(deferredAlarm).not.toBeNull();
 
         releaseNewSnapshot();
         expect((await restoring).status).toBe(200);
+        expect(await state.storage.getAlarm()).toBeLessThan(deferredAlarm!);
       } finally {
         document.bindings = originalBindings;
         releaseNewSnapshot();
