@@ -29,6 +29,7 @@ export type TablePageProps = {
 export function TablePage({ page, member, onPageChanged, onSelectPage, backlinksRevision }: TablePageProps) {
   const [table, setTable] = useState<TableData | null>(null);
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
+  const [leasePending, setLeasePending] = useState(member.role !== "viewer");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
@@ -40,6 +41,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   const columnCountRef = useRef(0);
   const rowCountRef = useRef(0);
   const mutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const leaseActionPromiseRef = useRef<Promise<void> | null>(null);
+  const loadsInFlightRef = useRef(0);
   const mountedRef = useRef(true);
   const loadGenerationRef = useRef(0);
   const canEdit = member.role !== "viewer";
@@ -59,6 +62,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   const load = useCallback(
     async (isCurrent: IsCurrent) => {
       const generation = ++loadGenerationRef.current;
+      loadsInFlightRef.current += 1;
       try {
         const result = await api<{ table: TableData }>(`/api/tables/${page.id}`);
         if (!isCurrent() || generation !== loadGenerationRef.current) return;
@@ -72,13 +76,28 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           setLoadError(errorMessage(cause, "Table could not be loaded."));
         }
         throw cause;
+      } finally {
+        loadsInFlightRef.current -= 1;
       }
     },
     [page.id],
   );
 
-  const acquire = useCallback(
-    async (isCurrent: IsCurrent) => {
+  const runLeaseAction = useCallback((isCurrent: IsCurrent, action: () => Promise<void>) => {
+    if (leaseActionPromiseRef.current) return leaseActionPromiseRef.current;
+    if (isCurrent()) setLeasePending(true);
+    const attempt = action();
+    let tracked!: Promise<void>;
+    tracked = attempt.finally(() => {
+      if (leaseActionPromiseRef.current === tracked) leaseActionPromiseRef.current = null;
+      if (isCurrent()) setLeasePending(false);
+    });
+    leaseActionPromiseRef.current = tracked;
+    return tracked;
+  }, []);
+
+  const performAcquire = useCallback(
+    async (isCurrent: IsCurrent, priorLoad?: Promise<void>) => {
       if (!canEdit) return;
       let result: { leaseToken: string };
       try {
@@ -89,7 +108,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           leaseTokenRef.current = null;
           setLeaseToken(null);
           setLeaseError("Another editor has this table open for editing.");
-          await load(isCurrent).catch(() => undefined);
+          await priorLoad?.catch(() => undefined);
+          if (isCurrent()) await load(isCurrent).catch(() => undefined);
           return;
         }
         throw cause;
@@ -101,9 +121,21 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       leaseTokenRef.current = result.leaseToken;
       setLeaseToken(result.leaseToken);
       setLeaseError(null);
-      await load(isCurrent).catch(() => undefined);
+      // Let the immediate mount load settle before starting the authoritative
+      // post-acquisition load. This preserves a successful fallback if the
+      // latter request fails without allowing an older response to overwrite it.
+      await priorLoad?.catch(() => undefined);
+      if (isCurrent()) await load(isCurrent).catch(() => undefined);
     },
     [canEdit, load, page.id],
+  );
+
+  const acquire = useCallback(
+    (isCurrent: IsCurrent, priorLoad?: Promise<void>) => {
+      if (!canEdit) return Promise.resolve();
+      return runLeaseAction(isCurrent, () => performAcquire(isCurrent, priorLoad));
+    },
+    [canEdit, performAcquire, runLeaseAction],
   );
 
   const reportLeaseError = useCallback((cause: unknown) => {
@@ -113,23 +145,29 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   useEffect(() => {
     let active = true;
     const isCurrent = () => active && mountedRef.current;
-    void load(isCurrent).catch(() => undefined);
-    if (canEdit) void acquire(isCurrent).catch(reportLeaseError);
+    const initialLoad = load(isCurrent);
+    void initialLoad.catch(() => undefined);
+    if (canEdit) void acquire(isCurrent, initialLoad).catch(reportLeaseError);
     return () => {
       active = false;
     };
   }, [load, acquire, canEdit, reportLeaseError]);
 
   useEffect(() => {
-    if (!leaseToken) {
-      let active = true;
-      const isCurrent = () => active && mountedRef.current;
-      const poll = window.setInterval(() => void load(isCurrent).catch(() => undefined), 5_000);
-      return () => {
-        active = false;
-        window.clearInterval(poll);
-      };
-    }
+    if (leaseToken && table) return undefined;
+    let active = true;
+    const isCurrent = () => active && mountedRef.current;
+    const poll = window.setInterval(() => {
+      if (!loadsInFlightRef.current) void load(isCurrent).catch(() => undefined);
+    }, 5_000);
+    return () => {
+      active = false;
+      window.clearInterval(poll);
+    };
+  }, [leaseToken, load, table]);
+
+  useEffect(() => {
+    if (!leaseToken) return undefined;
     let active = true;
     const renewLease = async () => {
       try {
@@ -137,12 +175,19 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           method: "PATCH",
           body: json({ leaseToken }),
         });
-      } catch {
+        if (active) setLeaseError(null);
+      } catch (cause) {
         if (!active) return;
+        const retryable = !(cause instanceof ApiClientError) || cause.status === 429 || cause.status >= 500;
+        if (retryable) {
+          setLeaseError(errorMessage(cause, "The editing lease could not be renewed. Retrying."));
+          return;
+        }
         leaseTokenRef.current = null;
         setLeaseToken(null);
-        setLeaseError("The editing lease was lost. Reloaded the authoritative table.");
-        releaseTableLease(page.id, leaseToken);
+        setLeaseError(
+          cause.status === 409 ? "The editing lease was lost. Reloaded the authoritative table." : cause.message,
+        );
         await load(isMounted).catch(() => undefined);
       }
     };
@@ -322,20 +367,21 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       );
     return rows;
   }, [filter, sortColumn, table]);
-  const error = leaseError ?? loadError;
-
   const tryAcquire = async () => {
     await acquire(isMounted).catch(reportLeaseError);
   };
 
-  const forceUnlock = async () => {
-    try {
-      await api(`/api/tables/${page.id}/force-unlock`, { method: "POST" });
-      if (isMounted()) await acquire(isMounted);
-    } catch (cause) {
-      reportLeaseError(cause);
-    }
-  };
+  const forceUnlock = () =>
+    runLeaseAction(isMounted, async () => {
+      try {
+        await api(`/api/tables/${page.id}/force-unlock`, { method: "POST" });
+      } catch (cause) {
+        if (isMounted()) setLeaseError(errorMessage(cause, "The table could not be force-unlocked."));
+        return;
+      }
+      if (!isMounted()) return;
+      await performAcquire(isMounted).catch(reportLeaseError);
+    });
 
   return (
     <main className="page-canvas table-canvas">
@@ -360,12 +406,12 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           </button>
         )}
         {!leaseToken && canEdit && (
-          <button className="quiet-button" onClick={() => void tryAcquire()}>
+          <button className="quiet-button" disabled={leasePending} onClick={() => void tryAcquire()}>
             Try edit lock
           </button>
         )}
         {member.role === "owner" && !leaseToken && (
-          <button className="quiet-button" onClick={() => void forceUnlock()}>
+          <button className="quiet-button" disabled={leasePending} onClick={() => void forceUnlock()}>
             Force unlock
           </button>
         )}
@@ -373,7 +419,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           Backlinks
         </button>
       </div>
-      {error && <div className="notice">{error}</div>}
+      {leaseError && <div className="notice">{leaseError}</div>}
+      {loadError && <div className="notice notice-danger">{loadError}</div>}
       <article className="table-paper">
         <input
           className="page-title"

@@ -19,6 +19,9 @@ type AppState =
 export function App() {
   const [state, setState] = useState<AppState>({ screen: "loading" });
   const signOut = useCallback(() => setState({ screen: "signin" }), []);
+  const sessionExpired = useCallback((error: ApiClientError) => {
+    setState((current) => (current.screen === "workspace" ? { screen: "signin", message: error.message } : current));
+  }, []);
 
   const load = useCallback(async () => {
     const invite = new URLSearchParams(window.location.search).get("invite");
@@ -40,15 +43,7 @@ export function App() {
     }
   }, []);
 
-  useEffect(
-    () =>
-      onApiUnauthorized((error) => {
-        setState((current) =>
-          current.screen === "workspace" ? { screen: "signin", message: error.message } : current,
-        );
-      }),
-    [],
-  );
+  useEffect(() => onApiUnauthorized(sessionExpired), [sessionExpired]);
 
   useEffect(() => {
     void load();
@@ -67,7 +62,7 @@ export function App() {
       />
     );
   if (state.screen === "signin") return <SignInScreen onComplete={load} initialError={state.message} />;
-  return <Workspace member={state.member} onSignOut={signOut} />;
+  return <Workspace member={state.member} onSignOut={signOut} onSessionExpired={sessionExpired} />;
 }
 
 function Splash() {
@@ -256,7 +251,15 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
   );
 }
 
-function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
+function Workspace({
+  member,
+  onSignOut,
+  onSessionExpired,
+}: {
+  member: ClientMemberContext;
+  onSignOut: () => void;
+  onSessionExpired: (error: ApiClientError) => void;
+}) {
   const [pages, setPages] = useState<Page[]>([]);
   const [pagesLoaded, setPagesLoaded] = useState(false);
   const [trash, setTrash] = useState<Page[]>([]);
@@ -602,6 +605,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               onPageChanged={updatePage}
               onPageUnavailable={pageUnavailable}
               onAccessDenied={documentAccessDenied}
+              onSessionExpired={onSessionExpired}
               onSelectPage={(id) => {
                 setSelectedId(id);
                 setView("pages");

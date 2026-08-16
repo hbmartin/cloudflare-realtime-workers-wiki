@@ -9,6 +9,7 @@ export type CollaborationBundle = {
   doc: Y.Doc;
   indexeddb: IndexeddbPersistence;
   provider: YProvider;
+  ready: Promise<void>;
   readonly hasUnsyncedChanges: boolean;
   destroy: () => void;
 };
@@ -104,7 +105,7 @@ export function createCollaboration(
     durability.markChanged();
     scheduleDurabilityBarrier();
   });
-  void indexeddb.whenSynced
+  const ready = indexeddb.whenSynced
     .then(() => {
       if (!destroyed) {
         // Until the server sync completes, conservatively treat a persisted copy
@@ -117,8 +118,8 @@ export function createCollaboration(
     .catch((error) => {
       if (destroyed) return;
       console.error("Failed to load offline document state", error);
-      indexeddbSynced = true;
-      connect();
+      onStatus("offline");
+      throw error;
     });
 
   const visibility = () => {
@@ -142,6 +143,7 @@ export function createCollaboration(
     doc,
     indexeddb,
     provider,
+    ready,
     get hasUnsyncedChanges() {
       return durability.hasUnsyncedChanges;
     },

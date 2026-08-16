@@ -33,6 +33,7 @@ function setup(hasUnsyncedChanges = false) {
   const onPageChanged = vi.fn();
   const onPageUnavailable = vi.fn();
   const onAccessDenied = vi.fn();
+  const onSessionExpired = vi.fn();
   const reconciler = createDocumentCloseReconciler({
     page,
     provider,
@@ -42,8 +43,9 @@ function setup(hasUnsyncedChanges = false) {
     onPageChanged,
     onPageUnavailable,
     onAccessDenied,
+    onSessionExpired,
   });
-  return { provider, quarantine, onPageChanged, onPageUnavailable, onAccessDenied, reconciler };
+  return { provider, quarantine, onPageChanged, onPageUnavailable, onAccessDenied, onSessionExpired, reconciler };
 }
 
 async function flushPromises() {
@@ -148,9 +150,9 @@ describe("document close reconciliation", () => {
     expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
   });
 
-  it("leaves session-expiry handling to the API layer when reconciliation returns 401", async () => {
+  it("becomes terminal and reports session expiry when reconciliation returns 401", async () => {
     mocks.api.mockRejectedValue(new ApiClientError(401, "session_expired", "Sign in again"));
-    const { provider, onPageUnavailable, onAccessDenied, reconciler } = setup();
+    const { provider, onPageUnavailable, onAccessDenied, onSessionExpired, reconciler } = setup();
 
     reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
     await flushPromises();
@@ -158,6 +160,11 @@ describe("document close reconciliation", () => {
     expect(provider.disconnect).toHaveBeenCalledTimes(2);
     expect(onPageUnavailable).not.toHaveBeenCalled();
     expect(onAccessDenied).not.toHaveBeenCalled();
+    expect(onSessionExpired).toHaveBeenCalledWith(expect.objectContaining({ status: 401 }));
+
+    reconciler.handleClose(new CloseEvent("close", { code: 1006 }));
+    await flushPromises();
+    expect(mocks.api).toHaveBeenCalledOnce();
   });
 
   it("reports access denial when reconciliation returns 403", async () => {

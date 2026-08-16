@@ -21,6 +21,7 @@ export type EditorPageProps = {
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
   onAccessDenied: (pageId: string, error: ApiClientError) => void;
+  onSessionExpired: (error: ApiClientError) => void;
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
 };
@@ -31,11 +32,13 @@ export function EditorPage({
   onPageChanged,
   onPageUnavailable,
   onAccessDenied,
+  onSessionExpired,
   onSelectPage,
   backlinksRevision,
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
+  const [storageError, setStorageError] = useState<string | null>(null);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [attachmentsOpen, setAttachmentsOpen] = useState(false);
@@ -56,7 +59,7 @@ export function EditorPage({
   const titlePageIdRef = useRef(page.id);
   const titleRevisionRef = useRef(page.revision);
   const titleDirtyRef = useRef(false);
-  const editable = member.role !== "viewer" && !sizeWarning?.readOnly;
+  const editable = member.role !== "viewer" && !sizeWarning?.readOnly && !storageError;
   const commentsVisible = commentsOpen;
 
   useEffect(() => {
@@ -76,7 +79,9 @@ export function EditorPage({
 
   useEffect(() => {
     setSizeWarning(null);
+    setStorageError(null);
     const next = createCollaboration(member.workspace.id, page.id, page.contentEpoch, setStatus);
+    let active = true;
     const customMessage = (message: string) => {
       try {
         const value = JSON.parse(message) as { type: string; bytes: number; readOnly: boolean };
@@ -101,13 +106,24 @@ export function EditorPage({
       onPageChanged,
       onPageUnavailable,
       onAccessDenied,
+      onSessionExpired,
     });
     const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
     const connectionSync = (synced: boolean) => closeReconciler.handleSync(synced);
     next.provider.on("connection-close", connectionClose);
     next.provider.on("sync", connectionSync);
-    setBundle(next);
+    void (async () => {
+      try {
+        await next.ready;
+        if (active) setBundle(next);
+      } catch {
+        if (!active) return;
+        setBundle(null);
+        setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+      }
+    })();
     return () => {
+      active = false;
       closeReconciler.destroy();
       next.provider.off("custom-message", customMessage);
       next.provider.off("connection-close", connectionClose);
@@ -119,6 +135,7 @@ export function EditorPage({
     member.role,
     member.workspace.id,
     onAccessDenied,
+    onSessionExpired,
     onPageChanged,
     onPageUnavailable,
     page.id,
@@ -240,7 +257,8 @@ export function EditorPage({
             : " Consider splitting it before it reaches 24 MiB."}
         </div>
       )}
-      {recovery && recovery.epoch !== page.contentEpoch && (
+      {storageError && <div className="notice notice-danger">{storageError}</div>}
+      {recovery && recovery.epoch !== page.contentEpoch && !storageError && (
         <div className="notice recovery-notice">
           <div>
             <strong>Offline copy quarantined</strong>
@@ -313,6 +331,10 @@ export function EditorPage({
           {titleError && <p className="form-error">{titleError}</p>}
           {bundle ? (
             <CollaborativeEditor bundle={bundle} member={member} editable={editable} commentsOpen={commentsVisible} />
+          ) : storageError ? (
+            <div className="editor-loading">
+              This document cannot be opened safely until offline storage is available.
+            </div>
           ) : (
             <div className="editor-loading">Opening your offline copy…</div>
           )}

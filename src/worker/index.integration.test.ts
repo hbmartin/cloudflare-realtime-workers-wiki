@@ -1047,8 +1047,10 @@ describe("Worker integration", () => {
             .restore_pending,
         ).toBe(1);
 
+        await state.storage.deleteAlarm();
         await document.onAlarm();
         expect(await env.BUCKET.get(newKey)).toBeTruthy();
+        expect(await state.storage.getAlarm()).not.toBeNull();
 
         releaseNewSnapshot();
         expect((await restoring).status).toBe(200);
