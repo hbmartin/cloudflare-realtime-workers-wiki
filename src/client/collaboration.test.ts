@@ -9,8 +9,18 @@ const mocks = vi.hoisted(() => ({
     synced: boolean;
     sendMessage: ReturnType<typeof vi.fn>;
     connect: ReturnType<typeof vi.fn>;
+    disconnect: ReturnType<typeof vi.fn>;
+    destroy: ReturnType<typeof vi.fn>;
   }>,
 }));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
 
 vi.mock("y-indexeddb", () => ({
   IndexeddbPersistence: class {
@@ -68,6 +78,7 @@ describe("collaboration durability barriers", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
+    vi.spyOn(Math, "random").mockReturnValue(1);
     mocks.whenSynced = new Promise<void>(() => undefined);
     mocks.providers.length = 0;
   });
@@ -115,5 +126,40 @@ describe("collaboration durability barriers", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     expect(provider.connect).toHaveBeenCalledTimes(2);
     bundle.destroy();
+  });
+
+  it("connects to the server when offline storage fails to open", async () => {
+    const error = new Error("IndexedDB unavailable");
+    mocks.whenSynced = Promise.reject(error);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn());
+    const provider = mocks.providers[0]!;
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(logged).toHaveBeenCalledWith("Failed to load offline document state", error);
+    expect(provider.connect).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
+  it("disconnects a collaboration connection that completes after destroy", async () => {
+    const connection = deferred<void>();
+    mocks.whenSynced = Promise.resolve();
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn());
+    const provider = mocks.providers[0]!;
+    provider.connect.mockReturnValue(connection.promise);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(provider.connect).toHaveBeenCalledOnce();
+
+    bundle.destroy();
+    connection.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(provider.disconnect).toHaveBeenCalledOnce();
   });
 });

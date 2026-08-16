@@ -987,6 +987,80 @@ describe("Worker integration", () => {
     expect(await env.BUCKET.get(preKey)).toBeTruthy();
   });
 
+  it("does not reconcile restore recovery while the restore is still committing", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      document.document.getMap("restore-alarm-race").set("value", 1);
+      await document.onSave();
+      await document.compact(true);
+    });
+    const version = await env.DB.prepare(
+      `SELECT id FROM page_versions WHERE page_id = ? ORDER BY created_at DESC LIMIT 1`,
+    )
+      .bind(installed.pageId)
+      .first<{ id: string }>();
+    expect(version).toBeTruthy();
+    const newKey = `documents/${installed.pageId}/epochs/2/current.bin`;
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      const originalBindings = document.bindings;
+      const bucket = originalBindings.BUCKET;
+      let releaseNewSnapshot!: () => void;
+      let markNewSnapshotStored!: () => void;
+      const newSnapshotGate = new Promise<void>((resolve) => {
+        releaseNewSnapshot = resolve;
+      });
+      const newSnapshotStored = new Promise<void>((resolve) => {
+        markNewSnapshotStored = resolve;
+      });
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property !== "BUCKET") return Reflect.get(target, property, receiver);
+          return new Proxy(bucket, {
+            get(bucketTarget, bucketProperty) {
+              if (bucketProperty === "put")
+                return async (...args: any[]) => {
+                  const result = await Reflect.apply(bucketTarget.put, bucketTarget, args);
+                  if (args[0] === newKey) {
+                    markNewSnapshotStored();
+                    await newSnapshotGate;
+                  }
+                  return result;
+                };
+              const value = Reflect.get(bucketTarget, bucketProperty, bucketTarget);
+              return typeof value === "function" ? value.bind(bucketTarget) : value;
+            },
+          });
+        },
+      });
+
+      try {
+        const restoring = document.restoreVersion(version!.id, installed.userId);
+        await newSnapshotStored;
+        expect(document.transition).toBe("restore");
+        expect(
+          state.storage.sql.exec<{ restore_pending: number }>(`SELECT restore_pending FROM document_meta`).one()
+            .restore_pending,
+        ).toBe(1);
+
+        await document.onAlarm();
+        expect(await env.BUCKET.get(newKey)).toBeTruthy();
+
+        releaseNewSnapshot();
+        expect((await restoring).status).toBe(200);
+      } finally {
+        document.bindings = originalBindings;
+        releaseNewSnapshot();
+      }
+    });
+
+    expect(await env.BUCKET.get(newKey)).toBeTruthy();
+  });
+
   it("rejects a concurrent restore before it can share the next epoch snapshot key", async () => {
     const installed = await bootstrap();
     const room = `${installed.pageId}~1`;

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type
 import type { ClientMemberContext } from "../shared/types";
 import { buildTree } from "../shared/tree-model";
 import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent } from "../shared/types";
-import { ApiClientError, api, authClient, json } from "./api";
+import { ApiClientError, api, authClient, json, onApiUnauthorized } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
 import { invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
@@ -19,7 +19,6 @@ type AppState =
 export function App() {
   const [state, setState] = useState<AppState>({ screen: "loading" });
   const signOut = useCallback(() => setState({ screen: "signin" }), []);
-  const sessionExpired = useCallback((message: string) => setState({ screen: "signin", message }), []);
 
   const load = useCallback(async () => {
     const invite = new URLSearchParams(window.location.search).get("invite");
@@ -41,6 +40,16 @@ export function App() {
     }
   }, []);
 
+  useEffect(
+    () =>
+      onApiUnauthorized((error) => {
+        setState((current) =>
+          current.screen === "workspace" ? { screen: "signin", message: error.message } : current,
+        );
+      }),
+    [],
+  );
+
   useEffect(() => {
     void load();
   }, [load]);
@@ -58,7 +67,7 @@ export function App() {
       />
     );
   if (state.screen === "signin") return <SignInScreen onComplete={load} initialError={state.message} />;
-  return <Workspace member={state.member} onSignOut={signOut} onSessionExpired={sessionExpired} />;
+  return <Workspace member={state.member} onSignOut={signOut} />;
 }
 
 function Splash() {
@@ -247,15 +256,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
   );
 }
 
-function Workspace({
-  member,
-  onSignOut,
-  onSessionExpired,
-}: {
-  member: ClientMemberContext;
-  onSignOut: () => void;
-  onSessionExpired: (message: string) => void;
-}) {
+function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
   const [pages, setPages] = useState<Page[]>([]);
   const [pagesLoaded, setPagesLoaded] = useState(false);
   const [trash, setTrash] = useState<Page[]>([]);
@@ -454,16 +455,12 @@ function Workspace({
     },
     [loadPages, recordPageRemovals],
   );
-  const documentAuthorizationError = useCallback(
+  const documentAccessDenied = useCallback(
     (pageId: string, error: ApiClientError) => {
-      if (error.status === 401) {
-        onSessionExpired(error.message);
-        return;
-      }
       setWorkspaceError(error.message);
       pageUnavailable(pageId);
     },
-    [onSessionExpired, pageUnavailable],
+    [pageUnavailable],
   );
 
   return (
@@ -604,7 +601,7 @@ function Workspace({
               member={member}
               onPageChanged={updatePage}
               onPageUnavailable={pageUnavailable}
-              onAuthorizationError={documentAuthorizationError}
+              onAccessDenied={documentAccessDenied}
               onSelectPage={(id) => {
                 setSelectedId(id);
                 setView("pages");

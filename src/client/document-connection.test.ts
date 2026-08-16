@@ -32,7 +32,7 @@ function setup(hasUnsyncedChanges = false) {
   const quarantine = vi.fn();
   const onPageChanged = vi.fn();
   const onPageUnavailable = vi.fn();
-  const onAuthorizationError = vi.fn();
+  const onAccessDenied = vi.fn();
   const reconciler = createDocumentCloseReconciler({
     page,
     provider,
@@ -41,9 +41,9 @@ function setup(hasUnsyncedChanges = false) {
     quarantine,
     onPageChanged,
     onPageUnavailable,
-    onAuthorizationError,
+    onAccessDenied,
   });
-  return { provider, quarantine, onPageChanged, onPageUnavailable, onAuthorizationError, reconciler };
+  return { provider, quarantine, onPageChanged, onPageUnavailable, onAccessDenied, reconciler };
 }
 
 async function flushPromises() {
@@ -54,6 +54,7 @@ async function flushPromises() {
 describe("document close reconciliation", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1);
     mocks.api.mockReset();
   });
 
@@ -147,15 +148,27 @@ describe("document close reconciliation", () => {
     expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
   });
 
-  it.each([401, 403])("reports an authorization failure when reconciliation returns %i", async (status) => {
-    mocks.api.mockRejectedValue(new ApiClientError(status, "access_error", "Access failed"));
-    const { provider, onPageUnavailable, onAuthorizationError, reconciler } = setup();
+  it("leaves session-expiry handling to the API layer when reconciliation returns 401", async () => {
+    mocks.api.mockRejectedValue(new ApiClientError(401, "session_expired", "Sign in again"));
+    const { provider, onPageUnavailable, onAccessDenied, reconciler } = setup();
 
     reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
     await flushPromises();
 
     expect(provider.disconnect).toHaveBeenCalledTimes(2);
     expect(onPageUnavailable).not.toHaveBeenCalled();
-    expect(onAuthorizationError).toHaveBeenCalledWith(page.id, expect.objectContaining({ status }));
+    expect(onAccessDenied).not.toHaveBeenCalled();
+  });
+
+  it("reports access denial when reconciliation returns 403", async () => {
+    mocks.api.mockRejectedValue(new ApiClientError(403, "access_denied", "Access failed"));
+    const { provider, onPageUnavailable, onAccessDenied, reconciler } = setup();
+
+    reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
+    await flushPromises();
+
+    expect(provider.disconnect).toHaveBeenCalledTimes(2);
+    expect(onPageUnavailable).not.toHaveBeenCalled();
+    expect(onAccessDenied).toHaveBeenCalledWith(page.id, expect.objectContaining({ status: 403 }));
   });
 });

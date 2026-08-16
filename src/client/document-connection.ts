@@ -1,5 +1,6 @@
 import type { Page } from "../shared/types";
 import { ApiClientError, api } from "./api";
+import { connectionRetryDelay } from "./retry";
 
 export type ProviderControl = {
   connect: () => Promise<void> | void;
@@ -14,15 +15,11 @@ export type DocumentCloseReconcilerOptions = {
   quarantine: () => void;
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
-  onAuthorizationError: (pageId: string, error: ApiClientError) => void;
+  onAccessDenied: (pageId: string, error: ApiClientError) => void;
 };
 
 const TRANSITION_CLOSE_CODES = new Set([4410, 4412]);
 const RECONCILED_CLOSE_CODES = new Set([4410, 4412, 1006]);
-
-function retryDelay(attempt: number) {
-  return Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
-}
 
 export function createDocumentCloseReconciler({
   page,
@@ -32,7 +29,7 @@ export function createDocumentCloseReconciler({
   quarantine,
   onPageChanged,
   onPageUnavailable,
-  onAuthorizationError,
+  onAccessDenied,
 }: DocumentCloseReconcilerOptions) {
   let active = true;
   let closeCheck = 0;
@@ -65,7 +62,7 @@ export function createDocumentCloseReconciler({
     } catch (error) {
       if (!active || check !== closeCheck) return;
       console.error("Failed to reconnect document collaboration", error);
-      schedule(() => void connect(check), retryDelay(reconnectAttempt++));
+      schedule(() => void connect(check), connectionRetryDelay(reconnectAttempt++));
     }
   };
 
@@ -83,7 +80,7 @@ export function createDocumentCloseReconciler({
         provider.disconnect();
         onPageChanged(result.page);
       } else if (TRANSITION_CLOSE_CODES.has(code)) {
-        const delay = retryDelay(reconnectAttempt++);
+        const delay = connectionRetryDelay(reconnectAttempt++);
         schedule(() => {
           if (active && check === closeCheck) void connect(check);
         }, delay);
@@ -95,10 +92,15 @@ export function createDocumentCloseReconciler({
           unavailable();
           return;
         }
-        if (error.status === 401 || error.status === 403) {
+        if (error.status === 401) {
           invalidate();
           provider.disconnect();
-          onAuthorizationError(page.id, error);
+          return;
+        }
+        if (error.status === 403) {
+          invalidate();
+          provider.disconnect();
+          onAccessDenied(page.id, error);
           return;
         }
       }
@@ -108,7 +110,7 @@ export function createDocumentCloseReconciler({
         unavailable();
         return;
       }
-      schedule(() => void reconcileClose(code, check, attempt + 1), retryDelay(attempt));
+      schedule(() => void reconcileClose(code, check, attempt + 1), connectionRetryDelay(attempt));
     }
   };
 
