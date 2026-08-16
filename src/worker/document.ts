@@ -930,8 +930,9 @@ export class Document extends YServer {
 
   private async finishTransition() {
     this.transition = null;
-    if (!this.transitionAlarmDeferred || this.purged) return;
+    if (!this.transitionAlarmDeferred) return;
     this.transitionAlarmDeferred = false;
+    if (this.purged) return;
     await this.transitionAlarmRearm?.catch(() => undefined);
     try {
       await this.scheduleAlarm(Date.now());

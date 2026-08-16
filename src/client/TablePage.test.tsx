@@ -2,7 +2,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { Page, TableData } from "../shared/types";
 import { ApiClientError, api } from "./api";
@@ -653,6 +653,7 @@ describe("TablePage", () => {
       window.setTimeout(() => controller.abort(), milliseconds);
       return controller.signal;
     });
+    onTestFinished(() => timeout.mockRestore());
     let loads = 0;
     vi.mocked(api).mockImplementation((_path, init) => {
       loads += 1;
@@ -675,6 +676,5 @@ describe("TablePage", () => {
 
     expect(loads).toBeGreaterThan(1);
     expect(screen.getByDisplayValue("Ready")).toBeInTheDocument();
-    timeout.mockRestore();
   });
 });

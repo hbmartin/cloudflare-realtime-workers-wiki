@@ -431,6 +431,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         return;
       }
       if (!isMounted()) return;
+      // Call performAcquire directly. acquire() would re-enter runLeaseAction
+      // with the same owner and return this still-pending promise.
       await performAcquire(isMounted).catch(reportLeaseError);
     });
 

@@ -200,6 +200,7 @@ describe("EditorPage close reconciliation", () => {
   });
 
   it("keeps the editor closed when offline storage is unavailable", async () => {
+    vi.useRealTimers();
     mocks.ready = Promise.reject(new Error("IndexedDB unavailable"));
 
     render(
@@ -213,12 +214,10 @@ describe("EditorPage close reconciliation", () => {
         backlinksRevision={0}
       />,
     );
-    await act(async () => {
-      await Promise.resolve();
-    });
-
     expect(
-      screen.getByText("Offline storage is unavailable, so editing and collaboration are disabled for this page."),
+      await screen.findByText(
+        "Offline storage is unavailable, so editing and collaboration are disabled for this page.",
+      ),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("Page title")).toHaveAttribute("readonly");
     expect(screen.queryByText("Opening your offline copy…")).not.toBeInTheDocument();

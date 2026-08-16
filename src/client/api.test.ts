@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { api, json, onApiUnauthorized } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -76,13 +76,12 @@ describe("api", () => {
     );
     const unauthorized = vi.fn();
     const unsubscribe = onApiUnauthorized(unauthorized);
+    onTestFinished(unsubscribe);
 
     await expect(api("/api/private")).rejects.toMatchObject({ status: 401, code: "session_expired" });
     expect(unauthorized).toHaveBeenCalledWith(
       expect.objectContaining({ status: 401, code: "session_expired", message: "Sign in again." }),
     );
-
-    unsubscribe();
   });
 
   it("isolates unauthorized subscribers and preserves the API error", async () => {
@@ -97,16 +96,18 @@ describe("api", () => {
     const subscriberError = new Error("subscriber failed");
     const laterSubscriber = vi.fn();
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
     const unsubscribeThrowing = onApiUnauthorized(() => {
       throw subscriberError;
     });
     const unsubscribeLater = onApiUnauthorized(laterSubscriber);
+    onTestFinished(() => {
+      unsubscribeThrowing();
+      unsubscribeLater();
+    });
 
     await expect(api("/api/private")).rejects.toMatchObject({ status: 401, code: "session_expired" });
     expect(laterSubscriber).toHaveBeenCalledWith(expect.objectContaining({ status: 401 }));
     expect(logged).toHaveBeenCalledWith("API unauthorized handler failed", subscriberError);
-
-    unsubscribeThrowing();
-    unsubscribeLater();
   });
 });
