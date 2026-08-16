@@ -90,6 +90,7 @@ type TestDocument = {
   compact(forceVersion?: boolean): Promise<void>;
   restoreVersion(versionId: string, userId: string): Promise<Response>;
   scheduleAlarm(when: number): Promise<void>;
+  deferAlarm(when: number): Promise<void>;
   flushPendingUpdates(): void;
   transition: "archive" | "restore" | null;
   getConnections(): Array<{ close(code: number, reason: string): void }>;
@@ -1069,7 +1070,7 @@ describe("Worker integration", () => {
         expect(scheduled.at(-1)).toBeLessThan(deferredAlarm!);
       } finally {
         document.bindings = originalBindings;
-        document.scheduleAlarm = originalScheduleAlarm;
+        Reflect.deleteProperty(document, "scheduleAlarm");
         releaseNewSnapshot();
       }
     });
@@ -1153,11 +1154,11 @@ describe("Worker integration", () => {
           });
         },
       });
-      const scheduled: number[] = [];
-      const originalScheduleAlarm = document.scheduleAlarm.bind(document);
-      document.scheduleAlarm = async (when: number) => {
-        scheduled.push(when);
-        await originalScheduleAlarm(when);
+      const backoffs: number[] = [];
+      const originalDeferAlarm = document.deferAlarm.bind(document);
+      document.deferAlarm = async (when: number) => {
+        backoffs.push(when);
+        await originalDeferAlarm(when);
       };
 
       try {
@@ -1168,6 +1169,10 @@ describe("Worker integration", () => {
         await state.storage.deleteAlarm();
         await document.onAlarm();
         expect(await state.storage.getAlarm()).not.toBeNull();
+        // A restore that fails slowly leaves the alarm deferred by onAlarm
+        // already overdue, so resuming it must move the alarm out to the
+        // backoff rather than settle for the soonest pending time.
+        await state.storage.setAlarm(Date.now() - 1_000);
 
         releaseNewSnapshot();
         expect((await restoring).status).toBe(503);
@@ -1176,13 +1181,12 @@ describe("Worker integration", () => {
           state.storage.sql.exec<{ restore_pending: number }>(`SELECT restore_pending FROM document_meta`).one()
             .restore_pending,
         ).toBe(1);
-        // Resuming the deferred alarm must not pull it in front of the backoff
-        // the failed restore just asked for.
-        expect(scheduled.at(-1)).toBeGreaterThan(finishedAt);
-        expect(await state.storage.getAlarm()).toBeGreaterThan(finishedAt);
+        const backoff = backoffs.at(-1);
+        expect(backoff).toBeGreaterThan(finishedAt);
+        expect(await state.storage.getAlarm()).toBe(backoff);
       } finally {
         document.bindings = originalBindings;
-        document.scheduleAlarm = originalScheduleAlarm;
+        Reflect.deleteProperty(document, "deferAlarm");
         releaseNewSnapshot();
       }
     });

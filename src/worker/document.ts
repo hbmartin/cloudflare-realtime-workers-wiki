@@ -944,8 +944,11 @@ export class Document extends YServer {
     try {
       // The alarm deferred during the transition runs now, unless the
       // transition itself scheduled a retry — that backoff exists because the
-      // work the alarm would do is the work that just failed.
-      await this.scheduleAlarm(retryAt ?? Date.now());
+      // work the alarm would do is the work that just failed. The deferred
+      // alarm can already be overdue by then, so the backoff has to move it
+      // later rather than settle for the soonest pending time.
+      if (retryAt === null) await this.scheduleAlarm(Date.now());
+      else await this.deferAlarm(retryAt);
     } catch (error) {
       console.error("Failed to resume document alarm after transition", error);
     }
@@ -954,5 +957,12 @@ export class Document extends YServer {
   private async scheduleAlarm(when: number) {
     const existing = await this.state.storage.getAlarm();
     if (existing === null || when < existing) await this.state.storage.setAlarm(when);
+  }
+
+  // The mirror of scheduleAlarm: a backoff has to hold even when an earlier
+  // alarm is already pending or overdue, so this only ever moves the alarm out.
+  private async deferAlarm(when: number) {
+    const existing = await this.state.storage.getAlarm();
+    if (existing === null || existing < when) await this.state.storage.setAlarm(when);
   }
 }

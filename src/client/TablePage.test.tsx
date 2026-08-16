@@ -67,10 +67,12 @@ function leaseResult(leaseToken = "lease-token"): TableLeaseResponse {
   return { leaseToken, leaseDurationMs: LEASE_DURATION_MS };
 }
 
-// Lease deadlines run on the monotonic clock, which fake timers leave alone.
-// Returns an advance function so a test can age a lease without also firing the
-// expiry timer that a real elapsed interval would.
+// Installs fake timers that deliberately leave performance.now alone, then
+// stubs it separately. Lease deadlines run on the monotonic clock, so this lets
+// a test age a lease without also firing the expiry timer that a real elapsed
+// interval would. Returns the advance function.
 function stubMonotonicClock() {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
   const base = performance.now();
   let elapsed = 0;
   const now = vi.spyOn(performance, "now").mockImplementation(() => base + elapsed);
@@ -742,7 +744,7 @@ describe("TablePage", () => {
   it("polls for the authoritative revision when the post-failure reload also fails", async () => {
     vi.useFakeTimers();
     const mutations: unknown[] = [];
-    let loads = 0;
+    let reloadFailed = false;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.includes("/cells/")) {
@@ -750,10 +752,12 @@ describe("TablePage", () => {
         if (mutations.length === 1) throw new DOMException("The operation timed out.", "TimeoutError");
         return { revision: 8 };
       }
-      loads += 1;
       // The reload that follows the failed mutation fails too, so the revision
       // stays unknown until polling recovers it.
-      if (loads === 3) throw new ApiClientError(503, "table_unavailable", "Table temporarily unavailable.");
+      if (mutations.length === 1 && !reloadFailed) {
+        reloadFailed = true;
+        throw new ApiClientError(503, "table_unavailable", "Table temporarily unavailable.");
+      }
       return { table: mutations.length ? tableWithValue("Ready", 7) : table };
     });
     render(
@@ -870,7 +874,6 @@ describe("TablePage", () => {
   });
 
   it("expires a stale lease when the window regains focus", async () => {
-    vi.useFakeTimers();
     const advanceMonotonic = stubMonotonicClock();
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
@@ -906,7 +909,6 @@ describe("TablePage", () => {
   });
 
   it("does not send a mutation after the local lease deadline", async () => {
-    vi.useFakeTimers();
     const advanceMonotonic = stubMonotonicClock();
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();

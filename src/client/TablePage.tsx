@@ -18,6 +18,9 @@ const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing."
 const LEASE_EXPIRED_MESSAGE = "The editing lease expired after renewal failures. Reloaded the authoritative table.";
 const SAVE_FAILED_MESSAGE = "The table update could not be saved.";
 const REQUEST_TIMEOUT_MS = 15_000;
+// Must stay above REQUEST_TIMEOUT_MS so a renewal cannot still be in flight
+// when the next one is due.
+const LEASE_RENEWAL_INTERVAL_MS = 20_000;
 // Deadlines are scheduled with setTimeout, whose delay overflows past 2^31-1 ms
 // and fires immediately. Reject implausible durations rather than clamp them:
 // a lease that long is a broken response, not a usable one.
@@ -72,8 +75,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   const [leasePending, setLeasePending] = useState(canEdit);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
-  // Kept apart from leaseError: a successful renewal clears the lease notice
-  // every 20s and would otherwise erase an unsaved-edit warning.
+  // Kept apart from leaseError: a successful renewal clears the lease notice on
+  // every interval and would otherwise erase an unsaved-edit warning.
   const [saveError, setSaveError] = useState<string | null>(null);
   // Mirrors revisionRef for rendering: a mutation that failed with an unknown
   // outcome drops the revision, and polling has to resume to recover it.
@@ -340,7 +343,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         renewing = false;
       }
     };
-    renew = window.setInterval(() => void renewLease(), 20_000);
+    renew = window.setInterval(() => void renewLease(), LEASE_RENEWAL_INTERVAL_MS);
     document.addEventListener("visibilitychange", checkExpiry);
     window.addEventListener("focus", checkExpiry);
     window.addEventListener("pageshow", checkExpiry);
