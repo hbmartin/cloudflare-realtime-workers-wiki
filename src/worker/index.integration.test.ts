@@ -12,6 +12,7 @@ import {
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
+import type { TableLeaseResponse, TableLeaseTiming } from "../shared/types";
 import { processDeletionJob } from "./cleanup";
 import worker from "./index";
 
@@ -1050,10 +1051,12 @@ describe("Worker integration", () => {
         await state.storage.deleteAlarm();
         await document.onAlarm();
         expect(await env.BUCKET.get(newKey)).toBeTruthy();
-        expect(await state.storage.getAlarm()).not.toBeNull();
+        const deferredAlarm = await state.storage.getAlarm();
+        expect(deferredAlarm).not.toBeNull();
 
         releaseNewSnapshot();
         expect((await restoring).status).toBe(200);
+        expect(await state.storage.getAlarm()).toBeLessThan(deferredAlarm!);
       } finally {
         document.bindings = originalBindings;
         releaseNewSnapshot();
@@ -1278,8 +1281,19 @@ describe("Worker integration", () => {
           method: "POST",
         }),
       )
-    ).json<{ leaseToken: string; leaseDurationMs: number }>();
+    ).json<TableLeaseResponse>();
     expect(lease.leaseDurationMs).toBe(60_000);
+    expect(lease).not.toHaveProperty("expiresAt");
+    const renewed = await (
+      await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/tables/${tableA.id}/lease`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ leaseToken: lease.leaseToken }),
+        }),
+      )
+    ).json<TableLeaseTiming>();
+    expect(renewed).toEqual({ leaseDurationMs: 60_000 });
     const mutationBody = JSON.stringify({ leaseToken: lease.leaseToken, expectedRevision: 1 });
 
     const deleteOption = await SELF.fetch(
