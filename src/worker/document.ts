@@ -267,6 +267,7 @@ export class Document extends YServer {
   }
 
   async onAlarm() {
+    if (this.purged) return;
     if (this.metadata.restore_pending) await this.reconcilePendingRestore();
     if (this.purged || this.metadata.retired || this.metadata.restore_pending) return;
     this.flushPendingUpdates();
@@ -661,34 +662,42 @@ export class Document extends YServer {
   }
 
   private recordRestoreRecovery(recovery: RestoreRecoveryRow) {
-    this.state.storage.sql.exec(
-      `INSERT OR REPLACE INTO restore_recovery
-        (id, old_epoch, new_epoch, new_key, pre_key)
-       VALUES (1, ?, ?, ?, ?)`,
-      recovery.old_epoch,
-      recovery.new_epoch,
-      recovery.new_key,
-      recovery.pre_key,
-    );
-    this.metadata.restore_pending = 1;
-    this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO restore_recovery
+          (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, ?, ?, ?, ?)`,
+        recovery.old_epoch,
+        recovery.new_epoch,
+        recovery.new_key,
+        recovery.pre_key,
+      );
+      this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
+      this.metadata.restore_pending = 1;
+    });
   }
 
   private clearRestoreRecovery(retired: boolean) {
-    this.metadata.retired = retired ? 1 : 0;
-    this.metadata.restore_pending = 0;
-    this.state.storage.sql.exec(
-      `UPDATE document_meta SET retired = ?, restore_pending = 0 WHERE id = 1`,
-      this.metadata.retired,
-    );
-    this.state.storage.sql.exec(`DELETE FROM restore_recovery WHERE id = 1`);
+    if (this.purged) return;
+    const retiredFlag = retired ? 1 : 0;
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(
+        `UPDATE document_meta SET retired = ?, restore_pending = 0 WHERE id = 1`,
+        retiredFlag,
+      );
+      this.state.storage.sql.exec(`DELETE FROM restore_recovery WHERE id = 1`);
+      this.metadata.retired = retiredFlag;
+      this.metadata.restore_pending = 0;
+    });
   }
 
   private async deleteRestoreObjects(recovery: Pick<RestoreRecoveryRow, "new_key" | "pre_key">) {
-    await Promise.all([
+    const results = await Promise.allSettled([
       this.bindings.BUCKET.delete(recovery.new_key),
       ...(recovery.pre_key ? [this.bindings.BUCKET.delete(recovery.pre_key)] : []),
     ]);
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
   }
 
   private async deferRestoreReconciliation(error: unknown) {
@@ -712,6 +721,7 @@ export class Document extends YServer {
       await this.deferRestoreReconciliation(error);
       return false;
     }
+    if (this.purged) return false;
 
     if (!recovery) {
       this.clearRestoreRecovery(!current || current.content_epoch !== epoch);
@@ -725,12 +735,27 @@ export class Document extends YServer {
         await this.deferRestoreReconciliation(error);
         return false;
       }
+      if (this.purged) return false;
       this.clearRestoreRecovery(false);
       return true;
     }
 
-    // The new epoch, a later epoch, or a deleted page all retire this room.
-    // The restore objects must be retained because the D1 batch may reference them.
+    try {
+      if (!current) {
+        await this.deleteRestoreObjects(recovery);
+      } else if (current.content_epoch > recovery.new_epoch) {
+        // The pre-restore version may still be referenced by page_versions, but
+        // a superseded epoch snapshot is no longer reachable from D1.
+        await this.deleteRestoreObjects({ new_key: recovery.new_key, pre_key: null });
+      }
+    } catch (error) {
+      await this.deferRestoreReconciliation(error);
+      return false;
+    }
+    if (this.purged) return false;
+
+    // At the committed new epoch, the epoch snapshot is current and the
+    // pre-restore version may be referenced by page_versions.
     this.clearRestoreRecovery(true);
     return true;
   }

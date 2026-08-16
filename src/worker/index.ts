@@ -17,7 +17,7 @@ import {
   sha256,
 } from "./http";
 import { columnType, nullableId, object, pageKind, role, text } from "../shared/validation";
-import type { Page, WorkspaceEvent } from "../shared/types";
+import type { ClientMemberContext, Page, WorkspaceEvent } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
@@ -283,7 +283,12 @@ app.all("/api/auth/*", async (c) => {
 
 app.get("/api/me", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  return c.json(member);
+  const context: ClientMemberContext = {
+    user: member.user,
+    workspace: member.workspace,
+    role: member.role,
+  };
+  return c.json(context);
 });
 
 app.get("/api/health", async (c) => {

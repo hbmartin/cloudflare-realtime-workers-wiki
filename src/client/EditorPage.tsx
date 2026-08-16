@@ -5,7 +5,7 @@ import { SuggestionMenuController, ThreadsSidebar, useCreateBlockNote } from "@b
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
-import type { MemberContext } from "../shared/types";
+import type { ClientMemberContext } from "../shared/types";
 import type { MentionSuggestion, Page } from "../shared/types";
 import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { diffBlockIds } from "../shared/block-diff";
@@ -17,9 +17,10 @@ import { notesSchema } from "./mentions";
 
 export type EditorPageProps = {
   page: Page;
-  member: MemberContext;
+  member: ClientMemberContext;
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
+  onAuthorizationError: (pageId: string, error: ApiClientError) => void;
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
 };
@@ -29,6 +30,7 @@ export function EditorPage({
   member,
   onPageChanged,
   onPageUnavailable,
+  onAuthorizationError,
   onSelectPage,
   backlinksRevision,
 }: EditorPageProps) {
@@ -98,6 +100,7 @@ export function EditorPage({
       quarantine,
       onPageChanged,
       onPageUnavailable,
+      onAuthorizationError,
     });
     const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
     const connectionSync = (synced: boolean) => closeReconciler.handleSync(synced);
@@ -112,7 +115,16 @@ export function EditorPage({
       next.destroy();
       setBundle(null);
     };
-  }, [member.role, member.workspace.id, onPageChanged, onPageUnavailable, page.id, page.contentEpoch, recoveryKey]);
+  }, [
+    member.role,
+    member.workspace.id,
+    onAuthorizationError,
+    onPageChanged,
+    onPageUnavailable,
+    page.id,
+    page.contentEpoch,
+    recoveryKey,
+  ]);
 
   async function saveTitle() {
     if (!titleDirtyRef.current) {
@@ -425,7 +437,7 @@ class ReadOnlyThreadStoreAuth extends ThreadStoreAuth {
   }
 }
 
-function editorOptions(bundle: CollaborationBundle, member: MemberContext, editable: boolean) {
+function editorOptions(bundle: CollaborationBundle, member: ClientMemberContext, editable: boolean) {
   const threadStore = new YjsThreadStore(
     member.user.id,
     bundle.doc.getMap("comments"),
@@ -461,7 +473,7 @@ function CollaborativeEditor({
   commentsOpen,
 }: {
   bundle: CollaborationBundle;
-  member: MemberContext;
+  member: ClientMemberContext;
   editable: boolean;
   commentsOpen: boolean;
 }) {
@@ -520,7 +532,7 @@ function HistoryPanel({
   onRestored,
 }: {
   page: Page;
-  member: MemberContext;
+  member: ClientMemberContext;
   current: Y.Doc | null;
   onRestored: (epoch: number) => void;
 }) {

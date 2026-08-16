@@ -4,12 +4,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
 
 const localBaseURL = "http://127.0.0.1:4173";
-const baseURL = process.env.NOTES_LOAD_BASE_URL ?? localBaseURL;
-const connectionCount = Number.parseInt(process.env.NOTES_LOAD_CONNECTIONS ?? "30", 10);
-const holdMilliseconds = Number.parseInt(process.env.NOTES_LOAD_HOLD_MS ?? "5000", 10);
-const email = process.env.NOTES_LOAD_EMAIL ?? "owner@example.test";
-const password = process.env.NOTES_LOAD_PASSWORD ?? "password123";
-const token = process.env.NOTES_LOAD_BOOTSTRAP_TOKEN ?? "e2e-bootstrap-token";
+const baseURL = process.env.NOTES_LOAD_BASE_URL || localBaseURL;
+const connectionCount = Number.parseInt(process.env.NOTES_LOAD_CONNECTIONS || "30", 10);
+const holdMilliseconds = Number.parseInt(process.env.NOTES_LOAD_HOLD_MS || "5000", 10);
+const email = process.env.NOTES_LOAD_EMAIL || "owner@example.test";
+const password = process.env.NOTES_LOAD_PASSWORD || "password123";
+const token = process.env.NOTES_LOAD_BOOTSTRAP_TOKEN || "e2e-bootstrap-token";
 let server;
 
 if (!Number.isInteger(connectionCount) || connectionCount < 1 || connectionCount > 100) {
@@ -72,7 +72,7 @@ try {
   await waitForHealth();
   const cookie = await authenticate();
   if (!cookie) throw new Error("Authentication did not return a session cookie.");
-  const treeResponse = await fetch(`${baseURL}/api/pages/tree`, { headers: { cookie } });
+  const treeResponse = await fetch(`${baseURL}/api/pages/tree`, { headers: { cookie, origin: baseURL } });
   if (!treeResponse.ok) throw new Error(`Page tree failed (${treeResponse.status}).`);
   const { pages } = await treeResponse.json();
   const page = pages.find((item) => item.kind === "document");
@@ -94,12 +94,15 @@ try {
   );
   console.log(`Opened ${sockets.length} authenticated realtime connections.`);
   await delay(holdMilliseconds);
-  await Promise.all(
+  const closed = await Promise.all(
     sockets.map(async (socket) => {
       socket.close(1000, "load check complete");
-      await Promise.race([once(socket, "close"), delay(5_000)]);
+      return Promise.race([once(socket, "close").then(() => true), delay(5_000).then(() => false)]);
     }),
   );
+  const lingering = sockets.filter((_, index) => !closed[index]);
+  for (const socket of lingering) socket.terminate();
+  if (lingering.length) console.warn(`Force-closed ${lingering.length} realtime connections after cleanup timed out.`);
 } finally {
   server?.kill("SIGTERM");
 }

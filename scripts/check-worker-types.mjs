@@ -29,24 +29,27 @@ try {
     { cwd: root, encoding: "utf8", stdio: "pipe" },
   );
   if (result.error) {
-    console.error(`Failed to start ${pnpm}: ${result.error.message}`);
-    process.exit(1);
+    throw new Error(`Failed to start ${pnpm}: ${result.error.message}`, { cause: result.error });
   }
   if (result.status !== 0) {
     process.stderr.write(result.stderr);
-    process.exit(result.status ?? 1);
-  }
-
-  const checked = portable(readFileSync(checkedPath, "utf8"));
-  const generated = portable(readFileSync(generatedPath, "utf8"));
-  if (checked !== generated) {
-    const checkedLines = checked.split("\n");
-    const generatedLines = generated.split("\n");
-    const line = checkedLines.findIndex((value, index) => value !== generatedLines[index]);
-    console.error(`worker-configuration.d.ts is out of date near line ${line + 1}. Run pnpm cf-typegen.`);
-    process.exitCode = 1;
+    process.exitCode = result.status ?? 1;
   } else {
-    console.log("worker-configuration.d.ts bindings are up to date.");
+    const checked = portable(readFileSync(checkedPath, "utf8"));
+    const generated = portable(readFileSync(generatedPath, "utf8"));
+    if (checked !== generated) {
+      const checkedLines = checked.split("\n");
+      const generatedLines = generated.split("\n");
+      const sharedLineCount = Math.min(checkedLines.length, generatedLines.length);
+      const mismatch = checkedLines
+        .slice(0, sharedLineCount)
+        .findIndex((value, index) => value !== generatedLines[index]);
+      const line = mismatch === -1 ? sharedLineCount + 1 : mismatch + 1;
+      console.error(`worker-configuration.d.ts is out of date near line ${line}. Run pnpm cf-typegen.`);
+      process.exitCode = 1;
+    } else {
+      console.log("worker-configuration.d.ts bindings are up to date.");
+    }
   }
 } finally {
   rmSync(generatedPath, { force: true });

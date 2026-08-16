@@ -27,21 +27,23 @@ const page: Page = {
   updatedAt: 1,
 };
 
-function setup() {
-  const provider = { connect: vi.fn(), disconnect: vi.fn() };
+function setup(hasUnsyncedChanges = false) {
+  const provider = { connect: vi.fn(async () => undefined), disconnect: vi.fn() };
   const quarantine = vi.fn();
   const onPageChanged = vi.fn();
   const onPageUnavailable = vi.fn();
+  const onAuthorizationError = vi.fn();
   const reconciler = createDocumentCloseReconciler({
     page,
     provider,
     canQuarantine: true,
-    hasUnsyncedChanges: () => false,
+    hasUnsyncedChanges: () => hasUnsyncedChanges,
     quarantine,
     onPageChanged,
     onPageUnavailable,
+    onAuthorizationError,
   });
-  return { provider, quarantine, onPageChanged, onPageUnavailable, reconciler };
+  return { provider, quarantine, onPageChanged, onPageUnavailable, onAuthorizationError, reconciler };
 }
 
 async function flushPromises() {
@@ -58,6 +60,7 @@ describe("document close reconciliation", () => {
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it("backs off before reconnecting a transition room whose epoch has not changed", async () => {
@@ -78,6 +81,45 @@ describe("document close reconciliation", () => {
     expect(provider.connect).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1);
     expect(provider.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("handles a rejected transition reconnect", async () => {
+    mocks.api.mockResolvedValue({ page });
+    const { provider, reconciler } = setup();
+    const error = new Error("connection parameters unavailable");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    provider.connect.mockRejectedValueOnce(error);
+
+    reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(logged).toHaveBeenCalledWith("Failed to reconnect document collaboration", error);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(provider.connect).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(provider.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("quarantines unsynced changes when a restore transition closes the room", async () => {
+    mocks.api.mockResolvedValue({ page });
+    const { quarantine, reconciler } = setup(true);
+
+    reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
+    await flushPromises();
+
+    expect(quarantine).toHaveBeenCalledOnce();
+  });
+
+  it("quarantines unsynced changes when reconciliation discovers a new epoch", async () => {
+    mocks.api.mockResolvedValue({ page: { ...page, contentEpoch: 2 } });
+    const { quarantine, onPageChanged, reconciler } = setup(true);
+
+    reconciler.handleClose(new CloseEvent("close", { code: 1006 }));
+    await flushPromises();
+
+    expect(quarantine).toHaveBeenCalledOnce();
+    expect(onPageChanged).toHaveBeenCalledWith({ ...page, contentEpoch: 2 });
   });
 
   it("cancels an earlier retry when the room is permanently deleted", async () => {
@@ -103,5 +145,17 @@ describe("document close reconciliation", () => {
 
     expect(provider.disconnect).toHaveBeenCalledOnce();
     expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
+  });
+
+  it.each([401, 403])("reports an authorization failure when reconciliation returns %i", async (status) => {
+    mocks.api.mockRejectedValue(new ApiClientError(status, "access_error", "Access failed"));
+    const { provider, onPageUnavailable, onAuthorizationError, reconciler } = setup();
+
+    reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
+    await flushPromises();
+
+    expect(provider.disconnect).toHaveBeenCalledTimes(2);
+    expect(onPageUnavailable).not.toHaveBeenCalled();
+    expect(onAuthorizationError).toHaveBeenCalledWith(page.id, expect.objectContaining({ status }));
   });
 });

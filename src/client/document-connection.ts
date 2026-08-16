@@ -14,6 +14,7 @@ export type DocumentCloseReconcilerOptions = {
   quarantine: () => void;
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
+  onAuthorizationError: (pageId: string, error: ApiClientError) => void;
 };
 
 const TRANSITION_CLOSE_CODES = new Set([4410, 4412]);
@@ -31,6 +32,7 @@ export function createDocumentCloseReconciler({
   quarantine,
   onPageChanged,
   onPageUnavailable,
+  onAuthorizationError,
 }: DocumentCloseReconcilerOptions) {
   let active = true;
   let closeCheck = 0;
@@ -57,6 +59,15 @@ export function createDocumentCloseReconciler({
       callback();
     }, delay);
   };
+  const connect = async (check: number) => {
+    try {
+      await provider.connect();
+    } catch (error) {
+      if (!active || check !== closeCheck) return;
+      console.error("Failed to reconnect document collaboration", error);
+      schedule(() => void connect(check), retryDelay(reconnectAttempt++));
+    }
+  };
 
   const reconcileClose = async (code: number, check: number, attempt = 0): Promise<void> => {
     try {
@@ -74,14 +85,22 @@ export function createDocumentCloseReconciler({
       } else if (TRANSITION_CLOSE_CODES.has(code)) {
         const delay = retryDelay(reconnectAttempt++);
         schedule(() => {
-          if (active && check === closeCheck) void provider.connect();
+          if (active && check === closeCheck) void connect(check);
         }, delay);
       }
     } catch (error) {
       if (!active || check !== closeCheck) return;
-      if (error instanceof ApiClientError && [401, 403, 404].includes(error.status)) {
-        unavailable();
-        return;
+      if (error instanceof ApiClientError) {
+        if (error.status === 404) {
+          unavailable();
+          return;
+        }
+        if (error.status === 401 || error.status === 403) {
+          invalidate();
+          provider.disconnect();
+          onAuthorizationError(page.id, error);
+          return;
+        }
       }
       const retryable = !(error instanceof ApiClientError) || error.status === 429 || error.status >= 500;
       if (!TRANSITION_CLOSE_CODES.has(code)) return;

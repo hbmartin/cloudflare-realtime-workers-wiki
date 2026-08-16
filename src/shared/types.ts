@@ -21,6 +21,8 @@ export type MemberContext = {
   role: Role;
 };
 
+export type ClientMemberContext = Omit<MemberContext, "session">;
+
 export type Page = {
   id: string;
   workspaceId: string;

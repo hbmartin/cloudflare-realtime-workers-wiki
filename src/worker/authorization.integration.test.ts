@@ -25,7 +25,8 @@ async function bootstrap(): Promise<InstalledWorkspace> {
   });
   expect(response.status).toBe(200);
   const cookie = response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
-  const me = await (await SELF.fetch(request(cookie, "/api/me"))).json<{ user: { id: string } }>();
+  const me = await (await SELF.fetch(request(cookie, "/api/me"))).json<{ user: { id: string }; session?: unknown }>();
+  expect(me).not.toHaveProperty("session");
   const tree = await (await SELF.fetch(request(cookie, "/api/pages/tree"))).json<{ pages: Array<{ id: string }> }>();
   return { cookie, userId: me.user.id, pageId: tree.pages[0]!.id };
 }
