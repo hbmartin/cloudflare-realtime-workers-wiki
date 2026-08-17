@@ -89,10 +89,13 @@ type TestDocument = {
   onRequest(request: Request): Promise<Response>;
   compact(forceVersion?: boolean): Promise<void>;
   restoreVersion(versionId: string, userId: string): Promise<Response>;
+  finishTransition(): Promise<void>;
   scheduleAlarm(when: number): Promise<void>;
   deferAlarm(when: number): Promise<void>;
   flushPendingUpdates(): void;
   transition: "archive" | "restore" | null;
+  transitionAlarmDeferred: boolean;
+  transitionRetryAt: number | null;
   getConnections(): Array<{ close(code: number, reason: string): void }>;
   bindings: Cloudflare.Env;
   metadata: { retired: number; restore_pending: number };
@@ -1192,6 +1195,26 @@ describe("Worker integration", () => {
     });
   });
 
+  it("keeps the reconciliation backoff when an earlier alarm has not fired", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      const earlierAlarm = Date.now() + 1_000;
+      const retryAt = Date.now() + 10_000;
+      await state.storage.setAlarm(earlierAlarm);
+      document.transition = "restore";
+      document.transitionAlarmDeferred = false;
+      document.transitionRetryAt = retryAt;
+
+      await document.finishTransition();
+
+      expect(await state.storage.getAlarm()).toBe(retryAt);
+    });
+  });
+
   it("rejects a concurrent restore before it can share the next epoch snapshot key", async () => {
     const installed = await bootstrap();
     const room = `${installed.pageId}~1`;
@@ -1449,6 +1472,62 @@ describe("Worker integration", () => {
           .first<{ revision: number }>()
       )?.revision,
     ).toBe(1);
+  });
+
+  it("distinguishes a stale table revision from a lost editing lease", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const columnId = crypto.randomUUID();
+    const rowId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Text', 'text', 0)`,
+      ).bind(columnId, tablePage.id),
+      env.DB.prepare(
+        `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
+      ).bind(rowId, tablePage.id, installed.userId, timestamp, timestamp),
+    ]);
+    const lease = await (
+      await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/lease`, {
+          method: "POST",
+        }),
+      )
+    ).json<TableLeaseResponse>();
+    await env.DB.prepare(`UPDATE table_state SET revision = 2 WHERE page_id = ?`).bind(tablePage.id).run();
+    const cellPath = `/api/tables/${tablePage.id}/cells/${rowId}/${columnId}`;
+
+    const staleRevision = await SELF.fetch(
+      authenticatedRequest(installed.cookie, cellPath, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ leaseToken: lease.leaseToken, expectedRevision: 1, value: "stale" }),
+      }),
+    );
+
+    expect(staleRevision.status).toBe(409);
+    expect(await staleRevision.json()).toMatchObject({ error: { code: "table_revision_conflict" } });
+
+    const retried = await SELF.fetch(
+      authenticatedRequest(installed.cookie, cellPath, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ leaseToken: lease.leaseToken, expectedRevision: 2, value: "saved" }),
+      }),
+    );
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toMatchObject({ revision: 3 });
+
+    const lostLease = await SELF.fetch(
+      authenticatedRequest(installed.cookie, cellPath, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ leaseToken: "wrong-token", expectedRevision: 3, value: "lost" }),
+      }),
+    );
+    expect(lostLease.status).toBe(409);
+    expect(await lostLease.json()).toMatchObject({ error: { code: "table_lease_lost" } });
   });
 
   it("paginates mention traversal before advancing the read watermark", async () => {

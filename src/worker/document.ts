@@ -937,18 +937,16 @@ export class Document extends YServer {
     this.transition = null;
     const retryAt = this.transitionRetryAt;
     this.transitionRetryAt = null;
-    if (!this.transitionAlarmDeferred) return;
+    const alarmWasDeferred = this.transitionAlarmDeferred;
     this.transitionAlarmDeferred = false;
     if (this.purged) return;
-    await this.transitionAlarmRearm?.catch(() => undefined);
+    if (alarmWasDeferred) await this.transitionAlarmRearm?.catch(() => undefined);
     try {
-      // The alarm deferred during the transition runs now, unless the
-      // transition itself scheduled a retry — that backoff exists because the
-      // work the alarm would do is the work that just failed. The deferred
-      // alarm can already be overdue by then, so the backoff has to move it
-      // later rather than settle for the soonest pending time.
-      if (retryAt === null) await this.scheduleAlarm(Date.now());
-      else await this.deferAlarm(retryAt);
+      // A transition retry must move any existing alarm out to its backoff even
+      // when that earlier alarm never fired during the transition. Otherwise a
+      // pre-existing alarm can immediately retry the dependency that just failed.
+      if (retryAt !== null) await this.deferAlarm(retryAt);
+      else if (alarmWasDeferred) await this.scheduleAlarm(Date.now());
     } catch (error) {
       console.error("Failed to resume document alarm after transition", error);
     }

@@ -68,9 +68,8 @@ function leaseResult(leaseToken = "lease-token"): TableLeaseResponse {
 }
 
 // Installs fake timers that deliberately leave performance.now alone, then
-// stubs it separately. Lease deadlines run on the monotonic clock, so this lets
-// a test age a lease without also firing the expiry timer that a real elapsed
-// interval would. Returns the advance function.
+// stubs it separately. This lets tests advance either lease clock without also
+// firing the scheduled expiry timer. Returns the monotonic advance function.
 function stubMonotonicClock() {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
   const base = performance.now();
@@ -190,16 +189,19 @@ describe("TablePage", () => {
     });
   });
 
-  it("continues queued edits after a mutation times out", async () => {
-    let mutations = 0;
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+  it("waits for revision recovery before running an already queued edit", async () => {
+    const firstMutation = deferred<{ revision: number }>();
+    const recovery = deferred<{ table: TableData }>();
+    const mutations: Array<Record<string, unknown>> = [];
+    let loads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
       if (path.includes("/cells/")) {
-        mutations += 1;
-        if (mutations === 1) throw new DOMException("The operation timed out.", "TimeoutError");
-        return { revision: 2 };
+        mutations.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return mutations.length === 1 ? firstMutation.promise : Promise.resolve({ revision: 8 });
       }
-      return { table };
+      loads += 1;
+      return loads === 3 ? recovery.promise : Promise.resolve({ table });
     });
     render(
       <TablePage
@@ -215,15 +217,24 @@ describe("TablePage", () => {
     const input = screen.getByDisplayValue("Ready");
     fireEvent.change(input, { target: { value: "First" } });
     fireEvent.blur(input);
-    expect(await screen.findByText("The table update could not be saved.")).toBeInTheDocument();
+    await waitFor(() => expect(mutations).toHaveLength(1));
 
     fireEvent.change(input, { target: { value: "Second" } });
     fireEvent.blur(input);
-    await waitFor(() => expect(mutations).toBe(2));
-    expect(api).toHaveBeenCalledWith(
-      "/api/tables/table-page/cells/row/status",
-      expect.objectContaining({ method: "PUT", signal: expect.any(AbortSignal) }),
-    );
+    firstMutation.reject(new DOMException("The operation timed out.", "TimeoutError"));
+
+    expect(await screen.findByText("The table update could not be saved.")).toBeInTheDocument();
+    expect(screen.getByText("Editing paused while table reloads")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Second")).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "+ Property" })).not.toBeInTheDocument();
+    expect(mutations).toHaveLength(1);
+
+    recovery.resolve({ table: tableWithValue("Ready", 7) });
+
+    await waitFor(() => expect(mutations).toHaveLength(2));
+    expect(mutations[1]).toMatchObject({ expectedRevision: 7, value: "Second" });
+    expect(await screen.findByDisplayValue("Second")).toBeEnabled();
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
   });
 
   it("restarts automatic lease acquisition after Strict Mode replays the effect", async () => {
@@ -353,6 +364,9 @@ describe("TablePage", () => {
       await Promise.resolve();
     });
     expect(screen.getByDisplayValue("Initial")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Initial")).toBeDisabled();
+    expect(screen.getByText("Editing paused while table reloads")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "+ Property" })).not.toBeInTheDocument();
     expect(loadCount).toBe(2);
 
     await act(async () => {
@@ -360,6 +374,7 @@ describe("TablePage", () => {
       await Promise.resolve();
     });
     expect(screen.getByDisplayValue("Initial")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Initial")).toBeDisabled();
     expect(screen.getByText("Table temporarily unavailable.")).toBeInTheDocument();
   });
 
@@ -733,12 +748,57 @@ describe("TablePage", () => {
     fireEvent.blur(input);
     expect(await screen.findByText("The table update could not be saved.")).toBeInTheDocument();
 
-    fireEvent.change(input, { target: { value: "Second" } });
-    fireEvent.blur(input);
+    const recoveredInput = screen.getByDisplayValue("Ready");
+    fireEvent.change(recoveredInput, { target: { value: "Second" } });
+    fireEvent.blur(recoveredInput);
     await waitFor(() => expect(mutations).toHaveLength(2));
     expect(mutations[1]).toMatchObject({ expectedRevision: 7 });
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
     expect(screen.queryByText("The table update could not be saved.")).not.toBeInTheDocument();
+  });
+
+  it("resyncs and retries a revision-only conflict without releasing the lease", async () => {
+    const mutations: Array<Record<string, unknown>> = [];
+    let loads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.includes("/cells/")) {
+        mutations.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (mutations.length === 1) throw new DOMException("The operation timed out.", "TimeoutError");
+        if (mutations.length === 2) {
+          throw new ApiClientError(409, "table_revision_conflict", "The table changed. Reloading before retrying.");
+        }
+        return { revision: 3 };
+      }
+      loads += 1;
+      if (loads === 4) return { table: tableWithValue("First", 2) };
+      return { table };
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    expect(await screen.findByText("Editing lease active")).toBeInTheDocument();
+    const firstInput = screen.getByDisplayValue("Ready");
+    fireEvent.change(firstInput, { target: { value: "First" } });
+    fireEvent.blur(firstInput);
+    await waitFor(() => expect(loads).toBe(3));
+
+    const secondInput = screen.getByDisplayValue("Ready");
+    fireEvent.change(secondInput, { target: { value: "Second" } });
+    fireEvent.blur(secondInput);
+
+    await waitFor(() => expect(mutations).toHaveLength(3));
+    expect(mutations.map((body) => body.expectedRevision)).toEqual([1, 1, 2]);
+    expect(await screen.findByDisplayValue("Second")).toBeEnabled();
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+    expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "DELETE" }));
   });
 
   it("polls for the authoritative revision when the post-failure reload also fails", async () => {
@@ -783,11 +843,17 @@ describe("TablePage", () => {
       await Promise.resolve();
     });
     expect(screen.getByText("Table temporarily unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("Editing paused while table reloads")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("First")).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "+ Property" })).not.toBeInTheDocument();
+    expect(mutations).toHaveLength(1);
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
 
-    fireEvent.change(input, { target: { value: "Second" } });
-    fireEvent.blur(input);
+    const recoveredInput = screen.getByDisplayValue("Ready");
+    expect(recoveredInput).toBeEnabled();
+    fireEvent.change(recoveredInput, { target: { value: "Second" } });
+    fireEvent.blur(recoveredInput);
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -897,6 +963,42 @@ describe("TablePage", () => {
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
 
     advanceMonotonic(LEASE_DURATION_MS + 1);
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(
+      screen.getByText("The editing lease expired after renewal failures. Reloaded the authoritative table."),
+    ).toBeInTheDocument();
+  });
+
+  it("expires a lease after system sleep even when the monotonic clock pauses", async () => {
+    stubMonotonicClock();
+    const acquiredAt = Date.now();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      return { table };
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+
+    vi.setSystemTime(acquiredAt + LEASE_DURATION_MS + 1);
     await act(async () => {
       window.dispatchEvent(new Event("focus"));
       await Promise.resolve();
