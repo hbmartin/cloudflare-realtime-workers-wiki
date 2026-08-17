@@ -12,6 +12,7 @@ import {
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
+import type { TableLeaseResponse, TableLeaseTiming } from "../shared/types";
 import { processDeletionJob } from "./cleanup";
 import worker from "./index";
 
@@ -89,6 +90,7 @@ type TestDocument = {
   compact(forceVersion?: boolean): Promise<void>;
   restoreVersion(versionId: string, userId: string): Promise<Response>;
   scheduleAlarm(when: number): Promise<void>;
+  deferAlarm(when: number): Promise<void>;
   flushPendingUpdates(): void;
   transition: "archive" | "restore" | null;
   getConnections(): Array<{ close(code: number, reason: string): void }>;
@@ -1038,6 +1040,16 @@ describe("Worker integration", () => {
         },
       });
 
+      // Record every requested alarm time: reading storage after the restore
+      // resolves races the runtime delivering the (immediately due) alarm,
+      // which clears the stored value.
+      const scheduled: number[] = [];
+      const originalScheduleAlarm = document.scheduleAlarm.bind(document);
+      document.scheduleAlarm = async (when: number) => {
+        scheduled.push(when);
+        await originalScheduleAlarm(when);
+      };
+
       try {
         const restoring = document.restoreVersion(version!.id, installed.userId);
         await newSnapshotStored;
@@ -1050,17 +1062,134 @@ describe("Worker integration", () => {
         await state.storage.deleteAlarm();
         await document.onAlarm();
         expect(await env.BUCKET.get(newKey)).toBeTruthy();
-        expect(await state.storage.getAlarm()).not.toBeNull();
+        const deferredAlarm = await state.storage.getAlarm();
+        expect(deferredAlarm).not.toBeNull();
 
         releaseNewSnapshot();
         expect((await restoring).status).toBe(200);
+        expect(scheduled.at(-1)).toBeLessThan(deferredAlarm!);
       } finally {
         document.bindings = originalBindings;
+        Reflect.deleteProperty(document, "scheduleAlarm");
         releaseNewSnapshot();
       }
     });
 
     expect(await env.BUCKET.get(newKey)).toBeTruthy();
+  });
+
+  it("keeps the reconciliation backoff when a deferred alarm resumes after a failed restore", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      document.document.getMap("restore-alarm-backoff").set("value", 1);
+      await document.onSave();
+      await document.compact(true);
+    });
+    const version = await env.DB.prepare(
+      `SELECT id FROM page_versions WHERE page_id = ? ORDER BY created_at DESC LIMIT 1`,
+    )
+      .bind(installed.pageId)
+      .first<{ id: string }>();
+    expect(version).toBeTruthy();
+    const newKey = `documents/${installed.pageId}/epochs/2/current.bin`;
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      const originalBindings = document.bindings;
+      const bucket = originalBindings.BUCKET;
+      let releaseNewSnapshot!: () => void;
+      let markNewSnapshotStored!: () => void;
+      const newSnapshotGate = new Promise<void>((resolve) => {
+        releaseNewSnapshot = resolve;
+      });
+      const newSnapshotStored = new Promise<void>((resolve) => {
+        markNewSnapshotStored = resolve;
+      });
+      // The commit fails and its confirmation lookup fails too, so the restore
+      // ends with an unknown commit state and schedules a reconciliation retry.
+      const unavailableDatabase = new Proxy(originalBindings.DB, {
+        get(target, property, receiver) {
+          if (property === "batch")
+            return async () => {
+              throw new Error("D1 batch unavailable");
+            };
+          if (property !== "prepare") return Reflect.get(target, property, receiver);
+          return (query: string) => {
+            const statement = target.prepare(query);
+            if (!query.includes("SELECT content_epoch FROM pages WHERE id = ?")) return statement;
+            return {
+              bind: (...args: unknown[]) => {
+                statement.bind(...args);
+                return {
+                  first: async () => {
+                    throw new Error("D1 confirmation unavailable");
+                  },
+                };
+              },
+            };
+          };
+        },
+      });
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property === "DB") return unavailableDatabase;
+          if (property !== "BUCKET") return Reflect.get(target, property, receiver);
+          return new Proxy(bucket, {
+            get(bucketTarget, bucketProperty) {
+              if (bucketProperty === "put")
+                return async (...args: any[]) => {
+                  const result = await Reflect.apply(bucketTarget.put, bucketTarget, args);
+                  if (args[0] === newKey) {
+                    markNewSnapshotStored();
+                    await newSnapshotGate;
+                  }
+                  return result;
+                };
+              const value = Reflect.get(bucketTarget, bucketProperty, bucketTarget);
+              return typeof value === "function" ? value.bind(bucketTarget) : value;
+            },
+          });
+        },
+      });
+      const backoffs: number[] = [];
+      const originalDeferAlarm = document.deferAlarm.bind(document);
+      document.deferAlarm = async (when: number) => {
+        backoffs.push(when);
+        await originalDeferAlarm(when);
+      };
+
+      try {
+        const restoring = document.restoreVersion(version!.id, installed.userId);
+        await newSnapshotStored;
+        expect(document.transition).toBe("restore");
+
+        await state.storage.deleteAlarm();
+        await document.onAlarm();
+        expect(await state.storage.getAlarm()).not.toBeNull();
+        // A restore that fails slowly leaves the alarm deferred by onAlarm
+        // already overdue, so resuming it must move the alarm out to the
+        // backoff rather than settle for the soonest pending time.
+        await state.storage.setAlarm(Date.now() - 1_000);
+
+        releaseNewSnapshot();
+        expect((await restoring).status).toBe(503);
+        const finishedAt = Date.now();
+        expect(
+          state.storage.sql.exec<{ restore_pending: number }>(`SELECT restore_pending FROM document_meta`).one()
+            .restore_pending,
+        ).toBe(1);
+        const backoff = backoffs.at(-1);
+        expect(backoff).toBeGreaterThan(finishedAt);
+        expect(await state.storage.getAlarm()).toBe(backoff);
+      } finally {
+        document.bindings = originalBindings;
+        Reflect.deleteProperty(document, "deferAlarm");
+        releaseNewSnapshot();
+      }
+    });
   });
 
   it("rejects a concurrent restore before it can share the next epoch snapshot key", async () => {
@@ -1278,8 +1407,19 @@ describe("Worker integration", () => {
           method: "POST",
         }),
       )
-    ).json<{ leaseToken: string; leaseDurationMs: number }>();
+    ).json<TableLeaseResponse>();
     expect(lease.leaseDurationMs).toBe(60_000);
+    expect(lease).not.toHaveProperty("expiresAt");
+    const renewed = await (
+      await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/tables/${tableA.id}/lease`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ leaseToken: lease.leaseToken }),
+        }),
+      )
+    ).json<TableLeaseTiming>();
+    expect(renewed).toEqual({ leaseDurationMs: 60_000 });
     const mutationBody = JSON.stringify({ leaseToken: lease.leaseToken, expectedRevision: 1 });
 
     const deleteOption = await SELF.fetch(

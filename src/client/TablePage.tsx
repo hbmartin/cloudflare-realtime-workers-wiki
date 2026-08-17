@@ -1,15 +1,51 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ClientMemberContext } from "../shared/types";
-import type { ColumnType, Page, TableColumn, TableData, TableRow } from "../shared/types";
+import type {
+  ColumnType,
+  Page,
+  TableColumn,
+  TableData,
+  TableLeaseResponse,
+  TableLeaseTiming,
+  TableRow,
+} from "../shared/types";
 import { ApiClientError, api, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 
 type IsCurrent = () => boolean;
 
 const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing.";
+const LEASE_EXPIRED_MESSAGE = "The editing lease expired after renewal failures. Reloaded the authoritative table.";
+const SAVE_FAILED_MESSAGE = "The table update could not be saved.";
 const REQUEST_TIMEOUT_MS = 15_000;
+// Must stay above REQUEST_TIMEOUT_MS so a renewal cannot still be in flight
+// when the next one is due.
+const LEASE_RENEWAL_INTERVAL_MS = 20_000;
+// Deadlines are scheduled with setTimeout, whose delay overflows past 2^31-1 ms
+// and fires immediately. Reject implausible durations rather than clamp them:
+// a lease that long is a broken response, not a usable one.
+const MAX_LEASE_DURATION_MS = 24 * 60 * 60 * 1_000;
 
-type LeaseTiming = { leaseDurationMs: number };
+// Distinguishable from a transport failure so renewal can fail closed on it.
+class LeaseResponseError extends Error {
+  constructor() {
+    super("The lease service returned an invalid response.");
+    this.name = "LeaseResponseError";
+  }
+}
+
+function assertLeaseTiming(value: unknown): asserts value is TableLeaseTiming {
+  const duration = (value as { leaseDurationMs?: unknown } | null)?.leaseDurationMs;
+  if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0 || duration > MAX_LEASE_DURATION_MS) {
+    throw new LeaseResponseError();
+  }
+}
+
+function assertLeaseResponse(value: unknown): asserts value is TableLeaseResponse {
+  assertLeaseTiming(value);
+  const token = (value as { leaseToken?: unknown }).leaseToken;
+  if (typeof token !== "string" || !token) throw new LeaseResponseError();
+}
 
 function releaseTableLease(pageId: string, leaseToken: string) {
   void api(`/api/tables/${pageId}/lease`, {
@@ -39,6 +75,12 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   const [leasePending, setLeasePending] = useState(canEdit);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
+  // Kept apart from leaseError: a successful renewal clears the lease notice on
+  // every interval and would otherwise erase an unsaved-edit warning.
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // Mirrors revisionRef for rendering: a mutation that failed with an unknown
+  // outcome drops the revision, and polling has to resume to recover it.
+  const [revisionKnown, setRevisionKnown] = useState(false);
   const [filter, setFilter] = useState("");
   const [sortColumn, setSortColumn] = useState<string | null>(null);
   const [title, setTitle] = useState(page.title);
@@ -73,6 +115,13 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     leaseDeadlineRef.current = null;
     setLeaseToken(null);
   }, []);
+  // Deadlines live on the monotonic clock so an NTP correction or a suspended
+  // laptop cannot make an expired lease look live (or vice versa). A missing
+  // deadline counts as expired everywhere this is asked.
+  const isLeaseExpired = useCallback(
+    () => leaseDeadlineRef.current === null || performance.now() >= leaseDeadlineRef.current,
+    [],
+  );
 
   const load = useCallback(
     async (isCurrent: IsCurrent) => {
@@ -85,6 +134,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         });
         if (!isCurrent() || generation !== loadGenerationRef.current) return;
         revisionRef.current = result.table.revision;
+        setRevisionKnown(true);
         columnCountRef.current = result.table.columns.length;
         rowCountRef.current = result.table.rows.length;
         setTable(result.table);
@@ -102,6 +152,17 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       }
     },
     [page.id],
+  );
+
+  const endLease = useCallback(
+    async (token: string, message: string, shouldRelease = true) => {
+      if (leaseTokenRef.current !== token) return;
+      clearLocalLease();
+      setLeaseError(message);
+      if (shouldRelease) releaseTableLease(page.id, token);
+      await load(isMounted).catch(() => undefined);
+    },
+    [clearLocalLease, isMounted, load, page.id],
   );
 
   const runLeaseAction = useCallback((isCurrent: IsCurrent, action: () => Promise<void>) => {
@@ -126,18 +187,28 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     async (isCurrent: IsCurrent, priorLoad?: Promise<void>) => {
       if (!canEdit) return;
       const requestedAt = performance.now();
-      let result: LeaseTiming & { leaseToken: string };
+      let result: TableLeaseResponse;
       try {
-        result = await api<LeaseTiming & { leaseToken: string }>(`/api/tables/${page.id}/lease`, {
+        result = await api<TableLeaseResponse>(`/api/tables/${page.id}/lease`, {
           method: "POST",
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
+        try {
+          assertLeaseResponse(result);
+        } catch (cause) {
+          const token = (result as { leaseToken?: unknown } | null)?.leaseToken;
+          if (typeof token === "string" && token) releaseTableLease(page.id, token);
+          throw cause;
+        }
       } catch (cause) {
         if (!isCurrent()) return;
         if (cause instanceof ApiClientError && cause.code === "lease_conflict") {
           leaseConflictGenerationRef.current += 1;
           clearLocalLease();
           setLeaseError(LEASE_CONFLICT_MESSAGE);
+          // Settle the mount load before the retry supersedes it, so a failing
+          // retry still leaves that table on screen. The generation bump above
+          // keeps its older lease snapshot from clearing the notice.
           await priorLoad?.catch(() => undefined);
           if (isCurrent()) await load(isCurrent).catch(() => undefined);
           return;
@@ -152,6 +223,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       leaseDeadlineRef.current = requestedAt + result.leaseDurationMs;
       setLeaseToken(result.leaseToken);
       setLeaseError(null);
+      setSaveError(null);
       // Let the immediate mount load settle before starting the authoritative
       // post-acquisition load. This preserves a successful fallback if the
       // latter request fails without allowing an older response to overwrite it.
@@ -185,7 +257,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   }, [load, acquire, canEdit, reportLeaseError]);
 
   useEffect(() => {
-    if (leaseToken && tableLoaded) return undefined;
+    if (leaseToken && tableLoaded && revisionKnown) return undefined;
     let active = true;
     const isCurrent = () => active && mountedRef.current;
     const poll = window.setInterval(() => {
@@ -195,69 +267,89 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       active = false;
       window.clearInterval(poll);
     };
-  }, [leaseToken, load, tableLoaded]);
+  }, [leaseToken, load, revisionKnown, tableLoaded]);
 
   useEffect(() => {
     if (!leaseToken) return undefined;
     let active = true;
-    let expiryTimer: number | undefined;
     let renewing = false;
+    let expiryTimer: number | undefined;
+    let renew: number | undefined;
+    const stopRenewal = () => {
+      active = false;
+      if (renew !== undefined) window.clearInterval(renew);
+      if (expiryTimer !== undefined) window.clearTimeout(expiryTimer);
+      document.removeEventListener("visibilitychange", checkExpiry);
+      window.removeEventListener("focus", checkExpiry);
+      window.removeEventListener("pageshow", checkExpiry);
+    };
     const expireLease = () => {
       if (!active) return;
-      active = false;
-      window.clearInterval(renew);
-      clearLocalLease();
-      setLeaseError("The editing lease expired after renewal failures. Reloaded the authoritative table.");
-      releaseTableLease(page.id, leaseToken);
-      void load(isMounted).catch(() => undefined);
+      stopRenewal();
+      void endLease(leaseToken, LEASE_EXPIRED_MESSAGE);
     };
-    const scheduleExpiry = (deadline: number | null) => {
+    const checkExpiry = () => {
+      if (isLeaseExpired()) expireLease();
+    };
+    const scheduleExpiry = () => {
       if (expiryTimer !== undefined) window.clearTimeout(expiryTimer);
-      if (deadline !== null) expiryTimer = window.setTimeout(expireLease, Math.max(0, deadline - performance.now()));
+      const deadline = leaseDeadlineRef.current;
+      if (deadline === null) {
+        expireLease();
+        return;
+      }
+      expiryTimer = window.setTimeout(expireLease, Math.max(0, deadline - performance.now()));
     };
     const renewLease = async () => {
+      // Overlapping renewals can resolve out of order, and the older response
+      // would then move the deadline backwards and expire a live lease early.
       if (renewing || !active) return;
       renewing = true;
       const requestedAt = performance.now();
       try {
-        const result = await api<LeaseTiming>(`/api/tables/${page.id}/lease`, {
+        const result = await api<TableLeaseTiming>(`/api/tables/${page.id}/lease`, {
           method: "PATCH",
           body: json({ leaseToken }),
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
+        assertLeaseTiming(result);
         if (active) {
           leaseDeadlineRef.current = requestedAt + result.leaseDurationMs;
-          scheduleExpiry(leaseDeadlineRef.current);
+          scheduleExpiry();
           setLeaseError(null);
         }
       } catch (cause) {
         if (!active) return;
+        // A response we cannot read leaves the real deadline unknown, so drop
+        // the lease instead of editing against it — the same call the
+        // acquisition path makes on an unreadable response.
+        if (cause instanceof LeaseResponseError) {
+          stopRenewal();
+          await endLease(leaseToken, cause.message);
+          return;
+        }
         const retryable = !(cause instanceof ApiClientError) || cause.status === 429 || cause.status >= 500;
         if (retryable) {
           setLeaseError(`${errorMessage(cause, "The editing lease could not be renewed.")} Retrying.`);
           return;
         }
-        active = false;
-        window.clearInterval(renew);
-        if (expiryTimer !== undefined) window.clearTimeout(expiryTimer);
-        clearLocalLease();
-        setLeaseError(
+        stopRenewal();
+        await endLease(
+          leaseToken,
           cause.status === 409 ? "The editing lease was lost. Reloaded the authoritative table." : cause.message,
+          cause.status !== 401,
         );
-        if (cause.status !== 401) releaseTableLease(page.id, leaseToken);
-        await load(isMounted).catch(() => undefined);
       } finally {
         renewing = false;
       }
     };
-    const renew = window.setInterval(() => void renewLease(), 20_000);
-    scheduleExpiry(leaseDeadlineRef.current);
-    return () => {
-      active = false;
-      window.clearInterval(renew);
-      if (expiryTimer !== undefined) window.clearTimeout(expiryTimer);
-    };
-  }, [clearLocalLease, isMounted, leaseToken, load, page.id]);
+    renew = window.setInterval(() => void renewLease(), LEASE_RENEWAL_INTERVAL_MS);
+    document.addEventListener("visibilitychange", checkExpiry);
+    window.addEventListener("focus", checkExpiry);
+    window.addEventListener("pageshow", checkExpiry);
+    scheduleExpiry();
+    return stopRenewal;
+  }, [endLease, isLeaseExpired, leaseToken, page.id]);
 
   async function saveTitle() {
     const normalized = title.trim() || "Untitled";
@@ -280,9 +372,14 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       const currentLease = leaseTokenRef.current;
       const currentRevision = revisionRef.current;
       if (!currentLease || currentRevision === null) return null;
+      if (isLeaseExpired()) {
+        await endLease(currentLease, LEASE_EXPIRED_MESSAGE);
+        return null;
+      }
       try {
         const result = await api<T & { revision: number }>(path, {
           method,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           body: json({
             ...body,
             ...(position ? { position: position() } : {}),
@@ -293,18 +390,24 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         if (!isMounted()) return null;
         revisionRef.current = result.revision;
         onSuccess?.();
+        setSaveError(null);
         setTable((current) => (current ? { ...current, revision: result.revision } : current));
         return result;
       } catch (cause) {
         if (!isMounted()) return null;
         if (cause instanceof ApiClientError && cause.status === 409) {
-          clearLocalLease();
-          setLeaseError(cause.message);
-          releaseTableLease(page.id, currentLease);
-          await load(isMounted).catch(() => undefined);
+          await endLease(currentLease, cause.message);
           return null;
         }
-        throw cause;
+        // A timed-out or failed request may still have been applied, which
+        // leaves the cached revision stale — and a stale expectedRevision reads
+        // as a lost lease on the next edit. Block further mutations until this
+        // reload restores the authoritative revision and cell values.
+        revisionRef.current = null;
+        setRevisionKnown(false);
+        setSaveError(errorMessage(cause, SAVE_FAILED_MESSAGE));
+        await load(isMounted).catch(() => undefined);
+        return null;
       }
     };
     const pending = mutationQueue.current.then(execute, execute);
@@ -485,6 +588,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         </button>
       </div>
       {leaseError && <div className="notice">{leaseError}</div>}
+      {saveError && <div className="notice notice-danger">{saveError}</div>}
       {loadError && <div className="notice notice-danger">{loadError}</div>}
       <article className="table-paper">
         <input

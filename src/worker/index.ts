@@ -17,7 +17,7 @@ import {
   sha256,
 } from "./http";
 import { columnType, nullableId, object, pageKind, role, text } from "../shared/validation";
-import type { ClientMemberContext, Page, WorkspaceEvent } from "../shared/types";
+import type { ClientMemberContext, Page, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
@@ -1139,7 +1139,7 @@ app.post("/api/tables/:pageId/lease", async (c) => {
     .run();
   if (!result.meta.changes)
     throw new HttpError(409, "lease_conflict", "Another editor currently holds this table lease.");
-  return c.json({ leaseToken: token, expiresAt, leaseDurationMs: TABLE_LEASE_DURATION_MS });
+  return c.json({ leaseToken: token, leaseDurationMs: TABLE_LEASE_DURATION_MS } satisfies TableLeaseResponse);
 });
 
 app.patch("/api/tables/:pageId/lease", async (c) => {
@@ -1160,7 +1160,7 @@ app.patch("/api/tables/:pageId/lease", async (c) => {
     )
     .run();
   if (!result.meta.changes) throw new HttpError(409, "lease_lost", "The table lease has expired or been replaced.");
-  return c.json({ expiresAt, leaseDurationMs: TABLE_LEASE_DURATION_MS });
+  return c.json({ leaseDurationMs: TABLE_LEASE_DURATION_MS } satisfies TableLeaseTiming);
 });
 
 app.delete("/api/tables/:pageId/lease", async (c) => {

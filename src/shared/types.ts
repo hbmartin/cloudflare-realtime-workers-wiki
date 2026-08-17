@@ -98,3 +98,7 @@ export type TableData = {
   rows: TableRow[];
   lease: { heldByMe: boolean; holderName: string | null; expiresAt: number | null };
 };
+
+export type TableLeaseTiming = { leaseDurationMs: number };
+
+export type TableLeaseResponse = TableLeaseTiming & { leaseToken: string };
