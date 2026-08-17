@@ -1469,15 +1469,13 @@ async function guardedBatch(
       `UPDATE table_state SET revision = revision + 1
         WHERE page_id = ? AND revision = ? AND ${leaseGuards()}`,
     ).bind(pageId, input.expectedRevision, pageId, input.expectedRevision, input.tokenHash, input.sessionId, updatedAt),
-  ]);
-  if (!results.at(-1)?.meta.changes) {
-    const lease = await env.DB.prepare(
-      `SELECT 1 FROM table_leases
+    env.DB.prepare(
+      `SELECT 1 lease_valid FROM table_leases
         WHERE page_id = ? AND token_hash = ? AND holder_session_id = ? AND expires_at > ?`,
-    )
-      .bind(pageId, input.tokenHash, input.sessionId, updatedAt)
-      .first();
-    if (lease) {
+    ).bind(pageId, input.tokenHash, input.sessionId, updatedAt),
+  ]);
+  if (!results.at(-2)?.meta.changes) {
+    if (results.at(-1)?.results.length) {
       throw new HttpError(409, "table_revision_conflict", "The table changed. Reloading before retrying the update.");
     }
     throw new HttpError(409, "table_lease_lost", "The editing lease was lost. Reloaded the authoritative table.");

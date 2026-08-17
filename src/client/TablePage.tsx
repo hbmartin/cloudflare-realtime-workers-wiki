@@ -13,12 +13,22 @@ import { ApiClientError, api, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 
 type IsCurrent = () => boolean;
+type MutationOptions = {
+  position?: () => number;
+  onSuccess?: () => void;
+  resetKey?: string;
+};
 
 const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing.";
-const LEASE_EXPIRED_MESSAGE = "The editing lease expired after renewal failures. Reloaded the authoritative table.";
+const LEASE_EXPIRED_MESSAGE = "The editing lease expired. Reloaded the authoritative table.";
+const LEASE_VERIFICATION_MESSAGE =
+  "Editing was paused because the lease could not be verified after the system clock changed.";
 const SAVE_FAILED_MESSAGE = "The table update could not be saved.";
-const REVISION_RECOVERY_MESSAGE = "Editing is paused until the authoritative table revision can be reloaded.";
 const LEASE_LOST_SAVE_MESSAGE = "The table update was not saved because editing access was lost.";
+const REVISION_RECOVERY_SAVE_MESSAGE =
+  "The table update was not saved because the authoritative table revision could not be reloaded.";
+const REVISION_CONFLICT_SAVE_MESSAGE =
+  "The table update was not saved because the table kept changing. Reloaded the authoritative table.";
 const REQUEST_TIMEOUT_MS = 15_000;
 // Must stay above REQUEST_TIMEOUT_MS so a renewal cannot still be in flight
 // when the next one is due.
@@ -27,6 +37,17 @@ const LEASE_RENEWAL_INTERVAL_MS = 20_000;
 // and fires immediately. Reject implausible durations rather than clamp them:
 // a lease that long is a broken response, not a usable one.
 const MAX_LEASE_DURATION_MS = 24 * 60 * 60 * 1_000;
+
+type LeaseClock = { monotonic: number; wall: number };
+type LocalLeaseStatus = "valid" | "expired" | "wall-clock-disagreement";
+
+function leaseClock(): LeaseClock {
+  return { monotonic: performance.now(), wall: Date.now() };
+}
+
+function cellInputKey(rowId: string, columnId: string) {
+  return `${rowId}:${columnId}`;
+}
 
 // Distinguishable from a transport failure so renewal can fail closed on it.
 class LeaseResponseError extends Error {
@@ -62,6 +83,18 @@ function errorMessage(cause: unknown, fallback: string) {
   return cause.name === "TimeoutError" ? fallback : cause.message;
 }
 
+function isDefinitiveMutationRejection(cause: unknown): cause is ApiClientError {
+  return (
+    cause instanceof ApiClientError &&
+    (cause.status === 400 ||
+      cause.status === 404 ||
+      cause.status === 413 ||
+      cause.status === 415 ||
+      cause.status === 422 ||
+      cause.status === 429)
+  );
+}
+
 export type TablePageProps = {
   page: Page;
   member: ClientMemberContext;
@@ -87,16 +120,18 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   const [sortColumn, setSortColumn] = useState<string | null>(null);
   const [title, setTitle] = useState(page.title);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
-  const [tableSnapshotGeneration, setTableSnapshotGeneration] = useState(0);
+  const [cellResetGenerations, setCellResetGenerations] = useState<Record<string, number>>({});
   const revisionRef = useRef<number | null>(null);
   const leaseTokenRef = useRef<string | null>(null);
   const columnCountRef = useRef(0);
   const rowCountRef = useRef(0);
+  const optionCountRef = useRef(new Map<string, number>());
   const mutationQueue = useRef<Promise<void>>(Promise.resolve());
   const leaseActionRef = useRef<{ owner: IsCurrent; promise: Promise<void> } | null>(null);
   const leaseMonotonicDeadlineRef = useRef<number | null>(null);
   const leaseWallDeadlineRef = useRef<number | null>(null);
-  const revisionRecoveryRef = useRef<Promise<boolean> | null>(null);
+  const leaseRenewalRef = useRef<{ token: string; promise: Promise<boolean> } | null>(null);
+  const pendingCellResetsRef = useRef(new Set<string>());
   const leaseConflictGenerationRef = useRef(0);
   const loadsInFlightRef = useRef(0);
   const mountedRef = useRef(true);
@@ -122,18 +157,34 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     leaseWallDeadlineRef.current = null;
     setLeaseToken(null);
   }, []);
-  // The monotonic clock is robust to wall-clock corrections, while the wall
-  // clock keeps advancing on platforms where performance.now() pauses during
-  // system sleep. Expire conservatively if either deadline has elapsed.
-  const isLeaseExpired = useCallback(() => {
+  const setLocalLeaseDeadline = useCallback((requestedAt: LeaseClock, duration: number) => {
+    leaseMonotonicDeadlineRef.current = requestedAt.monotonic + duration;
+    leaseWallDeadlineRef.current = requestedAt.wall + duration;
+  }, []);
+  // The monotonic clock is authoritative for ordinary elapsed time. If only
+  // the wall deadline elapsed, the machine may have slept or its clock may
+  // have jumped, so ask the server before discarding a potentially live lease.
+  const localLeaseStatus = useCallback((): LocalLeaseStatus => {
     const monotonicDeadline = leaseMonotonicDeadlineRef.current;
     const wallDeadline = leaseWallDeadlineRef.current;
-    return (
-      monotonicDeadline === null ||
-      wallDeadline === null ||
-      performance.now() >= monotonicDeadline ||
-      Date.now() >= wallDeadline
-    );
+    if (monotonicDeadline === null || wallDeadline === null || performance.now() >= monotonicDeadline) {
+      return "expired";
+    }
+    return Date.now() >= wallDeadline ? "wall-clock-disagreement" : "valid";
+  }, []);
+
+  const resetCellInput = useCallback((key: string | undefined) => {
+    if (!key || !mountedRef.current) return;
+    setCellResetGenerations((current) => ({ ...current, [key]: (current[key] ?? 0) + 1 }));
+  }, []);
+
+  const resetCellInputAfterLoad = useCallback((key: string | undefined) => {
+    if (key) pendingCellResetsRef.current.add(key);
+  }, []);
+
+  const invalidateRevision = useCallback(() => {
+    revisionRef.current = null;
+    setRevisionKnown(false);
   }, []);
 
   const load = useCallback(
@@ -150,7 +201,16 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         setRevisionKnown(true);
         columnCountRef.current = result.table.columns.length;
         rowCountRef.current = result.table.rows.length;
-        setTableSnapshotGeneration((current) => current + 1);
+        optionCountRef.current = new Map(result.table.columns.map((column) => [column.id, column.options.length]));
+        if (pendingCellResetsRef.current.size) {
+          const resets = [...pendingCellResetsRef.current];
+          pendingCellResetsRef.current.clear();
+          setCellResetGenerations((current) => {
+            const next = { ...current };
+            for (const key of resets) next[key] = (next[key] ?? 0) + 1;
+            return next;
+          });
+        }
         setTable(result.table);
         setLoadError(null);
         if (result.table.lease.expiresAt === null && leaseConflictGeneration === leaseConflictGenerationRef.current) {
@@ -168,19 +228,14 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     [page.id],
   );
 
-  const recoverRevision = useCallback(() => {
-    if (revisionRef.current !== null) return Promise.resolve(true);
-    const current = revisionRecoveryRef.current;
-    if (current) return current;
-    const attempt = load(isMounted)
-      .then(() => revisionRef.current !== null)
-      .catch(() => false);
-    let tracked!: Promise<boolean>;
-    tracked = attempt.finally(() => {
-      if (revisionRecoveryRef.current === tracked) revisionRecoveryRef.current = null;
-    });
-    revisionRecoveryRef.current = tracked;
-    return tracked;
+  const recoverRevision = useCallback(async () => {
+    if (revisionRef.current !== null) return true;
+    try {
+      await load(isMounted);
+      return revisionRef.current !== null;
+    } catch {
+      return false;
+    }
   }, [isMounted, load]);
 
   const endLease = useCallback(
@@ -192,6 +247,55 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       await load(isMounted).catch(() => undefined);
     },
     [clearLocalLease, isMounted, load, page.id],
+  );
+
+  const renewLocalLease = useCallback(
+    (token: string) => {
+      const current = leaseRenewalRef.current;
+      if (current?.token === token) return current.promise;
+      const requestedAt = leaseClock();
+      const attempt = api<TableLeaseTiming>(`/api/tables/${page.id}/lease`, {
+        method: "PATCH",
+        body: json({ leaseToken: token }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      }).then((result) => {
+        assertLeaseTiming(result);
+        if (leaseTokenRef.current !== token) return false;
+        setLocalLeaseDeadline(requestedAt, result.leaseDurationMs);
+        return true;
+      });
+      const tracked = { token, promise: Promise.resolve(false) };
+      tracked.promise = attempt.finally(() => {
+        if (leaseRenewalRef.current === tracked) leaseRenewalRef.current = null;
+      });
+      leaseRenewalRef.current = tracked;
+      return tracked.promise;
+    },
+    [page.id, setLocalLeaseDeadline],
+  );
+
+  const ensureLeaseUsable = useCallback(
+    async (token: string) => {
+      const status = localLeaseStatus();
+      if (status === "valid") return true;
+      if (status === "expired") {
+        await endLease(token, LEASE_EXPIRED_MESSAGE);
+        return false;
+      }
+      try {
+        return await renewLocalLease(token);
+      } catch (cause) {
+        if (leaseTokenRef.current === token) {
+          await endLease(
+            token,
+            cause instanceof ApiClientError && cause.status === 409 ? cause.message : LEASE_VERIFICATION_MESSAGE,
+            false,
+          );
+        }
+        return false;
+      }
+    },
+    [endLease, localLeaseStatus, renewLocalLease],
   );
 
   const runLeaseAction = useCallback((isCurrent: IsCurrent, action: () => Promise<void>) => {
@@ -215,8 +319,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   const performAcquire = useCallback(
     async (isCurrent: IsCurrent, priorLoad?: Promise<void>) => {
       if (!canEdit) return;
-      const requestedAt = performance.now();
-      const requestedAtWall = Date.now();
+      const requestedAt = leaseClock();
       let result: TableLeaseResponse;
       try {
         result = await api<TableLeaseResponse>(`/api/tables/${page.id}/lease`, {
@@ -250,8 +353,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         return;
       }
       leaseTokenRef.current = result.leaseToken;
-      leaseMonotonicDeadlineRef.current = requestedAt + result.leaseDurationMs;
-      leaseWallDeadlineRef.current = requestedAtWall + result.leaseDurationMs;
+      setLocalLeaseDeadline(requestedAt, result.leaseDurationMs);
       // Let the immediate mount load settle before starting the authoritative
       // post-acquisition load. This preserves a successful fallback if the
       // latter request fails without exposing edits against its older revision.
@@ -265,18 +367,14 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         }
         return;
       }
-      if (isLeaseExpired()) {
-        await endLease(result.leaseToken, LEASE_EXPIRED_MESSAGE);
-        return;
-      }
-      revisionRef.current = null;
-      setRevisionKnown(false);
+      if (!(await ensureLeaseUsable(result.leaseToken))) return;
+      invalidateRevision();
       setLeaseToken(result.leaseToken);
       setLeaseError(null);
       setSaveError(null);
       await load(isCurrent).catch(() => undefined);
     },
-    [canEdit, clearLocalLease, endLease, isLeaseExpired, load, page.id],
+    [canEdit, clearLocalLease, ensureLeaseUsable, invalidateRevision, load, page.id, setLocalLeaseDeadline],
   );
 
   const acquire = useCallback(
@@ -335,36 +433,38 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       void endLease(leaseToken, LEASE_EXPIRED_MESSAGE);
     };
     const checkExpiry = () => {
-      if (isLeaseExpired()) expireLease();
+      const status = localLeaseStatus();
+      if (status === "expired") {
+        expireLease();
+        return;
+      }
+      if (status === "wall-clock-disagreement") {
+        void ensureLeaseUsable(leaseToken).then((usable) => {
+          if (!active) return;
+          if (!usable) {
+            stopRenewal();
+            return;
+          }
+          scheduleExpiry();
+          setLeaseError(null);
+        });
+      }
     };
     const scheduleExpiry = () => {
       if (expiryTimer !== undefined) window.clearTimeout(expiryTimer);
       const monotonicDeadline = leaseMonotonicDeadlineRef.current;
-      const wallDeadline = leaseWallDeadlineRef.current;
-      if (monotonicDeadline === null || wallDeadline === null) {
+      if (monotonicDeadline === null) {
         expireLease();
         return;
       }
-      const remaining = Math.min(monotonicDeadline - performance.now(), wallDeadline - Date.now());
-      expiryTimer = window.setTimeout(expireLease, Math.max(0, remaining));
+      expiryTimer = window.setTimeout(checkExpiry, Math.max(0, monotonicDeadline - performance.now()));
     };
     const renewLease = async () => {
-      // Overlapping renewals can resolve out of order, and the older response
-      // would then move the deadline backwards and expire a live lease early.
       if (renewing || !active) return;
       renewing = true;
-      const requestedAt = performance.now();
-      const requestedAtWall = Date.now();
       try {
-        const result = await api<TableLeaseTiming>(`/api/tables/${page.id}/lease`, {
-          method: "PATCH",
-          body: json({ leaseToken }),
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        });
-        assertLeaseTiming(result);
-        if (active) {
-          leaseMonotonicDeadlineRef.current = requestedAt + result.leaseDurationMs;
-          leaseWallDeadlineRef.current = requestedAtWall + result.leaseDurationMs;
+        const renewed = await renewLocalLease(leaseToken);
+        if (active && renewed) {
           scheduleExpiry();
           setLeaseError(null);
         }
@@ -380,6 +480,16 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         }
         const retryable = !(cause instanceof ApiClientError) || cause.status === 429 || cause.status >= 500;
         if (retryable) {
+          const status = localLeaseStatus();
+          if (status !== "valid") {
+            stopRenewal();
+            await endLease(
+              leaseToken,
+              status === "expired" ? LEASE_EXPIRED_MESSAGE : LEASE_VERIFICATION_MESSAGE,
+              status === "expired",
+            );
+            return;
+          }
           setLeaseError(`${errorMessage(cause, "The editing lease could not be renewed.")} Retrying.`);
           return;
         }
@@ -399,7 +509,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     window.addEventListener("pageshow", checkExpiry);
     scheduleExpiry();
     return stopRenewal;
-  }, [endLease, isLeaseExpired, leaseToken, page.id]);
+  }, [endLease, ensureLeaseUsable, leaseToken, localLeaseStatus, renewLocalLease]);
 
   async function saveTitle() {
     const normalized = title.trim() || "Untitled";
@@ -415,12 +525,12 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     path: string,
     method: string,
     body: Record<string, unknown>,
-    position?: () => number,
-    onSuccess?: () => void,
+    { position, onSuccess, resetKey }: MutationOptions = {},
   ) {
     const execute = async () => {
       const currentLease = leaseTokenRef.current;
       if (!currentLease) {
+        resetCellInput(resetKey);
         if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
         return null;
       }
@@ -428,17 +538,28 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       while (leaseTokenRef.current === currentLease) {
         if (revisionRef.current === null) {
           const recovered = await recoverRevision();
-          if (!recovered || leaseTokenRef.current !== currentLease) {
-            if (isMounted()) setSaveError((current) => current ?? REVISION_RECOVERY_MESSAGE);
+          if (leaseTokenRef.current !== currentLease) {
+            resetCellInput(resetKey);
+            if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
+            return null;
+          }
+          if (!recovered) {
+            resetCellInputAfterLoad(resetKey);
+            if (isMounted()) setSaveError(REVISION_RECOVERY_SAVE_MESSAGE);
             return null;
           }
         }
-        if (isLeaseExpired()) {
-          await endLease(currentLease, LEASE_EXPIRED_MESSAGE);
+        if (!(await ensureLeaseUsable(currentLease))) {
+          resetCellInput(resetKey);
+          if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
           return null;
         }
         const currentRevision = revisionRef.current;
-        if (currentRevision === null) continue;
+        if (currentRevision === null) {
+          resetCellInputAfterLoad(resetKey);
+          if (isMounted()) setSaveError(REVISION_RECOVERY_SAVE_MESSAGE);
+          return null;
+        }
         try {
           const result = await api<T & { revision: number }>(path, {
             method,
@@ -451,6 +572,10 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
             }),
           });
           if (!isMounted()) return null;
+          // The request may have committed before the old lease was cleared but
+          // returned after another lease was acquired. Its result belongs to the
+          // authoritative reload for that lease, not this local state.
+          if (leaseTokenRef.current !== currentLease) return null;
           revisionRef.current = result.revision;
           onSuccess?.();
           setSaveError(null);
@@ -458,29 +583,58 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           return result;
         } catch (cause) {
           if (!isMounted()) return null;
+          if (leaseTokenRef.current !== currentLease) {
+            resetCellInput(resetKey);
+            setSaveError(LEASE_LOST_SAVE_MESSAGE);
+            return null;
+          }
           if (cause instanceof ApiClientError && cause.code === "table_revision_conflict") {
-            revisionRef.current = null;
-            setRevisionKnown(false);
-            setSaveError(cause.message);
+            invalidateRevision();
+            const terminalConflict = revisionConflictRetried;
+            if (terminalConflict) resetCellInputAfterLoad(resetKey);
+            else setSaveError(cause.message);
             const recovered = await recoverRevision();
-            if (!recovered || revisionConflictRetried) return null;
+            if (leaseTokenRef.current !== currentLease) {
+              resetCellInput(resetKey);
+              setSaveError(LEASE_LOST_SAVE_MESSAGE);
+              return null;
+            }
+            if (!recovered) {
+              resetCellInputAfterLoad(resetKey);
+              setSaveError(REVISION_RECOVERY_SAVE_MESSAGE);
+              return null;
+            }
+            if (terminalConflict) {
+              setSaveError(REVISION_CONFLICT_SAVE_MESSAGE);
+              return null;
+            }
             revisionConflictRetried = true;
             continue;
           }
           if (cause instanceof ApiClientError && cause.status === 409) {
+            resetCellInputAfterLoad(resetKey);
             await endLease(currentLease, cause.message);
+            setSaveError(LEASE_LOST_SAVE_MESSAGE);
+            return null;
+          }
+          // A handled client rejection is definitive: the server rejected the
+          // request before applying it, so keep the known revision and the
+          // user's input available for correction.
+          if (isDefinitiveMutationRejection(cause)) {
+            setSaveError(cause.message);
             return null;
           }
           // A timed-out or failed request may still have been applied. Its
           // outcome is ambiguous, so never replay it; pause edits and reload an
           // authoritative snapshot before the next queued mutation can run.
-          revisionRef.current = null;
-          setRevisionKnown(false);
+          invalidateRevision();
           setSaveError(errorMessage(cause, SAVE_FAILED_MESSAGE));
+          resetCellInputAfterLoad(resetKey);
           await recoverRevision();
           return null;
         }
       }
+      resetCellInput(resetKey);
       if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
       return null;
     };
@@ -502,22 +656,34 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       `/api/tables/${page.id}/columns`,
       "POST",
       { name, type },
-      () => columnCountRef.current,
-      () => {
-        columnCountRef.current += 1;
+      {
+        position: () => columnCountRef.current,
+        onSuccess: () => {
+          columnCountRef.current += 1;
+        },
       },
     );
-    if (result)
+    if (result) {
+      optionCountRef.current.set(result.column.id, 0);
       setTable((current) =>
         current ? { ...current, columns: [...current.columns, { ...result.column, options: [] }] } : current,
       );
+    }
   }
 
   async function removeColumn(column: TableColumn) {
     if (!confirm(`Delete “${column.name}” and every value in it?`)) return;
-    const result = await mutation(`/api/tables/${page.id}/columns/${column.id}`, "DELETE", {}, undefined, () => {
-      columnCountRef.current = Math.max(0, columnCountRef.current - 1);
-    });
+    const result = await mutation(
+      `/api/tables/${page.id}/columns/${column.id}`,
+      "DELETE",
+      {},
+      {
+        onSuccess: () => {
+          columnCountRef.current = Math.max(0, columnCountRef.current - 1);
+          optionCountRef.current.delete(column.id);
+        },
+      },
+    );
     if (result)
       setTable((current) =>
         current ? { ...current, columns: current.columns.filter((item) => item.id !== column.id) } : current,
@@ -530,7 +696,11 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     const result = await mutation<{ option: { id: string; label: string; position: number } }>(
       `/api/tables/${page.id}/columns/${column.id}/options`,
       "POST",
-      { label, position: column.options.length },
+      { label },
+      {
+        position: () => optionCountRef.current.get(column.id) ?? 0,
+        onSuccess: () => optionCountRef.current.set(column.id, (optionCountRef.current.get(column.id) ?? 0) + 1),
+      },
     );
     if (result)
       setTable((current) =>
@@ -551,18 +721,27 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       `/api/tables/${page.id}/rows`,
       "POST",
       {},
-      () => rowCountRef.current,
-      () => {
-        rowCountRef.current += 1;
+      {
+        position: () => rowCountRef.current,
+        onSuccess: () => {
+          rowCountRef.current += 1;
+        },
       },
     );
     if (result) setTable((current) => (current ? { ...current, rows: [...current.rows, result.row] } : current));
   }
 
   async function removeRow(row: TableRow) {
-    const result = await mutation(`/api/tables/${page.id}/rows/${row.id}`, "DELETE", {}, undefined, () => {
-      rowCountRef.current = Math.max(0, rowCountRef.current - 1);
-    });
+    const result = await mutation(
+      `/api/tables/${page.id}/rows/${row.id}`,
+      "DELETE",
+      {},
+      {
+        onSuccess: () => {
+          rowCountRef.current = Math.max(0, rowCountRef.current - 1);
+        },
+      },
+    );
     if (result)
       setTable((current) =>
         current ? { ...current, rows: current.rows.filter((item) => item.id !== row.id) } : current,
@@ -570,7 +749,12 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   }
 
   async function setCell(rowId: string, columnId: string, value: string | number | boolean | null) {
-    const result = await mutation(`/api/tables/${page.id}/cells/${rowId}/${columnId}`, "PUT", { value });
+    const result = await mutation(
+      `/api/tables/${page.id}/cells/${rowId}/${columnId}`,
+      "PUT",
+      { value },
+      { resetKey: cellInputKey(rowId, columnId) },
+    );
     if (result)
       setTable((current) =>
         current
@@ -729,7 +913,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
                     {table.columns.map((column) => (
                       <td key={column.id}>
                         <CellInput
-                          key={`${tableSnapshotGeneration}:${row.id}:${column.id}:${String(row.cells[column.id] ?? "")}`}
+                          key={`${cellResetGenerations[cellInputKey(row.id, column.id)] ?? 0}:${row.id}:${column.id}:${String(row.cells[column.id] ?? "")}`}
                           column={column}
                           value={row.cells[column.id] ?? null}
                           disabled={!editingReady}
@@ -807,15 +991,15 @@ function CellInput({
       type={column.type === "number" ? "number" : column.type === "date" ? "date" : "text"}
       defaultValue={value === null ? "" : String(value)}
       disabled={disabled}
-      onBlur={(event) =>
-        onCommit(
+      onBlur={(event) => {
+        const nextValue =
           column.type === "number"
             ? event.target.value === ""
               ? null
               : Number(event.target.value)
-            : event.target.value || null,
-        )
-      }
+            : event.target.value || null;
+        if (!Object.is(nextValue, value === "" ? null : value)) onCommit(nextValue);
+      }}
     />
   );
 }
