@@ -47,6 +47,11 @@ function cellInputKey(rowId: string, columnId: string) {
   return `${rowId}:${columnId}`;
 }
 
+function normalizedInputValue(column: TableColumn, value: string | number | boolean | null) {
+  if (value === null || value === "") return null;
+  return column.type === "number" ? Number(value) : String(value);
+}
+
 // Distinguishable from a transport failure so renewal can fail closed on it.
 class LeaseResponseError extends Error {
   constructor() {
@@ -952,7 +957,7 @@ function CellInput({
   disabled: boolean;
   onCommit: (value: string | number | boolean | null) => void;
 }) {
-  const lastEnqueuedValue = useRef(value === "" ? null : value);
+  const lastEnqueuedValue = useRef(normalizedInputValue(column, value));
   if (column.type === "checkbox") {
     return (
       <input

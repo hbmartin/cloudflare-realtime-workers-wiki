@@ -1212,6 +1212,8 @@ describe("Worker integration", () => {
       await document.finishTransition();
 
       expect(await state.storage.getAlarm()).toBe(retryAt);
+      expect(document.transitionRetryAt).toBeNull();
+      expect(document.transition).toBeNull();
     });
   });
 

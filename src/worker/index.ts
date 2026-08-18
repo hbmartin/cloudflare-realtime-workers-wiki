@@ -1194,12 +1194,23 @@ app.post("/api/tables/:pageId/columns", async (c) => {
         .bind(page.id)
         .first<{ position: number }>()
     )?.position ?? 0;
-  const result = await guardedBatch(c.env, page.id, input, [
+  const result = await guardedBatch(c.env, page.id, input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_columns (id, page_id, name, type, position)
        SELECT ?, ?, ?, ?, ? WHERE ${leaseGuards()}`,
-    ).bind(id, page.id, name, type, position, page.id, input.expectedRevision, input.tokenHash, input.sessionId, now()),
-  ]);
+    ).bind(
+      id,
+      page.id,
+      name,
+      type,
+      position,
+      page.id,
+      input.expectedRevision,
+      input.tokenHash,
+      input.sessionId,
+      guardedAt,
+    ),
+  );
   return c.json({ column: { id, name, type, position }, revision: result }, 201);
 });
 
@@ -1213,7 +1224,7 @@ app.delete("/api/tables/:pageId/columns/:columnId", async (c) => {
     .bind(c.req.param("columnId"), page.id)
     .first();
   if (!column) throw new HttpError(404, "column_not_found", "Column not found.");
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(`DELETE FROM table_columns WHERE id = ? AND page_id = ? AND ${leaseGuards()}`).bind(
       c.req.param("columnId"),
       c.req.param("pageId"),
@@ -1221,9 +1232,9 @@ app.delete("/api/tables/:pageId/columns/:columnId", async (c) => {
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ revision });
 });
 
@@ -1248,7 +1259,7 @@ app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
         .bind(c.req.param("columnId"))
         .first<{ position: number }>()
     )?.position ?? 0;
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_select_options (id, column_id, label, position)
        SELECT ?, ?, ?, ? WHERE EXISTS (
@@ -1265,9 +1276,9 @@ app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ option: { id, label, position }, revision }, 201);
 });
 
@@ -1283,7 +1294,7 @@ app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) 
     .bind(c.req.param("optionId"), c.req.param("columnId"), c.req.param("pageId"))
     .first();
   if (!option) throw new HttpError(404, "option_not_found", "Option not found.");
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(`DELETE FROM table_select_options WHERE id = ? AND column_id = ? AND ${leaseGuards()}`).bind(
       c.req.param("optionId"),
       c.req.param("columnId"),
@@ -1291,9 +1302,9 @@ app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) 
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ revision });
 });
 
@@ -1312,7 +1323,7 @@ app.post("/api/tables/:pageId/rows", async (c) => {
     throw new HttpError(422, "table_row_limit", "Tables are limited to 500 rows in v1.");
   const id = crypto.randomUUID();
   const position = rowState?.position ?? 0;
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
        SELECT ?, ?, ?, ?, ?, ? WHERE ${leaseGuards()}`,
@@ -1321,15 +1332,15 @@ app.post("/api/tables/:pageId/rows", async (c) => {
       c.req.param("pageId"),
       position,
       member.user.id,
-      now(),
-      now(),
+      guardedAt,
+      guardedAt,
       c.req.param("pageId"),
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ row: { id, position, cells: {} }, revision }, 201);
 });
 
@@ -1343,7 +1354,7 @@ app.delete("/api/tables/:pageId/rows/:rowId", async (c) => {
     .bind(c.req.param("rowId"), page.id)
     .first();
   if (!row) throw new HttpError(404, "row_not_found", "Row not found.");
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(`DELETE FROM table_rows WHERE id = ? AND page_id = ? AND ${leaseGuards()}`).bind(
       c.req.param("rowId"),
       c.req.param("pageId"),
@@ -1351,9 +1362,9 @@ app.delete("/api/tables/:pageId/rows/:rowId", async (c) => {
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ revision });
 });
 
@@ -1377,7 +1388,7 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
     if (!option) throw new HttpError(422, "invalid_cell", "The selected option does not belong to this column.");
   }
   const values = typedCell(column.type, input.body.value);
-  const revision = await guardedBatch(c.env, pageId, input, [
+  const revision = await guardedBatch(c.env, pageId, input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_cells
        (row_id, column_id, text_value, number_value, boolean_value, date_value, select_value, updated_at)
@@ -1390,14 +1401,14 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
       c.req.param("rowId"),
       c.req.param("columnId"),
       ...values,
-      now(),
+      guardedAt,
       pageId,
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ revision });
 });
 
@@ -1490,16 +1501,15 @@ async function guardedBatch(
   env: Env,
   pageId: string,
   input: { expectedRevision: number; tokenHash: string; sessionId: string },
-  mutations: D1PreparedStatement[],
+  prepareMutation: (guardedAt: number) => D1PreparedStatement,
 ) {
-  if (mutations.length !== 1) throw new Error("guardedBatch requires exactly one mutation statement.");
-  const updatedAt = now();
+  const guardedAt = now();
   const results = await env.DB.batch([
-    ...mutations,
+    prepareMutation(guardedAt),
     env.DB.prepare(
       `UPDATE table_state SET revision = revision + 1
         WHERE page_id = ? AND revision = ? AND changes() > 0 AND ${leaseGuards()}`,
-    ).bind(pageId, input.expectedRevision, pageId, input.expectedRevision, input.tokenHash, input.sessionId, updatedAt),
+    ).bind(pageId, input.expectedRevision, pageId, input.expectedRevision, input.tokenHash, input.sessionId, guardedAt),
   ]);
   const mutationApplied = Boolean(results[0]?.meta.changes);
   const revisionUpdated = Boolean(results[1]?.meta.changes);
@@ -1514,7 +1524,7 @@ async function guardedBatch(
        ) lease_valid
        FROM table_state s WHERE s.page_id = ?`,
   )
-    .bind(input.tokenHash, input.sessionId, updatedAt, pageId)
+    .bind(input.tokenHash, input.sessionId, guardedAt, pageId)
     .first<{ revision: number; lease_valid: number }>();
   if (!state?.lease_valid) {
     throw new HttpError(409, "table_lease_lost", "The editing lease was lost. Reloaded the authoritative table.");

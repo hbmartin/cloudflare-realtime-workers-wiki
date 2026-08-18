@@ -125,11 +125,11 @@ async function renderActiveEditor() {
       backlinksRevision={0}
     />,
   );
-  await act(async () => {
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-  });
+  if (vi.isFakeTimers()) {
+    await act(() => vi.advanceTimersByTimeAsync(0));
+  } else {
+    await screen.findByText("Editing lease active");
+  }
   expect(screen.getByText("Editing lease active")).toBeInTheDocument();
 }
 
@@ -208,17 +208,7 @@ describe("TablePage", () => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       return { table };
     });
-    render(
-      <TablePage
-        page={page}
-        member={member("editor")}
-        onPageChanged={vi.fn()}
-        onSelectPage={vi.fn()}
-        backlinksRevision={0}
-      />,
-    );
-
-    expect(await screen.findByText("Editing lease active")).toBeInTheDocument();
+    await renderActiveEditor();
     fireEvent.blur(screen.getByDisplayValue("Ready"));
     await act(async () => {
       await Promise.resolve();
@@ -230,6 +220,36 @@ describe("TablePage", () => {
       expect.objectContaining({ method: "PUT" }),
     );
   });
+
+  it.each([
+    ["number", "5"],
+    ["text", 5],
+  ] as const)(
+    "does not enqueue an unchanged %s cell whose stored value uses a different primitive type",
+    async (type, value) => {
+      const mismatchedTable: TableData = {
+        ...table,
+        columns: [{ ...table.columns[0]!, type }],
+        rows: [{ ...table.rows[0]!, cells: { status: value } }],
+      };
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+        return { table: mismatchedTable };
+      });
+      await renderActiveEditor();
+
+      fireEvent.blur(screen.getByDisplayValue("5"));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(api).not.toHaveBeenCalledWith(
+        "/api/tables/table-page/cells/row/status",
+        expect.objectContaining({ method: "PUT" }),
+      );
+    },
+  );
 
   it("enqueues a revert to the rendered value while an earlier cell mutation is pending", async () => {
     const firstMutation = deferred<{ revision: number }>();
@@ -1365,6 +1385,13 @@ describe("TablePage", () => {
       expect.objectContaining({ method: "PATCH", signal: expect.any(AbortSignal) }),
     );
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+    const patchCalls = vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "PATCH").length;
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(patchCalls);
     expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "DELETE" }));
   });
 
