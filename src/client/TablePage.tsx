@@ -86,6 +86,12 @@ function errorMessage(cause: unknown, fallback: string) {
   return cause.name === "TimeoutError" ? fallback : cause.message;
 }
 
+// The table's page was archived or deleted underneath this view. Terminal for
+// the component: nothing it could request would succeed afterwards.
+function isPageUnavailableError(cause: unknown): cause is ApiClientError {
+  return cause instanceof ApiClientError && cause.code === "page_not_found";
+}
+
 function isDefinitiveMutationRejection(cause: unknown): cause is ApiClientError {
   return (
     cause instanceof ApiClientError &&
@@ -145,7 +151,16 @@ export function TablePage({
   const loadsInFlightRef = useRef(0);
   const mountedRef = useRef(true);
   const loadGenerationRef = useRef(0);
+  // Mirrors terminalPageUnavailable for async code that must not act on stale
+  // render state, e.g. a queued mutation deciding whether a missing lease is
+  // worth reporting.
+  const pageUnavailableRef = useRef(false);
+  const onPageUnavailableRef = useRef(onPageUnavailable);
   const tableLoaded = table !== null;
+
+  useEffect(() => {
+    onPageUnavailableRef.current = onPageUnavailable;
+  }, [onPageUnavailable]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -166,6 +181,24 @@ export function TablePage({
     leaseWallDeadlineRef.current = null;
     setLeaseToken(null);
   }, []);
+  // Every request site that can learn the page is gone (a table load, a lease
+  // acquisition or renewal, a mutation) funnels through here, so polling,
+  // renewal, and queued edits stop no matter which request noticed first.
+  const markPageUnavailable = useCallback(
+    (message: string) => {
+      if (pageUnavailableRef.current || !mountedRef.current) return;
+      pageUnavailableRef.current = true;
+      const currentLease = leaseTokenRef.current;
+      clearLocalLease();
+      if (currentLease) releaseTableLease(page.id, currentLease);
+      setTerminalPageUnavailable(true);
+      setSaveError(null);
+      setLoadError(null);
+      setLeaseError(message);
+      onPageUnavailableRef.current?.(page.id);
+    },
+    [clearLocalLease, page.id],
+  );
   const setLocalLeaseDeadline = useCallback((requestedAt: LeaseClock, duration: number) => {
     leaseMonotonicDeadlineRef.current = requestedAt.monotonic + duration;
     leaseWallDeadlineRef.current = requestedAt.wall + duration;
@@ -247,14 +280,15 @@ export function TablePage({
         }
       } catch (cause) {
         if (isCurrent() && generation === loadGenerationRef.current) {
-          setLoadError(errorMessage(cause, "Table could not be loaded."));
+          if (isPageUnavailableError(cause)) markPageUnavailable(cause.message);
+          else setLoadError(errorMessage(cause, "Table could not be loaded."));
         }
         throw cause;
       } finally {
         loadsInFlightRef.current -= 1;
       }
     },
-    [page.id],
+    [markPageUnavailable, page.id],
   );
 
   const recoverRevision = useCallback(async () => {
@@ -293,12 +327,21 @@ export function TablePage({
         method: "PATCH",
         body: json({ leaseToken: token }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      }).then((result) => {
-        assertLeaseTiming(result);
-        if (leaseTokenRef.current !== token) return false;
-        setLocalLeaseDeadline(requestedAt, result.leaseDurationMs);
-        return true;
-      });
+      }).then(
+        (result) => {
+          assertLeaseTiming(result);
+          if (leaseTokenRef.current !== token) return false;
+          setLocalLeaseDeadline(requestedAt, result.leaseDurationMs);
+          return true;
+        },
+        (cause: unknown) => {
+          // Renewal is the only request an idle editor keeps making, so it is
+          // usually where an archived table is first noticed. Clearing the
+          // lease here turns every caller's lease-ending fallback into a no-op.
+          if (isPageUnavailableError(cause)) markPageUnavailable(cause.message);
+          throw cause;
+        },
+      );
       const tracked = { token, generation, promise: Promise.resolve(false) };
       tracked.promise = attempt.finally(() => {
         if (leaseRenewalRef.current === tracked) leaseRenewalRef.current = null;
@@ -306,7 +349,7 @@ export function TablePage({
       leaseRenewalRef.current = tracked;
       return tracked.promise;
     },
-    [page.id, setLocalLeaseDeadline],
+    [markPageUnavailable, page.id, setLocalLeaseDeadline],
   );
 
   const ensureLeaseUsable = useCallback(
@@ -379,6 +422,10 @@ export function TablePage({
         }
       } catch (cause) {
         if (!isCurrent()) return;
+        if (isPageUnavailableError(cause)) {
+          markPageUnavailable(cause.message);
+          return;
+        }
         if (cause instanceof ApiClientError && cause.code === "lease_conflict") {
           leaseConflictGenerationRef.current += 1;
           clearLocalLease();
@@ -418,7 +465,16 @@ export function TablePage({
       setSaveError(null);
       await load(isCurrent).catch(() => undefined);
     },
-    [canEdit, clearLocalLease, ensureLeaseUsable, invalidateRevision, load, page.id, setLocalLeaseDeadline],
+    [
+      canEdit,
+      clearLocalLease,
+      ensureLeaseUsable,
+      invalidateRevision,
+      load,
+      markPageUnavailable,
+      page.id,
+      setLocalLeaseDeadline,
+    ],
   );
 
   const acquire = useCallback(
@@ -577,6 +633,10 @@ export function TablePage({
   ) {
     const execute = async () => {
       const failForLostLease = () => {
+        // Once the page itself is gone the missing lease is not news: the
+        // page-unavailable notice already explains why edits stopped, and the
+        // draft stays visible in its disabled input.
+        if (pageUnavailableRef.current) return null;
         resetCellInput(resetKey);
         if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
         return null;
@@ -597,11 +657,9 @@ export function TablePage({
         if (!(await ensureLeaseUsable(currentLease))) return failForLostLease();
         if (leaseTokenRef.current !== currentLease) return failForLostLease();
         const currentRevision = revisionRef.current;
-        if (currentRevision === null) {
-          resetCellInputAfterLoad(resetKey);
-          if (isMounted()) setSaveError(REVISION_RECOVERY_SAVE_MESSAGE);
-          return null;
-        }
+        // Invalidated while the lease was being verified: recover it at the
+        // top of the loop rather than failing without a reload attempt.
+        if (currentRevision === null) continue;
         try {
           const result = await api<T & { revision: number }>(path, {
             method,
@@ -623,6 +681,13 @@ export function TablePage({
           return result;
         } catch (cause) {
           if (!isMounted()) return null;
+          // Terminal whichever lease the request carried, so it outranks the
+          // lease-identity check: a 404 that lands after the local lease
+          // expired must still stop polling instead of reading as lease loss.
+          if (isPageUnavailableError(cause)) {
+            markPageUnavailable(cause.message);
+            return null;
+          }
           if (leaseTokenRef.current !== currentLease) {
             return failForLostLease();
           }
@@ -654,17 +719,6 @@ export function TablePage({
           if (cause instanceof ApiClientError && cause.status === 403) {
             await endLease(currentLease, cause.message);
             setSaveError(LEASE_LOST_SAVE_MESSAGE);
-            return null;
-          }
-          if (cause instanceof ApiClientError && cause.code === "page_not_found") {
-            setTerminalPageUnavailable(true);
-            if (leaseTokenRef.current === currentLease) {
-              clearLocalLease();
-              releaseTableLease(page.id, currentLease);
-            }
-            setSaveError(null);
-            setLeaseError(cause.message);
-            onPageUnavailable?.(page.id);
             return null;
           }
           if (cause instanceof ApiClientError && cause.status === 404) {
