@@ -1000,9 +1000,13 @@ describe("TablePage", () => {
   it("keeps the revision and unrelated drafts after a definitive mutation rejection", async () => {
     const mutation = deferred<{ revision: number }>();
     let loads = 0;
+    let mutations = 0;
     vi.mocked(api).mockImplementation((path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
-      if (path.includes("/cells/")) return mutation.promise;
+      if (path.includes("/cells/")) {
+        mutations += 1;
+        return mutation.promise;
+      }
       loads += 1;
       return Promise.resolve({ table: tableWithTwoTextCells() });
     });
@@ -1030,6 +1034,10 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Unblurred draft")).toBeEnabled();
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
     expect(loads).toBe(2);
+
+    fireEvent.focus(status);
+    fireEvent.blur(status);
+    await waitFor(() => expect(mutations).toBe(2));
   });
 
   it("reloads the table when a mutation target no longer exists", async () => {
@@ -1066,12 +1074,79 @@ describe("TablePage", () => {
     fireEvent.blur(input);
 
     expect(await screen.findByText("Your workspace role is read-only.")).toBeInTheDocument();
+    expect(screen.getByText("The table update was not saved because editing access was lost.")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Unsaved draft")).toBeDisabled();
     expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
       method: "DELETE",
       body: JSON.stringify({ leaseToken: "lease-token" }),
       keepalive: true,
     });
+  });
+
+  it("clears an earlier save error when a role downgrade ends editing", async () => {
+    let mutations = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      if (path.includes("/cells/")) {
+        mutations += 1;
+        if (mutations === 1) throw new ApiClientError(422, "invalid_cell", "The first value was invalid.");
+        throw new ApiClientError(403, "read_only", "Your workspace role is read-only.");
+      }
+      return { table };
+    });
+    await renderActiveEditor();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "First" } });
+    fireEvent.blur(input);
+    expect(await screen.findByText("The first value was invalid.")).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: "Second" } });
+    fireEvent.blur(input);
+
+    expect(await screen.findByText("Your workspace role is read-only.")).toBeInTheDocument();
+    expect(screen.queryByText("The first value was invalid.")).not.toBeInTheDocument();
+    expect(screen.getByText("The table update was not saved because editing access was lost.")).toBeInTheDocument();
+  });
+
+  it("releases the lease and stops polling when a mutation reports that the page is unavailable", async () => {
+    vi.useFakeTimers();
+    const onPageUnavailable = vi.fn();
+    let loads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      if (path.includes("/cells/")) throw new ApiClientError(404, "page_not_found", "Page not found.");
+      loads += 1;
+      return { table };
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={onPageUnavailable}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Unsaved" } });
+    fireEvent.blur(input);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
+    expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
+      method: "DELETE",
+      body: JSON.stringify({ leaseToken: "lease-token" }),
+      keepalive: true,
+    });
+    expect(screen.queryByRole("button", { name: "Try edit lock" })).not.toBeInTheDocument();
+    expect(loads).toBe(2);
+
+    await act(() => vi.advanceTimersByTimeAsync(25_000));
+    expect(loads).toBe(2);
   });
 
   it("reports a terminal message when a revision conflict repeats", async () => {

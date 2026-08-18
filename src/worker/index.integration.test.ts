@@ -1476,6 +1476,63 @@ describe("Worker integration", () => {
     ).toBe(1);
   });
 
+  it("rejects cell and option mutations after a table is archived", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const columnId = crypto.randomUUID();
+    const rowId = crypto.randomUUID();
+    const optionId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Choice', 'select', 0)`,
+      ).bind(columnId, tablePage.id),
+      env.DB.prepare(
+        `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
+      ).bind(rowId, tablePage.id, installed.userId, timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO table_select_options (id, column_id, label, position) VALUES (?, ?, 'Open', 0)`).bind(
+        optionId,
+        columnId,
+      ),
+    ]);
+    const lease = await (
+      await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/lease`, { method: "POST" }))
+    ).json<TableLeaseResponse>();
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(timestamp, tablePage.id).run();
+    const mutationBody = { leaseToken: lease.leaseToken, expectedRevision: 1 };
+
+    const putCell = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/cells/${rowId}/${columnId}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...mutationBody, value: optionId }),
+      }),
+    );
+    expect(putCell.status).toBe(404);
+    expect(await putCell.json()).toMatchObject({ error: { code: "page_not_found" } });
+
+    const deleteOption = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/columns/${columnId}/options/${optionId}`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(mutationBody),
+      }),
+    );
+    expect(deleteOption.status).toBe(404);
+    expect(await deleteOption.json()).toMatchObject({ error: { code: "page_not_found" } });
+    expect(
+      await env.DB.prepare(`SELECT 1 FROM table_select_options WHERE id = ?`).bind(optionId).first(),
+    ).not.toBeNull();
+    expect((await env.DB.prepare(`SELECT COUNT(*) count FROM table_cells`).first<{ count: number }>())?.count).toBe(0);
+    expect(
+      (
+        await env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
+          .bind(tablePage.id)
+          .first<{ revision: number }>()
+      )?.revision,
+    ).toBe(1);
+  });
+
   it("assigns append positions on the server without reusing gaps", async () => {
     const installed = await bootstrap();
     const tablePage = await createPage(installed.cookie, "table");

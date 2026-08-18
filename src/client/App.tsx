@@ -609,6 +609,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               page={selected}
               member={member}
               onPageChanged={updatePage}
+              onPageUnavailable={pageUnavailable}
               onSelectPage={(id) => {
                 setSelectedId(id);
                 setView("pages");
