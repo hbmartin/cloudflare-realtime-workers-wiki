@@ -29,28 +29,20 @@ describe("D1 migrations", () => {
     );
   });
 
-  it("upgrades a populated v1 database without losing data and retains owner guards", async () => {
-    const migrations = env.TEST_MIGRATIONS!;
-    await applyD1Migrations(env.DB, migrations.slice(0, 1));
+  it("enforces the owner guards and workspace cascade on a fresh database", async () => {
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
     const timestamp = Date.now();
     await env.DB.batch([
       env.DB.prepare(
         `INSERT INTO user (id, name, email, createdAt, updatedAt) VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
       ).bind(timestamp, timestamp),
-      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Existing Notes', ?)`).bind(
-        timestamp,
-      ),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
       env.DB.prepare(
         `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
          VALUES ('workspace', 'owner', 'owner', ?)`,
       ).bind(timestamp),
     ]);
 
-    await applyD1Migrations(env.DB, migrations);
-
-    expect(await env.DB.prepare(`SELECT name FROM workspaces WHERE id = 'workspace'`).first()).toMatchObject({
-      name: "Existing Notes",
-    });
     await expect(
       env.DB.prepare(`UPDATE workspace_members SET role = 'viewer' WHERE user_id = 'owner'`).run(),
     ).rejects.toThrow(/final_owner/);
@@ -58,6 +50,7 @@ describe("D1 migrations", () => {
       /final_owner/,
     );
 
+    // Deleting the workspace itself must still cascade through the final owner.
     await env.DB.prepare(`DELETE FROM workspaces WHERE id = 'workspace'`).run();
     expect(await env.DB.prepare(`SELECT 1 FROM workspace_members WHERE user_id = 'owner'`).first()).toBeNull();
   });
