@@ -101,17 +101,26 @@ export type TablePageProps = {
   page: Page;
   member: ClientMemberContext;
   onPageChanged: (page: Page) => void;
+  onPageUnavailable?: (pageId: string) => void;
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
 };
 
-export function TablePage({ page, member, onPageChanged, onSelectPage, backlinksRevision }: TablePageProps) {
+export function TablePage({
+  page,
+  member,
+  onPageChanged,
+  onPageUnavailable,
+  onSelectPage,
+  backlinksRevision,
+}: TablePageProps) {
   const canEdit = member.role !== "viewer";
   const [table, setTable] = useState<TableData | null>(null);
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
   const [leasePending, setLeasePending] = useState(canEdit);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
+  const [terminalPageUnavailable, setTerminalPageUnavailable] = useState(false);
   // Kept apart from leaseError: a successful renewal clears the lease notice on
   // every interval and would otherwise erase an unsaved-edit warning.
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -182,24 +191,12 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     if (key) pendingCellResetsRef.current.add(key);
   }, []);
 
-  const forgetRowCellInputs = useCallback((rowId: string) => {
-    const prefix = `${rowId}:`;
+  const forgetCellInputs = useCallback((shouldForget: (key: string) => boolean) => {
     for (const key of pendingCellResetsRef.current) {
-      if (key.startsWith(prefix)) pendingCellResetsRef.current.delete(key);
+      if (shouldForget(key)) pendingCellResetsRef.current.delete(key);
     }
     setCellResetGenerations((current) => {
-      const entries = Object.entries(current).filter(([key]) => !key.startsWith(prefix));
-      return entries.length === Object.keys(current).length ? current : Object.fromEntries(entries);
-    });
-  }, []);
-
-  const forgetColumnCellInputs = useCallback((columnId: string) => {
-    const suffix = `:${columnId}`;
-    for (const key of pendingCellResetsRef.current) {
-      if (key.endsWith(suffix)) pendingCellResetsRef.current.delete(key);
-    }
-    setCellResetGenerations((current) => {
-      const entries = Object.entries(current).filter(([key]) => !key.endsWith(suffix));
+      const entries = Object.entries(current).filter(([key]) => !shouldForget(key));
       return entries.length === Object.keys(current).length ? current : Object.fromEntries(entries);
     });
   }, []);
@@ -448,7 +445,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   }, [load, acquire, canEdit, reportLeaseError]);
 
   useEffect(() => {
-    if (leaseToken && tableLoaded && revisionKnown) return undefined;
+    if (terminalPageUnavailable || (leaseToken && tableLoaded && revisionKnown)) return undefined;
     let active = true;
     const isCurrent = () => active && mountedRef.current;
     const poll = window.setInterval(() => {
@@ -458,7 +455,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       active = false;
       window.clearInterval(poll);
     };
-  }, [leaseToken, load, revisionKnown, tableLoaded]);
+  }, [leaseToken, load, revisionKnown, tableLoaded, terminalPageUnavailable]);
 
   useEffect(() => {
     if (!leaseToken) return undefined;
@@ -598,7 +595,13 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           }
         }
         if (!(await ensureLeaseUsable(currentLease))) return failForLostLease();
-        const currentRevision = revisionRef.current!;
+        if (leaseTokenRef.current !== currentLease) return failForLostLease();
+        const currentRevision = revisionRef.current;
+        if (currentRevision === null) {
+          resetCellInputAfterLoad(resetKey);
+          if (isMounted()) setSaveError(REVISION_RECOVERY_SAVE_MESSAGE);
+          return null;
+        }
         try {
           const result = await api<T & { revision: number }>(path, {
             method,
@@ -650,6 +653,18 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           }
           if (cause instanceof ApiClientError && cause.status === 403) {
             await endLease(currentLease, cause.message);
+            setSaveError(LEASE_LOST_SAVE_MESSAGE);
+            return null;
+          }
+          if (cause instanceof ApiClientError && cause.code === "page_not_found") {
+            setTerminalPageUnavailable(true);
+            if (leaseTokenRef.current === currentLease) {
+              clearLocalLease();
+              releaseTableLease(page.id, currentLease);
+            }
+            setSaveError(null);
+            setLeaseError(cause.message);
+            onPageUnavailable?.(page.id);
             return null;
           }
           if (cause instanceof ApiClientError && cause.status === 404) {
@@ -704,7 +719,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     if (!confirm(`Delete “${column.name}” and every value in it?`)) return;
     const result = await mutation(`/api/tables/${page.id}/columns/${column.id}`, "DELETE", {});
     if (result) {
-      forgetColumnCellInputs(column.id);
+      const suffix = `:${column.id}`;
+      forgetCellInputs((key) => key.endsWith(suffix));
       setTable((current) =>
         current ? { ...current, columns: current.columns.filter((item) => item.id !== column.id) } : current,
       );
@@ -741,7 +757,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   async function removeRow(row: TableRow) {
     const result = await mutation(`/api/tables/${page.id}/rows/${row.id}`, "DELETE", {});
     if (result) {
-      forgetRowCellInputs(row.id);
+      const prefix = `${row.id}:`;
+      forgetCellInputs((key) => key.startsWith(prefix));
       setTable((current) =>
         current ? { ...current, rows: current.rows.filter((item) => item.id !== row.id) } : current,
       );
@@ -755,17 +772,18 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       { value },
       { resetKey: cellInputKey(rowId, columnId) },
     );
-    if (result)
-      setTable((current) =>
-        current
-          ? {
-              ...current,
-              rows: current.rows.map((row) =>
-                row.id === rowId ? { ...row, cells: { ...row.cells, [columnId]: value } } : row,
-              ),
-            }
-          : current,
-      );
+    if (!result) return false;
+    setTable((current) =>
+      current
+        ? {
+            ...current,
+            rows: current.rows.map((row) =>
+              row.id === rowId ? { ...row, cells: { ...row.cells, [columnId]: value } } : row,
+            ),
+          }
+        : current,
+    );
+    return true;
   }
 
   const visibleRows = useMemo(() => {
@@ -833,12 +851,12 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
             {page.icon ?? "Add icon"}
           </button>
         )}
-        {!leaseToken && canEdit && (
+        {!terminalPageUnavailable && !leaseToken && canEdit && (
           <button className="quiet-button" disabled={leasePending} onClick={() => void tryAcquire()}>
             Try edit lock
           </button>
         )}
-        {member.role === "owner" && !leaseToken && (
+        {member.role === "owner" && !terminalPageUnavailable && !leaseToken && (
           <button className="quiet-button" disabled={leasePending} onClick={() => void forceUnlock()}>
             Force unlock
           </button>
@@ -917,7 +935,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
                           column={column}
                           value={row.cells[column.id] ?? null}
                           disabled={!editingReady}
-                          onCommit={(value) => void setCell(row.id, column.id, value)}
+                          onCommit={(value) => setCell(row.id, column.id, value)}
                         />
                       </td>
                     ))}
@@ -955,9 +973,8 @@ function CellInput({
   column: TableColumn;
   value: string | number | boolean | null;
   disabled: boolean;
-  onCommit: (value: string | number | boolean | null) => void;
+  onCommit: (value: string | number | boolean | null) => Promise<boolean>;
 }) {
-  const lastEnqueuedValue = useRef(normalizedInputValue(column, value));
   if (column.type === "checkbox") {
     return (
       <input
@@ -965,7 +982,7 @@ function CellInput({
         type="checkbox"
         checked={Boolean(value)}
         disabled={disabled}
-        onChange={(event) => onCommit(event.target.checked)}
+        onChange={(event) => void onCommit(event.target.checked)}
       />
     );
   }
@@ -975,7 +992,7 @@ function CellInput({
         aria-label={column.name}
         value={String(value ?? "")}
         disabled={disabled}
-        onChange={(event) => onCommit(event.target.value || null)}
+        onChange={(event) => void onCommit(event.target.value || null)}
       >
         <option value="">—</option>
         {column.options.map((option) => (
@@ -986,6 +1003,22 @@ function CellInput({
       </select>
     );
   }
+  return <DraftCellInput column={column} value={value} disabled={disabled} onCommit={onCommit} />;
+}
+
+function DraftCellInput({
+  column,
+  value,
+  disabled,
+  onCommit,
+}: {
+  column: TableColumn;
+  value: string | number | boolean | null;
+  disabled: boolean;
+  onCommit: (value: string | number | boolean | null) => Promise<boolean>;
+}) {
+  const normalizedValue = normalizedInputValue(column, value);
+  const lastEnqueuedValue = useRef(normalizedValue);
   return (
     <input
       aria-label={column.name}
@@ -1001,7 +1034,11 @@ function CellInput({
             : event.target.value || null;
         if (!Object.is(nextValue, lastEnqueuedValue.current)) {
           lastEnqueuedValue.current = nextValue;
-          onCommit(nextValue);
+          void onCommit(nextValue).then((committed) => {
+            if (!committed && Object.is(lastEnqueuedValue.current, nextValue)) {
+              lastEnqueuedValue.current = normalizedValue;
+            }
+          });
         }
       }}
     />
