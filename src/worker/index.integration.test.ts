@@ -1212,6 +1212,8 @@ describe("Worker integration", () => {
       await document.finishTransition();
 
       expect(await state.storage.getAlarm()).toBe(retryAt);
+      expect(document.transitionRetryAt).toBeNull();
+      expect(document.transition).toBeNull();
     });
   });
 
@@ -1472,6 +1474,125 @@ describe("Worker integration", () => {
           .first<{ revision: number }>()
       )?.revision,
     ).toBe(1);
+  });
+
+  it("assigns append positions on the server without reusing gaps", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await (
+      await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/lease`, { method: "POST" }))
+    ).json<TableLeaseResponse>();
+    let revision = 1;
+    const mutate = async <T>(path: string, method: string, body: Record<string, unknown> = {}) => {
+      const response = await SELF.fetch(
+        authenticatedRequest(installed.cookie, path, {
+          method,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...body, leaseToken: lease.leaseToken, expectedRevision: revision }),
+        }),
+      );
+      expect(response.status).toBeLessThan(300);
+      const result = await response.json<T & { revision: number }>();
+      revision = result.revision;
+      return result;
+    };
+
+    const firstColumn = await mutate<{ column: { id: string; position: number } }>(
+      `/api/tables/${tablePage.id}/columns`,
+      "POST",
+      { name: "First", type: "text" },
+    );
+    const selectColumn = await mutate<{ column: { id: string; position: number } }>(
+      `/api/tables/${tablePage.id}/columns`,
+      "POST",
+      { name: "Choice", type: "select" },
+    );
+    await mutate(`/api/tables/${tablePage.id}/columns/${firstColumn.column.id}`, "DELETE");
+    const thirdColumn = await mutate<{ column: { id: string; position: number } }>(
+      `/api/tables/${tablePage.id}/columns`,
+      "POST",
+      { name: "Third", type: "text" },
+    );
+    expect([firstColumn.column.position, selectColumn.column.position, thirdColumn.column.position]).toEqual([0, 1, 2]);
+
+    const firstOption = await mutate<{ option: { id: string; position: number } }>(
+      `/api/tables/${tablePage.id}/columns/${selectColumn.column.id}/options`,
+      "POST",
+      { label: "First" },
+    );
+    const secondOption = await mutate<{ option: { id: string; position: number } }>(
+      `/api/tables/${tablePage.id}/columns/${selectColumn.column.id}/options`,
+      "POST",
+      { label: "Second" },
+    );
+    await mutate(
+      `/api/tables/${tablePage.id}/columns/${selectColumn.column.id}/options/${firstOption.option.id}`,
+      "DELETE",
+    );
+    const thirdOption = await mutate<{ option: { id: string; position: number } }>(
+      `/api/tables/${tablePage.id}/columns/${selectColumn.column.id}/options`,
+      "POST",
+      { label: "Third" },
+    );
+    expect([firstOption.option.position, secondOption.option.position, thirdOption.option.position]).toEqual([0, 1, 2]);
+
+    const firstRow = await mutate<{ row: { id: string; position: number } }>(
+      `/api/tables/${tablePage.id}/rows`,
+      "POST",
+    );
+    const secondRow = await mutate<{ row: { id: string; position: number } }>(
+      `/api/tables/${tablePage.id}/rows`,
+      "POST",
+    );
+    await mutate(`/api/tables/${tablePage.id}/rows/${firstRow.row.id}`, "DELETE");
+    const thirdRow = await mutate<{ row: { id: string; position: number } }>(
+      `/api/tables/${tablePage.id}/rows`,
+      "POST",
+    );
+    expect([firstRow.row.position, secondRow.row.position, thirdRow.row.position]).toEqual([0, 1, 2]);
+  });
+
+  it("does not advance the revision when a guarded mutation affects no rows", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const rowId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
+    )
+      .bind(rowId, tablePage.id, installed.userId, timestamp, timestamp)
+      .run();
+    const lease = await (
+      await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/lease`, { method: "POST" }))
+    ).json<TableLeaseResponse>();
+    const triggerName = `ignore_delete_${rowId.replaceAll("-", "")}`;
+    await env.DB.prepare(
+      `CREATE TRIGGER ${triggerName} BEFORE DELETE ON table_rows
+       WHEN OLD.id = '${rowId}' BEGIN SELECT RAISE(IGNORE); END`,
+    ).run();
+
+    try {
+      const response = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/rows/${rowId}`, {
+          method: "DELETE",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ leaseToken: lease.leaseToken, expectedRevision: 1 }),
+        }),
+      );
+
+      expect(response.status).toBe(404);
+      expect(await response.json()).toMatchObject({ error: { code: "mutation_target_not_found" } });
+      expect(await env.DB.prepare(`SELECT 1 FROM table_rows WHERE id = ?`).bind(rowId).first()).not.toBeNull();
+      expect(
+        (
+          await env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
+            .bind(tablePage.id)
+            .first<{ revision: number }>()
+        )?.revision,
+      ).toBe(1);
+    } finally {
+      await env.DB.prepare(`DROP TRIGGER IF EXISTS ${triggerName}`).run();
+    }
   });
 
   it("distinguishes a stale table revision from a lost editing lease", async () => {

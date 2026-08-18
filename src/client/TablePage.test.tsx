@@ -125,11 +125,11 @@ async function renderActiveEditor() {
       backlinksRevision={0}
     />,
   );
-  await act(async () => {
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-  });
+  if (vi.isFakeTimers()) {
+    await act(() => vi.advanceTimersByTimeAsync(0));
+  } else {
+    await screen.findByText("Editing lease active");
+  }
   expect(screen.getByText("Editing lease active")).toBeInTheDocument();
 }
 
@@ -208,23 +208,72 @@ describe("TablePage", () => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       return { table };
     });
-    render(
-      <TablePage
-        page={page}
-        member={member("editor")}
-        onPageChanged={vi.fn()}
-        onSelectPage={vi.fn()}
-        backlinksRevision={0}
-      />,
-    );
-
-    expect(await screen.findByText("Editing lease active")).toBeInTheDocument();
+    await renderActiveEditor();
     fireEvent.blur(screen.getByDisplayValue("Ready"));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
 
     expect(api).not.toHaveBeenCalledWith(
       "/api/tables/table-page/cells/row/status",
       expect.objectContaining({ method: "PUT" }),
     );
+  });
+
+  it.each([
+    ["number", "5"],
+    ["text", 5],
+  ] as const)(
+    "does not enqueue an unchanged %s cell whose stored value uses a different primitive type",
+    async (type, value) => {
+      const mismatchedTable: TableData = {
+        ...table,
+        columns: [{ ...table.columns[0]!, type }],
+        rows: [{ ...table.rows[0]!, cells: { status: value } }],
+      };
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+        return { table: mismatchedTable };
+      });
+      await renderActiveEditor();
+
+      fireEvent.blur(screen.getByDisplayValue("5"));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(api).not.toHaveBeenCalledWith(
+        "/api/tables/table-page/cells/row/status",
+        expect.objectContaining({ method: "PUT" }),
+      );
+    },
+  );
+
+  it("enqueues a revert to the rendered value while an earlier cell mutation is pending", async () => {
+    const firstMutation = deferred<{ revision: number }>();
+    const mutations: Array<Record<string, unknown>> = [];
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.includes("/cells/")) {
+        mutations.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return mutations.length === 1 ? firstMutation.promise : Promise.resolve({ revision: 3 });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+    const input = screen.getByDisplayValue("Ready");
+
+    fireEvent.change(input, { target: { value: "First" } });
+    fireEvent.blur(input);
+    await waitFor(() => expect(mutations).toHaveLength(1));
+    fireEvent.change(input, { target: { value: "Ready" } });
+    fireEvent.blur(input);
+
+    firstMutation.resolve({ revision: 2 });
+    await waitFor(() => expect(mutations).toHaveLength(2));
+    expect(mutations.map((body) => body.value)).toEqual(["First", "Ready"]);
   });
 
   it.each([
@@ -836,6 +885,27 @@ describe("TablePage", () => {
     expect(renewals).toBe(2);
   });
 
+  it("reschedules an expiry timer that fires before the monotonic deadline", async () => {
+    const advanceMonotonic = stubMonotonicClock();
+    const acquiredAt = Date.now();
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/lease") && init?.method === "PATCH") return new Promise(() => undefined);
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    vi.setSystemTime(acquiredAt - LEASE_DURATION_MS);
+    advanceMonotonic(LEASE_DURATION_MS - 1);
+    await act(() => vi.advanceTimersByTimeAsync(LEASE_DURATION_MS));
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+
+    vi.setSystemTime(acquiredAt + LEASE_DURATION_MS + 1);
+    advanceMonotonic(2);
+    await act(() => vi.advanceTimersByTimeAsync(2));
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+  });
+
   it("ends the lease when a renewal response cannot be read", async () => {
     vi.useFakeTimers();
     vi.mocked(api).mockImplementation(async (path, init) => {
@@ -962,6 +1032,48 @@ describe("TablePage", () => {
     expect(loads).toBe(2);
   });
 
+  it("reloads the table when a mutation target no longer exists", async () => {
+    let loads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.includes("/cells/")) throw new ApiClientError(404, "row_not_found", "Row not found.");
+      loads += 1;
+      return { table: loads >= 3 ? { ...table, revision: 2, rows: [] } : table };
+    });
+    await renderActiveEditor();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Stale edit" } });
+    fireEvent.blur(input);
+
+    expect(await screen.findByText("Row not found.")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByDisplayValue("Stale edit")).not.toBeInTheDocument());
+    expect(loads).toBe(3);
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+  });
+
+  it("ends editing on a role downgrade without discarding the visible draft", async () => {
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      if (path.includes("/cells/")) {
+        throw new ApiClientError(403, "read_only", "Your workspace role is read-only.");
+      }
+      return { table };
+    });
+    await renderActiveEditor();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Unsaved draft" } });
+    fireEvent.blur(input);
+
+    expect(await screen.findByText("Your workspace role is read-only.")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Unsaved draft")).toBeDisabled();
+    expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
+      method: "DELETE",
+      body: JSON.stringify({ leaseToken: "lease-token" }),
+      keepalive: true,
+    });
+  });
+
   it("reports a terminal message when a revision conflict repeats", async () => {
     const mutations: Array<Record<string, unknown>> = [];
     let loads = 0;
@@ -1034,20 +1146,20 @@ describe("TablePage", () => {
     expect(screen.queryByText("The table changed. Reloading before retrying.")).not.toBeInTheDocument();
   });
 
-  it("recomputes an option position after revision recovery", async () => {
-    const positions: number[] = [];
+  it("leaves option position assignment to the server across revision recovery", async () => {
+    const mutations: Array<Record<string, unknown>> = [];
     let loads = 0;
     const prompt = vi.spyOn(window, "prompt").mockReturnValue("New option");
     onTestFinished(() => prompt.mockRestore());
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.endsWith("/options")) {
-        const body = JSON.parse(String(init?.body)) as { position: number };
-        positions.push(body.position);
-        if (positions.length === 1) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        mutations.push(body);
+        if (mutations.length === 1) {
           throw new ApiClientError(409, "table_revision_conflict", "The table changed. Reloading before retrying.");
         }
-        return { option: { id: "new-option", label: "New option", position: body.position }, revision: 3 };
+        return { option: { id: "new-option", label: "New option", position: 2 }, revision: 3 };
       }
       loads += 1;
       return { table: loads >= 3 ? tableWithOptions(["One", "Two"], 2) : tableWithOptions(["One"]) };
@@ -1065,7 +1177,11 @@ describe("TablePage", () => {
     expect(await screen.findByText("Editing lease active")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Add option to Choice" }));
 
-    await waitFor(() => expect(positions).toEqual([1, 2]));
+    await waitFor(() => expect(mutations).toHaveLength(2));
+    expect(mutations).toEqual([
+      expect.not.objectContaining({ position: expect.anything() }),
+      expect.not.objectContaining({ position: expect.anything() }),
+    ]);
     expect(screen.getByRole("option", { name: "New option" })).toBeInTheDocument();
   });
 
@@ -1269,7 +1385,74 @@ describe("TablePage", () => {
       expect.objectContaining({ method: "PATCH", signal: expect.any(AbortSignal) }),
     );
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+    const patchCalls = vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "PATCH").length;
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(patchCalls);
     expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "DELETE" }));
+  });
+
+  it("uses a renewal started after a clock change to verify the lease", async () => {
+    stubMonotonicClock();
+    const acquiredAt = Date.now();
+    const staleRenewal = deferred<TableLeaseTiming>();
+    let renewals = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/lease") && init?.method === "PATCH") {
+        renewals += 1;
+        return renewals === 1 ? staleRenewal.promise : Promise.resolve({ leaseDurationMs: LEASE_DURATION_MS });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+    expect(renewals).toBe(1);
+
+    vi.setSystemTime(acquiredAt + 100_000);
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      staleRenewal.resolve({ leaseDurationMs: LEASE_DURATION_MS });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(renewals).toBe(2);
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+  });
+
+  it("releases a possibly live lease when clock-change verification fails transiently", async () => {
+    stubMonotonicClock();
+    const acquiredAt = Date.now();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "PATCH") {
+        throw new DOMException("The operation timed out.", "TimeoutError");
+      }
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      return { table };
+    });
+    await renderActiveEditor();
+
+    vi.setSystemTime(acquiredAt + LEASE_DURATION_MS + 1);
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
+      method: "DELETE",
+      body: JSON.stringify({ leaseToken: "lease-token" }),
+      keepalive: true,
+    });
   });
 
   it("ends a lease after system sleep when the server says it was lost", async () => {

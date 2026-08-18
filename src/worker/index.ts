@@ -1188,23 +1188,43 @@ app.post("/api/tables/:pageId/columns", async (c) => {
   const id = crypto.randomUUID();
   const name = text(input.body.name, "name", 100);
   const type = columnType(input.body.type);
-  const position = Number(input.body.position);
-  if (!Number.isInteger(position) || position < 0)
-    throw new HttpError(422, "invalid_position", "position must be a non-negative integer.");
-  const result = await guardedBatch(c.env, page.id, input, [
+  const position =
+    (
+      await c.env.DB.prepare(`SELECT COALESCE(MAX(position) + 1, 0) position FROM table_columns WHERE page_id = ?`)
+        .bind(page.id)
+        .first<{ position: number }>()
+    )?.position ?? 0;
+  const result = await guardedBatch(c.env, page.id, input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_columns (id, page_id, name, type, position)
        SELECT ?, ?, ?, ?, ? WHERE ${leaseGuards()}`,
-    ).bind(id, page.id, name, type, position, page.id, input.expectedRevision, input.tokenHash, input.sessionId, now()),
-  ]);
+    ).bind(
+      id,
+      page.id,
+      name,
+      type,
+      position,
+      page.id,
+      input.expectedRevision,
+      input.tokenHash,
+      input.sessionId,
+      guardedAt,
+    ),
+  );
   return c.json({ column: { id, name, type, position }, revision: result }, 201);
 });
 
 app.delete("/api/tables/:pageId/columns/:columnId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
   const input = await leaseInputs(c.req.raw, member);
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const column = await c.env.DB.prepare(`SELECT 1 FROM table_columns WHERE id = ? AND page_id = ?`)
+    .bind(c.req.param("columnId"), page.id)
+    .first();
+  if (!column) throw new HttpError(404, "column_not_found", "Column not found.");
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(`DELETE FROM table_columns WHERE id = ? AND page_id = ? AND ${leaseGuards()}`).bind(
       c.req.param("columnId"),
       c.req.param("pageId"),
@@ -1212,22 +1232,34 @@ app.delete("/api/tables/:pageId/columns/:columnId", async (c) => {
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ revision });
 });
 
 app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
   const input = await leaseInputs(c.req.raw, member);
   const id = crypto.randomUUID();
   const label = text(input.body.label, "label", 100);
-  const position = Number(input.body.position);
-  if (!Number.isInteger(position) || position < 0)
-    throw new HttpError(422, "invalid_position", "position must be a non-negative integer.");
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const column = await c.env.DB.prepare(`SELECT type FROM table_columns WHERE id = ? AND page_id = ?`)
+    .bind(c.req.param("columnId"), page.id)
+    .first<{ type: string }>();
+  if (!column) throw new HttpError(404, "column_not_found", "Column not found.");
+  if (column.type !== "select") throw new HttpError(422, "select_required", "This column is not a select property.");
+  const position =
+    (
+      await c.env.DB.prepare(
+        `SELECT COALESCE(MAX(position) + 1, 0) position FROM table_select_options WHERE column_id = ?`,
+      )
+        .bind(c.req.param("columnId"))
+        .first<{ position: number }>()
+    )?.position ?? 0;
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_select_options (id, column_id, label, position)
        SELECT ?, ?, ?, ? WHERE EXISTS (
@@ -1244,9 +1276,9 @@ app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ option: { id, label, position }, revision }, 201);
 });
 
@@ -1262,7 +1294,7 @@ app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) 
     .bind(c.req.param("optionId"), c.req.param("columnId"), c.req.param("pageId"))
     .first();
   if (!option) throw new HttpError(404, "option_not_found", "Option not found.");
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(`DELETE FROM table_select_options WHERE id = ? AND column_id = ? AND ${leaseGuards()}`).bind(
       c.req.param("optionId"),
       c.req.param("columnId"),
@@ -1270,25 +1302,28 @@ app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) 
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ revision });
 });
 
 app.post("/api/tables/:pageId/rows", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
   const input = await leaseInputs(c.req.raw, member);
-  const count = await c.env.DB.prepare(`SELECT COUNT(*) count FROM table_rows WHERE page_id = ?`)
-    .bind(c.req.param("pageId"))
-    .first<{ count: number }>();
-  if ((count?.count ?? 0) >= 500) throw new HttpError(422, "table_row_limit", "Tables are limited to 500 rows in v1.");
+  const rowState = await c.env.DB.prepare(
+    `SELECT COUNT(*) count, COALESCE(MAX(position) + 1, 0) position FROM table_rows WHERE page_id = ?`,
+  )
+    .bind(page.id)
+    .first<{ count: number; position: number }>();
+  if ((rowState?.count ?? 0) >= 500)
+    throw new HttpError(422, "table_row_limit", "Tables are limited to 500 rows in v1.");
   const id = crypto.randomUUID();
-  const position = Number(input.body.position);
-  if (!Number.isInteger(position) || position < 0)
-    throw new HttpError(422, "invalid_position", "position must be a non-negative integer.");
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const position = rowState?.position ?? 0;
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
        SELECT ?, ?, ?, ?, ?, ? WHERE ${leaseGuards()}`,
@@ -1297,23 +1332,29 @@ app.post("/api/tables/:pageId/rows", async (c) => {
       c.req.param("pageId"),
       position,
       member.user.id,
-      now(),
-      now(),
+      guardedAt,
+      guardedAt,
       c.req.param("pageId"),
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ row: { id, position, cells: {} }, revision }, 201);
 });
 
 app.delete("/api/tables/:pageId/rows/:rowId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
   const input = await leaseInputs(c.req.raw, member);
-  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, [
+  const row = await c.env.DB.prepare(`SELECT 1 FROM table_rows WHERE id = ? AND page_id = ?`)
+    .bind(c.req.param("rowId"), page.id)
+    .first();
+  if (!row) throw new HttpError(404, "row_not_found", "Row not found.");
+  const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(`DELETE FROM table_rows WHERE id = ? AND page_id = ? AND ${leaseGuards()}`).bind(
       c.req.param("rowId"),
       c.req.param("pageId"),
@@ -1321,9 +1362,9 @@ app.delete("/api/tables/:pageId/rows/:rowId", async (c) => {
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ revision });
 });
 
@@ -1347,7 +1388,7 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
     if (!option) throw new HttpError(422, "invalid_cell", "The selected option does not belong to this column.");
   }
   const values = typedCell(column.type, input.body.value);
-  const revision = await guardedBatch(c.env, pageId, input, [
+  const revision = await guardedBatch(c.env, pageId, input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_cells
        (row_id, column_id, text_value, number_value, boolean_value, date_value, select_value, updated_at)
@@ -1360,14 +1401,14 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
       c.req.param("rowId"),
       c.req.param("columnId"),
       ...values,
-      now(),
+      guardedAt,
       pageId,
       input.expectedRevision,
       input.tokenHash,
       input.sessionId,
-      now(),
+      guardedAt,
     ),
-  ]);
+  );
   return c.json({ revision });
 });
 
@@ -1460,27 +1501,41 @@ async function guardedBatch(
   env: Env,
   pageId: string,
   input: { expectedRevision: number; tokenHash: string; sessionId: string },
-  mutations: D1PreparedStatement[],
+  prepareMutation: (guardedAt: number) => D1PreparedStatement,
 ) {
-  const updatedAt = now();
+  const guardedAt = now();
   const results = await env.DB.batch([
-    ...mutations,
+    prepareMutation(guardedAt),
     env.DB.prepare(
       `UPDATE table_state SET revision = revision + 1
-        WHERE page_id = ? AND revision = ? AND ${leaseGuards()}`,
-    ).bind(pageId, input.expectedRevision, pageId, input.expectedRevision, input.tokenHash, input.sessionId, updatedAt),
-    env.DB.prepare(
-      `SELECT 1 lease_valid FROM table_leases
-        WHERE page_id = ? AND token_hash = ? AND holder_session_id = ? AND expires_at > ?`,
-    ).bind(pageId, input.tokenHash, input.sessionId, updatedAt),
+        WHERE page_id = ? AND revision = ? AND changes() > 0 AND ${leaseGuards()}`,
+    ).bind(pageId, input.expectedRevision, pageId, input.expectedRevision, input.tokenHash, input.sessionId, guardedAt),
   ]);
-  if (!results.at(-2)?.meta.changes) {
-    if (results.at(-1)?.results.length) {
-      throw new HttpError(409, "table_revision_conflict", "The table changed. Reloading before retrying the update.");
-    }
+  const mutationApplied = Boolean(results[0]?.meta.changes);
+  const revisionUpdated = Boolean(results[1]?.meta.changes);
+  if (mutationApplied && revisionUpdated) return input.expectedRevision + 1;
+
+  const state = await env.DB.prepare(
+    `SELECT s.revision,
+       EXISTS (
+         SELECT 1 FROM table_leases l
+          WHERE l.page_id = s.page_id AND l.token_hash = ?
+            AND l.holder_session_id = ? AND l.expires_at > ?
+       ) lease_valid
+       FROM table_state s WHERE s.page_id = ?`,
+  )
+    .bind(input.tokenHash, input.sessionId, guardedAt, pageId)
+    .first<{ revision: number; lease_valid: number }>();
+  if (!state?.lease_valid) {
     throw new HttpError(409, "table_lease_lost", "The editing lease was lost. Reloaded the authoritative table.");
   }
-  return input.expectedRevision + 1;
+  if (!mutationApplied && state.revision === input.expectedRevision) {
+    throw new HttpError(404, "mutation_target_not_found", "The table item being changed no longer exists.");
+  }
+  if (!revisionUpdated && state.revision === input.expectedRevision) {
+    throw new HttpError(500, "table_revision_failed", "The table revision could not be advanced.");
+  }
+  throw new HttpError(409, "table_revision_conflict", "The table changed. Reloading before retrying the update.");
 }
 
 async function handlePartyRequest(request: Request, env: Env) {
