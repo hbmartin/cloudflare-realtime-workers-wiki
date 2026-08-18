@@ -155,15 +155,26 @@ async function pageForMember(env: Env, member: MemberContext, pageId: string, in
   return row;
 }
 
-function tableMutationPageQuery(env: Env, extraColumns = "") {
-  return env.DB.prepare(
-    `SELECT p.*${extraColumns}
+type TablePageExtras = { columns: string; binds: unknown[] };
+
+// Resolves the active (unarchived) table page a request targets, failing with
+// the 404/422 every table route reports. `extra.columns` are selected alongside
+// the page row so a route can fold its own existence and position lookups into
+// this one query; their placeholders bind first and the page/workspace binds
+// are appended here, so no route maintains a positional bind list by hand.
+async function activeTablePage<T = unknown>(
+  env: Env,
+  member: MemberContext,
+  pageId: string,
+  extra: TablePageExtras = { columns: "", binds: [] },
+) {
+  const row = await env.DB.prepare(
+    `SELECT p.*${extra.columns}
        FROM pages p
       WHERE p.id = ? AND p.workspace_id = ? AND p.archived_at IS NULL`,
-  );
-}
-
-function requireTableMutationPage<T>(row: (PageRow & T) | null) {
+  )
+    .bind(...extra.binds, pageId, member.workspace.id)
+    .first<PageRow & T>();
   if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
   if (row.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
   return row;
@@ -177,8 +188,7 @@ function leaseGuards() {
   )`;
 }
 
-async function leaseInputs(request: Request, member: MemberContext) {
-  const body = await jsonBody(request);
+async function leaseInputs(body: Record<string, unknown>, member: MemberContext) {
   const leaseToken = text(body.leaseToken, "leaseToken", 200);
   const expectedRevision = Number(body.expectedRevision);
   if (!Number.isInteger(expectedRevision) || expectedRevision < 1) {
@@ -1066,8 +1076,7 @@ app.post("/api/pages/:id/restore-version", async (c) => {
 
 app.get("/api/tables/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const page = await pageForMember(c.env, member, c.req.param("pageId"));
-  if (page.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
+  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
   const state = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
     .bind(page.id)
     .first<{ revision: number }>();
@@ -1137,8 +1146,7 @@ app.get("/api/tables/:pageId", async (c) => {
 app.post("/api/tables/:pageId/lease", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = await pageForMember(c.env, member, c.req.param("pageId"));
-  if (page.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
+  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
   const token = `${crypto.randomUUID()}${crypto.randomUUID()}`;
   const expiresAt = now() + TABLE_LEASE_DURATION_MS;
   const result = await c.env.DB.prepare(
@@ -1159,19 +1167,17 @@ app.post("/api/tables/:pageId/lease", async (c) => {
 app.patch("/api/tables/:pageId/lease", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
+  // Renewal must observe archival like every other table write: otherwise a
+  // client that never attempts an edit could keep a lease on an archived
+  // table alive indefinitely.
+  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
   const body = await jsonBody(c.req.raw);
   const expiresAt = now() + TABLE_LEASE_DURATION_MS;
   const result = await c.env.DB.prepare(
     `UPDATE table_leases SET expires_at = ?
       WHERE page_id = ? AND holder_session_id = ? AND token_hash = ? AND expires_at > ?`,
   )
-    .bind(
-      expiresAt,
-      c.req.param("pageId"),
-      member.session.id,
-      await sha256(text(body.leaseToken, "leaseToken", 200)),
-      now(),
-    )
+    .bind(expiresAt, page.id, member.session.id, await sha256(text(body.leaseToken, "leaseToken", 200)), now())
     .run();
   if (!result.meta.changes) throw new HttpError(409, "lease_lost", "The table lease has expired or been replaced.");
   return c.json({ leaseDurationMs: TABLE_LEASE_DURATION_MS } satisfies TableLeaseTiming);
@@ -1189,22 +1195,19 @@ app.delete("/api/tables/:pageId/lease", async (c) => {
 app.post("/api/tables/:pageId/force-unlock", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
-  await c.env.DB.prepare(`DELETE FROM table_leases WHERE page_id = ?`).bind(c.req.param("pageId")).run();
+  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
+  await c.env.DB.prepare(`DELETE FROM table_leases WHERE page_id = ?`).bind(page.id).run();
   return c.json({ ok: true });
 });
 
 app.post("/api/tables/:pageId/columns", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = requireTableMutationPage(
-    await tableMutationPageQuery(
-      c.env,
-      `, (SELECT COALESCE(MAX(position) + 1, 0) FROM table_columns WHERE page_id = p.id) next_position`,
-    )
-      .bind(c.req.param("pageId"), member.workspace.id)
-      .first<PageRow & { next_position: number }>(),
-  );
-  const input = await leaseInputs(c.req.raw, member);
+  const page = await activeTablePage<{ next_position: number }>(c.env, member, c.req.param("pageId"), {
+    columns: `, (SELECT COALESCE(MAX(position) + 1, 0) FROM table_columns WHERE page_id = p.id) next_position`,
+    binds: [],
+  });
+  const input = await leaseInputs(await jsonBody(c.req.raw), member);
   const id = crypto.randomUUID();
   const name = text(input.body.name, "name", 100);
   const type = columnType(input.body.type);
@@ -1232,16 +1235,12 @@ app.post("/api/tables/:pageId/columns", async (c) => {
 app.delete("/api/tables/:pageId/columns/:columnId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = requireTableMutationPage(
-    await tableMutationPageQuery(
-      c.env,
-      `, EXISTS (SELECT 1 FROM table_columns WHERE id = ? AND page_id = p.id) target_exists`,
-    )
-      .bind(c.req.param("columnId"), c.req.param("pageId"), member.workspace.id)
-      .first<PageRow & { target_exists: number }>(),
-  );
+  const page = await activeTablePage<{ target_exists: number }>(c.env, member, c.req.param("pageId"), {
+    columns: `, EXISTS (SELECT 1 FROM table_columns WHERE id = ? AND page_id = p.id) target_exists`,
+    binds: [c.req.param("columnId")],
+  });
   if (!page.target_exists) throw new HttpError(404, "column_not_found", "Column not found.");
-  const input = await leaseInputs(c.req.raw, member);
+  const input = await leaseInputs(await jsonBody(c.req.raw), member);
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(`DELETE FROM table_columns WHERE id = ? AND page_id = ? AND ${leaseGuards()}`).bind(
       c.req.param("columnId"),
@@ -1259,19 +1258,20 @@ app.delete("/api/tables/:pageId/columns/:columnId", async (c) => {
 app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = requireTableMutationPage(
-    await tableMutationPageQuery(
-      c.env,
-      `, (SELECT type FROM table_columns WHERE id = ? AND page_id = p.id) column_type,
+  const page = await activeTablePage<{ column_type: string | null; next_position: number }>(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    {
+      columns: `, (SELECT type FROM table_columns WHERE id = ? AND page_id = p.id) column_type,
           (SELECT COALESCE(MAX(position) + 1, 0) FROM table_select_options WHERE column_id = ?) next_position`,
-    )
-      .bind(c.req.param("columnId"), c.req.param("columnId"), c.req.param("pageId"), member.workspace.id)
-      .first<PageRow & { column_type: string | null; next_position: number }>(),
+      binds: [c.req.param("columnId"), c.req.param("columnId")],
+    },
   );
   if (page.column_type === null) throw new HttpError(404, "column_not_found", "Column not found.");
   if (page.column_type !== "select")
     throw new HttpError(422, "select_required", "This column is not a select property.");
-  const input = await leaseInputs(c.req.raw, member);
+  const input = await leaseInputs(await jsonBody(c.req.raw), member);
   const id = crypto.randomUUID();
   const label = text(input.body.label, "label", 100);
   const position = page.next_position;
@@ -1301,20 +1301,16 @@ app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
 app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = requireTableMutationPage(
-    await tableMutationPageQuery(
-      c.env,
-      `, EXISTS (
+  const page = await activeTablePage<{ target_exists: number }>(c.env, member, c.req.param("pageId"), {
+    columns: `, EXISTS (
         SELECT 1 FROM table_select_options option
         JOIN table_columns column ON column.id = option.column_id
         WHERE option.id = ? AND option.column_id = ? AND column.page_id = p.id
       ) target_exists`,
-    )
-      .bind(c.req.param("optionId"), c.req.param("columnId"), c.req.param("pageId"), member.workspace.id)
-      .first<PageRow & { target_exists: number }>(),
-  );
+    binds: [c.req.param("optionId"), c.req.param("columnId")],
+  });
   if (!page.target_exists) throw new HttpError(404, "option_not_found", "Option not found.");
-  const input = await leaseInputs(c.req.raw, member);
+  const input = await leaseInputs(await jsonBody(c.req.raw), member);
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(`DELETE FROM table_select_options WHERE id = ? AND column_id = ? AND ${leaseGuards()}`).bind(
       c.req.param("optionId"),
@@ -1332,16 +1328,17 @@ app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) 
 app.post("/api/tables/:pageId/rows", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = requireTableMutationPage(
-    await tableMutationPageQuery(
-      c.env,
-      `, (SELECT COUNT(*) FROM table_rows WHERE page_id = p.id) row_count,
+  const page = await activeTablePage<{ row_count: number; next_position: number }>(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    {
+      columns: `, (SELECT COUNT(*) FROM table_rows WHERE page_id = p.id) row_count,
           (SELECT COALESCE(MAX(position) + 1, 0) FROM table_rows WHERE page_id = p.id) next_position`,
-    )
-      .bind(c.req.param("pageId"), member.workspace.id)
-      .first<PageRow & { row_count: number; next_position: number }>(),
+      binds: [],
+    },
   );
-  const input = await leaseInputs(c.req.raw, member);
+  const input = await leaseInputs(await jsonBody(c.req.raw), member);
   if (page.row_count >= 500) throw new HttpError(422, "table_row_limit", "Tables are limited to 500 rows in v1.");
   const id = crypto.randomUUID();
   const position = page.next_position;
@@ -1369,16 +1366,12 @@ app.post("/api/tables/:pageId/rows", async (c) => {
 app.delete("/api/tables/:pageId/rows/:rowId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = requireTableMutationPage(
-    await tableMutationPageQuery(
-      c.env,
-      `, EXISTS (SELECT 1 FROM table_rows WHERE id = ? AND page_id = p.id) target_exists`,
-    )
-      .bind(c.req.param("rowId"), c.req.param("pageId"), member.workspace.id)
-      .first<PageRow & { target_exists: number }>(),
-  );
+  const page = await activeTablePage<{ target_exists: number }>(c.env, member, c.req.param("pageId"), {
+    columns: `, EXISTS (SELECT 1 FROM table_rows WHERE id = ? AND page_id = p.id) target_exists`,
+    binds: [c.req.param("rowId")],
+  });
   if (!page.target_exists) throw new HttpError(404, "row_not_found", "Row not found.");
-  const input = await leaseInputs(c.req.raw, member);
+  const input = await leaseInputs(await jsonBody(c.req.raw), member);
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(`DELETE FROM table_rows WHERE id = ? AND page_id = ? AND ${leaseGuards()}`).bind(
       c.req.param("rowId"),
@@ -1396,37 +1389,30 @@ app.delete("/api/tables/:pageId/rows/:rowId", async (c) => {
 app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const input = await leaseInputs(c.req.raw, member);
+  // The body is read first only because the option lookup below needs the
+  // submitted value; lease validation still follows the page and target
+  // checks so this route reports 404s in the same order as the others.
+  const body = await jsonBody(c.req.raw);
   const pageId = c.req.param("pageId");
-  const selectOptionId = typeof input.body.value === "string" ? input.body.value : null;
-  const page = requireTableMutationPage(
-    await tableMutationPageQuery(
-      c.env,
-      `, (SELECT type FROM table_columns WHERE id = ? AND page_id = p.id) column_type,
+  const selectOptionId = typeof body.value === "string" ? body.value : null;
+  const page = await activeTablePage<{ column_type: string | null; row_exists: number; select_option_exists: number }>(
+    c.env,
+    member,
+    pageId,
+    {
+      columns: `, (SELECT type FROM table_columns WHERE id = ? AND page_id = p.id) column_type,
           EXISTS (SELECT 1 FROM table_rows WHERE id = ? AND page_id = p.id) row_exists,
           EXISTS (SELECT 1 FROM table_select_options WHERE id = ? AND column_id = ?) select_option_exists`,
-    )
-      .bind(
-        c.req.param("columnId"),
-        c.req.param("rowId"),
-        selectOptionId,
-        c.req.param("columnId"),
-        pageId,
-        member.workspace.id,
-      )
-      .first<PageRow & { column_type: string | null; row_exists: number; select_option_exists: number }>(),
+      binds: [c.req.param("columnId"), c.req.param("rowId"), selectOptionId, c.req.param("columnId")],
+    },
   );
   if (page.column_type === null) throw new HttpError(404, "column_not_found", "Column not found.");
   if (!page.row_exists) throw new HttpError(404, "row_not_found", "Row not found.");
-  if (
-    page.column_type === "select" &&
-    input.body.value !== null &&
-    input.body.value !== "" &&
-    !page.select_option_exists
-  ) {
+  if (page.column_type === "select" && body.value !== null && body.value !== "" && !page.select_option_exists) {
     throw new HttpError(422, "invalid_cell", "The selected option does not belong to this column.");
   }
-  const values = typedCell(page.column_type, input.body.value);
+  const input = await leaseInputs(body, member);
+  const values = typedCell(page.column_type, body.value);
   const revision = await guardedBatch(c.env, pageId, input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_cells
