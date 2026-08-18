@@ -14,8 +14,6 @@ import { BacklinksPanel } from "./BacklinksPanel";
 
 type IsCurrent = () => boolean;
 type MutationOptions = {
-  position?: () => number;
-  onSuccess?: () => void;
   resetKey?: string;
 };
 
@@ -87,7 +85,6 @@ function isDefinitiveMutationRejection(cause: unknown): cause is ApiClientError 
   return (
     cause instanceof ApiClientError &&
     (cause.status === 400 ||
-      cause.status === 404 ||
       cause.status === 413 ||
       cause.status === 415 ||
       cause.status === 422 ||
@@ -123,14 +120,12 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   const [cellResetGenerations, setCellResetGenerations] = useState<Record<string, number>>({});
   const revisionRef = useRef<number | null>(null);
   const leaseTokenRef = useRef<string | null>(null);
-  const columnCountRef = useRef(0);
-  const rowCountRef = useRef(0);
-  const optionCountRef = useRef(new Map<string, number>());
   const mutationQueue = useRef<Promise<void>>(Promise.resolve());
   const leaseActionRef = useRef<{ owner: IsCurrent; promise: Promise<void> } | null>(null);
   const leaseMonotonicDeadlineRef = useRef<number | null>(null);
   const leaseWallDeadlineRef = useRef<number | null>(null);
-  const leaseRenewalRef = useRef<{ token: string; promise: Promise<boolean> } | null>(null);
+  const leaseRenewalRef = useRef<{ token: string; generation: number; promise: Promise<boolean> } | null>(null);
+  const leaseRenewalGenerationRef = useRef(0);
   const pendingCellResetsRef = useRef(new Set<string>());
   const leaseConflictGenerationRef = useRef(0);
   const loadsInFlightRef = useRef(0);
@@ -182,6 +177,28 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     if (key) pendingCellResetsRef.current.add(key);
   }, []);
 
+  const forgetRowCellInputs = useCallback((rowId: string) => {
+    const prefix = `${rowId}:`;
+    for (const key of pendingCellResetsRef.current) {
+      if (key.startsWith(prefix)) pendingCellResetsRef.current.delete(key);
+    }
+    setCellResetGenerations((current) => {
+      const entries = Object.entries(current).filter(([key]) => !key.startsWith(prefix));
+      return entries.length === Object.keys(current).length ? current : Object.fromEntries(entries);
+    });
+  }, []);
+
+  const forgetColumnCellInputs = useCallback((columnId: string) => {
+    const suffix = `:${columnId}`;
+    for (const key of pendingCellResetsRef.current) {
+      if (key.endsWith(suffix)) pendingCellResetsRef.current.delete(key);
+    }
+    setCellResetGenerations((current) => {
+      const entries = Object.entries(current).filter(([key]) => !key.endsWith(suffix));
+      return entries.length === Object.keys(current).length ? current : Object.fromEntries(entries);
+    });
+  }, []);
+
   const invalidateRevision = useCallback(() => {
     revisionRef.current = null;
     setRevisionKnown(false);
@@ -199,18 +216,28 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         if (!isCurrent() || generation !== loadGenerationRef.current) return;
         revisionRef.current = result.table.revision;
         setRevisionKnown(true);
-        columnCountRef.current = result.table.columns.length;
-        rowCountRef.current = result.table.rows.length;
-        optionCountRef.current = new Map(result.table.columns.map((column) => [column.id, column.options.length]));
-        if (pendingCellResetsRef.current.size) {
-          const resets = [...pendingCellResetsRef.current];
-          pendingCellResetsRef.current.clear();
-          setCellResetGenerations((current) => {
-            const next = { ...current };
-            for (const key of resets) next[key] = (next[key] ?? 0) + 1;
-            return next;
-          });
-        }
+        const validRows = new Set(result.table.rows.map((row) => row.id));
+        const validColumns = new Set(result.table.columns.map((column) => column.id));
+        const isValidCellKey = (key: string) => {
+          const separator = key.indexOf(":");
+          return separator >= 0 && validRows.has(key.slice(0, separator)) && validColumns.has(key.slice(separator + 1));
+        };
+        const resets = pendingCellResetsRef.current;
+        pendingCellResetsRef.current = new Set();
+        setCellResetGenerations((current) => {
+          let changed = false;
+          const next: Record<string, number> = {};
+          for (const [key, value] of Object.entries(current)) {
+            if (isValidCellKey(key)) next[key] = value;
+            else changed = true;
+          }
+          for (const key of resets) {
+            if (!isValidCellKey(key)) continue;
+            next[key] = (next[key] ?? 0) + 1;
+            changed = true;
+          }
+          return changed ? next : current;
+        });
         setTable(result.table);
         setLoadError(null);
         if (result.table.lease.expiresAt === null && leaseConflictGeneration === leaseConflictGenerationRef.current) {
@@ -250,10 +277,16 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
   );
 
   const renewLocalLease = useCallback(
-    (token: string) => {
+    (token: string, minimumGeneration = 0): Promise<boolean> => {
       const current = leaseRenewalRef.current;
-      if (current?.token === token) return current.promise;
+      if (current?.token === token) {
+        if (current.generation >= minimumGeneration) return current.promise;
+        return current.promise
+          .catch(() => false)
+          .then(() => (leaseTokenRef.current === token ? renewLocalLease(token, minimumGeneration) : false));
+      }
       const requestedAt = leaseClock();
+      const generation = ++leaseRenewalGenerationRef.current;
       const attempt = api<TableLeaseTiming>(`/api/tables/${page.id}/lease`, {
         method: "PATCH",
         body: json({ leaseToken: token }),
@@ -264,7 +297,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
         setLocalLeaseDeadline(requestedAt, result.leaseDurationMs);
         return true;
       });
-      const tracked = { token, promise: Promise.resolve(false) };
+      const tracked = { token, generation, promise: Promise.resolve(false) };
       tracked.promise = attempt.finally(() => {
         if (leaseRenewalRef.current === tracked) leaseRenewalRef.current = null;
       });
@@ -279,21 +312,30 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       const status = localLeaseStatus();
       if (status === "valid") return true;
       if (status === "expired") {
-        await endLease(token, LEASE_EXPIRED_MESSAGE);
+        await endLease(token, LEASE_EXPIRED_MESSAGE, false);
         return false;
       }
+      const minimumGeneration = leaseRenewalGenerationRef.current + 1;
       try {
-        return await renewLocalLease(token);
+        const renewed = await renewLocalLease(token, minimumGeneration);
+        if (!renewed) return false;
+        const renewedStatus = localLeaseStatus();
+        if (renewedStatus === "valid") return true;
+        await endLease(
+          token,
+          renewedStatus === "expired" ? LEASE_EXPIRED_MESSAGE : LEASE_VERIFICATION_MESSAGE,
+          renewedStatus === "wall-clock-disagreement",
+        );
       } catch (cause) {
         if (leaseTokenRef.current === token) {
           await endLease(
             token,
             cause instanceof ApiClientError && cause.status === 409 ? cause.message : LEASE_VERIFICATION_MESSAGE,
-            false,
+            !(cause instanceof ApiClientError && cause.status === 409),
           );
         }
-        return false;
       }
+      return false;
     },
     [endLease, localLeaseStatus, renewLocalLease],
   );
@@ -430,12 +472,16 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     const expireLease = () => {
       if (!active) return;
       stopRenewal();
-      void endLease(leaseToken, LEASE_EXPIRED_MESSAGE);
+      void endLease(leaseToken, LEASE_EXPIRED_MESSAGE, false);
     };
     const checkExpiry = () => {
       const status = localLeaseStatus();
       if (status === "expired") {
         expireLease();
+        return;
+      }
+      if (status === "valid") {
+        scheduleExpiry();
         return;
       }
       if (status === "wall-clock-disagreement") {
@@ -486,7 +532,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
             await endLease(
               leaseToken,
               status === "expired" ? LEASE_EXPIRED_MESSAGE : LEASE_VERIFICATION_MESSAGE,
-              status === "expired",
+              status === "wall-clock-disagreement",
             );
             return;
           }
@@ -525,48 +571,35 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     path: string,
     method: string,
     body: Record<string, unknown>,
-    { position, onSuccess, resetKey }: MutationOptions = {},
+    { resetKey }: MutationOptions = {},
   ) {
     const execute = async () => {
-      const currentLease = leaseTokenRef.current;
-      if (!currentLease) {
+      const failForLostLease = () => {
         resetCellInput(resetKey);
         if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
         return null;
-      }
+      };
+      const currentLease = leaseTokenRef.current;
+      if (!currentLease) return failForLostLease();
       let revisionConflictRetried = false;
       while (leaseTokenRef.current === currentLease) {
         if (revisionRef.current === null) {
           const recovered = await recoverRevision();
-          if (leaseTokenRef.current !== currentLease) {
-            resetCellInput(resetKey);
-            if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
-            return null;
-          }
+          if (leaseTokenRef.current !== currentLease) return failForLostLease();
           if (!recovered) {
             resetCellInputAfterLoad(resetKey);
             if (isMounted()) setSaveError(REVISION_RECOVERY_SAVE_MESSAGE);
             return null;
           }
         }
-        if (!(await ensureLeaseUsable(currentLease))) {
-          resetCellInput(resetKey);
-          if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
-          return null;
-        }
-        const currentRevision = revisionRef.current;
-        if (currentRevision === null) {
-          resetCellInputAfterLoad(resetKey);
-          if (isMounted()) setSaveError(REVISION_RECOVERY_SAVE_MESSAGE);
-          return null;
-        }
+        if (!(await ensureLeaseUsable(currentLease))) return failForLostLease();
+        const currentRevision = revisionRef.current!;
         try {
           const result = await api<T & { revision: number }>(path, {
             method,
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
             body: json({
               ...body,
-              ...(position ? { position: position() } : {}),
               leaseToken: currentLease,
               expectedRevision: currentRevision,
             }),
@@ -577,16 +610,13 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           // authoritative reload for that lease, not this local state.
           if (leaseTokenRef.current !== currentLease) return null;
           revisionRef.current = result.revision;
-          onSuccess?.();
           setSaveError(null);
           setTable((current) => (current ? { ...current, revision: result.revision } : current));
           return result;
         } catch (cause) {
           if (!isMounted()) return null;
           if (leaseTokenRef.current !== currentLease) {
-            resetCellInput(resetKey);
-            setSaveError(LEASE_LOST_SAVE_MESSAGE);
-            return null;
+            return failForLostLease();
           }
           if (cause instanceof ApiClientError && cause.code === "table_revision_conflict") {
             invalidateRevision();
@@ -594,11 +624,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
             if (terminalConflict) resetCellInputAfterLoad(resetKey);
             else setSaveError(cause.message);
             const recovered = await recoverRevision();
-            if (leaseTokenRef.current !== currentLease) {
-              resetCellInput(resetKey);
-              setSaveError(LEASE_LOST_SAVE_MESSAGE);
-              return null;
-            }
+            if (leaseTokenRef.current !== currentLease) return failForLostLease();
             if (!recovered) {
               resetCellInputAfterLoad(resetKey);
               setSaveError(REVISION_RECOVERY_SAVE_MESSAGE);
@@ -615,6 +641,17 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
             resetCellInputAfterLoad(resetKey);
             await endLease(currentLease, cause.message);
             setSaveError(LEASE_LOST_SAVE_MESSAGE);
+            return null;
+          }
+          if (cause instanceof ApiClientError && cause.status === 403) {
+            await endLease(currentLease, cause.message);
+            return null;
+          }
+          if (cause instanceof ApiClientError && cause.status === 404) {
+            invalidateRevision();
+            setSaveError(cause.message);
+            resetCellInputAfterLoad(resetKey);
+            await recoverRevision();
             return null;
           }
           // A handled client rejection is definitive: the server rejected the
@@ -634,9 +671,7 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
           return null;
         }
       }
-      resetCellInput(resetKey);
-      if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
-      return null;
+      return failForLostLease();
     };
     const pending = mutationQueue.current.then(execute, execute);
     mutationQueue.current = pending.then(
@@ -652,19 +687,8 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
     if (!name) return;
     const type = (prompt("Type: text, number, checkbox, date, or select", "text") ?? "") as ColumnType;
     if (!["text", "number", "checkbox", "date", "select"].includes(type)) return;
-    const result = await mutation<{ column: TableColumn }>(
-      `/api/tables/${page.id}/columns`,
-      "POST",
-      { name, type },
-      {
-        position: () => columnCountRef.current,
-        onSuccess: () => {
-          columnCountRef.current += 1;
-        },
-      },
-    );
+    const result = await mutation<{ column: TableColumn }>(`/api/tables/${page.id}/columns`, "POST", { name, type });
     if (result) {
-      optionCountRef.current.set(result.column.id, 0);
       setTable((current) =>
         current ? { ...current, columns: [...current.columns, { ...result.column, options: [] }] } : current,
       );
@@ -673,21 +697,13 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
 
   async function removeColumn(column: TableColumn) {
     if (!confirm(`Delete “${column.name}” and every value in it?`)) return;
-    const result = await mutation(
-      `/api/tables/${page.id}/columns/${column.id}`,
-      "DELETE",
-      {},
-      {
-        onSuccess: () => {
-          columnCountRef.current = Math.max(0, columnCountRef.current - 1);
-          optionCountRef.current.delete(column.id);
-        },
-      },
-    );
-    if (result)
+    const result = await mutation(`/api/tables/${page.id}/columns/${column.id}`, "DELETE", {});
+    if (result) {
+      forgetColumnCellInputs(column.id);
       setTable((current) =>
         current ? { ...current, columns: current.columns.filter((item) => item.id !== column.id) } : current,
       );
+    }
   }
 
   async function addOption(column: TableColumn) {
@@ -697,10 +713,6 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
       `/api/tables/${page.id}/columns/${column.id}/options`,
       "POST",
       { label },
-      {
-        position: () => optionCountRef.current.get(column.id) ?? 0,
-        onSuccess: () => optionCountRef.current.set(column.id, (optionCountRef.current.get(column.id) ?? 0) + 1),
-      },
     );
     if (result)
       setTable((current) =>
@@ -717,35 +729,18 @@ export function TablePage({ page, member, onPageChanged, onSelectPage, backlinks
 
   async function addRow() {
     if (!table) return;
-    const result = await mutation<{ row: TableRow }>(
-      `/api/tables/${page.id}/rows`,
-      "POST",
-      {},
-      {
-        position: () => rowCountRef.current,
-        onSuccess: () => {
-          rowCountRef.current += 1;
-        },
-      },
-    );
+    const result = await mutation<{ row: TableRow }>(`/api/tables/${page.id}/rows`, "POST", {});
     if (result) setTable((current) => (current ? { ...current, rows: [...current.rows, result.row] } : current));
   }
 
   async function removeRow(row: TableRow) {
-    const result = await mutation(
-      `/api/tables/${page.id}/rows/${row.id}`,
-      "DELETE",
-      {},
-      {
-        onSuccess: () => {
-          rowCountRef.current = Math.max(0, rowCountRef.current - 1);
-        },
-      },
-    );
-    if (result)
+    const result = await mutation(`/api/tables/${page.id}/rows/${row.id}`, "DELETE", {});
+    if (result) {
+      forgetRowCellInputs(row.id);
       setTable((current) =>
         current ? { ...current, rows: current.rows.filter((item) => item.id !== row.id) } : current,
       );
+    }
   }
 
   async function setCell(rowId: string, columnId: string, value: string | number | boolean | null) {
@@ -957,6 +952,7 @@ function CellInput({
   disabled: boolean;
   onCommit: (value: string | number | boolean | null) => void;
 }) {
+  const lastEnqueuedValue = useRef(value === "" ? null : value);
   if (column.type === "checkbox") {
     return (
       <input
@@ -998,7 +994,10 @@ function CellInput({
               ? null
               : Number(event.target.value)
             : event.target.value || null;
-        if (!Object.is(nextValue, value === "" ? null : value)) onCommit(nextValue);
+        if (!Object.is(nextValue, lastEnqueuedValue.current)) {
+          lastEnqueuedValue.current = nextValue;
+          onCommit(nextValue);
+        }
       }}
     />
   );
