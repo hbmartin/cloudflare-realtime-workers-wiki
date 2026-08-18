@@ -98,7 +98,7 @@ type TestDocument = {
   transitionRetryAt: number | null;
   getConnections(): Array<{ close(code: number, reason: string): void }>;
   bindings: Cloudflare.Env;
-  metadata: { retired: number; restore_pending: number };
+  metadata: { retired: number; restore_pending: number; restore_attempts: number };
 };
 
 beforeEach(async () => {
@@ -135,6 +135,48 @@ describe("Worker integration", () => {
     const response = await SELF.fetch("http://example.test/api/not-real");
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({ error: { code: "not_found", message: "API route not found." } });
+  });
+
+  it("logs unexpected party request failures and answers them generically", async () => {
+    const installed = await bootstrap();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // A malformed percent-escape makes decodeURIComponent throw a URIError:
+      // an internal failure, not an HttpError written for the client.
+      const response = await SELF.fetch(authenticatedRequest(installed.cookie, "/parties/document/%E0%A4%A"));
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        error: { code: "internal_error", message: "Something went wrong." },
+      });
+      expect(error).toHaveBeenCalledTimes(1);
+      const [message, cause] = error.mock.calls[0]!;
+      expect(message).toBe("Failed to handle document party request for /parties/document/%E0%A4%A");
+      expect(cause).toBeInstanceOf(URIError);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("keeps client-facing party request errors unlogged with their own message", async () => {
+    const installed = await bootstrap();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const stale = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/parties/document/${installed.pageId}~999`),
+      );
+      expect(stale.status).toBe(409);
+      expect(await stale.json()).toEqual({
+        error: { code: "stale_epoch", message: "Reload this page to connect to its current document version." },
+      });
+      const wrongRoom = await SELF.fetch(authenticatedRequest(installed.cookie, "/parties/workspace-events/other"));
+      expect(wrongRoom.status).toBe(404);
+      expect(await wrongRoom.json()).toEqual({
+        error: { code: "room_not_found", message: "Workspace event room not found." },
+      });
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it("serves all byte-range forms and conditionally revalidates private attachments", async () => {
@@ -821,6 +863,14 @@ describe("Worker integration", () => {
           return Reflect.get(target, property, receiver);
         },
       });
+      // Left over from an earlier pending restore: a new restore starts its
+      // reconciliation backoff from scratch.
+      state.storage.sql.exec(`UPDATE document_meta SET restore_attempts = 7 WHERE id = 1`);
+      document.metadata.restore_attempts = 7;
+      const restoreAttempts = () =>
+        state.storage.sql
+          .exec<{ restore_attempts: number }>(`SELECT restore_attempts FROM document_meta WHERE id = 1`)
+          .one().restore_attempts;
       try {
         const response = await document.restoreVersion(version!.id, installed.userId);
         expect(response.status).toBe(503);
@@ -831,12 +881,17 @@ describe("Worker integration", () => {
             )
             .one(),
         ).toEqual({ retired: 0, restore_pending: 1 });
+        expect(restoreAttempts()).toBe(1);
         recovery = state.storage.sql
           .exec<{ new_key: string; pre_key: string | null }>(
             `SELECT new_key, pre_key FROM restore_recovery WHERE id = 1`,
           )
           .one();
-        expect(await state.storage.getAlarm()).not.toBeNull();
+        // The first retry stays fast even though onSave left a later alarm
+        // (compaction, +30 s) stored before the restore began.
+        const retryAlarm = await state.storage.getAlarm();
+        expect(retryAlarm).not.toBeNull();
+        expect(retryAlarm!).toBeLessThanOrEqual(Date.now() + 5_000);
         expect(await env.BUCKET.get(recovery.new_key)).toBeTruthy();
         expect(await env.BUCKET.get(recovery.pre_key!)).toBeTruthy();
       } finally {
@@ -851,6 +906,7 @@ describe("Worker integration", () => {
           )
           .one(),
       ).toEqual({ retired: 0, restore_pending: 0 });
+      expect(restoreAttempts()).toBe(0);
       expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count).toBe(
         0,
       );
@@ -924,6 +980,87 @@ describe("Worker integration", () => {
           )
           .one(),
       ).toEqual({ retired: 0, restore_pending: 0 });
+      expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count).toBe(
+        0,
+      );
+    });
+  });
+
+  it("backs off restore reconciliation exponentially and persists the attempt count", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      state.storage.sql.exec(
+        `INSERT INTO restore_recovery (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, 1, 2, 'backoff-new', 'backoff-pre')`,
+      );
+      state.storage.sql.exec(`UPDATE document_meta SET retired = 1, restore_pending = 1 WHERE id = 1`);
+      document.metadata.retired = 1;
+      document.metadata.restore_pending = 1;
+      const restoreAttempts = () =>
+        state.storage.sql
+          .exec<{ restore_attempts: number }>(`SELECT restore_attempts FROM document_meta WHERE id = 1`)
+          .one().restore_attempts;
+
+      const originalBindings = document.bindings;
+      const deleteObject = vi.fn(async () => {
+        throw new Error("R2 delete unavailable");
+      });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      // Pin the jitter to the ceiling so each delay is exact.
+      const random = vi.spyOn(Math, "random").mockReturnValue(1);
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property === "BUCKET")
+            return new Proxy(target.BUCKET, {
+              get: (bucket, key) => (key === "delete" ? deleteObject : Reflect.get(bucket, key, bucket)),
+            });
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const failingAlarmDelay = async () => {
+        const before = Date.now();
+        await document.onAlarm();
+        const after = Date.now();
+        const alarm = await state.storage.getAlarm();
+        expect(alarm).not.toBeNull();
+        return { atLeast: alarm! - after, atMost: alarm! - before };
+      };
+      try {
+        for (const [index, ceiling] of [5_000, 10_000, 20_000].entries()) {
+          const delay = await failingAlarmDelay();
+          expect(delay.atLeast).toBeLessThanOrEqual(ceiling);
+          expect(delay.atMost).toBeGreaterThanOrEqual(ceiling);
+          expect(restoreAttempts()).toBe(index + 1);
+        }
+        // Far into an outage the delay holds at the cap instead of growing.
+        state.storage.sql.exec(`UPDATE document_meta SET restore_attempts = 40 WHERE id = 1`);
+        document.metadata.restore_attempts = 40;
+        const capped = await failingAlarmDelay();
+        expect(capped.atLeast).toBeLessThanOrEqual(5 * 60_000);
+        expect(capped.atMost).toBeGreaterThanOrEqual(5 * 60_000);
+        expect(restoreAttempts()).toBe(41);
+        expect(
+          state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count,
+        ).toBe(1);
+      } finally {
+        document.bindings = originalBindings;
+        random.mockRestore();
+        error.mockRestore();
+      }
+
+      await document.onAlarm();
+      expect(
+        state.storage.sql
+          .exec<{ retired: number; restore_pending: number }>(
+            `SELECT retired, restore_pending FROM document_meta WHERE id = 1`,
+          )
+          .one(),
+      ).toEqual({ retired: 0, restore_pending: 0 });
+      expect(restoreAttempts()).toBe(0);
       expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count).toBe(
         0,
       );
@@ -2064,17 +2201,22 @@ describe("Worker integration", () => {
       document.document.getMap("restart-content").set("value", 1);
       await document.onSave();
       state.storage.sql.exec(`UPDATE document_meta SET dirty = 0 WHERE id = 1`);
+      // The reconciliation backoff has to survive eviction: a fresh instance
+      // must resume from the persisted attempt count, not the fast first retry.
+      state.storage.sql.exec(`UPDATE document_meta SET restore_attempts = 3 WHERE id = 1`);
       await state.storage.deleteAlarm();
     });
 
     await abortAllDurableObjects();
     const restarted = env.DOCUMENT.getByName(room);
     await restarted.fetch(internalWarmupRequest());
-    await runInDurableObject(restarted, async (_instance, state) => {
+    await runInDurableObject(restarted, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
       expect(
         state.storage.sql.exec<{ dirty: number }>(`SELECT dirty FROM document_meta WHERE id = 1`).one().dirty,
       ).toBe(1);
       expect(await state.storage.getAlarm()).not.toBeNull();
+      expect(document.metadata.restore_attempts).toBe(3);
     });
   });
 });
