@@ -82,6 +82,12 @@ async function createPage(cookie: string, kind: "document" | "table" = "document
   return (await response.json<{ page: { id: string } }>()).page;
 }
 
+async function acquireLease(cookie: string, pageId: string) {
+  const response = await SELF.fetch(authenticatedRequest(cookie, `/api/tables/${pageId}/lease`, { method: "POST" }));
+  expect(response.status).toBe(200);
+  return response.json<TableLeaseResponse>();
+}
+
 type TestDocument = {
   document: Y.Doc;
   onAlarm(): Promise<void>;
@@ -1426,13 +1432,7 @@ describe("Worker integration", () => {
         `INSERT INTO table_select_options (id, column_id, label, position) VALUES (?, ?, 'Foreign', 0)`,
       ).bind(optionB, columnB),
     ]);
-    const lease = await (
-      await SELF.fetch(
-        authenticatedRequest(installed.cookie, `/api/tables/${tableA.id}/lease`, {
-          method: "POST",
-        }),
-      )
-    ).json<TableLeaseResponse>();
+    const lease = await acquireLease(installed.cookie, tableA.id);
     expect(lease.leaseDurationMs).toBe(60_000);
     expect(lease).not.toHaveProperty("expiresAt");
     const renewed = await (
@@ -1495,9 +1495,7 @@ describe("Worker integration", () => {
         columnId,
       ),
     ]);
-    const lease = await (
-      await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/lease`, { method: "POST" }))
-    ).json<TableLeaseResponse>();
+    const lease = await acquireLease(installed.cookie, tablePage.id);
     await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(timestamp, tablePage.id).run();
     const mutationBody = { leaseToken: lease.leaseToken, expectedRevision: 1 };
 
@@ -1533,12 +1531,60 @@ describe("Worker integration", () => {
     ).toBe(1);
   });
 
+  it("stops renewing and force-unlocking a lease once its table is archived", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await acquireLease(installed.cookie, tablePage.id);
+    const leaseRow = () =>
+      env.DB.prepare(`SELECT expires_at FROM table_leases WHERE page_id = ?`)
+        .bind(tablePage.id)
+        .first<{ expires_at: number }>();
+    const expiresAt = (await leaseRow())?.expires_at;
+    expect(expiresAt).toBeGreaterThan(0);
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), tablePage.id).run();
+    const jsonRequest = (path: string, method: string, body: Record<string, unknown>) =>
+      SELF.fetch(
+        authenticatedRequest(installed.cookie, path, {
+          method,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+
+    const renewed = await jsonRequest(`/api/tables/${tablePage.id}/lease`, "PATCH", { leaseToken: lease.leaseToken });
+    expect(renewed.status).toBe(404);
+    expect(await renewed.json()).toMatchObject({ error: { code: "page_not_found" } });
+    expect((await leaseRow())?.expires_at).toBe(expiresAt);
+
+    const forceUnlock = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/force-unlock`, { method: "POST" }),
+    );
+    expect(forceUnlock.status).toBe(404);
+    expect(await leaseRow()).not.toBeNull();
+
+    // A missing page outranks lease-input validation on cell writes, as on
+    // every other mutation route.
+    const putCell = await jsonRequest(
+      `/api/tables/${tablePage.id}/cells/${crypto.randomUUID()}/${crypto.randomUUID()}`,
+      "PUT",
+      {
+        value: "unsaved",
+      },
+    );
+    expect(putCell.status).toBe(404);
+    expect(await putCell.json()).toMatchObject({ error: { code: "page_not_found" } });
+
+    // Releasing one's own lease still works, so an archived table is not left
+    // holding a lease that would block editing after a restore.
+    const released = await jsonRequest(`/api/tables/${tablePage.id}/lease`, "DELETE", { leaseToken: lease.leaseToken });
+    expect(released.status).toBe(200);
+    expect(await leaseRow()).toBeNull();
+  });
+
   it("assigns append positions on the server without reusing gaps", async () => {
     const installed = await bootstrap();
     const tablePage = await createPage(installed.cookie, "table");
-    const lease = await (
-      await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/lease`, { method: "POST" }))
-    ).json<TableLeaseResponse>();
+    const lease = await acquireLease(installed.cookie, tablePage.id);
     let revision = 1;
     const mutate = async <T>(path: string, method: string, body: Record<string, unknown> = {}) => {
       const response = await SELF.fetch(
@@ -1619,9 +1665,7 @@ describe("Worker integration", () => {
     )
       .bind(rowId, tablePage.id, installed.userId, timestamp, timestamp)
       .run();
-    const lease = await (
-      await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/lease`, { method: "POST" }))
-    ).json<TableLeaseResponse>();
+    const lease = await acquireLease(installed.cookie, tablePage.id);
     const triggerName = `ignore_delete_${rowId.replaceAll("-", "")}`;
     await env.DB.prepare(
       `CREATE TRIGGER ${triggerName} BEFORE DELETE ON table_rows
@@ -1666,13 +1710,7 @@ describe("Worker integration", () => {
         `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
       ).bind(rowId, tablePage.id, installed.userId, timestamp, timestamp),
     ]);
-    const lease = await (
-      await SELF.fetch(
-        authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/lease`, {
-          method: "POST",
-        }),
-      )
-    ).json<TableLeaseResponse>();
+    const lease = await acquireLease(installed.cookie, tablePage.id);
     await env.DB.prepare(`UPDATE table_state SET revision = 2 WHERE page_id = ?`).bind(tablePage.id).run();
     const cellPath = `/api/tables/${tablePage.id}/cells/${rowId}/${columnId}`;
 

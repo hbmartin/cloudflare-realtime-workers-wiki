@@ -1149,6 +1149,192 @@ describe("TablePage", () => {
     expect(loads).toBe(2);
   });
 
+  it("stops polling and reports the page unavailable when a reload finds it gone", async () => {
+    vi.useFakeTimers();
+    const onPageUnavailable = vi.fn();
+    let loads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      if (path.includes("/cells/")) throw new DOMException("The operation timed out.", "TimeoutError");
+      loads += 1;
+      // The authoritative reload after the ambiguous save finds the page archived.
+      if (loads >= 3) throw new ApiClientError(404, "page_not_found", "Page not found.");
+      return { table };
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={onPageUnavailable}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Unsaved" } });
+    fireEvent.blur(input);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
+    expect(screen.getByText("Page not found.")).toBeInTheDocument();
+    expect(screen.queryByText("The table update could not be saved.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try edit lock" })).not.toBeInTheDocument();
+    expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
+      method: "DELETE",
+      body: JSON.stringify({ leaseToken: "lease-token" }),
+      keepalive: true,
+    });
+    expect(loads).toBe(3);
+
+    await act(() => vi.advanceTimersByTimeAsync(25_000));
+    expect(loads).toBe(3);
+    expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "PATCH" }));
+  });
+
+  it("ends editing without reloading or polling when lease renewal finds the page gone", async () => {
+    vi.useFakeTimers();
+    const onPageUnavailable = vi.fn();
+    let loads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "PATCH") {
+        throw new ApiClientError(404, "page_not_found", "Page not found.");
+      }
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      loads += 1;
+      return { table };
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={onPageUnavailable}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+    const loadsBeforeRenewal = loads;
+
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+
+    expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(screen.getByText("Page not found.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try edit lock" })).not.toBeInTheDocument();
+    expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
+      method: "DELETE",
+      body: JSON.stringify({ leaseToken: "lease-token" }),
+      keepalive: true,
+    });
+    expect(loads).toBe(loadsBeforeRenewal);
+
+    await act(() => vi.advanceTimersByTimeAsync(25_000));
+    expect(loads).toBe(loadsBeforeRenewal);
+  });
+
+  it("keeps a queued draft when an earlier save reports that the page is unavailable", async () => {
+    const firstSave = deferred<{ revision: number }>();
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/lease") && init?.method === "DELETE") return Promise.resolve({ ok: true });
+      if (path.includes("/cells/")) return firstSave.promise;
+      return Promise.resolve({ table: tableWithTwoTextCells() });
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    expect(await screen.findByText("Editing lease active")).toBeInTheDocument();
+    const status = screen.getByDisplayValue("Ready");
+    fireEvent.change(status, { target: { value: "First" } });
+    fireEvent.blur(status);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(expect.stringContaining("/cells/row/status"), expect.anything()),
+    );
+    const notes = screen.getByDisplayValue("Stable");
+    fireEvent.change(notes, { target: { value: "Second" } });
+    fireEvent.blur(notes);
+
+    firstSave.reject(new ApiClientError(404, "page_not_found", "Page not found."));
+
+    expect(await screen.findByText("Page not found.")).toBeInTheDocument();
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // The queued save is dropped quietly: no lease-loss notice, both drafts stay visible.
+    expect(screen.getByDisplayValue("First")).toBeDisabled();
+    expect(screen.getByDisplayValue("Second")).toBeDisabled();
+    expect(
+      screen.queryByText("The table update was not saved because editing access was lost."),
+    ).not.toBeInTheDocument();
+    expect(vi.mocked(api).mock.calls.filter(([path]) => String(path).includes("/cells/"))).toHaveLength(1);
+  });
+
+  it("treats a page-not-found response that lands after the local lease expired as terminal", async () => {
+    const advanceMonotonic = stubMonotonicClock();
+    const onPageUnavailable = vi.fn();
+    const save = deferred<{ revision: number }>();
+    let loads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/lease") && init?.method === "DELETE") return Promise.resolve({ ok: true });
+      if (path.includes("/cells/")) return save.promise;
+      loads += 1;
+      return Promise.resolve({ table });
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={onPageUnavailable}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "In flight" } });
+    fireEvent.blur(input);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(api).toHaveBeenCalledWith(expect.stringContaining("/cells/"), expect.anything());
+
+    // The local lease deadline passes while the save is still in flight.
+    advanceMonotonic(LEASE_DURATION_MS + 1);
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("The editing lease expired. Reloaded the authoritative table.")).toBeInTheDocument();
+    const loadsAfterExpiry = loads;
+
+    save.reject(new ApiClientError(404, "page_not_found", "Page not found."));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
+    expect(screen.getByText("Page not found.")).toBeInTheDocument();
+    expect(
+      screen.queryByText("The table update was not saved because editing access was lost."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try edit lock" })).not.toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(25_000));
+    expect(loads).toBe(loadsAfterExpiry);
+  });
+
   it("reports a terminal message when a revision conflict repeats", async () => {
     const mutations: Array<Record<string, unknown>> = [];
     let loads = 0;
