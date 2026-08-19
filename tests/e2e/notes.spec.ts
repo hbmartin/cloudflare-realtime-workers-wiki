@@ -18,10 +18,17 @@ async function signIn(page: Page) {
     await page.getByLabel("Password").fill(owner.password);
     await page.getByLabel("Bootstrap token").fill("e2e-bootstrap-token");
     await page.getByRole("button", { name: "Create workspace" }).click();
-  } else if (await page.getByRole("heading", { name: "Sign in" }).isVisible()) {
-    await page.getByLabel("Email").fill(owner.email);
-    await page.getByLabel("Password").fill(owner.password);
-    await page.getByRole("button", { name: "Continue" }).click();
+  } else {
+    // The app settles on the sign-in screen or the workspace only after it has
+    // checked the session, so wait for one of them before deciding: an instant
+    // isVisible() races that render and skips the sign-in form entirely.
+    const signInHeading = page.getByRole("heading", { name: "Sign in" });
+    await expect(signInHeading.or(page.getByLabel("Page title")).first()).toBeVisible();
+    if (await signInHeading.isVisible()) {
+      await page.getByLabel("Email").fill(owner.email);
+      await page.getByLabel("Password").fill(owner.password);
+      await page.getByRole("button", { name: "Continue" }).click();
+    }
   }
   await expect(page.getByLabel("Page title")).toBeVisible();
 }
