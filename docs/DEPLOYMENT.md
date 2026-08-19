@@ -51,7 +51,7 @@ installation will be served from:
 },
 ```
 
-This is a plain variable, not a secret. It sets the Better Auth cookie origin *and* is the base for the
+This is a plain variable, not a secret. It sets the Better Auth cookie origin _and_ is the base for the
 same-origin check applied to bootstrap, invite acceptance, and every WebSocket upgrade. Leaving it
 unchanged breaks sign-in and causes `invalid_origin` on connection attempts.
 
@@ -72,7 +72,7 @@ credential and rotate or remove it after the owner is created.
 
 `BETTER_AUTH_SECRET` is not only the session signing key. It is also the shared secret the Worker sends
 as the `x-notes-internal` header when it calls a Durable Object directly, for archive, version restore,
-and purge. Rotating it therefore invalidates every session *and* briefly disrupts internal Durable
+and purge. Rotating it therefore invalidates every session _and_ briefly disrupts internal Durable
 Object calls while the new value propagates. See
 [Operations](OPERATIONS.md#rotating-better_auth_secret).
 
@@ -88,11 +88,11 @@ makes the bootstrap token and member passwords brute-forceable without external 
 
 Add Cloudflare Rate Limiting rules before exposing the origin publicly. At minimum:
 
-| Path | Suggested limit |
-| --- | --- |
-| `/api/install/bootstrap` | 5 requests per minute per IP |
-| `/api/auth/*` | 20 requests per minute per IP |
-| `/api/invites/accept` | 10 requests per minute per IP |
+| Path                     | Suggested limit               |
+| ------------------------ | ----------------------------- |
+| `/api/install/bootstrap` | 5 requests per minute per IP  |
+| `/api/auth/*`            | 20 requests per minute per IP |
+| `/api/invites/accept`    | 10 requests per minute per IP |
 
 These are configured in the Cloudflare dashboard, not in this repository.
 
@@ -193,13 +193,13 @@ Durable Object migrations are append-only in `wrangler.jsonc`. Never rename or d
 
 Rollback is asymmetric. Worker code is reversible; data schema is not.
 
-| Change | Reversible |
-| --- | --- |
-| Worker code and assets | Yes — `pnpm wrangler rollback` or the dashboard's deployment history |
-| `vars` and secrets | Yes — set the previous value |
-| D1 migrations | **No** — migrations are forward-only; there are no down migrations |
-| Durable Object SQLite schema | **No** — applied inline on room start |
-| Durable Object class migrations | **No** — append-only by design |
+| Change                          | Reversible                                                           |
+| ------------------------------- | -------------------------------------------------------------------- |
+| Worker code and assets          | Yes — `pnpm wrangler rollback` or the dashboard's deployment history |
+| `vars` and secrets              | Yes — set the previous value                                         |
+| D1 migrations                   | **No** — migrations are forward-only; there are no down migrations   |
+| Durable Object SQLite schema    | **No** — applied inline on room start                                |
+| Durable Object class migrations | **No** — append-only by design                                       |
 
 To roll back a release that included a migration:
 
@@ -222,11 +222,11 @@ deploy reaches users directly.
 Configure the `production` GitHub Environment with these secrets and variables, and add required
 reviewers if you want a manual approval gate:
 
-| Name | Kind | Purpose |
-| --- | --- | --- |
-| `CLOUDFLARE_API_TOKEN` | secret | Wrangler authentication |
-| `CLOUDFLARE_ACCOUNT_ID` | secret | Target account |
-| `PRODUCTION_BASE_URL` | variable | Post-deploy health probe target |
+| Name                    | Kind     | Purpose                         |
+| ----------------------- | -------- | ------------------------------- |
+| `CLOUDFLARE_API_TOKEN`  | secret   | Wrangler authentication         |
+| `CLOUDFLARE_ACCOUNT_ID` | secret   | Target account                  |
+| `PRODUCTION_BASE_URL`   | variable | Post-deploy health probe target |
 
 The workflow applies D1 migrations before deploying, matching the manual order. It has not been
 exercised against a live Cloudflare account in this repository; validate it on a throwaway Worker

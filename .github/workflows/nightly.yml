@@ -40,14 +40,17 @@ jobs:
           NOTES_LOAD_EMAIL: ""
           NOTES_LOAD_PASSWORD: ""
         run: pnpm test:e2e:nightly
+      # The load checks report on a different subsystem than the UI sweep above,
+      # so a UI failure should not hide them.
       - name: Local 30-connection realtime load check
+        if: "!cancelled()"
         env:
           NOTES_LOAD_BASE_URL: ""
           NOTES_LOAD_EMAIL: ""
           NOTES_LOAD_PASSWORD: ""
         run: pnpm load:realtime
       - name: Staging realtime load check
-        if: env.NOTES_LOAD_BASE_URL != '' && env.NOTES_LOAD_EMAIL != '' && env.NOTES_LOAD_PASSWORD != ''
+        if: "!cancelled() && env.NOTES_LOAD_BASE_URL != '' && env.NOTES_LOAD_EMAIL != '' && env.NOTES_LOAD_PASSWORD != ''"
         run: pnpm load:realtime
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
