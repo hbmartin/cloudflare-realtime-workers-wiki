@@ -132,6 +132,7 @@ async function seedTable(installed: InstalledWorkspace, pageId: string, seed: Ta
 
 type TestDocument = {
   document: Y.Doc;
+  onStart(): Promise<void>;
   onAlarm(): Promise<void>;
   onSave(): Promise<void>;
   onRequest(request: Request): Promise<Response>;
@@ -209,9 +210,10 @@ describe("Worker integration", () => {
       expect(await wrongRoom.json()).toEqual({
         error: { code: "room_not_found", message: "Workspace event room not found." },
       });
-      // A malformed percent-escape makes decodeURIComponent throw a URIError.
-      // It is client input that can never name a room, so it answers like any
-      // other unknown room rather than as an internal failure.
+      // A percent escape never appears in a canonical room, so a malformed one
+      // fails the room pattern. It is client input that can never name a room,
+      // so it answers like any other unknown room rather than as an internal
+      // failure.
       const malformed = await SELF.fetch(authenticatedRequest(installed.cookie, "/parties/document/%E0%A4%A"));
       expect(malformed.status).toBe(404);
       expect(await malformed.json()).toEqual({
@@ -232,6 +234,69 @@ describe("Worker integration", () => {
       expect(await oversized.json()).toEqual({
         error: { code: "room_not_found", message: "Document room not found." },
       });
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("rejects room names that authorize as a page but address a different Durable Object", async () => {
+    const installed = await bootstrap();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // PartyServer hashes the raw pathname segment into the Durable Object
+      // name. Every epoch below coerces to the page's real epoch of 1 through
+      // Number, so accepting any of them would let one page fork into rooms
+      // that compact to a single R2 key and overwrite each other.
+      for (const epoch of ["01", "0001", "1e0", "1.0", "1.", "+1", "0x1", " 1", "1 "]) {
+        const aliased = await SELF.fetch(
+          authenticatedRequest(installed.cookie, `/parties/document/${installed.pageId}~${encodeURIComponent(epoch)}`),
+        );
+        expect(aliased.status, `epoch ${JSON.stringify(epoch)}`).toBe(404);
+        expect(await aliased.json()).toEqual({
+          error: { code: "room_not_found", message: "Document room not found." },
+        });
+      }
+
+      // An empty epoch is Number("") === 0, which passed the old integer check
+      // on shape and was caught only by the epoch comparison behind a D1 read.
+      const emptyEpoch = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/parties/document/${installed.pageId}~`),
+      );
+      expect(emptyEpoch.status).toBe(404);
+
+      // An encoded page id decodes to an authorized page but routes to a room
+      // whose own name parses back to a different id, so it would never reach
+      // the page it authorized against.
+      const encodedPageId = `%${installed.pageId.charCodeAt(0).toString(16)}${installed.pageId.slice(1)}`;
+      const encoded = await SELF.fetch(authenticatedRequest(installed.cookie, `/parties/document/${encodedPageId}~1`));
+      expect(encoded.status).toBe(404);
+
+      // An encoded separator leaves the routed name with no "~" at all.
+      const encodedSeparator = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/parties/document/${installed.pageId}%7E1`),
+      );
+      expect(encodedSeparator.status).toBe(404);
+
+      // Leading zeros are unbounded under Number, and Cloudflare stops exposing
+      // ctx.id.name past 1,024 bytes, which strands PartyServer's initialization
+      // and turns an authenticated request into a 500 with a stack trace.
+      const longEpoch = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/parties/document/${installed.pageId}~${"0".repeat(2000)}1`),
+      );
+      expect(longEpoch.status).toBe(404);
+
+      // An encoded workspace id would authorize but join a room nobody
+      // broadcasts into, silently dropping every live update.
+      const encodedWorkspace = await SELF.fetch(
+        authenticatedRequest(
+          installed.cookie,
+          `/parties/workspace-events/%${installed.workspaceId.charCodeAt(0).toString(16)}${installed.workspaceId.slice(1)}`,
+        ),
+      );
+      expect(encodedWorkspace.status).toBe(404);
+
+      // None of the above is a server fault, so none of them logs.
       expect(error).not.toHaveBeenCalled();
     } finally {
       error.mockRestore();
@@ -1009,6 +1074,79 @@ describe("Worker integration", () => {
     ).toBe(1);
     expect(await env.BUCKET.get(recovery.new_key)).toBeNull();
     expect(await env.BUCKET.get(recovery.pre_key!)).toBeNull();
+  });
+
+  it("attempts a pending restore once per alarm even when initialization outruns the retry deadline", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      state.storage.sql.exec(
+        `INSERT INTO restore_recovery (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, 1, 2, 'restore-new', NULL)`,
+      );
+      state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1, restore_attempts = 0 WHERE id = 1`);
+      document.metadata.restore_pending = 1;
+      document.metadata.restore_attempts = 0;
+
+      const restoreAttempts = () =>
+        state.storage.sql
+          .exec<{ restore_attempts: number }>(`SELECT restore_attempts FROM document_meta WHERE id = 1`)
+          .one().restore_attempts;
+
+      // Reconciliation reads the authoritative epoch first, so failing that
+      // read defers every attempt and leaves the count as the only record of
+      // how many ran.
+      const originalBindings = document.bindings;
+      const unavailableDatabase = new Proxy(originalBindings.DB, {
+        get(target, property, receiver) {
+          if (property !== "prepare") return Reflect.get(target, property, receiver);
+          return (query: string) => {
+            const statement = target.prepare(query);
+            if (!query.includes("SELECT content_epoch FROM pages WHERE id = ?")) return statement;
+            return {
+              bind: () => ({
+                first: async () => {
+                  throw new Error("D1 confirmation unavailable");
+                },
+              }),
+            };
+          };
+        },
+      });
+      document.bindings = new Proxy(originalBindings, {
+        get: (target, property, receiver) =>
+          property === "DB" ? unavailableDatabase : Reflect.get(target, property, receiver),
+      });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        // partyserver initializes before it delivers an alarm, so a cold wake
+        // runs onStart and then onAlarm for the same delivery.
+        await document.onStart();
+        expect(restoreAttempts()).toBe(1);
+
+        // super.onStart() loads the R2 snapshot and replays the update log
+        // between the two, which a large document can drag past the 2.5-5 s
+        // first backoff. The deadline alone can no longer distinguish that
+        // from a genuinely elapsed quiet period.
+        elapseRestoreBackoff(document, state);
+        await document.onAlarm();
+        expect(restoreAttempts()).toBe(1);
+
+        // The next delivered alarm is a new wake, so an elapsed deadline still
+        // reconciles: skipping once must not strand the room read-only.
+        elapseRestoreBackoff(document, state);
+        await document.onAlarm();
+        expect(restoreAttempts()).toBe(2);
+        expect(document.metadata.restore_pending).toBe(1);
+        expect(await state.storage.getAlarm()).not.toBeNull();
+      } finally {
+        document.bindings = originalBindings;
+        error.mockRestore();
+      }
+    });
   });
 
   it("retries failed restore cleanup and then follows the authoritative epoch", async () => {

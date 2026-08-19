@@ -18,8 +18,12 @@ All member management happens in the application UI as an owner. There is no CLI
 | Remove      | Owner removes the member; their sessions stop authorizing on the next check   |
 
 Role changes take effect on the next authorization, not instantly. WebSocket connections carry a grant
-of at most five minutes, so a demoted editor may retain write access for up to that long. To revoke
-immediately, remove the member and rotate `BETTER_AUTH_SECRET`.
+of at most five minutes, so a demoted editor may retain write access for up to that long.
+
+There is no way to revoke faster than that grant from inside the application. Removing the member and
+rotating `BETTER_AUTH_SECRET` stops every new connection and invalidates existing sessions, but an
+established socket already holds its role in Durable Object memory, and only the alarm that fires at the
+grant's expiry closes it. To cut access off immediately, block the user at the edge and then rotate.
 
 Two D1 triggers protect the last owner, created by `migrations/0001_initial.sql`:
 

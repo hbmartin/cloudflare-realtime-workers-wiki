@@ -18,7 +18,7 @@ import {
   now,
   sha256,
 } from "./http";
-import { columnType, ID_PATTERN, nullableId, object, pageKind, role, text } from "../shared/validation";
+import { columnType, documentRoom, ID_PATTERN, nullableId, object, pageKind, role, text } from "../shared/validation";
 import type { ClientMemberContext, Page, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
@@ -1569,19 +1569,16 @@ async function guardedBatch(
   // The mutation applied but the revision update, which checks the same lease
   // and revision plus changes() > 0, did not. Nothing in the batch can produce
   // this; keep it distinguishable rather than misreport it as a conflict.
+  // Logged explicitly because errorResponse only logs unexpected errors, and an
+  // HttpError describing a violated invariant is the one exception worth seeing.
+  // The lease token and session id are omitted: they authenticate the caller.
+  console.error("Table revision could not be advanced", {
+    pageId,
+    expectedRevision: input.expectedRevision,
+    revision: state.revision,
+    leaseValid: Boolean(state.lease_valid),
+  });
   throw new HttpError(500, "table_revision_failed", "The table revision could not be advanced.");
-}
-
-// A malformed percent escape is client input, not a server fault: it can never
-// name a real room, so it answers like any other unknown room instead of
-// logging a stack trace for whatever path was supplied.
-function decodePartyRoom(encoded: string, notFound: () => HttpError) {
-  try {
-    return decodeURIComponent(encoded);
-  } catch (error) {
-    if (error instanceof URIError) throw notFound();
-    throw error;
-  }
 }
 
 async function handlePartyRequest(request: Request, env: Env) {
@@ -1594,26 +1591,29 @@ async function handlePartyRequest(request: Request, env: Env) {
   const roomNotFound = () =>
     new HttpError(404, "room_not_found", isDocument ? "Document room not found." : "Workspace event room not found.");
   // Declared outside the try so a failure log can name the room. It only stays
-  // null when the failure preceded decoding, and every value it can hold has
+  // null when the failure preceded validation, and every value it can hold has
   // been bounded by then, so nothing unvalidated reaches the log.
   let room: string | null = null;
   try {
     assertSameOrigin(request, env.BETTER_AUTH_URL);
     const member = await requireMember(request, env);
-    room = decodePartyRoom(url.pathname.slice((isDocument ? documentPrefix : workspacePrefix).length), roomNotFound);
+    // The raw segment, deliberately not decoded: this is the exact text
+    // PartyServer hashes into the Durable Object name, so authorizing anything
+    // else lets one page fork into rooms that share an R2 key. Percent escapes
+    // fail the patterns below, which is also how a malformed one answers 404
+    // rather than surfacing a URIError as a server fault.
+    const candidate = url.pathname.slice((isDocument ? documentPrefix : workspacePrefix).length);
     if (isDocument) {
-      const separator = room.lastIndexOf("~");
-      const pageId = room.slice(0, separator);
-      const epoch = Number(room.slice(separator + 1));
-      // Shape-checked before the D1 lookup so an arbitrary path cannot become
-      // an unbounded log line further down.
-      if (!ID_PATTERN.test(pageId) || !Number.isInteger(epoch)) throw roomNotFound();
-      const page = await pageForMember(env, member, pageId);
-      if (page.kind !== "document" || page.content_epoch !== epoch) {
+      const ids = documentRoom(candidate);
+      if (!ids) throw roomNotFound();
+      room = candidate;
+      const page = await pageForMember(env, member, ids.pageId);
+      if (page.kind !== "document" || page.content_epoch !== ids.epoch) {
         throw new HttpError(409, "stale_epoch", "Reload this page to connect to its current document version.");
       }
-    } else if (room !== member.workspace.id) {
-      throw roomNotFound();
+    } else {
+      if (!ID_PATTERN.test(candidate) || candidate !== member.workspace.id) throw roomNotFound();
+      room = candidate;
     }
     const expiresAt = Math.min(member.session.expiresAt.getTime(), now() + 5 * 60_000);
     const placement = locationHint(member.workspace.locationHint ?? undefined);

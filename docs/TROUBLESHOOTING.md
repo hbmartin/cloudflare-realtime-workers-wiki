@@ -5,15 +5,15 @@ Organised by what you actually observe. For the tables and commands referenced h
 
 ## Deployment failures
 
-| Symptom                                                                                            | Cause                                                                                                       | Fix                                                                                        |
-| -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `Couldn't find DB` or a D1 error on first deploy                                                   | `database_id` is still the all-zero placeholder in `wrangler.jsonc`                                         | Replace it with the ID from `wrangler d1 create`                                           |
-| Sign-in fails; cookies not set; `invalid_origin` on connect                                        | `BETTER_AUTH_URL` still points at `http://localhost:5173`, or does not exactly match the served origin      | Set it to the exact HTTPS origin, no trailing slash, then redeploy                         |
-| Runtime `no such table` errors after a deploy                                                      | Worker deployed before `pnpm db:remote`                                                                     | Apply migrations, then redeploy                                                            |
-| `BETTER_AUTH_SECRET is not defined` or 500s on every request                                       | Secret never set, or set on a different Worker name                                                         | `pnpm wrangler secret list`, then `secret put`                                             |
-| CI fails at `cf-typegen:check`                                                                     | `worker-configuration.d.ts` is out of date with `wrangler.jsonc`                                            | Run `pnpm cf-typegen` and commit the result                                                |
-| Locally, `no such table` or a missing owner guard, with `pnpm db:local` reporting nothing to apply | The local D1 predates the squashed `0001_initial.sql` baseline, and `d1_migrations` already lists that name | Delete `.wrangler/state` and rerun `pnpm db:local`; there is no forward migration for this |
-| Deploy succeeds but the old version appears live                                                   | Asset or browser caching, or you are looking at a preview URL                                               | `pnpm wrangler deployments list` to confirm what is current                                |
+| Symptom                                                                                            | Cause                                                                                                            | Fix                                                                                        |
+| -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `Couldn't find DB` or a D1 error on first deploy                                                   | `database_id` is still the all-zero placeholder in `wrangler.jsonc`                                              | Replace it with the ID from `wrangler d1 create`                                           |
+| Sign-in fails; cookies not set; `invalid_origin` on connect                                        | `BETTER_AUTH_URL` still points at `http://localhost:5173`, or does not exactly match the origin the browser used | Set it to the exact HTTPS origin, no trailing slash, then redeploy                         |
+| Runtime `no such table` errors after a deploy                                                      | Worker deployed before `pnpm db:remote`                                                                          | Apply migrations, then redeploy                                                            |
+| `BETTER_AUTH_SECRET is not defined` or 500s on every request                                       | Secret never set, or set on a different Worker name                                                              | `pnpm wrangler secret list`, then `secret put`                                             |
+| CI fails at `cf-typegen:check`                                                                     | `worker-configuration.d.ts` is out of date with `wrangler.jsonc`                                                 | Run `pnpm cf-typegen` and commit the result                                                |
+| Locally, `no such table` or a missing owner guard, with `pnpm db:local` reporting nothing to apply | The local D1 predates the squashed `0001_initial.sql` baseline, and `d1_migrations` already lists that name      | Delete `.wrangler/state` and rerun `pnpm db:local`; there is no forward migration for this |
+| Deploy succeeds but the old version appears live                                                   | Asset or browser caching, or you are looking at a preview URL                                                    | `pnpm wrangler deployments list` to confirm what is current                                |
 
 `/api/health` returning `{"ok":true,"version":"0.1.0"}` does **not** confirm which revision is live;
 `version` is a hardcoded string.
@@ -43,16 +43,16 @@ as a bare `500 internal_error` with no detail, so an unfamiliar 500 means checki
 
 ### Authentication and installation
 
-| Code                           | Status | Meaning                                                                                         |
-| ------------------------------ | ------ | ----------------------------------------------------------------------------------------------- |
-| `invalid_origin`               | 403    | Request origin did not match `BETTER_AUTH_URL`. Almost always a misconfigured `BETTER_AUTH_URL` |
-| `registration_closed`          | 403    | Public sign-up is deliberately blocked. Expected; it is a smoke-test assertion                  |
-| `invalid_bootstrap_token`      | 403    | Wrong or rotated `BOOTSTRAP_TOKEN`                                                              |
-| `already_initialized`          | 409    | The owner already exists. Bootstrap is one-time                                                 |
-| `invite_invalid`               | 404    | Invite is invalid, expired, or already used                                                     |
-| `invite_used`                  | 409    | Another request consumed the invite first                                                       |
-| `final_owner`                  | 409    | Blocked by the last-owner triggers. Promote another owner first                                 |
-| `owner_required` / `read_only` | 403    | Role gate. `read_only` means an editor action attempted by a viewer                             |
+| Code                           | Status | Meaning                                                                                                                                                                                           |
+| ------------------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `invalid_origin`               | 403    | The `Origin` header did not match `BETTER_AUTH_URL` exactly. Almost always a misconfigured `BETTER_AUTH_URL`, or a request reaching the Worker on a second hostname such as a `workers.dev` route |
+| `registration_closed`          | 403    | Public sign-up is deliberately blocked. Expected; it is a smoke-test assertion                                                                                                                    |
+| `invalid_bootstrap_token`      | 403    | Wrong or rotated `BOOTSTRAP_TOKEN`                                                                                                                                                                |
+| `already_initialized`          | 409    | The owner already exists. Bootstrap is one-time                                                                                                                                                   |
+| `invite_invalid`               | 404    | Invite is invalid, expired, or already used                                                                                                                                                       |
+| `invite_used`                  | 409    | Another request consumed the invite first                                                                                                                                                         |
+| `final_owner`                  | 409    | Blocked by the last-owner triggers. Promote another owner first                                                                                                                                   |
+| `owner_required` / `read_only` | 403    | Role gate. `read_only` means an editor action attempted by a viewer                                                                                                                               |
 
 ### Pages and content
 
@@ -65,8 +65,8 @@ as a bare `500 internal_error` with no detail, so an unfamiliar 500 means checki
 | `unsafe_file_type`   | 415    | Active content — HTML, SVG, XML, script — is rejected by design                                                                                          |
 | `attachment_missing` | 404    | D1 metadata exists but the R2 object does not. See [Backup and recovery](BACKUP_AND_RECOVERY.md#attachment-object-missing)                               |
 | `version_missing`    | 404    | Version row exists but its R2 object does not                                                                                                            |
-| `restore_failed`     | 503    | Version restore could not complete. Usually an R2 or D1 outage; the room retries                                                                         |
-| `room_not_found`     | 404    | A `/parties/*` upgrade named a room that cannot exist: an unknown workspace, a malformed page id or epoch, or a path whose percent-escapes do not decode |
+| `restore_failed`     | 503    | Version restore could not complete. Usually an R2 or D1 outage. Whether it retries depends on how far it got — see below                                 |
+| `room_not_found`     | 404    | A `/parties/*` upgrade named a room that cannot exist: an unknown workspace, or a page id or epoch that is not the exact text this installation produces |
 
 ### Tables
 
@@ -123,7 +123,13 @@ The last row is defensive: the shared guards make it unreachable, and it is kept
 than misreported as a conflict.
 
 `table_revision_failed` means the invariant did not hold. It is not a transient error and retrying will
-not help. Alert on it, capture the D1 error from Workers Logs, and escalate.
+not help. Escalate it.
+
+It is the one client-facing error the Worker also logs. Expected errors are otherwise never logged, so
+without that line this branch would be invisible: there is no metric carrying the response code. Search
+Workers Logs for `Table revision could not be advanced`, which carries the page id, the revision the
+caller expected, the revision actually stored, and whether the lease was still valid. The lease token
+and session id are deliberately omitted; they authenticate the caller.
 
 Classification depends only on `meta.changes` from the batch results and the read-back row, not on any
 D1 error message, so a change to D1's error formatting cannot degrade a `404` into a generic `500`.
@@ -133,27 +139,40 @@ D1 error message, so a change to D1's error formatting cannot degrade a `404` in
 Logging is unstructured. There is no request-id correlation, so triage is by message string in the
 Workers Logs search box.
 
-| Message                                                      | Meaning                                                                                                                                             |
-| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Scheduled deletion cleanup failed`                          | The hourly deletion pass threw. Check `deletion_jobs`                                                                                               |
-| `Scheduled archive disconnect failed`                        | The hourly archive pass threw. Check `archive_disconnect_targets`                                                                                   |
-| `Immediate deletion cleanup failed`                          | The inline attempt during a delete request failed. The cron will retry                                                                              |
-| `Failed to discard staged deletion job`                      | A permanent delete failed _and_ its rollback failed. Inspect `deletion_jobs` for an orphan                                                          |
-| `Failed to reschedule archive disconnect`                    | Backoff could not be persisted. The row may retry sooner than intended                                                                              |
-| `Document restore failed`                                    | A version restore threw. The room stays read-only until reconciled                                                                                  |
-| `Document restore validation failed`                         | Restore rejected the selected snapshot                                                                                                              |
-| `Failed to confirm restore commit state`                     | Restore could not determine whether it committed. Left pending for the alarm                                                                        |
-| `Failed to reconcile pending document restore`               | A pending restore retried and failed again. Repeats on the backoff below, not in a hot loop                                                         |
-| `Failed to record restore reconciliation attempt`            | The backoff counter could not be persisted. The next retry may come sooner than intended                                                            |
-| `Failed to schedule restore reconciliation`                  | The retry alarm could not be armed. The room stays read-only until a request wakes it                                                               |
-| `Failed to prune document versions`                          | Version retention did not run. Storage grows; not urgent                                                                                            |
-| `Failed to broadcast workspace event`                        | A page-tree or projection event was dropped. Clients recover on reconnect                                                                           |
-| `Failed to broadcast projection update`                      | Same, from the document side                                                                                                                        |
-| `Failed to schedule compaction retry`                        | The compaction alarm could not be re-armed. The room may stay dirty                                                                                 |
-| `Failed to resume document alarm after transition`           | Alarm re-arm failed after archive, restore, or purge                                                                                                |
-| `Failed to persist retired document state`                   | An epoch could not be marked retired                                                                                                                |
-| `Failed to handle document party request for <room>`         | An unexpected failure on a `/parties/document/*` upgrade. The room is `<pageId>~<epoch>`, or `an undecoded room` when the failure preceded decoding |
-| `Failed to handle workspace-events party request for <room>` | The same for a `/parties/workspace-events/*` upgrade                                                                                                |
+| Message                                                      | Meaning                                                                                                                                                           |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Scheduled deletion cleanup failed`                          | The hourly deletion pass threw. Check `deletion_jobs`                                                                                                             |
+| `Scheduled archive disconnect failed`                        | The hourly archive pass threw. Check `archive_disconnect_targets`                                                                                                 |
+| `Immediate deletion cleanup failed`                          | The inline attempt during a delete request failed. The cron will retry                                                                                            |
+| `Failed to discard staged deletion job`                      | A permanent delete failed _and_ its rollback failed. Inspect `deletion_jobs` for an orphan                                                                        |
+| `Failed to reschedule archive disconnect`                    | Backoff could not be persisted. The row may retry sooner than intended                                                                                            |
+| `Document restore failed`                                    | A version restore threw. The room stays read-only until reconciled                                                                                                |
+| `Document restore validation failed`                         | The version row or its R2 object could not be read. Nothing was staged, so **nothing retries**; the user must restore again                                       |
+| `Table revision could not be advanced`                       | A table mutation applied but its revision update did not, which the batch cannot produce. Carries the page and both revisions. Not transient                      |
+| `Failed to confirm restore commit state`                     | Restore could not determine whether it committed. Left pending for the alarm                                                                                      |
+| `Failed to reconcile pending document restore`               | A pending restore retried and failed again. Repeats on the backoff below, not in a hot loop                                                                       |
+| `Failed to record restore reconciliation attempt`            | The backoff counter could not be persisted. The next retry may come sooner than intended                                                                          |
+| `Failed to schedule restore reconciliation`                  | The retry alarm could not be armed. The room stays read-only until a request wakes it                                                                             |
+| `Failed to prune document versions`                          | Version retention did not run. Storage grows; not urgent                                                                                                          |
+| `Failed to broadcast workspace event`                        | A page-tree or projection event was dropped. Clients recover on reconnect                                                                                         |
+| `Failed to broadcast projection update`                      | Same, from the document side                                                                                                                                      |
+| `Failed to schedule compaction retry`                        | The compaction alarm could not be re-armed. The room may stay dirty                                                                                               |
+| `Failed to resume document alarm after transition`           | Alarm re-arm failed after archive, restore, or purge                                                                                                              |
+| `Failed to persist retired document state`                   | An epoch could not be marked retired                                                                                                                              |
+| `Failed to handle document party request for <room>`         | An unexpected failure on a `/parties/document/*` upgrade. The room is a validated `<pageId>~<epoch>`, or `an undecoded room` when the failure preceded validation |
+| `Failed to handle workspace-events party request for <room>` | The same for a `/parties/workspace-events/*` upgrade                                                                                                              |
+
+### A restore returned 503
+
+`restore_failed` covers two cases that need different responses. Tell them apart by the log line:
+
+| Log line                             | What happened                                                                                                         | Response                                                                  |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `Document restore validation failed` | The version row lookup or its R2 read failed. Nothing was staged and no recovery state exists, so **nothing retries** | Tell the user to retry from the History panel once the dependency is back |
+| `Document restore failed`            | The transition was staged before the failure, so recovery state is persisted                                          | Leave it; the room reconciles on its own backoff, below                   |
+
+Only the second leaves the room read-only with a pending restore. The first leaves the document exactly
+as it was, still editable.
 
 ### Pending restore backoff
 

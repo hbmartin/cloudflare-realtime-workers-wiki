@@ -35,6 +35,7 @@
     "cf-typegen:check": "node scripts/check-worker-types.mjs",
     "db:local": "wrangler d1 migrations apply DB --local",
     "db:remote": "wrangler d1 migrations apply DB --remote",
+    "db:export": "node scripts/d1-export.mjs",
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker",
     "deploy": "pnpm build && wrangler deploy"
   },

@@ -67,6 +67,10 @@ export class Document extends YServer {
   private transitionAlarmRearm: Promise<void> | null = null;
   private transitionRetryAt: number | null = null;
   private validatingTransition = false;
+  // Set when onStart reconciled a pending restore, consumed by the alarm that
+  // initialization was running for. Per instance, so a later alarm delivered to
+  // a resident room still reconciles on its own schedule.
+  private reconciledOnStart = false;
   private compaction: Promise<void> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
@@ -153,6 +157,7 @@ export class Document extends YServer {
         this.metadata.retired,
       );
     } else if (this.metadata.restore_pending) {
+      this.reconciledOnStart = true;
       await this.reconcilePendingRestore();
     }
 
@@ -299,12 +304,22 @@ export class Document extends YServer {
     }
     if (this.metadata.restore_pending) {
       // partyserver initializes before it delivers an alarm, so onStart has
-      // already reconciled this wake. Inside the persisted quiet period the
-      // alarm has nothing left to do but hold the schedule that attempt set:
-      // the delivery consumed the stored alarm, so skipping without re-arming
-      // would strand the room read-only.
-      if (Date.now() >= this.metadata.restore_retry_at) await this.reconcilePendingRestore();
-      else await this.armRestoreRetry(this.metadata.restore_retry_at);
+      // already reconciled this wake, and that attempt armed the next retry.
+      // Tracked as state rather than inferred from restore_retry_at, because
+      // super.onStart() loads a snapshot and replays the log between the two:
+      // a large document can outrun the 2.5-5 s first backoff and reconcile
+      // twice on one delivery.
+      if (this.reconciledOnStart) {
+        this.reconciledOnStart = false;
+      } else if (Date.now() >= this.metadata.restore_retry_at) {
+        await this.reconcilePendingRestore();
+      } else {
+        // Inside the persisted quiet period the alarm has nothing left to do
+        // but hold the schedule that attempt set: the delivery consumed the
+        // stored alarm, so skipping without re-arming would strand the room
+        // read-only.
+        await this.armRestoreRetry(this.metadata.restore_retry_at);
+      }
     }
     if (this.purged || this.metadata.retired || this.metadata.restore_pending) return;
     this.flushPendingUpdates();
