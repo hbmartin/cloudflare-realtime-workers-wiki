@@ -4,7 +4,7 @@ Short version: the DO/Workers architecture buys you excellent per-document realt
 
 - **Long, heavy pages degrade or fail.** A Durable Object gets 10 GB of storage but the runtime memory ceiling is 128 MB, and the whole Y.Doc plus its update log has to live in that during merge. Pages with hundreds of images, giant tables, or years of edit history are where this bites — you'll be forced to compact aggressively, which means **capped version history depth** as a visible product decision, not a choice.
 - **Concurrent editors per page are limited.** Each object is inherently single-threaded, and Cloudflare explicitly warns that many small WebSocket messages can overwhelm a single Durable Object even when total data volume is small, recommending you batch messages into single frames. Practically: ~30 live collaborators per page is comfortable (tldraw's own guidance), and you'll throttle awareness updates — so cursors and presence feel slightly laggier than Figma/Notion.
-- **Uploads cap at 100 MB** unless you build direct-to-R2 multipart. Request body size is set by your Cloudflare account plan — 100 MB on Free and Pro, 200 MB Business, 500 MB Enterprise. Users see "file too large" on a video or big PDF.
+- **Uploads once capped at 100 MB**, the Cloudflare request-body limit on Free and Pro. This is now addressed: files above 8 MiB are chunked straight to R2 through a multipart session, so the request-body limit bounds a single part rather than the whole file.
 
 **Geography — the sharpest one**
 

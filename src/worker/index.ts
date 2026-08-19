@@ -1,8 +1,17 @@
-import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
+import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
+import {
+  isInlineMime,
+  isUnsafeMime,
+  MAX_ATTACHMENT_BYTES,
+  MAX_UPLOAD_BYTES,
+  processDueUploadReaps,
+  resolvePartSize,
+  UPLOAD_SESSION_TTL_MS,
+} from "./attachments";
 import { processDeletionJob, processDueDeletionJobs, pruneBulkWriteReceipts } from "./cleanup";
 import { Document } from "./document";
 import type { Env, MemberContext } from "./env";
@@ -35,31 +44,11 @@ import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 
 const app = new Hono<{ Bindings: Env }>();
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const DELETION_TARGET_BATCH_SIZE = 50;
+// Each page costs two or three statements, so this stays far inside D1's per-invocation
+// query ceiling while still collapsing a tree level into one request.
+const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
-const UNSAFE_MIME_TYPES = new Set([
-  "text/html",
-  "image/svg+xml",
-  "application/xhtml+xml",
-  "application/javascript",
-  "application/x-javascript",
-  "text/javascript",
-]);
-const UNSAFE_FILE_EXTENSIONS = new Set([
-  ".html",
-  ".htm",
-  ".htx",
-  ".xhtml",
-  ".xht",
-  ".svg",
-  ".svgz",
-  ".xml",
-  ".js",
-  ".jse",
-  ".mjs",
-  ".cjs",
-]);
 
 type PageRow = {
   id: string;
@@ -561,6 +550,99 @@ app.post("/api/pages", async (c) => {
   const created = pageJson(await pageForMember(c.env, member, id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [created] });
   return c.json({ page: created }, 201);
+});
+
+// Creates a whole tree level at once.
+//
+// Creating pages one at a time is correct but broadcasts `pages-upserted` per page,
+// and an import of a thousand pages then makes every connected client merge its tree a
+// thousand times. The event payload is already a list, so one request that inserts N
+// pages in a single batch and emits one event needs no client change at all.
+//
+// Parents must already exist: a page cannot name another page from the same request as
+// its parent. Callers walk the tree a level at a time, which also keeps sibling order
+// deterministic, since positions are handed out in request order.
+app.post("/api/pages/batch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const body = await jsonBody(c.req.raw);
+  const requested = Array.isArray(body.pages) ? body.pages : [];
+  if (!requested.length) throw new HttpError(422, "invalid_input", "pages must list at least one page.");
+  if (requested.length > PAGE_BATCH_MAX) {
+    throw new HttpError(422, "batch_too_large", `A batch is limited to ${PAGE_BATCH_MAX} pages.`);
+  }
+
+  const parsed = requested.map((raw, index) => {
+    const entry = object(raw);
+    return {
+      id: crypto.randomUUID(),
+      parentId: nullableId(entry.parentId, `pages[${index}].parentId`),
+      kind: pageKind(entry.kind ?? "document"),
+      title: typeof entry.title === "string" ? text(entry.title, `pages[${index}].title`, 200) : "Untitled",
+    };
+  });
+
+  // Every distinct parent is checked once, which also rejects a parent in another
+  // workspace or an archived one exactly as the single-page route does.
+  const parentIds = [...new Set(parsed.map((page) => page.parentId))];
+  for (const parentId of parentIds) {
+    if (parentId) await pageForMember(c.env, member, parentId);
+  }
+
+  // Positions are generated per parent, continuing after that parent's last child, so
+  // a batch appends in request order just like a sequence of single creates would.
+  const positions = new Map<string, string>();
+  for (const parentId of parentIds) {
+    const siblings = parsed.filter((page) => page.parentId === parentId);
+    const last = await c.env.DB.prepare(
+      `SELECT position FROM pages WHERE workspace_id = ? AND parent_id IS ? AND archived_at IS NULL
+        ORDER BY position DESC, id DESC LIMIT 1`,
+    )
+      .bind(member.workspace.id, parentId)
+      .first<{ position: string }>();
+    const keys = generateNJitteredKeysBetween(last?.position ?? null, null, siblings.length);
+    siblings.forEach((page, index) => positions.set(page.id, keys[index]!));
+  }
+
+  const timestamp = now();
+  const statements: D1PreparedStatement[] = [];
+  for (const page of parsed) {
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        page.id,
+        member.workspace.id,
+        page.parentId,
+        page.kind,
+        positions.get(page.id),
+        page.title,
+        member.user.id,
+        timestamp,
+        timestamp,
+      ),
+      c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
+        page.id,
+        member.workspace.id,
+        page.title,
+      ),
+    );
+    if (page.kind === "table") {
+      statements.push(c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(page.id));
+    }
+  }
+  await c.env.DB.batch(statements);
+
+  const created = await c.env.DB.prepare(
+    `SELECT * FROM pages WHERE workspace_id = ? AND id IN (${parsed.map(() => "?").join(", ")})
+      ORDER BY position, id`,
+  )
+    .bind(member.workspace.id, ...parsed.map((page) => page.id))
+    .all<PageRow>();
+  const pages = created.results.map(pageJson);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages });
+  return c.json({ pages }, 201);
 });
 
 app.get("/api/pages/:id", async (c) => {
@@ -1120,6 +1202,244 @@ app.delete("/api/attachments/:id", async (c) => {
   if (!attachment) throw new HttpError(404, "attachment_not_found", "Attachment not found.");
   await c.env.DB.prepare(`DELETE FROM attachments WHERE id = ?`).bind(c.req.param("id")).run();
   await c.env.BUCKET.delete(attachment.r2_key);
+  return c.json({ ok: true });
+});
+
+type UploadSessionRow = {
+  id: string;
+  workspace_id: string;
+  page_id: string;
+  r2_key: string;
+  r2_upload_id: string;
+  name: string;
+  mime: string;
+  size: number;
+  part_size: number;
+  part_count: number;
+};
+
+// Resolves an upload session the caller is allowed to act on. The R2 upload id is
+// never handed to a client: a session is addressed by our own id so every request is
+// authorised against D1 first, and R2's key layout stays server-side.
+async function activeUploadSession(env: Env, member: MemberContext, uploadId: string) {
+  const session = await env.DB.prepare(
+    `SELECT u.* FROM attachment_uploads u JOIN pages p ON p.id = u.page_id
+      WHERE u.id = ? AND u.workspace_id = ? AND p.archived_at IS NULL`,
+  )
+    .bind(uploadId, member.workspace.id)
+    .first<UploadSessionRow>();
+  if (!session) throw new HttpError(404, "upload_session_not_found", "That upload session no longer exists.");
+  return session;
+}
+
+// The size of one part, which is fixed for every part except the last. R2 rejects a
+// multipart upload whose middle parts differ in size, so the server dictates this
+// rather than accepting whatever the client happened to chunk to.
+function expectedPartBytes(session: UploadSessionRow, partNumber: number) {
+  return partNumber === session.part_count
+    ? session.size - session.part_size * (session.part_count - 1)
+    : session.part_size;
+}
+
+app.post("/api/pages/:id/uploads", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const name = normalizeFilename(text(body.name, "name", 400));
+  const mime = body.mime === undefined ? "application/octet-stream" : text(body.mime, "mime", 200);
+  const size = Number(body.size);
+  if (!Number.isInteger(size) || size <= 0) {
+    throw new HttpError(422, "invalid_input", "size must be a positive integer.");
+  }
+  if (size > MAX_ATTACHMENT_BYTES) {
+    throw new HttpError(413, "upload_too_large", "That file is larger than the attachment limit.");
+  }
+  // Checked before a single byte moves, so a rejected type costs one request rather
+  // than an entire multi-gigabyte upload.
+  if (isUnsafeMime(mime, name)) {
+    throw new HttpError(415, "unsafe_file_type", "That file type is not accepted.");
+  }
+  const partSize = resolvePartSize(body.partSize);
+  const partCount = Math.ceil(size / partSize);
+  // The session id doubles as the attachment id once the upload completes, so the R2
+  // object's customMetadata points at the right row from the moment it is created.
+  const id = crypto.randomUUID();
+  const key = `assets/${member.workspace.id}/${crypto.randomUUID()}`;
+  const upload = await c.env.BUCKET.createMultipartUpload(key, {
+    httpMetadata: { contentType: mime },
+    customMetadata: { attachmentId: id },
+  });
+  const timestamp = now();
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO attachment_uploads
+         (id, workspace_id, page_id, r2_key, r2_upload_id, name, mime, size, part_size, part_count,
+          created_by, created_at, updated_at, next_attempt_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        id,
+        member.workspace.id,
+        page.id,
+        key,
+        upload.uploadId,
+        name,
+        mime,
+        size,
+        partSize,
+        partCount,
+        member.user.id,
+        timestamp,
+        timestamp,
+        timestamp + UPLOAD_SESSION_TTL_MS,
+      )
+      .run();
+  } catch (error) {
+    // Nothing records this upload yet, so abandoning it here would leak parts with no
+    // row for the reaper to find them by.
+    await upload.abort().catch((abortError) => {
+      console.error("Failed to abort an unrecorded multipart upload", abortError);
+    });
+    throw error;
+  }
+  return c.json(
+    { upload: { id, name, mime, size, partSize, partCount, expiresAt: timestamp + UPLOAD_SESSION_TTL_MS } },
+    201,
+  );
+});
+
+app.get("/api/uploads/:uploadId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  const parts = await c.env.DB.prepare(
+    `SELECT part_number, etag, size FROM attachment_upload_parts WHERE upload_id = ? ORDER BY part_number`,
+  )
+    .bind(session.id)
+    .all<{ part_number: number; etag: string; size: number }>();
+  return c.json({
+    upload: {
+      id: session.id,
+      pageId: session.page_id,
+      name: session.name,
+      mime: session.mime,
+      size: session.size,
+      partSize: session.part_size,
+      partCount: session.part_count,
+    },
+    // Which parts already landed, so an interrupted upload resumes instead of
+    // restarting from the first byte.
+    parts: parts.results.map((part) => ({ partNumber: part.part_number, etag: part.etag, size: part.size })),
+  });
+});
+
+app.put("/api/uploads/:uploadId/parts/:partNumber", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  const partNumber = Number(c.req.param("partNumber"));
+  if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > session.part_count) {
+    throw new HttpError(422, "upload_part_size", "That part number is outside this upload.");
+  }
+  // Read rather than streamed so the length can be checked exactly before R2 is
+  // touched; one part is bounded well below the Worker's memory ceiling.
+  const bytes = await c.req.arrayBuffer();
+  const expected = expectedPartBytes(session, partNumber);
+  if (bytes.byteLength !== expected) {
+    throw new HttpError(422, "upload_part_size", `Part ${partNumber} must be exactly ${expected} bytes.`);
+  }
+  const upload = c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id);
+  const part = await upload.uploadPart(partNumber, bytes);
+  const timestamp = now();
+  await c.env.DB.batch([
+    // Re-uploading a part replaces it, so a retry after a network failure is safe.
+    c.env.DB.prepare(
+      `INSERT INTO attachment_upload_parts (upload_id, part_number, etag, size, uploaded_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(upload_id, part_number)
+         DO UPDATE SET etag = excluded.etag, size = excluded.size, uploaded_at = excluded.uploaded_at`,
+    ).bind(session.id, partNumber, part.etag, bytes.byteLength, timestamp),
+    // Every accepted part pushes the reaper's deadline out, so an upload that is merely
+    // slow is never collected - only one nobody is still feeding.
+    c.env.DB.prepare(`UPDATE attachment_uploads SET updated_at = ?, next_attempt_at = ? WHERE id = ?`).bind(
+      timestamp,
+      timestamp + UPLOAD_SESSION_TTL_MS,
+      session.id,
+    ),
+  ]);
+  return c.json({ part: { partNumber, etag: part.etag, size: bytes.byteLength } });
+});
+
+app.post("/api/uploads/:uploadId/complete", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  const parts = await c.env.DB.prepare(
+    `SELECT part_number, etag, size FROM attachment_upload_parts WHERE upload_id = ? ORDER BY part_number`,
+  )
+    .bind(session.id)
+    .all<{ part_number: number; etag: string; size: number }>();
+  if (parts.results.length !== session.part_count) {
+    throw new HttpError(409, "upload_incomplete", "Some parts of this upload have not arrived yet.");
+  }
+  const uploaded = parts.results.reduce((total, part) => total + part.size, 0);
+  if (uploaded !== session.size) {
+    throw new HttpError(422, "upload_size_mismatch", "The uploaded parts do not add up to the declared size.");
+  }
+  const upload = c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id);
+  try {
+    await upload.complete(parts.results.map((part) => ({ partNumber: part.part_number, etag: part.etag })));
+  } catch (error) {
+    console.error("Failed to complete a multipart upload", error);
+    throw new HttpError(503, "multipart_complete_failed", "The upload could not be finalised. Retry it.");
+  }
+  const timestamp = now();
+  try {
+    // R2 first, D1 second, matching the single-shot route: an object with no row is
+    // reclaimable, a row with no object is a broken attachment.
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO attachments (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        session.id,
+        session.workspace_id,
+        session.page_id,
+        session.r2_key,
+        session.name,
+        session.mime,
+        session.size,
+        member.user.id,
+        timestamp,
+      ),
+      c.env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ?`).bind(session.id),
+    ]);
+  } catch (error) {
+    await c.env.BUCKET.delete(session.r2_key).catch((cleanupError) => {
+      console.error("Failed to roll back a completed multipart upload", cleanupError);
+    });
+    throw error;
+  }
+  return c.json(
+    {
+      attachment: {
+        id: session.id,
+        pageId: session.page_id,
+        name: session.name,
+        mime: session.mime,
+        size: session.size,
+      },
+    },
+    201,
+  );
+});
+
+app.delete("/api/uploads/:uploadId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  await c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id).abort();
+  await c.env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ?`).bind(session.id).run();
   return c.json({ ok: true });
 });
 
@@ -1895,23 +2215,8 @@ async function currentPlainText(env: Env, pageId: string) {
   );
 }
 
-function isUnsafeMime(mime: string, name: string) {
-  const normalizedMime = mime.toLowerCase().split(";", 1)[0]!.trim();
-  const extension = name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
-  return UNSAFE_MIME_TYPES.has(normalizedMime) || UNSAFE_FILE_EXTENSIONS.has(extension);
-}
-
 function escapeLike(value: string) {
   return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
-}
-
-function isInlineMime(mime: string) {
-  return (
-    /^image\/(png|jpeg|gif|webp|avif)$/.test(mime) ||
-    mime === "application/pdf" ||
-    mime === "text/plain" ||
-    mime === "text/markdown"
-  );
 }
 
 function cellValue(cell: Record<string, unknown>) {
@@ -2107,6 +2412,11 @@ export default {
     context.waitUntil(
       pruneBulkWriteReceipts(env).catch((error) => {
         console.error("Scheduled bulk write receipt prune failed", error);
+      }),
+    );
+    context.waitUntil(
+      processDueUploadReaps(env).catch((error) => {
+        console.error("Scheduled upload reap failed", error);
       }),
     );
   },

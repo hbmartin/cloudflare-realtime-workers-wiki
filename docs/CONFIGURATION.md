@@ -92,7 +92,11 @@ configurable at runtime.
 | Connections per document epoch                          | 30, then close `4429`                                                    | `src/worker/document.ts` `onConnect`            |
 | Connection grant lifetime                               | `min(session expiry, now + 5 min)`                                       | `src/worker/index.ts` `handlePartyRequest`      |
 | `UPDATE_CHUNK_BYTES`                                    | 1 MiB                                                                    | `src/shared/bytes.ts`                           |
-| `MAX_UPLOAD_BYTES`                                      | 10 MiB                                                                   | `src/worker/index.ts`                           |
+| `MAX_UPLOAD_BYTES` (single-shot form upload)            | 10 MiB                                                                   | `src/worker/attachments.ts`                     |
+| `MAX_ATTACHMENT_BYTES` (chunked multipart upload)       | 10 GiB                                                                   | `src/worker/attachments.ts`                     |
+| Multipart part size                                     | 8 MiB default, clamped to 5-64 MiB                                       | `src/worker/attachments.ts`                     |
+| `UPLOAD_SESSION_TTL_MS`                                 | 24 h; each accepted part pushes the deadline out                         | `src/worker/attachments.ts`                     |
+| `PAGE_BATCH_MAX`                                        | 50 pages per batched create                                              | `src/worker/index.ts`                           |
 | `TABLE_LEASE_DURATION_MS`                               | 60 s                                                                     | `src/worker/index.ts`                           |
 | Table row limit (`TABLE_MAX_ROWS`)                      | 20000, enforced on write only                                            | `src/shared/table-limits.ts`                    |
 | Table page size (`TABLE_PAGE_DEFAULT`/`TABLE_PAGE_MAX`) | 500 default and maximum rows per read                                    | `src/shared/table-limits.ts`                    |

@@ -84,7 +84,7 @@ Rotate during low traffic. Do not rotate while a version restore is in progress.
 
 ## Inspecting the work queues
 
-Two D1 tables are the system's asynchronous work queues. Neither has a UI, and both are the first place
+Three D1 tables are the system's asynchronous work queues. None has a UI, and they are the first place
 to look when cleanup appears stuck. See [Configuration](CONFIGURATION.md#cron-drain-rates-and-backoff)
 for the drain rates that tell "stuck" from "backed off".
 
@@ -107,6 +107,26 @@ pnpm wrangler d1 execute DB --remote --command \
 
 `kind` is one of `document_do`, `r2_object`, or `r2_prefix`. `last_error` is truncated to 1000
 characters. A healthy installation has zero rows in both queries.
+
+### Abandoned uploads
+
+A chunked upload holds R2 parts from the moment it starts until it completes or is aborted. Each
+accepted part pushes the row's deadline out, so only an upload nobody is still feeding becomes due.
+
+```sh
+pnpm wrangler d1 execute DB --remote --command \
+  "SELECT id, page_id, name, size, part_count, attempts,
+          datetime(next_attempt_at/1000,'unixepoch') AS next_attempt, last_error
+     FROM attachment_uploads ORDER BY next_attempt_at;"
+```
+
+Rows here are normal while people are uploading. A row whose `next_attempt_at` is more than a cron
+interval in the past is one the reaper is failing to clear; `last_error` says why.
+
+**Configure an R2 lifecycle rule to abort incomplete multipart uploads after 7 days.** The reaper
+covers every session it has a row for, but a row lost to a D1 restore would otherwise leave its parts
+held indefinitely with nothing left to find them by. The lifecycle rule is the backstop for that case
+and is set in the Cloudflare dashboard under R2 → your bucket → Settings.
 
 Do not delete a job manually unless every one of its targets has been independently verified as gone.
 Removing the job is the only record that the work is outstanding.
@@ -193,7 +213,7 @@ before they reach it. Pages accumulate size from embedded images and long edit h
 | D1 database   | 10 GB                              | Cloudflare dashboard, D1 metrics |
 | Document size | 16 MiB warn / 24 MiB read-only     | Query above                      |
 | Table rows    | 20000 per table, enforced on write | Rejected with `table_row_limit`  |
-| Attachments   | 10 MiB per upload                  | Rejected with `upload_too_large` |
+| Attachments   | 10 MiB single-shot, 10 GiB chunked | Rejected with `upload_too_large` |
 | Connections   | 30 per document epoch              | Excess closed with `4429`        |
 | Versions      | 30 days, 200 per page              | Pruned during compaction         |
 

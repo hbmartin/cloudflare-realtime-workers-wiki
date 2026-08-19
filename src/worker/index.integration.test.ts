@@ -157,6 +157,52 @@ async function bulkWrite(cookie: string, pageId: string, body: Record<string, un
   };
 }
 
+const MIB = 1024 * 1024;
+
+async function initUpload(cookie: string, pageId: string, body: Record<string, unknown>) {
+  const response = await SELF.fetch(
+    authenticatedRequest(cookie, `/api/pages/${pageId}/uploads`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+  return {
+    status: response.status,
+    body: await response.json<{
+      upload: { id: string; partSize: number; partCount: number };
+      error?: { code: string };
+    }>(),
+  };
+}
+
+// Parts are built as ArrayBuffers so the request body needs no view-to-buffer dance.
+function filledBytes(length: number, value = 0) {
+  const buffer = new ArrayBuffer(length);
+  new Uint8Array(buffer).fill(value);
+  return buffer;
+}
+
+async function putUploadPart(cookie: string, uploadId: string, partNumber: number, bytes: ArrayBuffer) {
+  const response = await SELF.fetch(
+    authenticatedRequest(cookie, `/api/uploads/${uploadId}/parts/${partNumber}`, {
+      method: "PUT",
+      body: bytes,
+    }),
+  );
+  return { status: response.status, body: await response.json<{ error?: { code: string } }>() };
+}
+
+async function completeUpload(cookie: string, uploadId: string) {
+  const response = await SELF.fetch(
+    authenticatedRequest(cookie, `/api/uploads/${uploadId}/complete`, { method: "POST" }),
+  );
+  return {
+    status: response.status,
+    body: await response.json<{ attachment: { id: string; size: number }; error?: { code: string } }>(),
+  };
+}
+
 type TableSeed = { column?: "text" | "select"; option?: string; row?: boolean };
 
 // Seeds table structure straight into D1, bypassing the lease-guarded API, so a
@@ -2461,6 +2507,203 @@ describe("Worker integration", () => {
       .bind(tablePage.id)
       .first<{ expires_at: number }>();
     expect(renewed!.expires_at).toBeGreaterThan(nearlyExpired);
+  });
+
+  it("uploads a file in parts and serves the reassembled object", async () => {
+    const installed = await bootstrap();
+    // Two parts, because a single-part upload never exercises R2's equal-size rule.
+    const size = 5 * MIB + 1_024;
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      name: "recording.mp4",
+      mime: "video/mp4",
+      size,
+      partSize: 5 * MIB,
+    });
+    expect(started.status).toBe(201);
+    expect(started.body.upload.partCount).toBe(2);
+
+    const first = filledBytes(5 * MIB, 7);
+    const second = filledBytes(1_024, 9);
+    expect((await putUploadPart(installed.cookie, started.body.upload.id, 1, first)).status).toBe(200);
+    expect((await putUploadPart(installed.cookie, started.body.upload.id, 2, second)).status).toBe(200);
+
+    const completed = await completeUpload(installed.cookie, started.body.upload.id);
+    expect(completed.status).toBe(201);
+    expect(completed.body.attachment.size).toBe(size);
+
+    const download = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/attachments/${completed.body.attachment.id}`),
+    );
+    expect(download.status).toBe(200);
+    const downloaded = new Uint8Array(await download.arrayBuffer());
+    expect(downloaded.byteLength).toBe(size);
+    expect(downloaded[0]).toBe(7);
+    expect(downloaded.at(-1)).toBe(9);
+
+    // Video has to serve inline, or the editor's media block offers a download.
+    expect(download.headers.get("content-disposition")).toMatch(/^inline/);
+
+    const ranged = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/attachments/${completed.body.attachment.id}`, {
+        headers: { range: `bytes=${5 * MIB}-${5 * MIB + 3}` },
+      }),
+    );
+    expect(ranged.status).toBe(206);
+    expect(new Uint8Array(await ranged.arrayBuffer())).toEqual(new Uint8Array([9, 9, 9, 9]));
+
+    // The finished session is gone, so the reaper has nothing left to collect.
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM attachment_uploads`).first<{ count: number }>()).toEqual({
+      count: 0,
+    });
+  });
+
+  it("rejects a mistyped part and a part number outside the upload", async () => {
+    const installed = await bootstrap();
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      name: "notes.bin",
+      mime: "application/octet-stream",
+      size: 2_048,
+    });
+    expect(started.body.upload.partCount).toBe(1);
+
+    const wrongSize = await putUploadPart(installed.cookie, started.body.upload.id, 1, filledBytes(64));
+    expect(wrongSize.status).toBe(422);
+    expect(wrongSize.body.error?.code).toBe("upload_part_size");
+
+    const outOfRange = await putUploadPart(installed.cookie, started.body.upload.id, 5, filledBytes(2_048));
+    expect(outOfRange.status).toBe(422);
+    expect(outOfRange.body.error?.code).toBe("upload_part_size");
+  });
+
+  it("refuses to complete an upload that is missing a part", async () => {
+    const installed = await bootstrap();
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      name: "big.bin",
+      mime: "application/octet-stream",
+      size: 5 * MIB + 16,
+      partSize: 5 * MIB,
+    });
+    await putUploadPart(installed.cookie, started.body.upload.id, 1, filledBytes(5 * MIB));
+
+    const completed = await completeUpload(installed.cookie, started.body.upload.id);
+
+    expect(completed.status).toBe(409);
+    expect(completed.body.error?.code).toBe("upload_incomplete");
+  });
+
+  it("rejects a denylisted file type before any bytes are uploaded", async () => {
+    const installed = await bootstrap();
+
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      name: "payload.svg",
+      mime: "image/svg+xml",
+      size: 1_024,
+    });
+
+    expect(started.status).toBe(415);
+    expect(started.body.error?.code).toBe("unsafe_file_type");
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM attachment_uploads`).first<{ count: number }>()).toEqual({
+      count: 0,
+    });
+  });
+
+  it("abandons an aborted upload and stops accepting parts for it", async () => {
+    const installed = await bootstrap();
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      name: "cancelled.bin",
+      mime: "application/octet-stream",
+      size: 1_024,
+    });
+
+    const aborted = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/uploads/${started.body.upload.id}`, { method: "DELETE" }),
+    );
+    expect(aborted.status).toBe(200);
+
+    const orphaned = await putUploadPart(installed.cookie, started.body.upload.id, 1, filledBytes(1_024));
+    expect(orphaned.status).toBe(404);
+    expect(orphaned.body.error?.code).toBe("upload_session_not_found");
+  });
+
+  it("reaps an upload session nobody finished", async () => {
+    const installed = await bootstrap();
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      name: "abandoned.bin",
+      mime: "application/octet-stream",
+      size: 1_024,
+    });
+    // Wind the session past its deadline rather than waiting out the 24 hour TTL.
+    await env.DB.prepare(`UPDATE attachment_uploads SET next_attempt_at = 1 WHERE id = ?`)
+      .bind(started.body.upload.id)
+      .run();
+
+    const context = createExecutionContext();
+    await worker.scheduled!(createScheduledController(), env, context);
+    await waitOnExecutionContext(context);
+
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM attachment_uploads`).first<{ count: number }>()).toEqual({
+      count: 0,
+    });
+  });
+
+  it("creates a whole tree level in one request, in the order asked for", async () => {
+    const installed = await bootstrap();
+
+    const response = await SELF.fetch(
+      authenticatedRequest(installed.cookie, "/api/pages/batch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          pages: [
+            { parentId: null, kind: "document", title: "Alpha" },
+            { parentId: installed.pageId, kind: "document", title: "Beta" },
+            { parentId: installed.pageId, kind: "table", title: "Gamma" },
+          ],
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    const { pages } = await response.json<{ pages: { id: string; title: string; parentId: string | null }[] }>();
+    expect(pages).toHaveLength(3);
+    // Children of one parent keep request order, which is what makes an import's
+    // sibling ordering reproducible.
+    const children = pages.filter((page) => page.parentId === installed.pageId).map((page) => page.title);
+    expect(children).toEqual(["Beta", "Gamma"]);
+
+    // A table page gets its table_state row exactly as the single-page route gives it.
+    const table = pages.find((page) => page.title === "Gamma")!;
+    expect(await env.DB.prepare(`SELECT page_id FROM table_state WHERE page_id = ?`).bind(table.id).first()).toEqual({
+      page_id: table.id,
+    });
+    // Search rows are seeded for every page, so a batch import is findable immediately.
+    const indexed = await env.DB.prepare(`SELECT COUNT(*) count FROM page_search`).first<{ count: number }>();
+    expect(indexed!.count).toBe(4);
+  });
+
+  it("rejects a batch that is empty, oversized, or names a missing parent", async () => {
+    const installed = await bootstrap();
+    async function batch(body: unknown) {
+      const response = await SELF.fetch(
+        authenticatedRequest(installed.cookie, "/api/pages/batch", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+      return { status: response.status, body: await response.json<{ error?: { code: string } }>() };
+    }
+
+    expect((await batch({ pages: [] })).status).toBe(422);
+
+    const oversized = await batch({ pages: Array.from({ length: 51 }, () => ({ parentId: null })) });
+    expect(oversized.status).toBe(422);
+    expect(oversized.body.error?.code).toBe("batch_too_large");
+
+    const orphan = await batch({ pages: [{ parentId: crypto.randomUUID() }] });
+    expect(orphan.status).toBe(404);
+    // Nothing is created when the parent check fails.
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM pages`).first<{ count: number }>()).toEqual({ count: 1 });
   });
 
   it("distinguishes a stale table revision from a lost editing lease", async () => {

@@ -20,6 +20,8 @@ describe("D1 migrations", () => {
         "page_references",
         "prevent_final_owner_demotion",
         "prevent_final_owner_removal",
+        "attachment_upload_parts",
+        "attachment_uploads",
         "table_bulk_writes",
       ]),
     );

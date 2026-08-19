@@ -56,17 +56,23 @@ as a bare `500 internal_error` with no detail, so an unfamiliar 500 means checki
 
 ### Pages and content
 
-| Code                 | Status | Meaning                                                                                                                                                  |
-| -------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `stale_epoch`        | 409    | The client asked for a document epoch that is no longer current, typically mid-restore. The client refetches and follows the new epoch                   |
-| `page_cycle`         | 409    | A move would make a page its own ancestor                                                                                                                |
-| `archive_first`      | 409    | Permanent deletion attempted on a page that is not archived                                                                                              |
-| `upload_too_large`   | 413    | Over the 10 MiB attachment limit                                                                                                                         |
-| `unsafe_file_type`   | 415    | Active content — HTML, SVG, XML, script — is rejected by design                                                                                          |
-| `attachment_missing` | 404    | D1 metadata exists but the R2 object does not. See [Backup and recovery](BACKUP_AND_RECOVERY.md#attachment-object-missing)                               |
-| `version_missing`    | 404    | Version row exists but its R2 object does not                                                                                                            |
-| `restore_failed`     | 503    | Version restore could not complete. Usually an R2 or D1 outage. Whether it retries depends on how far it got — see below                                 |
-| `room_not_found`     | 404    | A `/parties/*` upgrade named a room that cannot exist: an unknown workspace, or a page id or epoch that is not the exact text this installation produces |
+| Code                        | Status | Meaning                                                                                                                                                  |
+| --------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stale_epoch`               | 409    | The client asked for a document epoch that is no longer current, typically mid-restore. The client refetches and follows the new epoch                   |
+| `page_cycle`                | 409    | A move would make a page its own ancestor                                                                                                                |
+| `archive_first`             | 409    | Permanent deletion attempted on a page that is not archived                                                                                              |
+| `upload_too_large`          | 413    | Over 10 MiB on the single-shot form route, or over 10 GiB on a multipart upload                                                                          |
+| `upload_session_not_found`  | 404    | The multipart session was aborted, completed, reaped, or its page archived                                                                               |
+| `upload_part_size`          | 422    | Part number outside the upload, or a part that is not exactly the size the server assigned                                                               |
+| `upload_incomplete`         | 409    | Complete was called before every part arrived                                                                                                            |
+| `upload_size_mismatch`      | 422    | The uploaded parts do not add up to the size declared at init                                                                                            |
+| `multipart_complete_failed` | 503    | R2 refused to finalise the upload. Retry; the parts are still held                                                                                       |
+| `batch_too_large`           | 422    | A batched page create asked for more than `PAGE_BATCH_MAX` pages                                                                                         |
+| `unsafe_file_type`          | 415    | Active content — HTML, SVG, XML, script — is rejected by design                                                                                          |
+| `attachment_missing`        | 404    | D1 metadata exists but the R2 object does not. See [Backup and recovery](BACKUP_AND_RECOVERY.md#attachment-object-missing)                               |
+| `version_missing`           | 404    | Version row exists but its R2 object does not                                                                                                            |
+| `restore_failed`            | 503    | Version restore could not complete. Usually an R2 or D1 outage. Whether it retries depends on how far it got — see below                                 |
+| `room_not_found`            | 404    | A `/parties/*` upgrade named a room that cannot exist: an unknown workspace, or a page id or epoch that is not the exact text this installation produces |
 
 ### Tables
 
