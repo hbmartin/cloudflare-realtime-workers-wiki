@@ -5,6 +5,7 @@ import {
   createScheduledController,
   env,
   reset,
+  runDurableObjectAlarm,
   runInDurableObject,
   SELF,
   waitOnExecutionContext,
@@ -145,8 +146,16 @@ type TestDocument = {
   transitionRetryAt: number | null;
   getConnections(): Array<{ close(code: number, reason: string): void }>;
   bindings: Cloudflare.Env;
-  metadata: { retired: number; restore_pending: number; restore_attempts: number };
+  metadata: { retired: number; restore_pending: number; restore_attempts: number; restore_retry_at: number };
 };
+
+// The reconciliation backoff is persisted and gates onAlarm, so a test that
+// drives consecutive attempts through the alarm has to stand in for the quiet
+// period elapsing between them.
+function elapseRestoreBackoff(document: TestDocument, state: DurableObjectState) {
+  state.storage.sql.exec(`UPDATE document_meta SET restore_retry_at = 0 WHERE id = 1`);
+  document.metadata.restore_retry_at = 0;
+}
 
 beforeEach(async () => {
   await reset();
@@ -184,26 +193,6 @@ describe("Worker integration", () => {
     expect(await response.json()).toEqual({ error: { code: "not_found", message: "API route not found." } });
   });
 
-  it("logs unexpected party request failures and answers them generically", async () => {
-    const installed = await bootstrap();
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    try {
-      // A malformed percent-escape makes decodeURIComponent throw a URIError:
-      // an internal failure, not an HttpError written for the client.
-      const response = await SELF.fetch(authenticatedRequest(installed.cookie, "/parties/document/%E0%A4%A"));
-      expect(response.status).toBe(500);
-      expect(await response.json()).toEqual({
-        error: { code: "internal_error", message: "Something went wrong." },
-      });
-      expect(error).toHaveBeenCalledTimes(1);
-      const [message, cause] = error.mock.calls[0]!;
-      expect(message).toBe("Failed to handle document party request for /parties/document/%E0%A4%A");
-      expect(cause).toBeInstanceOf(URIError);
-    } finally {
-      error.mockRestore();
-    }
-  });
-
   it("keeps client-facing party request errors unlogged with their own message", async () => {
     const installed = await bootstrap();
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -220,7 +209,58 @@ describe("Worker integration", () => {
       expect(await wrongRoom.json()).toEqual({
         error: { code: "room_not_found", message: "Workspace event room not found." },
       });
+      // A malformed percent-escape makes decodeURIComponent throw a URIError.
+      // It is client input that can never name a room, so it answers like any
+      // other unknown room rather than as an internal failure.
+      const malformed = await SELF.fetch(authenticatedRequest(installed.cookie, "/parties/document/%E0%A4%A"));
+      expect(malformed.status).toBe(404);
+      expect(await malformed.json()).toEqual({
+        error: { code: "room_not_found", message: "Document room not found." },
+      });
+      const malformedWorkspace = await SELF.fetch(
+        authenticatedRequest(installed.cookie, "/parties/workspace-events/%E0%A4%A"),
+      );
+      expect(malformedWorkspace.status).toBe(404);
+      expect(await malformedWorkspace.json()).toEqual({
+        error: { code: "room_not_found", message: "Workspace event room not found." },
+      });
+      // An oversized room is rejected on its shape, not by failing a lookup.
+      const oversized = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/parties/document/${"p".repeat(101)}~1`),
+      );
+      expect(oversized.status).toBe(404);
+      expect(await oversized.json()).toEqual({
+        error: { code: "room_not_found", message: "Document room not found." },
+      });
       expect(error).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("logs unexpected party request failures against a bounded room and answers them generically", async () => {
+    const installed = await bootstrap();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // A real dependency failure, reached only after the room shape checks, so
+      // the log names a validated id rather than whatever path was supplied.
+      await env.DB.exec("ALTER TABLE pages RENAME TO pages_offline");
+      const response = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/parties/document/${installed.pageId}~1`),
+      );
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        error: { code: "internal_error", message: "Something went wrong." },
+      });
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(error.mock.calls[0]![0]).toBe(`Failed to handle document party request for ${installed.pageId}~1`);
+      // The same broken dependency cannot be reached by an unbounded room, so
+      // no arbitrary path can ride into that log line.
+      const oversized = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/parties/document/${"p".repeat(101)}~1`),
+      );
+      expect(oversized.status).toBe(404);
+      expect(error).toHaveBeenCalledTimes(1);
     } finally {
       error.mockRestore();
     }
@@ -945,6 +985,7 @@ describe("Worker integration", () => {
         document.bindings = originalBindings;
       }
 
+      elapseRestoreBackoff(document, state);
       await document.onAlarm();
       expect(
         state.storage.sql
@@ -1019,6 +1060,7 @@ describe("Worker integration", () => {
       );
       expect(await state.storage.getAlarm()).not.toBeNull();
 
+      elapseRestoreBackoff(document, state);
       await document.onAlarm();
       expect(
         state.storage.sql
@@ -1069,6 +1111,7 @@ describe("Worker integration", () => {
         },
       });
       const failingAlarmDelay = async () => {
+        elapseRestoreBackoff(document, state);
         const before = Date.now();
         await document.onAlarm();
         const after = Date.now();
@@ -1099,6 +1142,7 @@ describe("Worker integration", () => {
         error.mockRestore();
       }
 
+      elapseRestoreBackoff(document, state);
       await document.onAlarm();
       expect(
         state.storage.sql
@@ -1111,6 +1155,46 @@ describe("Worker integration", () => {
       expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count).toBe(
         0,
       );
+    });
+  });
+
+  it("holds the reconciliation backoff when an alarm fires inside the quiet period", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      state.storage.sql.exec(
+        `INSERT INTO restore_recovery (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, 1, 2, 'quiet-new', 'quiet-pre')`,
+      );
+      const retryAt = Date.now() + 60_000;
+      state.storage.sql.exec(
+        `UPDATE document_meta SET retired = 1, restore_pending = 1, restore_attempts = 3, restore_retry_at = ? WHERE id = 1`,
+        retryAt,
+      );
+      document.metadata.retired = 1;
+      document.metadata.restore_pending = 1;
+      document.metadata.restore_attempts = 3;
+      document.metadata.restore_retry_at = retryAt;
+      await state.storage.setAlarm(Date.now());
+
+      // Nothing here is sabotaged: an ungated alarm would reconcile
+      // successfully and clear restore_pending.
+      await document.onAlarm();
+
+      expect(
+        state.storage.sql
+          .exec<{ restore_pending: number; restore_attempts: number }>(
+            `SELECT restore_pending, restore_attempts FROM document_meta WHERE id = 1`,
+          )
+          .one(),
+      ).toEqual({ restore_pending: 1, restore_attempts: 3 });
+      expect(state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM restore_recovery`).one().count).toBe(
+        1,
+      );
+      expect(await state.storage.getAlarm()).toBe(retryAt);
     });
   });
 
@@ -2227,9 +2311,66 @@ describe("Worker integration", () => {
     expect(await env.DB.prepare(`SELECT id FROM deletion_jobs WHERE id = ?`).bind(jobId).first()).toBeNull();
   });
 
+  it("reconciles a pending restore once when a real alarm wakes a restarted room", async () => {
+    const installed = await bootstrap();
+    const room = `${installed.pageId}~1`;
+    const stub = env.DOCUMENT.getByName(room);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      state.storage.sql.exec(
+        `INSERT INTO restore_recovery (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, 1, 2, 'cold-wake-new', 'cold-wake-pre')`,
+      );
+      state.storage.sql.exec(
+        `UPDATE document_meta SET retired = 1, restore_pending = 1, restore_attempts = 0, restore_retry_at = 0 WHERE id = 1`,
+      );
+      document.metadata.retired = 1;
+      document.metadata.restore_pending = 1;
+      document.metadata.restore_attempts = 0;
+      document.metadata.restore_retry_at = 0;
+      // Far out, so the runtime cannot deliver it before the restart;
+      // runDurableObjectAlarm runs whatever is stored regardless of when it is due.
+      await state.storage.setAlarm(Date.now() + 60 * 60_000);
+    });
+
+    // The instance-level proxies the other backoff tests use die with the
+    // instance, so break the dependency itself: it has to still be failing when
+    // a fresh instance reads it.
+    await env.DB.exec("ALTER TABLE pages RENAME TO pages_offline");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await abortAllDurableObjects();
+    const restarted = env.DOCUMENT.getByName(room);
+    try {
+      // partyserver initializes before it delivers an alarm, so this one wake
+      // runs onStart and then onAlarm. Only onStart may contact the dependency.
+      expect(await runDurableObjectAlarm(restarted)).toBe(true);
+      expect(
+        error.mock.calls.filter(([message]) => message === "Failed to reconcile pending document restore"),
+      ).toHaveLength(1);
+    } finally {
+      error.mockRestore();
+      await env.DB.exec("ALTER TABLE pages_offline RENAME TO pages");
+    }
+
+    await runInDurableObject(restarted, async (_instance, state) => {
+      const meta = state.storage.sql
+        .exec<{ restore_pending: number; restore_attempts: number; restore_retry_at: number }>(
+          `SELECT restore_pending, restore_attempts, restore_retry_at FROM document_meta WHERE id = 1`,
+        )
+        .one();
+      expect(meta.restore_pending).toBe(1);
+      expect(meta.restore_attempts).toBe(1);
+      expect(meta.restore_retry_at).toBeGreaterThan(Date.now());
+      // The delivery consumed the stored alarm, so the skipped second attempt
+      // still has to leave the backoff armed.
+      expect(await state.storage.getAlarm()).toBe(meta.restore_retry_at);
+    });
+  });
+
   // abortAllDurableObjects simulates a crash rather than a graceful eviction and
-  // intentionally invalidates the test isolate, so keep this destructive restart
-  // scenario last in the file.
+  // intentionally invalidates the test isolate, so keep these destructive restart
+  // scenarios last in the file.
   it("recovers a pending update log when an instance restarts after dirty was cleared", async () => {
     const installed = await bootstrap();
     const room = `${installed.pageId}~1`;

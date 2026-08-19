@@ -15,9 +15,14 @@ export function text(value: unknown, name: string, max = 200): string {
   return normalized;
 }
 
+// The shape every generated id takes (`crypto.randomUUID()` today). Exported for
+// callers outside the ValidationError-to-422 path, such as the party room
+// parser, which has to bound an id but reject it with its own status.
+export const ID_PATTERN = /^[\w-]{1,100}$/;
+
 export function nullableId(value: unknown, name: string): string | null {
   if (value === null || value === undefined || value === "") return null;
-  if (typeof value !== "string" || !/^[\w-]{1,100}$/.test(value)) throw new ValidationError(`${name} is invalid`);
+  if (typeof value !== "string" || !ID_PATTERN.test(value)) throw new ValidationError(`${name} is invalid`);
   return value;
 }
 

@@ -83,7 +83,8 @@ configurable at runtime.
 | --- | --- | --- |
 | Yjs save debounce | 1 s, 5 s maximum | `src/worker/document.ts` `callbackOptions` |
 | `COMPACTION_DELAY_MS` | 30 s | `src/worker/document.ts` |
-| `ALARM_RETRY_DELAY_MS` | 5 s, flat, no growth | `src/worker/document.ts` |
+| `ALARM_RETRY_DELAY_MS` | 5 s — the transition-deferral delay, and the base of the restore backoff | `src/worker/document.ts` |
+| `RESTORE_RECONCILIATION_MAX_DELAY_MS` | 5 min — the ceiling that backoff holds at | `src/worker/document.ts` |
 | `VERSION_INTERVAL_MS` | 15 min | `src/worker/document.ts` |
 | `VERSION_RETENTION_MS` | 30 days, and at most 200 versions per page | `src/worker/document.ts`, `pruneVersions` |
 | `WARN_BYTES` | 16 MiB | `src/worker/document.ts` |
@@ -106,6 +107,15 @@ configurable at runtime.
 | Invite lifetime | 7 days, one use | `src/worker/index.ts` |
 | Hidden-tab disconnect | 30 s | `src/client/collaboration.ts` |
 | Client reconnect backoff | `min(30 s, 1 s × 2^min(attempt, 5))`, jittered | `src/client/retry.ts` |
+| Restore reconciliation backoff | `min(5 min, 5 s × 2^attempt)`, jittered | `src/worker/document.ts`, `src/shared/retry.ts` |
+
+Both backoffs draw from `jitteredBackoff` in `src/shared/retry.ts`, which applies equal jitter: the
+delay lands anywhere in `[ceiling / 2, ceiling]`, so a fleet that failed together does not retry in
+lockstep. For a pending restore the ceilings run 5 → 10 → 20 → 40 → 80 → 160 → 300 seconds and then
+hold. The attempt count and the time the next attempt is due are persisted in the room's own SQLite
+(`document_meta.restore_attempts` and `restore_retry_at`) because the Durable Object hibernates; both
+reset when the restore resolves or a new one starts. See
+[Troubleshooting](TROUBLESHOOTING.md#pending-restore-backoff).
 
 The 24 MiB read-only flag is **sticky**. It is written as
 `read_only = CASE WHEN ? THEN 1 ELSE read_only END`, so shrinking a document never clears it. Recovery

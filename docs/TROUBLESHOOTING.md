@@ -66,6 +66,7 @@ as a bare `500 internal_error` with no detail, so an unfamiliar 500 means checki
 | `attachment_missing` | 404 | D1 metadata exists but the R2 object does not. See [Backup and recovery](BACKUP_AND_RECOVERY.md#attachment-object-missing) |
 | `version_missing` | 404 | Version row exists but its R2 object does not |
 | `restore_failed` | 503 | Version restore could not complete. Usually an R2 or D1 outage; the room retries |
+| `room_not_found` | 404 | A `/parties/*` upgrade named a room that cannot exist: an unknown workspace, a malformed page id or epoch, or a path whose percent-escapes do not decode |
 
 ### Tables
 
@@ -142,34 +143,40 @@ Workers Logs search box.
 | `Document restore failed` | A version restore threw. The room stays read-only until reconciled |
 | `Document restore validation failed` | Restore rejected the selected snapshot |
 | `Failed to confirm restore commit state` | Restore could not determine whether it committed. Left pending for the alarm |
-| `Failed to reconcile pending document restore` | A pending restore retried and failed again. See the hot-loop note below |
+| `Failed to reconcile pending document restore` | A pending restore retried and failed again. Repeats on the backoff below, not in a hot loop |
+| `Failed to record restore reconciliation attempt` | The backoff counter could not be persisted. The next retry may come sooner than intended |
+| `Failed to schedule restore reconciliation` | The retry alarm could not be armed. The room stays read-only until a request wakes it |
 | `Failed to prune document versions` | Version retention did not run. Storage grows; not urgent |
 | `Failed to broadcast workspace event` | A page-tree or projection event was dropped. Clients recover on reconnect |
 | `Failed to broadcast projection update` | Same, from the document side |
 | `Failed to schedule compaction retry` | The compaction alarm could not be re-armed. The room may stay dirty |
 | `Failed to resume document alarm after transition` | Alarm re-arm failed after archive, restore, or purge |
 | `Failed to persist retired document state` | An epoch could not be marked retired |
+| `Failed to handle document party request for <room>` | An unexpected failure on a `/parties/document/*` upgrade. The room is `<pageId>~<epoch>`, or `an undecoded room` when the failure preceded decoding |
+| `Failed to handle workspace-events party request for <room>` | The same for a `/parties/workspace-events/*` upgrade |
+
+### Pending restore backoff
+
+A restore that cannot finish leaves the room read-only and retries on a capped exponential backoff:
+ceilings of 5, 10, 20, 40, 80, 160 then 300 seconds, each delay drawn with equal jitter from
+`[ceiling / 2, ceiling]`. Both the attempt count and the time the next attempt is due are persisted in
+the room's own SQLite (`document_meta.restore_attempts` and `restore_retry_at`), so an eviction
+mid-outage does not reset the room to the fast first retry. Both reset to zero when the restore
+resolves, and when a new restore starts.
+
+One alarm delivery makes at most one attempt. A request that wakes an evicted room reconciles
+immediately rather than waiting out the quiet period — a client connecting mid-outage is a useful
+signal that the dependency is back.
+
+Symptom of a genuine outage: one page stuck read-only, and `Failed to reconcile pending document
+restore` repeating at a widening interval that settles at 5 minutes. It self-heals once the dependency
+recovers. Repeats faster than that, or two entries per interval, mean the backoff state is not being
+persisted — look for `Failed to record restore reconciliation attempt` alongside it.
 
 ## Known unresolved issues
 
-Recorded because they change how you interpret symptoms. Both are code-level and out of scope for a
+Recorded because they change how you interpret symptoms. They are code-level and out of scope for a
 documentation change.
-
-**Pending restore retries at a flat interval.** `deferRestoreReconciliation` in `src/worker/document.ts`
-reschedules using `ALARM_RETRY_DELAY_MS`, a fixed 5 seconds with no growth. If D1 or R2 stays
-unavailable while a restore is pending, the room retries every 5 seconds indefinitely while remaining
-read-only. Symptom: one page stuck read-only, and `Failed to reconcile pending document restore`
-repeating at 5-second intervals in the logs. It self-heals once the dependency recovers.
-
-**WebSocket upgrade failures are not logged.** The error handler around `handlePartyRequest` in
-`src/worker/index.ts` returns a JSON error response but does not call `console.error`. Unexpected 500s
-on `/parties/*` upgrades are therefore invisible in Workers Logs. If users report failing connections
-and the logs are silent, reproduce the upgrade with `curl` and read the response body directly:
-
-```sh
-curl -i -H "Origin: https://notes.example.com" -H "Cookie: <session>" \
-  "https://notes.example.com/parties/document/<pageId>~<epoch>"
-```
 
 **Unreachable `ASSETS` branch.** `app.notFound` in `src/worker/index.ts` calls `c.env.ASSETS.fetch(...)`,
 but the `assets` block in `wrangler.jsonc` declares no `binding`, and `ASSETS` is absent from the

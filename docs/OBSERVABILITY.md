@@ -84,18 +84,20 @@ Scheduled deletion cleanup failed
 Scheduled archive disconnect failed
 Document restore failed
 Failed to reconcile pending document restore
+Failed to handle document party request for
 ```
 
 Source maps are uploaded, so stack traces in the dashboard resolve to TypeScript source rather than
 bundled output.
 
-Two blind spots to remember:
+Two things to remember:
 
-- WebSocket upgrade failures on `/parties/*` are **not logged**. Silent logs do not mean healthy
-  connections.
 - Unrecognised exceptions are collapsed into `500 internal_error` with the original logged separately.
   A 500 in a client report and a log entry are two views of one event; correlate by timestamp, since
   there is no request id.
+- Expected errors are never logged, by design. A client reporting a `404 room_not_found` or a
+  `409 stale_epoch` on `/parties/*` will leave no trace in Workers Logs. Malformed upgrade paths land
+  in that group, so a burst of them is visible in request metrics but not in the logs.
 
 ## Verifying a deploy
 
