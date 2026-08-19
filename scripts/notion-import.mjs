@@ -26,6 +26,7 @@ import { createClient } from "./notion-import/api-client.mjs";
 import { createManifest } from "./notion-import/manifest.mjs";
 import { createReport } from "./notion-import/report.mjs";
 import { runImport } from "./notion-import/run.mjs";
+import { verifyImport } from "./notion-import/verify.mjs";
 
 const COMMANDS = new Set(["inspect", "plan", "run", "verify"]);
 
@@ -108,10 +109,10 @@ function validate(options) {
   ) {
     throw new Error("--rps must be an integer between 1 and 200.");
   }
-  if (options.command === "run" && !options.email) {
+  if ((options.command === "run" || options.command === "verify") && !options.email) {
     throw new Error("Set --email or NOTES_IMPORT_EMAIL to an owner or editor account.");
   }
-  if (options.command === "run" && !process.env.NOTES_IMPORT_PASSWORD) {
+  if ((options.command === "run" || options.command === "verify") && !process.env.NOTES_IMPORT_PASSWORD) {
     throw new Error("Set NOTES_IMPORT_PASSWORD. The password is never taken from the command line.");
   }
   return root;
@@ -219,6 +220,19 @@ if (options.command === "inspect") {
     manifest.flush();
   }
 } else {
-  console.error(`The ${options.command} command is not implemented yet.`);
-  process.exit(1);
+  const client = await createClient({
+    baseURL: options.baseURL,
+    email: options.email,
+    password: process.env.NOTES_IMPORT_PASSWORD,
+    requestsPerSecond: options.requestsPerSecond,
+  });
+  const manifest = createManifest({
+    path: options.manifest,
+    root,
+    baseURL: options.baseURL,
+    workspaceId: client.workspaceId,
+    rootParentId: options.parent,
+  });
+  const problems = await verifyImport({ client, manifest, index });
+  if (problems > 0) process.exitCode = 1;
 }

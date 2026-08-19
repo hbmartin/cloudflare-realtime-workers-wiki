@@ -125,6 +125,22 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
       return result.attachment;
     },
 
+    async acquireTableLease(pageId) {
+      return request(`/api/tables/${pageId}/lease`, { method: "POST", body: "{}" });
+    },
+
+    async releaseTableLease(pageId, leaseToken) {
+      return request(`/api/tables/${pageId}/lease`, { method: "DELETE", body: JSON.stringify({ leaseToken }) });
+    },
+
+    async bulkTableWrite(pageId, body) {
+      return request(`/api/tables/${pageId}/bulk`, { method: "POST", body: JSON.stringify(body) });
+    },
+
+    async readTable(pageId) {
+      return request(`/api/tables/${pageId}?count=true&limit=1`);
+    },
+
     async tree() {
       const result = await request("/api/pages/tree");
       return result.pages;

@@ -13,8 +13,12 @@ import { assignStableIds, createImportEditor, htmlToBlocks } from "./blocks.mjs"
 import { readPageHtml, resolveLink } from "./export-tree.mjs";
 import { normalizeNotionHtml } from "./normalize-html.mjs";
 import { pushDocument } from "./document-push.mjs";
+import { tableFromCsv } from "./csv.mjs";
 
 const PAGE_BATCH = 50;
+// Matches the route's own per-request caps, so a batch is never rejected for size.
+const TABLE_ROW_BATCH = 200;
+const TABLE_CELL_BATCH = 2_000;
 const TITLE_MAX = 200;
 
 // Extensions the server rejects outright, checked here so a refusal is a line in the
@@ -194,8 +198,67 @@ export async function runImport({ index, client, manifest, report, rootParentId,
   }
   manifest.flush();
 
+  // Databases last: a table page has to exist before its rows can be written, and the
+  // lease it takes is exclusive, so this is kept away from the content pass.
   const databases = selected.filter((page) => page.kind === "database");
-  for (const database of databases) report.issue("database_rows_pending", database.title);
+  let rowsWritten = 0;
+  for (const database of databases) {
+    const record = manifest.node(keyOf(database));
+    if (record.rowsWritten) continue;
+    try {
+      rowsWritten += await importTable({ index, client, report, database, record });
+      manifest.record(keyOf(database), { rowsWritten: true });
+    } catch (error) {
+      report.issue("table_failed", `${database.title}: ${error.message}`);
+    }
+  }
+  manifest.flush();
 
-  return { pages: selected.length, written, databases: databases.length };
+  return { pages: selected.length, written, databases: databases.length, rows: rowsWritten };
+}
+
+/**
+ * Writes one Notion database into a typed table.
+ *
+ * Every mutation carries the current revision, so these requests are strictly
+ * sequential no matter how they are batched. Batching is still what makes it viable: a
+ * three thousand row database costs tens of requests here rather than tens of thousands
+ * of per-cell writes. The lease renews itself on each bulk write, so a long table does
+ * not need a renewal timer running alongside.
+ */
+async function importTable({ index, client, report, database, record }) {
+  const csv = readFileSync(join(index.root, database.csvPath), "utf8");
+  const table = tableFromCsv(csv, (code, detail) => report.issue(code, detail));
+  if (table.columns.length === 0) return 0;
+
+  const lease = await client.acquireTableLease(record.pageId);
+  let revision = (await client.readTable(record.pageId)).table.revision;
+  let written = 0;
+  try {
+    // Columns travel with the first batch of rows, addressed by ref, so nothing has to
+    // wait on a round trip to learn the generated column ids.
+    // Sized so a batch never trips the route's row or cell cap.
+    const perBatch = Math.max(1, Math.min(TABLE_ROW_BATCH, Math.floor(TABLE_CELL_BATCH / table.columns.length)));
+    let columns = table.columns;
+    let offset = 0;
+    do {
+      const rows = table.rows.slice(offset, offset + perBatch);
+      const result = await client.bulkTableWrite(record.pageId, {
+        leaseToken: lease.leaseToken,
+        expectedRevision: revision,
+        // Identifies the batch so a lost response replays instead of duplicating rows.
+        clientRequestId: `${database.path}#${offset}`,
+        columns: columns ?? [],
+        rows,
+      });
+      revision = result.revision;
+      written += rows.length;
+      columns = null;
+      offset += perBatch;
+      report.progress("tables", Math.min(written, table.rows.length), table.rows.length, database.title);
+    } while (offset < table.rows.length);
+  } finally {
+    await client.releaseTableLease(record.pageId, lease.leaseToken).catch(() => undefined);
+  }
+  return written;
 }

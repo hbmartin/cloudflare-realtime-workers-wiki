@@ -33,10 +33,10 @@ export function createReport({ verbose = false } = {}) {
       console.log(`${phase}: ${done} of ${total}${note ? ` (${note})` : ""}.`);
     },
     print(summary) {
-      console.log(
-        `Imported ${plural(summary.pages, "page")}; wrote content for ${summary.written}` +
-          (summary.databases ? `, and created ${plural(summary.databases, "table page")}.` : "."),
-      );
+      const tables = summary.databases
+        ? `, and ${plural(summary.databases, "table page")} holding ${plural(summary.rows ?? 0, "row")}.`
+        : ".";
+      console.log(`Imported ${plural(summary.pages, "page")}; wrote content for ${summary.written}${tables}`);
       if (issues.size) {
         console.log("");
         console.log("Skipped or degraded, by reason:");

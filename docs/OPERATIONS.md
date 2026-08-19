@@ -221,6 +221,48 @@ Table reads are paged, so a table that grows past the write limit through an out
 write still reads back correctly. Inserting table rows directly in D1 is still unwise: it
 bypasses the lease and revision guards, so a concurrent editor's write can be lost.
 
+## Importing a Notion export
+
+`pnpm import:notion` converts an unpacked Notion **HTML** export and drives the ordinary API. Conversion
+runs on the operator's machine: document content has exactly one ingress, the Yjs WebSocket, and parsing a
+large export is unbounded CPU work that does not fit a Worker.
+
+```sh
+unzip "Export-....zip" -d notion-export          # large exports also contain nested Part-N.zip files
+pnpm import:notion inspect notion-export         # what is in the export, and what each construct becomes
+pnpm import:notion plan    notion-export         # converts everything in memory; reports every degradation
+NOTES_IMPORT_PASSWORD=... pnpm import:notion run notion-export \
+  --base-url https://notes.example.com --email owner@example.com
+pnpm import:notion verify notion-export --base-url https://notes.example.com --email owner@example.com
+```
+
+Run `inspect` and `plan` first. Neither touches the network, and `plan` is where a construct this
+installation cannot represent shows up — while it is still free to do something about it.
+
+| Setting                 | Meaning                                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `NOTES_IMPORT_PASSWORD` | Required for `run` and `verify`. Never accepted as a flag.                                                                           |
+| `--email`               | An owner or editor. A viewer is rejected before anything is created.                                                                 |
+| `--manifest <path>`     | Progress record. Re-running with the same manifest resumes; default `./notion-import.manifest.json`.                                 |
+| `--parent <pageId>`     | Import beneath an existing page instead of at the top level.                                                                         |
+| `--limit <n>`           | Import only the first n pages, for a smoke test.                                                                                     |
+| `--rps <n>`             | Request rate, default 20. **The Worker has no rate limiting and never returns 429, so this is the only backpressure in the system.** |
+
+**Re-running is safe.** Pages already created are skipped, attachments are matched by name against what the
+page already has, and content is re-pushed only if it differs — block ids are derived from the source, so an
+unchanged page produces no Yjs update at all. A manifest is refused if the export it was created from has
+changed, since the Notion-to-page mapping would no longer hold.
+
+**What an export cannot carry.** Notion never includes comments, version history, permissions, or custom
+emoji in an export, and omits pages the exporting user cannot see. Those cannot be migrated by any importer.
+Column layouts flatten, callouts become quotes, and equations are kept as LaTeX source; each is counted in
+the final report with the first page it appeared in.
+
+**Order matters and is enforced.** Every page is created before any content is written, because a mention
+whose target does not yet exist produces no backlink and is not repaired until the source page is next
+edited. Search, backlinks, and previews follow the 30-second compaction alarm rather than the import's
+writes, so `verify` immediately after a run will legitimately report pages with no searchable text yet.
+
 ## Load testing safely
 
 Two hazards, both easy to trigger by accident.

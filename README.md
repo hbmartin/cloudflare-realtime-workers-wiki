@@ -13,6 +13,7 @@ The editor is BlockNote backed by Yjs. Each document epoch has one hibernating `
 - Realtime page-tree metadata, unified page/member mentions, backlinks, authorized hover previews, and a cursor-based mention inbox.
 - Private R2 attachments with authorization, all HTTP range forms, conditional ETags, safe disposition, `nosniff`, MIME rejection, inline editor media, and chunked direct-to-R2 uploads for large files.
 - Full-page typed tables with 60-second single-editor leases, revision conflicts, owner force unlock, server-side paging and sorting, replayable bulk writes, and a 20,000-row limit.
+- Bulk Notion import from an HTML export: page tree, block content, inline media, internal links as mentions, and databases as typed tables, resumable and idempotent.
 
 This is an early v1 implementation. Production billing-grade hibernation verification and high-concurrency load tests still require a deployed Workers Paid account.
 
