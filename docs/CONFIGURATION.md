@@ -7,9 +7,9 @@ be confirmed rather than trusted.
 
 Set in the `vars` block of `wrangler.jsonc`. Plaintext; visible in the dashboard and in the repository.
 
-| Name              | Default                 | Notes                                                                                                                                                                                                                         |
-| ----------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BETTER_AUTH_URL` | `http://localhost:5173` | The exact origin the installation is served from. Sets the Better Auth cookie origin and is the base for the same-origin check on bootstrap, invite acceptance, and WebSocket upgrades. **Must be changed before deploying.** |
+| Name              | Default                 | Notes                                                                                                                                                                                                                                                                                                                                     |
+| ----------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BETTER_AUTH_URL` | `http://localhost:5173` | The exact origin the installation is served from. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **Must be changed before deploying.** |
 
 ## Secrets
 
@@ -129,8 +129,11 @@ takes to clear, and whether a stalled row is broken or merely waiting.
 
 | Queue                        | Per tick | Backoff                                 | Effective ceiling |
 | ---------------------------- | -------- | --------------------------------------- | ----------------- |
-| `deletion_jobs`              | 10       | `min(24 h, 1 h × 2^min(attempts-1, 4))` | 24 h              |
-| `archive_disconnect_targets` | 50       | `min(1 h, 10 s × 2^min(attempts-1, 8))` | 1 h               |
+| `deletion_jobs`              | 10       | `min(24 h, 1 h × 2^min(attempts-1, 4))` | 16 h              |
+| `archive_disconnect_targets` | 50       | `min(1 h, 10 s × 2^min(attempts-1, 8))` | 42 min            |
+
+The outer `min` in each expression is never reached: the attempt clamp caps the exponent first, at
+`1 h × 2^4` and `10 s × 2^8` respectively. Read the effective ceiling column, not the outer bound.
 
 Two consequences worth internalising:
 

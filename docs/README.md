@@ -23,7 +23,7 @@ recovery decision.
 
 | Plane                 | Authoritative for                                                                                                                                         | Recovery source                                        |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| D1                    | Accounts, sessions, membership, page metadata, FTS5 search, backlink/mention projections, attachment and version metadata, structured tables, work queues | `wrangler d1 export`                                   |
+| D1                    | Accounts, sessions, membership, page metadata, FTS5 search, backlink/mention projections, attachment and version metadata, structured tables, work queues | `pnpm db:export` (search index rebuilt on import)      |
 | R2                    | Current document snapshots, immutable version snapshots, attachment bodies                                                                                | Bucket copy or replication                             |
 | Durable Object SQLite | The Yjs update log after the last snapshot, plus room metadata                                                                                            | Not exportable in bulk; the DO itself is the only copy |
 

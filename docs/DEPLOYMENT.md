@@ -1,7 +1,7 @@
 # Deployment
 
-Cloudflare Realtime Notes targets Workers Paid. The application uses Workers Static Assets, D1, R2, and
-SQLite-backed Durable Objects.
+Cloudflare Realtime Notes targets Workers Paid for production capacity. The application uses Workers
+Static Assets, D1, R2, and SQLite-backed Durable Objects.
 
 Read [Configuration](CONFIGURATION.md) alongside this document; it is the reference for every value
 named here.
@@ -9,8 +9,12 @@ named here.
 ## 0. Prerequisites
 
 - Node.js 22 or later and pnpm 11.18.0.
-- A **Workers Paid** plan. SQLite-backed Durable Objects and cron triggers are not available on the
-  free plan, and both are required.
+- A **Workers Paid** plan, for production capacity rather than feature access. Workers Free caps
+  requests at 100,000 per day and applies a tighter per-invocation CPU limit, and its Durable Object
+  and D1 daily row limits are well below what an active workspace uses. SQLite-backed Durable Objects
+  and cron triggers are both available on Free — the free plan offers only SQLite-backed Durable
+  Objects, and allows 5 cron triggers per account against 250 on Paid — so a small evaluation
+  installation does run there.
 - R2 enabled on the account.
 - Authenticated Wrangler: either `pnpm wrangler login`, or `CLOUDFLARE_API_TOKEN` and
   `CLOUDFLARE_ACCOUNT_ID` in the environment.
@@ -51,9 +55,14 @@ installation will be served from:
 },
 ```
 
-This is a plain variable, not a secret. It sets the Better Auth cookie origin _and_ is the base for the
-same-origin check applied to bootstrap, invite acceptance, and every WebSocket upgrade. Leaving it
-unchanged breaks sign-in and causes `invalid_origin` on connection attempts.
+This is a plain variable, not a secret. It sets the Better Auth cookie origin _and_ is the allowlist the
+`Origin` header is compared against on bootstrap, invite acceptance, and every WebSocket upgrade.
+Leaving it unchanged breaks sign-in and causes `invalid_origin` on connection attempts.
+
+The comparison is against this value, not against the hostname the request arrived on, so a Worker
+reachable on more than one hostname — a `workers.dev` route left enabled alongside a custom domain —
+serves the application only on the configured one. Requests carrying no `Origin` header are not
+rejected; browsers always send one on the cross-origin requests this check exists to stop.
 
 There is no `account_id` and no `routes` block in the configuration. The Worker deploys to the account
 Wrangler is authenticated against and is served on `*.workers.dev` unless you attach a custom domain in
@@ -177,8 +186,11 @@ The last item must be measured on a deployed account; Miniflare cannot prove bil
 
 ## Upgrade procedure
 
-1. Export D1 and back up R2 as described in [Backup and recovery](BACKUP_AND_RECOVERY.md).
-2. Build and test the exact revision locally with `pnpm check`.
+1. Export D1 with `pnpm db:export --remote` and back up R2, as described in
+   [Backup and recovery](BACKUP_AND_RECOVERY.md). Confirm the export is non-empty before continuing;
+   `wrangler d1 export` on its own fails on this schema.
+2. Build and test the exact revision locally with `pnpm check`. The deploy workflow runs the same gate
+   and refuses to proceed without it, so a failure here is a failure there.
 3. Run `pnpm db:remote` and confirm every migration in `migrations/` reports success before deploying.
    The directory is the source of truth for what must be applied; do not rely on a list enumerated in
    documentation, which drifts.

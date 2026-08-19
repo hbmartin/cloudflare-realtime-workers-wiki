@@ -32,8 +32,20 @@ Schedule D1 exports and R2 replication or copies according to the installation's
 At minimum, before an upgrade:
 
 ```sh
-pnpm wrangler d1 export DB --remote --output backup.sql
+pnpm db:export --remote --output backup.sql
 ```
+
+Use `pnpm db:export`, not `wrangler d1 export` directly. D1 refuses to export a database containing a
+virtual table:
+
+```
+D1 Export error: cannot export databases with Virtual Tables (fts5)
+```
+
+`page_search` is an FTS5 index, so a plain export exits 1 and writes nothing. Every authoritative table
+is ordinary, and the index is derived from `pages`, so the script exports the real tables by name and
+leaves the index to be rebuilt on import. It discovers the table list from `sqlite_master` on each run,
+so a migration that adds a table needs no change here.
 
 Use Cloudflare R2 tooling or an S3-compatible client to copy both `assets/` and `documents/`. Preserve
 object metadata.
@@ -42,14 +54,21 @@ object metadata.
 
 For a consistent copy rather than a best-effort one:
 
-1. Stop writes. Remove access at the edge, or set every member to `viewer`.
-2. Wait at least one compaction interval — 30 seconds — plus the 5-second save debounce.
+1. Stop writes by removing access at the edge. Demoting members does not work: `prevent_final_owner_demotion`
+   refuses to demote the last owner, and an established WebSocket keeps the role it was granted at
+   connection time regardless of any later change.
+2. Wait for connections to lose write access — up to the 5-minute connection grant — then one compaction
+   interval of 30 seconds plus the 5-second save debounce. The alarm closes each connection when its
+   grant expires; confirm no connections remain before continuing.
 3. Confirm document versions and current snapshot objects were updated, by checking `updated_at` on the
    affected pages and the modification time of the `documents/{pageId}/epochs/{epoch}/current.bin`
    objects.
-4. Export D1.
+4. Export D1 with `pnpm db:export`.
 5. Copy R2 `assets/` and `documents/`.
 6. Restore write access.
+
+Skipping step 2 produces a copy that is inconsistent across planes: D1 metadata from one moment and
+Durable Object state from another.
 
 A process crash inside the five-second debounce can lose the server's in-memory copy; connected
 browsers retain local Yjs state in IndexedDB and resynchronize it.
@@ -59,10 +78,32 @@ browsers retain local Yjs state in IndexedDB and resynchronize it.
 ### Restore metadata and objects
 
 1. Deploy the same application revision and migrations.
-2. Import the D1 export into an empty replacement D1 database.
-3. Restore R2 keys without changing them.
-4. Point bindings at the restored resources.
-5. Verify attachment authorization and current/history snapshot reads before enabling edits.
+2. Import the D1 export into an **empty** replacement D1 database. The export carries its own
+   `CREATE TABLE` statements and the `d1_migrations` rows, so do not apply migrations first — the import
+   would collide with the tables they create.
+
+   ```sh
+   pnpm wrangler d1 execute DB --remote --file backup.sql
+   ```
+
+3. Rebuild the search index. The export omits `page_search` because D1 cannot export a virtual table,
+   and nothing else reconstructs it:
+
+   ```sh
+   pnpm wrangler d1 execute DB --remote --command \
+     "CREATE VIRTUAL TABLE IF NOT EXISTS page_search USING fts5(
+        page_id UNINDEXED, workspace_id UNINDEXED, title, body, tokenize = 'unicode61');
+      DELETE FROM page_search;
+      INSERT INTO page_search (page_id, workspace_id, title, body)
+      SELECT id, workspace_id, title, plain_text FROM pages WHERE archived_at IS NULL;"
+   ```
+
+   Archived pages are deliberately excluded, matching what compaction maintains. Search returns nothing
+   until this runs; every other feature works without it.
+
+4. Restore R2 keys without changing them.
+5. Point bindings at the restored resources.
+6. Verify search, attachment authorization, and current/history snapshot reads before enabling edits.
 
 ### Restore one document to a prior version
 
@@ -92,7 +133,7 @@ document epoch Durable Object has its alarm canceled and is purged with `storage
 job deletes exact attachment keys and complete `documents/{pageId}/` prefixes.
 
 Inspect `deletion_jobs` and unfinished `deletion_targets`; the hourly cron retries them idempotently
-with backoff capped at 24 hours. Because only 10 jobs drain per tick and the first retry is a full hour
+with backoff capped at 16 hours. Because only 10 jobs drain per tick and the first retry is a full hour
 out, a job that looks stuck may simply be waiting — check `next_attempt_at` before intervening.
 
 Do not remove a job manually unless every target has been independently verified. Pages deleted before

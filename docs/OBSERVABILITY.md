@@ -11,8 +11,9 @@
 
 That is the entirety of the instrumentation. There is deliberately **no** Sentry, Analytics Engine
 binding, tail consumer, Logpush configuration, OpenTelemetry export, or metrics emitter. Application
-logging is 17 bare `console.error(message, error)` calls in the Worker, with no request-id correlation
-and no structured fields.
+logging is 20 `console.error` calls in the Worker, with no request-id correlation. All but one pass a
+bare error object; `Table revision could not be advanced` carries structured fields, because it is the
+one invariant violation that no other signal would surface.
 
 Plan monitoring around that constraint: Cloudflare's own dashboards carry the numeric signal, and the
 two D1 work queues carry the durable error state. Logs are for narrative detail after something else
@@ -60,19 +61,24 @@ accrue duration, hibernation is not working and cost scales with connections rat
 
 ## Suggested alerts
 
-| Alert                   | Condition                                                           | Why it matters                                                                                                             |
-| ----------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Cron failure            | Scheduled invocation errors, or no successful invocation in 2 hours | Both cleanup queues stop draining; deleted content leaks and archived pages keep editors connected                         |
-| Sustained 5xx           | Worker error rate above baseline for 5 minutes                      | General outage                                                                                                             |
-| `table_revision_failed` | Any occurrence                                                      | A table mutation invariant was violated. Not transient; see [Troubleshooting](TROUBLESHOOTING.md#the-table-mutation-guard) |
-| Deletion backlog        | `deletion_jobs` count above 10                                      | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                       |
-| Stuck deletion          | Any `deletion_jobs` row older than 24 hours                         | Past the backoff ceiling, so it is failing rather than waiting                                                             |
-| Stuck archive           | Any `archive_disconnect_targets` row older than 1 hour              | Past its backoff ceiling                                                                                                   |
-| D1 size                 | Above 8 GB                                                          | Approaching the 10 GB cap with no migration path                                                                           |
+| Alert                   | Condition                                                                                                 | Why it matters                                                                                                                       |
+| ----------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Cron failure            | Scheduled invocation errors, or no successful invocation in 2 hours                                       | Both cleanup queues stop draining; deleted content leaks and archived pages keep editors connected                                   |
+| Sustained 5xx           | Worker error rate above baseline for 5 minutes                                                            | General outage                                                                                                                       |
+| `table_revision_failed` | Any `Table revision could not be advanced` log line                                                       | A table mutation invariant was violated. Not transient; see [Troubleshooting](TROUBLESHOOTING.md#the-table-mutation-guard)           |
+| Deletion backlog        | `deletion_jobs` count above 10                                                                            | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                                 |
+| Stuck deletion          | Any `deletion_jobs` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5              | Overdue by more than a cron interval, so the runner is not clearing it; `attempts` past the clamp means it is at the 16-hour ceiling |
+| Stuck archive           | Any `archive_disconnect_targets` row with `next_attempt_at` more than 2 hours past, or `attempts` above 9 | Same, against the 42-minute ceiling                                                                                                  |
+| D1 size                 | Above 8 GB                                                                                                | Approaching the 10 GB cap with no migration path                                                                                     |
 
 The queue-based alerts have no push mechanism in this repository. Run the queries from
 [Operations](OPERATIONS.md#inspecting-the-work-queues) from an external scheduler and alert on a
 non-zero count.
+
+Alert on `next_attempt_at` and `attempts`, never on how old a row is. The only general runner is the
+hourly cron, so a row that failed with a 10-second backoff still waits until the next tick: a healthy
+retrying row is routinely older than the delay that scheduled it. Row age says nothing about whether
+work is progressing.
 
 ## Log triage
 
