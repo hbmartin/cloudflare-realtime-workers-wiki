@@ -1149,6 +1149,65 @@ describe("Worker integration", () => {
     });
   });
 
+  it("re-arms the restore retry when the alarm it scheduled lands on the same instance", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const document = instance as unknown as TestDocument;
+      state.storage.sql.exec(
+        `INSERT INTO restore_recovery (id, old_epoch, new_epoch, new_key, pre_key)
+         VALUES (1, 1, 2, 'rearm-new', NULL)`,
+      );
+      state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1, restore_attempts = 0 WHERE id = 1`);
+      document.metadata.restore_pending = 1;
+      document.metadata.restore_attempts = 0;
+
+      const originalBindings = document.bindings;
+      const unavailableDatabase = new Proxy(originalBindings.DB, {
+        get(target, property, receiver) {
+          if (property !== "prepare") return Reflect.get(target, property, receiver);
+          return (query: string) => {
+            const statement = target.prepare(query);
+            if (!query.includes("SELECT content_epoch FROM pages WHERE id = ?")) return statement;
+            return {
+              bind: () => ({
+                first: async () => {
+                  throw new Error("D1 confirmation unavailable");
+                },
+              }),
+            };
+          };
+        },
+      });
+      document.bindings = new Proxy(originalBindings, {
+        get: (target, property, receiver) =>
+          property === "DB" ? unavailableDatabase : Reflect.get(target, property, receiver),
+      });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        // A normal request starts the object, so onStart reconciles and its
+        // failure arms a retry with no alarm delivery of its own to follow.
+        await document.onStart();
+        expect(await state.storage.getAlarm()).toBe(document.metadata.restore_retry_at);
+
+        // That retry is delivered to the instance still holding the latch, and
+        // the delivery consumes the stored alarm.
+        await state.storage.deleteAlarm();
+        await document.onAlarm();
+
+        // Skipping the wake without re-arming would strand the room read-only
+        // until something else cold-starts it.
+        expect(await state.storage.getAlarm()).toBe(document.metadata.restore_retry_at);
+        expect(document.metadata.restore_pending).toBe(1);
+      } finally {
+        document.bindings = originalBindings;
+        error.mockRestore();
+      }
+    });
+  });
+
   it("retries failed restore cleanup and then follows the authoritative epoch", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
