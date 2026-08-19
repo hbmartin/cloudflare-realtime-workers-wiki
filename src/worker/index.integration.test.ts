@@ -2658,6 +2658,7 @@ describe("Worker integration", () => {
             { parentId: null, kind: "document", title: "Alpha" },
             { parentId: installed.pageId, kind: "document", title: "Beta" },
             { parentId: installed.pageId, kind: "table", title: "Gamma" },
+            { parentId: null, kind: "document", title: "Delta" },
           ],
         }),
       }),
@@ -2665,11 +2666,16 @@ describe("Worker integration", () => {
 
     expect(response.status).toBe(201);
     const { pages } = await response.json<{ pages: { id: string; title: string; parentId: string | null }[] }>();
-    expect(pages).toHaveLength(3);
+    expect(pages).toHaveLength(4);
     // Children of one parent keep request order, which is what makes an import's
     // sibling ordering reproducible.
     const children = pages.filter((page) => page.parentId === installed.pageId).map((page) => page.title);
     expect(children).toEqual(["Beta", "Gamma"]);
+
+    // Request order, not position order: positions are generated per parent, so a batch
+    // spanning two parents has no global ordering and a caller pairing input to output
+    // by index would silently attach content to the wrong pages.
+    expect(pages.map((page) => page.title)).toEqual(["Alpha", "Beta", "Gamma", "Delta"]);
 
     // A table page gets its table_state row exactly as the single-page route gives it.
     const table = pages.find((page) => page.title === "Gamma")!;
@@ -2678,7 +2684,7 @@ describe("Worker integration", () => {
     });
     // Search rows are seeded for every page, so a batch import is findable immediately.
     const indexed = await env.DB.prepare(`SELECT COUNT(*) count FROM page_search`).first<{ count: number }>();
-    expect(indexed!.count).toBe(4);
+    expect(indexed!.count).toBe(5);
   });
 
   it("rejects a batch that is empty, oversized, or names a missing parent", async () => {

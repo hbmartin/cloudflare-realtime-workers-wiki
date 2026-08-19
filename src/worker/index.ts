@@ -635,12 +635,18 @@ app.post("/api/pages/batch", async (c) => {
   await c.env.DB.batch(statements);
 
   const created = await c.env.DB.prepare(
-    `SELECT * FROM pages WHERE workspace_id = ? AND id IN (${parsed.map(() => "?").join(", ")})
-      ORDER BY position, id`,
+    `SELECT * FROM pages WHERE workspace_id = ? AND id IN (${parsed.map(() => "?").join(", ")})`,
   )
     .bind(member.workspace.id, ...parsed.map((page) => page.id))
     .all<PageRow>();
-  const pages = created.results.map(pageJson);
+  // Returned in request order, not position order. Positions are generated per parent,
+  // so a batch spanning two parents has no meaningful global ordering, and a caller
+  // pairing its input to this response by index would silently mismatch.
+  const rows = new Map(created.results.map((row) => [row.id, row]));
+  const pages = parsed.flatMap((page) => {
+    const row = rows.get(page.id);
+    return row ? [pageJson(row)] : [];
+  });
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages });
   return c.json({ pages }, 201);
 });

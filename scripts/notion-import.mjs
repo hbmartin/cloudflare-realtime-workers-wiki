@@ -22,6 +22,10 @@ import { assertSupportedNode, createImportEditor, htmlToBlocks } from "./notion-
 import { readExport, readPageHtml, resolveLink } from "./notion-import/export-tree.mjs";
 import { printSurvey, surveyExport } from "./notion-import/inspect.mjs";
 import { normalizeNotionHtml } from "./notion-import/normalize-html.mjs";
+import { createClient } from "./notion-import/api-client.mjs";
+import { createManifest } from "./notion-import/manifest.mjs";
+import { createReport } from "./notion-import/report.mjs";
+import { runImport } from "./notion-import/run.mjs";
 
 const COMMANDS = new Set(["inspect", "plan", "run", "verify"]);
 
@@ -33,6 +37,9 @@ function parseArguments(argv) {
     email: process.env.NOTES_IMPORT_EMAIL || "",
     parent: null,
     limit: Number.POSITIVE_INFINITY,
+    manifest: "./notion-import.manifest.json",
+    requestsPerSecond: Number.parseInt(process.env.NOTES_IMPORT_RPS || "20", 10),
+    lingerMs: 1_200,
     verbose: false,
   };
   const positional = [];
@@ -48,6 +55,9 @@ function parseArguments(argv) {
     else if (flag === "--email") options.email = take();
     else if (flag === "--parent") options.parent = take();
     else if (flag === "--limit") options.limit = Number.parseInt(take(), 10);
+    else if (flag === "--manifest") options.manifest = take();
+    else if (flag === "--rps") options.requestsPerSecond = Number.parseInt(take(), 10);
+    else if (flag === "--linger-ms") options.lingerMs = Number.parseInt(take(), 10);
     else if (flag === "--verbose") options.verbose = true;
     else if (flag.startsWith("--")) throw new Error(`Unknown option ${flag}.`);
     else positional.push(argument);
@@ -65,6 +75,9 @@ function usage() {
   console.error("                     The password comes from NOTES_IMPORT_PASSWORD only.");
   console.error("  --parent <pageId>  Import beneath an existing page instead of the top level.");
   console.error("  --limit <n>        Only process the first n pages, for a smoke test.");
+  console.error("  --manifest <path>  Where to record progress. Re-running resumes from it.");
+  console.error("  --rps <n>          Global request rate. The server has no rate limiting of its own.");
+  console.error("  --linger-ms <n>    How long to hold each document open so compaction is armed promptly.");
   console.error("  --verbose          One line per page instead of a summary.");
 }
 
@@ -87,6 +100,19 @@ function validate(options) {
   if (!existsSync(root)) throw new Error(`No such directory: ${root}.`);
   if (!Number.isFinite(options.limit) && options.limit !== Number.POSITIVE_INFINITY) {
     throw new Error("--limit must be a positive integer.");
+  }
+  if (
+    !Number.isInteger(options.requestsPerSecond) ||
+    options.requestsPerSecond < 1 ||
+    options.requestsPerSecond > 200
+  ) {
+    throw new Error("--rps must be an integer between 1 and 200.");
+  }
+  if (options.command === "run" && !options.email) {
+    throw new Error("Set --email or NOTES_IMPORT_EMAIL to an owner or editor account.");
+  }
+  if (options.command === "run" && !process.env.NOTES_IMPORT_PASSWORD) {
+    throw new Error("Set NOTES_IMPORT_PASSWORD. The password is never taken from the command line.");
   }
   return root;
 }
@@ -160,6 +186,38 @@ if (options.command === "inspect") {
       (planned.failed ? `; ${planned.failed} failed.` : "."),
   );
   reportIssues(planned.issues);
+} else if (options.command === "run") {
+  const client = await createClient({
+    baseURL: options.baseURL,
+    email: options.email,
+    password: process.env.NOTES_IMPORT_PASSWORD,
+    requestsPerSecond: options.requestsPerSecond,
+  });
+  console.log(`Signed in to ${options.baseURL} as ${options.email} (${client.role}).`);
+  const manifest = createManifest({
+    path: options.manifest,
+    root,
+    baseURL: options.baseURL,
+    workspaceId: client.workspaceId,
+    rootParentId: options.parent,
+  });
+  const report = createReport({ verbose: options.verbose });
+  try {
+    const summary = await runImport({
+      index,
+      client,
+      manifest,
+      report,
+      rootParentId: options.parent,
+      limit: options.limit,
+      lingerMs: options.lingerMs,
+    });
+    report.print(summary);
+  } finally {
+    // The manifest is what makes a resume possible, so it is written even when the run
+    // fails part way through.
+    manifest.flush();
+  }
 } else {
   console.error(`The ${options.command} command is not implemented yet.`);
   process.exit(1);

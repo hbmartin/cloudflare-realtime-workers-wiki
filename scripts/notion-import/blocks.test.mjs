@@ -11,6 +11,7 @@ import { projectDocument } from "../../src/shared/document-projection.ts";
 import { mentionInlineConfig } from "../../src/shared/mention-spec.ts";
 import {
   assertSupportedNode,
+  assignStableIds,
   createImportEditor,
   DOCUMENT_FRAGMENT,
   escapeHtml,
@@ -53,17 +54,31 @@ describe("headless BlockNote conversion", () => {
     expect(projection.pageReferences).toEqual([{ targetId, excerpt: expect.stringContaining("Roadmap") }]);
   });
 
-  it("treats an identical second write as a no-op so a resumed import is free", async () => {
+  it("treats a re-converted identical page as a no-op so a resumed import is free", async () => {
+    // Converting again, not reusing the blocks: BlockNote mints a random id per block,
+    // and those ids live in the Yjs document, so without stable ids a re-import would be
+    // a real edit on every run even though the text never changed.
     const editor = await createImportEditor();
-    const blocks = await htmlToBlocks(editor, "<h1>Doc</h1><p>Hello <strong>world</strong></p><ul><li>one</li></ul>");
+    const html = "<h1>Doc</h1><p>Hello <strong>world</strong></p><ul><li>one</li></ul>";
+    const convert = async () => assignStableIds(await htmlToBlocks(editor, html), "source/page.html");
     const doc = new Y.Doc();
 
-    const first = await writeBlocksToFragment(editor, blocks, doc);
+    const first = await writeBlocksToFragment(editor, await convert(), doc);
     expect(first.updates).toBeGreaterThan(0);
 
-    const second = await writeBlocksToFragment(editor, blocks, doc);
+    const second = await writeBlocksToFragment(editor, await convert(), doc);
     expect(second.updates).toBe(0);
     expect(second.byteLength).toBe(first.byteLength);
+  });
+
+  it("derives block ids from the page, so two pages never collide", async () => {
+    const editor = await createImportEditor();
+    const html = "<p>Same text on both pages</p>";
+    const left = assignStableIds(await htmlToBlocks(editor, html), "a.html");
+    const right = assignStableIds(await htmlToBlocks(editor, html), "b.html");
+
+    expect(left[0].id).not.toBe(right[0].id);
+    expect(assignStableIds(await htmlToBlocks(editor, html), "a.html")[0].id).toBe(left[0].id);
   });
 
   it("keeps a mention projectable when the label is blank", async () => {

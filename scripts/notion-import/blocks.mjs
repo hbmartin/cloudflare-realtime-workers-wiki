@@ -14,6 +14,7 @@
  * `@blocknote/core` in the dependency graph and hand `YProvider` a `Y.Doc` from a
  * different module instance.
  */
+import { createHash } from "node:crypto";
 import { mentionInlineConfig } from "../../src/shared/mention-spec.ts";
 
 // Node strips TypeScript types natively from 22.18 onward, which is what lets this
@@ -103,6 +104,28 @@ export async function createImportEditor() {
 
 export async function htmlToBlocks(editor, html) {
   return editor.tryParseHTMLToBlocks(html);
+}
+
+/**
+ * Replaces BlockNote's random block ids with ids derived from the page and the block's
+ * position in the tree.
+ *
+ * Block ids are stored in the Yjs document, so a fresh random id per conversion makes
+ * re-importing an unchanged page a real edit rather than a no-op: the text matches but
+ * every attribute differs. Deriving them from stable inputs is what actually makes a
+ * resumed import free, and it keeps a re-import from inflating the update log and
+ * burning a version on every run.
+ */
+export function assignStableIds(blocks, seed) {
+  const assign = (list, prefix) => {
+    list.forEach((block, index) => {
+      const path = `${prefix}.${index}`;
+      block.id = createHash("sha256").update(`${seed}${path}`).digest("hex").slice(0, 32);
+      if (Array.isArray(block.children) && block.children.length > 0) assign(block.children, path);
+    });
+  };
+  assign(blocks, "");
+  return blocks;
 }
 
 /**
