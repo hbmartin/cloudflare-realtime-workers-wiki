@@ -34,9 +34,23 @@ async function signIn(page: Page) {
 }
 
 async function openSidebar(page: Page) {
-  const members = page.getByRole("button", { name: /Members/ });
-  if (!(await members.isVisible())) await page.getByRole("button", { name: "☰" }).click();
-  await expect(members).toBeVisible();
+  // Below the 760px breakpoint the sidebar is an off-canvas drawer. Decide from
+  // the toggle and the scrim rather than the drawer's own visibility: "☰" only
+  // renders below the breakpoint and the scrim only exists while the drawer is
+  // open, so both track React state exactly, while the drawer stays visible for
+  // the length of its slide-out transition. Clicking "☰" while it is already
+  // open would also be swallowed by the scrim, which outranks the topbar.
+  const toggle = page.getByRole("button", { name: "☰" });
+  const scrim = page.getByRole("button", { name: "Close sidebar" });
+  if ((await toggle.isVisible()) && !(await scrim.isVisible())) await toggle.click();
+  await expect(page.getByRole("button", { name: /Members/ })).toBeVisible();
+}
+
+// A row's "Add child to <title>" and "Archive <title>" labels also carry the
+// title, and below the 760px breakpoint they are laid out rather than hidden,
+// so matching on the title alone is ambiguous there. Match the link itself.
+function treeLink(page: Page, title: string) {
+  return page.locator("button.page-link").filter({ hasText: title });
 }
 
 async function createInvite(page: Page, role: "editor" | "viewer") {
@@ -81,7 +95,9 @@ test("creates, renames, archives, and restores a page through the UI", async ({ 
   await expect(titleInput).toHaveValue("Untitled");
   await titleInput.fill(title);
   await titleInput.press("Enter");
-  const pageLink = page.getByRole("button", { name: new RegExp(title) });
+  // Creating a page closes the mobile drawer, and the tree lives inside it.
+  await openSidebar(page);
+  const pageLink = treeLink(page, title);
   await expect(pageLink).toBeVisible();
 
   await pageLink.locator("..").hover();
@@ -114,7 +130,7 @@ test("propagates page metadata to an invited editor in realtime", async ({ brows
     await page.getByLabel("Page title").fill(title);
     await page.getByLabel("Page title").press("Enter");
     await openSidebar(editorPage);
-    await expect(editorPage.getByRole("button", { name: new RegExp(title) })).toBeVisible({ timeout: 15_000 });
+    await expect(treeLink(editorPage, title)).toBeVisible({ timeout: 15_000 });
   } finally {
     await editorContext.close();
   }
@@ -134,6 +150,11 @@ test("enforces viewer UI permissions and table edit leases", async ({ browser, p
     await viewerContext.close();
   }
 
+  // "+ Table" is hidden below the 760px breakpoint, so the lease half of this
+  // scenario has no mobile entry point. The viewer assertions above still run
+  // everywhere; skipping here keeps viewerContext.close() above it.
+  test.skip(testInfo.project.name === "mobile-chromium", "+ Table is hidden at mobile widths");
+
   const editorURL = await createInvite(page, "editor");
   const editorContext = await browser.newContext();
   try {
@@ -145,7 +166,7 @@ test("enforces viewer UI permissions and table edit leases", async ({ browser, p
     await page.locator("input.page-title").fill(tableTitle);
     await page.locator("input.page-title").press("Enter");
     await openSidebar(editorPage);
-    await editorPage.getByRole("button", { name: new RegExp(tableTitle) }).click();
+    await treeLink(editorPage, tableTitle).click();
     await expect(editorPage.getByText("Another editor has this table open for editing.")).toBeVisible();
   } finally {
     await editorContext.close();
