@@ -429,9 +429,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     );
     setSearchResults(data.results);
   }
+  // Under the mobile breakpoint the open drawer sits over a full-viewport scrim,
+  // so navigating without closing it strands the reader behind the thing they
+  // just opened. Selecting a page already closes it; these do the same.
   async function showTrash() {
+    setSidebarOpen(false);
     await loadTrash();
     setView("trash");
+  }
+  function showView(next: "search" | "mentions" | "settings") {
+    setView(next);
+    setSidebarOpen(false);
   }
   const updatePage = useCallback(
     (page: Page) => {
@@ -474,13 +482,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           </button>
         </header>
         <nav className="sidebar-nav">
-          <button className={view === "search" ? "active" : ""} onClick={() => setView("search")}>
+          <button className={view === "search" ? "active" : ""} onClick={() => showView("search")}>
             <span>⌕</span> Search
           </button>
-          <button className={view === "mentions" ? "active" : ""} onClick={() => setView("mentions")}>
+          <button className={view === "mentions" ? "active" : ""} onClick={() => showView("mentions")}>
             <span>@</span> Mentions {unreadMentions > 0 && <b className="mention-badge">{unreadMentions}</b>}
           </button>
-          <button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}>
+          <button className={view === "settings" ? "active" : ""} onClick={() => showView("settings")}>
             <span>⚙</span> Members
           </button>
         </nav>
