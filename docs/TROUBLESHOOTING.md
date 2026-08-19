@@ -80,8 +80,8 @@ errors are normal concurrency outcomes.
 | `table_revision_conflict`          | 409    | The table changed underneath this edit                    | Client reloads and retries once        |
 | `mutation_target_not_found`        | 404    | The row, column, or option being changed no longer exists | Normal after a concurrent delete       |
 | `table_row_limit`                  | 422    | 500-row v1 limit, enforced on read **and** write          | See below                              |
-| `invalid_cell` / `select_required` | 422    | Value failed type validation                              |
-| `table_revision_failed`            | 500    | **An invariant was violated.** See below                  |
+| `invalid_cell` / `select_required` | 422    | Value failed type validation                              | Correct the cell value                 |
+| `table_revision_failed`            | 500    | **An invariant was violated.** See below                  | Escalate; do not retry                 |
 
 A table pushed past 500 rows by a direct D1 write becomes **unreadable**, not merely unwritable, because
 the read path enforces the same limit. Never insert table rows outside the application.
