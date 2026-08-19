@@ -20,6 +20,24 @@ export function text(value: unknown, name: string, max = 200): string {
 // parser, which has to bound an id but reject it with its own status.
 export const ID_PATTERN = /^[\w-]{1,100}$/;
 
+// PartyServer hashes the raw pathname segment into the Durable Object name, so
+// the authorized room and the addressed room are only the same object when the
+// segment is already canonical. `pageId~01`, `~1e0` and `~+1` all coerce to
+// epoch 1 through `Number` but address distinct rooms that compact to one R2
+// key, so the epoch is matched as canonical decimal text rather than parsed.
+// No character `ID_PATTERN` admits needs percent-encoding, which is why callers
+// match the segment before decoding and never decode at all.
+const DOCUMENT_ROOM_PATTERN = /^([\w-]{1,100})~([1-9]\d{0,9})$/;
+
+// The pieces of a document room name, or null when `room` is not the exact text
+// this installation would have produced for them. Bounds the name at 111 bytes,
+// well inside the 1,024 past which Cloudflare stops exposing `ctx.id.name`.
+export function documentRoom(room: string): { pageId: string; epoch: number } | null {
+  const match = DOCUMENT_ROOM_PATTERN.exec(room);
+  if (!match) return null;
+  return { pageId: match[1]!, epoch: Number(match[2]) };
+}
+
 export function nullableId(value: unknown, name: string): string | null {
   if (value === null || value === undefined || value === "") return null;
   if (typeof value !== "string" || !ID_PATTERN.test(value)) throw new ValidationError(`${name} is invalid`);

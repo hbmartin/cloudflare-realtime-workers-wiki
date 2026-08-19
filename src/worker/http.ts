@@ -49,10 +49,15 @@ export function now() {
   return Date.now();
 }
 
-export function assertSameOrigin(request: Request, _baseUrl: string) {
+// Pinned to the configured origin rather than the one the request arrived on,
+// so a route left attached to the Worker on another hostname cannot authorize
+// itself. A request with no Origin header is not a browser form post and is
+// left to the session check; browsers always send one on the cross-origin
+// requests this exists to reject.
+export function assertSameOrigin(request: Request, baseUrl: string) {
   const origin = request.headers.get("Origin");
-  const expected = new URL(request.url).origin;
-  if (origin && origin !== expected) {
+  if (!origin) return;
+  if (origin !== new URL(baseUrl).origin) {
     throw new HttpError(403, "invalid_origin", "This request is not from the application origin.");
   }
 }
