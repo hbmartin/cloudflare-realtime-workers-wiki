@@ -1,0 +1,192 @@
+# Troubleshooting
+
+Organised by what you actually observe. For the tables and commands referenced here, see
+[Operations](OPERATIONS.md); for limits and constants, see [Configuration](CONFIGURATION.md).
+
+## Deployment failures
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `Couldn't find DB` or a D1 error on first deploy | `database_id` is still the all-zero placeholder in `wrangler.jsonc` | Replace it with the ID from `wrangler d1 create` |
+| Sign-in fails; cookies not set; `invalid_origin` on connect | `BETTER_AUTH_URL` still points at `http://localhost:5173`, or does not exactly match the served origin | Set it to the exact HTTPS origin, no trailing slash, then redeploy |
+| Runtime `no such table` errors after a deploy | Worker deployed before `pnpm db:remote` | Apply migrations, then redeploy |
+| `BETTER_AUTH_SECRET is not defined` or 500s on every request | Secret never set, or set on a different Worker name | `pnpm wrangler secret list`, then `secret put` |
+| CI fails at `cf-typegen:check` | `worker-configuration.d.ts` is out of date with `wrangler.jsonc` | Run `pnpm cf-typegen` and commit the result |
+| Locally, `no such table` or a missing owner guard, with `pnpm db:local` reporting nothing to apply | The local D1 predates the squashed `0001_initial.sql` baseline, and `d1_migrations` already lists that name | Delete `.wrangler/state` and rerun `pnpm db:local`; there is no forward migration for this |
+| Deploy succeeds but the old version appears live | Asset or browser caching, or you are looking at a preview URL | `pnpm wrangler deployments list` to confirm what is current |
+
+`/api/health` returning `{"ok":true,"version":"0.1.0"}` does **not** confirm which revision is live;
+`version` is a hardcoded string.
+
+## WebSocket close codes
+
+All application close codes are in the 4xxx range. This is the first thing a user reports, usually as
+"the page keeps disconnecting".
+
+| Code | Meaning | Expected? |
+| --- | --- | --- |
+| `4401` | Authorization missing or expired. Every grant lasts at most five minutes | Yes — routine. The client reconnects and reauthorizes |
+| `4410` | This document epoch was retired, or a restored version replaced it | Yes, after a version restore. The client follows the new epoch |
+| `4411` | The page was permanently deleted | Yes. Terminal; the client stops retrying |
+| `4412` | The page was archived | Yes. The client reconciles and removes it from the tree |
+| `4429` | The room already has 30 collaborators | Yes at capacity — **but see below** |
+
+`4429` is not handled by the client's close reconciler, which only acts on `4410`, `4412`, and `1006`.
+A client rejected from a full room therefore reconnects on the normal backoff schedule and is rejected
+again. Operators see this as a sustained reconnect loop and elevated request volume against one room,
+not as an error. The fix is fewer concurrent editors on that page; there is no server-side mitigation.
+
+## HTTP error codes
+
+Responses are `{"error":{"code","message","details"}}`. Unrecognised exceptions are logged and returned
+as a bare `500 internal_error` with no detail, so an unfamiliar 500 means checking Workers Logs.
+
+### Authentication and installation
+
+| Code | Status | Meaning |
+| --- | --- | --- |
+| `invalid_origin` | 403 | Request origin did not match `BETTER_AUTH_URL`. Almost always a misconfigured `BETTER_AUTH_URL` |
+| `registration_closed` | 403 | Public sign-up is deliberately blocked. Expected; it is a smoke-test assertion |
+| `invalid_bootstrap_token` | 403 | Wrong or rotated `BOOTSTRAP_TOKEN` |
+| `already_initialized` | 409 | The owner already exists. Bootstrap is one-time |
+| `invite_invalid` | 404 | Invite is invalid, expired, or already used |
+| `invite_used` | 409 | Another request consumed the invite first |
+| `final_owner` | 409 | Blocked by the last-owner triggers. Promote another owner first |
+| `owner_required` / `read_only` | 403 | Role gate. `read_only` means an editor action attempted by a viewer |
+
+### Pages and content
+
+| Code | Status | Meaning |
+| --- | --- | --- |
+| `stale_epoch` | 409 | The client asked for a document epoch that is no longer current, typically mid-restore. The client refetches and follows the new epoch |
+| `page_cycle` | 409 | A move would make a page its own ancestor |
+| `archive_first` | 409 | Permanent deletion attempted on a page that is not archived |
+| `upload_too_large` | 413 | Over the 10 MiB attachment limit |
+| `unsafe_file_type` | 415 | Active content — HTML, SVG, XML, script — is rejected by design |
+| `attachment_missing` | 404 | D1 metadata exists but the R2 object does not. See [Backup and recovery](BACKUP_AND_RECOVERY.md#attachment-object-missing) |
+| `version_missing` | 404 | Version row exists but its R2 object does not |
+| `restore_failed` | 503 | Version restore could not complete. Usually an R2 or D1 outage; the room retries |
+
+### Tables
+
+Structured tables have no CRDT, so they use an explicit lease plus optimistic revisions. Most table
+errors are normal concurrency outcomes.
+
+| Code | Status | Meaning | Action |
+| --- | --- | --- | --- |
+| `lease_conflict` | 409 | Another session holds the editing lease | Wait up to 60 s, or owner force-unlock |
+| `lease_lost` / `table_lease_lost` | 409 | The lease expired or was taken over | Client reacquires automatically |
+| `table_revision_conflict` | 409 | The table changed underneath this edit | Client reloads and retries once |
+| `mutation_target_not_found` | 404 | The row, column, or option being changed no longer exists | Normal after a concurrent delete |
+| `table_row_limit` | 422 | 500-row v1 limit, enforced on read **and** write | See below |
+| `invalid_cell` / `select_required` | 422 | Value failed type validation |
+| `table_revision_failed` | 500 | **An invariant was violated.** See below |
+
+A table pushed past 500 rows by a direct D1 write becomes **unreadable**, not merely unwritable, because
+the read path enforces the same limit. Never insert table rows outside the application.
+
+## The table mutation guard
+
+Every guarded table mutation runs as one D1 batch of three statements: the data change, a revision
+bump, then a read-back of the lease and revision.
+
+```sql
+UPDATE table_state SET revision = revision + 1
+ WHERE page_id = ? AND revision = ? AND changes() > 0 AND <lease guards>
+```
+
+`changes()` reports the row count of the statement immediately before it in the batch, so the revision
+bump applies exactly when the data change matched a row. There is no trigger and no `mutation_guard`
+column; the guard is the `changes() > 0` predicate, enforced inside the batch's implicit transaction.
+
+The data change carries the same lease and revision guards as the bump, evaluated against the same
+timestamp. That closes the invariant in both directions: the bump cannot apply without the change
+(`changes() > 0`), and the change cannot apply without the bump (whatever the change matched on, the
+bump matches on too).
+
+**The invariant: a revision advances if and only if its paired data mutation applied.** Neither half can
+commit alone. This is what stops a failed write from silently advancing the revision, which would make
+every other client believe it had already applied the change.
+
+The handler classifies the outcome from the batch's row counts and the read-back, in this order:
+
+| Mutation applied | Revision bumped | Read-back | Result |
+| --- | --- | --- | --- |
+| Yes | Yes | not consulted | Success, `revision + 1` |
+| No | No | Lease no longer valid | `409 table_lease_lost` |
+| No | No | Revision moved underneath | `409 table_revision_conflict` |
+| No | No | Lease and revision both intact | `404 mutation_target_not_found` |
+| Yes | No | — | `500 table_revision_failed` |
+
+The last row is defensive: the shared guards make it unreachable, and it is kept distinguishable rather
+than misreported as a conflict.
+
+`table_revision_failed` means the invariant did not hold. It is not a transient error and retrying will
+not help. Alert on it, capture the D1 error from Workers Logs, and escalate.
+
+Classification depends only on `meta.changes` from the batch results and the read-back row, not on any
+D1 error message, so a change to D1's error formatting cannot degrade a `404` into a generic `500`.
+
+## Log triage
+
+Logging is unstructured. There is no request-id correlation, so triage is by message string in the
+Workers Logs search box.
+
+| Message | Meaning |
+| --- | --- |
+| `Scheduled deletion cleanup failed` | The hourly deletion pass threw. Check `deletion_jobs` |
+| `Scheduled archive disconnect failed` | The hourly archive pass threw. Check `archive_disconnect_targets` |
+| `Immediate deletion cleanup failed` | The inline attempt during a delete request failed. The cron will retry |
+| `Failed to discard staged deletion job` | A permanent delete failed *and* its rollback failed. Inspect `deletion_jobs` for an orphan |
+| `Failed to reschedule archive disconnect` | Backoff could not be persisted. The row may retry sooner than intended |
+| `Document restore failed` | A version restore threw. The room stays read-only until reconciled |
+| `Document restore validation failed` | Restore rejected the selected snapshot |
+| `Failed to confirm restore commit state` | Restore could not determine whether it committed. Left pending for the alarm |
+| `Failed to reconcile pending document restore` | A pending restore retried and failed again. See the hot-loop note below |
+| `Failed to prune document versions` | Version retention did not run. Storage grows; not urgent |
+| `Failed to broadcast workspace event` | A page-tree or projection event was dropped. Clients recover on reconnect |
+| `Failed to broadcast projection update` | Same, from the document side |
+| `Failed to schedule compaction retry` | The compaction alarm could not be re-armed. The room may stay dirty |
+| `Failed to resume document alarm after transition` | Alarm re-arm failed after archive, restore, or purge |
+| `Failed to persist retired document state` | An epoch could not be marked retired |
+
+## Known unresolved issues
+
+Recorded because they change how you interpret symptoms. Both are code-level and out of scope for a
+documentation change.
+
+**Pending restore retries at a flat interval.** `deferRestoreReconciliation` in `src/worker/document.ts`
+reschedules using `ALARM_RETRY_DELAY_MS`, a fixed 5 seconds with no growth. If D1 or R2 stays
+unavailable while a restore is pending, the room retries every 5 seconds indefinitely while remaining
+read-only. Symptom: one page stuck read-only, and `Failed to reconcile pending document restore`
+repeating at 5-second intervals in the logs. It self-heals once the dependency recovers.
+
+**WebSocket upgrade failures are not logged.** The error handler around `handlePartyRequest` in
+`src/worker/index.ts` returns a JSON error response but does not call `console.error`. Unexpected 500s
+on `/parties/*` upgrades are therefore invisible in Workers Logs. If users report failing connections
+and the logs are silent, reproduce the upgrade with `curl` and read the response body directly:
+
+```sh
+curl -i -H "Origin: https://notes.example.com" -H "Cookie: <session>" \
+  "https://notes.example.com/parties/document/<pageId>~<epoch>"
+```
+
+**Unreachable `ASSETS` branch.** `app.notFound` in `src/worker/index.ts` calls `c.env.ASSETS.fetch(...)`,
+but the `assets` block in `wrangler.jsonc` declares no `binding`, and `ASSETS` is absent from the
+generated `worker-configuration.d.ts`. The branch is unreachable in practice because `run_worker_first`
+covers only `/api/*` and `/parties/*`; every other path is served by the asset layer without invoking
+the Worker. It would throw if reached. Do not "fix" this by adding the binding without also confirming
+the routing assumption still holds.
+
+## Escalation
+
+Before escalating a data-affecting issue, capture:
+
+1. `pnpm wrangler deployments list` — which revision is live.
+2. The relevant queue query output from [Operations](OPERATIONS.md#inspecting-the-work-queues).
+3. Workers Logs for the matching message string, with timestamps.
+4. Whether the hourly cron has run since the incident began.
+
+Do not delete Durable Objects, remove queue rows, or recreate a room to clear a symptom. The Durable
+Object may hold the only copy of a document's recent tail; see
+[Backup and recovery](BACKUP_AND_RECOVERY.md#r2-current-snapshot-missing).

@@ -84,7 +84,9 @@ There is intentionally no ORM, Redis, Postgres, custom WebSocket protocol, Hocus
 
 ## Production
 
-See [Deployment](docs/DEPLOYMENT.md), [Backup and recovery](docs/BACKUP_AND_RECOVERY.md), [Security policy](SECURITY.md), and [third-party notices](THIRD_PARTY_NOTICES.md).
+Start at the [operator documentation index](docs/README.md), which covers deployment, configuration,
+day-to-day operations, troubleshooting, observability, and backup and recovery. See also the
+[security policy](SECURITY.md) and [third-party notices](THIRD_PARTY_NOTICES.md).
 
 ## Accepted v1 limits
 

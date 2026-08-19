@@ -1,0 +1,75 @@
+name: Deploy
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_BASE_URL }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 11.18.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Production build
+        run: pnpm build
+
+      - name: Worker dry run
+        run: pnpm build:worker
+
+      # Migrations must complete before the Worker is deployed. The Worker
+      # queries the projection, mention, deletion-job, archive-disconnect, and
+      # table-mutation-guard tables on ordinary request paths.
+      - name: Apply D1 migrations
+        run: pnpm wrangler d1 migrations apply DB --remote
+
+      - name: Deploy Worker
+        run: pnpm wrangler deploy
+
+      - name: Health check
+        if: vars.PRODUCTION_BASE_URL != ''
+        env:
+          BASE_URL: ${{ vars.PRODUCTION_BASE_URL }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            body=$(curl -fsS --max-time 15 "${BASE_URL}/api/health" || true)
+            if [ -n "${body}" ]; then
+              echo "${body}"
+              case "${body}" in
+                *'"ok":true'*) echo "Health check passed."; exit 0 ;;
+              esac
+            fi
+            echo "Attempt ${attempt} failed; retrying."
+            sleep 10
+          done
+          echo "Health check did not pass after 5 attempts." >&2
+          exit 1
+
+      - name: Deployed version
+        run: pnpm wrangler deployments list
