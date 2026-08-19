@@ -33,6 +33,7 @@ interface MetaRow extends Record<string, SqlStorageValue> {
   retired: number;
   restore_pending: number;
   restore_attempts: number;
+  restore_retry_at: number;
   read_only: number;
   last_version_at: number;
   last_editor_id: string | null;
@@ -93,6 +94,7 @@ export class Document extends YServer {
       retired INTEGER NOT NULL DEFAULT 0,
       restore_pending INTEGER NOT NULL DEFAULT 0,
       restore_attempts INTEGER NOT NULL DEFAULT 0,
+      restore_retry_at INTEGER NOT NULL DEFAULT 0,
       read_only INTEGER NOT NULL DEFAULT 0,
       last_version_at INTEGER NOT NULL DEFAULT 0,
       last_editor_id TEXT
@@ -106,6 +108,9 @@ export class Document extends YServer {
     }
     if (!metaColumns.some((column) => column.name === "restore_attempts")) {
       sql.exec(`ALTER TABLE document_meta ADD COLUMN restore_attempts INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!metaColumns.some((column) => column.name === "restore_retry_at")) {
+      sql.exec(`ALTER TABLE document_meta ADD COLUMN restore_retry_at INTEGER NOT NULL DEFAULT 0`);
     }
     const hadMetadata = Boolean(
       sql.exec<{ present: number }>(`SELECT EXISTS(SELECT 1 FROM document_meta WHERE id = 1) present`).one().present,
@@ -292,7 +297,15 @@ export class Document extends YServer {
       }
       return;
     }
-    if (this.metadata.restore_pending) await this.reconcilePendingRestore();
+    if (this.metadata.restore_pending) {
+      // partyserver initializes before it delivers an alarm, so onStart has
+      // already reconciled this wake. Inside the persisted quiet period the
+      // alarm has nothing left to do but hold the schedule that attempt set:
+      // the delivery consumed the stored alarm, so skipping without re-arming
+      // would strand the room read-only.
+      if (Date.now() >= this.metadata.restore_retry_at) await this.reconcilePendingRestore();
+      else await this.armRestoreRetry(this.metadata.restore_retry_at);
+    }
     if (this.purged || this.metadata.retired || this.metadata.restore_pending) return;
     this.flushPendingUpdates();
     const time = Date.now();
@@ -696,9 +709,12 @@ export class Document extends YServer {
         recovery.new_key,
         recovery.pre_key,
       );
-      this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1, restore_attempts = 0 WHERE id = 1`);
+      this.state.storage.sql.exec(
+        `UPDATE document_meta SET restore_pending = 1, restore_attempts = 0, restore_retry_at = 0 WHERE id = 1`,
+      );
       this.metadata.restore_pending = 1;
       this.metadata.restore_attempts = 0;
+      this.metadata.restore_retry_at = 0;
     });
   }
 
@@ -707,13 +723,14 @@ export class Document extends YServer {
     const retiredFlag = retired ? 1 : 0;
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(
-        `UPDATE document_meta SET retired = ?, restore_pending = 0, restore_attempts = 0 WHERE id = 1`,
+        `UPDATE document_meta SET retired = ?, restore_pending = 0, restore_attempts = 0, restore_retry_at = 0 WHERE id = 1`,
         retiredFlag,
       );
       this.state.storage.sql.exec(`DELETE FROM restore_recovery WHERE id = 1`);
       this.metadata.retired = retiredFlag;
       this.metadata.restore_pending = 0;
       this.metadata.restore_attempts = 0;
+      this.metadata.restore_retry_at = 0;
     });
   }
 
@@ -731,24 +748,35 @@ export class Document extends YServer {
     // A purge can land during the dependency call that just failed; its
     // storage is gone, so there is nothing left to record or arm.
     if (this.purged) return;
-    // The attempt count lives in SQLite because this object hibernates: an
-    // in-memory count would reset to the fast first retry on every eviction,
-    // which is exactly when a long outage would keep evicting it.
+    // The attempt count and the time the next one is due live in SQLite because
+    // this object hibernates: in-memory state would reset to the fast first
+    // retry on every eviction, which is exactly when a long outage keeps
+    // evicting it. The due time is also what stops one alarm delivery from
+    // reconciling twice; see onAlarm.
     const attempt = this.metadata.restore_attempts;
     const retryAt = Date.now() + jitteredBackoff(attempt, ALARM_RETRY_DELAY_MS, RESTORE_RECONCILIATION_MAX_DELAY_MS);
     try {
-      this.state.storage.sql.exec(`UPDATE document_meta SET restore_attempts = ? WHERE id = 1`, attempt + 1);
+      this.state.storage.sql.exec(
+        `UPDATE document_meta SET restore_attempts = ?, restore_retry_at = ? WHERE id = 1`,
+        attempt + 1,
+        retryAt,
+      );
       this.metadata.restore_attempts = attempt + 1;
+      this.metadata.restore_retry_at = retryAt;
     } catch (storageError) {
       console.error("Failed to record restore reconciliation attempt", storageError);
     }
     // Remember the backoff so finishTransition does not pull the alarm forward
     // and retry immediately against the dependency that just failed.
     if (this.transition) this.transitionRetryAt = Math.max(this.transitionRetryAt ?? 0, retryAt);
+    await this.armRestoreRetry(retryAt);
+  }
+
+  // While a restore is pending the alarm only ever reconciles, so the retry
+  // replaces whatever alarm is stored: an earlier one would fire before the
+  // backoff, a later one (connection expiry, compaction) would delay it.
+  private async armRestoreRetry(retryAt: number) {
     try {
-      // While a restore is pending the alarm only ever reconciles, so the retry
-      // replaces whatever alarm is stored: an earlier one would fire before the
-      // backoff, a later one (connection expiry, compaction) would delay it.
       await this.state.storage.setAlarm(retryAt);
     } catch (alarmError) {
       console.error("Failed to schedule restore reconciliation", alarmError);

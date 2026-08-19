@@ -1,6 +1,22 @@
 # Deployment
 
-Cloudflare Realtime Notes targets Workers Paid. The application uses Workers Static Assets, D1, R2, and SQLite-backed Durable Objects.
+Cloudflare Realtime Notes targets Workers Paid. The application uses Workers Static Assets, D1, R2, and
+SQLite-backed Durable Objects.
+
+Read [Configuration](CONFIGURATION.md) alongside this document; it is the reference for every value
+named here.
+
+## 0. Prerequisites
+
+- Node.js 22 or later and pnpm 11.18.0.
+- A **Workers Paid** plan. SQLite-backed Durable Objects and cron triggers are not available on the
+  free plan, and both are required.
+- R2 enabled on the account.
+- Authenticated Wrangler: either `pnpm wrangler login`, or `CLOUDFLARE_API_TOKEN` and
+  `CLOUDFLARE_ACCOUNT_ID` in the environment.
+
+An API token used for deployment needs Workers Scripts Edit, D1 Edit, R2 Edit, Workers Observability,
+and account-level Durable Objects permissions.
 
 ## 1. Create resources
 
@@ -13,22 +29,74 @@ pnpm wrangler r2 bucket create cloudflare-realtime-notes
 pnpm wrangler r2 bucket create cloudflare-realtime-notes-preview
 ```
 
-Replace the placeholder `database_id` in `wrangler.jsonc` with the returned D1 ID. Bucket names may be changed as long as the binding remains `BUCKET`.
+Bucket names may be changed as long as the binding remains `BUCKET`.
 
-## 2. Configure production values
+## 2. Replace the committed placeholders
 
-Set `BETTER_AUTH_URL` in `wrangler.jsonc` to the final HTTPS origin. Add secrets:
+`wrangler.jsonc` ships two values that are correct for local development and wrong for every
+deployment. Both cause a failed or broken install if left alone.
+
+**`database_id`** is the all-zero placeholder. Replace it with the ID returned by `d1 create`:
+
+```jsonc
+"database_id": "00000000-0000-0000-0000-000000000000",  // replace this
+```
+
+**`BETTER_AUTH_URL`** defaults to `http://localhost:5173`. Set it to the exact HTTPS origin the
+installation will be served from:
+
+```jsonc
+"vars": {
+  "BETTER_AUTH_URL": "https://notes.example.com",
+},
+```
+
+This is a plain variable, not a secret. It sets the Better Auth cookie origin *and* is the base for the
+same-origin check applied to bootstrap, invite acceptance, and every WebSocket upgrade. Leaving it
+unchanged breaks sign-in and causes `invalid_origin` on connection attempts.
+
+There is no `account_id` and no `routes` block in the configuration. The Worker deploys to the account
+Wrangler is authenticated against and is served on `*.workers.dev` unless you attach a custom domain in
+the Cloudflare dashboard under **Workers & Pages → your Worker → Settings → Domains & Routes**. If you
+attach one, `BETTER_AUTH_URL` must match it exactly, including scheme and absence of a trailing slash.
+
+## 3. Set secrets
 
 ```sh
 pnpm wrangler secret put BETTER_AUTH_SECRET
 pnpm wrangler secret put BOOTSTRAP_TOKEN
 ```
 
-Use at least 32 random bytes for `BETTER_AUTH_SECRET`. Treat `BOOTSTRAP_TOKEN` as a one-time operator credential and rotate or remove it after the owner is created.
+Use at least 32 random bytes for `BETTER_AUTH_SECRET`. Treat `BOOTSTRAP_TOKEN` as a one-time operator
+credential and rotate or remove it after the owner is created.
 
-Optionally set `DO_LOCATION_HINT` to one of `wnam`, `enam`, `sam`, `weur`, `eeur`, `apac`, `oc`, `afr`, or `me`. If omitted, bootstrap maps the initial request continent to a broad Cloudflare hint. The saved workspace hint is immutable in v1.
+`BETTER_AUTH_SECRET` is not only the session signing key. It is also the shared secret the Worker sends
+as the `x-notes-internal` header when it calls a Durable Object directly, for archive, version restore,
+and purge. Rotating it therefore invalidates every session *and* briefly disrupts internal Durable
+Object calls while the new value propagates. See
+[Operations](OPERATIONS.md#rotating-better_auth_secret).
 
-## 3. Migrate and deploy
+Optionally set `DO_LOCATION_HINT` to one of `wnam`, `enam`, `sam`, `weur`, `eeur`, `apac`, `oc`, `afr`,
+or `me`. If omitted, bootstrap maps the initial request continent to a broad Cloudflare hint. The saved
+workspace hint is immutable in v1, and it is an optimization rather than a data-residency guarantee.
+
+## 4. Configure rate limiting
+
+The application performs no rate limiting of its own. It never returns `429`. `/api/install/bootstrap`,
+`/api/invites/accept`, and `/api/auth/*` sign-in are all unthrottled at the application layer, which
+makes the bootstrap token and member passwords brute-forceable without external protection.
+
+Add Cloudflare Rate Limiting rules before exposing the origin publicly. At minimum:
+
+| Path | Suggested limit |
+| --- | --- |
+| `/api/install/bootstrap` | 5 requests per minute per IP |
+| `/api/auth/*` | 20 requests per minute per IP |
+| `/api/invites/accept` | 10 requests per minute per IP |
+
+These are configured in the Cloudflare dashboard, not in this repository.
+
+## 5. Migrate and deploy
 
 ```sh
 pnpm build
@@ -36,33 +104,133 @@ pnpm db:remote
 pnpm deploy
 ```
 
-Open the deployment, bootstrap the owner, then verify `/api/health`. Do not expose the site publicly before the owner is created unless the bootstrap token is strong.
+Migrations must complete before the Worker is deployed. The Worker queries the projection, mention,
+deletion-job, archive-disconnect, and table-state tables on ordinary request paths; deploying
+code that expects a migration which has not been applied produces runtime failures rather than a clean
+startup error.
 
-## Upgrade procedure
+`pnpm deploy` runs `pnpm build` again, which runs the full typecheck. To deploy from CI instead, see
+[Automated deployment](#automated-deployment).
 
-1. Export D1 and back up R2 as described in `BACKUP_AND_RECOVERY.md`.
-2. Build and test the exact revision locally.
-3. Run `pnpm db:remote` and verify both `migrations/0004_realtime_knowledge_cleanup.sql` and `migrations/0005_archive_disconnects.sql` complete before `pnpm deploy`; this Worker requires its projection, mention, deletion-job, and archive-disconnect tables.
-4. Deploy the Worker.
-5. Test sign-in, page metadata, document and workspace-event WebSockets, attachment range/conditional download, table lease, and version listing.
+`migrations/` is a single squashed baseline, `0001_initial.sql`. The incremental history was collapsed
+into it before the first production deploy, and the file kept its name so that databases already
+recorded as migrated are left alone. That is correct for a database that applied the whole old history,
+which holds a superset of the baseline, but not for one that stopped partway: `d1_migrations` already
+lists `0001_initial.sql`, so the missing objects will never be applied. Any database in that state
+predates the first deploy and must be recreated rather than patched forward.
 
-Durable Object migrations are append-only in `wrangler.jsonc`. Never rename or delete the `Document`/`WorkspaceEvents` classes or their bindings without a Cloudflare Durable Object migration plan. The hourly `0 * * * *` cron is required: it retries document-room disconnects left by archive and independently tracked Durable Object/R2 targets left by permanent deletion.
+## 6. Bootstrap the owner
 
-## Production smoke checklist
+Open the deployment and complete the first-run screen, or call the API directly:
+
+```sh
+curl -s https://notes.example.com/api/install          # {"initialized":false}
+```
+
+Submit the workspace name, owner name, email, password, and `BOOTSTRAP_TOKEN` on the install screen.
+Passwords must be at least 8 characters. There is no email verification and no password reset by
+design; recovery means an owner revokes and reinvites the account.
+
+Do not expose the site publicly before the owner is created unless the bootstrap token is strong.
+Once the owner exists, rotate or remove the token:
+
+```sh
+pnpm wrangler secret delete BOOTSTRAP_TOKEN
+```
+
+Deleting it is safe. `/api/install/bootstrap` returns `already_initialized` after the first successful
+bootstrap regardless.
+
+## 7. Verify
+
+```sh
+curl -s https://notes.example.com/api/health
+```
+
+Expect `{"ok":true,"version":"0.1.0","time":"..."}`. Note that `version` is a hardcoded string, not a
+build identifier, so this endpoint confirms the Worker is up and D1 is reachable but **cannot tell you
+which revision is live**. Use `pnpm wrangler deployments list` for that.
+
+The health check probes D1 only. It returns `ok` during a complete R2 or Durable Object outage.
+
+### Production smoke checklist
 
 - Better Auth cookies are Secure, HttpOnly, and same-origin.
 - Direct `/api/auth/sign-up/email` returns `registration_closed`.
 - A viewer can connect and read but cannot persist a crafted Yjs update.
 - A hidden tab disconnects after 30 seconds and reconnects on visibility.
-- A document restores after a Worker/DO restart.
-- R2 failure leaves the DO update log intact.
+- A document restores after a Worker or Durable Object restart.
+- R2 failure leaves the Durable Object update log intact.
 - Edits arriving during compaction remain dirty and are included by the next compaction.
 - Rename or move a page in one browser and observe the other browser update without reload.
-- Archive a page while its document room is unavailable, then confirm `archive_disconnect_targets` is eventually empty.
-- Matching attachment `If-None-Match` returns a bodyless `304`; bounded, open-ended, and suffix ranges return correct lengths.
-- Permanently delete a disposable multi-epoch page, then confirm `deletion_jobs` is empty, no unfinished `deletion_targets` remain, and its `documents/{pageId}/` prefix is empty.
+- Archive a page while its document room is unavailable, then confirm `archive_disconnect_targets` is
+  eventually empty.
+- Matching attachment `If-None-Match` returns a bodyless `304`; bounded, open-ended, and suffix ranges
+  return correct lengths.
+- Permanently delete a disposable multi-epoch page, then confirm `deletion_jobs` is empty, no unfinished
+  `deletion_targets` remain, and its `documents/{pageId}/` prefix is empty.
 - The hourly scheduled handler runs successfully and no deletion jobs or unfinished targets remain.
 - Idle connected rooms stop accruing billed duration in Cloudflare analytics.
-- D1/R2/DO metrics and Worker structured logs are visible.
+- D1, R2, and Durable Object metrics and Worker logs are visible.
 
-The last item must be measured on staging; Miniflare cannot prove billing behavior.
+The last item must be measured on a deployed account; Miniflare cannot prove billing behavior.
+
+## Upgrade procedure
+
+1. Export D1 and back up R2 as described in [Backup and recovery](BACKUP_AND_RECOVERY.md).
+2. Build and test the exact revision locally with `pnpm check`.
+3. Run `pnpm db:remote` and confirm every migration in `migrations/` reports success before deploying.
+   The directory is the source of truth for what must be applied; do not rely on a list enumerated in
+   documentation, which drifts.
+4. Deploy the Worker.
+5. Test sign-in, page metadata, document and workspace-event WebSockets, attachment range and
+   conditional download, table lease acquisition, and version listing.
+
+Durable Object migrations are append-only in `wrangler.jsonc`. Never rename or delete the `Document` or
+`WorkspaceEvents` classes or their bindings without a Cloudflare Durable Object migration plan.
+
+## Rollback
+
+Rollback is asymmetric. Worker code is reversible; data schema is not.
+
+| Change | Reversible |
+| --- | --- |
+| Worker code and assets | Yes — `pnpm wrangler rollback` or the dashboard's deployment history |
+| `vars` and secrets | Yes — set the previous value |
+| D1 migrations | **No** — migrations are forward-only; there are no down migrations |
+| Durable Object SQLite schema | **No** — applied inline on room start |
+| Durable Object class migrations | **No** — append-only by design |
+
+To roll back a release that included a migration:
+
+1. Stop writes if the schema change is destructive.
+2. Restore D1 from the export taken in step 1 of the upgrade procedure, into a replacement database.
+3. Point the `DB` binding at the restored database.
+4. Deploy the previous revision.
+5. Accept that Durable Object update logs are ahead of the restored D1 metadata. Documents converge on
+   reconnect; page metadata does not. Verify page tree, membership, and version listings before
+   reopening access.
+
+If the release contained no migration, `pnpm wrangler rollback` alone is sufficient.
+
+## Automated deployment
+
+`.github/workflows/deploy.yml` deploys on a pushed `v*` tag or a manual `workflow_dispatch`. It is
+deliberately not wired to every push on the default branch: there is no staging environment, so a bad
+deploy reaches users directly.
+
+Configure the `production` GitHub Environment with these secrets and variables, and add required
+reviewers if you want a manual approval gate:
+
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `CLOUDFLARE_API_TOKEN` | secret | Wrangler authentication |
+| `CLOUDFLARE_ACCOUNT_ID` | secret | Target account |
+| `PRODUCTION_BASE_URL` | variable | Post-deploy health probe target |
+
+The workflow applies D1 migrations before deploying, matching the manual order. It has not been
+exercised against a live Cloudflare account in this repository; validate it on a throwaway Worker
+before relying on it.
+
+Secrets set with `wrangler secret put` are not managed by the workflow. They persist across deploys and
+must be set once, manually, per the steps above.

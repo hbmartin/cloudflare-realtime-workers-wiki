@@ -18,7 +18,7 @@ import {
   now,
   sha256,
 } from "./http";
-import { columnType, nullableId, object, pageKind, role, text } from "../shared/validation";
+import { columnType, ID_PATTERN, nullableId, object, pageKind, role, text } from "../shared/validation";
 import type { ClientMemberContext, Page, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
@@ -1572,6 +1572,18 @@ async function guardedBatch(
   throw new HttpError(500, "table_revision_failed", "The table revision could not be advanced.");
 }
 
+// A malformed percent escape is client input, not a server fault: it can never
+// name a real room, so it answers like any other unknown room instead of
+// logging a stack trace for whatever path was supplied.
+function decodePartyRoom(encoded: string, notFound: () => HttpError) {
+  try {
+    return decodeURIComponent(encoded);
+  } catch (error) {
+    if (error instanceof URIError) throw notFound();
+    throw error;
+  }
+}
+
 async function handlePartyRequest(request: Request, env: Env) {
   const url = new URL(request.url);
   const documentPrefix = "/parties/document/";
@@ -1579,24 +1591,29 @@ async function handlePartyRequest(request: Request, env: Env) {
   const isDocument = url.pathname.startsWith(documentPrefix);
   const isWorkspace = url.pathname.startsWith(workspacePrefix);
   if (!isDocument && !isWorkspace) return null;
-  // Declared outside the try so a failure log can name the room; decoding
-  // stays inside because a malformed escape is itself a handled failure.
+  const roomNotFound = () =>
+    new HttpError(404, "room_not_found", isDocument ? "Document room not found." : "Workspace event room not found.");
+  // Declared outside the try so a failure log can name the room. It only stays
+  // null when the failure preceded decoding, and every value it can hold has
+  // been bounded by then, so nothing unvalidated reaches the log.
   let room: string | null = null;
   try {
     assertSameOrigin(request, env.BETTER_AUTH_URL);
     const member = await requireMember(request, env);
-    room = decodeURIComponent(url.pathname.slice((isDocument ? documentPrefix : workspacePrefix).length));
+    room = decodePartyRoom(url.pathname.slice((isDocument ? documentPrefix : workspacePrefix).length), roomNotFound);
     if (isDocument) {
       const separator = room.lastIndexOf("~");
       const pageId = room.slice(0, separator);
       const epoch = Number(room.slice(separator + 1));
-      if (!pageId || !Number.isInteger(epoch)) throw new HttpError(404, "room_not_found", "Document room not found.");
+      // Shape-checked before the D1 lookup so an arbitrary path cannot become
+      // an unbounded log line further down.
+      if (!ID_PATTERN.test(pageId) || !Number.isInteger(epoch)) throw roomNotFound();
       const page = await pageForMember(env, member, pageId);
       if (page.kind !== "document" || page.content_epoch !== epoch) {
         throw new HttpError(409, "stale_epoch", "Reload this page to connect to its current document version.");
       }
     } else if (room !== member.workspace.id) {
-      throw new HttpError(404, "room_not_found", "Workspace event room not found.");
+      throw roomNotFound();
     }
     const expiresAt = Math.min(member.session.expiresAt.getTime(), now() + 5 * 60_000);
     const placement = locationHint(member.workspace.locationHint ?? undefined);
@@ -1620,7 +1637,7 @@ async function handlePartyRequest(request: Request, env: Env) {
     // generically. The room is an opaque id, safe to log where the cookie is not.
     if (!isExpectedError(error)) {
       const party = isDocument ? "document" : "workspace-events";
-      console.error(`Failed to handle ${party} party request for ${room ?? url.pathname}`, error);
+      console.error(`Failed to handle ${party} party request for ${room ?? "an undecoded room"}`, error);
     }
     const { status, body } = errorPayload(error);
     return Response.json(body, { status });
