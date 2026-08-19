@@ -7,7 +7,8 @@
     "vitest.config.ts",
     "vitest.worker.config.ts",
     "playwright.config.ts",
-    "scripts/*.mjs"
+    "scripts/*.mjs",
+    "scripts/**/*.test.mjs"
   ],
   "ignorePatterns": ["worker-configuration.d.ts", "reviews_triage/**"],
   "typeAware": {

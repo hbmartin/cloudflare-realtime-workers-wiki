@@ -34,6 +34,12 @@ const table: TableData = {
   columns: [{ id: "status", name: "Status", type: "text", position: 0, options: [] }],
   rows: [{ id: "row", position: 0, cells: { status: "Ready" } }],
   lease: { heldByMe: false, holderName: null, expiresAt: null },
+  limit: 500,
+  sort: null,
+  dir: "asc",
+  hasMore: false,
+  nextCursor: null,
+  rowCount: 1,
 };
 
 const LEASE_DURATION_MS = 60_000;
@@ -159,7 +165,9 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Roadmap")).toHaveAttribute("readonly");
     expect(screen.queryByRole("button", { name: "+ Property" })).not.toBeInTheDocument();
     expect(api).toHaveBeenCalledTimes(1);
-    expect(api).toHaveBeenCalledWith("/api/tables/table-page", { signal: expect.any(AbortSignal) });
+    expect(api).toHaveBeenCalledWith("/api/tables/table-page?limit=500&count=true", {
+      signal: expect.any(AbortSignal),
+    });
   });
 
   it("uses the table-load fallback when a request times out", async () => {
@@ -1918,5 +1926,73 @@ describe("TablePage", () => {
 
     expect(loads).toBeGreaterThan(1);
     expect(screen.getByDisplayValue("Ready")).toBeInTheDocument();
+  });
+  function renderViewer() {
+    render(
+      <TablePage
+        page={page}
+        member={member("viewer")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+  }
+
+  it("appends the next keyset page instead of replacing the loaded rows", async () => {
+    const first: TableData = {
+      ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "One" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const second: TableData = {
+      ...table,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: 2,
+    };
+    vi.mocked(api).mockResolvedValueOnce({ table: first }).mockResolvedValueOnce({ table: second });
+    renderViewer();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Two")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("One")).toBeInTheDocument();
+    expect(api).toHaveBeenLastCalledWith("/api/tables/table-page?limit=500&afterPosition=0&afterId=row-1", {
+      signal: expect.any(AbortSignal),
+    });
+  });
+
+  it("counts every row on the server, not just the ones loaded", async () => {
+    vi.mocked(api).mockResolvedValue({
+      table: { ...table, hasMore: true, nextCursor: { position: 0, rowId: "row" }, rowCount: 4_000 },
+    });
+    renderViewer();
+
+    expect(await screen.findByText("1 / 4000 rows")).toBeInTheDocument();
+  });
+
+  it("hides the load-more control once the last page has arrived", async () => {
+    vi.mocked(api).mockResolvedValue({ table });
+    renderViewer();
+
+    expect(await screen.findByDisplayValue("Ready")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
+  });
+
+  it("re-reads from the server when a sort is applied rather than reordering loaded rows", async () => {
+    vi.mocked(api).mockResolvedValue({ table });
+    renderViewer();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Status/ }));
+
+    await waitFor(() =>
+      expect(api).toHaveBeenLastCalledWith("/api/tables/table-page?limit=500&count=true&sort=status&dir=asc", {
+        signal: expect.any(AbortSignal),
+      }),
+    );
   });
 });

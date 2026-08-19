@@ -79,35 +79,39 @@ Never rename or delete a class or binding without a Cloudflare Durable Object mi
 These are compile-time constants. Changing one requires a code edit and a redeploy; none is
 configurable at runtime.
 
-| Constant                              | Value                                                                    | Source                                          |
-| ------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------- |
-| Yjs save debounce                     | 1 s, 5 s maximum                                                         | `src/worker/document.ts` `callbackOptions`      |
-| `COMPACTION_DELAY_MS`                 | 30 s                                                                     | `src/worker/document.ts`                        |
-| `ALARM_RETRY_DELAY_MS`                | 5 s — the transition-deferral delay, and the base of the restore backoff | `src/worker/document.ts`                        |
-| `RESTORE_RECONCILIATION_MAX_DELAY_MS` | 5 min — the ceiling that backoff holds at                                | `src/worker/document.ts`                        |
-| `VERSION_INTERVAL_MS`                 | 15 min                                                                   | `src/worker/document.ts`                        |
-| `VERSION_RETENTION_MS`                | 30 days, and at most 200 versions per page                               | `src/worker/document.ts`, `pruneVersions`       |
-| `WARN_BYTES`                          | 16 MiB                                                                   | `src/worker/document.ts`                        |
-| `READ_ONLY_BYTES`                     | 24 MiB                                                                   | `src/worker/document.ts`                        |
-| Connections per document epoch        | 30, then close `4429`                                                    | `src/worker/document.ts` `onConnect`            |
-| Connection grant lifetime             | `min(session expiry, now + 5 min)`                                       | `src/worker/index.ts` `handlePartyRequest`      |
-| `UPDATE_CHUNK_BYTES`                  | 1 MiB                                                                    | `src/shared/bytes.ts`                           |
-| `MAX_UPLOAD_BYTES`                    | 10 MiB                                                                   | `src/worker/index.ts`                           |
-| `TABLE_LEASE_DURATION_MS`             | 60 s                                                                     | `src/worker/index.ts`                           |
-| Table row limit                       | 500, enforced on read **and** write                                      | `src/worker/index.ts`                           |
-| `DELETION_TARGET_BATCH_SIZE`          | 50                                                                       | `src/worker/index.ts`                           |
-| `CLEANUP_LEASE_MS`                    | 15 min                                                                   | `src/worker/cleanup.ts`                         |
-| `DOCUMENT_PURGE_TIMEOUT_MS`           | 30 s                                                                     | `src/worker/cleanup.ts`                         |
-| `ARCHIVE_DISCONNECT_BATCH_SIZE`       | 25                                                                       | `src/worker/archive.ts`                         |
-| `ARCHIVE_DISCONNECT_TIMEOUT_MS`       | 30 s                                                                     | `src/worker/archive.ts`                         |
-| `ARCHIVE_DISCONNECT_LEASE_MS`         | 60 s                                                                     | `src/worker/archive.ts`                         |
-| Search results / terms / query length | 30 / 20 / 200 chars                                                      | `src/worker/index.ts`                           |
-| Mentions per page                     | 100                                                                      | `src/worker/index.ts`                           |
-| Mention suggestions                   | 10 pages + 10 members                                                    | `src/worker/index.ts`                           |
-| Invite lifetime                       | 7 days, one use                                                          | `src/worker/index.ts`                           |
-| Hidden-tab disconnect                 | 30 s                                                                     | `src/client/collaboration.ts`                   |
-| Client reconnect backoff              | `min(30 s, 1 s × 2^min(attempt, 5))`, jittered                           | `src/client/retry.ts`                           |
-| Restore reconciliation backoff        | `min(5 min, 5 s × 2^attempt)`, jittered                                  | `src/worker/document.ts`, `src/shared/retry.ts` |
+| Constant                                                | Value                                                                    | Source                                          |
+| ------------------------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------- |
+| Yjs save debounce                                       | 1 s, 5 s maximum                                                         | `src/worker/document.ts` `callbackOptions`      |
+| `COMPACTION_DELAY_MS`                                   | 30 s                                                                     | `src/worker/document.ts`                        |
+| `ALARM_RETRY_DELAY_MS`                                  | 5 s — the transition-deferral delay, and the base of the restore backoff | `src/worker/document.ts`                        |
+| `RESTORE_RECONCILIATION_MAX_DELAY_MS`                   | 5 min — the ceiling that backoff holds at                                | `src/worker/document.ts`                        |
+| `VERSION_INTERVAL_MS`                                   | 15 min                                                                   | `src/worker/document.ts`                        |
+| `VERSION_RETENTION_MS`                                  | 30 days, and at most 200 versions per page                               | `src/worker/document.ts`, `pruneVersions`       |
+| `WARN_BYTES`                                            | 16 MiB                                                                   | `src/worker/document.ts`                        |
+| `READ_ONLY_BYTES`                                       | 24 MiB                                                                   | `src/worker/document.ts`                        |
+| Connections per document epoch                          | 30, then close `4429`                                                    | `src/worker/document.ts` `onConnect`            |
+| Connection grant lifetime                               | `min(session expiry, now + 5 min)`                                       | `src/worker/index.ts` `handlePartyRequest`      |
+| `UPDATE_CHUNK_BYTES`                                    | 1 MiB                                                                    | `src/shared/bytes.ts`                           |
+| `MAX_UPLOAD_BYTES`                                      | 10 MiB                                                                   | `src/worker/index.ts`                           |
+| `TABLE_LEASE_DURATION_MS`                               | 60 s                                                                     | `src/worker/index.ts`                           |
+| Table row limit (`TABLE_MAX_ROWS`)                      | 20000, enforced on write only                                            | `src/shared/table-limits.ts`                    |
+| Table page size (`TABLE_PAGE_DEFAULT`/`TABLE_PAGE_MAX`) | 500 default and maximum rows per read                                    | `src/shared/table-limits.ts`                    |
+| Sorted table depth (`TABLE_SORT_MAX_OFFSET`)            | 5000 rows reachable by offset when sorting                               | `src/shared/table-limits.ts`                    |
+| Bulk write caps                                         | 50 columns, 200 rows, 2000 cells, 1 MiB body per request                 | `src/shared/table-limits.ts`                    |
+| Bulk receipt retention                                  | 24 h, pruned by the hourly cron                                          | `src/shared/table-limits.ts`                    |
+| `DELETION_TARGET_BATCH_SIZE`                            | 50                                                                       | `src/worker/index.ts`                           |
+| `CLEANUP_LEASE_MS`                                      | 15 min                                                                   | `src/worker/cleanup.ts`                         |
+| `DOCUMENT_PURGE_TIMEOUT_MS`                             | 30 s                                                                     | `src/worker/cleanup.ts`                         |
+| `ARCHIVE_DISCONNECT_BATCH_SIZE`                         | 25                                                                       | `src/worker/archive.ts`                         |
+| `ARCHIVE_DISCONNECT_TIMEOUT_MS`                         | 30 s                                                                     | `src/worker/archive.ts`                         |
+| `ARCHIVE_DISCONNECT_LEASE_MS`                           | 60 s                                                                     | `src/worker/archive.ts`                         |
+| Search results / terms / query length                   | 30 / 20 / 200 chars                                                      | `src/worker/index.ts`                           |
+| Mentions per page                                       | 100                                                                      | `src/worker/index.ts`                           |
+| Mention suggestions                                     | 10 pages + 10 members                                                    | `src/worker/index.ts`                           |
+| Invite lifetime                                         | 7 days, one use                                                          | `src/worker/index.ts`                           |
+| Hidden-tab disconnect                                   | 30 s                                                                     | `src/client/collaboration.ts`                   |
+| Client reconnect backoff                                | `min(30 s, 1 s × 2^min(attempt, 5))`, jittered                           | `src/client/retry.ts`                           |
+| Restore reconciliation backoff                          | `min(5 min, 5 s × 2^attempt)`, jittered                                  | `src/worker/document.ts`, `src/shared/retry.ts` |
 
 Both backoffs draw from `jitteredBackoff` in `src/shared/retry.ts`, which applies equal jitter: the
 delay lands anywhere in `[ceiling / 2, ceiling]`, so a fleet that failed together does not retry in
@@ -131,6 +135,7 @@ takes to clear, and whether a stalled row is broken or merely waiting.
 | ---------------------------- | -------- | --------------------------------------- | ----------------- |
 | `deletion_jobs`              | 10       | `min(24 h, 1 h × 2^min(attempts-1, 4))` | 16 h              |
 | `archive_disconnect_targets` | 50       | `min(1 h, 10 s × 2^min(attempts-1, 8))` | 42 min 40 s       |
+| `table_bulk_writes`          | all      | Pruned, not retried; 24 h retention     | n/a               |
 
 The outer `min` in each expression is never reached: the attempt clamp caps the exponent first, at
 `1 h × 2^4` and `10 s × 2^8` respectively. Read the effective ceiling column, not the outer bound.

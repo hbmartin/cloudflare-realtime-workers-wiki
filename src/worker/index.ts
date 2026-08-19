@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
-import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
+import { processDeletionJob, processDueDeletionJobs, pruneBulkWriteReceipts } from "./cleanup";
 import { Document } from "./document";
 import type { Env, MemberContext } from "./env";
 import {
@@ -18,6 +18,16 @@ import {
   now,
   sha256,
 } from "./http";
+import {
+  TABLE_BULK_MAX_BODY_BYTES,
+  TABLE_BULK_MAX_CELLS,
+  TABLE_BULK_MAX_COLUMNS,
+  TABLE_BULK_MAX_ROWS,
+  TABLE_MAX_ROWS,
+  TABLE_PAGE_DEFAULT,
+  TABLE_PAGE_MAX,
+  TABLE_SORT_MAX_OFFSET,
+} from "../shared/table-limits";
 import { columnType, documentRoom, ID_PATTERN, nullableId, object, pageKind, role, text } from "../shared/validation";
 import type { ClientMemberContext, Page, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
@@ -197,6 +207,119 @@ async function leaseInputs(body: Record<string, unknown>, member: MemberContext)
     throw new HttpError(422, "invalid_revision", "expectedRevision must be a positive integer.");
   }
   return { body, expectedRevision, tokenHash: await sha256(leaseToken), sessionId: member.session.id };
+}
+
+// Sorting targets a caller-supplied column, so the value expression is chosen from
+// this fixed map keyed by the column's declared type and is never interpolated from
+// request input.
+const SORT_VALUE_EXPRESSIONS: Record<string, string> = {
+  text: "sort_cell.text_value",
+  number: "sort_cell.number_value",
+  checkbox: "sort_cell.boolean_value",
+  date: "sort_cell.date_value",
+  select: "(SELECT o.label FROM table_select_options o WHERE o.id = sort_cell.select_value)",
+};
+
+type TableRowQuery = {
+  sql: string;
+  binds: unknown[];
+  limit: number;
+  offset: number;
+  sort: string | null;
+  dir: "asc" | "desc";
+};
+
+// Builds the row query, which the cell read reuses as a derived table.
+//
+// Two paging modes, because they are not interchangeable. The default order is
+// (position, id), backed by idx_table_rows_page, so a keyset cursor is exact, stays
+// cheap at any depth, and is stable while rows are appended - that is the path an
+// importer or an export loop walks. An arbitrary-column sort cannot be keyset-paged
+// cheaply across five typed value columns, and its only caller is a human scrolling a
+// sorted view, so it pages by offset with a hard depth cap instead.
+function buildTableRowQuery(
+  pageId: string,
+  columns: { id: string; type: string }[],
+  query: Record<string, string | undefined>,
+): TableRowQuery {
+  const limit = query.limit === undefined ? TABLE_PAGE_DEFAULT : Number(query.limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > TABLE_PAGE_MAX) {
+    throw new HttpError(422, "invalid_table_cursor", `limit must be an integer between 1 and ${TABLE_PAGE_MAX}.`);
+  }
+  const dir = query.dir ?? "asc";
+  if (dir !== "asc" && dir !== "desc") {
+    throw new HttpError(422, "invalid_table_sort", "dir must be asc or desc.");
+  }
+  const sortColumn = query.sort === undefined ? undefined : columns.find((column) => column.id === query.sort);
+  if (query.sort !== undefined && !sortColumn) {
+    throw new HttpError(422, "invalid_table_sort", "The sort column does not belong to this table.");
+  }
+
+  const afterId = query.afterId;
+  const afterPosition = query.afterPosition === undefined ? null : Number(query.afterPosition);
+  if ((query.afterPosition === undefined) !== (afterId === undefined)) {
+    throw new HttpError(422, "invalid_table_cursor", "The table page cursor is incomplete.");
+  }
+  if (afterPosition !== null && !Number.isInteger(afterPosition)) {
+    throw new HttpError(422, "invalid_table_cursor", "The table page cursor is invalid.");
+  }
+  if (afterId !== undefined && (!afterId || afterId.length > 100)) {
+    throw new HttpError(422, "invalid_table_cursor", "The table page cursor is invalid.");
+  }
+  if (afterPosition !== null && sortColumn) {
+    throw new HttpError(422, "invalid_table_cursor", "A sorted table page uses offset, not a cursor.");
+  }
+
+  const offset = query.offset === undefined ? 0 : Number(query.offset);
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new HttpError(422, "invalid_table_cursor", "offset must be a non-negative integer.");
+  }
+  if (offset > 0 && !sortColumn) {
+    throw new HttpError(422, "invalid_table_cursor", "offset is only valid together with sort.");
+  }
+  if (offset + limit > TABLE_SORT_MAX_OFFSET) {
+    throw new HttpError(
+      422,
+      "invalid_table_cursor",
+      `A sorted table page cannot reach beyond row ${TABLE_SORT_MAX_OFFSET}.`,
+    );
+  }
+
+  if (!sortColumn) {
+    return {
+      sql: `SELECT r.id, r.position FROM table_rows r
+             WHERE r.page_id = ?
+               AND (? IS NULL OR r.position > ? OR (r.position = ? AND r.id > ?))
+             ORDER BY r.position, r.id LIMIT ? OFFSET ?`,
+      binds: [pageId, afterPosition, afterPosition, afterPosition, afterId ?? null],
+      limit,
+      offset: 0,
+      sort: null,
+      dir,
+    };
+  }
+
+  const value = SORT_VALUE_EXPRESSIONS[sortColumn.type];
+  if (!value) throw new HttpError(422, "invalid_table_sort", "That column type cannot be sorted.");
+  // Empty cells sort last in both directions: the NULL grouping deliberately does not
+  // take the sort direction, so reversing a sort does not drag every blank to the top.
+  return {
+    sql: `SELECT r.id, r.position FROM table_rows r
+           LEFT JOIN table_cells sort_cell ON sort_cell.row_id = r.id AND sort_cell.column_id = ?
+           WHERE r.page_id = ?
+           ORDER BY (CASE WHEN ${value} IS NULL THEN 1 ELSE 0 END), ${value} ${dir === "desc" ? "DESC" : "ASC"},
+                    r.position, r.id
+           LIMIT ? OFFSET ?`,
+    binds: [sortColumn.id, pageId],
+    limit,
+    offset,
+    sort: sortColumn.id,
+    dir,
+  };
+}
+
+function tableRowBinds(query: TableRowQuery, limit: number) {
+  return [...query.binds, limit, query.offset];
 }
 
 app.onError((error, c) => errorResponse(c, error));
@@ -1078,7 +1201,12 @@ app.post("/api/pages/:id/restore-version", async (c) => {
 
 app.get("/api/tables/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
+  // COUNT(*) is opt-in so a paging loop does not pay for it on every page.
+  const wantsCount = c.req.query("count") === "true";
+  const page = await activeTablePage<{ row_count?: number }>(c.env, member, c.req.param("pageId"), {
+    columns: wantsCount ? `, (SELECT COUNT(*) FROM table_rows WHERE page_id = p.id) row_count` : "",
+    binds: [],
+  });
   const state = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
     .bind(page.id)
     .first<{ revision: number }>();
@@ -1095,19 +1223,25 @@ app.get("/api/tables/:pageId", async (c) => {
   )
     .bind(page.id)
     .all<{ id: string; column_id: string; label: string; position: number }>();
-  // ponytail: 500 rows are loaded and sorted in the client; graduate to server-side
-  // querying and a realtime table Durable Object only when this boundary is exceeded.
-  const rows = await c.env.DB.prepare(
-    `SELECT id, position FROM table_rows WHERE page_id = ? ORDER BY position, id LIMIT 501`,
-  )
-    .bind(page.id)
+  // Rows are paged and sorted server-side. Graduating to a realtime table Durable
+  // Object is not about row count: a table has exactly one writer at a time (the
+  // lease) and readers poll, so the trigger is dropping the single-editor lease or
+  // replacing the poll with push, neither of which paging affects.
+  const rowQuery = buildTableRowQuery(page.id, columns.results, c.req.query());
+  // One row beyond the page is fetched purely to answer hasMore without a second count.
+  const rows = await c.env.DB.prepare(rowQuery.sql)
+    .bind(...tableRowBinds(rowQuery, rowQuery.limit + 1))
     .all<{ id: string; position: number }>();
-  if (rows.results.length > 500)
-    throw new HttpError(422, "table_row_limit", "This table has exceeded the 500-row v1 limit.");
+  const pageRows = rows.results.slice(0, rowQuery.limit);
+  const hasMore = rows.results.length > pageRows.length;
+  const lastRow = pageRows.at(-1);
+  // The cell read joins the row query as a derived table rather than binding the ids
+  // it returned, which at a full page would exceed D1's 100 bound parameters.
   const cells = await c.env.DB.prepare(
-    `SELECT c.* FROM table_cells c JOIN table_rows r ON r.id = c.row_id WHERE r.page_id = ?`,
+    `SELECT c.row_id, c.column_id, c.text_value, c.number_value, c.boolean_value, c.date_value, c.select_value
+       FROM table_cells c JOIN (${rowQuery.sql}) page_rows ON page_rows.id = c.row_id`,
   )
-    .bind(page.id)
+    .bind(...tableRowBinds(rowQuery, rowQuery.limit))
     .all<Record<string, unknown>>();
   const lease = await c.env.DB.prepare(
     `SELECT l.expires_at, l.holder_session_id, u.name holder_name
@@ -1135,12 +1269,19 @@ app.get("/api/tables/:pageId", async (c) => {
             position: option.position,
           })),
       })),
-      rows: rows.results.map((row) => ({ ...row, cells: cellMap.get(row.id) ?? {} })),
+      rows: pageRows.map((row) => ({ ...row, cells: cellMap.get(row.id) ?? {} })),
       lease: {
         heldByMe: lease?.holder_session_id === member.session.id,
         holderName: lease?.holder_name ?? null,
         expiresAt: lease?.expires_at ?? null,
       },
+      limit: rowQuery.limit,
+      sort: rowQuery.sort,
+      dir: rowQuery.dir,
+      hasMore,
+      // Keyset paging applies to the default order only; a sorted view pages by offset.
+      nextCursor: hasMore && !rowQuery.sort && lastRow ? { position: lastRow.position, rowId: lastRow.id } : null,
+      rowCount: wantsCount ? Number(page.row_count ?? 0) : null,
     },
   });
 });
@@ -1327,6 +1468,288 @@ app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) 
   return c.json({ revision });
 });
 
+app.post("/api/tables/:pageId/bulk", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const pageId = c.req.param("pageId");
+  const declaredLength = Number(c.req.header("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > TABLE_BULK_MAX_BODY_BYTES) {
+    throw new HttpError(413, "bulk_too_large", "The bulk table write is larger than the request limit.");
+  }
+  const page = await activeTablePage<{
+    row_count: number;
+    next_row_position: number;
+    next_column_position: number;
+  }>(c.env, member, pageId, {
+    columns: `, (SELECT COUNT(*) FROM table_rows WHERE page_id = p.id) row_count,
+        (SELECT COALESCE(MAX(position) + 1, 0) FROM table_rows WHERE page_id = p.id) next_row_position,
+        (SELECT COALESCE(MAX(position) + 1, 0) FROM table_columns WHERE page_id = p.id) next_column_position`,
+    binds: [],
+  });
+  const body = await jsonBody(c.req.raw);
+  const input = await leaseInputs(body, member);
+  const clientRequestId =
+    body.clientRequestId === undefined ? null : text(body.clientRequestId, "clientRequestId", 200);
+
+  // A timed-out request is replayed with the same id rather than appended twice.
+  if (clientRequestId) {
+    const receipt = await c.env.DB.prepare(
+      `SELECT response_json FROM table_bulk_writes WHERE page_id = ? AND client_request_id = ?`,
+    )
+      .bind(pageId, clientRequestId)
+      .first<{ response_json: string }>();
+    if (receipt) return c.json({ ...JSON.parse(receipt.response_json), replayed: true });
+  }
+
+  const columnInput = Array.isArray(body.columns) ? body.columns : [];
+  const rowInput = Array.isArray(body.rows) ? body.rows : [];
+  // An empty request would advance the revision while changing nothing, which would
+  // invalidate every other editor's expectedRevision for no reason.
+  if (!columnInput.length && !rowInput.length) {
+    throw new HttpError(422, "empty_bulk_write", "A bulk write must add at least one column or row.");
+  }
+  if (columnInput.length > TABLE_BULK_MAX_COLUMNS || rowInput.length > TABLE_BULK_MAX_ROWS) {
+    throw new HttpError(422, "bulk_too_large", "This bulk write exceeds the per-request column or row limit.");
+  }
+  if (page.row_count + rowInput.length > TABLE_MAX_ROWS) {
+    throw new HttpError(422, "table_row_limit", `Tables are limited to ${TABLE_MAX_ROWS} rows.`);
+  }
+
+  const [existingColumns, existingOptions] = await Promise.all([
+    c.env.DB.prepare(`SELECT id, type FROM table_columns WHERE page_id = ?`)
+      .bind(pageId)
+      .all<{ id: string; type: string }>(),
+    c.env.DB.prepare(
+      `SELECT o.id, o.column_id, o.label, o.position FROM table_select_options o
+         JOIN table_columns col ON col.id = o.column_id WHERE col.page_id = ?`,
+    )
+      .bind(pageId)
+      .all<{ id: string; column_id: string; label: string; position: number }>(),
+  ]);
+
+  // Columns are addressable by their real id and, for ones created in this same
+  // request, by the caller's `ref:` token - otherwise an importer would need a round
+  // trip just to learn the generated ids before it could send any rows.
+  const columnsByKey = new Map<string, { id: string; type: string }>();
+  for (const column of existingColumns.results) columnsByKey.set(column.id, column);
+  const optionIdsByLabel = new Map<string, Map<string, string>>();
+  const optionIds = new Set<string>();
+  const nextOptionPosition = new Map<string, number>();
+  for (const option of existingOptions.results) {
+    const byLabel = optionIdsByLabel.get(option.column_id) ?? new Map<string, string>();
+    byLabel.set(option.label, option.id);
+    optionIdsByLabel.set(option.column_id, byLabel);
+    optionIds.add(option.id);
+    nextOptionPosition.set(
+      option.column_id,
+      Math.max(nextOptionPosition.get(option.column_id) ?? 0, option.position + 1),
+    );
+  }
+
+  const newColumns: { id: string; ref: string | null; name: string; type: string; position: number }[] = [];
+  const newOptions: { id: string; columnId: string; label: string; position: number }[] = [];
+
+  function declareOption(columnId: string, label: string) {
+    const byLabel = optionIdsByLabel.get(columnId) ?? new Map<string, string>();
+    const existing = byLabel.get(label);
+    if (existing) return existing;
+    const id = crypto.randomUUID();
+    const position = nextOptionPosition.get(columnId) ?? 0;
+    byLabel.set(label, id);
+    optionIdsByLabel.set(columnId, byLabel);
+    nextOptionPosition.set(columnId, position + 1);
+    optionIds.add(id);
+    newOptions.push({ id, columnId, label, position });
+    return id;
+  }
+
+  columnInput.forEach((raw, index) => {
+    const entry = object(raw);
+    const id = crypto.randomUUID();
+    const type = columnType(entry.type);
+    const name = text(entry.name, `columns[${index}].name`, 200);
+    const ref = entry.ref === undefined ? null : text(entry.ref, `columns[${index}].ref`, 64);
+    if (ref && columnsByKey.has(`ref:${ref}`)) {
+      throw new HttpError(422, "invalid_bulk_reference", `The column ref ${ref} is used twice.`);
+    }
+    newColumns.push({ id, ref, name, type, position: page.next_column_position + index });
+    columnsByKey.set(id, { id, type });
+    if (ref) columnsByKey.set(`ref:${ref}`, { id, type });
+    const options = Array.isArray(entry.options) ? entry.options : [];
+    for (const option of options) {
+      declareOption(id, text(object(option).label, `columns[${index}].options[].label`, 200));
+    }
+  });
+
+  const newRows: { id: string; position: number }[] = [];
+  const newCells: {
+    r: string;
+    c: string;
+    t: string | null;
+    n: number | null;
+    b: number | null;
+    d: string | null;
+    s: string | null;
+  }[] = [];
+
+  rowInput.forEach((raw, index) => {
+    const entry = object(raw);
+    const rowId = crypto.randomUUID();
+    newRows.push({ id: rowId, position: page.next_row_position + index });
+    const cells = entry.cells === undefined ? {} : object(entry.cells);
+    for (const [key, value] of Object.entries(cells)) {
+      const column = columnsByKey.get(key);
+      if (!column) {
+        throw new HttpError(422, "invalid_bulk_reference", `Unknown column ${key}.`, {
+          rowIndex: index,
+          columnKey: key,
+        });
+      }
+      // Notion and every other export hands over option labels, not ids, so a select
+      // cell may name its option and have it created on demand. A bare string stays
+      // an option id, matching the per-cell route exactly.
+      let resolved: unknown = value;
+      if (column.type === "select" && value && typeof value === "object" && "option" in value) {
+        resolved = declareOption(column.id, text((value as { option: unknown }).option, "option", 200));
+      }
+      const [textValue, numberValue, booleanValue, dateValue, selectValue] = typedCell(column.type, resolved);
+      if (selectValue !== null && !optionIds.has(selectValue)) {
+        throw new HttpError(422, "invalid_cell", "That select option does not belong to this column.", {
+          rowIndex: index,
+          columnKey: key,
+        });
+      }
+      // An absent cell already reads as null, so writing empties would be pure cost.
+      if (
+        textValue === null &&
+        numberValue === null &&
+        booleanValue === null &&
+        dateValue === null &&
+        selectValue === null
+      ) {
+        continue;
+      }
+      newCells.push({
+        r: rowId,
+        c: column.id,
+        t: textValue,
+        n: numberValue,
+        b: booleanValue,
+        d: dateValue,
+        s: selectValue,
+      });
+    }
+  });
+
+  if (newCells.length > TABLE_BULK_MAX_CELLS) {
+    throw new HttpError(422, "bulk_too_large", "This bulk write exceeds the per-request cell limit.");
+  }
+
+  const response = {
+    columns: newColumns.map((column) => ({
+      id: column.id,
+      ref: column.ref,
+      name: column.name,
+      type: column.type,
+      position: column.position,
+      options: newOptions
+        .filter((option) => option.columnId === column.id)
+        .map((option) => ({ id: option.id, label: option.label, position: option.position })),
+    })),
+    rows: newRows,
+    counts: {
+      columns: newColumns.length,
+      options: newOptions.length,
+      rows: newRows.length,
+      cells: newCells.length,
+    },
+  };
+
+  const revision = await guardedBatch(
+    c.env,
+    pageId,
+    input,
+    (guardedAt) => {
+      const guardBinds = [pageId, input.expectedRevision, input.tokenHash, input.sessionId, guardedAt];
+      const statements: D1PreparedStatement[] = [];
+      // Every insert expands one JSON parameter with json_each rather than binding a
+      // placeholder per value, which at these batch sizes would blow past D1's limit of
+      // 100 bound parameters per query. `json_each().key` is the array index, so
+      // positions are assigned deterministically regardless of iteration order.
+      if (newColumns.length) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_columns (id, page_id, name, type, position)
+             SELECT json_extract(item.value, '$.id'), ?, json_extract(item.value, '$.name'),
+                    json_extract(item.value, '$.type'), json_extract(item.value, '$.position')
+               FROM json_each(?) item WHERE ${leaseGuards()}`,
+          ).bind(pageId, JSON.stringify(newColumns), ...guardBinds),
+        );
+      }
+      if (newOptions.length) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_select_options (id, column_id, label, position)
+             SELECT json_extract(item.value, '$.id'), json_extract(item.value, '$.columnId'),
+                    json_extract(item.value, '$.label'), json_extract(item.value, '$.position')
+               FROM json_each(?) item WHERE ${leaseGuards()}`,
+          ).bind(JSON.stringify(newOptions), ...guardBinds),
+        );
+      }
+      if (newRows.length) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
+             SELECT json_extract(item.value, '$.id'), ?, json_extract(item.value, '$.position'), ?, ?, ?
+               FROM json_each(?) item WHERE ${leaseGuards()}`,
+          ).bind(pageId, member.user.id, guardedAt, guardedAt, JSON.stringify(newRows), ...guardBinds),
+        );
+      }
+      if (newCells.length) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_cells
+               (row_id, column_id, text_value, number_value, boolean_value, date_value, select_value, updated_at)
+             SELECT json_extract(item.value, '$.r'), json_extract(item.value, '$.c'),
+                    json_extract(item.value, '$.t'), json_extract(item.value, '$.n'),
+                    json_extract(item.value, '$.b'), json_extract(item.value, '$.d'),
+                    json_extract(item.value, '$.s'), ?
+               FROM json_each(?) item WHERE ${leaseGuards()}`,
+          ).bind(guardedAt, JSON.stringify(newCells), ...guardBinds),
+        );
+      }
+      if (clientRequestId) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_bulk_writes (page_id, client_request_id, revision, response_json, created_at)
+             SELECT ?, ?, ?, ?, ? WHERE ${leaseGuards()}`,
+          ).bind(
+            pageId,
+            clientRequestId,
+            input.expectedRevision + 1,
+            JSON.stringify({ revision: input.expectedRevision + 1, ...response }),
+            guardedAt,
+            ...guardBinds,
+          ),
+        );
+      }
+      // An import runs far longer than the 60-second lease, and asking the caller to
+      // run a renewal timer alongside its writes is how tables end up half-written.
+      // The guard means this can only extend a lease that is already live.
+      statements.push(
+        c.env.DB.prepare(
+          `UPDATE table_leases SET expires_at = ?
+            WHERE page_id = ? AND token_hash = ? AND holder_session_id = ? AND expires_at > ?`,
+        ).bind(guardedAt + TABLE_LEASE_DURATION_MS, pageId, input.tokenHash, input.sessionId, guardedAt),
+      );
+      return statements;
+    },
+    { requireChanges: false },
+  );
+
+  return c.json({ revision, replayed: false, ...response }, 201);
+});
+
 app.post("/api/tables/:pageId/rows", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
@@ -1341,7 +1764,9 @@ app.post("/api/tables/:pageId/rows", async (c) => {
     },
   );
   const input = await leaseInputs(await jsonBody(c.req.raw), member);
-  if (page.row_count >= 500) throw new HttpError(422, "table_row_limit", "Tables are limited to 500 rows in v1.");
+  if (page.row_count >= TABLE_MAX_ROWS) {
+    throw new HttpError(422, "table_row_limit", `Tables are limited to ${TABLE_MAX_ROWS} rows.`);
+  }
   const id = crypto.randomUUID();
   const position = page.next_position;
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
@@ -1524,21 +1949,37 @@ function typedCell(
   throw new HttpError(422, "invalid_cell", "Unknown column type.");
 }
 
+// `requireChanges` is the single-statement contract every per-cell route relies on and
+// must stay the default. The bulk route is the one caller that turns it off, because
+// changes() reports only the statement immediately before the bump: with several
+// statements it would read whichever one happened to land last and silently refuse to
+// advance the revision on a request that did write rows.
+//
+// Dropping it is safe there, and only there, because every bulk statement inserts
+// freshly generated ids that cannot match zero rows, and each carries the same
+// leaseGuards() predicate as the bump inside one D1 batch, which is one transaction.
+// So the inserts apply exactly when the guard holds, which is exactly when the bump
+// applies. Adding an update or delete to that route would reintroduce a statement that
+// can legitimately match nothing, and this reasoning would have to be redone.
 async function guardedBatch(
   env: Env,
   pageId: string,
   input: { expectedRevision: number; tokenHash: string; sessionId: string },
-  prepareMutation: (guardedAt: number) => D1PreparedStatement,
+  prepareMutation: (guardedAt: number) => D1PreparedStatement | D1PreparedStatement[],
+  options: { requireChanges?: boolean } = {},
 ) {
+  const requireChanges = options.requireChanges ?? true;
   const guardedAt = now();
+  const prepared = prepareMutation(guardedAt);
+  const mutations = Array.isArray(prepared) ? prepared : [prepared];
   const results = await env.DB.batch([
-    prepareMutation(guardedAt),
+    ...mutations,
     // changes() is the row count of the statement immediately before this one
     // in the batch, so the revision only advances when the mutation applied and
     // a mutation can never commit without advancing the revision.
     env.DB.prepare(
       `UPDATE table_state SET revision = revision + 1
-        WHERE page_id = ? AND revision = ? AND changes() > 0 AND ${leaseGuards()}`,
+        WHERE page_id = ? AND revision = ?${requireChanges ? " AND changes() > 0" : ""} AND ${leaseGuards()}`,
     ).bind(pageId, input.expectedRevision, pageId, input.expectedRevision, input.tokenHash, input.sessionId, guardedAt),
     // Read the state inside the same batch so a failure is classified against
     // what the guards actually saw, not against a later change.
@@ -1552,11 +1993,13 @@ async function guardedBatch(
          FROM table_state s WHERE s.page_id = ?`,
     ).bind(input.tokenHash, input.sessionId, guardedAt, pageId),
   ]);
-  const mutationApplied = Boolean(results[0]?.meta.changes);
-  const revisionUpdated = Boolean(results[1]?.meta.changes);
+  const revisionUpdated = Boolean(results[mutations.length]?.meta.changes);
+  // Without changes() there is nothing to distinguish "the write missed" from "the
+  // guard failed", and for insert-only statements the two coincide.
+  const mutationApplied = requireChanges ? Boolean(results[mutations.length - 1]?.meta.changes) : revisionUpdated;
   if (mutationApplied && revisionUpdated) return input.expectedRevision + 1;
 
-  const state = results[2]?.results[0] as { revision: number; lease_valid: number } | undefined;
+  const state = results[mutations.length + 1]?.results[0] as { revision: number; lease_valid: number } | undefined;
   if (!state?.lease_valid) {
     throw new HttpError(409, "table_lease_lost", "The editing lease was lost. Reloaded the authoritative table.");
   }
@@ -1659,6 +2102,11 @@ export default {
     context.waitUntil(
       processDueDeletionJobs(env).catch((error) => {
         console.error("Scheduled deletion cleanup failed", error);
+      }),
+    );
+    context.waitUntil(
+      pruneBulkWriteReceipts(env).catch((error) => {
+        console.error("Scheduled bulk write receipt prune failed", error);
       }),
     );
   },

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "./env";
-import { processDeletionJob } from "./cleanup";
+import { processDeletionJob, pruneBulkWriteReceipts } from "./cleanup";
 
 describe("deletion job cleanup", () => {
   afterEach(() => {
@@ -96,5 +96,31 @@ describe("deletion job cleanup", () => {
 
     expect(env.BUCKET.delete).toHaveBeenCalledWith("attachments/file");
     expect(queries.some((query) => query.includes("SELECT location_hint FROM workspaces"))).toBe(false);
+  });
+});
+
+describe("bulk write receipt pruning", () => {
+  it("deletes only receipts older than the retention window", async () => {
+    const run = vi.fn(async () => ({}));
+    const bind = vi.fn((_cutoff: number) => ({ run }));
+    const prepare = vi.fn(() => ({ bind }));
+    const env = { DB: { prepare } } as unknown as Env;
+
+    await pruneBulkWriteReceipts(env, 1_000);
+
+    expect(prepare).toHaveBeenCalledWith(expect.stringContaining("DELETE FROM table_bulk_writes"));
+    expect(bind).toHaveBeenCalledWith(1_000);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("defaults the cutoff to the retention window before now", async () => {
+    const run = vi.fn(async () => ({}));
+    const bind = vi.fn((_cutoff: number) => ({ run }));
+    const env = { DB: { prepare: vi.fn(() => ({ bind })) } } as unknown as Env;
+
+    await pruneBulkWriteReceipts(env);
+
+    expect(bind).toHaveBeenCalledWith(expect.any(Number));
+    expect(bind.mock.calls[0]?.[0]).toBeLessThan(Date.now());
   });
 });

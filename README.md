@@ -12,7 +12,7 @@ The editor is BlockNote backed by Yjs. Each document epoch has one hibernating `
 - Merged update chunks, 30-second R2 compaction, structured D1 search/reference projection, 16/24 MiB warnings and limits, automatic versions, comparison, and epoch-safe restore.
 - Realtime page-tree metadata, unified page/member mentions, backlinks, authorized hover previews, and a cursor-based mention inbox.
 - Private R2 attachments with authorization, all HTTP range forms, conditional ETags, safe disposition, `nosniff`, MIME rejection, and a 10 MiB limit.
-- Full-page typed tables with 60-second single-editor leases, revision conflicts, owner force unlock, local filtering/sorting, and a 500-row limit.
+- Full-page typed tables with 60-second single-editor leases, revision conflicts, owner force unlock, server-side paging and sorting, replayable bulk writes, and a 20,000-row limit.
 
 This is an early v1 implementation. Production billing-grade hibernation verification and high-concurrency load tests still require a deployed Workers Paid account.
 
@@ -95,7 +95,7 @@ day-to-day operations, troubleshooting, observability, and backup and recovery. 
 - 30 live connections per document epoch.
 - Document warning at 16 MiB; server read-only at 24 MiB.
 - 10 MiB single-request file uploads.
-- 500 table rows, loaded and sorted in the browser.
+- 20,000 table rows, read 500 at a time and sorted by the server.
 - Server durability has a crash-only in-memory window of at most the configured five-second save debounce; IndexedDB resynchronizes surviving client edits.
 - Search, backlinks, mentions, and previews follow document compaction rather than every keystroke.
 - A workspace location hint affects only first Durable Object placement and is not a residency guarantee.

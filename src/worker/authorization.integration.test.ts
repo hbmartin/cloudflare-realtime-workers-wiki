@@ -102,6 +102,10 @@ describe("authorization matrix", () => {
         `/api/pages/${installed.pageId}/restore-version`,
         { method: "POST", body: JSON.stringify({ versionId: "missing" }) },
       ],
+      [
+        `/api/tables/${installed.pageId}/bulk`,
+        { method: "POST", body: JSON.stringify({ leaseToken: "none", expectedRevision: 1, rows: [{ cells: {} }] }) },
+      ],
     ];
     for (const [path, init] of mutations) {
       const response = await SELF.fetch(

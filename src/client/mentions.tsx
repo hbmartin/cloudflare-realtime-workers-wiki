@@ -1,6 +1,7 @@
 import { BlockNoteSchema, defaultBlockSpecs, defaultInlineContentSpecs, defaultStyleSpecs } from "@blocknote/core";
 import { createReactInlineContentSpec } from "@blocknote/react";
 import { useState } from "react";
+import { mentionInlineConfig } from "../shared/mention-spec";
 import type { PagePreview } from "../shared/types";
 import { api } from "./api";
 
@@ -81,28 +82,17 @@ function MentionChip({
   );
 }
 
-const mentionInlineSpec = createReactInlineContentSpec(
-  {
-    type: "mention",
-    content: "none",
-    propSchema: {
-      entityType: { default: "page", values: ["page", "user"] as const },
-      entityId: { default: "" },
-      label: { default: "" },
-    },
-  } as const,
-  {
-    render: ({ inlineContent, contentRef }) => (
-      <MentionChip
-        entityType={inlineContent.props.entityType}
-        entityId={inlineContent.props.entityId}
-        label={inlineContent.props.label}
-        contentRef={contentRef}
-      />
-    ),
-    toExternalHTML: ({ inlineContent, contentRef }) => <span ref={contentRef}>@{inlineContent.props.label}</span>,
-  },
-);
+const mentionInlineSpec = createReactInlineContentSpec(mentionInlineConfig, {
+  render: ({ inlineContent, contentRef }) => (
+    <MentionChip
+      entityType={inlineContent.props.entityType}
+      entityId={inlineContent.props.entityId}
+      label={inlineContent.props.label}
+      contentRef={contentRef}
+    />
+  ),
+  toExternalHTML: ({ inlineContent, contentRef }) => <span ref={contentRef}>@{inlineContent.props.label}</span>,
+});
 
 export const notesSchema = BlockNoteSchema.create({
   blockSpecs: defaultBlockSpecs,

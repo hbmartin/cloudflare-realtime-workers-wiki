@@ -188,17 +188,18 @@ before they reach it. Pages accumulate size from embedded images and long edit h
 
 ## Capacity review
 
-| Resource      | Limit                                     | Check                                     |
-| ------------- | ----------------------------------------- | ----------------------------------------- |
-| D1 database   | 10 GB                                     | Cloudflare dashboard, D1 metrics          |
-| Document size | 16 MiB warn / 24 MiB read-only            | Query above                               |
-| Table rows    | 500 per table, enforced on read and write | A table over the limit becomes unreadable |
-| Attachments   | 10 MiB per upload                         | Rejected with `upload_too_large`          |
-| Connections   | 30 per document epoch                     | Excess closed with `4429`                 |
-| Versions      | 30 days, 200 per page                     | Pruned during compaction                  |
+| Resource      | Limit                              | Check                            |
+| ------------- | ---------------------------------- | -------------------------------- |
+| D1 database   | 10 GB                              | Cloudflare dashboard, D1 metrics |
+| Document size | 16 MiB warn / 24 MiB read-only     | Query above                      |
+| Table rows    | 20000 per table, enforced on write | Rejected with `table_row_limit`  |
+| Attachments   | 10 MiB per upload                  | Rejected with `upload_too_large` |
+| Connections   | 30 per document epoch              | Excess closed with `4429`        |
+| Versions      | 30 days, 200 per page              | Pruned during compaction         |
 
-A table that exceeds 500 rows through an out-of-band write becomes unreadable, not merely
-unwritable — the read path enforces the same limit. Do not insert table rows directly in D1.
+Table reads are paged, so a table that grows past the write limit through an out-of-band
+write still reads back correctly. Inserting table rows directly in D1 is still unwise: it
+bypasses the lease and revision guards, so a concurrent editor's write can be lost.
 
 ## Load testing safely
 

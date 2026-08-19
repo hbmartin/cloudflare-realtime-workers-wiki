@@ -13,7 +13,8 @@ import {
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
-import type { TableLeaseResponse, TableLeaseTiming } from "../shared/types";
+import { TABLE_BULK_MAX_ROWS } from "../shared/table-limits";
+import type { TableData, TableLeaseResponse, TableLeaseTiming } from "../shared/types";
 import { processDeletionJob } from "./cleanup";
 import worker from "./index";
 
@@ -87,6 +88,73 @@ async function acquireLease(cookie: string, pageId: string) {
   const response = await SELF.fetch(authenticatedRequest(cookie, `/api/tables/${pageId}/lease`, { method: "POST" }));
   expect(response.status).toBe(200);
   return response.json<TableLeaseResponse>();
+}
+
+// Seeds many rows straight into D1, batched so one call does not exceed D1's limits.
+// Paging needs hundreds of rows and the row API is one lease-guarded request each.
+async function seedRows(
+  installed: InstalledWorkspace,
+  pageId: string,
+  count: number,
+  cell?: { columnId: string; value: (index: number) => string | null },
+) {
+  const timestamp = Date.now();
+  const ids: string[] = [];
+  for (let start = 0; start < count; start += 50) {
+    const statements: D1PreparedStatement[] = [];
+    for (let index = start; index < Math.min(start + 50, count); index += 1) {
+      const rowId = crypto.randomUUID();
+      ids.push(rowId);
+      statements.push(
+        env.DB.prepare(
+          `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        ).bind(rowId, pageId, index, installed.userId, timestamp, timestamp),
+      );
+      const value = cell?.value(index);
+      if (cell && value !== null && value !== undefined) {
+        statements.push(
+          env.DB.prepare(
+            `INSERT INTO table_cells (row_id, column_id, text_value, updated_at) VALUES (?, ?, ?, ?)`,
+          ).bind(rowId, cell.columnId, value, timestamp),
+        );
+      }
+    }
+    await env.DB.batch(statements);
+  }
+  return ids;
+}
+
+// Reads a table page, returning the parsed body either way so a test can assert on
+// the error code without a second branch.
+async function readTable(cookie: string, pageId: string, query = "") {
+  const response = await SELF.fetch(authenticatedRequest(cookie, `/api/tables/${pageId}${query}`));
+  return {
+    status: response.status,
+    body: await response.json<{ table: TableData; error?: { code: string } }>(),
+  };
+}
+
+// Posts a bulk table write, returning the parsed body either way.
+async function bulkWrite(cookie: string, pageId: string, body: Record<string, unknown>) {
+  const response = await SELF.fetch(
+    authenticatedRequest(cookie, `/api/tables/${pageId}/bulk`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+  return {
+    status: response.status,
+    body: await response.json<{
+      revision: number;
+      replayed: boolean;
+      columns: { id: string; ref: string | null; options: { id: string; label: string }[] }[];
+      rows: { id: string; position: number }[];
+      counts: { columns: number; options: number; rows: number; cells: number };
+      error?: { code: string };
+    }>(),
+  };
 }
 
 type TableSeed = { column?: "text" | "select"; option?: string; row?: boolean };
@@ -2123,6 +2191,276 @@ describe("Worker integration", () => {
     } finally {
       await env.DB.prepare(`DROP TRIGGER IF EXISTS ${triggerName}`).run();
     }
+  });
+
+  it("serves a table past the old 500-row ceiling instead of refusing to read it", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    await seedRows(installed, tablePage.id, 600);
+
+    const { status, body } = await readTable(installed.cookie, tablePage.id, "?count=true");
+
+    expect(status).toBe(200);
+    expect(body.table.rows).toHaveLength(500);
+    expect(body.table.rowCount).toBe(600);
+    expect(body.table.hasMore).toBe(true);
+    expect(body.table.nextCursor).not.toBeNull();
+  });
+
+  it("walks every row exactly once through the keyset cursor", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const seeded = await seedRows(installed, tablePage.id, 300);
+
+    const seen: string[] = [];
+    let cursor: TableData["nextCursor"] = null;
+    let hasMore = true;
+    for (let page = 0; page < 10 && hasMore; page += 1) {
+      const query = cursor ? `?limit=120&afterPosition=${cursor.position}&afterId=${cursor.rowId}` : "?limit=120";
+      const { body } = await readTable(installed.cookie, tablePage.id, query);
+      seen.push(...body.table.rows.map((row) => row.id));
+      cursor = body.table.nextCursor;
+      hasMore = body.table.hasMore;
+    }
+
+    expect(hasMore).toBe(false);
+    expect(cursor).toBeNull();
+    expect(seen).toEqual(seeded);
+    expect(new Set(seen).size).toBe(seeded.length);
+  });
+
+  it("omits the row count unless the caller asks for it", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    await seedRows(installed, tablePage.id, 3);
+
+    const { body } = await readTable(installed.cookie, tablePage.id);
+
+    expect(body.table.rowCount).toBeNull();
+    expect(body.table.rows).toHaveLength(3);
+    expect(body.table.hasMore).toBe(false);
+  });
+
+  it("sorts by a column and keeps empty cells last in both directions", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const { columnId } = await seedTable(installed, tablePage.id, { column: "text" });
+    // Two filled cells either side of two blanks, so ordering cannot pass by accident.
+    const values = ["banana", null, "apple", null];
+    const seeded = await seedRows(installed, tablePage.id, 4, {
+      columnId,
+      value: (index) => values[index] ?? null,
+    });
+
+    const ascending = await readTable(installed.cookie, tablePage.id, `?sort=${columnId}&dir=asc`);
+    expect(ascending.body.table.rows.map((row) => row.cells[columnId] ?? null)).toEqual([
+      "apple",
+      "banana",
+      null,
+      null,
+    ]);
+    expect(ascending.body.table.sort).toBe(columnId);
+
+    const descending = await readTable(installed.cookie, tablePage.id, `?sort=${columnId}&dir=desc`);
+    expect(descending.body.table.rows.map((row) => row.cells[columnId] ?? null)).toEqual([
+      "banana",
+      "apple",
+      null,
+      null,
+    ]);
+    // The blanks keep their stored order rather than flipping with the sort.
+    expect(descending.body.table.rows.slice(2).map((row) => row.id)).toEqual([seeded[1], seeded[3]]);
+  });
+
+  it("rejects an unknown sort column, a half-written cursor, and an out-of-range offset", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    await seedRows(installed, tablePage.id, 2);
+
+    const unknownSort = await readTable(installed.cookie, tablePage.id, "?sort=not-a-column");
+    expect(unknownSort.status).toBe(422);
+    expect(unknownSort.body.error?.code).toBe("invalid_table_sort");
+
+    const halfCursor = await readTable(installed.cookie, tablePage.id, "?afterPosition=1");
+    expect(halfCursor.status).toBe(422);
+    expect(halfCursor.body.error?.code).toBe("invalid_table_cursor");
+
+    const deepOffset = await readTable(installed.cookie, tablePage.id, "?sort=x&offset=999999");
+    expect(deepOffset.status).toBe(422);
+
+    const oversizedLimit = await readTable(installed.cookie, tablePage.id, "?limit=5000");
+    expect(oversizedLimit.status).toBe(422);
+    expect(oversizedLimit.body.error?.code).toBe("invalid_table_cursor");
+  });
+
+  it("refuses a cursor on a sorted page, which pages by offset instead", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const { columnId } = await seedTable(installed, tablePage.id, { column: "text" });
+    await seedRows(installed, tablePage.id, 2);
+
+    const mixed = await readTable(
+      installed.cookie,
+      tablePage.id,
+      `?sort=${columnId}&afterPosition=0&afterId=${crypto.randomUUID()}`,
+    );
+
+    expect(mixed.status).toBe(422);
+    expect(mixed.body.error?.code).toBe("invalid_table_cursor");
+  });
+
+  it("writes columns, options, rows, and cells in a single bulk request", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await acquireLease(installed.cookie, tablePage.id);
+
+    const written = await bulkWrite(installed.cookie, tablePage.id, {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 1,
+      columns: [
+        { ref: "title", name: "Title", type: "text" },
+        { ref: "status", name: "Status", type: "select", options: [{ label: "Todo" }] },
+      ],
+      rows: [
+        { cells: { "ref:title": "First", "ref:status": { option: "Todo" } } },
+        // A label never declared up front is created on demand, which is what an
+        // export hands over: labels, not generated option ids.
+        { cells: { "ref:title": "Second", "ref:status": { option: "Doing" } } },
+      ],
+    });
+
+    expect(written.status).toBe(201);
+    expect(written.body.revision).toBe(2);
+    expect(written.body.counts).toEqual({ columns: 2, options: 2, rows: 2, cells: 4 });
+
+    const { body } = await readTable(installed.cookie, tablePage.id, "?count=true");
+    expect(body.table.rowCount).toBe(2);
+    const status = body.table.columns.find((column) => column.name === "Status")!;
+    expect(status.options.map((option) => option.label)).toEqual(["Todo", "Doing"]);
+    const titleColumn = body.table.columns.find((column) => column.name === "Title")!;
+    expect(body.table.rows.map((row) => row.cells[titleColumn.id])).toEqual(["First", "Second"]);
+  });
+
+  it("writes nothing at all when the expected revision is stale", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await acquireLease(installed.cookie, tablePage.id);
+
+    const conflicted = await bulkWrite(installed.cookie, tablePage.id, {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 99,
+      columns: [{ ref: "a", name: "A", type: "text" }],
+      rows: [{ cells: { "ref:a": "value" } }],
+    });
+
+    expect(conflicted.status).toBe(409);
+    expect(conflicted.body.error?.code).toBe("table_revision_conflict");
+    // The whole batch is one transaction, so a rejected write must leave no trace.
+    const { body } = await readTable(installed.cookie, tablePage.id, "?count=true");
+    expect(body.table.rowCount).toBe(0);
+    expect(body.table.columns).toHaveLength(0);
+    expect(body.table.revision).toBe(1);
+  });
+
+  it("rejects a bulk write whose lease has been lost", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    await acquireLease(installed.cookie, tablePage.id);
+
+    const rejected = await bulkWrite(installed.cookie, tablePage.id, {
+      leaseToken: "not-the-held-token",
+      expectedRevision: 1,
+      rows: [{ cells: {} }],
+    });
+
+    expect(rejected.status).toBe(409);
+    expect(rejected.body.error?.code).toBe("table_lease_lost");
+  });
+
+  it("refuses an empty bulk write rather than advancing the revision for nothing", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await acquireLease(installed.cookie, tablePage.id);
+
+    const empty = await bulkWrite(installed.cookie, tablePage.id, {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 1,
+      columns: [],
+      rows: [],
+    });
+
+    expect(empty.status).toBe(422);
+    expect(empty.body.error?.code).toBe("empty_bulk_write");
+  });
+
+  it("rejects an unknown column reference and an oversized batch", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await acquireLease(installed.cookie, tablePage.id);
+
+    const unknown = await bulkWrite(installed.cookie, tablePage.id, {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 1,
+      rows: [{ cells: { "ref:nope": "value" } }],
+    });
+    expect(unknown.status).toBe(422);
+    expect(unknown.body.error?.code).toBe("invalid_bulk_reference");
+
+    const oversized = await bulkWrite(installed.cookie, tablePage.id, {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 1,
+      rows: Array.from({ length: TABLE_BULK_MAX_ROWS + 1 }, () => ({ cells: {} })),
+    });
+    expect(oversized.status).toBe(422);
+    expect(oversized.body.error?.code).toBe("bulk_too_large");
+  });
+
+  it("replays a repeated bulk write instead of appending the rows twice", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await acquireLease(installed.cookie, tablePage.id);
+    const request = {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 1,
+      clientRequestId: "import-0007",
+      columns: [{ ref: "a", name: "A", type: "text" }],
+      rows: [{ cells: { "ref:a": "only once" } }],
+    };
+
+    const first = await bulkWrite(installed.cookie, tablePage.id, request);
+    const second = await bulkWrite(installed.cookie, tablePage.id, request);
+
+    expect(first.status).toBe(201);
+    expect(first.body.replayed).toBe(false);
+    expect(second.body.replayed).toBe(true);
+    expect(second.body.revision).toBe(first.body.revision);
+    expect(second.body.rows.map((row) => row.id)).toEqual(first.body.rows.map((row) => row.id));
+
+    const { body } = await readTable(installed.cookie, tablePage.id, "?count=true");
+    expect(body.table.rowCount).toBe(1);
+  });
+
+  it("extends its own editing lease so a long import cannot outlive it", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await acquireLease(installed.cookie, tablePage.id);
+    // Wind the lease close to expiry; a real import spends far longer than 60s.
+    const nearlyExpired = Date.now() + 5_000;
+    await env.DB.prepare(`UPDATE table_leases SET expires_at = ? WHERE page_id = ?`)
+      .bind(nearlyExpired, tablePage.id)
+      .run();
+
+    const written = await bulkWrite(installed.cookie, tablePage.id, {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 1,
+      rows: [{ cells: {} }],
+    });
+
+    expect(written.status).toBe(201);
+    const renewed = await env.DB.prepare(`SELECT expires_at FROM table_leases WHERE page_id = ?`)
+      .bind(tablePage.id)
+      .first<{ expires_at: number }>();
+    expect(renewed!.expires_at).toBeGreaterThan(nearlyExpired);
   });
 
   it("distinguishes a stale table revision from a lost editing lease", async () => {

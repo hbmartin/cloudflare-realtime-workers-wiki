@@ -20,8 +20,13 @@ describe("D1 migrations", () => {
         "page_references",
         "prevent_final_owner_demotion",
         "prevent_final_owner_removal",
+        "table_bulk_writes",
       ]),
     );
+
+    // Sorting a table joins table_cells on column_id, which the primary key cannot serve.
+    const indexes = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all<{ name: string }>();
+    expect(indexes.results.map((index) => index.name)).toContain("idx_table_cells_column");
 
     const applied = await env.DB.prepare(`SELECT name FROM d1_migrations ORDER BY id`).all<{ name: string }>();
     expect(applied.results.map((migration) => migration.name)).toEqual(

@@ -79,13 +79,15 @@ errors are normal concurrency outcomes.
 | `lease_lost` / `table_lease_lost` | 409    | The lease expired or was taken over                       | Client reacquires automatically               |
 | `table_revision_conflict`         | 409    | The table changed underneath this edit                    | Client reloads and retries once               |
 | `mutation_target_not_found`       | 404    | The row, column, or option being changed no longer exists | Normal after a concurrent delete              |
-| `table_row_limit`                 | 422    | 500-row v1 limit, enforced on read **and** write          | See below                                     |
+| `table_row_limit`                 | 422    | `TABLE_MAX_ROWS` reached; enforced on write only          | Split the table                               |
+| `invalid_table_cursor`            | 422    | Bad `limit`, `after*` cursor, or `offset` on a table read | Restart the page walk from the first page     |
+| `invalid_table_sort`              | 422    | `sort` names no column on this table, or a bad `dir`      | Reload the client; check the request          |
+| `empty_bulk_write`                | 422    | Bulk write declared neither a column nor a row            | Skip the request; it would change nothing     |
+| `bulk_too_large`                  | 422    | Bulk write exceeds the per-request column, row, cell cap  | Split into smaller batches                    |
+| `invalid_bulk_reference`          | 422    | Bulk cell names an unknown column id or `ref:` token      | Check the column was declared in the request  |
 | `invalid_cell`                    | 422    | A submitted cell value failed type validation             | Correct the cell value                        |
 | `select_required`                 | 422    | Add-option targeted a column whose type is not `select`   | Reload the client; check the request's column |
 | `table_revision_failed`           | 500    | **An invariant was violated.** See below                  | Escalate; do not retry                        |
-
-A table pushed past 500 rows by a direct D1 write becomes **unreadable**, not merely unwritable, because
-the read path enforces the same limit. Never insert table rows outside the application.
 
 `select_required` is not reachable from the UI, which offers **Add option** only on select columns.
 Seeing it means a stale client, a hand-built API call, or a column whose type changed underneath the
@@ -109,6 +111,19 @@ The data change carries the same lease and revision guards as the bump, evaluate
 timestamp. That closes the invariant in both directions: the bump cannot apply without the change
 (`changes() > 0`), and the change cannot apply without the bump (whatever the change matched on, the
 bump matches on too).
+
+### The bulk variant
+
+`POST /api/tables/:pageId/bulk` is the one route that drops `changes() > 0`, because that predicate
+reads only the statement immediately before the bump and a bulk write emits several. Dropping it is
+safe **only** because every bulk statement inserts freshly generated ids, which cannot match zero
+rows, and each carries the same lease guards as the bump inside the same transaction — so the inserts
+apply exactly when the bump does. This is why the route is append-only: adding a bulk update or
+delete would reintroduce a statement that can legitimately match nothing, and the reasoning would
+have to be redone. `mutation_target_not_found` is unreachable on this path.
+
+A bulk write also renews its own lease, so a long import cannot outlive the 60-second window. The
+renewal carries its own guard and therefore cannot revive a lease that already lapsed.
 
 **The invariant: a revision advances if and only if its paired data mutation applied.** Neither half can
 commit alone. This is what stops a failed write from silently advancing the revision, which would make
