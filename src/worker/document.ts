@@ -310,7 +310,15 @@ export class Document extends YServer {
       // a large document can outrun the 2.5-5 s first backoff and reconcile
       // twice on one delivery.
       if (this.reconciledOnStart) {
+        // The latch outlives the wake that set it: onStart reconciles on any
+        // start, not only an alarm delivery, and nothing else clears it. A
+        // start driven by a normal request therefore holds it on a live
+        // instance, and the retry that attempt armed lands here instead of the
+        // cold wake this branch was written for. Re-arm for the same reason the
+        // quiet-period branch does: the delivery consumed the stored alarm
+        // either way.
         this.reconciledOnStart = false;
+        await this.armRestoreRetry(this.metadata.restore_retry_at);
       } else if (Date.now() >= this.metadata.restore_retry_at) {
         await this.reconcilePendingRestore();
       } else {
