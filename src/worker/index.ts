@@ -1531,40 +1531,27 @@ async function guardedBatch(
   prepareMutation: (guardedAt: number) => D1PreparedStatement,
 ) {
   const guardedAt = now();
-  const mutationGuard = crypto.randomUUID();
-  let results: D1Result[];
-  try {
-    results = await env.DB.batch([
-      prepareMutation(guardedAt),
-      env.DB.prepare(
-        `UPDATE table_state SET revision = revision + 1, mutation_guard = ?
-          WHERE page_id = ? AND revision = ? AND ${leaseGuards()}`,
-      ).bind(
-        mutationGuard,
-        pageId,
-        input.expectedRevision,
-        pageId,
-        input.expectedRevision,
-        input.tokenHash,
-        input.sessionId,
-        guardedAt,
-      ),
-      env.DB.prepare(
-        `SELECT s.revision,
-           EXISTS (
-             SELECT 1 FROM table_leases l
-              WHERE l.page_id = s.page_id AND l.token_hash = ?
-                AND l.holder_session_id = ? AND l.expires_at > ?
-           ) lease_valid
-           FROM table_state s WHERE s.page_id = ?`,
-      ).bind(input.tokenHash, input.sessionId, guardedAt, pageId),
-    ]);
-  } catch (cause) {
-    if (cause instanceof Error && cause.message.includes("table_mutation_not_applied")) {
-      throw new HttpError(404, "mutation_target_not_found", "The table item being changed no longer exists.");
-    }
-    throw cause;
-  }
+  const results = await env.DB.batch([
+    prepareMutation(guardedAt),
+    // changes() is the row count of the statement immediately before this one
+    // in the batch, so the revision only advances when the mutation applied and
+    // a mutation can never commit without advancing the revision.
+    env.DB.prepare(
+      `UPDATE table_state SET revision = revision + 1
+        WHERE page_id = ? AND revision = ? AND changes() > 0 AND ${leaseGuards()}`,
+    ).bind(pageId, input.expectedRevision, pageId, input.expectedRevision, input.tokenHash, input.sessionId, guardedAt),
+    // Read the state inside the same batch so a failure is classified against
+    // what the guards actually saw, not against a later change.
+    env.DB.prepare(
+      `SELECT s.revision,
+         EXISTS (
+           SELECT 1 FROM table_leases l
+            WHERE l.page_id = s.page_id AND l.token_hash = ?
+              AND l.holder_session_id = ? AND l.expires_at > ?
+         ) lease_valid
+         FROM table_state s WHERE s.page_id = ?`,
+    ).bind(input.tokenHash, input.sessionId, guardedAt, pageId),
+  ]);
   const mutationApplied = Boolean(results[0]?.meta.changes);
   const revisionUpdated = Boolean(results[1]?.meta.changes);
   if (mutationApplied && revisionUpdated) return input.expectedRevision + 1;
@@ -1573,16 +1560,16 @@ async function guardedBatch(
   if (!state?.lease_valid) {
     throw new HttpError(409, "table_lease_lost", "The editing lease was lost. Reloaded the authoritative table.");
   }
-  if (!mutationApplied && revisionUpdated) {
-    throw new HttpError(500, "table_revision_failed", "The table revision advanced without applying the mutation.");
+  if (state.revision !== input.expectedRevision) {
+    throw new HttpError(409, "table_revision_conflict", "The table changed. Reloading before retrying the update.");
   }
-  if (!mutationApplied && state.revision === input.expectedRevision) {
+  if (!mutationApplied) {
     throw new HttpError(404, "mutation_target_not_found", "The table item being changed no longer exists.");
   }
-  if (!revisionUpdated && state.revision === input.expectedRevision) {
-    throw new HttpError(500, "table_revision_failed", "The table revision could not be advanced.");
-  }
-  throw new HttpError(409, "table_revision_conflict", "The table changed. Reloading before retrying the update.");
+  // The mutation applied but the revision update, which checks the same lease
+  // and revision plus changes() > 0, did not. Nothing in the batch can produce
+  // this; keep it distinguishable rather than misreport it as a conflict.
+  throw new HttpError(500, "table_revision_failed", "The table revision could not be advanced.");
 }
 
 async function handlePartyRequest(request: Request, env: Env) {

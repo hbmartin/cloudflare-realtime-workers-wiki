@@ -88,6 +88,47 @@ async function acquireLease(cookie: string, pageId: string) {
   return response.json<TableLeaseResponse>();
 }
 
+type TableSeed = { column?: "text" | "select"; option?: string; row?: boolean };
+
+// Seeds table structure straight into D1, bypassing the lease-guarded API, so a
+// test can start from a populated table without acquiring a lease first. Ids are
+// generated for every part; only the requested parts are inserted.
+async function seedTable(installed: InstalledWorkspace, pageId: string, seed: TableSeed) {
+  const columnId = crypto.randomUUID();
+  const rowId = crypto.randomUUID();
+  const optionId = crypto.randomUUID();
+  const timestamp = Date.now();
+  const statements: D1PreparedStatement[] = [];
+  if (seed.column) {
+    statements.push(
+      env.DB.prepare(`INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, ?, ?, 0)`).bind(
+        columnId,
+        pageId,
+        seed.column === "select" ? "Choice" : "Text",
+        seed.column,
+      ),
+    );
+  }
+  if (seed.option) {
+    statements.push(
+      env.DB.prepare(`INSERT INTO table_select_options (id, column_id, label, position) VALUES (?, ?, ?, 0)`).bind(
+        optionId,
+        columnId,
+        seed.option,
+      ),
+    );
+  }
+  if (seed.row) {
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
+      ).bind(rowId, pageId, installed.userId, timestamp, timestamp),
+    );
+  }
+  await env.DB.batch(statements);
+  return { columnId, rowId, optionId };
+}
+
 type TestDocument = {
   document: Y.Doc;
   onAlarm(): Promise<void>;
@@ -1550,25 +1591,12 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     const tableA = await createPage(installed.cookie, "table");
     const tableB = await createPage(installed.cookie, "table");
-    const columnA = crypto.randomUUID();
-    const columnB = crypto.randomUUID();
-    const rowB = crypto.randomUUID();
-    const optionB = crypto.randomUUID();
-    const timestamp = Date.now();
-    await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Text', 'text', 0)`,
-      ).bind(columnA, tableA.id),
-      env.DB.prepare(
-        `INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Choice', 'select', 0)`,
-      ).bind(columnB, tableB.id),
-      env.DB.prepare(
-        `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
-      ).bind(rowB, tableB.id, installed.userId, timestamp, timestamp),
-      env.DB.prepare(
-        `INSERT INTO table_select_options (id, column_id, label, position) VALUES (?, ?, 'Foreign', 0)`,
-      ).bind(optionB, columnB),
-    ]);
+    const { columnId: columnA } = await seedTable(installed, tableA.id, { column: "text" });
+    const {
+      columnId: columnB,
+      rowId: rowB,
+      optionId: optionB,
+    } = await seedTable(installed, tableB.id, { column: "select", option: "Foreign", row: true });
     const lease = await acquireLease(installed.cookie, tableA.id);
     expect(lease.leaseDurationMs).toBe(60_000);
     expect(lease).not.toHaveProperty("expiresAt");
@@ -1616,24 +1644,13 @@ describe("Worker integration", () => {
   it("rejects cell and option mutations after a table is archived", async () => {
     const installed = await bootstrap();
     const tablePage = await createPage(installed.cookie, "table");
-    const columnId = crypto.randomUUID();
-    const rowId = crypto.randomUUID();
-    const optionId = crypto.randomUUID();
-    const timestamp = Date.now();
-    await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Choice', 'select', 0)`,
-      ).bind(columnId, tablePage.id),
-      env.DB.prepare(
-        `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
-      ).bind(rowId, tablePage.id, installed.userId, timestamp, timestamp),
-      env.DB.prepare(`INSERT INTO table_select_options (id, column_id, label, position) VALUES (?, ?, 'Open', 0)`).bind(
-        optionId,
-        columnId,
-      ),
-    ]);
+    const { columnId, rowId, optionId } = await seedTable(installed, tablePage.id, {
+      column: "select",
+      option: "Open",
+      row: true,
+    });
     const lease = await acquireLease(installed.cookie, tablePage.id);
-    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(timestamp, tablePage.id).run();
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), tablePage.id).run();
     const mutationBody = { leaseToken: lease.leaseToken, expectedRevision: 1 };
 
     const putCell = await SELF.fetch(
@@ -1795,13 +1812,7 @@ describe("Worker integration", () => {
   it("does not advance the revision when a guarded mutation affects no rows", async () => {
     const installed = await bootstrap();
     const tablePage = await createPage(installed.cookie, "table");
-    const rowId = crypto.randomUUID();
-    const timestamp = Date.now();
-    await env.DB.prepare(
-      `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
-    )
-      .bind(rowId, tablePage.id, installed.userId, timestamp, timestamp)
-      .run();
+    const { rowId } = await seedTable(installed, tablePage.id, { row: true });
     const lease = await acquireLease(installed.cookie, tablePage.id);
     const triggerName = `ignore_delete_${rowId.replaceAll("-", "")}`;
     await env.DB.prepare(
@@ -1836,17 +1847,7 @@ describe("Worker integration", () => {
   it("distinguishes a stale table revision from a lost editing lease", async () => {
     const installed = await bootstrap();
     const tablePage = await createPage(installed.cookie, "table");
-    const columnId = crypto.randomUUID();
-    const rowId = crypto.randomUUID();
-    const timestamp = Date.now();
-    await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Text', 'text', 0)`,
-      ).bind(columnId, tablePage.id),
-      env.DB.prepare(
-        `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
-      ).bind(rowId, tablePage.id, installed.userId, timestamp, timestamp),
-    ]);
+    const { columnId, rowId } = await seedTable(installed, tablePage.id, { column: "text", row: true });
     const lease = await acquireLease(installed.cookie, tablePage.id);
     await env.DB.prepare(`UPDATE table_state SET revision = 2 WHERE page_id = ?`).bind(tablePage.id).run();
     const cellPath = `/api/tables/${tablePage.id}/cells/${rowId}/${columnId}`;
