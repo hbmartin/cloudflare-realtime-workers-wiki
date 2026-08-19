@@ -130,7 +130,7 @@ takes to clear, and whether a stalled row is broken or merely waiting.
 | Queue                        | Per tick | Backoff                                 | Effective ceiling |
 | ---------------------------- | -------- | --------------------------------------- | ----------------- |
 | `deletion_jobs`              | 10       | `min(24 h, 1 h × 2^min(attempts-1, 4))` | 16 h              |
-| `archive_disconnect_targets` | 50       | `min(1 h, 10 s × 2^min(attempts-1, 8))` | 42 min            |
+| `archive_disconnect_targets` | 50       | `min(1 h, 10 s × 2^min(attempts-1, 8))` | 42 min 40 s       |
 
 The outer `min` in each expression is never reached: the attempt clamp caps the exponent first, at
 `1 h × 2^4` and `10 s × 2^8` respectively. Read the effective ceiling column, not the outer bound.

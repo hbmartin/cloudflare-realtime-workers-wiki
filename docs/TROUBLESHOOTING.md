@@ -73,18 +73,23 @@ as a bare `500 internal_error` with no detail, so an unfamiliar 500 means checki
 Structured tables have no CRDT, so they use an explicit lease plus optimistic revisions. Most table
 errors are normal concurrency outcomes.
 
-| Code                               | Status | Meaning                                                   | Action                                 |
-| ---------------------------------- | ------ | --------------------------------------------------------- | -------------------------------------- |
-| `lease_conflict`                   | 409    | Another session holds the editing lease                   | Wait up to 60 s, or owner force-unlock |
-| `lease_lost` / `table_lease_lost`  | 409    | The lease expired or was taken over                       | Client reacquires automatically        |
-| `table_revision_conflict`          | 409    | The table changed underneath this edit                    | Client reloads and retries once        |
-| `mutation_target_not_found`        | 404    | The row, column, or option being changed no longer exists | Normal after a concurrent delete       |
-| `table_row_limit`                  | 422    | 500-row v1 limit, enforced on read **and** write          | See below                              |
-| `invalid_cell` / `select_required` | 422    | Value failed type validation                              | Correct the cell value                 |
-| `table_revision_failed`            | 500    | **An invariant was violated.** See below                  | Escalate; do not retry                 |
+| Code                              | Status | Meaning                                                   | Action                                        |
+| --------------------------------- | ------ | --------------------------------------------------------- | --------------------------------------------- |
+| `lease_conflict`                  | 409    | Another session holds the editing lease                   | Wait up to 60 s, or owner force-unlock        |
+| `lease_lost` / `table_lease_lost` | 409    | The lease expired or was taken over                       | Client reacquires automatically               |
+| `table_revision_conflict`         | 409    | The table changed underneath this edit                    | Client reloads and retries once               |
+| `mutation_target_not_found`       | 404    | The row, column, or option being changed no longer exists | Normal after a concurrent delete              |
+| `table_row_limit`                 | 422    | 500-row v1 limit, enforced on read **and** write          | See below                                     |
+| `invalid_cell`                    | 422    | A submitted cell value failed type validation             | Correct the cell value                        |
+| `select_required`                 | 422    | Add-option targeted a column whose type is not `select`   | Reload the client; check the request's column |
+| `table_revision_failed`           | 500    | **An invariant was violated.** See below                  | Escalate; do not retry                        |
 
 A table pushed past 500 rows by a direct D1 write becomes **unreadable**, not merely unwritable, because
 the read path enforces the same limit. Never insert table rows outside the application.
+
+`select_required` is not reachable from the UI, which offers **Add option** only on select columns.
+Seeing it means a stale client, a hand-built API call, or a column whose type changed underneath the
+request. Investigate the caller, not the cell.
 
 ## The table mutation guard
 
