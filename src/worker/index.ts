@@ -10,7 +10,9 @@ import {
   HttpError,
   assertSameOrigin,
   attachmentDisposition,
+  errorPayload,
   errorResponse,
+  isExpectedError,
   locationHint,
   normalizeFilename,
   now,
@@ -1590,10 +1592,13 @@ async function handlePartyRequest(request: Request, env: Env) {
   const isDocument = url.pathname.startsWith(documentPrefix);
   const isWorkspace = url.pathname.startsWith(workspacePrefix);
   if (!isDocument && !isWorkspace) return null;
+  // Declared outside the try so a failure log can name the room; decoding
+  // stays inside because a malformed escape is itself a handled failure.
+  let room: string | null = null;
   try {
     assertSameOrigin(request, env.BETTER_AUTH_URL);
     const member = await requireMember(request, env);
-    const room = decodeURIComponent(url.pathname.slice((isDocument ? documentPrefix : workspacePrefix).length));
+    room = decodeURIComponent(url.pathname.slice((isDocument ? documentPrefix : workspacePrefix).length));
     if (isDocument) {
       const separator = room.lastIndexOf("~");
       const pageId = room.slice(0, separator);
@@ -1608,7 +1613,9 @@ async function handlePartyRequest(request: Request, env: Env) {
     }
     const expiresAt = Math.min(member.session.expiresAt.getTime(), now() + 5 * 60_000);
     const placement = locationHint(member.workspace.locationHint ?? undefined);
-    return routePartykitRequest(request, env, {
+    // Awaited so a rejection from the room fetch is enveloped and logged
+    // below instead of escaping this handler as an unlogged runtime 500.
+    return await routePartykitRequest(request, env, {
       ...(placement ? { locationHint: placement } : {}),
       onBeforeConnect(incoming) {
         const headers = new Headers(incoming.headers);
@@ -1621,10 +1628,15 @@ async function handlePartyRequest(request: Request, env: Env) {
       },
     });
   } catch (error) {
-    const status = error instanceof HttpError ? error.status : 500;
-    const code = error instanceof HttpError ? error.code : "internal_error";
-    const message = error instanceof Error ? error.message : "Something went wrong.";
-    return Response.json({ error: { code, message } }, { status });
+    // Mirrors errorResponse: expected errors carry client-facing messages, and
+    // anything else is logged here (there is no Hono context yet) and answered
+    // generically. The room is an opaque id, safe to log where the cookie is not.
+    if (!isExpectedError(error)) {
+      const party = isDocument ? "document" : "workspace-events";
+      console.error(`Failed to handle ${party} party request for ${room ?? url.pathname}`, error);
+    }
+    const { status, body } = errorPayload(error);
+    return Response.json(body, { status });
   }
 }
 

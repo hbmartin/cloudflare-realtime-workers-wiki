@@ -12,15 +12,32 @@ export class HttpError extends Error {
   }
 }
 
-export function errorResponse(c: Context, error: unknown) {
+// An error whose message was written for the client. Anything else is an
+// internal failure: callers log it and answer with a generic message.
+export function isExpectedError(error: unknown): error is HttpError | ValidationError {
+  return error instanceof HttpError || error instanceof ValidationError;
+}
+
+// The status and JSON envelope for any error, independent of the framework
+// that produces the response, so the Hono error handler and the raw party
+// request path cannot drift apart.
+export function errorPayload(error: unknown) {
   if (error instanceof ValidationError) {
-    return c.json({ error: { code: "invalid_input", message: error.message } }, 422);
+    return { status: 422 as const, body: { error: { code: "invalid_input", message: error.message } } };
   }
   if (error instanceof HttpError) {
-    return c.json({ error: { code: error.code, message: error.message, details: error.details } }, error.status);
+    return {
+      status: error.status,
+      body: { error: { code: error.code, message: error.message, details: error.details } },
+    };
   }
-  console.error(error);
-  return c.json({ error: { code: "internal_error", message: "Something went wrong." } }, 500);
+  return { status: 500 as const, body: { error: { code: "internal_error", message: "Something went wrong." } } };
+}
+
+export function errorResponse(c: Context, error: unknown) {
+  if (!isExpectedError(error)) console.error(error);
+  const { status, body } = errorPayload(error);
+  return c.json(body, status);
 }
 
 export async function sha256(value: string) {

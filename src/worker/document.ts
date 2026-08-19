@@ -4,11 +4,16 @@ import { YServer } from "y-partyserver";
 import * as Y from "yjs";
 import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { joinBytes, splitBytes } from "../shared/bytes";
+import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
 const COMPACTION_DELAY_MS = 30_000;
 const ALARM_RETRY_DELAY_MS = 5_000;
+// Ceiling for the restore-reconciliation backoff. The room is read-only while a
+// restore is pending, so this also bounds how long a resident room can lag
+// behind a recovered dependency; a cold wake still reconciles in onStart.
+const RESTORE_RECONCILIATION_MAX_DELAY_MS = 5 * 60_000;
 const VERSION_INTERVAL_MS = 15 * 60_000;
 const VERSION_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const WARN_BYTES = 16 * 1024 * 1024;
@@ -27,6 +32,7 @@ interface MetaRow extends Record<string, SqlStorageValue> {
   dirty: number;
   retired: number;
   restore_pending: number;
+  restore_attempts: number;
   read_only: number;
   last_version_at: number;
   last_editor_id: string | null;
@@ -86,6 +92,7 @@ export class Document extends YServer {
       dirty INTEGER NOT NULL DEFAULT 0,
       retired INTEGER NOT NULL DEFAULT 0,
       restore_pending INTEGER NOT NULL DEFAULT 0,
+      restore_attempts INTEGER NOT NULL DEFAULT 0,
       read_only INTEGER NOT NULL DEFAULT 0,
       last_version_at INTEGER NOT NULL DEFAULT 0,
       last_editor_id TEXT
@@ -96,6 +103,9 @@ export class Document extends YServer {
     }
     if (!metaColumns.some((column) => column.name === "restore_pending")) {
       sql.exec(`ALTER TABLE document_meta ADD COLUMN restore_pending INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!metaColumns.some((column) => column.name === "restore_attempts")) {
+      sql.exec(`ALTER TABLE document_meta ADD COLUMN restore_attempts INTEGER NOT NULL DEFAULT 0`);
     }
     const hadMetadata = Boolean(
       sql.exec<{ present: number }>(`SELECT EXISTS(SELECT 1 FROM document_meta WHERE id = 1) present`).one().present,
@@ -686,8 +696,9 @@ export class Document extends YServer {
         recovery.new_key,
         recovery.pre_key,
       );
-      this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1 WHERE id = 1`);
+      this.state.storage.sql.exec(`UPDATE document_meta SET restore_pending = 1, restore_attempts = 0 WHERE id = 1`);
       this.metadata.restore_pending = 1;
+      this.metadata.restore_attempts = 0;
     });
   }
 
@@ -696,12 +707,13 @@ export class Document extends YServer {
     const retiredFlag = retired ? 1 : 0;
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(
-        `UPDATE document_meta SET retired = ?, restore_pending = 0 WHERE id = 1`,
+        `UPDATE document_meta SET retired = ?, restore_pending = 0, restore_attempts = 0 WHERE id = 1`,
         retiredFlag,
       );
       this.state.storage.sql.exec(`DELETE FROM restore_recovery WHERE id = 1`);
       this.metadata.retired = retiredFlag;
       this.metadata.restore_pending = 0;
+      this.metadata.restore_attempts = 0;
     });
   }
 
@@ -716,12 +728,28 @@ export class Document extends YServer {
 
   private async deferRestoreReconciliation(error: unknown) {
     console.error("Failed to reconcile pending document restore", error);
-    const retryAt = Date.now() + ALARM_RETRY_DELAY_MS;
+    // A purge can land during the dependency call that just failed; its
+    // storage is gone, so there is nothing left to record or arm.
+    if (this.purged) return;
+    // The attempt count lives in SQLite because this object hibernates: an
+    // in-memory count would reset to the fast first retry on every eviction,
+    // which is exactly when a long outage would keep evicting it.
+    const attempt = this.metadata.restore_attempts;
+    const retryAt = Date.now() + jitteredBackoff(attempt, ALARM_RETRY_DELAY_MS, RESTORE_RECONCILIATION_MAX_DELAY_MS);
+    try {
+      this.state.storage.sql.exec(`UPDATE document_meta SET restore_attempts = ? WHERE id = 1`, attempt + 1);
+      this.metadata.restore_attempts = attempt + 1;
+    } catch (storageError) {
+      console.error("Failed to record restore reconciliation attempt", storageError);
+    }
     // Remember the backoff so finishTransition does not pull the alarm forward
     // and retry immediately against the dependency that just failed.
     if (this.transition) this.transitionRetryAt = Math.max(this.transitionRetryAt ?? 0, retryAt);
     try {
-      await this.scheduleAlarm(retryAt);
+      // While a restore is pending the alarm only ever reconciles, so the retry
+      // replaces whatever alarm is stored: an earlier one would fire before the
+      // backoff, a later one (connection expiry, compaction) would delay it.
+      await this.state.storage.setAlarm(retryAt);
     } catch (alarmError) {
       console.error("Failed to schedule restore reconciliation", alarmError);
     }
