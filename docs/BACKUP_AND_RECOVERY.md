@@ -15,12 +15,12 @@ re-dirties the room after any failed R2/D1 write.
 
 ## Recovery point objective per plane
 
-| Plane | Worst-case loss | Mitigation |
-| --- | --- | --- |
-| D1 | Everything since the last export | Export on a schedule matching your objective |
-| R2 current snapshots | Up to the 30-second compaction interval | The Durable Object log holds the tail |
-| R2 attachments and versions | Written synchronously; no lag | — |
-| Durable Object SQLite | Up to the 5-second save debounce, on a process crash only | Connected browsers hold local Yjs state in IndexedDB and resynchronize on reconnect |
+| Plane                       | Worst-case loss                                           | Mitigation                                                                          |
+| --------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| D1                          | Everything since the last export                          | Export on a schedule matching your objective                                        |
+| R2 current snapshots        | Up to the 30-second compaction interval                   | The Durable Object log holds the tail                                               |
+| R2 attachments and versions | Written synchronously; no lag                             | —                                                                                   |
+| Durable Object SQLite       | Up to the 5-second save debounce, on a process crash only | Connected browsers hold local Yjs state in IndexedDB and resynchronize on reconnect |
 
 Cloudflare does not expose a bulk user-managed export of each Durable Object's SQLite database. The
 Durable Object remains the primary recovery source for its own flushed tail, and an R2 copy can lag

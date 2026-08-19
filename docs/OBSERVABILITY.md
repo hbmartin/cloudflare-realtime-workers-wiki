@@ -41,16 +41,16 @@ a fresh installation. Both endpoints are unauthenticated.
 
 ## What to watch
 
-| Signal | Where | Why |
-| --- | --- | --- |
-| Worker error rate | Workers metrics | The primary outage indicator |
-| Worker CPU time | Workers metrics | Compaction of large documents is the expensive path |
-| Cron invocation success | Workers → Cron Triggers | Both cleanup queues stall silently if this fails |
-| D1 database size | D1 metrics | Hard 10 GB cap; there is no sharding |
-| D1 query latency | D1 metrics | Single-threaded; search and projection writes contend |
-| R2 storage and Class A/B operations | R2 metrics | Grows with attachments, snapshots, and versions |
-| Durable Object billed duration | Durable Object metrics | Idle connected rooms should approach zero |
-| Durable Object request rate per object | Durable Object metrics | A single hot room is a single-threaded bottleneck |
+| Signal                                 | Where                   | Why                                                   |
+| -------------------------------------- | ----------------------- | ----------------------------------------------------- |
+| Worker error rate                      | Workers metrics         | The primary outage indicator                          |
+| Worker CPU time                        | Workers metrics         | Compaction of large documents is the expensive path   |
+| Cron invocation success                | Workers → Cron Triggers | Both cleanup queues stall silently if this fails      |
+| D1 database size                       | D1 metrics              | Hard 10 GB cap; there is no sharding                  |
+| D1 query latency                       | D1 metrics              | Single-threaded; search and projection writes contend |
+| R2 storage and Class A/B operations    | R2 metrics              | Grows with attachments, snapshots, and versions       |
+| Durable Object billed duration         | Durable Object metrics  | Idle connected rooms should approach zero             |
+| Durable Object request rate per object | Durable Object metrics  | A single hot room is a single-threaded bottleneck     |
 
 Durable Object billed duration deserves specific attention. Both classes set `hibernate: true`, and the
 design depends on idle rooms costing nothing. Miniflare cannot prove hibernation behavior, so this can
@@ -60,15 +60,15 @@ accrue duration, hibernation is not working and cost scales with connections rat
 
 ## Suggested alerts
 
-| Alert | Condition | Why it matters |
-| --- | --- | --- |
-| Cron failure | Scheduled invocation errors, or no successful invocation in 2 hours | Both cleanup queues stop draining; deleted content leaks and archived pages keep editors connected |
-| Sustained 5xx | Worker error rate above baseline for 5 minutes | General outage |
-| `table_revision_failed` | Any occurrence | A table mutation invariant was violated. Not transient; see [Troubleshooting](TROUBLESHOOTING.md#the-table-mutation-guard) |
-| Deletion backlog | `deletion_jobs` count above 10 | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up |
-| Stuck deletion | Any `deletion_jobs` row older than 24 hours | Past the backoff ceiling, so it is failing rather than waiting |
-| Stuck archive | Any `archive_disconnect_targets` row older than 1 hour | Past its backoff ceiling |
-| D1 size | Above 8 GB | Approaching the 10 GB cap with no migration path |
+| Alert                   | Condition                                                           | Why it matters                                                                                                             |
+| ----------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Cron failure            | Scheduled invocation errors, or no successful invocation in 2 hours | Both cleanup queues stop draining; deleted content leaks and archived pages keep editors connected                         |
+| Sustained 5xx           | Worker error rate above baseline for 5 minutes                      | General outage                                                                                                             |
+| `table_revision_failed` | Any occurrence                                                      | A table mutation invariant was violated. Not transient; see [Troubleshooting](TROUBLESHOOTING.md#the-table-mutation-guard) |
+| Deletion backlog        | `deletion_jobs` count above 10                                      | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                       |
+| Stuck deletion          | Any `deletion_jobs` row older than 24 hours                         | Past the backoff ceiling, so it is failing rather than waiting                                                             |
+| Stuck archive           | Any `archive_disconnect_targets` row older than 1 hour              | Past its backoff ceiling                                                                                                   |
+| D1 size                 | Above 8 GB                                                          | Approaching the 10 GB cap with no migration path                                                                           |
 
 The queue-based alerts have no push mechanism in this repository. Run the queries from
 [Operations](OPERATIONS.md#inspecting-the-work-queues) from an external scheduler and alert on a

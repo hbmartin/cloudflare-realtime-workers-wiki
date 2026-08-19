@@ -10,12 +10,12 @@ stored as epoch milliseconds, so the queries divide by 1000 before formatting.
 
 All member management happens in the application UI as an owner. There is no CLI.
 
-| Task | How |
-| --- | --- |
-| Invite | Owner creates an invite; it is one-use, SHA-256 hashed, and expires in 7 days |
-| Accept | Recipient opens the invite link and sets a password (8 characters minimum) |
-| Change role | Owner edits the member; roles are `owner`, `editor`, `viewer` |
-| Remove | Owner removes the member; their sessions stop authorizing on the next check |
+| Task        | How                                                                           |
+| ----------- | ----------------------------------------------------------------------------- |
+| Invite      | Owner creates an invite; it is one-use, SHA-256 hashed, and expires in 7 days |
+| Accept      | Recipient opens the invite link and sets a password (8 characters minimum)    |
+| Change role | Owner edits the member; roles are `owner`, `editor`, `viewer`                 |
+| Remove      | Owner removes the member; their sessions stop authorizing on the next check   |
 
 Role changes take effect on the next authorization, not instantly. WebSocket connections carry a grant
 of at most five minutes, so a demoted editor may retain write access for up to that long. To revoke
@@ -136,11 +136,11 @@ Confirm a tick ran by checking that queue rows advanced their `attempts` and `ne
 
 Three unrelated mechanisms are called leases. Only the first is user-facing.
 
-| Lease | Duration | Purpose |
-| --- | --- | --- |
-| Table editing lease | 60 s | Makes a structured table single-writer; tables have no CRDT |
-| Deletion-job claim | 15 min | Stops two cron runs processing the same job |
-| Archive-disconnect claim | 60 s | Same, for archive targets |
+| Lease                    | Duration | Purpose                                                     |
+| ------------------------ | -------- | ----------------------------------------------------------- |
+| Table editing lease      | 60 s     | Makes a structured table single-writer; tables have no CRDT |
+| Deletion-job claim       | 15 min   | Stops two cron runs processing the same job                 |
+| Archive-disconnect claim | 60 s     | Same, for archive targets                                   |
 
 ### Table editing leases
 
@@ -184,14 +184,14 @@ before they reach it. Pages accumulate size from embedded images and long edit h
 
 ## Capacity review
 
-| Resource | Limit | Check |
-| --- | --- | --- |
-| D1 database | 10 GB | Cloudflare dashboard, D1 metrics |
-| Document size | 16 MiB warn / 24 MiB read-only | Query above |
-| Table rows | 500 per table, enforced on read and write | A table over the limit becomes unreadable |
-| Attachments | 10 MiB per upload | Rejected with `upload_too_large` |
-| Connections | 30 per document epoch | Excess closed with `4429` |
-| Versions | 30 days, 200 per page | Pruned during compaction |
+| Resource      | Limit                                     | Check                                     |
+| ------------- | ----------------------------------------- | ----------------------------------------- |
+| D1 database   | 10 GB                                     | Cloudflare dashboard, D1 metrics          |
+| Document size | 16 MiB warn / 24 MiB read-only            | Query above                               |
+| Table rows    | 500 per table, enforced on read and write | A table over the limit becomes unreadable |
+| Attachments   | 10 MiB per upload                         | Rejected with `upload_too_large`          |
+| Connections   | 30 per document epoch                     | Excess closed with `4429`                 |
+| Versions      | 30 days, 200 per page                     | Pruned during compaction                  |
 
 A table that exceeds 500 rows through an out-of-band write becomes unreadable, not merely
 unwritable — the read path enforces the same limit. Do not insert table rows directly in D1.
