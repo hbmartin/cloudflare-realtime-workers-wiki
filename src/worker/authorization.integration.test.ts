@@ -102,6 +102,18 @@ describe("authorization matrix", () => {
         `/api/pages/${installed.pageId}/restore-version`,
         { method: "POST", body: JSON.stringify({ versionId: "missing" }) },
       ],
+      [
+        `/api/tables/${installed.pageId}/bulk`,
+        { method: "POST", body: JSON.stringify({ leaseToken: "none", expectedRevision: 1, rows: [{ cells: {} }] }) },
+      ],
+      [
+        `/api/pages/${installed.pageId}/uploads`,
+        { method: "POST", body: JSON.stringify({ name: "a.bin", mime: "application/octet-stream", size: 16 }) },
+      ],
+      [`/api/uploads/missing/parts/1`, { method: "PUT", body: JSON.stringify({}) }],
+      [`/api/uploads/missing/complete`, { method: "POST", body: JSON.stringify({}) }],
+      [`/api/uploads/missing`, { method: "DELETE" }],
+      ["/api/pages/batch", { method: "POST", body: JSON.stringify({ pages: [{ parentId: null }] }) }],
     ];
     for (const [path, init] of mutations) {
       const response = await SELF.fetch(

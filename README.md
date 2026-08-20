@@ -11,8 +11,9 @@ The editor is BlockNote backed by Yjs. Each document epoch has one hibernating `
 - Realtime BlockNote editing, awareness, local undo, offline IndexedDB, hidden-tab disconnects, server-enforced viewer read-only access, and five-minute connection reauthorization.
 - Merged update chunks, 30-second R2 compaction, structured D1 search/reference projection, 16/24 MiB warnings and limits, automatic versions, comparison, and epoch-safe restore.
 - Realtime page-tree metadata, unified page/member mentions, backlinks, authorized hover previews, and a cursor-based mention inbox.
-- Private R2 attachments with authorization, all HTTP range forms, conditional ETags, safe disposition, `nosniff`, MIME rejection, and a 10 MiB limit.
-- Full-page typed tables with 60-second single-editor leases, revision conflicts, owner force unlock, local filtering/sorting, and a 500-row limit.
+- Private R2 attachments with authorization, all HTTP range forms, conditional ETags, safe disposition, `nosniff`, MIME rejection, inline editor media, and chunked direct-to-R2 uploads for large files.
+- Full-page typed tables with 60-second single-editor leases, revision conflicts, owner force unlock, server-side paging and sorting, replayable bulk writes, and a 20,000-row limit.
+- Bulk Notion import from an HTML export: page tree, block content, inline media, internal links as mentions, and databases as typed tables, resumable and idempotent.
 
 This is an early v1 implementation. Production billing-grade hibernation verification and high-concurrency load tests still require a deployed Workers Paid account.
 
@@ -94,8 +95,8 @@ day-to-day operations, troubleshooting, observability, and backup and recovery. 
 - Workers Paid is the supported production target.
 - 30 live connections per document epoch.
 - Document warning at 16 MiB; server read-only at 24 MiB.
-- 10 MiB single-request file uploads.
-- 500 table rows, loaded and sorted in the browser.
+- 10 MiB single-request file uploads; larger files upload in parts.
+- 20,000 table rows, read 500 at a time and sorted by the server.
 - Server durability has a crash-only in-memory window of at most the configured five-second save debounce; IndexedDB resynchronizes surviving client edits.
 - Search, backlinks, mentions, and previews follow document compaction rather than every keystroke.
 - A workspace location hint affects only first Durable Object placement and is not a residency guarantee.

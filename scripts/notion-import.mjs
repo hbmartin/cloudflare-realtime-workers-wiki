@@ -1,0 +1,238 @@
+/**
+ * Imports an unpacked Notion HTML export into this workspace.
+ *
+ * Conversion runs here rather than on the Worker deliberately. Document content has
+ * exactly one ingress - the Yjs WebSocket - and parsing a large export is unbounded CPU
+ * work that does not fit the Workers execution model, so the operator's machine does the
+ * conversion and drives the ordinary authenticated API.
+ *
+ * Commands escalate in what they touch:
+ *   inspect   reads the export and reports what is in it. No network, no writes.
+ *   plan      also converts every page in memory, reporting each degradation. Still no
+ *             network, so a rule can be corrected before anything is created.
+ *   run       performs the import.
+ *   verify    re-checks an existing import against the live workspace.
+ *
+ * The export must be unpacked first: Node ships no zip reader and this repository
+ * carries no archive dependency.
+ */
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { assertSupportedNode, createImportEditor, htmlToBlocks } from "./notion-import/blocks.mjs";
+import { readExport, readPageHtml, resolveLink } from "./notion-import/export-tree.mjs";
+import { printSurvey, surveyExport } from "./notion-import/inspect.mjs";
+import { normalizeNotionHtml } from "./notion-import/normalize-html.mjs";
+import { createClient } from "./notion-import/api-client.mjs";
+import { createManifest } from "./notion-import/manifest.mjs";
+import { createReport } from "./notion-import/report.mjs";
+import { runImport } from "./notion-import/run.mjs";
+import { verifyImport } from "./notion-import/verify.mjs";
+
+const COMMANDS = new Set(["inspect", "plan", "run", "verify"]);
+
+function parseArguments(argv) {
+  const options = {
+    command: null,
+    exportDir: null,
+    baseURL: process.env.NOTES_IMPORT_BASE_URL || "http://127.0.0.1:4173",
+    email: process.env.NOTES_IMPORT_EMAIL || "",
+    parent: null,
+    limit: Number.POSITIVE_INFINITY,
+    manifest: "./notion-import.manifest.json",
+    requestsPerSecond: Number.parseInt(process.env.NOTES_IMPORT_RPS || "20", 10),
+    lingerMs: 1_200,
+    verbose: false,
+  };
+  const positional = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    const equals = argument.indexOf("=");
+    const [flag, inlineValue] =
+      argument.startsWith("--") && equals !== -1
+        ? [argument.slice(0, equals), argument.slice(equals + 1)]
+        : [argument, null];
+    const take = () => inlineValue ?? argv[(index += 1)];
+    if (flag === "--base-url") options.baseURL = take();
+    else if (flag === "--email") options.email = take();
+    else if (flag === "--parent") options.parent = take();
+    else if (flag === "--limit") options.limit = Number.parseInt(take(), 10);
+    else if (flag === "--manifest") options.manifest = take();
+    else if (flag === "--rps") options.requestsPerSecond = Number.parseInt(take(), 10);
+    else if (flag === "--linger-ms") options.lingerMs = Number.parseInt(take(), 10);
+    else if (flag === "--verbose") options.verbose = true;
+    else if (flag.startsWith("--")) throw new Error(`Unknown option ${flag}.`);
+    else positional.push(argument);
+  }
+  options.command = positional[0] ?? null;
+  options.exportDir = positional[1] ?? null;
+  return options;
+}
+
+function usage() {
+  console.error("Usage: pnpm import:notion <inspect|plan|run|verify> <export-directory> [options]");
+  console.error("");
+  console.error("  --base-url <url>   Target installation. Defaults to NOTES_IMPORT_BASE_URL.");
+  console.error("  --email <address>  Owner or editor account. Defaults to NOTES_IMPORT_EMAIL.");
+  console.error("                     The password comes from NOTES_IMPORT_PASSWORD only.");
+  console.error("  --parent <pageId>  Import beneath an existing page instead of the top level.");
+  console.error("  --limit <n>        Only process the first n pages, for a smoke test.");
+  console.error("  --manifest <path>  Where to record progress. Re-running resumes from it.");
+  console.error("  --rps <n>          Global request rate. The server has no rate limiting of its own.");
+  console.error("  --linger-ms <n>    How long to hold each document open so compaction is armed promptly.");
+  console.error("  --verbose          One line per page instead of a summary.");
+}
+
+function validate(options) {
+  if (!options.command || !COMMANDS.has(options.command)) {
+    usage();
+    process.exit(1);
+  }
+  if (!options.exportDir) {
+    console.error("Point the importer at an unpacked Notion HTML export directory.");
+    process.exit(1);
+  }
+  const root = resolve(options.exportDir);
+  if (options.exportDir.toLowerCase().endsWith(".zip")) {
+    throw new Error(
+      `Unpack the export first, for example: unzip "${options.exportDir}" -d notion-export. ` +
+        "A large Notion export also contains nested Part-N.zip files that must be unpacked too.",
+    );
+  }
+  if (!existsSync(root)) throw new Error(`No such directory: ${root}.`);
+  if (!Number.isFinite(options.limit) && options.limit !== Number.POSITIVE_INFINITY) {
+    throw new Error("--limit must be a positive integer.");
+  }
+  if (
+    !Number.isInteger(options.requestsPerSecond) ||
+    options.requestsPerSecond < 1 ||
+    options.requestsPerSecond > 200
+  ) {
+    throw new Error("--rps must be an integer between 1 and 200.");
+  }
+  if ((options.command === "run" || options.command === "verify") && !options.email) {
+    throw new Error("Set --email or NOTES_IMPORT_EMAIL to an owner or editor account.");
+  }
+  if ((options.command === "run" || options.command === "verify") && !process.env.NOTES_IMPORT_PASSWORD) {
+    throw new Error("Set NOTES_IMPORT_PASSWORD. The password is never taken from the command line.");
+  }
+  return root;
+}
+
+/**
+ * Converts every page in memory and reports what would be lost.
+ *
+ * Link targets do not exist yet at plan time, so this resolves them to a placeholder
+ * mention purely to exercise the same code path a real run takes.
+ */
+async function planImport(index, limit) {
+  const editor = await createImportEditor();
+  const issues = new Map();
+  const record = (code, detail, title) => {
+    const key = `${code}:${detail}`;
+    const entry = issues.get(key) ?? { count: 0, firstSeenIn: title };
+    entry.count += 1;
+    issues.set(key, entry);
+  };
+
+  let converted = 0;
+  let blocks = 0;
+  let failed = 0;
+  for (const page of index.pages.slice(0, limit)) {
+    try {
+      const html = normalizeNotionHtml(readPageHtml(index.root, page), {
+        onIssue: (code, detail) => record(code, detail, page.title),
+        resolveHref: (href) => {
+          const target = resolveLink(href, index);
+          if (!target) return null;
+          if (target.kind === "asset") return { type: "asset", url: `/api/attachments/planned` };
+          return { type: "page", entityId: "00000000-0000-0000-0000-000000000000", label: target.title };
+        },
+      });
+      blocks += (await htmlToBlocks(editor, html)).length;
+      converted += 1;
+    } catch (error) {
+      failed += 1;
+      record("conversion_failed", error instanceof Error ? error.message : "unknown", page.title);
+    }
+  }
+  return { converted, blocks, failed, issues };
+}
+
+function reportIssues(issues) {
+  if (!issues.size) {
+    console.log("No degradations: every construct in this export has a mapping.");
+    return;
+  }
+  console.log("Degradations, by reason:");
+  const sorted = [...issues.entries()].sort((left, right) => right[1].count - left[1].count);
+  for (const [key, entry] of sorted) {
+    console.log(`  ${key.padEnd(44)} ${String(entry.count).padStart(6)}  first in "${entry.firstSeenIn}"`);
+  }
+}
+
+assertSupportedNode();
+const options = parseArguments(process.argv.slice(2));
+const root = validate(options);
+
+console.log(`Reading ${root}.`);
+const index = readExport(root);
+
+if (options.command === "inspect") {
+  printSurvey(index, surveyExport(index));
+} else if (options.command === "plan") {
+  printSurvey(index, surveyExport(index));
+  const planned = await planImport(index, options.limit);
+  console.log(
+    `Converted ${planned.converted} of ${index.pages.length} pages into ${planned.blocks} blocks` +
+      (planned.failed ? `; ${planned.failed} failed.` : "."),
+  );
+  reportIssues(planned.issues);
+} else if (options.command === "run") {
+  const client = await createClient({
+    baseURL: options.baseURL,
+    email: options.email,
+    password: process.env.NOTES_IMPORT_PASSWORD,
+    requestsPerSecond: options.requestsPerSecond,
+  });
+  console.log(`Signed in to ${options.baseURL} as ${options.email} (${client.role}).`);
+  const manifest = createManifest({
+    path: options.manifest,
+    root,
+    baseURL: options.baseURL,
+    workspaceId: client.workspaceId,
+    rootParentId: options.parent,
+  });
+  const report = createReport({ verbose: options.verbose });
+  try {
+    const summary = await runImport({
+      index,
+      client,
+      manifest,
+      report,
+      rootParentId: options.parent,
+      limit: options.limit,
+      lingerMs: options.lingerMs,
+    });
+    report.print(summary);
+  } finally {
+    // The manifest is what makes a resume possible, so it is written even when the run
+    // fails part way through.
+    manifest.flush();
+  }
+} else {
+  const client = await createClient({
+    baseURL: options.baseURL,
+    email: options.email,
+    password: process.env.NOTES_IMPORT_PASSWORD,
+    requestsPerSecond: options.requestsPerSecond,
+  });
+  const manifest = createManifest({
+    path: options.manifest,
+    root,
+    baseURL: options.baseURL,
+    workspaceId: client.workspaceId,
+    rootParentId: options.parent,
+  });
+  const problems = await verifyImport({ client, manifest, index });
+  if (problems > 0) process.exitCode = 1;
+}

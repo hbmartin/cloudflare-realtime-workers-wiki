@@ -91,12 +91,24 @@ export type TableRow = {
   cells: Record<string, string | number | boolean | null>;
 };
 
+export type TableCursor = { position: number; rowId: string };
+
 export type TableData = {
   pageId: string;
   revision: number;
   columns: TableColumn[];
   rows: TableRow[];
   lease: { heldByMe: boolean; holderName: string | null; expiresAt: number | null };
+  /** Page size this response was built with. */
+  limit: number;
+  /** Column the rows were sorted by, or null for the stored order. */
+  sort: string | null;
+  dir: "asc" | "desc";
+  hasMore: boolean;
+  /** Keyset cursor for the next page. Null when sorting, which pages by offset. */
+  nextCursor: TableCursor | null;
+  /** Total rows, present only when the request asked for `count=true`. */
+  rowCount: number | null;
 };
 
 export type TableLeaseTiming = { leaseDurationMs: number };

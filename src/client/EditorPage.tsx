@@ -14,6 +14,7 @@ import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
 import { createDocumentCloseReconciler } from "./document-connection";
 import { notesSchema } from "./mentions";
+import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 
 export type EditorPageProps = {
   page: Page;
@@ -325,7 +326,13 @@ export function EditorPage({
           />
           {titleError && <p className="form-error">{titleError}</p>}
           {bundle ? (
-            <CollaborativeEditor bundle={bundle} member={member} editable={editable} commentsOpen={commentsVisible} />
+            <CollaborativeEditor
+              bundle={bundle}
+              member={member}
+              editable={editable}
+              commentsOpen={commentsVisible}
+              pageId={page.id}
+            />
           ) : storageError ? (
             <div className="editor-loading">
               This document cannot be opened safely until offline storage is available.
@@ -368,10 +375,8 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
 
   async function upload(file: File) {
     setBusy(true);
-    const body = new FormData();
-    body.set("file", file);
     try {
-      await api(`/api/pages/${page.id}/attachments`, { method: "POST", body });
+      await uploadAttachment(page.id, file);
       await load();
     } finally {
       setBusy(false);
@@ -381,7 +386,7 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
   return (
     <aside className="side-panel attachments-panel">
       <h2>Files</h2>
-      <p className="muted">Private workspace files, up to 10 MiB each.</p>
+      <p className="muted">Private workspace files. Large files upload in parts.</p>
       {editable && (
         <>
           <input
@@ -454,7 +459,7 @@ class ReadOnlyThreadStoreAuth extends ThreadStoreAuth {
   }
 }
 
-function editorOptions(bundle: CollaborationBundle, member: ClientMemberContext, editable: boolean) {
+function editorOptions(bundle: CollaborationBundle, member: ClientMemberContext, editable: boolean, pageId: string) {
   const threadStore = new YjsThreadStore(
     member.user.id,
     bundle.doc.getMap("comments"),
@@ -462,6 +467,14 @@ function editorOptions(bundle: CollaborationBundle, member: ClientMemberContext,
   );
   return withCollaboration({
     schema: notesSchema,
+    // Media dropped or pasted into the body becomes a real attachment on this page, so
+    // the subtree delete that already collects attachments covers inline media too.
+    uploadFile: async (file: File) => {
+      if (!editable) throw new Error("This document is read-only.");
+      const attachment = await uploadAttachment(pageId, file);
+      return `/api/attachments/${attachment.id}`;
+    },
+    resolveFileUrl: async (url: string) => resolveAttachmentUrl(url),
     collaboration: {
       fragment: bundle.doc.getXmlFragment("document-store"),
       provider: bundle.provider,
@@ -488,14 +501,16 @@ function CollaborativeEditor({
   member,
   editable,
   commentsOpen,
+  pageId,
 }: {
   bundle: CollaborationBundle;
   member: ClientMemberContext;
   editable: boolean;
   commentsOpen: boolean;
+  pageId: string;
 }) {
-  const options = useMemo(() => editorOptions(bundle, member, editable), [bundle, editable, member]);
-  const editor = useCreateBlockNote(options, [bundle, editable]);
+  const options = useMemo(() => editorOptions(bundle, member, editable, pageId), [bundle, editable, member, pageId]);
+  const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
   const getMentionItems = async (query: string) => {
     const data = await api<{ suggestions: MentionSuggestion[] }>(
       `/api/mentions/suggestions?q=${encodeURIComponent(query)}`,

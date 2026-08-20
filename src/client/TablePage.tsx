@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { TABLE_MAX_ROWS, TABLE_PAGE_DEFAULT } from "../shared/table-limits";
+import type { TableCursor } from "../shared/types";
 import type { ClientMemberContext } from "../shared/types";
 import type {
   ColumnType,
@@ -135,6 +137,14 @@ export function TablePage({
   const [revisionKnown, setRevisionKnown] = useState(false);
   const [filter, setFilter] = useState("");
   const [sortColumn, setSortColumn] = useState<string | null>(null);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  // Mirrored so `load` can read the current sort without taking it as a dependency:
+  // the mount effect keys off `load`, and rebuilding it would re-acquire the lease.
+  const sortRef = useRef<{ column: string | null; dir: "asc" | "desc" }>({ column: null, dir: "asc" });
+  sortRef.current = { column: sortColumn, dir: sortDir };
+  // Pages appended past the first. While any are loaded the background poll stands
+  // down, so browsing deep into a table is not yanked back to the top every 5s.
+  const appendedPagesRef = useRef(0);
   const [title, setTitle] = useState(page.title);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [cellResetGenerations, setCellResetGenerations] = useState<Record<string, number>>({});
@@ -245,7 +255,12 @@ export function TablePage({
       const leaseConflictGeneration = leaseConflictGenerationRef.current;
       loadsInFlightRef.current += 1;
       try {
-        const result = await api<{ table: TableData }>(`/api/tables/${page.id}`, {
+        const params = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
+        if (sortRef.current.column) {
+          params.set("sort", sortRef.current.column);
+          params.set("dir", sortRef.current.dir);
+        }
+        const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
         if (!isCurrent() || generation !== loadGenerationRef.current) return;
@@ -273,6 +288,7 @@ export function TablePage({
           }
           return changed ? next : current;
         });
+        appendedPagesRef.current = 0;
         setTable(result.table);
         setLoadError(null);
         if (result.table.lease.expiresAt === null && leaseConflictGeneration === leaseConflictGenerationRef.current) {
@@ -290,6 +306,42 @@ export function TablePage({
     },
     [markPageUnavailable, page.id],
   );
+
+  // Appends the next keyset page. Deliberately separate from `load`, which always
+  // returns to the first page so a refresh has a single, predictable meaning.
+  const loadMore = useCallback(
+    async (cursor: TableCursor) => {
+      const params = new URLSearchParams({
+        limit: String(TABLE_PAGE_DEFAULT),
+        afterPosition: String(cursor.position),
+        afterId: cursor.rowId,
+      });
+      const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (!mountedRef.current) return;
+      appendedPagesRef.current += 1;
+      setTable((current) =>
+        current
+          ? {
+              ...current,
+              rows: [...current.rows, ...result.table.rows],
+              hasMore: result.table.hasMore,
+              nextCursor: result.table.nextCursor,
+            }
+          : current,
+      );
+    },
+    [page.id],
+  );
+
+  const sortKey = `${sortColumn ?? ""}:${sortDir}`;
+  const appliedSortRef = useRef(sortKey);
+  useEffect(() => {
+    if (appliedSortRef.current === sortKey) return;
+    appliedSortRef.current = sortKey;
+    void load(isMounted).catch(() => undefined);
+  }, [isMounted, load, sortKey]);
 
   const recoverRevision = useCallback(async () => {
     if (revisionRef.current !== null) return true;
@@ -505,7 +557,7 @@ export function TablePage({
     let active = true;
     const isCurrent = () => active && mountedRef.current;
     const poll = window.setInterval(() => {
-      if (!loadsInFlightRef.current) void load(isCurrent).catch(() => undefined);
+      if (!loadsInFlightRef.current && !appendedPagesRef.current) void load(isCurrent).catch(() => undefined);
     }, 5_000);
     return () => {
       active = false;
@@ -852,14 +904,10 @@ export function TablePage({
           ),
         )
       : [...table.rows];
-    if (sortColumn)
-      rows.sort((left, right) =>
-        String(left.cells[sortColumn] ?? "").localeCompare(String(right.cells[sortColumn] ?? ""), undefined, {
-          numeric: true,
-        }),
-      );
+    // Sorting is the server's job now, so the rows arrive already ordered. The filter
+    // stays local, which is why it is labelled as covering loaded rows only.
     return rows;
-  }, [filter, sortColumn, table]);
+  }, [filter, table]);
   const tryAcquire = async () => {
     await acquire(isMounted).catch(reportLeaseError);
   };
@@ -934,9 +982,9 @@ export function TablePage({
           readOnly={!canEdit}
         />
         <div className="table-toolbar">
-          <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter rows…" />
+          <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter loaded rows…" />
           <span>
-            {visibleRows.length} / {table?.rows.length ?? 0} rows
+            {visibleRows.length} / {table?.rowCount ?? table?.rows.length ?? 0} rows
           </span>
           {editingReady && <button onClick={() => void addColumn()}>+ Property</button>}
         </div>
@@ -951,10 +999,16 @@ export function TablePage({
                     <th key={column.id}>
                       <button
                         className="column-sort"
-                        onClick={() => setSortColumn(sortColumn === column.id ? null : column.id)}
+                        onClick={() => {
+                          if (sortColumn !== column.id) {
+                            setSortColumn(column.id);
+                            setSortDir("asc");
+                          } else if (sortDir === "asc") setSortDir("desc");
+                          else setSortColumn(null);
+                        }}
                       >
                         {column.name} <small>{column.type}</small>
-                        {sortColumn === column.id ? " ↑" : ""}
+                        {sortColumn === column.id ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
                       </button>
                       {editingReady && column.type === "select" && (
                         <button
@@ -1004,8 +1058,20 @@ export function TablePage({
                 ))}
               </tbody>
             </table>
+            {table.hasMore && (
+              <button
+                className="load-more"
+                onClick={() => table.nextCursor && void loadMore(table.nextCursor).catch(() => undefined)}
+              >
+                Load more rows
+              </button>
+            )}
             {editingReady && (
-              <button className="add-row" onClick={() => void addRow()} disabled={table.rows.length >= 500}>
+              <button
+                className="add-row"
+                onClick={() => void addRow()}
+                disabled={(table.rowCount ?? table.rows.length) >= TABLE_MAX_ROWS}
+              >
                 + New row
               </button>
             )}

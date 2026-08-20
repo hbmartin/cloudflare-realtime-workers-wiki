@@ -46,7 +46,9 @@ a fresh installation. Both endpoints are unauthenticated.
 | -------------------------------------- | ----------------------- | ----------------------------------------------------- |
 | Worker error rate                      | Workers metrics         | The primary outage indicator                          |
 | Worker CPU time                        | Workers metrics         | Compaction of large documents is the expensive path   |
-| Cron invocation success                | Workers → Cron Triggers | Both cleanup queues stall silently if this fails      |
+| Cron invocation success                | Workers → Cron Triggers | Every queue and reaper stalls silently if this fails  |
+| R2 Class A operations                  | R2 metrics              | Every uploaded part is one, so multipart moves this   |
+| Incomplete multipart uploads           | `attachment_uploads`    | Parts R2 still holds for uploads nobody finished      |
 | D1 database size                       | D1 metrics              | Hard 10 GB cap; there is no sharding                  |
 | D1 query latency                       | D1 metrics              | Single-threaded; search and projection writes contend |
 | R2 storage and Class A/B operations    | R2 metrics              | Grows with attachments, snapshots, and versions       |
@@ -69,6 +71,7 @@ accrue duration, hibernation is not working and cost scales with connections rat
 | Deletion backlog        | `deletion_jobs` count above 10                                                                            | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                                 |
 | Stuck deletion          | Any `deletion_jobs` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5              | Overdue by more than a cron interval, so the runner is not clearing it; `attempts` past the clamp means it is at the 16-hour ceiling |
 | Stuck archive           | Any `archive_disconnect_targets` row with `next_attempt_at` more than 2 hours past, or `attempts` above 9 | Same, against the 42 min 40 s ceiling                                                                                                |
+| Stuck upload            | Any `attachment_uploads` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5         | The reaper is not clearing it, so R2 keeps holding the parts                                                                         |
 | D1 size                 | Above 8 GB                                                                                                | Approaching the 10 GB cap with no migration path                                                                                     |
 
 The queue-based alerts have no push mechanism in this repository. Run the queries from

@@ -84,7 +84,7 @@ Rotate during low traffic. Do not rotate while a version restore is in progress.
 
 ## Inspecting the work queues
 
-Two D1 tables are the system's asynchronous work queues. Neither has a UI, and both are the first place
+Three D1 tables are the system's asynchronous work queues. None has a UI, and they are the first place
 to look when cleanup appears stuck. See [Configuration](CONFIGURATION.md#cron-drain-rates-and-backoff)
 for the drain rates that tell "stuck" from "backed off".
 
@@ -107,6 +107,26 @@ pnpm wrangler d1 execute DB --remote --command \
 
 `kind` is one of `document_do`, `r2_object`, or `r2_prefix`. `last_error` is truncated to 1000
 characters. A healthy installation has zero rows in both queries.
+
+### Abandoned uploads
+
+A chunked upload holds R2 parts from the moment it starts until it completes or is aborted. Each
+accepted part pushes the row's deadline out, so only an upload nobody is still feeding becomes due.
+
+```sh
+pnpm wrangler d1 execute DB --remote --command \
+  "SELECT id, page_id, name, size, part_count, attempts,
+          datetime(next_attempt_at/1000,'unixepoch') AS next_attempt, last_error
+     FROM attachment_uploads ORDER BY next_attempt_at;"
+```
+
+Rows here are normal while people are uploading. A row whose `next_attempt_at` is more than a cron
+interval in the past is one the reaper is failing to clear; `last_error` says why.
+
+**Configure an R2 lifecycle rule to abort incomplete multipart uploads after 7 days.** The reaper
+covers every session it has a row for, but a row lost to a D1 restore would otherwise leave its parts
+held indefinitely with nothing left to find them by. The lifecycle rule is the backstop for that case
+and is set in the Cloudflare dashboard under R2 → your bucket → Settings.
 
 Do not delete a job manually unless every one of its targets has been independently verified as gone.
 Removing the job is the only record that the work is outstanding.
@@ -188,17 +208,60 @@ before they reach it. Pages accumulate size from embedded images and long edit h
 
 ## Capacity review
 
-| Resource      | Limit                                     | Check                                     |
-| ------------- | ----------------------------------------- | ----------------------------------------- |
-| D1 database   | 10 GB                                     | Cloudflare dashboard, D1 metrics          |
-| Document size | 16 MiB warn / 24 MiB read-only            | Query above                               |
-| Table rows    | 500 per table, enforced on read and write | A table over the limit becomes unreadable |
-| Attachments   | 10 MiB per upload                         | Rejected with `upload_too_large`          |
-| Connections   | 30 per document epoch                     | Excess closed with `4429`                 |
-| Versions      | 30 days, 200 per page                     | Pruned during compaction                  |
+| Resource      | Limit                              | Check                            |
+| ------------- | ---------------------------------- | -------------------------------- |
+| D1 database   | 10 GB                              | Cloudflare dashboard, D1 metrics |
+| Document size | 16 MiB warn / 24 MiB read-only     | Query above                      |
+| Table rows    | 20000 per table, enforced on write | Rejected with `table_row_limit`  |
+| Attachments   | 10 MiB single-shot, 10 GiB chunked | Rejected with `upload_too_large` |
+| Connections   | 30 per document epoch              | Excess closed with `4429`        |
+| Versions      | 30 days, 200 per page              | Pruned during compaction         |
 
-A table that exceeds 500 rows through an out-of-band write becomes unreadable, not merely
-unwritable — the read path enforces the same limit. Do not insert table rows directly in D1.
+Table reads are paged, so a table that grows past the write limit through an out-of-band
+write still reads back correctly. Inserting table rows directly in D1 is still unwise: it
+bypasses the lease and revision guards, so a concurrent editor's write can be lost.
+
+## Importing a Notion export
+
+`pnpm import:notion` converts an unpacked Notion **HTML** export and drives the ordinary API. Conversion
+runs on the operator's machine: document content has exactly one ingress, the Yjs WebSocket, and parsing a
+large export is unbounded CPU work that does not fit a Worker.
+
+```sh
+unzip "Export-....zip" -d notion-export          # large exports also contain nested Part-N.zip files
+pnpm import:notion inspect notion-export         # what is in the export, and what each construct becomes
+pnpm import:notion plan    notion-export         # converts everything in memory; reports every degradation
+NOTES_IMPORT_PASSWORD=... pnpm import:notion run notion-export \
+  --base-url https://notes.example.com --email owner@example.com
+pnpm import:notion verify notion-export --base-url https://notes.example.com --email owner@example.com
+```
+
+Run `inspect` and `plan` first. Neither touches the network, and `plan` is where a construct this
+installation cannot represent shows up — while it is still free to do something about it.
+
+| Setting                 | Meaning                                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `NOTES_IMPORT_PASSWORD` | Required for `run` and `verify`. Never accepted as a flag.                                                                           |
+| `--email`               | An owner or editor. A viewer is rejected before anything is created.                                                                 |
+| `--manifest <path>`     | Progress record. Re-running with the same manifest resumes; default `./notion-import.manifest.json`.                                 |
+| `--parent <pageId>`     | Import beneath an existing page instead of at the top level.                                                                         |
+| `--limit <n>`           | Import only the first n pages, for a smoke test.                                                                                     |
+| `--rps <n>`             | Request rate, default 20. **The Worker has no rate limiting and never returns 429, so this is the only backpressure in the system.** |
+
+**Re-running is safe.** Pages already created are skipped, attachments are matched by name against what the
+page already has, and content is re-pushed only if it differs — block ids are derived from the source, so an
+unchanged page produces no Yjs update at all. A manifest is refused if the export it was created from has
+changed, since the Notion-to-page mapping would no longer hold.
+
+**What an export cannot carry.** Notion never includes comments, version history, permissions, or custom
+emoji in an export, and omits pages the exporting user cannot see. Those cannot be migrated by any importer.
+Column layouts flatten, callouts become quotes, and equations are kept as LaTeX source; each is counted in
+the final report with the first page it appeared in.
+
+**Order matters and is enforced.** Every page is created before any content is written, because a mention
+whose target does not yet exist produces no backlink and is not repaired until the source page is next
+edited. Search, backlinks, and previews follow the 30-second compaction alarm rather than the import's
+writes, so `verify` immediately after a run will legitimately report pages with no searchable text yet.
 
 ## Load testing safely
 

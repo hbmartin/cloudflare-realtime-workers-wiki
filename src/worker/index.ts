@@ -1,9 +1,18 @@
-import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
+import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
-import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
+import {
+  isInlineMime,
+  isUnsafeMime,
+  MAX_ATTACHMENT_BYTES,
+  MAX_UPLOAD_BYTES,
+  processDueUploadReaps,
+  resolvePartSize,
+  UPLOAD_SESSION_TTL_MS,
+} from "./attachments";
+import { processDeletionJob, processDueDeletionJobs, pruneBulkWriteReceipts } from "./cleanup";
 import { Document } from "./document";
 import type { Env, MemberContext } from "./env";
 import {
@@ -18,6 +27,16 @@ import {
   now,
   sha256,
 } from "./http";
+import {
+  TABLE_BULK_MAX_BODY_BYTES,
+  TABLE_BULK_MAX_CELLS,
+  TABLE_BULK_MAX_COLUMNS,
+  TABLE_BULK_MAX_ROWS,
+  TABLE_MAX_ROWS,
+  TABLE_PAGE_DEFAULT,
+  TABLE_PAGE_MAX,
+  TABLE_SORT_MAX_OFFSET,
+} from "../shared/table-limits";
 import { columnType, documentRoom, ID_PATTERN, nullableId, object, pageKind, role, text } from "../shared/validation";
 import type { ClientMemberContext, Page, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
@@ -25,31 +44,11 @@ import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 
 const app = new Hono<{ Bindings: Env }>();
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const DELETION_TARGET_BATCH_SIZE = 50;
+// Each page costs two or three statements, so this stays far inside D1's per-invocation
+// query ceiling while still collapsing a tree level into one request.
+const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
-const UNSAFE_MIME_TYPES = new Set([
-  "text/html",
-  "image/svg+xml",
-  "application/xhtml+xml",
-  "application/javascript",
-  "application/x-javascript",
-  "text/javascript",
-]);
-const UNSAFE_FILE_EXTENSIONS = new Set([
-  ".html",
-  ".htm",
-  ".htx",
-  ".xhtml",
-  ".xht",
-  ".svg",
-  ".svgz",
-  ".xml",
-  ".js",
-  ".jse",
-  ".mjs",
-  ".cjs",
-]);
 
 type PageRow = {
   id: string;
@@ -197,6 +196,119 @@ async function leaseInputs(body: Record<string, unknown>, member: MemberContext)
     throw new HttpError(422, "invalid_revision", "expectedRevision must be a positive integer.");
   }
   return { body, expectedRevision, tokenHash: await sha256(leaseToken), sessionId: member.session.id };
+}
+
+// Sorting targets a caller-supplied column, so the value expression is chosen from
+// this fixed map keyed by the column's declared type and is never interpolated from
+// request input.
+const SORT_VALUE_EXPRESSIONS: Record<string, string> = {
+  text: "sort_cell.text_value",
+  number: "sort_cell.number_value",
+  checkbox: "sort_cell.boolean_value",
+  date: "sort_cell.date_value",
+  select: "(SELECT o.label FROM table_select_options o WHERE o.id = sort_cell.select_value)",
+};
+
+type TableRowQuery = {
+  sql: string;
+  binds: unknown[];
+  limit: number;
+  offset: number;
+  sort: string | null;
+  dir: "asc" | "desc";
+};
+
+// Builds the row query, which the cell read reuses as a derived table.
+//
+// Two paging modes, because they are not interchangeable. The default order is
+// (position, id), backed by idx_table_rows_page, so a keyset cursor is exact, stays
+// cheap at any depth, and is stable while rows are appended - that is the path an
+// importer or an export loop walks. An arbitrary-column sort cannot be keyset-paged
+// cheaply across five typed value columns, and its only caller is a human scrolling a
+// sorted view, so it pages by offset with a hard depth cap instead.
+function buildTableRowQuery(
+  pageId: string,
+  columns: { id: string; type: string }[],
+  query: Record<string, string | undefined>,
+): TableRowQuery {
+  const limit = query.limit === undefined ? TABLE_PAGE_DEFAULT : Number(query.limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > TABLE_PAGE_MAX) {
+    throw new HttpError(422, "invalid_table_cursor", `limit must be an integer between 1 and ${TABLE_PAGE_MAX}.`);
+  }
+  const dir = query.dir ?? "asc";
+  if (dir !== "asc" && dir !== "desc") {
+    throw new HttpError(422, "invalid_table_sort", "dir must be asc or desc.");
+  }
+  const sortColumn = query.sort === undefined ? undefined : columns.find((column) => column.id === query.sort);
+  if (query.sort !== undefined && !sortColumn) {
+    throw new HttpError(422, "invalid_table_sort", "The sort column does not belong to this table.");
+  }
+
+  const afterId = query.afterId;
+  const afterPosition = query.afterPosition === undefined ? null : Number(query.afterPosition);
+  if ((query.afterPosition === undefined) !== (afterId === undefined)) {
+    throw new HttpError(422, "invalid_table_cursor", "The table page cursor is incomplete.");
+  }
+  if (afterPosition !== null && !Number.isInteger(afterPosition)) {
+    throw new HttpError(422, "invalid_table_cursor", "The table page cursor is invalid.");
+  }
+  if (afterId !== undefined && (!afterId || afterId.length > 100)) {
+    throw new HttpError(422, "invalid_table_cursor", "The table page cursor is invalid.");
+  }
+  if (afterPosition !== null && sortColumn) {
+    throw new HttpError(422, "invalid_table_cursor", "A sorted table page uses offset, not a cursor.");
+  }
+
+  const offset = query.offset === undefined ? 0 : Number(query.offset);
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new HttpError(422, "invalid_table_cursor", "offset must be a non-negative integer.");
+  }
+  if (offset > 0 && !sortColumn) {
+    throw new HttpError(422, "invalid_table_cursor", "offset is only valid together with sort.");
+  }
+  if (offset + limit > TABLE_SORT_MAX_OFFSET) {
+    throw new HttpError(
+      422,
+      "invalid_table_cursor",
+      `A sorted table page cannot reach beyond row ${TABLE_SORT_MAX_OFFSET}.`,
+    );
+  }
+
+  if (!sortColumn) {
+    return {
+      sql: `SELECT r.id, r.position FROM table_rows r
+             WHERE r.page_id = ?
+               AND (? IS NULL OR r.position > ? OR (r.position = ? AND r.id > ?))
+             ORDER BY r.position, r.id LIMIT ? OFFSET ?`,
+      binds: [pageId, afterPosition, afterPosition, afterPosition, afterId ?? null],
+      limit,
+      offset: 0,
+      sort: null,
+      dir,
+    };
+  }
+
+  const value = SORT_VALUE_EXPRESSIONS[sortColumn.type];
+  if (!value) throw new HttpError(422, "invalid_table_sort", "That column type cannot be sorted.");
+  // Empty cells sort last in both directions: the NULL grouping deliberately does not
+  // take the sort direction, so reversing a sort does not drag every blank to the top.
+  return {
+    sql: `SELECT r.id, r.position FROM table_rows r
+           LEFT JOIN table_cells sort_cell ON sort_cell.row_id = r.id AND sort_cell.column_id = ?
+           WHERE r.page_id = ?
+           ORDER BY (CASE WHEN ${value} IS NULL THEN 1 ELSE 0 END), ${value} ${dir === "desc" ? "DESC" : "ASC"},
+                    r.position, r.id
+           LIMIT ? OFFSET ?`,
+    binds: [sortColumn.id, pageId],
+    limit,
+    offset,
+    sort: sortColumn.id,
+    dir,
+  };
+}
+
+function tableRowBinds(query: TableRowQuery, limit: number) {
+  return [...query.binds, limit, query.offset];
 }
 
 app.onError((error, c) => errorResponse(c, error));
@@ -438,6 +550,105 @@ app.post("/api/pages", async (c) => {
   const created = pageJson(await pageForMember(c.env, member, id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [created] });
   return c.json({ page: created }, 201);
+});
+
+// Creates a whole tree level at once.
+//
+// Creating pages one at a time is correct but broadcasts `pages-upserted` per page,
+// and an import of a thousand pages then makes every connected client merge its tree a
+// thousand times. The event payload is already a list, so one request that inserts N
+// pages in a single batch and emits one event needs no client change at all.
+//
+// Parents must already exist: a page cannot name another page from the same request as
+// its parent. Callers walk the tree a level at a time, which also keeps sibling order
+// deterministic, since positions are handed out in request order.
+app.post("/api/pages/batch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const body = await jsonBody(c.req.raw);
+  const requested = Array.isArray(body.pages) ? body.pages : [];
+  if (!requested.length) throw new HttpError(422, "invalid_input", "pages must list at least one page.");
+  if (requested.length > PAGE_BATCH_MAX) {
+    throw new HttpError(422, "batch_too_large", `A batch is limited to ${PAGE_BATCH_MAX} pages.`);
+  }
+
+  const parsed = requested.map((raw, index) => {
+    const entry = object(raw);
+    return {
+      id: crypto.randomUUID(),
+      parentId: nullableId(entry.parentId, `pages[${index}].parentId`),
+      kind: pageKind(entry.kind ?? "document"),
+      title: typeof entry.title === "string" ? text(entry.title, `pages[${index}].title`, 200) : "Untitled",
+    };
+  });
+
+  // Every distinct parent is checked once, which also rejects a parent in another
+  // workspace or an archived one exactly as the single-page route does.
+  const parentIds = [...new Set(parsed.map((page) => page.parentId))];
+  for (const parentId of parentIds) {
+    if (parentId) await pageForMember(c.env, member, parentId);
+  }
+
+  // Positions are generated per parent, continuing after that parent's last child, so
+  // a batch appends in request order just like a sequence of single creates would.
+  const positions = new Map<string, string>();
+  for (const parentId of parentIds) {
+    const siblings = parsed.filter((page) => page.parentId === parentId);
+    const last = await c.env.DB.prepare(
+      `SELECT position FROM pages WHERE workspace_id = ? AND parent_id IS ? AND archived_at IS NULL
+        ORDER BY position DESC, id DESC LIMIT 1`,
+    )
+      .bind(member.workspace.id, parentId)
+      .first<{ position: string }>();
+    const keys = generateNJitteredKeysBetween(last?.position ?? null, null, siblings.length);
+    siblings.forEach((page, index) => positions.set(page.id, keys[index]!));
+  }
+
+  const timestamp = now();
+  const statements: D1PreparedStatement[] = [];
+  for (const page of parsed) {
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        page.id,
+        member.workspace.id,
+        page.parentId,
+        page.kind,
+        positions.get(page.id),
+        page.title,
+        member.user.id,
+        timestamp,
+        timestamp,
+      ),
+      c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
+        page.id,
+        member.workspace.id,
+        page.title,
+      ),
+    );
+    if (page.kind === "table") {
+      statements.push(c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(page.id));
+    }
+  }
+  await c.env.DB.batch(statements);
+
+  const created = await c.env.DB.prepare(
+    `SELECT * FROM pages WHERE workspace_id = ? AND id IN (${parsed.map(() => "?").join(", ")})`,
+  )
+    .bind(member.workspace.id, ...parsed.map((page) => page.id))
+    .all<PageRow>();
+  // Returned in request order, not position order. Positions are generated per parent,
+  // so a batch spanning two parents has no meaningful global ordering, and a caller
+  // pairing its input to this response by index would silently mismatch.
+  const rows = new Map(created.results.map((row) => [row.id, row]));
+  const pages = parsed.flatMap((page) => {
+    const row = rows.get(page.id);
+    return row ? [pageJson(row)] : [];
+  });
+  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages });
+  return c.json({ pages }, 201);
 });
 
 app.get("/api/pages/:id", async (c) => {
@@ -1000,6 +1211,244 @@ app.delete("/api/attachments/:id", async (c) => {
   return c.json({ ok: true });
 });
 
+type UploadSessionRow = {
+  id: string;
+  workspace_id: string;
+  page_id: string;
+  r2_key: string;
+  r2_upload_id: string;
+  name: string;
+  mime: string;
+  size: number;
+  part_size: number;
+  part_count: number;
+};
+
+// Resolves an upload session the caller is allowed to act on. The R2 upload id is
+// never handed to a client: a session is addressed by our own id so every request is
+// authorised against D1 first, and R2's key layout stays server-side.
+async function activeUploadSession(env: Env, member: MemberContext, uploadId: string) {
+  const session = await env.DB.prepare(
+    `SELECT u.* FROM attachment_uploads u JOIN pages p ON p.id = u.page_id
+      WHERE u.id = ? AND u.workspace_id = ? AND p.archived_at IS NULL`,
+  )
+    .bind(uploadId, member.workspace.id)
+    .first<UploadSessionRow>();
+  if (!session) throw new HttpError(404, "upload_session_not_found", "That upload session no longer exists.");
+  return session;
+}
+
+// The size of one part, which is fixed for every part except the last. R2 rejects a
+// multipart upload whose middle parts differ in size, so the server dictates this
+// rather than accepting whatever the client happened to chunk to.
+function expectedPartBytes(session: UploadSessionRow, partNumber: number) {
+  return partNumber === session.part_count
+    ? session.size - session.part_size * (session.part_count - 1)
+    : session.part_size;
+}
+
+app.post("/api/pages/:id/uploads", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const name = normalizeFilename(text(body.name, "name", 400));
+  const mime = body.mime === undefined ? "application/octet-stream" : text(body.mime, "mime", 200);
+  const size = Number(body.size);
+  if (!Number.isInteger(size) || size <= 0) {
+    throw new HttpError(422, "invalid_input", "size must be a positive integer.");
+  }
+  if (size > MAX_ATTACHMENT_BYTES) {
+    throw new HttpError(413, "upload_too_large", "That file is larger than the attachment limit.");
+  }
+  // Checked before a single byte moves, so a rejected type costs one request rather
+  // than an entire multi-gigabyte upload.
+  if (isUnsafeMime(mime, name)) {
+    throw new HttpError(415, "unsafe_file_type", "That file type is not accepted.");
+  }
+  const partSize = resolvePartSize(body.partSize);
+  const partCount = Math.ceil(size / partSize);
+  // The session id doubles as the attachment id once the upload completes, so the R2
+  // object's customMetadata points at the right row from the moment it is created.
+  const id = crypto.randomUUID();
+  const key = `assets/${member.workspace.id}/${crypto.randomUUID()}`;
+  const upload = await c.env.BUCKET.createMultipartUpload(key, {
+    httpMetadata: { contentType: mime },
+    customMetadata: { attachmentId: id },
+  });
+  const timestamp = now();
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO attachment_uploads
+         (id, workspace_id, page_id, r2_key, r2_upload_id, name, mime, size, part_size, part_count,
+          created_by, created_at, updated_at, next_attempt_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        id,
+        member.workspace.id,
+        page.id,
+        key,
+        upload.uploadId,
+        name,
+        mime,
+        size,
+        partSize,
+        partCount,
+        member.user.id,
+        timestamp,
+        timestamp,
+        timestamp + UPLOAD_SESSION_TTL_MS,
+      )
+      .run();
+  } catch (error) {
+    // Nothing records this upload yet, so abandoning it here would leak parts with no
+    // row for the reaper to find them by.
+    await upload.abort().catch((abortError) => {
+      console.error("Failed to abort an unrecorded multipart upload", abortError);
+    });
+    throw error;
+  }
+  return c.json(
+    { upload: { id, name, mime, size, partSize, partCount, expiresAt: timestamp + UPLOAD_SESSION_TTL_MS } },
+    201,
+  );
+});
+
+app.get("/api/uploads/:uploadId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  const parts = await c.env.DB.prepare(
+    `SELECT part_number, etag, size FROM attachment_upload_parts WHERE upload_id = ? ORDER BY part_number`,
+  )
+    .bind(session.id)
+    .all<{ part_number: number; etag: string; size: number }>();
+  return c.json({
+    upload: {
+      id: session.id,
+      pageId: session.page_id,
+      name: session.name,
+      mime: session.mime,
+      size: session.size,
+      partSize: session.part_size,
+      partCount: session.part_count,
+    },
+    // Which parts already landed, so an interrupted upload resumes instead of
+    // restarting from the first byte.
+    parts: parts.results.map((part) => ({ partNumber: part.part_number, etag: part.etag, size: part.size })),
+  });
+});
+
+app.put("/api/uploads/:uploadId/parts/:partNumber", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  const partNumber = Number(c.req.param("partNumber"));
+  if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > session.part_count) {
+    throw new HttpError(422, "upload_part_size", "That part number is outside this upload.");
+  }
+  // Read rather than streamed so the length can be checked exactly before R2 is
+  // touched; one part is bounded well below the Worker's memory ceiling.
+  const bytes = await c.req.arrayBuffer();
+  const expected = expectedPartBytes(session, partNumber);
+  if (bytes.byteLength !== expected) {
+    throw new HttpError(422, "upload_part_size", `Part ${partNumber} must be exactly ${expected} bytes.`);
+  }
+  const upload = c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id);
+  const part = await upload.uploadPart(partNumber, bytes);
+  const timestamp = now();
+  await c.env.DB.batch([
+    // Re-uploading a part replaces it, so a retry after a network failure is safe.
+    c.env.DB.prepare(
+      `INSERT INTO attachment_upload_parts (upload_id, part_number, etag, size, uploaded_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(upload_id, part_number)
+         DO UPDATE SET etag = excluded.etag, size = excluded.size, uploaded_at = excluded.uploaded_at`,
+    ).bind(session.id, partNumber, part.etag, bytes.byteLength, timestamp),
+    // Every accepted part pushes the reaper's deadline out, so an upload that is merely
+    // slow is never collected - only one nobody is still feeding.
+    c.env.DB.prepare(`UPDATE attachment_uploads SET updated_at = ?, next_attempt_at = ? WHERE id = ?`).bind(
+      timestamp,
+      timestamp + UPLOAD_SESSION_TTL_MS,
+      session.id,
+    ),
+  ]);
+  return c.json({ part: { partNumber, etag: part.etag, size: bytes.byteLength } });
+});
+
+app.post("/api/uploads/:uploadId/complete", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  const parts = await c.env.DB.prepare(
+    `SELECT part_number, etag, size FROM attachment_upload_parts WHERE upload_id = ? ORDER BY part_number`,
+  )
+    .bind(session.id)
+    .all<{ part_number: number; etag: string; size: number }>();
+  if (parts.results.length !== session.part_count) {
+    throw new HttpError(409, "upload_incomplete", "Some parts of this upload have not arrived yet.");
+  }
+  const uploaded = parts.results.reduce((total, part) => total + part.size, 0);
+  if (uploaded !== session.size) {
+    throw new HttpError(422, "upload_size_mismatch", "The uploaded parts do not add up to the declared size.");
+  }
+  const upload = c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id);
+  try {
+    await upload.complete(parts.results.map((part) => ({ partNumber: part.part_number, etag: part.etag })));
+  } catch (error) {
+    console.error("Failed to complete a multipart upload", error);
+    throw new HttpError(503, "multipart_complete_failed", "The upload could not be finalised. Retry it.");
+  }
+  const timestamp = now();
+  try {
+    // R2 first, D1 second, matching the single-shot route: an object with no row is
+    // reclaimable, a row with no object is a broken attachment.
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO attachments (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        session.id,
+        session.workspace_id,
+        session.page_id,
+        session.r2_key,
+        session.name,
+        session.mime,
+        session.size,
+        member.user.id,
+        timestamp,
+      ),
+      c.env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ?`).bind(session.id),
+    ]);
+  } catch (error) {
+    await c.env.BUCKET.delete(session.r2_key).catch((cleanupError) => {
+      console.error("Failed to roll back a completed multipart upload", cleanupError);
+    });
+    throw error;
+  }
+  return c.json(
+    {
+      attachment: {
+        id: session.id,
+        pageId: session.page_id,
+        name: session.name,
+        mime: session.mime,
+        size: session.size,
+      },
+    },
+    201,
+  );
+});
+
+app.delete("/api/uploads/:uploadId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  await c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id).abort();
+  await c.env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ?`).bind(session.id).run();
+  return c.json({ ok: true });
+});
+
 app.get("/api/pages/:id/versions", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
@@ -1078,7 +1527,12 @@ app.post("/api/pages/:id/restore-version", async (c) => {
 
 app.get("/api/tables/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
+  // COUNT(*) is opt-in so a paging loop does not pay for it on every page.
+  const wantsCount = c.req.query("count") === "true";
+  const page = await activeTablePage<{ row_count?: number }>(c.env, member, c.req.param("pageId"), {
+    columns: wantsCount ? `, (SELECT COUNT(*) FROM table_rows WHERE page_id = p.id) row_count` : "",
+    binds: [],
+  });
   const state = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
     .bind(page.id)
     .first<{ revision: number }>();
@@ -1095,19 +1549,25 @@ app.get("/api/tables/:pageId", async (c) => {
   )
     .bind(page.id)
     .all<{ id: string; column_id: string; label: string; position: number }>();
-  // ponytail: 500 rows are loaded and sorted in the client; graduate to server-side
-  // querying and a realtime table Durable Object only when this boundary is exceeded.
-  const rows = await c.env.DB.prepare(
-    `SELECT id, position FROM table_rows WHERE page_id = ? ORDER BY position, id LIMIT 501`,
-  )
-    .bind(page.id)
+  // Rows are paged and sorted server-side. Graduating to a realtime table Durable
+  // Object is not about row count: a table has exactly one writer at a time (the
+  // lease) and readers poll, so the trigger is dropping the single-editor lease or
+  // replacing the poll with push, neither of which paging affects.
+  const rowQuery = buildTableRowQuery(page.id, columns.results, c.req.query());
+  // One row beyond the page is fetched purely to answer hasMore without a second count.
+  const rows = await c.env.DB.prepare(rowQuery.sql)
+    .bind(...tableRowBinds(rowQuery, rowQuery.limit + 1))
     .all<{ id: string; position: number }>();
-  if (rows.results.length > 500)
-    throw new HttpError(422, "table_row_limit", "This table has exceeded the 500-row v1 limit.");
+  const pageRows = rows.results.slice(0, rowQuery.limit);
+  const hasMore = rows.results.length > pageRows.length;
+  const lastRow = pageRows.at(-1);
+  // The cell read joins the row query as a derived table rather than binding the ids
+  // it returned, which at a full page would exceed D1's 100 bound parameters.
   const cells = await c.env.DB.prepare(
-    `SELECT c.* FROM table_cells c JOIN table_rows r ON r.id = c.row_id WHERE r.page_id = ?`,
+    `SELECT c.row_id, c.column_id, c.text_value, c.number_value, c.boolean_value, c.date_value, c.select_value
+       FROM table_cells c JOIN (${rowQuery.sql}) page_rows ON page_rows.id = c.row_id`,
   )
-    .bind(page.id)
+    .bind(...tableRowBinds(rowQuery, rowQuery.limit))
     .all<Record<string, unknown>>();
   const lease = await c.env.DB.prepare(
     `SELECT l.expires_at, l.holder_session_id, u.name holder_name
@@ -1135,12 +1595,19 @@ app.get("/api/tables/:pageId", async (c) => {
             position: option.position,
           })),
       })),
-      rows: rows.results.map((row) => ({ ...row, cells: cellMap.get(row.id) ?? {} })),
+      rows: pageRows.map((row) => ({ ...row, cells: cellMap.get(row.id) ?? {} })),
       lease: {
         heldByMe: lease?.holder_session_id === member.session.id,
         holderName: lease?.holder_name ?? null,
         expiresAt: lease?.expires_at ?? null,
       },
+      limit: rowQuery.limit,
+      sort: rowQuery.sort,
+      dir: rowQuery.dir,
+      hasMore,
+      // Keyset paging applies to the default order only; a sorted view pages by offset.
+      nextCursor: hasMore && !rowQuery.sort && lastRow ? { position: lastRow.position, rowId: lastRow.id } : null,
+      rowCount: wantsCount ? Number(page.row_count ?? 0) : null,
     },
   });
 });
@@ -1327,6 +1794,288 @@ app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) 
   return c.json({ revision });
 });
 
+app.post("/api/tables/:pageId/bulk", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const pageId = c.req.param("pageId");
+  const declaredLength = Number(c.req.header("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > TABLE_BULK_MAX_BODY_BYTES) {
+    throw new HttpError(413, "bulk_too_large", "The bulk table write is larger than the request limit.");
+  }
+  const page = await activeTablePage<{
+    row_count: number;
+    next_row_position: number;
+    next_column_position: number;
+  }>(c.env, member, pageId, {
+    columns: `, (SELECT COUNT(*) FROM table_rows WHERE page_id = p.id) row_count,
+        (SELECT COALESCE(MAX(position) + 1, 0) FROM table_rows WHERE page_id = p.id) next_row_position,
+        (SELECT COALESCE(MAX(position) + 1, 0) FROM table_columns WHERE page_id = p.id) next_column_position`,
+    binds: [],
+  });
+  const body = await jsonBody(c.req.raw);
+  const input = await leaseInputs(body, member);
+  const clientRequestId =
+    body.clientRequestId === undefined ? null : text(body.clientRequestId, "clientRequestId", 200);
+
+  // A timed-out request is replayed with the same id rather than appended twice.
+  if (clientRequestId) {
+    const receipt = await c.env.DB.prepare(
+      `SELECT response_json FROM table_bulk_writes WHERE page_id = ? AND client_request_id = ?`,
+    )
+      .bind(pageId, clientRequestId)
+      .first<{ response_json: string }>();
+    if (receipt) return c.json({ ...JSON.parse(receipt.response_json), replayed: true });
+  }
+
+  const columnInput = Array.isArray(body.columns) ? body.columns : [];
+  const rowInput = Array.isArray(body.rows) ? body.rows : [];
+  // An empty request would advance the revision while changing nothing, which would
+  // invalidate every other editor's expectedRevision for no reason.
+  if (!columnInput.length && !rowInput.length) {
+    throw new HttpError(422, "empty_bulk_write", "A bulk write must add at least one column or row.");
+  }
+  if (columnInput.length > TABLE_BULK_MAX_COLUMNS || rowInput.length > TABLE_BULK_MAX_ROWS) {
+    throw new HttpError(422, "bulk_too_large", "This bulk write exceeds the per-request column or row limit.");
+  }
+  if (page.row_count + rowInput.length > TABLE_MAX_ROWS) {
+    throw new HttpError(422, "table_row_limit", `Tables are limited to ${TABLE_MAX_ROWS} rows.`);
+  }
+
+  const [existingColumns, existingOptions] = await Promise.all([
+    c.env.DB.prepare(`SELECT id, type FROM table_columns WHERE page_id = ?`)
+      .bind(pageId)
+      .all<{ id: string; type: string }>(),
+    c.env.DB.prepare(
+      `SELECT o.id, o.column_id, o.label, o.position FROM table_select_options o
+         JOIN table_columns col ON col.id = o.column_id WHERE col.page_id = ?`,
+    )
+      .bind(pageId)
+      .all<{ id: string; column_id: string; label: string; position: number }>(),
+  ]);
+
+  // Columns are addressable by their real id and, for ones created in this same
+  // request, by the caller's `ref:` token - otherwise an importer would need a round
+  // trip just to learn the generated ids before it could send any rows.
+  const columnsByKey = new Map<string, { id: string; type: string }>();
+  for (const column of existingColumns.results) columnsByKey.set(column.id, column);
+  const optionIdsByLabel = new Map<string, Map<string, string>>();
+  const optionIds = new Set<string>();
+  const nextOptionPosition = new Map<string, number>();
+  for (const option of existingOptions.results) {
+    const byLabel = optionIdsByLabel.get(option.column_id) ?? new Map<string, string>();
+    byLabel.set(option.label, option.id);
+    optionIdsByLabel.set(option.column_id, byLabel);
+    optionIds.add(option.id);
+    nextOptionPosition.set(
+      option.column_id,
+      Math.max(nextOptionPosition.get(option.column_id) ?? 0, option.position + 1),
+    );
+  }
+
+  const newColumns: { id: string; ref: string | null; name: string; type: string; position: number }[] = [];
+  const newOptions: { id: string; columnId: string; label: string; position: number }[] = [];
+
+  function declareOption(columnId: string, label: string) {
+    const byLabel = optionIdsByLabel.get(columnId) ?? new Map<string, string>();
+    const existing = byLabel.get(label);
+    if (existing) return existing;
+    const id = crypto.randomUUID();
+    const position = nextOptionPosition.get(columnId) ?? 0;
+    byLabel.set(label, id);
+    optionIdsByLabel.set(columnId, byLabel);
+    nextOptionPosition.set(columnId, position + 1);
+    optionIds.add(id);
+    newOptions.push({ id, columnId, label, position });
+    return id;
+  }
+
+  columnInput.forEach((raw, index) => {
+    const entry = object(raw);
+    const id = crypto.randomUUID();
+    const type = columnType(entry.type);
+    const name = text(entry.name, `columns[${index}].name`, 200);
+    const ref = entry.ref === undefined ? null : text(entry.ref, `columns[${index}].ref`, 64);
+    if (ref && columnsByKey.has(`ref:${ref}`)) {
+      throw new HttpError(422, "invalid_bulk_reference", `The column ref ${ref} is used twice.`);
+    }
+    newColumns.push({ id, ref, name, type, position: page.next_column_position + index });
+    columnsByKey.set(id, { id, type });
+    if (ref) columnsByKey.set(`ref:${ref}`, { id, type });
+    const options = Array.isArray(entry.options) ? entry.options : [];
+    for (const option of options) {
+      declareOption(id, text(object(option).label, `columns[${index}].options[].label`, 200));
+    }
+  });
+
+  const newRows: { id: string; position: number }[] = [];
+  const newCells: {
+    r: string;
+    c: string;
+    t: string | null;
+    n: number | null;
+    b: number | null;
+    d: string | null;
+    s: string | null;
+  }[] = [];
+
+  rowInput.forEach((raw, index) => {
+    const entry = object(raw);
+    const rowId = crypto.randomUUID();
+    newRows.push({ id: rowId, position: page.next_row_position + index });
+    const cells = entry.cells === undefined ? {} : object(entry.cells);
+    for (const [key, value] of Object.entries(cells)) {
+      const column = columnsByKey.get(key);
+      if (!column) {
+        throw new HttpError(422, "invalid_bulk_reference", `Unknown column ${key}.`, {
+          rowIndex: index,
+          columnKey: key,
+        });
+      }
+      // Notion and every other export hands over option labels, not ids, so a select
+      // cell may name its option and have it created on demand. A bare string stays
+      // an option id, matching the per-cell route exactly.
+      let resolved: unknown = value;
+      if (column.type === "select" && value && typeof value === "object" && "option" in value) {
+        resolved = declareOption(column.id, text((value as { option: unknown }).option, "option", 200));
+      }
+      const [textValue, numberValue, booleanValue, dateValue, selectValue] = typedCell(column.type, resolved);
+      if (selectValue !== null && !optionIds.has(selectValue)) {
+        throw new HttpError(422, "invalid_cell", "That select option does not belong to this column.", {
+          rowIndex: index,
+          columnKey: key,
+        });
+      }
+      // An absent cell already reads as null, so writing empties would be pure cost.
+      if (
+        textValue === null &&
+        numberValue === null &&
+        booleanValue === null &&
+        dateValue === null &&
+        selectValue === null
+      ) {
+        continue;
+      }
+      newCells.push({
+        r: rowId,
+        c: column.id,
+        t: textValue,
+        n: numberValue,
+        b: booleanValue,
+        d: dateValue,
+        s: selectValue,
+      });
+    }
+  });
+
+  if (newCells.length > TABLE_BULK_MAX_CELLS) {
+    throw new HttpError(422, "bulk_too_large", "This bulk write exceeds the per-request cell limit.");
+  }
+
+  const response = {
+    columns: newColumns.map((column) => ({
+      id: column.id,
+      ref: column.ref,
+      name: column.name,
+      type: column.type,
+      position: column.position,
+      options: newOptions
+        .filter((option) => option.columnId === column.id)
+        .map((option) => ({ id: option.id, label: option.label, position: option.position })),
+    })),
+    rows: newRows,
+    counts: {
+      columns: newColumns.length,
+      options: newOptions.length,
+      rows: newRows.length,
+      cells: newCells.length,
+    },
+  };
+
+  const revision = await guardedBatch(
+    c.env,
+    pageId,
+    input,
+    (guardedAt) => {
+      const guardBinds = [pageId, input.expectedRevision, input.tokenHash, input.sessionId, guardedAt];
+      const statements: D1PreparedStatement[] = [];
+      // Every insert expands one JSON parameter with json_each rather than binding a
+      // placeholder per value, which at these batch sizes would blow past D1's limit of
+      // 100 bound parameters per query. `json_each().key` is the array index, so
+      // positions are assigned deterministically regardless of iteration order.
+      if (newColumns.length) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_columns (id, page_id, name, type, position)
+             SELECT json_extract(item.value, '$.id'), ?, json_extract(item.value, '$.name'),
+                    json_extract(item.value, '$.type'), json_extract(item.value, '$.position')
+               FROM json_each(?) item WHERE ${leaseGuards()}`,
+          ).bind(pageId, JSON.stringify(newColumns), ...guardBinds),
+        );
+      }
+      if (newOptions.length) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_select_options (id, column_id, label, position)
+             SELECT json_extract(item.value, '$.id'), json_extract(item.value, '$.columnId'),
+                    json_extract(item.value, '$.label'), json_extract(item.value, '$.position')
+               FROM json_each(?) item WHERE ${leaseGuards()}`,
+          ).bind(JSON.stringify(newOptions), ...guardBinds),
+        );
+      }
+      if (newRows.length) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
+             SELECT json_extract(item.value, '$.id'), ?, json_extract(item.value, '$.position'), ?, ?, ?
+               FROM json_each(?) item WHERE ${leaseGuards()}`,
+          ).bind(pageId, member.user.id, guardedAt, guardedAt, JSON.stringify(newRows), ...guardBinds),
+        );
+      }
+      if (newCells.length) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_cells
+               (row_id, column_id, text_value, number_value, boolean_value, date_value, select_value, updated_at)
+             SELECT json_extract(item.value, '$.r'), json_extract(item.value, '$.c'),
+                    json_extract(item.value, '$.t'), json_extract(item.value, '$.n'),
+                    json_extract(item.value, '$.b'), json_extract(item.value, '$.d'),
+                    json_extract(item.value, '$.s'), ?
+               FROM json_each(?) item WHERE ${leaseGuards()}`,
+          ).bind(guardedAt, JSON.stringify(newCells), ...guardBinds),
+        );
+      }
+      if (clientRequestId) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO table_bulk_writes (page_id, client_request_id, revision, response_json, created_at)
+             SELECT ?, ?, ?, ?, ? WHERE ${leaseGuards()}`,
+          ).bind(
+            pageId,
+            clientRequestId,
+            input.expectedRevision + 1,
+            JSON.stringify({ revision: input.expectedRevision + 1, ...response }),
+            guardedAt,
+            ...guardBinds,
+          ),
+        );
+      }
+      // An import runs far longer than the 60-second lease, and asking the caller to
+      // run a renewal timer alongside its writes is how tables end up half-written.
+      // The guard means this can only extend a lease that is already live.
+      statements.push(
+        c.env.DB.prepare(
+          `UPDATE table_leases SET expires_at = ?
+            WHERE page_id = ? AND token_hash = ? AND holder_session_id = ? AND expires_at > ?`,
+        ).bind(guardedAt + TABLE_LEASE_DURATION_MS, pageId, input.tokenHash, input.sessionId, guardedAt),
+      );
+      return statements;
+    },
+    { requireChanges: false },
+  );
+
+  return c.json({ revision, replayed: false, ...response }, 201);
+});
+
 app.post("/api/tables/:pageId/rows", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
@@ -1341,7 +2090,9 @@ app.post("/api/tables/:pageId/rows", async (c) => {
     },
   );
   const input = await leaseInputs(await jsonBody(c.req.raw), member);
-  if (page.row_count >= 500) throw new HttpError(422, "table_row_limit", "Tables are limited to 500 rows in v1.");
+  if (page.row_count >= TABLE_MAX_ROWS) {
+    throw new HttpError(422, "table_row_limit", `Tables are limited to ${TABLE_MAX_ROWS} rows.`);
+  }
   const id = crypto.randomUUID();
   const position = page.next_position;
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
@@ -1470,23 +2221,8 @@ async function currentPlainText(env: Env, pageId: string) {
   );
 }
 
-function isUnsafeMime(mime: string, name: string) {
-  const normalizedMime = mime.toLowerCase().split(";", 1)[0]!.trim();
-  const extension = name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
-  return UNSAFE_MIME_TYPES.has(normalizedMime) || UNSAFE_FILE_EXTENSIONS.has(extension);
-}
-
 function escapeLike(value: string) {
   return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
-}
-
-function isInlineMime(mime: string) {
-  return (
-    /^image\/(png|jpeg|gif|webp|avif)$/.test(mime) ||
-    mime === "application/pdf" ||
-    mime === "text/plain" ||
-    mime === "text/markdown"
-  );
 }
 
 function cellValue(cell: Record<string, unknown>) {
@@ -1524,21 +2260,37 @@ function typedCell(
   throw new HttpError(422, "invalid_cell", "Unknown column type.");
 }
 
+// `requireChanges` is the single-statement contract every per-cell route relies on and
+// must stay the default. The bulk route is the one caller that turns it off, because
+// changes() reports only the statement immediately before the bump: with several
+// statements it would read whichever one happened to land last and silently refuse to
+// advance the revision on a request that did write rows.
+//
+// Dropping it is safe there, and only there, because every bulk statement inserts
+// freshly generated ids that cannot match zero rows, and each carries the same
+// leaseGuards() predicate as the bump inside one D1 batch, which is one transaction.
+// So the inserts apply exactly when the guard holds, which is exactly when the bump
+// applies. Adding an update or delete to that route would reintroduce a statement that
+// can legitimately match nothing, and this reasoning would have to be redone.
 async function guardedBatch(
   env: Env,
   pageId: string,
   input: { expectedRevision: number; tokenHash: string; sessionId: string },
-  prepareMutation: (guardedAt: number) => D1PreparedStatement,
+  prepareMutation: (guardedAt: number) => D1PreparedStatement | D1PreparedStatement[],
+  options: { requireChanges?: boolean } = {},
 ) {
+  const requireChanges = options.requireChanges ?? true;
   const guardedAt = now();
+  const prepared = prepareMutation(guardedAt);
+  const mutations = Array.isArray(prepared) ? prepared : [prepared];
   const results = await env.DB.batch([
-    prepareMutation(guardedAt),
+    ...mutations,
     // changes() is the row count of the statement immediately before this one
     // in the batch, so the revision only advances when the mutation applied and
     // a mutation can never commit without advancing the revision.
     env.DB.prepare(
       `UPDATE table_state SET revision = revision + 1
-        WHERE page_id = ? AND revision = ? AND changes() > 0 AND ${leaseGuards()}`,
+        WHERE page_id = ? AND revision = ?${requireChanges ? " AND changes() > 0" : ""} AND ${leaseGuards()}`,
     ).bind(pageId, input.expectedRevision, pageId, input.expectedRevision, input.tokenHash, input.sessionId, guardedAt),
     // Read the state inside the same batch so a failure is classified against
     // what the guards actually saw, not against a later change.
@@ -1552,11 +2304,13 @@ async function guardedBatch(
          FROM table_state s WHERE s.page_id = ?`,
     ).bind(input.tokenHash, input.sessionId, guardedAt, pageId),
   ]);
-  const mutationApplied = Boolean(results[0]?.meta.changes);
-  const revisionUpdated = Boolean(results[1]?.meta.changes);
+  const revisionUpdated = Boolean(results[mutations.length]?.meta.changes);
+  // Without changes() there is nothing to distinguish "the write missed" from "the
+  // guard failed", and for insert-only statements the two coincide.
+  const mutationApplied = requireChanges ? Boolean(results[mutations.length - 1]?.meta.changes) : revisionUpdated;
   if (mutationApplied && revisionUpdated) return input.expectedRevision + 1;
 
-  const state = results[2]?.results[0] as { revision: number; lease_valid: number } | undefined;
+  const state = results[mutations.length + 1]?.results[0] as { revision: number; lease_valid: number } | undefined;
   if (!state?.lease_valid) {
     throw new HttpError(409, "table_lease_lost", "The editing lease was lost. Reloaded the authoritative table.");
   }
@@ -1659,6 +2413,16 @@ export default {
     context.waitUntil(
       processDueDeletionJobs(env).catch((error) => {
         console.error("Scheduled deletion cleanup failed", error);
+      }),
+    );
+    context.waitUntil(
+      pruneBulkWriteReceipts(env).catch((error) => {
+        console.error("Scheduled bulk write receipt prune failed", error);
+      }),
+    );
+    context.waitUntil(
+      processDueUploadReaps(env).catch((error) => {
+        console.error("Scheduled upload reap failed", error);
       }),
     );
   },
