@@ -13,6 +13,7 @@ import {
   assignStableIds,
   createImportEditor,
   DOCUMENT_FRAGMENT,
+  DocumentStateChangedError,
   escapeHtml,
   htmlToBlocks,
   mentionHtml,
@@ -68,6 +69,26 @@ describe("headless BlockNote conversion", () => {
     const second = await writeBlocksToFragment(editor, await convert(), doc);
     expect(second.updates).toBe(0);
     expect(second.byteLength).toBe(first.byteLength);
+  });
+
+  it("refuses a guarded replacement after a collaborator changes the Yjs document", async () => {
+    const editor = await createImportEditor();
+    const doc = new Y.Doc();
+    await writeBlocksToFragment(editor, await htmlToBlocks(editor, "<p>Original</p>"), doc);
+    const checkedState = Y.encodeStateVector(doc);
+    await writeBlocksToFragment(editor, await htmlToBlocks(editor, "<p>Collaborator edit</p>"), doc);
+
+    await expect(
+      writeBlocksToFragment(
+        editor,
+        await htmlToBlocks(editor, "<p>Imported replacement</p>"),
+        doc,
+        DOCUMENT_FRAGMENT,
+        checkedState,
+      ),
+    ).rejects.toBeInstanceOf(DocumentStateChangedError);
+    expect(projectFragment(doc).plainText).toContain("Collaborator edit");
+    expect(projectFragment(doc).plainText).not.toContain("Imported replacement");
   });
 
   it("derives block ids from the page, so two pages never collide", async () => {

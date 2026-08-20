@@ -82,6 +82,105 @@ describe("runImport", () => {
       expect.objectContaining({ plannedPageId: expect.any(String), expectedPage: expect.any(Object) }),
     );
   });
+
+  it("keeps a collaborator edit made after a fresh page is created", async () => {
+    const page = {
+      path: "Page.html",
+      parent: null,
+      kind: "document",
+      title: "Page",
+      assets: [],
+    };
+    const root = mkdtempSync(join(tmpdir(), "notion-run-test-"));
+    writeFileSync(join(root, page.path), '<html><body><div class="page-body"><p>Imported</p></div></body></html>');
+    const state = { importId: "a".repeat(32), nodes: {} };
+    const update = (path, patch) => {
+      state.nodes[path] = { ...state.nodes[path], ...patch };
+    };
+    const manifest = {
+      state,
+      node: (path) => state.nodes[path] ?? null,
+      record: vi.fn(update),
+      recordNow: vi.fn(update),
+      flush: vi.fn(),
+    };
+    const documentPush = vi.fn(async () => ({
+      conflict: true,
+      liveProjectionHash: "collaborator-document",
+      updates: 0,
+    }));
+    const report = {
+      errorCount: 0,
+      error: vi.fn(),
+      issue: vi.fn(),
+      progress: vi.fn(),
+      inPage: vi.fn(),
+    };
+
+    await expect(
+      runImport({
+        index: {
+          pages: [page],
+          root,
+          pagesByPath: new Map([[page.path, page]]),
+          assetsByPath: new Map(),
+          byPath: new Map([[page.path, [page]]]),
+          assetIndex: new Map(),
+        },
+        client: {
+          createPages: vi.fn(async (pages) => pages.map(({ id }) => ({ id, contentEpoch: 1 }))),
+        },
+        manifest,
+        report,
+        rootParentId: null,
+        limit: 1,
+        lingerMs: 0,
+        documentPush,
+      }),
+    ).resolves.toMatchObject({ written: 0, errors: 0 });
+    expect(documentPush).toHaveBeenCalledWith(
+      expect.objectContaining({ expectedProjectionHashes: [expect.stringMatching(/^[a-f\d]{64}$/)] }),
+    );
+    expect(state.nodes[page.path].content).toMatchObject({
+      status: "destination-owned",
+      acceptedRemoteHash: "collaborator-document",
+    });
+    expect(report.issue).toHaveBeenCalledWith("destination_document_kept", "Page");
+  });
+
+  it("names the database when table batch planning fails", async () => {
+    const database = {
+      path: "Table.html",
+      csvPath: "Table.csv",
+      parent: null,
+      kind: "database",
+      title: "Table",
+      assets: [],
+    };
+    const root = mkdtempSync(join(tmpdir(), "notion-run-test-"));
+    const headers = Array.from({ length: 2_001 }, (_, index) => `Column ${index}`);
+    writeFileSync(join(root, database.csvPath), `${headers.join(",")}\n${headers.map(() => "x").join(",")}\n`);
+    const manifest = {
+      state: {},
+      node: vi.fn(() => null),
+      record: vi.fn(),
+      recordNow: vi.fn(),
+      flush: vi.fn(),
+    };
+
+    await expect(
+      runImport({
+        index: { pages: [database], root },
+        client: {},
+        manifest,
+        report: { issue: vi.fn(), progress: vi.fn(), inPage: vi.fn() },
+        rootParentId: null,
+        limit: 1,
+        lingerMs: 0,
+      }),
+    ).rejects.toThrow("Table (Table.html): Row 1 has 2001 cells");
+    expect(manifest.record).not.toHaveBeenCalled();
+  });
 });
 
 describe("reconcileCommitted", () => {
@@ -281,6 +380,102 @@ describe("reconcileCommitted", () => {
     expect(report.issue).toHaveBeenCalledWith("destination_table_kept", "Table");
     expect(report.error).not.toHaveBeenCalled();
   });
+
+  it("replays an interrupted column commit to recover its generated ids", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const committedColumn = canonicalSourceTable(table, 1, 0);
+    const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
+    const state = {
+      importId: "a".repeat(32),
+      nodes: {
+        [page.path]: {
+          pageId: "page-1",
+          expectedPage: { kind: "table", title: "Table", parentId: null },
+          table: {
+            phase: "columns",
+            revision: 1,
+            columnOffset: 0,
+            rowOffset: 0,
+            columnsByRef: {},
+            expectedColumns: 1,
+            expectedRows: 1,
+            contentHash: plan.contentHash,
+          },
+        },
+      },
+    };
+    const update = (path, patch) => {
+      state.nodes[path] = { ...state.nodes[path], ...patch };
+    };
+    const manifest = {
+      state,
+      node: (path) => state.nodes[path],
+      record: vi.fn(update),
+      recordNow: vi.fn(update),
+    };
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
+      acquireTableLease: vi
+        .fn()
+        .mockResolvedValueOnce({ leaseToken: "reconcile-lease" })
+        .mockResolvedValueOnce({ leaseToken: "import-lease" }),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(async (_pageId, body) => {
+        if (body.columns.length) {
+          return { revision: 2, columns: [{ ref: "c0", id: "column-1" }], rows: [], replayed: true };
+        }
+        expect(body.rows).toEqual([{ cells: { "column-1": "imported" } }]);
+        return { revision: 3, columns: [], rows: [{ id: "row-1" }] };
+      }),
+      readTable: vi.fn(async () => ({ table: { revision: 3, columns: [{}], rowCount: 1 } })),
+    };
+    const report = { issue: vi.fn(), error: vi.fn(), progress: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+    expect(state.nodes[page.path].table).toMatchObject({
+      revision: 2,
+      columnOffset: 1,
+      columnsByRef: { c0: "column-1" },
+    });
+    expect(client.bulkTableWrite).toHaveBeenNthCalledWith(
+      1,
+      "page-1",
+      expect.objectContaining({
+        leaseToken: "reconcile-lease",
+        expectedRevision: 1,
+        clientRequestId: expect.stringContaining(":columns:0:"),
+      }),
+    );
+
+    await expect(
+      importTable({
+        index: {},
+        client,
+        manifest,
+        report,
+        database: page,
+        record: state.nodes[page.path],
+        plan,
+      }),
+    ).resolves.toBe(1);
+    expect(state.nodes[page.path].table).toMatchObject({
+      phase: "complete",
+      rowOffset: 1,
+      columnsByRef: { c0: "column-1" },
+    });
+  });
 });
 
 describe("table batching", () => {
@@ -328,17 +523,16 @@ describe("table batching", () => {
     ]);
     const database = { path: "Table.html", title: "Table" };
     const state = { importId: "a".repeat(32), nodes: { [database.path]: { pageId: "page-1" } } };
+    const update = (path, patch) => {
+      state.nodes[path] = { ...state.nodes[path], ...patch };
+    };
     const manifest = {
       state,
       node(path) {
         return state.nodes[path];
       },
-      record(path, patch) {
-        state.nodes[path] = { ...state.nodes[path], ...patch };
-      },
-      recordNow(path, patch) {
-        state.nodes[path] = { ...state.nodes[path], ...patch };
-      },
+      record: vi.fn(update),
+      recordNow: vi.fn(update),
     };
     let bulk = 0;
     const client = {
@@ -382,6 +576,11 @@ describe("table batching", () => {
     expect(client.bulkTableWrite.mock.calls.every(([, body]) => body.clientRequestId.includes("Table.html"))).toBe(
       true,
     );
+    expect(
+      manifest.recordNow.mock.calls
+        .map(([, patch]) => patch.table?.revision)
+        .filter((revision) => revision !== undefined),
+    ).toEqual([1, 2, 3, 4]);
     expect(state.nodes[database.path].table).toMatchObject({
       phase: "complete",
       columnOffset: 1,

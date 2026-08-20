@@ -12,7 +12,9 @@ import { WebSocket } from "ws";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
-import { DOCUMENT_FRAGMENT, writeBlocksToFragment } from "./blocks.mjs";
+import { projectDocument } from "../../src/shared/document-projection.ts";
+import { documentProjectionHash } from "../../src/shared/import-integrity.ts";
+import { DOCUMENT_FRAGMENT, DocumentStateChangedError, writeBlocksToFragment } from "./blocks.mjs";
 
 const SYNC_TIMEOUT_MS = 30_000;
 
@@ -122,6 +124,10 @@ export async function readDocumentJson({ client, pageId, epoch }) {
   }
 }
 
+function currentProjectionHash(doc) {
+  return documentProjectionHash(projectDocument(yXmlFragmentToProsemirrorJSON(doc.getXmlFragment(DOCUMENT_FRAGMENT))));
+}
+
 /**
  * Waits for the server to confirm the update reached its storage.
  *
@@ -153,6 +159,8 @@ export async function pushDocument({
   epoch,
   lingerMs = 1_200,
   barrierTimeoutMs = 30_000,
+  expectedProjectionHashes = null,
+  beforeWrite = () => {},
 }) {
   const doc = new Y.Doc();
   const provider = createProvider(client, pageId, epoch, doc);
@@ -160,7 +168,23 @@ export async function pushDocument({
   try {
     await provider.connect();
     await waitForSync(provider);
-    const written = await writeBlocksToFragment(editor, blocks, doc);
+    // Compare and replace through one synchronized Y.Doc. The state vector closes the
+    // remaining async window: if another client writes while the hash is calculated or
+    // its baseline is persisted, writeBlocksToFragment refuses the transaction.
+    const stateVector = Y.encodeStateVector(doc);
+    let liveProjectionHash = await currentProjectionHash(doc);
+    if (expectedProjectionHashes && !expectedProjectionHashes.includes(liveProjectionHash)) {
+      return { conflict: true, liveProjectionHash, updates: 0 };
+    }
+    beforeWrite(liveProjectionHash);
+    let written;
+    try {
+      written = await writeBlocksToFragment(editor, blocks, doc, DOCUMENT_FRAGMENT, stateVector);
+    } catch (error) {
+      if (!(error instanceof DocumentStateChangedError)) throw error;
+      liveProjectionHash = await currentProjectionHash(doc);
+      return { conflict: true, liveProjectionHash, updates: 0 };
+    }
     // Zero updates means the page already held exactly this content, which is what makes
     // a resumed import free rather than a rewrite.
     if (written.updates > 0) {
