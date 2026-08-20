@@ -2,7 +2,9 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { tableContentHash } from "../../src/shared/import-integrity.ts";
 import {
+  canonicalSourceTable,
   deterministicResourceId,
   importTable,
   planTableRowBatches,
@@ -10,6 +12,15 @@ import {
   runImport,
   selectPages,
 } from "./run.mjs";
+
+async function planFor(table) {
+  const canonical = canonicalSourceTable(table);
+  return {
+    table,
+    batches: table.columns.length ? planTableRowBatches(table) : [],
+    contentHash: await tableContentHash(canonical.columns, canonical.rows),
+  };
+}
 
 describe("selectPages", () => {
   it("includes ancestors when a limited child sorts before its parent", () => {
@@ -87,7 +98,7 @@ describe("reconcileCommitted", () => {
     const manifest = {
       state,
       node: (path) => state.nodes[path],
-      recordNow(path, patch) {
+      record(path, patch) {
         state.nodes[path] = { ...state.nodes[path], ...patch };
       },
     };
@@ -134,7 +145,7 @@ describe("reconcileCommitted", () => {
       node(path) {
         return state.nodes[path];
       },
-      recordNow(path, patch) {
+      record(path, patch) {
         state.nodes[path] = { ...state.nodes[path], ...patch };
       },
     };
@@ -195,7 +206,7 @@ describe("reconcileCommitted", () => {
     const manifest = {
       state,
       node: (path) => state.nodes[path],
-      recordNow(path, patch) {
+      record(path, patch) {
         state.nodes[path] = { ...state.nodes[path], ...patch };
       },
     };
@@ -243,7 +254,7 @@ describe("reconcileCommitted", () => {
     const manifest = {
       state,
       node: (path) => state.nodes[path],
-      recordNow(path, patch) {
+      record(path, patch) {
         state.nodes[path] = { ...state.nodes[path], ...patch };
       },
     };
@@ -253,7 +264,7 @@ describe("reconcileCommitted", () => {
       selected: [page],
       manifest,
       report,
-      tablePlans: new Map([[page, table]]),
+      tablePlans: new Map([[page, await planFor(table)]]),
       client: {
         pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
         listAttachments: vi.fn(async () => []),
@@ -278,7 +289,7 @@ describe("table batching", () => {
     const state = { importId: "a".repeat(32), nodes: { [database.path]: { pageId: "page-1" } } };
     const manifest = {
       state,
-      recordNow(path, patch) {
+      record(path, patch) {
         state.nodes[path] = { ...state.nodes[path], ...patch };
       },
     };
@@ -292,7 +303,7 @@ describe("table batching", () => {
         report: { issue: vi.fn(), progress: vi.fn() },
         database,
         record: state.nodes[database.path],
-        table: { columns: [], rows: [] },
+        plan: await planFor({ columns: [], rows: [] }),
       }),
     ).resolves.toBe(0);
     expect(state.nodes[database.path].table).toMatchObject({
@@ -321,6 +332,9 @@ describe("table batching", () => {
       state,
       node(path) {
         return state.nodes[path];
+      },
+      record(path, patch) {
+        state.nodes[path] = { ...state.nodes[path], ...patch };
       },
       recordNow(path, patch) {
         state.nodes[path] = { ...state.nodes[path], ...patch };
@@ -354,7 +368,7 @@ describe("table batching", () => {
         report: { issue: vi.fn(), progress: vi.fn() },
         database,
         record: state.nodes[database.path],
-        table,
+        plan: await planFor(table),
       }),
     ).resolves.toBe(201);
     expect(client.bulkTableWrite).toHaveBeenCalledTimes(3);

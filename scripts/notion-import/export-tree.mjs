@@ -247,7 +247,15 @@ export function resolveLink(href, index, sourcePath = null, onIssue = () => {}) 
     // Already decoded, or malformed escaping; match on the raw value.
   }
   if (/^https?:/i.test(decoded)) {
-    const url = new URL(decoded);
+    // Exports carry whatever the user pasted; a malformed absolute link is one
+    // unresolved link, never a thrown parse error that would abort the whole import.
+    let url;
+    try {
+      url = new URL(decoded);
+    } catch {
+      onIssue("link_unresolved", href);
+      return null;
+    }
     if (!(url.hostname === "notion.so" || url.hostname.endsWith(".notion.so"))) return null;
     const id = notionIdOf(url.pathname.replace(/\/+$/, "").replaceAll("-", ""));
     const target = id ? (index.byNotionId.get(id) ?? null) : null;

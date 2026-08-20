@@ -41,6 +41,10 @@ describe("inferColumnType", () => {
   it("reads dates and numbers", () => {
     expect(inferColumnType(["2026-01-02", "2026-03-04"])).toBe("date");
     expect(inferColumnType(["1.25", "2.5", "-3.75"])).toBe("number");
+    // Integers and ordinary decimals are numbers: their canonical string form
+    // regenerates the source exactly, so verification hashes still match.
+    expect(inferColumnType(["1", "2", "3"])).toBe("number");
+    expect(inferColumnType(["0.1", "19.99", "-4.7"])).toBe("number");
   });
 
   it("uses select only when values actually repeat", () => {
@@ -57,13 +61,12 @@ describe("inferColumnType", () => {
     expect(inferColumnType(["", "", ""])).toBe("text");
   });
 
-  it("keeps integers, leading-zero ids, exponents, and lossy decimal forms as text", () => {
-    expect(inferColumnType(["1", "2", "3"])).toBe("text");
+  it("keeps leading-zero ids, exponents, and lossy decimal forms as text", () => {
     expect(inferColumnType(["00123", "00456"])).toBe("text");
     expect(inferColumnType(["9007199254740993", "9007199254740995"])).toBe("text");
     expect(inferColumnType(["1e3", "2e3"])).toBe("text");
     expect(inferColumnType(["1.50", "2.50"])).toBe("text");
-    expect(inferColumnType(["0.1", "0.2"])).toBe("text");
+    expect(inferColumnType(["-0", "0"])).toBe("text");
     expect(tableFromCsv("Code\n00123\n9007199254740993\n").rows.map((row) => row.cells["ref:c0"])).toEqual([
       "00123",
       "9007199254740993",

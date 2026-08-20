@@ -15,8 +15,13 @@ import {
   TABLE_BULK_MAX_CELLS,
   TABLE_BULK_MAX_COLUMNS,
   TABLE_BULK_MAX_ROWS,
+  TABLE_COLUMN_NAME_MAX,
   TABLE_MAX_ROWS,
+  TABLE_SELECT_LABEL_MAX,
+  TABLE_TEXT_CELL_MAX,
 } from "../../src/shared/table-limits.ts";
+import { PAGE_TITLE_MAX } from "../../src/shared/validation.ts";
+import { MAX_ATTACHMENT_BYTES } from "../../src/worker/attachments.ts";
 import { projectDocument } from "../../src/shared/document-projection.ts";
 import { documentProjectionHash, tableContentHash } from "../../src/shared/import-integrity.ts";
 import { assignStableIds, createImportEditor, htmlToBlocks } from "./blocks.mjs";
@@ -27,12 +32,6 @@ import { tableFromCsv } from "./csv.mjs";
 import { hashFileContent } from "./manifest.mjs";
 
 const PAGE_BATCH = 50;
-// Matches the route's own per-request caps, so a batch is never rejected for size.
-const TITLE_MAX = 200;
-const COLUMN_NAME_MAX = 200;
-const TEXT_CELL_MAX = 10_000;
-const SELECT_LABEL_MAX = 200;
-const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024 * 1024;
 const EMPTY_DOCUMENT_PROJECTION_HASH = documentProjectionHash({
   plainText: "",
   pageReferences: [],
@@ -148,17 +147,19 @@ function validateTable(table, title) {
     throw new Error(`${title} has ${table.rows.length} rows; tables are limited to ${TABLE_MAX_ROWS}.`);
   }
   for (const column of table.columns) {
-    if (column.name.length > COLUMN_NAME_MAX) {
-      throw new Error(`${title} has a column name longer than ${COLUMN_NAME_MAX} characters.`);
+    if (column.name.length > TABLE_COLUMN_NAME_MAX) {
+      throw new Error(`${title} has a column name longer than ${TABLE_COLUMN_NAME_MAX} characters.`);
     }
   }
   for (const [rowIndex, row] of table.rows.entries()) {
     for (const value of Object.values(row.cells)) {
-      if (typeof value === "string" && value.length > TEXT_CELL_MAX) {
-        throw new Error(`${title} row ${rowIndex + 1} has text longer than ${TEXT_CELL_MAX} characters.`);
+      if (typeof value === "string" && value.length > TABLE_TEXT_CELL_MAX) {
+        throw new Error(`${title} row ${rowIndex + 1} has text longer than ${TABLE_TEXT_CELL_MAX} characters.`);
       }
-      if (value?.option?.length > SELECT_LABEL_MAX) {
-        throw new Error(`${title} row ${rowIndex + 1} has a select label longer than ${SELECT_LABEL_MAX} characters.`);
+      if (value?.option?.length > TABLE_SELECT_LABEL_MAX) {
+        throw new Error(
+          `${title} row ${rowIndex + 1} has a select label longer than ${TABLE_SELECT_LABEL_MAX} characters.`,
+        );
       }
     }
   }
@@ -181,15 +182,30 @@ function mapRow(row, columnIds) {
   return { cells };
 }
 
+// Byte cost of the fixed request fields around an empty rows array, using the widest
+// values a real request can carry. Adding a row to `rows: []` costs exactly the row's
+// own JSON plus a separating comma, so each row is serialized once, not once per
+// candidate batch size.
+const BULK_ENVELOPE_BYTES = Buffer.byteLength(
+  JSON.stringify({
+    leaseToken: "x".repeat(200),
+    expectedRevision: Number.MAX_SAFE_INTEGER,
+    clientRequestId: "x".repeat(200),
+    columns: [],
+    rows: [],
+  }),
+);
+
 export function planTableRowBatches(table) {
   const ids = placeholderColumnIds(table.columns);
   const batches = [];
   let start = 0;
   while (start < table.rows.length) {
-    const rows = [];
+    let count = 0;
     let cells = 0;
+    let bytes = BULK_ENVELOPE_BYTES;
     let end = start;
-    while (end < table.rows.length && rows.length < TABLE_BULK_MAX_ROWS) {
+    while (end < table.rows.length && count < TABLE_BULK_MAX_ROWS) {
       const candidate = mapRow(table.rows[end], ids);
       const candidateCells = Object.keys(candidate.cells).length;
       if (candidateCells > TABLE_BULK_MAX_CELLS) {
@@ -197,21 +213,15 @@ export function planTableRowBatches(table) {
           `Row ${end + 1} has ${candidateCells} cells; one request is limited to ${TABLE_BULK_MAX_CELLS}.`,
         );
       }
-      if (rows.length && cells + candidateCells > TABLE_BULK_MAX_CELLS) break;
-      const nextRows = [...rows, candidate];
-      const envelope = {
-        leaseToken: "x".repeat(200),
-        expectedRevision: Number.MAX_SAFE_INTEGER,
-        clientRequestId: "x".repeat(200),
-        columns: [],
-        rows: nextRows,
-      };
-      if (Buffer.byteLength(JSON.stringify(envelope)) > TABLE_BULK_MAX_BODY_BYTES) {
-        if (!rows.length) throw new Error(`Row ${start + 1} cannot fit in one bulk table request.`);
+      if (count && cells + candidateCells > TABLE_BULK_MAX_CELLS) break;
+      const candidateBytes = Buffer.byteLength(JSON.stringify(candidate)) + (count ? 1 : 0);
+      if (bytes + candidateBytes > TABLE_BULK_MAX_BODY_BYTES) {
+        if (!count) throw new Error(`Row ${start + 1} cannot fit in one bulk table request.`);
         break;
       }
-      rows.push(candidate);
+      count += 1;
       cells += candidateCells;
+      bytes += candidateBytes;
       end += 1;
     }
     batches.push({ start, end });
@@ -223,11 +233,21 @@ export function planTableRowBatches(table) {
 export function preflightTable(index, database, onIssue = () => {}) {
   const csv = readFileSync(join(index.root, database.csvPath), "utf8");
   const table = tableFromCsv(csv, onIssue);
-  if (table.columns.length) {
-    validateTable(table, database.title);
-    planTableRowBatches(table);
-  }
+  if (table.columns.length) validateTable(table, database.title);
   return table;
+}
+
+/**
+ * Everything the import needs to know about one database, computed exactly once.
+ * The plan is shared by preflight, reconciliation, and the write pass, so the CSV is
+ * parsed, batch-planned, and hashed a single time per run.
+ */
+export async function planTable(index, database, onIssue = () => {}) {
+  const table = preflightTable(index, database, onIssue);
+  const batches = table.columns.length ? planTableRowBatches(table) : [];
+  const canonical = canonicalSourceTable(table);
+  const contentHash = await tableContentHash(canonical.columns, canonical.rows);
+  return { table, batches, contentHash };
 }
 
 export function canonicalSourceTable(source, columnLimit = source.columns.length, rowLimit = source.rows.length) {
@@ -302,7 +322,9 @@ function expectedPageFor(page, manifest, rootParentId) {
   return {
     id: deterministicResourceId(manifest.state.importId, "page", page.path),
     kind: page.kind === "database" ? "table" : "document",
-    title: page.title.slice(0, TITLE_MAX) || "Untitled",
+    // Trimmed after the cap because the server trims what it stores; without it a
+    // truncation landing on whitespace would make every later comparison a mismatch.
+    title: page.title.slice(0, PAGE_TITLE_MAX).trim() || "Untitled",
     parentId: page.parent
       ? deterministicResourceId(manifest.state.importId, "page", page.parent.path)
       : (rootParentId ?? null),
@@ -315,6 +337,31 @@ async function currentDocumentProjectionHash(client, pageId, contentEpoch) {
   return documentProjectionHash(projectDocument(document));
 }
 
+/**
+ * The table state exactly one committed bulk batch ahead of the manifest, or null when
+ * no further batch exists. A process killed between the server's commit and the
+ * manifest write leaves the live table in precisely this state, and it must resume,
+ * not be mistaken for a destination edit.
+ */
+async function advancedCommitFor(plan, columnOffset, rowOffset) {
+  const { table, batches } = plan;
+  let nextColumnOffset = columnOffset;
+  let nextRowOffset = rowOffset;
+  if (columnOffset < table.columns.length) {
+    nextColumnOffset = Math.min(columnOffset + TABLE_BULK_MAX_COLUMNS, table.columns.length);
+  } else {
+    const batch = batches.find((candidate) => candidate.start === rowOffset);
+    if (!batch) return null;
+    nextRowOffset = batch.end;
+  }
+  const canonical = canonicalSourceTable(table, nextColumnOffset, nextRowOffset);
+  return {
+    columnOffset: nextColumnOffset,
+    rowOffset: nextRowOffset,
+    contentHash: await tableContentHash(canonical.columns, canonical.rows),
+  };
+}
+
 export async function reconcileCommitted({
   selected,
   client,
@@ -322,9 +369,16 @@ export async function reconcileCommitted({
   report,
   tablePlans = new Map(),
   documentHash = currentDocumentProjectionHash,
+  skipPaths = new Set(),
 }) {
+  // Live document hashes read during reconciliation, for the write pass to reuse
+  // instead of opening a second WebSocket per document.
+  const documentHashes = new Map();
   for (const page of selected) {
     const key = keyOf(page);
+    // A node first planned by this run has provably no committed server state to
+    // reconcile; probing it would be one guaranteed 404 per page before any work.
+    if (skipPaths.has(key)) continue;
     const node = manifest.node(key);
     const pageId = node?.pageId ?? node?.plannedPageId;
     if (!pageId) continue;
@@ -376,10 +430,16 @@ export async function reconcileCommitted({
       // Reconcile against the live Yjs document so an interrupted run cannot mistake
       // its own unindexed write for a destination edit and accept stale content.
       const liveHash = await documentHash(client, pageId, livePage.contentEpoch);
+      documentHashes.set(pageId, liveHash);
       if (liveHash !== content.projectionHash) {
-        content.status = "destination-owned";
-        content.acceptedRemoteHash = liveHash;
-        report.issue("destination_document_kept", page.title);
+        // An interrupted own write keeps its 'writing'/'failed' marker: only the write
+        // pass can tell a never-landed write (live still equals the recorded base)
+        // from a destination edit, and its recovery check needs that status intact.
+        if (content.status !== "writing" && content.status !== "failed") {
+          content.status = "destination-owned";
+          content.acceptedRemoteHash = liveHash;
+          report.issue("destination_document_kept", page.title);
+        }
       } else {
         if (content.status === "destination-owned") content.status = "unchanged";
         delete content.acceptedRemoteHash;
@@ -420,10 +480,9 @@ export async function reconcileCommitted({
       try {
         const live = await client.tableVerification(pageId);
         patch.remoteTableMissing = false;
-        const source = tablePlans.get(page);
-        if (source) {
-          const fullCanonical = canonicalSourceTable(source);
-          const fullHash = await tableContentHash(fullCanonical.columns, fullCanonical.rows);
+        const plan = tablePlans.get(page);
+        if (plan) {
+          const source = plan.table;
           const progress = node.table;
           const complete = progress?.phase === "complete";
           const columnOffset = complete ? source.columns.length : (progress?.columnOffset ?? 0);
@@ -435,14 +494,24 @@ export async function reconcileCommitted({
             ...progress,
             phase: progress?.phase ?? "columns",
             revision: progress?.revision ?? live.revision,
-            contentHash: fullHash,
+            contentHash: plan.contentHash,
             expectedColumns: source.columns.length,
             expectedRows: source.rows.length,
             columnOffset,
             rowOffset,
             columnsByRef: progress?.columnsByRef ?? {},
           };
+          // A process killed after the server committed a bulk batch but before the
+          // manifest recorded it leaves the live table exactly one batch ahead. That
+          // is this import's own write, so the offsets advance and the run resumes.
+          const advanced = complete ? null : await advancedCommitFor(plan, columnOffset, rowOffset);
           if (matchesLastCommit) {
+            delete table.acceptedRemoteHash;
+            delete table.acceptedRemoteRowCount;
+          } else if (advanced && live.contentHash === advanced.contentHash && live.rowCount === advanced.rowOffset) {
+            table.columnOffset = advanced.columnOffset;
+            table.rowOffset = advanced.rowOffset;
+            table.revision = live.revision;
             delete table.acceptedRemoteHash;
             delete table.acceptedRemoteRowCount;
           } else {
@@ -463,8 +532,9 @@ export async function reconcileCommitted({
         patch.remoteTableMissing = true;
       }
     }
-    manifest.recordNow(key, patch);
+    manifest.record(key, patch);
   }
+  return { documentHashes };
 }
 
 export async function runImport({ index, client, manifest, report, rootParentId, limit, lingerMs }) {
@@ -482,44 +552,58 @@ export async function runImport({ index, client, manifest, report, rootParentId,
   const tablePlans = new Map();
   for (const database of selected.filter((page) => page.kind === "database")) {
     report.inPage(database.title);
-    tablePlans.set(
-      database,
-      preflightTable(index, database, (code, detail) => report.issue(code, detail)),
-    );
+    tablePlans.set(database, await planTable(index, database, (code, detail) => report.issue(code, detail)));
   }
-  // Finish every local hard-limit/body check before writing even the manifest.
+  // Finish every local hard-limit/body check before writing even the manifest. The
+  // failing page is named: a bare parser error from deep inside one file would
+  // otherwise leave the operator bisecting the export.
   for (const page of selected) {
-    if (page.kind === "document") {
-      normalizeNotionHtml(readPageHtml(index.root, page), {
-        onIssue() {},
-        resolveHref: (href) => {
-          const target = resolveLink(href, index, page.path);
-          if (!target) return null;
-          return target.kind === "asset"
-            ? { type: "asset", url: "/api/attachments/preflight" }
-            : { type: "page", entityId: "preflight", label: target.title };
-        },
-      });
-    }
-    for (const asset of page.assets) {
-      if (DENIED_EXTENSIONS.has(extensionOf(asset))) continue;
-      const size = statSync(join(index.root, asset)).size;
-      if (size > MAX_ATTACHMENT_BYTES) {
-        throw new Error(`${asset} is ${size} bytes; attachments are limited to ${MAX_ATTACHMENT_BYTES}.`);
+    try {
+      if (page.kind === "document") {
+        normalizeNotionHtml(readPageHtml(index.root, page), {
+          onIssue() {},
+          resolveHref: (href) => {
+            const target = resolveLink(href, index, page.path);
+            if (!target) return null;
+            return target.kind === "asset"
+              ? { type: "asset", url: "/api/attachments/preflight" }
+              : { type: "page", entityId: "preflight", label: target.title };
+          },
+        });
       }
+      for (const asset of page.assets) {
+        if (DENIED_EXTENSIONS.has(extensionOf(asset))) continue;
+        const size = statSync(join(index.root, asset)).size;
+        if (size > MAX_ATTACHMENT_BYTES) {
+          throw new Error(`${asset} is ${size} bytes; attachments are limited to ${MAX_ATTACHMENT_BYTES}.`);
+        }
+      }
+    } catch (error) {
+      throw new Error(`${page.title} (${page.path}): ${errorMessage(error)}`, { cause: error });
     }
   }
   manifest.state.selectedPaths = selectedPaths;
+  // Paths this run is the first to plan. They have no committed server state, so
+  // reconciliation skips them and the content pass knows their documents start empty.
+  const freshPaths = new Set();
   for (const page of selected) {
     const expectedPage = expectedPages.get(page);
     const current = manifest.node(keyOf(page));
+    if (!current) freshPaths.add(keyOf(page));
     manifest.record(keyOf(page), {
       plannedPageId: expectedPage.id,
       expectedPage: current?.expectedPage ?? expectedPage,
     });
   }
   manifest.flush();
-  await reconcileCommitted({ selected, client, manifest, report, tablePlans });
+  const { documentHashes } = await reconcileCommitted({
+    selected,
+    client,
+    manifest,
+    report,
+    tablePlans,
+    skipPaths: freshPaths,
+  });
 
   // Pass 1: every page, no content.
   const levels = levelsOf(selected);
@@ -549,7 +633,7 @@ export async function runImport({ index, client, manifest, report, rootParentId,
       }
       chunk.forEach((page, position) => {
         const remote = created[position];
-        if (page.title.length > TITLE_MAX) report.issue("title_truncated", page.title);
+        if (page.title.length > PAGE_TITLE_MAX) report.issue("title_truncated", page.title);
         manifest.record(keyOf(page), {
           title: page.title,
           kind: page.kind,
@@ -574,14 +658,16 @@ export async function runImport({ index, client, manifest, report, rootParentId,
       const extension = extensionOf(asset);
       if (DENIED_EXTENSIONS.has(extension)) {
         uploaded[asset] = { status: "skipped-unsafe" };
-        manifest.recordNow(keyOf(page), { assets: { ...uploaded } });
+        manifest.record(keyOf(page), { assets: { ...uploaded } });
         report.issue("attachment_denied_type", basename(asset));
         continue;
       }
       try {
         const path = join(index.root, asset);
         const size = statSync(path).size;
-        const contentSha256 = hashFileContent(path);
+        // Already computed once by the export fingerprint; hash again only if a caller
+        // supplied a manifest without the digest map.
+        const contentSha256 = manifest.contentSha256?.(asset) ?? hashFileContent(path);
         const attachmentId = deterministicResourceId(manifest.state.importId, "attachment", `${page.path}\0${asset}`);
         if (uploaded[asset]?.id) {
           if (uploaded[asset].id !== attachmentId || uploaded[asset].contentSha256 !== contentSha256) {
@@ -611,11 +697,6 @@ export async function runImport({ index, client, manifest, report, rootParentId,
           {
             attachmentId,
             contentSha256,
-            uploadId: uploaded[asset]?.uploadId,
-            onSession: async (uploadId) => {
-              uploaded[asset] = { ...uploaded[asset], uploadId };
-              manifest.recordNow(keyOf(page), { assets: { ...uploaded } });
-            },
           },
         );
         uploaded[asset] = {
@@ -626,7 +707,9 @@ export async function runImport({ index, client, manifest, report, rootParentId,
           name: attachment.name,
           mime: attachment.mime,
         };
-        manifest.recordNow(keyOf(page), { assets: { ...uploaded } });
+        // Debounced: a lost record is re-derived on resume by asking for the
+        // deterministic attachment id, so only the pre-write record above must flush.
+        manifest.record(keyOf(page), { assets: { ...uploaded } });
       } catch (error) {
         report.error("attachment_failed", `${basename(asset)}: ${errorMessage(error)}`);
       }
@@ -652,14 +735,19 @@ export async function runImport({ index, client, manifest, report, rootParentId,
     try {
       const blocks = await convertDocument({ index, page, manifest, included, editor, report, assetUrls });
       projectionHash = await documentProjectionHash(projectDocument(await documentJsonForBlocks(editor, blocks)));
-      baseRemoteHash = await currentDocumentProjectionHash(client, record.pageId, record.contentEpoch);
+      // A page this run just created is provably empty, and reconciliation already
+      // read the rest; a second sync per document would double the connection cost.
+      baseRemoteHash = freshPaths.has(keyOf(page))
+        ? await EMPTY_DOCUMENT_PROJECTION_HASH
+        : (documentHashes.get(record.pageId) ??
+          (await currentDocumentProjectionHash(client, record.pageId, record.contentEpoch)));
       const prior = record.content;
       const expectedBeforeWrite = prior?.projectionHash ?? (await EMPTY_DOCUMENT_PROJECTION_HASH);
       const ambiguousOwnWrite =
         (prior?.status === "writing" || prior?.status === "failed") &&
         (baseRemoteHash === prior.projectionHash || baseRemoteHash === prior.baseRemoteHash);
       if (baseRemoteHash !== expectedBeforeWrite && !ambiguousOwnWrite) {
-        manifest.recordNow(keyOf(page), {
+        manifest.record(keyOf(page), {
           content: {
             status: "destination-owned",
             projectionHash,
@@ -686,13 +774,15 @@ export async function runImport({ index, client, manifest, report, rootParentId,
         epoch: record.contentEpoch,
         lingerMs,
       });
-      manifest.recordNow(keyOf(page), {
+      // Debounced: losing this record leaves 'writing', which the next run resolves by
+      // comparing the live document against the recorded base - never by rewriting.
+      manifest.record(keyOf(page), {
         content: { status: result.updates > 0 ? "written" : "unchanged", projectionHash },
         contentError: null,
       });
       if (result.updates > 0) written += 1;
     } catch (error) {
-      manifest.recordNow(keyOf(page), {
+      manifest.record(keyOf(page), {
         content: {
           status: "failed",
           ...(projectionHash ? { projectionHash } : {}),
@@ -726,7 +816,7 @@ export async function runImport({ index, client, manifest, report, rootParentId,
         report,
         database,
         record,
-        table: tablePlans.get(database),
+        plan: tablePlans.get(database),
       });
     } catch (error) {
       manifest.recordNow(keyOf(database), { tableError: errorMessage(error) });
@@ -759,12 +849,11 @@ function sameStringSets(left, right) {
  * of per-cell writes. The lease renews itself on each bulk write, so a long table does
  * not need a renewal timer running alongside.
  */
-export async function importTable({ index, client, manifest, report, database, record, table = null }) {
-  table ??= preflightTable(index, database, (code, detail) => report.issue(code, detail));
-  const canonical = canonicalSourceTable(table);
-  const contentHash = await tableContentHash(canonical.columns, canonical.rows);
+export async function importTable({ index, client, manifest, report, database, record, plan = null }) {
+  plan ??= await planTable(index, database, (code, detail) => report.issue(code, detail));
+  const { table, batches: rowBatches, contentHash } = plan;
   if (table.columns.length === 0) {
-    manifest.recordNow(keyOf(database), {
+    manifest.record(keyOf(database), {
       table: {
         phase: "complete",
         contentHash,
@@ -774,12 +863,10 @@ export async function importTable({ index, client, manifest, report, database, r
         columnOffset: 0,
         rowOffset: 0,
       },
-      rowsWritten: true,
       tableError: null,
     });
     return 0;
   }
-  const rowBatches = planTableRowBatches(table);
 
   const lease = await client.acquireTableLease(record.pageId);
   try {
@@ -799,7 +886,9 @@ export async function importTable({ index, client, manifest, report, database, r
         expectedColumns: table.columns.length,
         expectedRows: table.rows.length,
       };
-      manifest.recordNow(keyOf(database), { table: progress, rowsWritten: false, tableError: null });
+      // Flushed before the first bulk write so a kill can never leave committed server
+      // state with no recorded baseline to reconcile it against.
+      manifest.recordNow(keyOf(database), { table: progress, tableError: null });
     }
     if (progress.expectedColumns !== table.columns.length || progress.expectedRows !== table.rows.length) {
       throw new Error("The saved table progress does not match the current CSV.");
@@ -834,11 +923,13 @@ export async function importTable({ index, client, manifest, report, database, r
         columnOffset: offset + columns.length,
         columnsByRef,
       };
-      manifest.recordNow(keyOf(database), { table: progress });
+      // Debounced: a record lost to a kill is recovered on resume, where the live
+      // table hash matches the one-batch-ahead state and the offsets advance.
+      manifest.record(keyOf(database), { table: progress });
     }
     if (progress.phase === "columns") {
       progress = { ...progress, phase: "rows" };
-      manifest.recordNow(keyOf(database), { table: progress });
+      manifest.record(keyOf(database), { table: progress });
     }
 
     const columnIds = new Map(Object.entries(progress.columnsByRef));
@@ -859,7 +950,7 @@ export async function importTable({ index, client, manifest, report, database, r
       const result = await client.bulkTableWrite(record.pageId, body);
       if (result.rows?.length !== rows.length) throw new Error("The bulk route returned an incomplete row result.");
       progress = { ...progress, revision: result.revision, rowOffset: batch.end };
-      manifest.recordNow(keyOf(database), { table: progress });
+      manifest.record(keyOf(database), { table: progress });
       report.progress("tables", progress.rowOffset, table.rows.length, database.title);
     }
 
@@ -870,7 +961,7 @@ export async function importTable({ index, client, manifest, report, database, r
       );
     }
     progress = { ...progress, phase: "complete" };
-    manifest.recordNow(keyOf(database), { table: progress, rowsWritten: true, tableError: null });
+    manifest.record(keyOf(database), { table: progress, tableError: null });
   } finally {
     await client.releaseTableLease(record.pageId, lease.leaseToken).catch(() => undefined);
   }

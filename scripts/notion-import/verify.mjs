@@ -1,5 +1,6 @@
 /** Exact, read-only verification of a completed import against its local export. */
 import { setTimeout as delay } from "node:timers/promises";
+import { PAGE_TITLE_MAX } from "../../src/shared/validation.ts";
 import { projectDocument } from "../../src/shared/document-projection.ts";
 import { documentProjectionHash, tableContentHash } from "../../src/shared/import-integrity.ts";
 import { createImportEditor } from "./blocks.mjs";
@@ -32,7 +33,7 @@ function expectedPageMetadata(node, sourcePage, manifest) {
     ...(node.expectedPage ?? {
       id: deterministicResourceId(manifest.state.importId, "page", sourcePage.path),
       kind: sourcePage.kind === "database" ? "table" : "document",
-      title: sourcePage.title.slice(0, 200) || "Untitled",
+      title: sourcePage.title.slice(0, PAGE_TITLE_MAX).trim() || "Untitled",
       parentId: sourcePage.parent
         ? (manifest.node(sourcePage.parent.path)?.pageId ?? null)
         : manifest.state.rootParentId,

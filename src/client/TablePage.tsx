@@ -151,7 +151,6 @@ export function TablePage({
   // Pages appended past the first. While any are loaded the background poll stands
   // down, so browsing deep into a table is not yanked back to the top every 5s.
   const appendedPagesRef = useRef(0);
-  const loadMoreInFlightRef = useRef(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [title, setTitle] = useState(page.title);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
@@ -318,7 +317,7 @@ export function TablePage({
   // Appends the next keyset or offset page. Deliberately separate from `load`,
   // which always returns to the first page so a refresh has one predictable meaning.
   async function loadMore(currentPage: TableData) {
-    if (loadMoreInFlightRef.current || loadsInFlightRef.current || !currentPage.hasMore) return;
+    if (loadsInFlightRef.current || !currentPage.hasMore) return;
 
     const params = new URLSearchParams({ limit: String(currentPage.limit) });
     if (currentPage.sort) {
@@ -335,7 +334,6 @@ export function TablePage({
 
     const generation = loadGenerationRef.current;
     const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
-    loadMoreInFlightRef.current = true;
     loadsInFlightRef.current += 1;
     setLoadingMore(true);
     try {
@@ -365,7 +363,6 @@ export function TablePage({
       });
     } finally {
       loadsInFlightRef.current -= 1;
-      loadMoreInFlightRef.current = false;
       if (mountedRef.current) setLoadingMore(false);
     }
   }
