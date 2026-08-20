@@ -35,7 +35,7 @@ Two limitations that determine how you use it:
   Object outage.** An uptime monitor on this endpoint proves the Worker is running and D1 is reachable;
   it proves nothing about document editing, attachments, or version history.
 - `version` is a hardcoded string, not a build identifier. It cannot tell you which revision is live.
-  Use `pnpm wrangler deployments list`.
+  Use `pnpm wrangler deployments list --env production`.
 
 `GET /api/install` returns `{"initialized": boolean}` and is a useful probe for the bootstrap state of
 a fresh installation. Both endpoints are unauthenticated.
@@ -111,9 +111,9 @@ Two things to remember:
 ## Verifying a deploy
 
 ```sh
-pnpm wrangler deployments list          # which revision is live
+pnpm wrangler deployments list --env production          # which revision is live
 curl -s https://notes.example.com/api/health
-pnpm wrangler d1 execute DB --remote --command \
+pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT COUNT(*) jobs FROM deletion_jobs;"
 ```
 

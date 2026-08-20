@@ -12,7 +12,7 @@ import {
   resolvePartSize,
   UPLOAD_SESSION_TTL_MS,
 } from "./attachments";
-import { processDeletionJob, processDueDeletionJobs, pruneBulkWriteReceipts } from "./cleanup";
+import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
 import { Document } from "./document";
 import type { Env, MemberContext } from "./env";
 import {
@@ -40,6 +40,7 @@ import {
 import { columnType, documentRoom, ID_PATTERN, nullableId, object, pageKind, role, text } from "../shared/validation";
 import type { ClientMemberContext, Page, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
+import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 
@@ -61,6 +62,7 @@ type PageRow = {
   revision: number;
   content_epoch: number;
   plain_text: string;
+  indexed_seq: number;
   archived_at: number | null;
   created_at: number;
   updated_at: number;
@@ -113,6 +115,39 @@ function defaultLocation(request: Request, override?: string) {
 async function jsonBody(request: Request) {
   try {
     return object(await request.json());
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
+  }
+}
+
+async function limitedJsonBody(request: Request, limit: number) {
+  const declared = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) {
+    throw new HttpError(413, "bulk_too_large", "The bulk table write is larger than the request limit.");
+  }
+  if (!request.body) throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > limit) {
+        await reader.cancel();
+        throw new HttpError(413, "bulk_too_large", "The bulk table write is larger than the request limit.");
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return object(JSON.parse(new TextDecoder().decode(bytes)));
   } catch (error) {
     if (error instanceof HttpError) throw error;
     throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
@@ -211,6 +246,7 @@ const SORT_VALUE_EXPRESSIONS: Record<string, string> = {
 
 type TableRowQuery = {
   sql: string;
+  orderSql: string;
   binds: unknown[];
   limit: number;
   offset: number;
@@ -276,11 +312,12 @@ function buildTableRowQuery(
 
   if (!sortColumn) {
     return {
-      sql: `SELECT r.id, r.position FROM table_rows r
+      sql: `SELECT r.id, r.position, 0 sort_null, NULL sort_value FROM table_rows r
              WHERE r.page_id = ?
                AND (? IS NULL OR r.position > ? OR (r.position = ? AND r.id > ?))
              ORDER BY r.position, r.id LIMIT ? OFFSET ?`,
       binds: [pageId, afterPosition, afterPosition, afterPosition, afterId ?? null],
+      orderSql: "page_rows.position, page_rows.id",
       limit,
       offset: 0,
       sort: null,
@@ -293,13 +330,15 @@ function buildTableRowQuery(
   // Empty cells sort last in both directions: the NULL grouping deliberately does not
   // take the sort direction, so reversing a sort does not drag every blank to the top.
   return {
-    sql: `SELECT r.id, r.position FROM table_rows r
+    sql: `SELECT r.id, r.position, CASE WHEN ${value} IS NULL THEN 1 ELSE 0 END sort_null,
+                 ${value} sort_value FROM table_rows r
            LEFT JOIN table_cells sort_cell ON sort_cell.row_id = r.id AND sort_cell.column_id = ?
            WHERE r.page_id = ?
            ORDER BY (CASE WHEN ${value} IS NULL THEN 1 ELSE 0 END), ${value} ${dir === "desc" ? "DESC" : "ASC"},
                     r.position, r.id
            LIMIT ? OFFSET ?`,
     binds: [sortColumn.id, pageId],
+    orderSql: `page_rows.sort_null, page_rows.sort_value ${dir === "desc" ? "DESC" : "ASC"}, page_rows.position, page_rows.id`,
     limit,
     offset,
     sort: sortColumn.id,
@@ -574,13 +613,49 @@ app.post("/api/pages/batch", async (c) => {
 
   const parsed = requested.map((raw, index) => {
     const entry = object(raw);
+    const requestedId = entry.id === undefined ? crypto.randomUUID() : text(entry.id, `pages[${index}].id`, 100);
+    if (!ID_PATTERN.test(requestedId)) {
+      throw new HttpError(422, "invalid_input", `pages[${index}].id is not a valid resource id.`);
+    }
     return {
-      id: crypto.randomUUID(),
+      id: requestedId,
       parentId: nullableId(entry.parentId, `pages[${index}].parentId`),
       kind: pageKind(entry.kind ?? "document"),
       title: typeof entry.title === "string" ? text(entry.title, `pages[${index}].title`, 200) : "Untitled",
     };
   });
+  if (new Set(parsed.map(({ id }) => id)).size !== parsed.length) {
+    throw new HttpError(422, "invalid_input", "A page id may appear only once in a batch.");
+  }
+
+  const readRequested = () =>
+    c.env.DB.prepare(`SELECT * FROM pages WHERE id IN (${parsed.map(() => "?").join(", ")})`)
+      .bind(...parsed.map(({ id }) => id))
+      .all<PageRow>();
+  const matchingReplay = (rows: PageRow[]) => {
+    if (rows.length !== parsed.length) return null;
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const matches = parsed.every((page) => {
+      const row = byId.get(page.id);
+      return (
+        row?.workspace_id === member.workspace.id &&
+        row.archived_at === null &&
+        row.parent_id === page.parentId &&
+        row.kind === page.kind &&
+        row.title === page.title
+      );
+    });
+    return matches ? parsed.map(({ id }) => pageJson(byId.get(id)!)) : null;
+  };
+
+  const existing = await readRequested();
+  if (existing.results.length) {
+    const pages = matchingReplay(existing.results);
+    if (!pages) {
+      throw new HttpError(409, "idempotency_key_reused", "Those page ids already describe different pages.");
+    }
+    return c.json({ pages, replayed: true });
+  }
 
   // Every distinct parent is checked once, which also rejects a parent in another
   // workspace or an archived one exactly as the single-page route does.
@@ -632,7 +707,19 @@ app.post("/api/pages/batch", async (c) => {
       statements.push(c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(page.id));
     }
   }
-  await c.env.DB.batch(statements);
+  try {
+    await c.env.DB.batch(statements);
+  } catch (error) {
+    // A concurrent identical retry may have committed between the existence check
+    // and this transaction. Re-read before classifying the unique conflict.
+    const afterConflict = (await readRequested()).results;
+    const replay = matchingReplay(afterConflict);
+    if (replay) return c.json({ pages: replay, replayed: true });
+    if (afterConflict.length) {
+      throw new HttpError(409, "idempotency_key_reused", "Those page ids already describe different pages.");
+    }
+    throw error;
+  }
 
   const created = await c.env.DB.prepare(
     `SELECT * FROM pages WHERE workspace_id = ? AND id IN (${parsed.map(() => "?").join(", ")})`,
@@ -643,12 +730,12 @@ app.post("/api/pages/batch", async (c) => {
   // so a batch spanning two parents has no meaningful global ordering, and a caller
   // pairing its input to this response by index would silently mismatch.
   const rows = new Map(created.results.map((row) => [row.id, row]));
-  const pages = parsed.flatMap((page) => {
-    const row = rows.get(page.id);
-    return row ? [pageJson(row)] : [];
-  });
+  if (created.results.length !== parsed.length || rows.size !== parsed.length) {
+    throw new HttpError(500, "batch_read_incomplete", "The created page batch could not be read back completely.");
+  }
+  const pages = parsed.map((page) => pageJson(rows.get(page.id)!));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages });
-  return c.json({ pages }, 201);
+  return c.json({ pages, replayed: false }, 201);
 });
 
 app.get("/api/pages/:id", async (c) => {
@@ -856,7 +943,11 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       ) SELECT r2_key FROM attachments WHERE page_id IN subtree`,
+       )
+       SELECT r2_key FROM attachments WHERE page_id IN subtree
+       UNION ALL
+       SELECT r2_key FROM attachment_uploads
+        WHERE page_id IN subtree AND state IN ('r2_complete', 'committed')`,
     )
       .bind(page.id)
       .all<{ r2_key: string }>(),
@@ -909,9 +1000,17 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
            ) SELECT id FROM subtree
          )`,
       ).bind(page.id),
+      c.env.DB.prepare(
+        `DELETE FROM attachment_uploads
+          WHERE state IN ('r2_complete', 'committed') AND page_id IN (
+            WITH RECURSIVE subtree(id) AS (
+              SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+            ) SELECT id FROM subtree
+          )`,
+      ).bind(page.id),
       c.env.DB.prepare(`DELETE FROM pages WHERE id = ? AND workspace_id = ?`).bind(page.id, member.workspace.id),
     ]);
-    if (!results[2]?.meta.changes) throw new Error("Page metadata changed during permanent deletion.");
+    if (!results[3]?.meta.changes) throw new Error("Page metadata changed during permanent deletion.");
   } catch (error) {
     try {
       await c.env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ?`).bind(jobId).run();
@@ -997,6 +1096,39 @@ app.get("/api/pages/:id/preview", async (c) => {
     .first<PageRow>();
   if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
   return c.json({ preview: { page: pageJson(row), excerpt: (row.plain_text ?? "").slice(0, 280) } });
+});
+
+app.get("/api/pages/:id/verification", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const row = await c.env.DB.prepare(`SELECT * FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`)
+    .bind(c.req.param("id"), member.workspace.id)
+    .first<PageRow>();
+  if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
+  const [references, mentions] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT target_page_id targetId FROM page_references WHERE source_page_id = ? ORDER BY target_page_id`,
+    )
+      .bind(row.id)
+      .all<{ targetId: string }>(),
+    c.env.DB.prepare(
+      `SELECT target_user_id targetId FROM member_mentions WHERE source_page_id = ? ORDER BY target_user_id`,
+    )
+      .bind(row.id)
+      .all<{ targetId: string }>(),
+  ]);
+  const projection = {
+    plainText: row.plain_text ?? "",
+    pageReferences: references.results.map(({ targetId }) => ({ targetId, excerpt: "" })),
+    memberMentions: mentions.results.map(({ targetId }) => ({ targetId, excerpt: "" })),
+  };
+  return c.json({
+    verification: {
+      page: pageJson(row),
+      indexedSequence: row.indexed_seq,
+      projectionHash: await documentProjectionHash(projection),
+      plainTextLength: projection.plainText.length,
+    },
+  });
 });
 
 app.get("/api/pages/:id/backlinks", async (c) => {
@@ -1104,11 +1236,63 @@ app.post("/api/mentions/read", async (c) => {
   return c.json({ unreadCount: unread?.count ?? 0 });
 });
 
+type AttachmentRow = {
+  id: string;
+  workspace_id: string;
+  page_id: string;
+  r2_key: string;
+  name: string;
+  mime: string;
+  size: number;
+  content_sha256: string | null;
+  created_by: string;
+  created_at: number;
+};
+
+function attachmentJson(attachment: AttachmentRow) {
+  return {
+    id: attachment.id,
+    pageId: attachment.page_id,
+    name: attachment.name,
+    mime: attachment.mime,
+    size: attachment.size,
+    contentSha256: attachment.content_sha256,
+  };
+}
+
+function optionalSha256(value: unknown, field: string) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || !/^[a-f\d]{64}$/i.test(value)) {
+    throw new HttpError(422, "invalid_input", `${field} must be a hexadecimal SHA-256 digest.`);
+  }
+  return value.toLowerCase();
+}
+
+function sameAttachment(
+  attachment: AttachmentRow,
+  expected: { pageId: string; name: string; mime: string; size: number; contentSha256: string | null },
+) {
+  return (
+    attachment.page_id === expected.pageId &&
+    attachment.name === expected.name &&
+    attachment.mime === expected.mime &&
+    attachment.size === expected.size &&
+    attachment.content_sha256 === expected.contentSha256
+  );
+}
+
+async function attachmentById(env: Env, workspaceId: string, id: string) {
+  return env.DB.prepare(`SELECT * FROM attachments WHERE id = ? AND workspace_id = ?`)
+    .bind(id, workspaceId)
+    .first<AttachmentRow>();
+}
+
 app.get("/api/pages/:id/attachments", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   const attachments = await c.env.DB.prepare(
-    `SELECT id, page_id pageId, name, mime, size, created_by createdBy, created_at createdAt
+    `SELECT id, page_id pageId, name, mime, size, content_sha256 contentSha256,
+            created_by createdBy, created_at createdAt
        FROM attachments WHERE page_id = ? AND workspace_id = ? ORDER BY created_at DESC`,
   )
     .bind(page.id, member.workspace.id)
@@ -1130,27 +1314,58 @@ app.post("/api/pages/:id/attachments", async (c) => {
   const mime = file.type || "application/octet-stream";
   if (isUnsafeMime(mime, file.name))
     throw new HttpError(415, "unsafe_file_type", "HTML, SVG, and executable web content cannot be uploaded.");
-  const id = crypto.randomUUID();
-  const key = `assets/${member.workspace.id}/${crypto.randomUUID()}`;
+  const suppliedId = form.get("attachmentId");
+  const id = suppliedId === null ? crypto.randomUUID() : text(suppliedId, "attachmentId", 100);
+  if (!ID_PATTERN.test(id)) throw new HttpError(422, "invalid_input", "attachmentId is not a valid resource id.");
+  const name = normalizeFilename(file.name);
+  const declaredContentSha = optionalSha256(form.get("contentSha256"), "contentSha256");
+  const suppliedRequestHash = optionalSha256(form.get("requestHash"), "requestHash");
+  const actualContentSha = await sha256Hex(new Uint8Array(await file.arrayBuffer()));
+  if (declaredContentSha && declaredContentSha !== actualContentSha) {
+    throw new HttpError(422, "attachment_hash_mismatch", "The uploaded bytes do not match contentSha256.");
+  }
+  const contentSha256 = declaredContentSha ?? actualContentSha;
+  const canonicalRequestHash = await sha256Hex(
+    canonicalJson({ attachmentId: id, pageId: page.id, name, mime, size: file.size, contentSha256 }),
+  );
+  if (suppliedRequestHash && suppliedRequestHash !== canonicalRequestHash) {
+    throw new HttpError(422, "request_hash_mismatch", "requestHash does not match the attachment metadata.");
+  }
+  const expected = { pageId: page.id, name, mime, size: file.size, contentSha256 };
+  const existing = await attachmentById(c.env, member.workspace.id, id);
+  if (existing) {
+    if (!sameAttachment(existing, expected)) {
+      throw new HttpError(409, "idempotency_key_reused", "That attachment id already describes another file.");
+    }
+    return c.json({ attachment: attachmentJson(existing), replayed: true });
+  }
+  const inFlight = await c.env.DB.prepare(`SELECT 1 found FROM attachment_uploads WHERE id = ?`).bind(id).first();
+  if (inFlight) throw new HttpError(409, "idempotency_key_reused", "That attachment id is already an upload session.");
+  const key = `assets/${member.workspace.id}/${id}/${contentSha256}`;
   await c.env.BUCKET.put(key, file.stream(), {
     httpMetadata: { contentType: mime },
     customMetadata: { attachmentId: id },
   });
   try {
     await c.env.DB.prepare(
-      `INSERT INTO attachments (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO attachments
+         (id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(id, member.workspace.id, page.id, key, normalizeFilename(file.name), mime, file.size, member.user.id, now())
+      .bind(id, member.workspace.id, page.id, key, name, mime, file.size, contentSha256, member.user.id, now())
       .run();
   } catch (error) {
+    const replay = await attachmentById(c.env, member.workspace.id, id);
+    if (replay && sameAttachment(replay, expected)) {
+      return c.json({ attachment: attachmentJson(replay), replayed: true });
+    }
     await c.env.BUCKET.delete(key);
+    if (replay) {
+      throw new HttpError(409, "idempotency_key_reused", "That attachment id already describes another file.");
+    }
     throw error;
   }
-  return c.json(
-    { attachment: { id, pageId: page.id, name: normalizeFilename(file.name), mime, size: file.size } },
-    201,
-  );
+  return c.json({ attachment: { id, ...expected }, replayed: false }, 201);
 });
 
 app.get("/api/attachments/:id", async (c) => {
@@ -1222,12 +1437,17 @@ type UploadSessionRow = {
   size: number;
   part_size: number;
   part_count: number;
+  state: "active" | "completing" | "r2_complete" | "committed" | "reaping" | "aborting";
+  request_hash: string | null;
+  content_sha256: string | null;
+  next_attempt_at: number;
+  updated_at: number;
 };
 
 // Resolves an upload session the caller is allowed to act on. The R2 upload id is
 // never handed to a client: a session is addressed by our own id so every request is
 // authorised against D1 first, and R2's key layout stays server-side.
-async function activeUploadSession(env: Env, member: MemberContext, uploadId: string) {
+async function uploadSession(env: Env, member: MemberContext, uploadId: string) {
   const session = await env.DB.prepare(
     `SELECT u.* FROM attachment_uploads u JOIN pages p ON p.id = u.page_id
       WHERE u.id = ? AND u.workspace_id = ? AND p.archived_at IS NULL`,
@@ -1236,6 +1456,41 @@ async function activeUploadSession(env: Env, member: MemberContext, uploadId: st
     .first<UploadSessionRow>();
   if (!session) throw new HttpError(404, "upload_session_not_found", "That upload session no longer exists.");
   return session;
+}
+
+function uploadJson(session: UploadSessionRow) {
+  return {
+    id: session.id,
+    pageId: session.page_id,
+    name: session.name,
+    mime: session.mime,
+    size: session.size,
+    contentSha256: session.content_sha256,
+    partSize: session.part_size,
+    partCount: session.part_count,
+    expiresAt: session.next_attempt_at,
+  };
+}
+
+function sameUpload(
+  session: UploadSessionRow,
+  expected: {
+    pageId: string;
+    name: string;
+    mime: string;
+    size: number;
+    contentSha256: string | null;
+    requestHash: string;
+  },
+) {
+  return (
+    session.page_id === expected.pageId &&
+    session.name === expected.name &&
+    session.mime === expected.mime &&
+    session.size === expected.size &&
+    session.content_sha256 === expected.contentSha256 &&
+    session.request_hash === expected.requestHash
+  );
 }
 
 // The size of one part, which is fixed for every part except the last. R2 rejects a
@@ -1268,10 +1523,35 @@ app.post("/api/pages/:id/uploads", async (c) => {
   }
   const partSize = resolvePartSize(body.partSize);
   const partCount = Math.ceil(size / partSize);
-  // The session id doubles as the attachment id once the upload completes, so the R2
-  // object's customMetadata points at the right row from the moment it is created.
-  const id = crypto.randomUUID();
-  const key = `assets/${member.workspace.id}/${crypto.randomUUID()}`;
+  const id = body.attachmentId === undefined ? crypto.randomUUID() : text(body.attachmentId, "attachmentId", 100);
+  if (!ID_PATTERN.test(id)) throw new HttpError(422, "invalid_input", "attachmentId is not a valid resource id.");
+  const contentSha256 = optionalSha256(body.contentSha256, "contentSha256");
+  const canonicalRequestHash = await sha256Hex(
+    canonicalJson({ attachmentId: id, pageId: page.id, name, mime, size, contentSha256 }),
+  );
+  const suppliedRequestHash = optionalSha256(body.requestHash, "requestHash");
+  if (suppliedRequestHash && suppliedRequestHash !== canonicalRequestHash) {
+    throw new HttpError(422, "request_hash_mismatch", "requestHash does not match the upload metadata.");
+  }
+  const requestHash = suppliedRequestHash ?? canonicalRequestHash;
+  const expected = { pageId: page.id, name, mime, size, contentSha256, requestHash };
+  const completed = await attachmentById(c.env, member.workspace.id, id);
+  if (completed) {
+    if (!sameAttachment(completed, expected)) {
+      throw new HttpError(409, "idempotency_key_reused", "That attachment id already describes another file.");
+    }
+    return c.json({ status: "committed", attachment: attachmentJson(completed), replayed: true });
+  }
+  const existing = await c.env.DB.prepare(`SELECT * FROM attachment_uploads WHERE id = ? AND workspace_id = ?`)
+    .bind(id, member.workspace.id)
+    .first<UploadSessionRow>();
+  if (existing) {
+    if (!sameUpload(existing, expected) || existing.state === "reaping" || existing.state === "aborting") {
+      throw new HttpError(409, "idempotency_key_reused", "That attachment id is already used by another upload.");
+    }
+    return c.json({ status: existing.state, upload: uploadJson(existing), replayed: true });
+  }
+  const key = `assets/${member.workspace.id}/${id}/${contentSha256 ?? requestHash}`;
   const upload = await c.env.BUCKET.createMultipartUpload(key, {
     httpMetadata: { contentType: mime },
     customMetadata: { attachmentId: id },
@@ -1281,8 +1561,8 @@ app.post("/api/pages/:id/uploads", async (c) => {
     await c.env.DB.prepare(
       `INSERT INTO attachment_uploads
          (id, workspace_id, page_id, r2_key, r2_upload_id, name, mime, size, part_size, part_count,
-          created_by, created_at, updated_at, next_attempt_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          created_by, created_at, updated_at, next_attempt_at, state, request_hash, content_sha256)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
     )
       .bind(
         id,
@@ -1299,6 +1579,8 @@ app.post("/api/pages/:id/uploads", async (c) => {
         timestamp,
         timestamp,
         timestamp + UPLOAD_SESSION_TTL_MS,
+        requestHash,
+        contentSha256,
       )
       .run();
   } catch (error) {
@@ -1307,32 +1589,54 @@ app.post("/api/pages/:id/uploads", async (c) => {
     await upload.abort().catch((abortError) => {
       console.error("Failed to abort an unrecorded multipart upload", abortError);
     });
+    const completedReplay = await attachmentById(c.env, member.workspace.id, id);
+    if (completedReplay && sameAttachment(completedReplay, expected)) {
+      return c.json({ status: "committed", attachment: attachmentJson(completedReplay), replayed: true });
+    }
+    const replay = await c.env.DB.prepare(`SELECT * FROM attachment_uploads WHERE id = ? AND workspace_id = ?`)
+      .bind(id, member.workspace.id)
+      .first<UploadSessionRow>();
+    if (replay && sameUpload(replay, expected)) {
+      return c.json({ status: replay.state, upload: uploadJson(replay), replayed: true });
+    }
+    if (replay || completedReplay) {
+      throw new HttpError(409, "idempotency_key_reused", "That attachment id is already used by another upload.");
+    }
     throw error;
   }
   return c.json(
-    { upload: { id, name, mime, size, partSize, partCount, expiresAt: timestamp + UPLOAD_SESSION_TTL_MS } },
+    {
+      status: "active",
+      upload: {
+        id,
+        pageId: page.id,
+        name,
+        mime,
+        size,
+        contentSha256,
+        partSize,
+        partCount,
+        expiresAt: timestamp + UPLOAD_SESSION_TTL_MS,
+      },
+      replayed: false,
+    },
     201,
   );
 });
 
 app.get("/api/uploads/:uploadId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  const completed = await attachmentById(c.env, member.workspace.id, c.req.param("uploadId"));
+  if (completed) return c.json({ status: "committed", attachment: attachmentJson(completed) });
+  const session = await uploadSession(c.env, member, c.req.param("uploadId"));
   const parts = await c.env.DB.prepare(
     `SELECT part_number, etag, size FROM attachment_upload_parts WHERE upload_id = ? ORDER BY part_number`,
   )
     .bind(session.id)
     .all<{ part_number: number; etag: string; size: number }>();
   return c.json({
-    upload: {
-      id: session.id,
-      pageId: session.page_id,
-      name: session.name,
-      mime: session.mime,
-      size: session.size,
-      partSize: session.part_size,
-      partCount: session.part_count,
-    },
+    status: session.state,
+    upload: uploadJson(session),
     // Which parts already landed, so an interrupted upload resumes instead of
     // restarting from the first byte.
     parts: parts.results.map((part) => ({ partNumber: part.part_number, etag: part.etag, size: part.size })),
@@ -1342,7 +1646,16 @@ app.get("/api/uploads/:uploadId", async (c) => {
 app.put("/api/uploads/:uploadId/parts/:partNumber", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  await uploadSession(c.env, member, c.req.param("uploadId"));
+  const claimedAt = now();
+  const session = await c.env.DB.prepare(
+    `UPDATE attachment_uploads SET updated_at = ?, next_attempt_at = ?, last_error = NULL
+      WHERE id = ? AND workspace_id = ? AND state = 'active'
+      RETURNING *`,
+  )
+    .bind(claimedAt, claimedAt + UPLOAD_SESSION_TTL_MS, c.req.param("uploadId"), member.workspace.id)
+    .first<UploadSessionRow>();
+  if (!session) throw new HttpError(409, "upload_not_active", "That upload is no longer accepting parts.");
   const partNumber = Number(c.req.param("partNumber"));
   if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > session.part_count) {
     throw new HttpError(422, "upload_part_size", "That part number is outside this upload.");
@@ -1367,11 +1680,9 @@ app.put("/api/uploads/:uploadId/parts/:partNumber", async (c) => {
     ).bind(session.id, partNumber, part.etag, bytes.byteLength, timestamp),
     // Every accepted part pushes the reaper's deadline out, so an upload that is merely
     // slow is never collected - only one nobody is still feeding.
-    c.env.DB.prepare(`UPDATE attachment_uploads SET updated_at = ?, next_attempt_at = ? WHERE id = ?`).bind(
-      timestamp,
-      timestamp + UPLOAD_SESSION_TTL_MS,
-      session.id,
-    ),
+    c.env.DB.prepare(
+      `UPDATE attachment_uploads SET updated_at = ?, next_attempt_at = ? WHERE id = ? AND state = 'active'`,
+    ).bind(timestamp, timestamp + UPLOAD_SESSION_TTL_MS, session.id),
   ]);
   return c.json({ part: { partNumber, etag: part.etag, size: bytes.byteLength } });
 });
@@ -1379,7 +1690,13 @@ app.put("/api/uploads/:uploadId/parts/:partNumber", async (c) => {
 app.post("/api/uploads/:uploadId/complete", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
+  const uploadId = c.req.param("uploadId");
+  const completed = await attachmentById(c.env, member.workspace.id, uploadId);
+  if (completed) return c.json({ status: "committed", attachment: attachmentJson(completed), replayed: true });
+  let session = await uploadSession(c.env, member, uploadId);
+  if (["reaping", "aborting"].includes(session.state)) {
+    throw new HttpError(409, "upload_not_active", "That upload is being abandoned and cannot be completed.");
+  }
   const parts = await c.env.DB.prepare(
     `SELECT part_number, etag, size FROM attachment_upload_parts WHERE upload_id = ? ORDER BY part_number`,
   )
@@ -1392,60 +1709,111 @@ app.post("/api/uploads/:uploadId/complete", async (c) => {
   if (uploaded !== session.size) {
     throw new HttpError(422, "upload_size_mismatch", "The uploaded parts do not add up to the declared size.");
   }
-  const upload = c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id);
-  try {
-    await upload.complete(parts.results.map((part) => ({ partNumber: part.part_number, etag: part.etag })));
-  } catch (error) {
-    console.error("Failed to complete a multipart upload", error);
-    throw new HttpError(503, "multipart_complete_failed", "The upload could not be finalised. Retry it.");
+
+  if (session.state === "active") {
+    const claimedAt = now();
+    const claimed = await c.env.DB.prepare(
+      `UPDATE attachment_uploads
+          SET state = 'completing', updated_at = ?, next_attempt_at = ?, last_error = NULL
+        WHERE id = ? AND workspace_id = ? AND state = 'active'
+        RETURNING *`,
+    )
+      .bind(claimedAt, claimedAt + UPLOAD_SESSION_TTL_MS, uploadId, member.workspace.id)
+      .first<UploadSessionRow>();
+    session = claimed ?? (await uploadSession(c.env, member, uploadId));
   }
+
+  if (session.state === "completing") {
+    const r2Object = await c.env.BUCKET.head(session.r2_key);
+    if (r2Object && r2Object.size === session.size) {
+      await c.env.DB.prepare(
+        `UPDATE attachment_uploads SET state = 'r2_complete', updated_at = ?, next_attempt_at = ?
+          WHERE id = ? AND state = 'completing'`,
+      )
+        .bind(now(), now() + UPLOAD_SESSION_TTL_MS, session.id)
+        .run();
+    } else {
+      const upload = c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id);
+      try {
+        await upload.complete(parts.results.map((part) => ({ partNumber: part.part_number, etag: part.etag })));
+      } catch (error) {
+        // A concurrent/lost completion response is successful if the completed object
+        // is now present. Otherwise the session stays completing for status/retry.
+        const recovered = await c.env.BUCKET.head(session.r2_key).catch(() => null);
+        if (!recovered || recovered.size !== session.size) {
+          await c.env.DB.prepare(
+            `UPDATE attachment_uploads SET last_error = ?, updated_at = ?, next_attempt_at = ?
+              WHERE id = ? AND state = 'completing'`,
+          )
+            .bind("R2 multipart completion failed", now(), now() + UPLOAD_SESSION_TTL_MS, session.id)
+            .run()
+            .catch(() => undefined);
+          console.error("Failed to complete a multipart upload", error);
+          throw new HttpError(503, "multipart_complete_failed", "The upload could not be finalised. Retry it.");
+        }
+      }
+      await c.env.DB.prepare(
+        `UPDATE attachment_uploads SET state = 'r2_complete', updated_at = ?, next_attempt_at = ?, last_error = NULL
+          WHERE id = ? AND state = 'completing'`,
+      )
+        .bind(now(), now() + UPLOAD_SESSION_TTL_MS, session.id)
+        .run();
+    }
+    session = await uploadSession(c.env, member, uploadId);
+  }
+  if (session.state !== "r2_complete") {
+    throw new HttpError(503, "upload_completion_in_progress", "The upload is still being finalised. Retry it.");
+  }
+
   const timestamp = now();
-  try {
-    // R2 first, D1 second, matching the single-shot route: an object with no row is
-    // reclaimable, a row with no object is a broken attachment.
-    await c.env.DB.batch([
-      c.env.DB.prepare(
-        `INSERT INTO attachments (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(
-        session.id,
-        session.workspace_id,
-        session.page_id,
-        session.r2_key,
-        session.name,
-        session.mime,
-        session.size,
-        member.user.id,
-        timestamp,
-      ),
-      c.env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ?`).bind(session.id),
-    ]);
-  } catch (error) {
-    await c.env.BUCKET.delete(session.r2_key).catch((cleanupError) => {
-      console.error("Failed to roll back a completed multipart upload", cleanupError);
-    });
-    throw error;
-  }
-  return c.json(
-    {
-      attachment: {
-        id: session.id,
-        pageId: session.page_id,
-        name: session.name,
-        mime: session.mime,
-        size: session.size,
-      },
-    },
-    201,
-  );
+  // If this batch fails, the completed R2 object and r2_complete row are deliberately
+  // preserved. A retry only commits metadata; it never completes the upload again.
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO attachments
+           (id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, created_at)
+         SELECT id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, ?
+           FROM attachment_uploads WHERE id = ? AND state = 'r2_complete'`,
+    ).bind(timestamp, session.id),
+    c.env.DB.prepare(
+      `UPDATE attachment_uploads SET state = 'committed', updated_at = ? WHERE id = ? AND state = 'r2_complete'`,
+    ).bind(timestamp, session.id),
+    c.env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ? AND state = 'committed'`).bind(session.id),
+  ]);
+  const attachment = await attachmentById(c.env, member.workspace.id, session.id);
+  if (!attachment)
+    throw new HttpError(503, "attachment_commit_failed", "The completed upload metadata was not committed.");
+  return c.json({ status: "committed", attachment: attachmentJson(attachment), replayed: false }, 201);
 });
 
 app.delete("/api/uploads/:uploadId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const session = await activeUploadSession(c.env, member, c.req.param("uploadId"));
-  await c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id).abort();
-  await c.env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ?`).bind(session.id).run();
+  const completed = await attachmentById(c.env, member.workspace.id, c.req.param("uploadId"));
+  if (completed) {
+    throw new HttpError(409, "upload_already_committed", "The upload is already an attachment and cannot be aborted.");
+  }
+  await uploadSession(c.env, member, c.req.param("uploadId"));
+  const session = await c.env.DB.prepare(
+    `UPDATE attachment_uploads SET state = 'aborting', updated_at = ?, next_attempt_at = ?
+      WHERE id = ? AND workspace_id = ? AND state = 'active' RETURNING *`,
+  )
+    .bind(now(), now() + UPLOAD_SESSION_TTL_MS, c.req.param("uploadId"), member.workspace.id)
+    .first<UploadSessionRow>();
+  if (!session) throw new HttpError(409, "upload_not_abortable", "Only an active upload can be aborted.");
+  try {
+    await c.env.BUCKET.resumeMultipartUpload(session.r2_key, session.r2_upload_id).abort();
+    await c.env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ? AND state = 'aborting'`).bind(session.id).run();
+  } catch (error) {
+    await c.env.DB.prepare(
+      `UPDATE attachment_uploads SET last_error = ?, updated_at = ?, next_attempt_at = ?
+        WHERE id = ? AND state = 'aborting'`,
+    )
+      .bind("R2 multipart abort failed", now(), now() + UPLOAD_SESSION_TTL_MS, session.id)
+      .run()
+      .catch(() => undefined);
+    throw error;
+  }
   return c.json({ ok: true });
 });
 
@@ -1527,89 +1895,164 @@ app.post("/api/pages/:id/restore-version", async (c) => {
 
 app.get("/api/tables/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  // COUNT(*) is opt-in so a paging loop does not pay for it on every page.
   const wantsCount = c.req.query("count") === "true";
-  const page = await activeTablePage<{ row_count?: number }>(c.env, member, c.req.param("pageId"), {
-    columns: wantsCount ? `, (SELECT COUNT(*) FROM table_rows WHERE page_id = p.id) row_count` : "",
-    binds: [],
-  });
-  const state = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
-    .bind(page.id)
-    .first<{ revision: number }>();
-  const columns = await c.env.DB.prepare(`SELECT * FROM table_columns WHERE page_id = ? ORDER BY position, id`)
-    .bind(page.id)
-    .all<{
-      id: string;
-      name: string;
-      type: string;
-      position: number;
-    }>();
-  const options = await c.env.DB.prepare(
-    `SELECT o.* FROM table_select_options o JOIN table_columns c ON c.id = o.column_id WHERE c.page_id = ? ORDER BY o.position, o.id`,
-  )
-    .bind(page.id)
-    .all<{ id: string; column_id: string; label: string; position: number }>();
-  // Rows are paged and sorted server-side. Graduating to a realtime table Durable
-  // Object is not about row count: a table has exactly one writer at a time (the
-  // lease) and readers poll, so the trigger is dropping the single-editor lease or
-  // replacing the poll with push, neither of which paging affects.
-  const rowQuery = buildTableRowQuery(page.id, columns.results, c.req.query());
-  // One row beyond the page is fetched purely to answer hasMore without a second count.
-  const rows = await c.env.DB.prepare(rowQuery.sql)
-    .bind(...tableRowBinds(rowQuery, rowQuery.limit + 1))
-    .all<{ id: string; position: number }>();
-  const pageRows = rows.results.slice(0, rowQuery.limit);
-  const hasMore = rows.results.length > pageRows.length;
-  const lastRow = pageRows.at(-1);
-  // The cell read joins the row query as a derived table rather than binding the ids
-  // it returned, which at a full page would exceed D1's 100 bound parameters.
-  const cells = await c.env.DB.prepare(
-    `SELECT c.row_id, c.column_id, c.text_value, c.number_value, c.boolean_value, c.date_value, c.select_value
-       FROM table_cells c JOIN (${rowQuery.sql}) page_rows ON page_rows.id = c.row_id`,
-  )
-    .bind(...tableRowBinds(rowQuery, rowQuery.limit))
-    .all<Record<string, unknown>>();
-  const lease = await c.env.DB.prepare(
-    `SELECT l.expires_at, l.holder_session_id, u.name holder_name
-       FROM table_leases l JOIN user u ON u.id = l.holder_user_id WHERE l.page_id = ? AND l.expires_at > ?`,
-  )
-    .bind(page.id, now())
-    .first<{ expires_at: number; holder_session_id: string; holder_name: string }>();
-  const cellMap = new Map<string, Record<string, string | number | boolean | null>>();
-  for (const cell of cells.results) {
-    const row = cellMap.get(String(cell.row_id)) ?? {};
-    row[String(cell.column_id)] = cellValue(cell);
-    cellMap.set(String(cell.row_id), row);
-  }
-  return c.json({
-    table: {
-      pageId: page.id,
-      revision: state?.revision ?? 1,
-      columns: columns.results.map((column) => ({
-        ...column,
-        options: options.results
-          .filter((option) => option.column_id === column.id)
-          .map((option) => ({
-            id: option.id,
-            label: option.label,
-            position: option.position,
-          })),
-      })),
-      rows: pageRows.map((row) => ({ ...row, cells: cellMap.get(row.id) ?? {} })),
-      lease: {
-        heldByMe: lease?.holder_session_id === member.session.id,
-        holderName: lease?.holder_name ?? null,
-        expiresAt: lease?.expires_at ?? null,
+  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const stateBefore = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
+      .bind(page.id)
+      .first<{ revision: number }>();
+    const [columns, options] = await Promise.all([
+      c.env.DB.prepare(`SELECT * FROM table_columns WHERE page_id = ? ORDER BY position, id`)
+        .bind(page.id)
+        .all<{ id: string; name: string; type: string; position: number }>(),
+      c.env.DB.prepare(
+        `SELECT o.* FROM table_select_options o JOIN table_columns col ON col.id = o.column_id
+          WHERE col.page_id = ? ORDER BY o.position, o.id`,
+      )
+        .bind(page.id)
+        .all<{ id: string; column_id: string; label: string; position: number }>(),
+    ]);
+    const rowQuery = buildTableRowQuery(page.id, columns.results, c.req.query());
+    // Row identity and cells are assembled by one joined statement. The revision
+    // reads fence the remaining column/option reads; a concurrent writer causes one
+    // complete retry rather than returning a torn table.
+    const snapshot = await c.env.DB.prepare(
+      `WITH page_rows AS (${rowQuery.sql})
+       SELECT page_rows.id row_id, page_rows.position row_position,
+              cell.column_id, cell.text_value, cell.number_value, cell.boolean_value,
+              cell.date_value, cell.select_value
+         FROM page_rows LEFT JOIN table_cells cell ON cell.row_id = page_rows.id
+        ORDER BY ${rowQuery.orderSql}, cell.column_id`,
+    )
+      .bind(...tableRowBinds(rowQuery, rowQuery.limit + 1))
+      .all<Record<string, unknown>>();
+    const stateAfter = await c.env.DB.prepare(
+      `SELECT revision${wantsCount ? ", (SELECT COUNT(*) FROM table_rows WHERE page_id = ?) row_count" : ""}
+         FROM table_state WHERE page_id = ?`,
+    )
+      .bind(...(wantsCount ? [page.id, page.id] : [page.id]))
+      .first<{ revision: number; row_count?: number }>();
+    if (stateBefore?.revision !== stateAfter?.revision) {
+      if (attempt === 0) continue;
+      throw new HttpError(409, "table_snapshot_changed", "The table changed while this page was assembled. Retry it.");
+    }
+
+    const rowMap = new Map<
+      string,
+      { id: string; position: number; cells: Record<string, string | number | boolean | null> }
+    >();
+    for (const item of snapshot.results) {
+      const rowId = String(item.row_id);
+      const row = rowMap.get(rowId) ?? { id: rowId, position: Number(item.row_position), cells: {} };
+      if (typeof item.column_id === "string") row.cells[item.column_id] = cellValue(item);
+      rowMap.set(rowId, row);
+    }
+    const allRows = [...rowMap.values()];
+    const pageRows = allRows.slice(0, rowQuery.limit);
+    const hasMoreRows = allRows.length > pageRows.length;
+    const truncated = Boolean(
+      rowQuery.sort && hasMoreRows && rowQuery.offset + rowQuery.limit >= TABLE_SORT_MAX_OFFSET,
+    );
+    const hasMore = hasMoreRows && !truncated;
+    const lastRow = pageRows.at(-1);
+    const lease = await c.env.DB.prepare(
+      `SELECT l.expires_at, l.holder_session_id, u.name holder_name
+         FROM table_leases l JOIN user u ON u.id = l.holder_user_id WHERE l.page_id = ? AND l.expires_at > ?`,
+    )
+      .bind(page.id, now())
+      .first<{ expires_at: number; holder_session_id: string; holder_name: string }>();
+    return c.json({
+      table: {
+        pageId: page.id,
+        revision: stateAfter?.revision ?? 1,
+        columns: columns.results.map((column) => ({
+          ...column,
+          options: options.results
+            .filter((option) => option.column_id === column.id)
+            .map((option) => ({ id: option.id, label: option.label, position: option.position })),
+        })),
+        rows: pageRows,
+        lease: {
+          heldByMe: lease?.holder_session_id === member.session.id,
+          holderName: lease?.holder_name ?? null,
+          expiresAt: lease?.expires_at ?? null,
+        },
+        limit: rowQuery.limit,
+        sort: rowQuery.sort,
+        dir: rowQuery.dir,
+        hasMore,
+        nextCursor: hasMore && !rowQuery.sort && lastRow ? { position: lastRow.position, rowId: lastRow.id } : null,
+        nextOffset: hasMore && rowQuery.sort ? rowQuery.offset + pageRows.length : null,
+        truncated,
+        rowCount: wantsCount ? Number(stateAfter?.row_count ?? 0) : null,
       },
-      limit: rowQuery.limit,
-      sort: rowQuery.sort,
-      dir: rowQuery.dir,
-      hasMore,
-      // Keyset paging applies to the default order only; a sorted view pages by offset.
-      nextCursor: hasMore && !rowQuery.sort && lastRow ? { position: lastRow.position, rowId: lastRow.id } : null,
-      rowCount: wantsCount ? Number(page.row_count ?? 0) : null,
-    },
-  });
+    });
+  }
+  throw new HttpError(409, "table_snapshot_changed", "The table changed while this page was assembled. Retry it.");
+});
+
+app.get("/api/tables/:pageId/verification", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const stateBefore = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
+      .bind(page.id)
+      .first<{ revision: number }>();
+    const [columns, options, snapshot] = await Promise.all([
+      c.env.DB.prepare(`SELECT id, name, type, position FROM table_columns WHERE page_id = ? ORDER BY position, id`)
+        .bind(page.id)
+        .all<{ id: string; name: string; type: string; position: number }>(),
+      c.env.DB.prepare(
+        `SELECT option.id, option.column_id, option.label, option.position
+           FROM table_select_options option JOIN table_columns col ON col.id = option.column_id
+          WHERE col.page_id = ? ORDER BY option.position, option.id`,
+      )
+        .bind(page.id)
+        .all<{ id: string; column_id: string; label: string; position: number }>(),
+      c.env.DB.prepare(
+        `SELECT row.id row_id, row.position row_position, cell.column_id,
+                cell.text_value, cell.number_value, cell.boolean_value, cell.date_value, cell.select_value
+           FROM table_rows row LEFT JOIN table_cells cell ON cell.row_id = row.id
+          WHERE row.page_id = ? ORDER BY row.position, row.id, cell.column_id`,
+      )
+        .bind(page.id)
+        .all<Record<string, unknown>>(),
+    ]);
+    const stateAfter = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
+      .bind(page.id)
+      .first<{ revision: number }>();
+    if (stateBefore?.revision !== stateAfter?.revision) {
+      if (attempt === 0) continue;
+      throw new HttpError(409, "table_snapshot_changed", "The table changed while verification was assembled.");
+    }
+    const cellRows = new Map<string, Record<string, string | number | boolean | null>>();
+    for (const item of snapshot.results) {
+      const rowId = String(item.row_id);
+      const cells = cellRows.get(rowId) ?? {};
+      if (typeof item.column_id === "string") cells[item.column_id] = cellValue(item);
+      cellRows.set(rowId, cells);
+    }
+    const optionLabels = new Map(options.results.map((option) => [option.id, option.label]));
+    const canonicalColumns = columns.results.map((column) => ({
+      name: column.name,
+      type: column.type,
+      options: options.results.filter((option) => option.column_id === column.id).map(({ label }) => label),
+    }));
+    const canonicalRows = [...cellRows.values()].map((cells) =>
+      columns.results.map((column) => {
+        const value = cells[column.id] ?? null;
+        return column.type === "select" && typeof value === "string" ? (optionLabels.get(value) ?? null) : value;
+      }),
+    );
+    return c.json({
+      verification: {
+        revision: stateAfter?.revision ?? 1,
+        contentHash: await tableContentHash(canonicalColumns, canonicalRows),
+        rowCount: canonicalRows.length,
+      },
+    });
+  }
+  throw new HttpError(409, "table_snapshot_changed", "The table changed while verification was assembled.");
 });
 
 app.post("/api/tables/:pageId/lease", async (c) => {
@@ -1798,10 +2241,7 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const pageId = c.req.param("pageId");
-  const declaredLength = Number(c.req.header("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > TABLE_BULK_MAX_BODY_BYTES) {
-    throw new HttpError(413, "bulk_too_large", "The bulk table write is larger than the request limit.");
-  }
+  const body = await limitedJsonBody(c.req.raw, TABLE_BULK_MAX_BODY_BYTES);
   const page = await activeTablePage<{
     row_count: number;
     next_row_position: number;
@@ -1812,23 +2252,28 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
         (SELECT COALESCE(MAX(position) + 1, 0) FROM table_columns WHERE page_id = p.id) next_column_position`,
     binds: [],
   });
-  const body = await jsonBody(c.req.raw);
   const input = await leaseInputs(body, member);
   const clientRequestId =
     body.clientRequestId === undefined ? null : text(body.clientRequestId, "clientRequestId", 200);
+  const columnInput = Array.isArray(body.columns) ? body.columns : [];
+  const rowInput = Array.isArray(body.rows) ? body.rows : [];
+  const requestHash = await sha256Hex(canonicalJson({ columns: columnInput, rows: rowInput }));
 
   // A timed-out request is replayed with the same id rather than appended twice.
   if (clientRequestId) {
     const receipt = await c.env.DB.prepare(
-      `SELECT response_json FROM table_bulk_writes WHERE page_id = ? AND client_request_id = ?`,
+      `SELECT request_hash, response_json FROM table_bulk_writes WHERE page_id = ? AND client_request_id = ?`,
     )
       .bind(pageId, clientRequestId)
-      .first<{ response_json: string }>();
-    if (receipt) return c.json({ ...JSON.parse(receipt.response_json), replayed: true });
+      .first<{ request_hash: string; response_json: string }>();
+    if (receipt) {
+      if (receipt.request_hash !== requestHash) {
+        throw new HttpError(409, "idempotency_key_reused", "That bulk request id was already used for other data.");
+      }
+      return c.json({ ...JSON.parse(receipt.response_json), replayed: true });
+    }
   }
 
-  const columnInput = Array.isArray(body.columns) ? body.columns : [];
-  const rowInput = Array.isArray(body.rows) ? body.rows : [];
   // An empty request would advance the revision while changing nothing, which would
   // invalidate every other editor's expectedRevision for no reason.
   if (!columnInput.length && !rowInput.length) {
@@ -1991,87 +2436,110 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
     },
   };
 
-  const revision = await guardedBatch(
-    c.env,
-    pageId,
-    input,
-    (guardedAt) => {
-      const guardBinds = [pageId, input.expectedRevision, input.tokenHash, input.sessionId, guardedAt];
-      const statements: D1PreparedStatement[] = [];
-      // Every insert expands one JSON parameter with json_each rather than binding a
-      // placeholder per value, which at these batch sizes would blow past D1's limit of
-      // 100 bound parameters per query. `json_each().key` is the array index, so
-      // positions are assigned deterministically regardless of iteration order.
-      if (newColumns.length) {
-        statements.push(
-          c.env.DB.prepare(
-            `INSERT INTO table_columns (id, page_id, name, type, position)
+  let revision: number;
+  try {
+    revision = await guardedBatch(
+      c.env,
+      pageId,
+      input,
+      (guardedAt) => {
+        const guardBinds = [pageId, input.expectedRevision, input.tokenHash, input.sessionId, guardedAt];
+        const statements: D1PreparedStatement[] = [];
+        // Every insert expands one JSON parameter with json_each rather than binding a
+        // placeholder per value, which at these batch sizes would blow past D1's limit of
+        // 100 bound parameters per query. `json_each().key` is the array index, so
+        // positions are assigned deterministically regardless of iteration order.
+        if (newColumns.length) {
+          statements.push(
+            c.env.DB.prepare(
+              `INSERT INTO table_columns (id, page_id, name, type, position)
              SELECT json_extract(item.value, '$.id'), ?, json_extract(item.value, '$.name'),
                     json_extract(item.value, '$.type'), json_extract(item.value, '$.position')
                FROM json_each(?) item WHERE ${leaseGuards()}`,
-          ).bind(pageId, JSON.stringify(newColumns), ...guardBinds),
-        );
-      }
-      if (newOptions.length) {
-        statements.push(
-          c.env.DB.prepare(
-            `INSERT INTO table_select_options (id, column_id, label, position)
+            ).bind(pageId, JSON.stringify(newColumns), ...guardBinds),
+          );
+        }
+        if (newOptions.length) {
+          statements.push(
+            c.env.DB.prepare(
+              `INSERT INTO table_select_options (id, column_id, label, position)
              SELECT json_extract(item.value, '$.id'), json_extract(item.value, '$.columnId'),
                     json_extract(item.value, '$.label'), json_extract(item.value, '$.position')
                FROM json_each(?) item WHERE ${leaseGuards()}`,
-          ).bind(JSON.stringify(newOptions), ...guardBinds),
-        );
-      }
-      if (newRows.length) {
-        statements.push(
-          c.env.DB.prepare(
-            `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
+            ).bind(JSON.stringify(newOptions), ...guardBinds),
+          );
+        }
+        if (newRows.length) {
+          statements.push(
+            c.env.DB.prepare(
+              `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
              SELECT json_extract(item.value, '$.id'), ?, json_extract(item.value, '$.position'), ?, ?, ?
                FROM json_each(?) item WHERE ${leaseGuards()}`,
-          ).bind(pageId, member.user.id, guardedAt, guardedAt, JSON.stringify(newRows), ...guardBinds),
-        );
-      }
-      if (newCells.length) {
-        statements.push(
-          c.env.DB.prepare(
-            `INSERT INTO table_cells
+            ).bind(pageId, member.user.id, guardedAt, guardedAt, JSON.stringify(newRows), ...guardBinds),
+          );
+        }
+        if (newCells.length) {
+          statements.push(
+            c.env.DB.prepare(
+              `INSERT INTO table_cells
                (row_id, column_id, text_value, number_value, boolean_value, date_value, select_value, updated_at)
              SELECT json_extract(item.value, '$.r'), json_extract(item.value, '$.c'),
                     json_extract(item.value, '$.t'), json_extract(item.value, '$.n'),
                     json_extract(item.value, '$.b'), json_extract(item.value, '$.d'),
                     json_extract(item.value, '$.s'), ?
                FROM json_each(?) item WHERE ${leaseGuards()}`,
-          ).bind(guardedAt, JSON.stringify(newCells), ...guardBinds),
-        );
-      }
-      if (clientRequestId) {
+            ).bind(guardedAt, JSON.stringify(newCells), ...guardBinds),
+          );
+        }
+        if (clientRequestId) {
+          statements.push(
+            c.env.DB.prepare(
+              `INSERT INTO table_bulk_writes
+               (page_id, client_request_id, revision, request_hash, response_json, created_at)
+             SELECT ?, ?, ?, ?, ?, ? WHERE ${leaseGuards()}`,
+            ).bind(
+              pageId,
+              clientRequestId,
+              input.expectedRevision + 1,
+              requestHash,
+              JSON.stringify({ revision: input.expectedRevision + 1, ...response }),
+              guardedAt,
+              ...guardBinds,
+            ),
+          );
+        }
+        // An import runs far longer than the 60-second lease, and asking the caller to
+        // run a renewal timer alongside its writes is how tables end up half-written.
+        // The guard means this can only extend a lease that is already live.
         statements.push(
           c.env.DB.prepare(
-            `INSERT INTO table_bulk_writes (page_id, client_request_id, revision, response_json, created_at)
-             SELECT ?, ?, ?, ?, ? WHERE ${leaseGuards()}`,
-          ).bind(
-            pageId,
-            clientRequestId,
-            input.expectedRevision + 1,
-            JSON.stringify({ revision: input.expectedRevision + 1, ...response }),
-            guardedAt,
-            ...guardBinds,
-          ),
-        );
-      }
-      // An import runs far longer than the 60-second lease, and asking the caller to
-      // run a renewal timer alongside its writes is how tables end up half-written.
-      // The guard means this can only extend a lease that is already live.
-      statements.push(
-        c.env.DB.prepare(
-          `UPDATE table_leases SET expires_at = ?
+            `UPDATE table_leases SET expires_at = ?
             WHERE page_id = ? AND token_hash = ? AND holder_session_id = ? AND expires_at > ?`,
-        ).bind(guardedAt + TABLE_LEASE_DURATION_MS, pageId, input.tokenHash, input.sessionId, guardedAt),
-      );
-      return statements;
-    },
-    { requireChanges: false },
-  );
+          ).bind(guardedAt + TABLE_LEASE_DURATION_MS, pageId, input.tokenHash, input.sessionId, guardedAt),
+        );
+        return statements;
+      },
+      { requireChanges: false },
+    );
+  } catch (error) {
+    // The original request may have committed while an identical retry was already
+    // running. A receipt is authoritative even when the losing attempt observed a
+    // stale revision or collided on the receipt's unique key.
+    if (clientRequestId) {
+      const receipt = await c.env.DB.prepare(
+        `SELECT request_hash, response_json FROM table_bulk_writes WHERE page_id = ? AND client_request_id = ?`,
+      )
+        .bind(pageId, clientRequestId)
+        .first<{ request_hash: string; response_json: string }>();
+      if (receipt) {
+        if (receipt.request_hash !== requestHash) {
+          throw new HttpError(409, "idempotency_key_reused", "That bulk request id was already used for other data.");
+        }
+        return c.json({ ...JSON.parse(receipt.response_json), replayed: true });
+      }
+    }
+    throw error;
+  }
 
   return c.json({ revision, replayed: false, ...response }, 201);
 });
@@ -2413,11 +2881,6 @@ export default {
     context.waitUntil(
       processDueDeletionJobs(env).catch((error) => {
         console.error("Scheduled deletion cleanup failed", error);
-      }),
-    );
-    context.waitUntil(
-      pruneBulkWriteReceipts(env).catch((error) => {
-        console.error("Scheduled bulk write receipt prune failed", error);
       }),
     );
     context.waitUntil(

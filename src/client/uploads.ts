@@ -16,12 +16,19 @@ type UploadedAttachment = {
   name: string;
   mime: string;
   size: number;
+  contentSha256?: string | null;
+};
+
+type UploadStatus = {
+  status: "active" | "completing" | "r2_complete" | "committed" | "reaping" | "aborting";
+  attachment?: UploadedAttachment;
 };
 
 /** Below this a single request is simpler and faster than negotiating a session. */
 const SINGLE_SHOT_BYTES = 8 * 1024 * 1024;
 const PART_CONCURRENCY = 3;
 const PART_ATTEMPTS = 4;
+const COMPLETE_ATTEMPTS = 4;
 
 function delay(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -30,8 +37,22 @@ function delay(milliseconds: number) {
 // Parts are independent, so a transient failure is worth retrying in place rather than
 // abandoning an upload that may already be gigabytes in.
 function isRetryable(error: unknown) {
-  if (error instanceof ApiClientError) return error.status >= 500;
+  if (error instanceof ApiClientError) {
+    return error.status >= 500 || [408, 409, 425, 429].includes(error.status);
+  }
   return true;
+}
+
+// Authentication, authorization, ambiguous 404s, conflicts, and throttling can all
+// leave a valid server-side session behind. Abort only when the server has definitively
+// rejected the upload's immutable inputs.
+function isTerminalClientFailure(error: unknown) {
+  return (
+    error instanceof ApiClientError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    ![401, 403, 404, 408, 409, 425, 429].includes(error.status)
+  );
 }
 
 async function uploadPart(uploadId: string, partNumber: number, slice: Blob) {
@@ -44,6 +65,35 @@ async function uploadPart(uploadId: string, partNumber: number, slice: Blob) {
       await delay(jitteredBackoff(attempt, 500, 15_000));
     }
   }
+}
+
+async function uploadStatus(uploadId: string) {
+  try {
+    return await api<UploadStatus>(`/api/uploads/${uploadId}`);
+  } catch {
+    // The completion error remains authoritative. Status is a best-effort way to
+    // reconcile a response that may have been lost after the server committed.
+    return null;
+  }
+}
+
+async function completeUpload(uploadId: string) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < COMPLETE_ATTEMPTS; attempt += 1) {
+    try {
+      const result = await api<{ attachment: UploadedAttachment }>(`/api/uploads/${uploadId}/complete`, {
+        method: "POST",
+      });
+      return result.attachment;
+    } catch (error) {
+      lastError = error;
+      const status = await uploadStatus(uploadId);
+      if (status?.status === "committed" && status.attachment) return status.attachment;
+      if (!isRetryable(error) || attempt >= COMPLETE_ATTEMPTS - 1) throw error;
+      await delay(jitteredBackoff(attempt, 500, 15_000));
+    }
+  }
+  throw lastError;
 }
 
 export async function uploadAttachment(pageId: string, file: File, onProgress?: (fraction: number) => void) {
@@ -82,12 +132,11 @@ export async function uploadAttachment(pageId: string, file: File, onProgress?: 
       }
     });
     await Promise.all(workers);
-    const finished = await api<{ attachment: UploadedAttachment }>(`/api/uploads/${id}/complete`, { method: "POST" });
-    return finished.attachment;
+    return await completeUpload(id);
   } catch (error) {
-    // The failure is already known here, so release the session rather than leaving the
-    // parts for the reaper to collect a day later.
-    await api(`/api/uploads/${id}`, { method: "DELETE" }).catch(() => undefined);
+    if (isTerminalClientFailure(error)) {
+      await api(`/api/uploads/${id}`, { method: "DELETE" }).catch(() => undefined);
+    }
     throw error;
   }
 }

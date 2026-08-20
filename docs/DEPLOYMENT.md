@@ -35,23 +35,29 @@ pnpm wrangler r2 bucket create cloudflare-realtime-notes-preview
 
 Bucket names may be changed as long as the binding remains `BUCKET`.
 
-## 2. Replace the committed placeholders
+## 2. Configure the production environment
 
-`wrangler.jsonc` ships two values that are correct for local development and wrong for every
-deployment. Both cause a failed or broken install if left alone.
+The top-level bindings in `wrangler.jsonc` are local-safe defaults. Remote commands and deployment use
+the named `production` environment, which keeps account-specific values out of local development.
 
-**`database_id`** is the all-zero placeholder. Replace it with the ID returned by `d1 create`:
+Set the production **`database_id`** to the ID returned by `d1 create`:
 
 ```jsonc
-"database_id": "00000000-0000-0000-0000-000000000000",  // replace this
+"env": {
+  "production": {
+    "d1_databases": [{ "binding": "DB", "database_id": "your-database-id" }],
+  },
+},
 ```
 
-**`BETTER_AUTH_URL`** defaults to `http://localhost:5173`. Set it to the exact HTTPS origin the
-installation will be served from:
+Set production **`BETTER_AUTH_URL`** to the exact HTTPS origin the installation will be served from.
+Leave the top-level local value unchanged:
 
 ```jsonc
-"vars": {
-  "BETTER_AUTH_URL": "https://notes.example.com",
+"env": {
+  "production": {
+    "vars": { "BETTER_AUTH_URL": "https://notes.example.com" },
+  },
 },
 ```
 
@@ -72,8 +78,8 @@ attach one, `BETTER_AUTH_URL` must match it exactly, including scheme and absenc
 ## 3. Set secrets
 
 ```sh
-pnpm wrangler secret put BETTER_AUTH_SECRET
-pnpm wrangler secret put BOOTSTRAP_TOKEN
+pnpm wrangler secret put BETTER_AUTH_SECRET --env production
+pnpm wrangler secret put BOOTSTRAP_TOKEN --env production
 ```
 
 Use at least 32 random bytes for `BETTER_AUTH_SECRET`. Treat `BOOTSTRAP_TOKEN` as a one-time operator
@@ -121,12 +127,17 @@ startup error.
 `pnpm deploy` runs `pnpm build` again, which runs the full typecheck. To deploy from CI instead, see
 [Automated deployment](#automated-deployment).
 
-`migrations/` is a single squashed baseline, `0001_initial.sql`. The incremental history was collapsed
-into it before the first production deploy, and the file kept its name so that databases already
-recorded as migrated are left alone. That is correct for a database that applied the whole old history,
-which holds a superset of the baseline, but not for one that stopped partway: `d1_migrations` already
-lists `0001_initial.sql`, so the missing objects will never be applied. Any database in that state
-predates the first deploy and must be recreated rather than patched forward.
+`0001_initial.sql` is the squashed pre-production baseline. Files `0002` and later are forward-only
+production migrations and must remain in order; never edit an applied migration or mark it applied by
+hand. Before upgrading an existing installation, take a D1 export and stop any running Notion import,
+then run `pnpm db:remote` before deploying the Worker that consumes the new schema.
+
+`0005_import_reliability.sql` adopts existing multipart sessions as `active`, so uploads already in
+progress remain recoverable. It also clears legacy bulk-write replay receipts because they have no
+request hash and cannot safely distinguish a retry from reuse of the same request id with different
+content. Newly hashed receipts are durable until their table is deleted; do not run an old importer
+between applying `0005` and deploying the matching Worker, because it can create another unhashed
+receipt in that window.
 
 ## 6. Bootstrap the owner
 
@@ -144,7 +155,7 @@ Do not expose the site publicly before the owner is created unless the bootstrap
 Once the owner exists, rotate or remove the token:
 
 ```sh
-pnpm wrangler secret delete BOOTSTRAP_TOKEN
+pnpm wrangler secret delete BOOTSTRAP_TOKEN --env production
 ```
 
 Deleting it is safe. `/api/install/bootstrap` returns `already_initialized` after the first successful
@@ -158,7 +169,7 @@ curl -s https://notes.example.com/api/health
 
 Expect `{"ok":true,"version":"0.1.0","time":"..."}`. Note that `version` is a hardcoded string, not a
 build identifier, so this endpoint confirms the Worker is up and D1 is reachable but **cannot tell you
-which revision is live**. Use `pnpm wrangler deployments list` for that.
+which revision is live**. Use `pnpm wrangler deployments list --env production` for that.
 
 The health check probes D1 only. It returns `ok` during a complete R2 or Durable Object outage.
 
@@ -244,5 +255,5 @@ The workflow applies D1 migrations before deploying, matching the manual order. 
 exercised against a live Cloudflare account in this repository; validate it on a throwaway Worker
 before relying on it.
 
-Secrets set with `wrangler secret put` are not managed by the workflow. They persist across deploys and
-must be set once, manually, per the steps above.
+Secrets set with `wrangler secret put --env production` are not managed by the workflow. They persist
+across deploys and must be set once, manually, per the steps above.

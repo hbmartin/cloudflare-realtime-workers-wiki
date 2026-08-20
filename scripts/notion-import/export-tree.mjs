@@ -12,7 +12,7 @@
  * relative href work regardless of how many `../` segments it climbs.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join, relative, sep } from "node:path";
+import { basename, join, posix, relative, sep } from "node:path";
 
 const FULL_ID = /([0-9a-f]{32})$/i;
 const byName = (left, right) => left.localeCompare(right);
@@ -126,7 +126,9 @@ function registerSuffixes(index, path, value) {
   const segments = path.split("/");
   while (segments.length) {
     const key = segments.join("/");
-    if (!index.has(key)) index.set(key, value);
+    const candidates = index.get(key) ?? [];
+    if (!candidates.includes(value)) candidates.push(value);
+    index.set(key, candidates);
     segments.shift();
   }
 }
@@ -217,7 +219,17 @@ export function readExport(root) {
   }
 
   const roots = [...pagesByPath.values()].filter((page) => !page.parent);
-  return { root, pages: [...pagesByPath.values()], roots, byPath, byNotionId, assetIndex, issues };
+  return {
+    root,
+    pages: [...pagesByPath.values()],
+    roots,
+    pagesByPath,
+    assetsByPath,
+    byPath,
+    byNotionId,
+    assetIndex,
+    issues,
+  };
 }
 
 /**
@@ -226,24 +238,46 @@ export function readExport(root) {
  * An absolute notion.so link is matched by its trailing 32-hex, which is how Notion
  * writes a link to a page that also exists in the export.
  */
-export function resolveLink(href, index) {
-  let decoded = href;
+export function resolveLink(href, index, sourcePath = null, onIssue = () => {}) {
+  const rawPath = href.split("#", 1)[0].split("?", 1)[0];
+  let decoded = rawPath;
   try {
-    decoded = decodeURIComponent(href);
+    decoded = decodeURIComponent(rawPath);
   } catch {
     // Already decoded, or malformed escaping; match on the raw value.
   }
-  const withoutFragment = decoded.split("#")[0].split("?")[0];
-  if (/^https?:/i.test(withoutFragment)) {
-    const id = notionIdOf(withoutFragment.replace(/\/+$/, "").replaceAll("-", ""));
-    return id ? (index.byNotionId.get(id) ?? null) : null;
+  if (/^https?:/i.test(decoded)) {
+    const url = new URL(decoded);
+    if (!(url.hostname === "notion.so" || url.hostname.endsWith(".notion.so"))) return null;
+    const id = notionIdOf(url.pathname.replace(/\/+$/, "").replaceAll("-", ""));
+    const target = id ? (index.byNotionId.get(id) ?? null) : null;
+    if (!target) onIssue("link_unresolved", href);
+    return target;
   }
-  const segments = withoutFragment.split("/").filter((segment) => segment && segment !== ".");
+  const relativePath = decoded.replaceAll("\\", "/");
+  if (sourcePath) {
+    const resolvedPath = posix.normalize(posix.join(posix.dirname(sourcePath), relativePath));
+    const page = index.pagesByPath.get(resolvedPath);
+    if (page) return page;
+    const asset = index.assetsByPath.get(resolvedPath);
+    if (asset) return asset;
+  }
+  const segments = relativePath.split("/").filter((segment) => segment && segment !== "." && segment !== "..");
   while (segments.length) {
     const key = segments.join("/");
-    const page = index.byPath.get(key);
+    const pageCandidates = index.byPath.get(key) ?? [];
+    if (pageCandidates.length > 1) {
+      onIssue("link_ambiguous", href);
+      return null;
+    }
+    const page = pageCandidates[0];
     if (page) return page;
-    const asset = index.assetIndex.get(key);
+    const assetCandidates = index.assetIndex.get(key) ?? [];
+    if (assetCandidates.length > 1) {
+      onIssue("link_ambiguous", href);
+      return null;
+    }
+    const asset = assetCandidates[0];
     if (asset) return { kind: "asset", path: asset };
     segments.shift();
   }

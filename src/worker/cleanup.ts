@@ -1,6 +1,5 @@
 import type { Env } from "./env";
 import { locationHint } from "./http";
-import { TABLE_BULK_RECEIPT_TTL_MS } from "../shared/table-limits";
 
 type DeletionTargetKind = "document_do" | "r2_object" | "r2_prefix";
 
@@ -140,11 +139,4 @@ export async function processDueDeletionJobs(env: Env, limit = 10) {
     .bind(Date.now(), limit)
     .all<{ id: string }>();
   for (const job of jobs.results) await processDeletionJob(env, job.id);
-}
-
-// Bulk-write receipts exist only so a request whose response was lost can be replayed
-// instead of appending its rows a second time. Past the TTL the caller has long since
-// stopped waiting, so the receipt is dead weight on a table's cascade.
-export async function pruneBulkWriteReceipts(env: Env, before = Date.now() - TABLE_BULK_RECEIPT_TTL_MS) {
-  await env.DB.prepare(`DELETE FROM table_bulk_writes WHERE created_at < ?`).bind(before).run();
 }

@@ -17,21 +17,6 @@
 import { createHash } from "node:crypto";
 import { mentionInlineConfig } from "../../src/shared/mention-spec.ts";
 
-// Node strips TypeScript types natively from 22.18 onward, which is what lets this
-// plain .mjs script import the shared modules the worker and client already use
-// instead of keeping a second, drifting copy of them.
-const MINIMUM_NODE = [22, 18];
-
-export function assertSupportedNode(version = process.versions.node) {
-  const [major, minor] = version.split(".").map((part) => Number.parseInt(part, 10));
-  const supported = major > MINIMUM_NODE[0] || (major === MINIMUM_NODE[0] && minor >= MINIMUM_NODE[1]);
-  if (!supported) {
-    throw new Error(
-      `The Notion importer needs Node ${MINIMUM_NODE.join(".")} or newer to read the shared TypeScript modules; this is Node ${version}.`,
-    );
-  }
-}
-
 // BlockNote reaches for these during schema construction and HTML parsing. Anything
 // it only touches while mounted in a browser is deliberately absent — if this list
 // grows, prefer adding the one missing global over widening to a full jsdom window.
@@ -120,7 +105,10 @@ export function assignStableIds(blocks, seed) {
   const assign = (list, prefix) => {
     list.forEach((block, index) => {
       const path = `${prefix}.${index}`;
-      block.id = createHash("sha256").update(`${seed}${path}`).digest("hex").slice(0, 32);
+      block.id = createHash("sha256")
+        .update(JSON.stringify([seed, path]))
+        .digest("hex")
+        .slice(0, 32);
       if (Array.isArray(block.children) && block.children.length > 0) assign(block.children, path);
     });
   };

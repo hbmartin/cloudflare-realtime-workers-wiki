@@ -10,7 +10,6 @@ import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { projectDocument } from "../../src/shared/document-projection.ts";
 import { mentionInlineConfig } from "../../src/shared/mention-spec.ts";
 import {
-  assertSupportedNode,
   assignStableIds,
   createImportEditor,
   DOCUMENT_FRAGMENT,
@@ -110,17 +109,5 @@ describe("mention html", () => {
 
   it("escapes only what needs escaping", () => {
     expect(escapeHtml("plain text")).toBe("plain text");
-  });
-});
-
-describe("node version guard", () => {
-  it("accepts versions that strip TypeScript types natively", () => {
-    expect(() => assertSupportedNode("22.18.0")).not.toThrow();
-    expect(() => assertSupportedNode("24.19.0")).not.toThrow();
-  });
-
-  it("rejects versions that would fail on the shared TypeScript imports", () => {
-    expect(() => assertSupportedNode("22.6.0")).toThrow(/Node 22.18 or newer/);
-    expect(() => assertSupportedNode("20.11.0")).toThrow(/Node 22.18 or newer/);
   });
 });

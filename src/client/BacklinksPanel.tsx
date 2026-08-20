@@ -11,18 +11,25 @@ export function BacklinksPanel({
   revision: number;
   onSelect: (pageId: string) => void;
 }) {
-  const [backlinks, setBacklinks] = useState<Backlink[]>([]);
-  const [error, setError] = useState("");
+  const [result, setResult] = useState<{
+    pageId: string;
+    revision: number;
+    backlinks: Backlink[];
+    error: string;
+  }>(() => ({ pageId, revision, backlinks: [], error: "" }));
+  const currentResult = result.pageId === pageId && result.revision === revision;
+  const backlinks = currentResult ? result.backlinks : [];
+  const error = currentResult ? result.error : "";
   useEffect(() => {
     let active = true;
-    setError("");
-    setBacklinks([]);
     void api<{ backlinks: Backlink[] }>(`/api/pages/${pageId}/backlinks`)
       .then((data) => {
-        if (active) setBacklinks(data.backlinks);
+        if (active) setResult({ pageId, revision, backlinks: data.backlinks, error: "" });
       })
       .catch(() => {
-        if (active) setError("Backlinks could not be loaded. Try again.");
+        if (active) {
+          setResult({ pageId, revision, backlinks: [], error: "Backlinks could not be loaded. Try again." });
+        }
       });
     return () => {
       active = false;

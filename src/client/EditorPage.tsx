@@ -77,8 +77,6 @@ export function EditorPage({
   }, [page.id, page.revision, page.title]);
 
   useEffect(() => {
-    setSizeWarning(null);
-    setStorageError(null);
     const next = createCollaboration(member.workspace.id, page.id, page.contentEpoch, setStatus);
     let active = true;
     const customMessage = (message: string) => {

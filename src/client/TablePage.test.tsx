@@ -39,6 +39,8 @@ const table: TableData = {
   dir: "asc",
   hasMore: false,
   nextCursor: null,
+  nextOffset: null,
+  truncated: false,
   rowCount: 1,
 };
 
@@ -1964,6 +1966,138 @@ describe("TablePage", () => {
     expect(api).toHaveBeenLastCalledWith("/api/tables/table-page?limit=500&afterPosition=0&afterId=row-1", {
       signal: expect.any(AbortSignal),
     });
+  });
+
+  it("appends a sorted offset page while preserving its column and direction", async () => {
+    const first: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-1", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 700,
+    };
+    const second: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-2", position: 1, cells: { status: "Beta" } }],
+      rowCount: 700,
+    };
+    vi.mocked(api)
+      .mockResolvedValueOnce({ table })
+      .mockResolvedValueOnce({ table: first })
+      .mockResolvedValueOnce({ table: second });
+    renderViewer();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Status/ }));
+    expect(await screen.findByDisplayValue("Alpha")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Beta")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Alpha")).toBeInTheDocument();
+    expect(api).toHaveBeenLastCalledWith("/api/tables/table-page?limit=500&sort=status&dir=asc&offset=500", {
+      signal: expect.any(AbortSignal),
+    });
+  });
+
+  it("does not overlap repeated load-more requests", async () => {
+    const first: TableData = {
+      ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "One" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const second = deferred<{ table: TableData }>();
+    vi.mocked(api)
+      .mockResolvedValueOnce({ table: first })
+      .mockImplementationOnce(() => second.promise);
+    renderViewer();
+
+    const loadMore = await screen.findByRole("button", { name: "Load more rows" });
+    fireEvent.click(loadMore);
+    fireEvent.click(loadMore);
+
+    expect(loadMore).toBeDisabled();
+    expect(api).toHaveBeenCalledTimes(2);
+    await act(async () =>
+      second.resolve({
+        table: {
+          ...table,
+          rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
+          rowCount: 2,
+        },
+      }),
+    );
+    expect(await screen.findByDisplayValue("Two")).toBeInTheDocument();
+  });
+
+  it("discards an appended page when the sort changes before its response arrives", async () => {
+    const stalePage = deferred<{ table: TableData }>();
+    const ascending: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-1", position: 0, cells: { status: "Ascending" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 700,
+    };
+    const descending: TableData = {
+      ...table,
+      sort: "status",
+      dir: "desc",
+      rows: [{ id: "row-3", position: 2, cells: { status: "Descending" } }],
+      rowCount: 700,
+    };
+    vi.mocked(api).mockImplementation((path) => {
+      if (path.includes("offset=500")) return stalePage.promise;
+      if (path.includes("dir=desc")) return Promise.resolve({ table: descending });
+      if (path.includes("sort=status")) return Promise.resolve({ table: ascending });
+      return Promise.resolve({ table });
+    });
+    renderViewer();
+
+    const sort = await screen.findByRole("button", { name: /^Status/ });
+    fireEvent.click(sort);
+    expect(await screen.findByDisplayValue("Ascending")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await waitFor(() => expect(api).toHaveBeenCalledWith(expect.stringContaining("offset=500"), expect.anything()));
+    fireEvent.click(sort);
+    expect(await screen.findByDisplayValue("Descending")).toBeInTheDocument();
+
+    await act(async () =>
+      stalePage.resolve({
+        table: {
+          ...ascending,
+          rows: [{ id: "row-2", position: 1, cells: { status: "Stale" } }],
+          hasMore: false,
+          nextOffset: null,
+        },
+      }),
+    );
+    expect(screen.queryByDisplayValue("Stale")).not.toBeInTheDocument();
+    expect(screen.getByDisplayValue("Descending")).toBeInTheDocument();
+  });
+
+  it("explains when a sorted view reaches the 5,000-row depth cap", async () => {
+    const truncated: TableData = {
+      ...table,
+      sort: "status",
+      hasMore: false,
+      nextCursor: null,
+      nextOffset: null,
+      truncated: true,
+      rowCount: 6_000,
+    };
+    vi.mocked(api).mockResolvedValueOnce({ table }).mockResolvedValueOnce({ table: truncated });
+    renderViewer();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Status/ }));
+
+    expect(await screen.findByText(/Showing the first 5,000 sorted rows/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
   });
 
   it("counts every row on the server, not just the ones loaded", async () => {

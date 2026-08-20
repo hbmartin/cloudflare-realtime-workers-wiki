@@ -5,15 +5,15 @@ Organised by what you actually observe. For the tables and commands referenced h
 
 ## Deployment failures
 
-| Symptom                                                                                            | Cause                                                                                                            | Fix                                                                                        |
-| -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `Couldn't find DB` or a D1 error on first deploy                                                   | `database_id` is still the all-zero placeholder in `wrangler.jsonc`                                              | Replace it with the ID from `wrangler d1 create`                                           |
-| Sign-in fails; cookies not set; `invalid_origin` on connect                                        | `BETTER_AUTH_URL` still points at `http://localhost:5173`, or does not exactly match the origin the browser used | Set it to the exact HTTPS origin, no trailing slash, then redeploy                         |
-| Runtime `no such table` errors after a deploy                                                      | Worker deployed before `pnpm db:remote`                                                                          | Apply migrations, then redeploy                                                            |
-| `BETTER_AUTH_SECRET is not defined` or 500s on every request                                       | Secret never set, or set on a different Worker name                                                              | `pnpm wrangler secret list`, then `secret put`                                             |
-| CI fails at `cf-typegen:check`                                                                     | `worker-configuration.d.ts` is out of date with `wrangler.jsonc`                                                 | Run `pnpm cf-typegen` and commit the result                                                |
-| Locally, `no such table` or a missing owner guard, with `pnpm db:local` reporting nothing to apply | The local D1 predates the squashed `0001_initial.sql` baseline, and `d1_migrations` already lists that name      | Delete `.wrangler/state` and rerun `pnpm db:local`; there is no forward migration for this |
-| Deploy succeeds but the old version appears live                                                   | Asset or browser caching, or you are looking at a preview URL                                                    | `pnpm wrangler deployments list` to confirm what is current                                |
+| Symptom                                                                                            | Cause                                                                                                       | Fix                                                                                        |
+| -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `Couldn't find DB` or a D1 error on first deploy                                                   | Production `database_id` is missing or still a placeholder in `wrangler.jsonc`                              | Set `env.production.d1_databases` to the ID from `wrangler d1 create`                      |
+| Sign-in fails; cookies not set; `invalid_origin` on connect                                        | Production `BETTER_AUTH_URL` does not exactly match the origin the browser used                             | Set `env.production.vars.BETTER_AUTH_URL` to the exact HTTPS origin, then redeploy         |
+| Runtime `no such table` errors after a deploy                                                      | Worker deployed before `pnpm db:remote`                                                                     | Apply migrations, then redeploy                                                            |
+| `BETTER_AUTH_SECRET is not defined` or 500s on every request                                       | Secret was not set for the production environment                                                           | Run `pnpm wrangler secret list --env production`, then `secret put --env production`       |
+| CI fails at `cf-typegen:check`                                                                     | `worker-configuration.d.ts` is out of date with `wrangler.jsonc`                                            | Run `pnpm cf-typegen` and commit the result                                                |
+| Locally, `no such table` or a missing owner guard, with `pnpm db:local` reporting nothing to apply | The local D1 predates the squashed `0001_initial.sql` baseline, and `d1_migrations` already lists that name | Delete `.wrangler/state` and rerun `pnpm db:local`; there is no forward migration for this |
+| Deploy succeeds but the old version appears live                                                   | Asset or browser caching, or you are looking at a preview URL                                               | `pnpm wrangler deployments list --env production` to confirm what is current               |
 
 `/api/health` returning `{"ok":true,"version":"0.1.0"}` does **not** confirm which revision is live;
 `version` is a hardcoded string.
@@ -234,7 +234,7 @@ the routing assumption still holds.
 
 Before escalating a data-affecting issue, capture:
 
-1. `pnpm wrangler deployments list` — which revision is live.
+1. `pnpm wrangler deployments list --env production` — which revision is live.
 2. The relevant queue query output from [Operations](OPERATIONS.md#inspecting-the-work-queues).
 3. Workers Logs for the matching message string, with timestamps.
 4. Whether the hourly cron has run since the incident began.

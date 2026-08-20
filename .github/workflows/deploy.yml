@@ -109,10 +109,10 @@ jobs:
       # queries the search, reference, mention, deletion-job, archive-disconnect,
       # and table-state tables on ordinary request paths.
       - name: Apply D1 migrations
-        run: pnpm wrangler d1 migrations apply DB --remote
+        run: pnpm wrangler d1 migrations apply DB --env production --remote
 
       - name: Deploy Worker
-        run: pnpm wrangler deploy
+        run: pnpm wrangler deploy --env production
 
       - name: Health check
         if: vars.PRODUCTION_BASE_URL != ''
@@ -134,4 +134,4 @@ jobs:
           exit 1
 
       - name: Deployed version
-        run: pnpm wrangler deployments list
+        run: pnpm wrangler deployments list --env production

@@ -83,14 +83,14 @@ browsers retain local Yjs state in IndexedDB and resynchronize it.
    would collide with the tables they create.
 
    ```sh
-   pnpm wrangler d1 execute DB --remote --file backup.sql
+   pnpm wrangler d1 execute DB --env production --remote --file backup.sql
    ```
 
 3. Rebuild the search index. The export omits `page_search` because D1 cannot export a virtual table,
    and nothing else reconstructs it:
 
    ```sh
-   pnpm wrangler d1 execute DB --remote --command \
+   pnpm wrangler d1 execute DB --env production --remote --command \
      "CREATE VIRTUAL TABLE IF NOT EXISTS page_search USING fts5(
         page_id UNINDEXED, workspace_id UNINDEXED, title, body, tokenize = 'unicode61');
       DELETE FROM page_search;

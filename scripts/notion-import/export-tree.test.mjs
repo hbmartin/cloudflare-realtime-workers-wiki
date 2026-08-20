@@ -73,10 +73,34 @@ describe("resolving links", () => {
     expect(resolveLink("../Cool 3333333333333333333333333333cccc.html", index)?.title).toBe("Cool");
   });
 
+  it("normalizes ../ against the referring HTML path before suffix fallback", () => {
+    const target = { title: "Exact target" };
+    const index = {
+      pagesByPath: new Map([["Parent/Target.html", target]]),
+      assetsByPath: new Map(),
+      byPath: new Map([["Target.html", [target, { title: "Ambiguous suffix" }]]]),
+      assetIndex: new Map(),
+      byNotionId: new Map(),
+    };
+
+    expect(resolveLink("../Target.html", index, "Parent/Nested/Source.html")).toBe(target);
+  });
+
   it("matches an absolute notion.so link by its trailing id", () => {
     const index = readExport(root);
     const target = resolveLink("https://www.notion.so/abcdef0123456789abcdef0123456789?pvs=21", index);
     expect(target?.title).toBe("Handbook");
+  });
+
+  it("reports an absolute Notion link whose page is absent from the export", () => {
+    const index = readExport(root);
+    const issues = [];
+    expect(
+      resolveLink("https://www.notion.so/ffffffffffffffffffffffffffffffff", index, null, (code, detail) =>
+        issues.push(`${code}:${detail}`),
+      ),
+    ).toBeNull();
+    expect(issues).toEqual(["link_unresolved:https://www.notion.so/ffffffffffffffffffffffffffffffff"]);
   });
 
   it("returns nothing for a link that leaves the export", () => {
@@ -88,5 +112,18 @@ describe("resolving links", () => {
     const index = readExport(root);
     const asset = resolveLink("Onboarding%201111111111111111111111111111aaaa/diagram.png", index);
     expect(asset).toEqual({ kind: "asset", path: expect.stringContaining("diagram.png") });
+  });
+
+  it("reports an ambiguous suffix instead of choosing either candidate", () => {
+    const issues = [];
+    const index = {
+      pagesByPath: new Map(),
+      assetsByPath: new Map(),
+      byPath: new Map([["Shared.html", [{ title: "One" }, { title: "Two" }]]]),
+      assetIndex: new Map(),
+      byNotionId: new Map(),
+    };
+    expect(resolveLink("Shared.html", index, null, (code, detail) => issues.push(`${code}:${detail}`))).toBeNull();
+    expect(issues).toEqual(["link_ambiguous:Shared.html"]);
   });
 });
