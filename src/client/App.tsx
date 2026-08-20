@@ -16,6 +16,20 @@ type AppState =
   | { screen: "invite"; token: string }
   | { screen: "workspace"; member: ClientMemberContext };
 
+async function resolveAppState(): Promise<AppState> {
+  const invite = new URLSearchParams(window.location.search).get("invite");
+  if (invite) return { screen: "invite", token: invite };
+  const install = await api<{ initialized: boolean }>("/api/install");
+  if (!install.initialized) return { screen: "bootstrap" };
+  try {
+    const member = await api<ClientMemberContext>("/api/me");
+    return { screen: "workspace", member };
+  } catch (error) {
+    if (error instanceof ApiClientError && error.status === 401) return { screen: "signin" };
+    throw error;
+  }
+}
+
 export function App() {
   const [state, setState] = useState<AppState>({ screen: "loading" });
   const signOut = useCallback(() => setState({ screen: "signin" }), []);
@@ -23,25 +37,7 @@ export function App() {
     setState((current) => (current.screen === "workspace" ? { screen: "signin", message: error.message } : current));
   }, []);
 
-  const load = useCallback(async () => {
-    const invite = new URLSearchParams(window.location.search).get("invite");
-    if (invite) {
-      setState({ screen: "invite", token: invite });
-      return;
-    }
-    const install = await api<{ initialized: boolean }>("/api/install");
-    if (!install.initialized) {
-      setState({ screen: "bootstrap" });
-      return;
-    }
-    try {
-      const member = await api<ClientMemberContext>("/api/me");
-      setState({ screen: "workspace", member });
-    } catch (error) {
-      if (error instanceof ApiClientError && error.status === 401) setState({ screen: "signin" });
-      else throw error;
-    }
-  }, []);
+  const load = useCallback(() => resolveAppState().then(setState), []);
 
   useEffect(() => onApiUnauthorized(sessionExpired), [sessionExpired]);
 
@@ -300,10 +296,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const data = await api<{ pages: Page[] }>("/api/pages/tree?archived=true");
     setTrash(data.pages);
   }, []);
-  const loadUnreadMentions = useCallback(async () => {
-    const data = await api<{ unreadCount: number }>("/api/mentions/unread-count");
-    setUnreadMentions(data.unreadCount);
-  }, []);
+  const loadUnreadMentions = useCallback(
+    () =>
+      api<{ unreadCount: number }>("/api/mentions/unread-count").then((data) => {
+        setUnreadMentions(data.unreadCount);
+      }),
+    [],
+  );
   const handleMentionsRead = useCallback((unreadCount: number) => setUnreadMentions(unreadCount), []);
   useEffect(() => {
     void loadPages().catch((error) => {
@@ -313,10 +312,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   useEffect(() => {
     void loadUnreadMentions();
   }, [loadUnreadMentions]);
-  useEffect(() => {
-    if (selectedId) localStorage.setItem("notes:last-page", selectedId);
-  }, [selectedId]);
-
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
       if (event.type === "pages-upserted") {
@@ -366,13 +361,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     return () => window.removeEventListener(PAGE_NAVIGATE_EVENT, navigate);
   }, []);
 
+  const selected =
+    pages.find((page) => page.id === selectedId) ?? (pagesLoaded && selectedId ? (pages[0] ?? null) : null);
+  const resolvedSelectedId = selected?.id ?? selectedId;
   useEffect(() => {
-    if (pagesLoaded && selectedId && !pages.some((page) => page.id === selectedId)) {
-      setSelectedId(pages[0]?.id ?? null);
-    }
-  }, [pages, pagesLoaded, selectedId]);
-
-  const selected = pages.find((page) => page.id === selectedId) ?? null;
+    if (resolvedSelectedId) localStorage.setItem("notes:last-page", resolvedSelectedId);
+  }, [resolvedSelectedId]);
   const tree = useMemo(() => buildTree(pages), [pages]);
   const breadcrumbs = useMemo(() => {
     const items: Page[] = [];
@@ -506,7 +500,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         >
           <PageTree
             nodes={tree}
-            selectedId={selectedId}
+            selectedId={resolvedSelectedId}
             editable={member.role !== "viewer"}
             onSelect={(id) => {
               setSelectedId(id);
@@ -757,39 +751,49 @@ function SearchView({
   );
 }
 
+type MentionPageResponse = {
+  mentions: MentionInboxItem[];
+  asOf: number;
+  nextCursor: { firstSeenAt: number; pageId: string } | null;
+};
+
+function requestMentionPage(cursor: { firstSeenAt: number; pageId: string } | null, traversalAsOf: number | null) {
+  const query = new URLSearchParams();
+  if (traversalAsOf !== null) query.set("asOf", String(traversalAsOf));
+  if (cursor) {
+    query.set("beforeAt", String(cursor.firstSeenAt));
+    query.set("beforeId", cursor.pageId);
+  }
+  return api<MentionPageResponse>(`/api/mentions${query.size ? `?${query}` : ""}`);
+}
+
+function markMentionsRead(through: number) {
+  return api<{ unreadCount: number }>("/api/mentions/read", {
+    method: "POST",
+    body: json({ through }),
+  });
+}
+
 function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; onRead: (unreadCount: number) => void }) {
   const [mentions, setMentions] = useState<MentionInboxItem[]>([]);
   const [error, setError] = useState("");
   const [asOf, setAsOf] = useState<number | null>(null);
   const [nextCursor, setNextCursor] = useState<{ firstSeenAt: number; pageId: string } | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const active = useRef(true);
 
   const loadMentionPage = useCallback(
-    async (cursor: { firstSeenAt: number; pageId: string } | null = null, traversalAsOf: number | null = null) => {
+    async (cursor: { firstSeenAt: number; pageId: string }, traversalAsOf: number | null) => {
       setLoading(true);
       setError("");
-      const query = new URLSearchParams();
-      if (traversalAsOf !== null) query.set("asOf", String(traversalAsOf));
-      if (cursor) {
-        query.set("beforeAt", String(cursor.firstSeenAt));
-        query.set("beforeId", cursor.pageId);
-      }
       try {
-        const data = await api<{
-          mentions: MentionInboxItem[];
-          asOf: number;
-          nextCursor: { firstSeenAt: number; pageId: string } | null;
-        }>(`/api/mentions${query.size ? `?${query}` : ""}`);
+        const data = await requestMentionPage(cursor, traversalAsOf);
         if (!active.current) return;
-        setMentions((current) => (cursor ? [...current, ...data.mentions] : data.mentions));
+        setMentions((current) => [...current, ...data.mentions]);
         setAsOf(data.asOf);
         setNextCursor(data.nextCursor);
         if (!data.nextCursor) {
-          const read = await api<{ unreadCount: number }>("/api/mentions/read", {
-            method: "POST",
-            body: json({ through: data.asOf }),
-          });
+          const read = await markMentionsRead(data.asOf);
           if (active.current) onRead(read.unreadCount);
         }
       } catch {
@@ -803,11 +807,29 @@ function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; on
 
   useEffect(() => {
     active.current = true;
-    void loadMentionPage();
+    let current = true;
+    void requestMentionPage(null, null)
+      .then(async (data) => {
+        if (!current) return;
+        setMentions(data.mentions);
+        setAsOf(data.asOf);
+        setNextCursor(data.nextCursor);
+        if (!data.nextCursor) {
+          const read = await markMentionsRead(data.asOf);
+          if (current) onRead(read.unreadCount);
+        }
+      })
+      .catch(() => {
+        if (current) setError("Mentions could not be loaded. Try again.");
+      })
+      .finally(() => {
+        if (current) setLoading(false);
+      });
     return () => {
+      current = false;
       active.current = false;
     };
-  }, [loadMentionPage]);
+  }, [onRead]);
   return (
     <main className="utility-view">
       <p className="eyebrow">Inbox</p>

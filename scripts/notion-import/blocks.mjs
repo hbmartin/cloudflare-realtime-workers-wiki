@@ -105,7 +105,10 @@ export function assignStableIds(blocks, seed) {
   const assign = (list, prefix) => {
     list.forEach((block, index) => {
       const path = `${prefix}.${index}`;
-      block.id = createHash("sha256").update(`${seed}${path}`).digest("hex").slice(0, 32);
+      block.id = createHash("sha256")
+        .update(JSON.stringify([seed, path]))
+        .digest("hex")
+        .slice(0, 32);
       if (Array.isArray(block.children) && block.children.length > 0) assign(block.children, path);
     });
   };

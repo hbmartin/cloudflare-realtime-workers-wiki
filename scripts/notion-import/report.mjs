@@ -9,21 +9,41 @@ const PROGRESS_INTERVAL_MS = 5_000;
 
 const plural = (count, singular) => `${count} ${count === 1 ? singular : `${singular}s`}`;
 
+function printEntries(heading, entries) {
+  if (!entries.size) return;
+  console.log(heading);
+  const sorted = [...entries.entries()].sort((left, right) => right[1].count - left[1].count);
+  for (const [key, entry] of sorted) {
+    const where = entry.firstSeenIn ? ` first in "${entry.firstSeenIn}"` : "";
+    console.log(`  ${key.slice(0, 52).padEnd(54)} ${String(entry.count).padStart(6)}${where}`);
+  }
+}
+
 export function createReport({ verbose = false } = {}) {
-  const issues = new Map();
+  const warnings = new Map();
+  const errors = new Map();
   const lastPrinted = new Map();
   let context = null;
 
+  const record = (target, code, detail) => {
+    const key = detail ? `${code}:${detail}` : code;
+    const entry = target.get(key) ?? { count: 0, firstSeenIn: context };
+    entry.count += 1;
+    target.set(key, entry);
+  };
   return {
     /** Names the page whose conversion is running, so issues can point at it. */
     inPage(title) {
       context = title;
     },
     issue(code, detail = "") {
-      const key = detail ? `${code}:${detail}` : code;
-      const entry = issues.get(key) ?? { count: 0, firstSeenIn: context };
-      entry.count += 1;
-      issues.set(key, entry);
+      record(warnings, code, detail);
+    },
+    error(code, detail = "") {
+      record(errors, code, detail);
+    },
+    get errorCount() {
+      return [...errors.values()].reduce((total, entry) => total + entry.count, 0);
     },
     progress(phase, done, total, note = "") {
       const now = Date.now();
@@ -39,14 +59,11 @@ export function createReport({ verbose = false } = {}) {
       console.log(
         `Imported ${plural(summary.pages, "page")}; wrote content for ${plural(summary.written, "page")}${tables}`,
       );
-      if (issues.size) {
+      if (warnings.size || errors.size) {
         console.log("");
-        console.log("Skipped or degraded, by reason:");
-        const sorted = [...issues.entries()].sort((left, right) => right[1].count - left[1].count);
-        for (const [key, entry] of sorted) {
-          const where = entry.firstSeenIn ? ` first in "${entry.firstSeenIn}"` : "";
-          console.log(`  ${key.slice(0, 52).padEnd(54)} ${String(entry.count).padStart(6)}${where}`);
-        }
+        printEntries("Warnings (content was intentionally degraded):", warnings);
+        if (warnings.size && errors.size) console.log("");
+        printEntries("Data errors (the import is incomplete):", errors);
       }
       console.log("");
       console.log(

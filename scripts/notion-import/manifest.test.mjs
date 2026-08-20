@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -51,5 +51,28 @@ describe("createManifest", () => {
     writeFileSync(files.path, "null\n");
 
     expect(() => open(files)).toThrow(new RegExp(`${files.path} does not contain a valid manifest`));
+  });
+
+  it("hashes file contents and rejects a same-size edit", () => {
+    const files = fixture();
+    open(files).flush();
+    writeFileSync(join(files.root, "Page 11111111111111111111111111111111.html"), "<p>Fake</p>");
+
+    expect(() => open(files)).toThrow(/different copy of this export/);
+  });
+
+  it("uses a random import id and explicitly rejects version 1", () => {
+    const first = fixture();
+    const manifest = open(first);
+    manifest.flush();
+    const state = JSON.parse(readFileSync(first.path, "utf8"));
+    expect(state.importId).toMatch(/^[0-9a-f]{32}$/);
+    const second = fixture();
+    open(second).flush();
+    expect(JSON.parse(readFileSync(second.path, "utf8")).importId).not.toBe(state.importId);
+
+    state.version = 1;
+    writeFileSync(first.path, JSON.stringify(state));
+    expect(() => open(first)).toThrow(/Version 1 did not hash file contents/);
   });
 });

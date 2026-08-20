@@ -31,6 +31,3 @@ export const TABLE_BULK_MAX_COLUMNS = 50;
 export const TABLE_BULK_MAX_ROWS = 200;
 export const TABLE_BULK_MAX_CELLS = 2_000;
 export const TABLE_BULK_MAX_BODY_BYTES = 1024 * 1024;
-
-/** How long a replayable bulk-write receipt is kept before the hourly cron prunes it. */
-export const TABLE_BULK_RECEIPT_TTL_MS = 24 * 60 * 60_000;

@@ -10,11 +10,13 @@ import {
   SELF,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
+import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { TABLE_BULK_MAX_ROWS } from "../shared/table-limits";
 import type { TableData, TableLeaseResponse, TableLeaseTiming } from "../shared/types";
+import { processDueUploadReaps } from "./attachments";
 import { processDeletionJob } from "./cleanup";
 import worker from "./index";
 
@@ -273,8 +275,29 @@ function elapseRestoreBackoff(document: TestDocument, state: DurableObjectState)
 }
 
 beforeEach(async () => {
-  await reset();
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+});
+
+async function clearWorkerDatabase() {
+  // pool-workers 0.22 does not currently clear D1 rows when reset() is called from
+  // this long shared integration file. Keep schemas/migration history and remove the
+  // two application roots explicitly; their foreign-key cascades cover every child.
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM install_state`),
+    env.DB.prepare(`DELETE FROM page_search`),
+    env.DB.prepare(`DELETE FROM workspaces`),
+    env.DB.prepare(`DELETE FROM verification`),
+    env.DB.prepare(`DELETE FROM user`),
+  ]);
+}
+
+afterEach(async () => {
+  // reset() clears persisted bindings, but it does not evict an instantiated Durable
+  // Object. Evict after the test has drained so appended tests cannot retain its
+  // in-memory document state or recreate rows after the next reset.
+  await abortAllDurableObjects();
+  await clearWorkerDatabase();
+  await reset();
 });
 
 describe("Worker integration", () => {
@@ -590,6 +613,44 @@ describe("Worker integration", () => {
       )
     ).json<{ suggestions: Array<{ entityId: string }> }>();
     expect(suggestions.suggestions.map((item) => item.entityId)).toContain(installed.pageId);
+  });
+
+  it("replays a deterministic single-shot attachment and rejects changed metadata", async () => {
+    const installed = await bootstrap();
+    const attachmentId = crypto.randomUUID();
+    const contentSha256 = await sha256Hex("same bytes");
+    const upload = async (name = "stable.txt") => {
+      const requestHash = await sha256Hex(
+        canonicalJson({
+          attachmentId,
+          pageId: installed.pageId,
+          name,
+          mime: "text/plain",
+          size: 10,
+          contentSha256,
+        }),
+      );
+      const form = new FormData();
+      form.set("file", new File(["same bytes"], name, { type: "text/plain" }));
+      form.set("attachmentId", attachmentId);
+      form.set("contentSha256", contentSha256);
+      form.set("requestHash", requestHash);
+      return SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/attachments`, {
+          method: "POST",
+          body: form,
+        }),
+      );
+    };
+    const first = await upload();
+    expect(first.status).toBe(201);
+    expect(await first.json()).toMatchObject({ replayed: false, attachment: { id: attachmentId, contentSha256 } });
+    const replay = await upload();
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({ replayed: true, attachment: { id: attachmentId } });
+    const mismatch = await upload("renamed.txt");
+    expect(mismatch.status).toBe(409);
+    expect((await mismatch.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
   });
 
   it("accepts a redundant invite for an existing workspace member without failing the membership constraint", async () => {
@@ -2318,6 +2379,20 @@ describe("Worker integration", () => {
     expect(descending.body.table.rows.slice(2).map((row) => row.id)).toEqual([seeded[1], seeded[3]]);
   });
 
+  it("marks a sorted result truncated at the 5,000-row offset ceiling", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const { columnId } = await seedTable(installed, tablePage.id, { column: "text" });
+    await seedRows(installed, tablePage.id, 5_001);
+
+    const capped = await readTable(installed.cookie, tablePage.id, `?sort=${columnId}&dir=asc&offset=4500&limit=500`);
+    expect(capped.status).toBe(200);
+    expect(capped.body.table.rows).toHaveLength(500);
+    expect(capped.body.table.hasMore).toBe(false);
+    expect(capped.body.table.nextOffset).toBeNull();
+    expect(capped.body.table.truncated).toBe(true);
+  });
+
   it("rejects an unknown sort column, a half-written cursor, and an out-of-range offset", async () => {
     const installed = await bootstrap();
     const tablePage = await createPage(installed.cookie, "table");
@@ -2385,6 +2460,28 @@ describe("Worker integration", () => {
     expect(status.options.map((option) => option.label)).toEqual(["Todo", "Doing"]);
     const titleColumn = body.table.columns.find((column) => column.name === "Title")!;
     expect(body.table.rows.map((row) => row.cells[titleColumn.id])).toEqual(["First", "Second"]);
+  });
+
+  it("returns an exact canonical hash and row count for table verification", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const { columnId, rowId } = await seedTable(installed, tablePage.id, { column: "text", row: true });
+    await env.DB.prepare(
+      `INSERT INTO table_cells (row_id, column_id, text_value, updated_at) VALUES (?, ?, 'exact', ?)`,
+    )
+      .bind(rowId, columnId, Date.now())
+      .run();
+    const response = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/verification`),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      verification: {
+        revision: 1,
+        contentHash: await tableContentHash([{ name: "Text", type: "text", options: [] }], [["exact"]]),
+        rowCount: 1,
+      },
+    });
   });
 
   it("writes nothing at all when the expected revision is stale", async () => {
@@ -2486,6 +2583,65 @@ describe("Worker integration", () => {
     expect(body.table.rowCount).toBe(1);
   });
 
+  it("binds durable bulk receipts to the canonical columns and rows", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await acquireLease(installed.cookie, tablePage.id);
+    const first = await bulkWrite(installed.cookie, tablePage.id, {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 1,
+      clientRequestId: "import/table/rows/0",
+      rows: [{ cells: {} }],
+    });
+    expect(first.status).toBe(201);
+
+    const reused = await bulkWrite(installed.cookie, tablePage.id, {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 1,
+      clientRequestId: "import/table/rows/0",
+      rows: [{ cells: {} }, { cells: {} }],
+    });
+    expect(reused.status).toBe(409);
+    expect(reused.body.error?.code).toBe("idempotency_key_reused");
+  });
+
+  it("converges concurrent identical bulk retries on one committed receipt", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const lease = await acquireLease(installed.cookie, tablePage.id);
+    const request = {
+      leaseToken: lease.leaseToken,
+      expectedRevision: 1,
+      clientRequestId: "import/table/concurrent/0",
+      rows: [{ cells: {} }],
+    };
+    const [left, right] = await Promise.all([
+      bulkWrite(installed.cookie, tablePage.id, request),
+      bulkWrite(installed.cookie, tablePage.id, request),
+    ]);
+    expect([left.status, right.status].sort((first, second) => first - second)).toEqual([200, 201]);
+    expect([left.body.replayed, right.body.replayed].sort((first, second) => Number(first) - Number(second))).toEqual([
+      false,
+      true,
+    ]);
+    expect(left.body.rows).toEqual(right.body.rows);
+    expect((await readTable(installed.cookie, tablePage.id, "?count=true")).body.table.rowCount).toBe(1);
+  });
+
+  it("enforces the bulk byte ceiling without a Content-Length header", async () => {
+    const installed = await bootstrap();
+    const tablePage = await createPage(installed.cookie, "table");
+    const request = authenticatedRequest(installed.cookie, `/api/tables/${tablePage.id}/bulk`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ padding: "x".repeat(1024 * 1024) }),
+    });
+    expect(request.headers.has("content-length")).toBe(false);
+    const response = await SELF.fetch(request);
+    expect(response.status).toBe(413);
+    expect((await response.json<{ error: { code: string } }>()).error.code).toBe("bulk_too_large");
+  });
+
   it("extends its own editing lease so a long import cannot outlive it", async () => {
     const installed = await bootstrap();
     const tablePage = await createPage(installed.cookie, "table");
@@ -2555,6 +2711,101 @@ describe("Worker integration", () => {
     expect(await env.DB.prepare(`SELECT COUNT(*) count FROM attachment_uploads`).first<{ count: number }>()).toEqual({
       count: 0,
     });
+
+    const replay = await completeUpload(installed.cookie, started.body.upload.id);
+    expect(replay.status).toBe(200);
+    expect(replay.body.attachment.id).toBe(completed.body.attachment.id);
+    const status = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/uploads/${started.body.upload.id}`));
+    expect(await status.json()).toMatchObject({ status: "committed", attachment: { id: started.body.upload.id } });
+  });
+
+  it("preserves r2_complete when D1 attachment finalization fails, then commits on retry", async () => {
+    const installed = await bootstrap();
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      attachmentId: crypto.randomUUID(),
+      name: "recoverable.bin",
+      mime: "application/octet-stream",
+      size: 1_024,
+    });
+    expect((await putUploadPart(installed.cookie, started.body.upload.id, 1, filledBytes(1_024))).status).toBe(200);
+
+    await env.DB.prepare(
+      `CREATE TRIGGER fail_attachment_commit BEFORE INSERT ON attachments
+       BEGIN SELECT RAISE(ABORT, 'forced attachment commit failure'); END`,
+    ).run();
+    try {
+      const failed = await completeUpload(installed.cookie, started.body.upload.id);
+      expect(failed.status).toBe(500);
+      expect(
+        await env.DB.prepare(`SELECT state FROM attachment_uploads WHERE id = ?`).bind(started.body.upload.id).first(),
+      ).toEqual({ state: "r2_complete" });
+    } finally {
+      await env.DB.prepare(`DROP TRIGGER fail_attachment_commit`).run();
+    }
+
+    const retried = await completeUpload(installed.cookie, started.body.upload.id);
+    expect(retried.status).toBe(201);
+    expect(retried.body.attachment.id).toBe(started.body.upload.id);
+    expect(
+      await env.DB.prepare(`SELECT 1 FROM attachment_uploads WHERE id = ?`).bind(started.body.upload.id).first(),
+    ).toBeNull();
+  });
+
+  it("atomically fences a part upload racing the reaper", async () => {
+    const installed = await bootstrap();
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      name: "part-race.bin",
+      mime: "application/octet-stream",
+      size: 1_024,
+    });
+    await env.DB.prepare(`UPDATE attachment_uploads SET next_attempt_at = 1 WHERE id = ?`)
+      .bind(started.body.upload.id)
+      .run();
+
+    const [part] = await Promise.all([
+      putUploadPart(installed.cookie, started.body.upload.id, 1, filledBytes(1_024)),
+      processDueUploadReaps(env),
+    ]);
+    const session = await env.DB.prepare(`SELECT state FROM attachment_uploads WHERE id = ?`)
+      .bind(started.body.upload.id)
+      .first<{ state: string }>();
+    const partCount = await env.DB.prepare(`SELECT COUNT(*) count FROM attachment_upload_parts WHERE upload_id = ?`)
+      .bind(started.body.upload.id)
+      .first();
+    expect([
+      { status: 200, session: { state: "active" }, partCount: { count: 1 } },
+      { status: 404, session: null, partCount: { count: 0 } },
+      { status: 409, session: null, partCount: { count: 0 } },
+    ]).toContainEqual({ status: part.status, session, partCount });
+  });
+
+  it("atomically resolves completion racing the reaper", async () => {
+    const installed = await bootstrap();
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      name: "completion-race.bin",
+      mime: "application/octet-stream",
+      size: 1_024,
+    });
+    expect((await putUploadPart(installed.cookie, started.body.upload.id, 1, filledBytes(1_024))).status).toBe(200);
+    await env.DB.prepare(`UPDATE attachment_uploads SET next_attempt_at = 1 WHERE id = ?`)
+      .bind(started.body.upload.id)
+      .run();
+
+    const [completion] = await Promise.all([
+      completeUpload(installed.cookie, started.body.upload.id),
+      processDueUploadReaps(env),
+    ]);
+    const attachment = await env.DB.prepare(`SELECT id FROM attachments WHERE id = ?`)
+      .bind(started.body.upload.id)
+      .first();
+    const session = await env.DB.prepare(`SELECT state FROM attachment_uploads WHERE id = ?`)
+      .bind(started.body.upload.id)
+      .first();
+    expect([
+      { status: 201, attachment: { id: started.body.upload.id }, session: null },
+      { status: 404, attachment: null, session: null },
+      { status: 409, attachment: null, session: null },
+    ]).toContainEqual({ status: completion.status, attachment, session });
   });
 
   it("rejects a mistyped part and a part number outside the upload", async () => {
@@ -2685,6 +2936,70 @@ describe("Worker integration", () => {
     // Search rows are seeded for every page, so a batch import is findable immediately.
     const indexed = await env.DB.prepare(`SELECT COUNT(*) count FROM page_search`).first<{ count: number }>();
     expect(indexed!.count).toBe(5);
+  });
+
+  it("replays a deterministic page batch and rejects partial or mismatched reuse", async () => {
+    const installed = await bootstrap();
+    const firstId = crypto.randomUUID();
+    const secondId = crypto.randomUUID();
+    const pages = [
+      { id: firstId, parentId: installed.pageId, kind: "document", title: "Stable A" },
+      { id: secondId, parentId: installed.pageId, kind: "table", title: "Stable B" },
+    ];
+    const post = (entries: unknown[]) =>
+      SELF.fetch(
+        authenticatedRequest(installed.cookie, "/api/pages/batch", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ pages: entries }),
+        }),
+      );
+    const created = await post(pages);
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ replayed: false });
+    const replayed = await post(pages);
+    expect(replayed.status).toBe(200);
+    expect(await replayed.json()).toMatchObject({ replayed: true });
+
+    const mismatch = await post([{ ...pages[0], title: "Different" }, pages[1]]);
+    expect(mismatch.status).toBe(409);
+    expect((await mismatch.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
+    const partial = await post([pages[0], { ...pages[1], id: crypto.randomUUID() }]);
+    expect(partial.status).toBe(409);
+  });
+
+  it("returns the indexed sequence and exact canonical document projection hash", async () => {
+    const installed = await bootstrap();
+    const target = await createPage(installed.cookie);
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE pages SET plain_text = 'Canonical text', indexed_seq = 7 WHERE id = ?`).bind(
+        installed.pageId,
+      ),
+      env.DB.prepare(
+        `INSERT INTO page_references (source_page_id, target_page_id, excerpt, projection_seq)
+         VALUES (?, ?, '', 7)`,
+      ).bind(installed.pageId, target.id),
+      env.DB.prepare(
+        `INSERT INTO member_mentions
+           (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, projection_seq)
+         VALUES (?, ?, ?, '', ?, 7)`,
+      ).bind(installed.workspaceId, installed.pageId, installed.userId, Date.now()),
+    ]);
+    const response = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/verification`),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      verification: {
+        indexedSequence: 7,
+        plainTextLength: 14,
+        projectionHash: await documentProjectionHash({
+          plainText: "Canonical text",
+          pageReferences: [{ targetId: target.id, excerpt: "" }],
+          memberMentions: [{ targetId: installed.userId, excerpt: "" }],
+        }),
+      },
+    });
   });
 
   it("rejects a batch that is empty, oversized, or names a missing parent", async () => {

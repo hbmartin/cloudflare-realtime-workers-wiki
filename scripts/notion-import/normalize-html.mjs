@@ -38,7 +38,7 @@ export function normalizeNotionHtml(html, options = {}) {
   // The exported header holds the cover, icon, title, and the database property table.
   // The title is taken from the page's own metadata, so the whole header goes.
   const body = document.querySelector("article > div.page-body") ?? document.querySelector("div.page-body");
-  if (!body) return "";
+  if (!body) throw new Error("The exported page has no Notion page-body element; refusing to import it as blank.");
 
   for (const nav of body.querySelectorAll("nav.table_of_contents, nav.breadcrumb")) {
     onIssue("unsupported_block", nav.className.includes("breadcrumb") ? "breadcrumb" : "table_of_contents");
@@ -220,6 +220,11 @@ function rewriteLinks(body, document, resolveHref, onIssue) {
       anchor.setAttribute("href", resolved.url);
       continue;
     }
+    if (resolved.type === "skipped-unsafe-asset") {
+      onIssue("attachment_skipped_unsafe", href);
+      replaceWith(anchor, document.createTextNode(anchor.textContent ?? ""));
+      continue;
+    }
     const mention = document.createElement("span");
     mention.setAttribute("data-inline-content-type", "mention");
     mention.setAttribute("data-entity-type", "page");
@@ -234,7 +239,10 @@ function rewriteLinks(body, document, resolveHref, onIssue) {
   for (const element of body.querySelectorAll("img[src], embed[src], video[src], audio[src], source[src]")) {
     const resolved = resolveHref(element.getAttribute("src") ?? "");
     if (resolved?.type === "asset") element.setAttribute("src", resolved.url);
-    else if (!resolved) onIssue("attachment_missing", element.getAttribute("src") ?? "");
+    else if (resolved?.type === "skipped-unsafe-asset") {
+      onIssue("attachment_skipped_unsafe", element.getAttribute("src") ?? "");
+      element.remove();
+    } else if (!resolved) onIssue("attachment_missing", element.getAttribute("src") ?? "");
   }
 }
 

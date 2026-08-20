@@ -11,7 +11,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
-import { writeBlocksToFragment } from "./blocks.mjs";
+import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
+import { DOCUMENT_FRAGMENT, writeBlocksToFragment } from "./blocks.mjs";
 
 const SYNC_TIMEOUT_MS = 30_000;
 
@@ -77,6 +78,50 @@ function waitForSync(provider) {
   });
 }
 
+function createProvider(client, pageId, epoch, doc) {
+  const url = new URL(client.baseURL);
+  return new YProvider(url.host, `${pageId}~${epoch}`, doc, {
+    party: "document",
+    connect: false,
+    protocol: url.protocol === "https:" ? "wss" : "ws",
+    disableBc: true,
+    WebSocketPolyfill: authenticatedSocket(client.cookie, client.origin),
+  });
+}
+
+function closeProvider(provider, doc, pageId) {
+  try {
+    provider.awareness?.setLocalState(null);
+    provider.disconnect();
+    provider.destroy();
+    doc.destroy();
+  } catch (error) {
+    console.warn(`Failed to close the connection for ${pageId} cleanly: ${error.message}`);
+  }
+}
+
+export async function documentJsonForBlocks(editor, blocks) {
+  const doc = new Y.Doc();
+  try {
+    await writeBlocksToFragment(editor, blocks, doc);
+    return yXmlFragmentToProsemirrorJSON(doc.getXmlFragment(DOCUMENT_FRAGMENT));
+  } finally {
+    doc.destroy();
+  }
+}
+
+export async function readDocumentJson({ client, pageId, epoch }) {
+  const doc = new Y.Doc();
+  const provider = createProvider(client, pageId, epoch, doc);
+  try {
+    await provider.connect();
+    await waitForSync(provider);
+    return yXmlFragmentToProsemirrorJSON(doc.getXmlFragment(DOCUMENT_FRAGMENT));
+  } finally {
+    closeProvider(provider, doc, pageId);
+  }
+}
+
 /**
  * Waits for the server to confirm the update reached its storage.
  *
@@ -109,18 +154,8 @@ export async function pushDocument({
   lingerMs = 1_200,
   barrierTimeoutMs = 30_000,
 }) {
-  const url = new URL(client.baseURL);
   const doc = new Y.Doc();
-  const provider = new YProvider(url.host, `${pageId}~${epoch}`, doc, {
-    party: "document",
-    connect: false,
-    // Both are set explicitly: the provider otherwise guesses the scheme from the
-    // hostname, and disables its broadcast channel only when `window` is undefined,
-    // which is false once jsdom's globals are installed for the HTML parser.
-    protocol: url.protocol === "https:" ? "wss" : "ws",
-    disableBc: true,
-    WebSocketPolyfill: authenticatedSocket(client.cookie, client.origin),
-  });
+  const provider = createProvider(client, pageId, epoch, doc);
 
   try {
     await provider.connect();
@@ -137,15 +172,7 @@ export async function pushDocument({
     }
     return written;
   } finally {
-    try {
-      provider.awareness?.setLocalState(null);
-      provider.disconnect();
-      // destroy() is what removes the process exit listener the provider installs;
-      // without it a thousand sequential pages exhaust the listener limit.
-      provider.destroy();
-      doc.destroy();
-    } catch (error) {
-      console.warn(`Failed to close the connection for ${pageId} cleanly: ${error.message}`);
-    }
+    // destroy() removes the process exit listener installed by the provider.
+    closeProvider(provider, doc, pageId);
   }
 }

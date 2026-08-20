@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { TABLE_MAX_ROWS, TABLE_PAGE_DEFAULT } from "../shared/table-limits";
+import { TABLE_MAX_ROWS, TABLE_PAGE_DEFAULT, TABLE_SORT_MAX_OFFSET } from "../shared/table-limits";
 import type { TableCursor } from "../shared/types";
 import type { ClientMemberContext } from "../shared/types";
 import type {
@@ -47,6 +47,10 @@ function leaseClock(): LeaseClock {
 
 function cellInputKey(rowId: string, columnId: string) {
   return `${rowId}:${columnId}`;
+}
+
+function tableSortKey(column: string | null, dir: "asc" | "desc") {
+  return column ? `${column}:${dir}` : "";
 }
 
 function normalizedInputValue(column: TableColumn, value: string | number | boolean | null) {
@@ -141,10 +145,14 @@ export function TablePage({
   // Mirrored so `load` can read the current sort without taking it as a dependency:
   // the mount effect keys off `load`, and rebuilding it would re-acquire the lease.
   const sortRef = useRef<{ column: string | null; dir: "asc" | "desc" }>({ column: null, dir: "asc" });
-  sortRef.current = { column: sortColumn, dir: sortDir };
+  useEffect(() => {
+    sortRef.current = { column: sortColumn, dir: sortDir };
+  }, [sortColumn, sortDir]);
   // Pages appended past the first. While any are loaded the background poll stands
   // down, so browsing deep into a table is not yanked back to the top every 5s.
   const appendedPagesRef = useRef(0);
+  const loadMoreInFlightRef = useRef(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [title, setTitle] = useState(page.title);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [cellResetGenerations, setCellResetGenerations] = useState<Record<string, number>>({});
@@ -307,35 +315,62 @@ export function TablePage({
     [markPageUnavailable, page.id],
   );
 
-  // Appends the next keyset page. Deliberately separate from `load`, which always
-  // returns to the first page so a refresh has a single, predictable meaning.
-  const loadMore = useCallback(
-    async (cursor: TableCursor) => {
-      const params = new URLSearchParams({
-        limit: String(TABLE_PAGE_DEFAULT),
-        afterPosition: String(cursor.position),
-        afterId: cursor.rowId,
-      });
+  // Appends the next keyset or offset page. Deliberately separate from `load`,
+  // which always returns to the first page so a refresh has one predictable meaning.
+  async function loadMore(currentPage: TableData) {
+    if (loadMoreInFlightRef.current || loadsInFlightRef.current || !currentPage.hasMore) return;
+
+    const params = new URLSearchParams({ limit: String(currentPage.limit) });
+    if (currentPage.sort) {
+      if (currentPage.nextOffset === null) return;
+      params.set("sort", currentPage.sort);
+      params.set("dir", currentPage.dir);
+      params.set("offset", String(currentPage.nextOffset));
+    } else {
+      const cursor: TableCursor | null = currentPage.nextCursor;
+      if (!cursor) return;
+      params.set("afterPosition", String(cursor.position));
+      params.set("afterId", cursor.rowId);
+    }
+
+    const generation = loadGenerationRef.current;
+    const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
+    loadMoreInFlightRef.current = true;
+    loadsInFlightRef.current += 1;
+    setLoadingMore(true);
+    try {
       const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (!mountedRef.current) return;
+      const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
+      if (
+        !mountedRef.current ||
+        generation !== loadGenerationRef.current ||
+        requestedSort !== activeSort ||
+        tableSortKey(result.table.sort, result.table.dir) !== requestedSort
+      ) {
+        return;
+      }
       appendedPagesRef.current += 1;
-      setTable((current) =>
-        current
-          ? {
-              ...current,
-              rows: [...current.rows, ...result.table.rows],
-              hasMore: result.table.hasMore,
-              nextCursor: result.table.nextCursor,
-            }
-          : current,
-      );
-    },
-    [page.id],
-  );
+      setTable((current) => {
+        if (!current || tableSortKey(current.sort, current.dir) !== requestedSort) return current;
+        return {
+          ...current,
+          rows: [...current.rows, ...result.table.rows],
+          hasMore: result.table.hasMore,
+          nextCursor: result.table.nextCursor,
+          nextOffset: result.table.nextOffset,
+          truncated: result.table.truncated,
+        };
+      });
+    } finally {
+      loadsInFlightRef.current -= 1;
+      loadMoreInFlightRef.current = false;
+      if (mountedRef.current) setLoadingMore(false);
+    }
+  }
 
-  const sortKey = `${sortColumn ?? ""}:${sortDir}`;
+  const sortKey = tableSortKey(sortColumn, sortDir);
   const appliedSortRef = useRef(sortKey);
   useEffect(() => {
     if (appliedSortRef.current === sortKey) return;
@@ -365,13 +400,13 @@ export function TablePage({
   );
 
   const renewLocalLease = useCallback(
-    (token: string, minimumGeneration = 0): Promise<boolean> => {
+    function renewLease(token: string, minimumGeneration = 0): Promise<boolean> {
       const current = leaseRenewalRef.current;
       if (current?.token === token) {
         if (current.generation >= minimumGeneration) return current.promise;
         return current.promise
           .catch(() => false)
-          .then(() => (leaseTokenRef.current === token ? renewLocalLease(token, minimumGeneration) : false));
+          .then(() => (leaseTokenRef.current === token ? renewLease(token, minimumGeneration) : false));
       }
       const requestedAt = leaseClock();
       const generation = ++leaseRenewalGenerationRef.current;
@@ -1058,13 +1093,20 @@ export function TablePage({
                 ))}
               </tbody>
             </table>
-            {table.hasMore && (
+            {table.hasMore && (table.nextCursor || table.nextOffset !== null) && (
               <button
                 className="load-more"
-                onClick={() => table.nextCursor && void loadMore(table.nextCursor).catch(() => undefined)}
+                disabled={loadingMore}
+                onClick={() => void loadMore(table).catch(() => undefined)}
               >
                 Load more rows
               </button>
+            )}
+            {table.truncated && (
+              <output className="table-limit-notice">
+                Showing the first {TABLE_SORT_MAX_OFFSET.toLocaleString("en-US")} sorted rows. Clear the sort to browse
+                the rest.
+              </output>
             )}
             {editingReady && (
               <button

@@ -107,6 +107,10 @@ export type TableData = {
   hasMore: boolean;
   /** Keyset cursor for the next page. Null when sorting, which pages by offset. */
   nextCursor: TableCursor | null;
+  /** Offset for the next sorted page. Null for stored-order paging or when sorting cannot continue. */
+  nextOffset: number | null;
+  /** Whether more sorted rows exist beyond the server's supported offset depth. */
+  truncated: boolean;
   /** Total rows, present only when the request asked for `count=true`. */
   rowCount: number | null;
 };

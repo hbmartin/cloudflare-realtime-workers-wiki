@@ -40,7 +40,7 @@ describe("inferColumnType", () => {
 
   it("reads dates and numbers", () => {
     expect(inferColumnType(["2026-01-02", "2026-03-04"])).toBe("date");
-    expect(inferColumnType(["1", "2.5", "-3"])).toBe("number");
+    expect(inferColumnType(["1.25", "2.5", "-3.75"])).toBe("number");
   });
 
   it("uses select only when values actually repeat", () => {
@@ -55,6 +55,19 @@ describe("inferColumnType", () => {
 
   it("falls back to text for an empty column", () => {
     expect(inferColumnType(["", "", ""])).toBe("text");
+  });
+
+  it("keeps integers, leading-zero ids, exponents, and lossy decimal forms as text", () => {
+    expect(inferColumnType(["1", "2", "3"])).toBe("text");
+    expect(inferColumnType(["00123", "00456"])).toBe("text");
+    expect(inferColumnType(["9007199254740993", "9007199254740995"])).toBe("text");
+    expect(inferColumnType(["1e3", "2e3"])).toBe("text");
+    expect(inferColumnType(["1.50", "2.50"])).toBe("text");
+    expect(inferColumnType(["0.1", "0.2"])).toBe("text");
+    expect(tableFromCsv("Code\n00123\n9007199254740993\n").rows.map((row) => row.cells["ref:c0"])).toEqual([
+      "00123",
+      "9007199254740993",
+    ]);
   });
 });
 
@@ -74,7 +87,7 @@ describe("tableFromCsv", () => {
   it("builds columns and rows addressed by ref so one request carries both", () => {
     const issues = [];
     const table = tableFromCsv(
-      "Name,Status,Done,Count\nFirst,Todo,Yes,1\nSecond,Doing,No,2\nThird,Todo,Yes,3\nFourth,Doing,No,4\n",
+      "Name,Status,Done,Count\nFirst,Todo,Yes,1.25\nSecond,Doing,No,2.5\nThird,Todo,Yes,3.75\nFourth,Doing,No,4.5\n",
       (code, detail) => issues.push(`${code}:${detail}`),
     );
 
@@ -88,7 +101,7 @@ describe("tableFromCsv", () => {
       "ref:c0": "First",
       "ref:c1": { option: "Todo" },
       "ref:c2": true,
-      "ref:c3": 1,
+      "ref:c3": 1.25,
     });
     expect(issues).toEqual([]);
   });

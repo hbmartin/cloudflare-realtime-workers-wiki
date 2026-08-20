@@ -42,7 +42,7 @@ const { normalizeNotionHtml } = normalizer;
 const { createClient } = api;
 const { createManifest } = manifests;
 const { createReport } = reports;
-const { runImport } = runner;
+const { preflightTable, runImport } = runner;
 const { verifyImport } = verifier;
 
 const COMMANDS = new Set(["inspect", "plan", "run", "verify"]);
@@ -58,6 +58,7 @@ function parseArguments(argv) {
     manifest: "./notion-import.manifest.json",
     requestsPerSecond: Number.parseInt(process.env.NOTES_IMPORT_RPS || "20", 10),
     lingerMs: 1_200,
+    verifyTimeoutMs: Number(process.env.NOTES_IMPORT_VERIFY_TIMEOUT_MS || 120_000),
     verbose: false,
   };
   const positional = [];
@@ -80,6 +81,7 @@ function parseArguments(argv) {
     else if (flag === "--manifest") options.manifest = take();
     else if (flag === "--rps") options.requestsPerSecond = takeNumber();
     else if (flag === "--linger-ms") options.lingerMs = takeNumber();
+    else if (flag === "--verify-timeout-ms") options.verifyTimeoutMs = takeNumber();
     else if (flag === "--verbose") options.verbose = true;
     else if (flag.startsWith("--")) throw new Error(`Unknown option ${flag}.`);
     else positional.push(argument);
@@ -100,6 +102,7 @@ function usage() {
   console.error("  --manifest <path>  Where to record progress. Re-running resumes from it.");
   console.error("  --rps <n>          Global request rate. Defaults to NOTES_IMPORT_RPS or 20.");
   console.error("  --linger-ms <n>    How long to hold each document open so compaction is armed promptly.");
+  console.error("  --verify-timeout-ms <n>  Maximum time for exact post-import verification.");
   console.error("  --verbose          One line per page instead of a summary.");
 }
 
@@ -132,6 +135,9 @@ function validate(options) {
   }
   if (!Number.isInteger(options.lingerMs) || options.lingerMs < 0 || options.lingerMs > 60_000) {
     throw new Error("--linger-ms must be an integer between 0 and 60000.");
+  }
+  if (!Number.isInteger(options.verifyTimeoutMs) || options.verifyTimeoutMs < 1 || options.verifyTimeoutMs > 600_000) {
+    throw new Error("--verify-timeout-ms must be an integer between 1 and 600000.");
   }
   if ((options.command === "run" || options.command === "verify") && !options.email) {
     throw new Error("Set --email or NOTES_IMPORT_EMAIL to an owner or editor account.");
@@ -166,7 +172,7 @@ async function planImport(index, limit) {
       const html = normalizeNotionHtml(readPageHtml(index.root, page), {
         onIssue: (code, detail) => record(code, detail, page.title),
         resolveHref: (href) => {
-          const target = resolveLink(href, index);
+          const target = resolveLink(href, index, page.path, (code, detail) => record(code, detail, page.title));
           if (!target) return null;
           if (target.kind === "asset") return { type: "asset", url: `/api/attachments/planned` };
           return { type: "page", entityId: "00000000-0000-0000-0000-000000000000", label: target.title };
@@ -174,6 +180,9 @@ async function planImport(index, limit) {
       });
       blocks += (await htmlToBlocks(editor, html)).length;
       converted += 1;
+      if (page.kind === "database") {
+        preflightTable(index, page, (code, detail) => record(code, detail, page.title));
+      }
     } catch (error) {
       failed += 1;
       record("conversion_failed", error instanceof Error ? error.message : "unknown", page.title);
@@ -204,7 +213,7 @@ async function connect(options, root) {
   const manifest = createManifest({
     path: options.manifest,
     root,
-    baseURL: options.baseURL,
+    baseURL: client.baseURL,
     workspaceId: client.workspaceId,
     rootParentId: options.parent,
   });
@@ -227,12 +236,14 @@ if (options.command === "inspect") {
       (planned.failed ? `; ${planned.failed} failed.` : "."),
   );
   reportIssues(planned.issues);
+  if (planned.failed) process.exitCode = 1;
 } else if (options.command === "run") {
   const { client, manifest } = await connect(options, root);
   console.log(`Signed in to ${options.baseURL} as ${options.email} (${client.role}).`);
   const report = createReport({ verbose: options.verbose });
+  let summary;
   try {
-    const summary = await runImport({
+    summary = await runImport({
       index,
       client,
       manifest,
@@ -247,6 +258,14 @@ if (options.command === "inspect") {
     // fails part way through.
     manifest.flush();
   }
+  console.log("Running exact post-import verification.");
+  const problems = await verifyImport({
+    client,
+    manifest,
+    index,
+    timeoutMs: options.verifyTimeoutMs,
+  });
+  if (summary.errors > 0 || problems > 0) process.exitCode = 1;
 } else if (options.command === "verify") {
   if (!existsSync(options.manifest)) {
     throw new Error(
@@ -254,6 +273,6 @@ if (options.command === "inspect") {
     );
   }
   const { client, manifest } = await connect(options, root);
-  const problems = await verifyImport({ client, manifest, index });
+  const problems = await verifyImport({ client, manifest, index, timeoutMs: options.verifyTimeoutMs });
   if (problems > 0) process.exitCode = 1;
 }

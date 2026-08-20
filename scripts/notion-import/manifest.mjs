@@ -9,13 +9,35 @@
  * Content needs no reconciliation at all: pushing a page that already holds the same
  * blocks produces no Yjs updates, so a retry is free and provably a no-op.
  */
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { walkExport } from "./export-tree.mjs";
 
-const MANIFEST_VERSION = 1;
+const MANIFEST_VERSION = 2;
 const SAVE_DEBOUNCE_MS = 500;
+const HASH_BUFFER_BYTES = 1024 * 1024;
+
+function hashFile(hash, path) {
+  const metadata = lstatSync(path);
+  if (!metadata.isFile()) throw new Error(`Refusing to import non-regular file ${path}.`);
+  const descriptor = openSync(path, "r");
+  const buffer = Buffer.allocUnsafe(HASH_BUFFER_BYTES);
+  try {
+    for (let bytes = readSync(descriptor, buffer, 0, buffer.length, null); bytes > 0;) {
+      hash.update(buffer.subarray(0, bytes));
+      bytes = readSync(descriptor, buffer, 0, buffer.length, null);
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+export function hashFileContent(path) {
+  const hash = createHash("sha256");
+  hashFile(hash, path);
+  return hash.digest("hex");
+}
 
 /**
  * Identifies the export a manifest belongs to.
@@ -29,7 +51,7 @@ export function fingerprintExport(root) {
   for (const path of files) {
     hash.update(path);
     hash.update("\0");
-    hash.update(String(statSync(join(root, path)).size));
+    hashFile(hash, join(root, path));
     hash.update("\0");
   }
   return hash.digest("hex");
@@ -57,7 +79,16 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId 
       throw new Error(`${path} does not contain a valid manifest. Move it aside to start over.`);
     }
     if (state.version !== MANIFEST_VERSION) {
-      throw new Error(`${path} was written by a different version of the importer. Move it aside to start over.`);
+      const detail = state.version === 1 ? "Version 1 did not hash file contents and cannot be resumed safely." : "";
+      throw new Error(
+        `${path} was written by a different version of the importer. ${detail} Move it aside to start over.`.replace(
+          "  ",
+          " ",
+        ),
+      );
+    }
+    if (!/^[0-9a-f]{32}$/.test(state.importId ?? "")) {
+      throw new Error(`${path} does not contain a valid version 2 import id. Move it aside to start over.`);
     }
     if (state.exportFingerprint !== fingerprint) {
       throw new Error(
@@ -75,8 +106,12 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId 
       throw new Error(`${path} was created with a different --parent. Move it aside to start over.`);
     }
   } else {
+    // Each run owns a fresh idempotency namespace. Reusing ids for a new manifest of
+    // the same export would accidentally replay resources from an earlier import.
+    const importId = randomBytes(16).toString("hex");
     state = {
       version: MANIFEST_VERSION,
+      importId,
       startedAt: Date.now(),
       baseURL,
       workspaceId,
@@ -116,6 +151,10 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId 
     record(notionKey, patch) {
       state.nodes[notionKey] = { ...state.nodes[notionKey], ...patch };
       save();
+    },
+    recordNow(notionKey, patch) {
+      state.nodes[notionKey] = { ...state.nodes[notionKey], ...patch };
+      flush();
     },
     flush,
   };

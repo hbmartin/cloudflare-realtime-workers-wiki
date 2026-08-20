@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api, ApiClientError } from "./api";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 
@@ -16,6 +16,11 @@ function fileOfSize(bytes: number, name = "clip.mp4", type = "video/mp4") {
 describe("uploadAttachment", () => {
   beforeEach(() => {
     vi.mocked(api).mockReset();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("sends a small file in one request rather than negotiating a session", async () => {
@@ -63,6 +68,69 @@ describe("uploadAttachment", () => {
     await expect(uploadAttachment("p1", fileOfSize(9 * 1024 * 1024))).rejects.toThrow("No.");
 
     expect(vi.mocked(api).mock.calls.map((call) => call[0])).toContain("/api/uploads/u1");
+  });
+
+  it("reconciles a lost completion response from committed status", async () => {
+    const size = 9 * 1024 * 1024;
+    vi.mocked(api).mockImplementation(async (path: string) => {
+      if (path === "/api/pages/p1/uploads") {
+        return { upload: { id: "u1", partSize: 5 * 1024 * 1024, partCount: 2 } };
+      }
+      if (path === "/api/uploads/u1/complete") throw new TypeError("Connection closed");
+      if (path === "/api/uploads/u1") {
+        return {
+          status: "committed",
+          attachment: { id: "u1", pageId: "p1", name: "clip.mp4", mime: "video/mp4", size },
+        };
+      }
+      return {};
+    });
+
+    await expect(uploadAttachment("p1", fileOfSize(size))).resolves.toMatchObject({ id: "u1" });
+    expect(vi.mocked(api).mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
+  });
+
+  it("retries completion while status reports the R2 object is complete", async () => {
+    const size = 9 * 1024 * 1024;
+    let completions = 0;
+    vi.mocked(api).mockImplementation(async (path: string) => {
+      if (path === "/api/pages/p1/uploads") {
+        return { upload: { id: "u1", partSize: 5 * 1024 * 1024, partCount: 2 } };
+      }
+      if (path === "/api/uploads/u1/complete") {
+        completions += 1;
+        if (completions === 1) throw new ApiClientError(503, "multipart_complete_failed", "Retry.");
+        return { attachment: { id: "u1", pageId: "p1", name: "clip.mp4", mime: "video/mp4", size } };
+      }
+      if (path === "/api/uploads/u1") return { status: "r2_complete" };
+      return {};
+    });
+
+    const uploaded = uploadAttachment("p1", fileOfSize(size));
+    await vi.runAllTimersAsync();
+
+    await expect(uploaded).resolves.toMatchObject({ id: "u1" });
+    expect(completions).toBe(2);
+  });
+
+  it("preserves the session after retryable completion failures", async () => {
+    vi.mocked(api).mockImplementation(async (path: string) => {
+      if (path === "/api/pages/p1/uploads") {
+        return { upload: { id: "u1", partSize: 5 * 1024 * 1024, partCount: 2 } };
+      }
+      if (path === "/api/uploads/u1/complete") {
+        throw new ApiClientError(503, "multipart_complete_failed", "Retry later.");
+      }
+      if (path === "/api/uploads/u1") return { status: "completing" };
+      return {};
+    });
+
+    const uploaded = uploadAttachment("p1", fileOfSize(9 * 1024 * 1024));
+    const rejected = uploaded.catch((error: unknown) => error);
+    await vi.runAllTimersAsync();
+
+    await expect(rejected).resolves.toMatchObject({ message: "Retry later." });
+    expect(vi.mocked(api).mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
   });
 });
 

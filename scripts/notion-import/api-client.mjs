@@ -11,11 +11,29 @@
  * backpressure in the system, so it is not optional.
  */
 import { setTimeout as delay } from "node:timers/promises";
+import { open, readFile } from "node:fs/promises";
 import { jitteredBackoff } from "../../src/shared/retry.ts";
+import { canonicalJson, sha256Hex } from "../../src/shared/import-integrity.ts";
 
 const RETRYABLE_ATTEMPTS = 5;
 const REQUEST_TIMEOUT_MS = 120_000;
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "DELETE"]);
+const SINGLE_SHOT_BYTES = 8 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024 * 1024;
+const LOOPBACK_HOSTS = new Set(["localhost", "[::1]"]);
+
+export function validateBaseURL(value) {
+  const url = new URL(value);
+  if (url.username || url.password) throw new Error("--base-url must not contain credentials.");
+  const loopback = LOOPBACK_HOSTS.has(url.hostname) || /^127(?:\.\d{1,3}){3}$/.test(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new Error("--base-url must use HTTPS (plain HTTP is allowed only for localhost).");
+  }
+  if (url.pathname !== "/" || url.search || url.hash) {
+    throw new Error("--base-url must be an origin without a path, query, or fragment.");
+  }
+  return url.origin;
+}
 
 class Throttle {
   #interval;
@@ -41,8 +59,16 @@ export class ApiError extends Error {
   }
 }
 
+export class AmbiguousWriteError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "AmbiguousWriteError";
+  }
+}
+
 export async function createClient({ baseURL, email, password, requestsPerSecond = 20 }) {
-  const origin = new URL(baseURL).origin;
+  const origin = validateBaseURL(baseURL);
+  baseURL = origin;
   const throttle = new Throttle(requestsPerSecond);
 
   async function send(path, init = {}, cookie = "") {
@@ -58,6 +84,7 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
     return fetch(new URL(path, baseURL), {
       ...init,
       headers,
+      redirect: "error",
       signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   }
@@ -93,7 +120,26 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
         await delay(jitteredBackoff(attempt, 500, 15_000));
         continue;
       }
-      if (response.ok) return response.status === 204 ? null : response.json();
+      if (response.ok) {
+        if (response.status === 204) return null;
+        try {
+          return await response.json();
+        } catch (cause) {
+          // Receiving a success status without a complete response body is ambiguous:
+          // the server may have committed a write. Replay only receipt/id backed calls.
+          if (retryable && attempt < RETRYABLE_ATTEMPTS - 1) {
+            await delay(jitteredBackoff(attempt, 500, 15_000));
+            continue;
+          }
+          if (!SAFE_METHODS.has(method)) {
+            throw new AmbiguousWriteError(
+              `${method} ${path} returned an unreadable success response; the write outcome is ambiguous.`,
+              { cause },
+            );
+          }
+          throw cause;
+        }
+      }
       if (retryable && response.status >= 500 && attempt < RETRYABLE_ATTEMPTS - 1) {
         await delay(jitteredBackoff(attempt, 500, 15_000));
         continue;
@@ -123,22 +169,137 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
     workspaceId: me.workspace.id,
     request,
 
+    async hasAttachment(id) {
+      const response = await send(`/api/attachments/${id}`, { headers: { range: "bytes=0-0" } }, cookie);
+      await response.body?.cancel().catch(() => undefined);
+      return response.ok;
+    },
+
+    async listAttachments(pageId) {
+      return (await request(`/api/pages/${pageId}/attachments`)).attachments;
+    },
+
+    async pageVerification(pageId) {
+      return (await request(`/api/pages/${pageId}/verification`)).verification;
+    },
+
+    async tableVerification(pageId) {
+      return (await request(`/api/tables/${pageId}/verification`)).verification;
+    },
+
     async createPages(pages) {
       // One request per tree level rather than per page: each create otherwise
       // broadcasts a workspace event that every connected client acts on.
       const result = await request(
         "/api/pages/batch",
         { method: "POST", body: JSON.stringify({ pages }) },
-        { retryable: false },
+        // Every import supplies deterministic page ids. The batch route treats an
+        // identical replay as success, so a lost response is safe to retry.
+        { retryable: pages.every((page) => typeof page.id === "string" && page.id.length > 0) },
       );
       return result.pages;
     },
 
-    async uploadAttachment(pageId, name, mime, bytes) {
-      const body = new FormData();
-      body.set("file", new File([bytes], name, { type: mime }));
-      const result = await request(`/api/pages/${pageId}/attachments`, { method: "POST", body }, { retryable: false });
-      return result.attachment;
+    async uploadAttachment(pageId, name, mime, source, options = {}) {
+      const size = source?.size ?? source?.byteLength;
+      if (!Number.isInteger(size) || size < 0 || size > MAX_ATTACHMENT_BYTES) {
+        throw new Error(`Attachment ${name} has an unsupported size (${size ?? "unknown"} bytes).`);
+      }
+      const attachmentId = options.attachmentId;
+      const contentSha256 = options.contentSha256;
+      if (typeof attachmentId !== "string" || !attachmentId) throw new Error(`Attachment ${name} has no stable id.`);
+      if (!/^[a-f\d]{64}$/i.test(contentSha256 ?? "")) {
+        throw new Error(`Attachment ${name} has no valid content SHA-256 digest.`);
+      }
+      // Must match normalizeFilename in the Worker before computing the canonical hash.
+      const normalizedName =
+        name
+          .replace(/[\r\n"\\/]/g, "_")
+          .trim()
+          .slice(0, 180) || "download";
+      const requestHash = await sha256Hex(
+        canonicalJson({ attachmentId, pageId, name: normalizedName, mime, size, contentSha256 }),
+      );
+      if (size <= SINGLE_SHOT_BYTES) {
+        const bytes = source.path ? await readFile(source.path) : source;
+        const body = new FormData();
+        body.set("file", new File([bytes], normalizedName, { type: mime }));
+        body.set("attachmentId", attachmentId);
+        body.set("contentSha256", contentSha256);
+        body.set("requestHash", requestHash);
+        const result = await request(`/api/pages/${pageId}/attachments`, { method: "POST", body }, { retryable: true });
+        return result.attachment;
+      }
+
+      let session;
+      let completedParts = new Set();
+      if (options.uploadId ?? attachmentId) {
+        let resumed;
+        try {
+          resumed = await request(`/api/uploads/${options.uploadId ?? attachmentId}`);
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.status !== 404) throw error;
+          resumed = null;
+        }
+        if (resumed?.status === "committed") return resumed.attachment;
+        if (resumed) {
+          session = resumed.upload;
+          completedParts = new Set((resumed.parts ?? []).map((part) => part.partNumber));
+        }
+      }
+      if (!session) {
+        const started = await request(
+          `/api/pages/${pageId}/uploads`,
+          {
+            method: "POST",
+            body: JSON.stringify({ attachmentId, name: normalizedName, mime, size, contentSha256, requestHash }),
+          },
+          { retryable: true },
+        );
+        if (started.status === "committed") return started.attachment;
+        session = started.upload;
+        await options.onSession?.(session.id);
+      }
+      if (
+        session.id !== attachmentId ||
+        session.pageId !== pageId ||
+        session.name !== normalizedName ||
+        session.mime !== mime ||
+        session.size !== size ||
+        session.contentSha256 !== contentSha256
+      ) {
+        throw new Error(`Saved upload ${session.id} does not match ${name}.`);
+      }
+
+      const file = await open(source.path, "r");
+      try {
+        for (let partNumber = 1; partNumber <= session.partCount; partNumber += 1) {
+          if (completedParts.has(partNumber)) continue;
+          const start = (partNumber - 1) * session.partSize;
+          const length = Math.min(session.partSize, size - start);
+          const bytes = Buffer.allocUnsafe(length);
+          let offset = 0;
+          while (offset < length) {
+            const read = await file.read(bytes, offset, length - offset, start + offset);
+            if (read.bytesRead === 0) throw new Error(`Attachment ${name} ended while reading part ${partNumber}.`);
+            offset += read.bytesRead;
+          }
+          await request(
+            `/api/uploads/${session.id}/parts/${partNumber}`,
+            { method: "PUT", headers: { "content-type": "application/octet-stream" }, body: bytes },
+            { retryable: true },
+          );
+        }
+      } finally {
+        await file.close();
+      }
+
+      const finished = await request(
+        `/api/uploads/${session.id}/complete`,
+        { method: "POST", body: "{}" },
+        { retryable: true },
+      );
+      return finished.attachment;
     },
 
     async acquireTableLease(pageId) {
@@ -161,8 +322,14 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
       );
     },
 
-    async readTable(pageId) {
-      return request(`/api/tables/${pageId}?count=true&limit=1`);
+    async readTable(pageId, options = {}) {
+      const query = new URLSearchParams({
+        count: options.count === false ? "false" : "true",
+        limit: String(options.limit ?? 1),
+      });
+      if (options.afterPosition !== undefined) query.set("afterPosition", String(options.afterPosition));
+      if (options.afterId !== undefined) query.set("afterId", options.afterId);
+      return request(`/api/tables/${pageId}?${query}`);
     },
 
     async tree() {

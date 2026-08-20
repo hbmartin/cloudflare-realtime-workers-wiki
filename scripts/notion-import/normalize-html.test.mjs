@@ -23,6 +23,10 @@ function normalize(inner, options) {
 }
 
 describe("scoping", () => {
+  it("refuses markup without a Notion page body instead of importing a blank page", () => {
+    expect(() => normalizeNotionHtml("<html><body><p>orphaned</p></body></html>")).toThrow(/no Notion page-body/);
+  });
+
   it("keeps only the page body, dropping the cover, icon, title, and property table", () => {
     const { html } = normalize('<p id="p1">Body text</p>');
     expect(html).toContain("Body text");
@@ -190,5 +194,15 @@ describe("link rewriting", () => {
     expect(html).toContain('href="https://example.test/x"');
     expect(issues.some((issue) => issue.startsWith("link_unresolved:"))).toBe(true);
     expect(issues.some((issue) => issue.includes("example.test"))).toBe(false);
+  });
+
+  it("removes an unsafe skipped asset as a warning without reporting it missing", () => {
+    const { issues, html } = normalize(
+      '<p><a href="unsafe.svg">diagram</a></p><figure><img src="unsafe.svg"></figure>',
+      { resolveHref: () => ({ type: "skipped-unsafe-asset" }) },
+    );
+    expect(html).toContain("diagram");
+    expect(html).not.toContain("unsafe.svg");
+    expect(issues).toEqual(["attachment_skipped_unsafe:unsafe.svg", "attachment_skipped_unsafe:unsafe.svg"]);
   });
 });

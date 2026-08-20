@@ -127,12 +127,17 @@ startup error.
 `pnpm deploy` runs `pnpm build` again, which runs the full typecheck. To deploy from CI instead, see
 [Automated deployment](#automated-deployment).
 
-`migrations/` is a single squashed baseline, `0001_initial.sql`. The incremental history was collapsed
-into it before the first production deploy, and the file kept its name so that databases already
-recorded as migrated are left alone. That is correct for a database that applied the whole old history,
-which holds a superset of the baseline, but not for one that stopped partway: `d1_migrations` already
-lists `0001_initial.sql`, so the missing objects will never be applied. Any database in that state
-predates the first deploy and must be recreated rather than patched forward.
+`0001_initial.sql` is the squashed pre-production baseline. Files `0002` and later are forward-only
+production migrations and must remain in order; never edit an applied migration or mark it applied by
+hand. Before upgrading an existing installation, take a D1 export and stop any running Notion import,
+then run `pnpm db:remote` before deploying the Worker that consumes the new schema.
+
+`0005_import_reliability.sql` adopts existing multipart sessions as `active`, so uploads already in
+progress remain recoverable. It also clears legacy bulk-write replay receipts because they have no
+request hash and cannot safely distinguish a retry from reuse of the same request id with different
+content. Newly hashed receipts are durable until their table is deleted; do not run an old importer
+between applying `0005` and deploying the matching Worker, because it can create another unhashed
+receipt in that window.
 
 ## 6. Bootstrap the owner
 

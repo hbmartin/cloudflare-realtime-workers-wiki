@@ -98,41 +98,161 @@ interface UploadReapRow {
   attempts: number;
 }
 
+interface DueUploadRow {
+  id: string;
+  state: "active" | "completing" | "reaping" | "aborting";
+}
+
+function uploadRetryDelay(attempts: number) {
+  return Math.min(60 * 60_000, 10_000 * 2 ** Math.min(Math.max(1, attempts) - 1, 8));
+}
+
+function uploadErrorMessage(error: unknown, fallback: string) {
+  return (error instanceof Error ? error.message : fallback).slice(0, 1_000);
+}
+
+async function rescheduleUpload(
+  env: Env,
+  row: Pick<UploadReapRow, "id" | "attempts">,
+  leaseUntil: number,
+  state: "active" | "completing" | "reaping" | "aborting",
+  error: unknown,
+) {
+  const timestamp = Date.now();
+  await env.DB.prepare(
+    `UPDATE attachment_uploads
+        SET state = ?, attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+      WHERE id = ? AND next_attempt_at = ?`,
+  )
+    .bind(
+      state,
+      Math.max(1, row.attempts),
+      timestamp + uploadRetryDelay(row.attempts),
+      uploadErrorMessage(error, "Unknown upload cleanup failure"),
+      timestamp,
+      row.id,
+      leaseUntil,
+    )
+    .run();
+}
+
 async function reapUpload(env: Env, id: string) {
   const claimedAt = Date.now();
   const leaseUntil = claimedAt + UPLOAD_REAP_LEASE_MS;
-  let attempts = 0;
-  try {
-    const claimed = await env.DB.prepare(
-      `UPDATE attachment_uploads
-          SET attempts = attempts + 1, next_attempt_at = ?, updated_at = ?
-        WHERE id = ? AND next_attempt_at <= ?
+  const claimed = await env.DB.prepare(
+    `UPDATE attachment_uploads
+          SET state = 'reaping', attempts = attempts + 1, next_attempt_at = ?, updated_at = ?
+        WHERE id = ? AND state = 'active' AND next_attempt_at <= ?
         RETURNING id, r2_key, r2_upload_id, attempts`,
-    )
-      .bind(leaseUntil, claimedAt, id, claimedAt)
-      .first<UploadReapRow>();
-    if (!claimed) return false;
-    attempts = claimed.attempts;
+  )
+    .bind(leaseUntil, claimedAt, id, claimedAt)
+    .first<UploadReapRow>();
+  if (!claimed) return false;
+
+  try {
     await env.BUCKET.resumeMultipartUpload(claimed.r2_key, claimed.r2_upload_id).abort();
-    await env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ? AND next_attempt_at = ?`)
+  } catch (error) {
+    try {
+      // An abort failure is ambiguous: R2 may have applied it before the response was
+      // lost. Keep the session fenced as reaping so a client never resumes an upload
+      // whose multipart state may already be gone; the terminal retry path reconciles it.
+      await rescheduleUpload(env, claimed, leaseUntil, "reaping", error);
+    } catch (retryError) {
+      console.error("Failed to reschedule abandoned upload", retryError);
+    }
+    return false;
+  }
+
+  try {
+    await env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ? AND state = 'reaping' AND next_attempt_at = ?`)
       .bind(id, leaseUntil)
       .run();
     return true;
   } catch (error) {
-    const recordedAttempts = Math.max(1, attempts);
-    const delay = Math.min(60 * 60_000, 10_000 * 2 ** Math.min(recordedAttempts - 1, 8));
-    const message = error instanceof Error ? error.message : "Unknown upload abort failure";
-    try {
+    // R2 is already clean. Do not make the row active again: it would advertise a
+    // resumable multipart upload that no longer exists. The fenced reaping row is safe
+    // for an operator to discard after D1 recovers.
+    console.error("Failed to delete reaped upload row", error);
+    return false;
+  }
+}
+
+async function retryTerminalAbort(env: Env, id: string, state: "reaping" | "aborting") {
+  const claimedAt = Date.now();
+  const leaseUntil = claimedAt + UPLOAD_REAP_LEASE_MS;
+  const claimed = await env.DB.prepare(
+    `UPDATE attachment_uploads
+        SET attempts = attempts + 1, next_attempt_at = ?, updated_at = ?
+      WHERE id = ? AND state = ? AND next_attempt_at <= ?
+      RETURNING id, r2_key, r2_upload_id, attempts`,
+  )
+    .bind(leaseUntil, claimedAt, id, state, claimedAt)
+    .first<UploadReapRow>();
+  if (!claimed) return false;
+  try {
+    // R2 abort is repeatable. This covers a Worker disappearing before abort and the
+    // equally important split where abort succeeded but deleting the D1 row did not.
+    await env.BUCKET.resumeMultipartUpload(claimed.r2_key, claimed.r2_upload_id).abort();
+    await env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ? AND state = ? AND next_attempt_at = ?`)
+      .bind(id, state, leaseUntil)
+      .run();
+    return true;
+  } catch (error) {
+    await rescheduleUpload(env, claimed, leaseUntil, state, error).catch((retryError) => {
+      console.error("Failed to reschedule terminal upload abort", retryError);
+    });
+    return false;
+  }
+}
+
+/**
+ * Resolves a completion request whose Worker disappeared after changing state.
+ *
+ * R2 is strongly consistent once complete: an object at the private random key proves
+ * the multipart upload crossed the irreversible boundary, so the request route can
+ * safely finish the D1 commit. No object means the parts may still be resumable; return
+ * the row to a due active state so the next cron aborts it unless a client refreshes its
+ * deadline first.
+ */
+async function inspectStaleCompletion(env: Env, id: string) {
+  const inspectedAt = Date.now();
+  const leaseUntil = inspectedAt + UPLOAD_REAP_LEASE_MS;
+  const claimed = await env.DB.prepare(
+    `UPDATE attachment_uploads
+        SET next_attempt_at = ?, updated_at = ?
+      WHERE id = ? AND state = 'completing' AND next_attempt_at <= ?
+      RETURNING id, r2_key, r2_upload_id, attempts`,
+  )
+    .bind(leaseUntil, inspectedAt, id, inspectedAt)
+    .first<UploadReapRow>();
+  if (!claimed) return false;
+
+  try {
+    const object = await env.BUCKET.head(claimed.r2_key);
+    if (object) {
       await env.DB.prepare(
         `UPDATE attachment_uploads
-            SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
-          WHERE id = ? AND next_attempt_at = ?`,
+            SET state = 'r2_complete', next_attempt_at = ?, last_error = NULL, updated_at = ?
+          WHERE id = ? AND state = 'completing' AND next_attempt_at = ?`,
       )
-        .bind(recordedAttempts, Date.now() + delay, message.slice(0, 1_000), Date.now(), id, leaseUntil)
+        .bind(Number.MAX_SAFE_INTEGER, Date.now(), id, leaseUntil)
         .run();
+      return true;
+    }
+
+    await env.DB.prepare(
+      `UPDATE attachment_uploads
+          SET state = 'active', next_attempt_at = ?, last_error = NULL, updated_at = ?
+        WHERE id = ? AND state = 'completing' AND next_attempt_at = ?`,
+    )
+      .bind(inspectedAt, Date.now(), id, leaseUntil)
+      .run();
+    return true;
+  } catch (error) {
+    try {
+      await rescheduleUpload(env, claimed, leaseUntil, "completing", error);
     } catch (retryError) {
-      // The row stays due, so the next cron picks it up again.
-      console.error("Failed to reschedule abandoned upload", retryError);
+      console.error("Failed to reschedule completion inspection", retryError);
     }
     return false;
   }
@@ -147,9 +267,15 @@ async function reapUpload(env: Env, id: string) {
  */
 export async function processDueUploadReaps(env: Env, limit = UPLOAD_REAP_BATCH_SIZE) {
   const due = await env.DB.prepare(
-    `SELECT id FROM attachment_uploads WHERE next_attempt_at <= ? ORDER BY created_at LIMIT ?`,
+    `SELECT id, state FROM attachment_uploads
+      WHERE state IN ('active', 'completing', 'reaping', 'aborting') AND next_attempt_at <= ?
+      ORDER BY created_at LIMIT ?`,
   )
     .bind(Date.now(), limit)
-    .all<{ id: string }>();
-  for (const row of due.results) await reapUpload(env, row.id);
+    .all<DueUploadRow>();
+  for (const row of due.results) {
+    if (row.state === "completing") await inspectStaleCompletion(env, row.id);
+    else if (row.state === "active") await reapUpload(env, row.id);
+    else await retryTerminalAbort(env, row.id, row.state);
+  }
 }
