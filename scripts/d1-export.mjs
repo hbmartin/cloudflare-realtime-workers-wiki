@@ -36,6 +36,12 @@ if (!passthrough.includes("--local") && !passthrough.includes("--remote")) {
   console.error("Specify --local or --remote, matching the database you mean to export.");
   process.exit(1);
 }
+if (
+  passthrough.includes("--remote") &&
+  !passthrough.some((argument) => argument === "--env" || argument === "-e" || argument.startsWith("--env="))
+) {
+  passthrough.push("--env", "production");
+}
 
 function wrangler(commandArgs, { capture = false } = {}) {
   const result = spawnSync("pnpm", ["exec", "wrangler", ...commandArgs], {

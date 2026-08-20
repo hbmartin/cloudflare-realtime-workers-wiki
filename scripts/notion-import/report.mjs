@@ -36,7 +36,9 @@ export function createReport({ verbose = false } = {}) {
       const tables = summary.databases
         ? `, and ${plural(summary.databases, "table page")} holding ${plural(summary.rows ?? 0, "row")}.`
         : ".";
-      console.log(`Imported ${plural(summary.pages, "page")}; wrote content for ${summary.written}${tables}`);
+      console.log(
+        `Imported ${plural(summary.pages, "page")}; wrote content for ${plural(summary.written, "page")}${tables}`,
+      );
       if (issues.size) {
         console.log("");
         console.log("Skipped or degraded, by reason:");

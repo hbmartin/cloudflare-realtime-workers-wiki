@@ -11,6 +11,13 @@ describe("parseCsv", () => {
     ]);
   });
 
+  it("normalizes CRLF record separators and quoted multiline fields", () => {
+    expect(parseCsv('a,b\r\n"line\r\nbreak",plain\r\n')).toEqual([
+      ["a", "b"],
+      ["line\nbreak", "plain"],
+    ]);
+  });
+
   it("strips a byte order mark and tolerates a missing trailing newline", () => {
     expect(parseCsv("﻿Name,Age\nAda,36")).toEqual([
       ["Name", "Age"],

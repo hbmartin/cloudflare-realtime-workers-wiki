@@ -5,15 +5,16 @@ be confirmed rather than trusted.
 
 ## Variables
 
-Set in the `vars` block of `wrangler.jsonc`. Plaintext; visible in the dashboard and in the repository.
+Set in the environment's `vars` block of `wrangler.jsonc`. Plaintext; visible in the dashboard and in
+the repository.
 
-| Name              | Default                 | Notes                                                                                                                                                                                                                                                                                                                                     |
-| ----------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BETTER_AUTH_URL` | `http://localhost:5173` | The exact origin the installation is served from. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **Must be changed before deploying.** |
+| Name              | Default                 | Notes                                                                                                                                                                                                                                                                                                                                                                  |
+| ----------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BETTER_AUTH_URL` | `http://localhost:5173` | The exact origin the installation is served from. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **The production environment must use its deployed HTTPS origin.** |
 
 ## Secrets
 
-Set with `wrangler secret put`. Never place these in `wrangler.jsonc`.
+Set for deployment with `wrangler secret put --env production`. Never place these in `wrangler.jsonc`.
 
 | Name                 | Required             | Notes                                                                                                                                                                                                                                        |
 | -------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -181,8 +182,10 @@ Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:; img-sr
 
 ## Environments
 
-`wrangler.jsonc` defines one named environment, `notes-checks-e2e`, used only by the local Playwright
-harness. **The top-level configuration is production.**
+`wrangler.jsonc` keeps local-safe defaults at the top level and defines two named environments:
+`production`, which holds the deployed D1, R2, Durable Object, and origin bindings; and
+`notes-checks-e2e`, used only by the local Playwright harness. Production scripts always pass
+`--env production` explicitly.
 
 There is no staging environment. `nightly.yml` refers to a `STAGING_BASE_URL` repository variable for
 its realtime load check, but no configuration in this repository deploys such an environment; it must

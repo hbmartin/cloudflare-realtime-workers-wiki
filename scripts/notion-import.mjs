@@ -18,15 +18,32 @@
  */
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { assertSupportedNode, createImportEditor, htmlToBlocks } from "./notion-import/blocks.mjs";
-import { readExport, readPageHtml, resolveLink } from "./notion-import/export-tree.mjs";
-import { printSurvey, surveyExport } from "./notion-import/inspect.mjs";
-import { normalizeNotionHtml } from "./notion-import/normalize-html.mjs";
-import { createClient } from "./notion-import/api-client.mjs";
-import { createManifest } from "./notion-import/manifest.mjs";
-import { createReport } from "./notion-import/report.mjs";
-import { runImport } from "./notion-import/run.mjs";
-import { verifyImport } from "./notion-import/verify.mjs";
+import { assertSupportedNode } from "./notion-import/node-version.mjs";
+
+assertSupportedNode();
+
+// These modules import shared .ts files. Keep them dynamic so the plain-JavaScript
+// version guard above can explain an unsupported Node version before module loading fails.
+const [blockModule, exportTree, inspect, normalizer, api, manifests, reports, runner, verifier] = await Promise.all([
+  import("./notion-import/blocks.mjs"),
+  import("./notion-import/export-tree.mjs"),
+  import("./notion-import/inspect.mjs"),
+  import("./notion-import/normalize-html.mjs"),
+  import("./notion-import/api-client.mjs"),
+  import("./notion-import/manifest.mjs"),
+  import("./notion-import/report.mjs"),
+  import("./notion-import/run.mjs"),
+  import("./notion-import/verify.mjs"),
+]);
+const { createImportEditor, htmlToBlocks } = blockModule;
+const { readExport, readPageHtml, resolveLink } = exportTree;
+const { printSurvey, surveyExport } = inspect;
+const { normalizeNotionHtml } = normalizer;
+const { createClient } = api;
+const { createManifest } = manifests;
+const { createReport } = reports;
+const { runImport } = runner;
+const { verifyImport } = verifier;
 
 const COMMANDS = new Set(["inspect", "plan", "run", "verify"]);
 
@@ -52,13 +69,17 @@ function parseArguments(argv) {
         ? [argument.slice(0, equals), argument.slice(equals + 1)]
         : [argument, null];
     const take = () => inlineValue ?? argv[(index += 1)];
+    const takeNumber = () => {
+      const value = take();
+      return typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
+    };
     if (flag === "--base-url") options.baseURL = take();
     else if (flag === "--email") options.email = take();
     else if (flag === "--parent") options.parent = take();
-    else if (flag === "--limit") options.limit = Number.parseInt(take(), 10);
+    else if (flag === "--limit") options.limit = takeNumber();
     else if (flag === "--manifest") options.manifest = take();
-    else if (flag === "--rps") options.requestsPerSecond = Number.parseInt(take(), 10);
-    else if (flag === "--linger-ms") options.lingerMs = Number.parseInt(take(), 10);
+    else if (flag === "--rps") options.requestsPerSecond = takeNumber();
+    else if (flag === "--linger-ms") options.lingerMs = takeNumber();
     else if (flag === "--verbose") options.verbose = true;
     else if (flag.startsWith("--")) throw new Error(`Unknown option ${flag}.`);
     else positional.push(argument);
@@ -77,7 +98,7 @@ function usage() {
   console.error("  --parent <pageId>  Import beneath an existing page instead of the top level.");
   console.error("  --limit <n>        Only process the first n pages, for a smoke test.");
   console.error("  --manifest <path>  Where to record progress. Re-running resumes from it.");
-  console.error("  --rps <n>          Global request rate. The server has no rate limiting of its own.");
+  console.error("  --rps <n>          Global request rate. Defaults to NOTES_IMPORT_RPS or 20.");
   console.error("  --linger-ms <n>    How long to hold each document open so compaction is armed promptly.");
   console.error("  --verbose          One line per page instead of a summary.");
 }
@@ -99,7 +120,7 @@ function validate(options) {
     );
   }
   if (!existsSync(root)) throw new Error(`No such directory: ${root}.`);
-  if (!Number.isFinite(options.limit) && options.limit !== Number.POSITIVE_INFINITY) {
+  if (options.limit !== Number.POSITIVE_INFINITY && (!Number.isInteger(options.limit) || options.limit < 1)) {
     throw new Error("--limit must be a positive integer.");
   }
   if (
@@ -108,6 +129,9 @@ function validate(options) {
     options.requestsPerSecond > 200
   ) {
     throw new Error("--rps must be an integer between 1 and 200.");
+  }
+  if (!Number.isInteger(options.lingerMs) || options.lingerMs < 0 || options.lingerMs > 60_000) {
+    throw new Error("--linger-ms must be an integer between 0 and 60000.");
   }
   if ((options.command === "run" || options.command === "verify") && !options.email) {
     throw new Error("Set --email or NOTES_IMPORT_EMAIL to an owner or editor account.");
@@ -170,7 +194,23 @@ function reportIssues(issues) {
   }
 }
 
-assertSupportedNode();
+async function connect(options, root) {
+  const client = await createClient({
+    baseURL: options.baseURL,
+    email: options.email,
+    password: process.env.NOTES_IMPORT_PASSWORD,
+    requestsPerSecond: options.requestsPerSecond,
+  });
+  const manifest = createManifest({
+    path: options.manifest,
+    root,
+    baseURL: options.baseURL,
+    workspaceId: client.workspaceId,
+    rootParentId: options.parent,
+  });
+  return { client, manifest };
+}
+
 const options = parseArguments(process.argv.slice(2));
 const root = validate(options);
 
@@ -188,20 +228,8 @@ if (options.command === "inspect") {
   );
   reportIssues(planned.issues);
 } else if (options.command === "run") {
-  const client = await createClient({
-    baseURL: options.baseURL,
-    email: options.email,
-    password: process.env.NOTES_IMPORT_PASSWORD,
-    requestsPerSecond: options.requestsPerSecond,
-  });
+  const { client, manifest } = await connect(options, root);
   console.log(`Signed in to ${options.baseURL} as ${options.email} (${client.role}).`);
-  const manifest = createManifest({
-    path: options.manifest,
-    root,
-    baseURL: options.baseURL,
-    workspaceId: client.workspaceId,
-    rootParentId: options.parent,
-  });
   const report = createReport({ verbose: options.verbose });
   try {
     const summary = await runImport({
@@ -219,20 +247,13 @@ if (options.command === "inspect") {
     // fails part way through.
     manifest.flush();
   }
-} else {
-  const client = await createClient({
-    baseURL: options.baseURL,
-    email: options.email,
-    password: process.env.NOTES_IMPORT_PASSWORD,
-    requestsPerSecond: options.requestsPerSecond,
-  });
-  const manifest = createManifest({
-    path: options.manifest,
-    root,
-    baseURL: options.baseURL,
-    workspaceId: client.workspaceId,
-    rootParentId: options.parent,
-  });
+} else if (options.command === "verify") {
+  if (!existsSync(options.manifest)) {
+    throw new Error(
+      `No manifest at ${options.manifest}. Run the import first, or pass --manifest <path> for the run you want to verify.`,
+    );
+  }
+  const { client, manifest } = await connect(options, root);
   const problems = await verifyImport({ client, manifest, index });
   if (problems > 0) process.exitCode = 1;
 }

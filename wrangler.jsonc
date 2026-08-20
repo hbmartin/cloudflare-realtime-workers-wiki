@@ -41,6 +41,33 @@
     "BETTER_AUTH_URL": "http://localhost:5173",
   },
   "env": {
+    "production": {
+      "name": "cloudflare-realtime-notes",
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "cloudflare-realtime-notes",
+          "database_id": "a1e3ebcb-6fb4-4cdb-8ccc-ef5821fb6fbc",
+          "migrations_dir": "migrations",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "BUCKET",
+          "bucket_name": "cloudflare-realtime-notes",
+          "preview_bucket_name": "cloudflare-realtime-notes-preview",
+        },
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "DOCUMENT", "class_name": "Document" },
+          { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
+        ],
+      },
+      "vars": {
+        "BETTER_AUTH_URL": "https://cloudflare-realtime-notes.harold-martin.workers.dev",
+      },
+    },
     "notes-checks-e2e": {
       "d1_databases": [
         {

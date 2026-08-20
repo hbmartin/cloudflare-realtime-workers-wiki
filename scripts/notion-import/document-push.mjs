@@ -15,7 +15,7 @@ import { writeBlocksToFragment } from "./blocks.mjs";
 
 const SYNC_TIMEOUT_MS = 30_000;
 
-// Close codes the server uses, mapped to whether the page is worth another attempt.
+// Close codes the server uses, mapped to the text reported for a failed page.
 const CLOSE_REASONS = new Map([
   [4401, "the connection grant expired"],
   [4410, "a restored version replaced this document"],

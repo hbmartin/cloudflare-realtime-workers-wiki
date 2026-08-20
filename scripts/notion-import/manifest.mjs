@@ -3,8 +3,8 @@
  *
  * The server has no notion of "this page came from Notion", and giving it one would mean
  * a schema change for a one-off operation. The mapping lives here instead, and the parts
- * the server can confirm cheaply - which pages still exist, which attachments a page
- * already has - are re-read from it on a resume rather than trusted from this file.
+ * the importer needs to resume - page ids and uploaded attachment ids - are recorded in
+ * this file. Live page existence is checked separately by the verify command.
  *
  * Content needs no reconciliation at all: pushing a page that already holds the same
  * blocks produces no Yjs updates, so a retry is free and provably a no-op.
@@ -40,7 +40,22 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId 
   let state;
 
   if (existsSync(path)) {
-    state = JSON.parse(readFileSync(path, "utf8"));
+    try {
+      state = JSON.parse(readFileSync(path, "utf8"));
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      throw new Error(`${path} is not readable as a manifest: ${detail}. Move it aside to start over.`, { cause });
+    }
+    if (
+      !state ||
+      typeof state !== "object" ||
+      Array.isArray(state) ||
+      !state.nodes ||
+      typeof state.nodes !== "object" ||
+      Array.isArray(state.nodes)
+    ) {
+      throw new Error(`${path} does not contain a valid manifest. Move it aside to start over.`);
+    }
     if (state.version !== MANIFEST_VERSION) {
       throw new Error(`${path} was written by a different version of the importer. Move it aside to start over.`);
     }
@@ -52,6 +67,12 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId 
     }
     if (state.baseURL !== baseURL) {
       throw new Error(`${path} was created against ${state.baseURL}, not ${baseURL}.`);
+    }
+    if (state.workspaceId !== workspaceId) {
+      throw new Error(`${path} was created against a different workspace. Move it aside to start over.`);
+    }
+    if (state.rootParentId !== (rootParentId ?? null)) {
+      throw new Error(`${path} was created with a different --parent. Move it aside to start over.`);
     }
   } else {
     state = {

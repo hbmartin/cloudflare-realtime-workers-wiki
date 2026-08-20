@@ -83,8 +83,21 @@ function levelsOf(pages) {
   return levels;
 }
 
+/** Includes the ancestors a limited selection needs in order to preserve its tree. */
+export function selectPages(pages, limit) {
+  const included = new Set(pages.slice(0, limit));
+  for (const page of included) {
+    let parent = page.parent;
+    while (parent) {
+      included.add(parent);
+      parent = parent.parent;
+    }
+  }
+  return [...included];
+}
+
 export async function runImport({ index, client, manifest, report, rootParentId, limit, lingerMs }) {
-  const selected = index.pages.slice(0, limit);
+  const selected = selectPages(index.pages, limit);
   const included = new Set(selected);
 
   // Pass 1: every page, no content.
@@ -102,6 +115,11 @@ export async function runImport({ index, client, manifest, report, rootParentId,
           title: page.title.slice(0, TITLE_MAX) || "Untitled",
         })),
       );
+      if (!Array.isArray(created) || created.length !== chunk.length) {
+        throw new Error(
+          `Page batch returned ${Array.isArray(created) ? created.length : "no"} results for ${chunk.length} pages.`,
+        );
+      }
       chunk.forEach((page, position) => {
         const remote = created[position];
         if (page.title.length > TITLE_MAX) report.issue("title_truncated", page.title);

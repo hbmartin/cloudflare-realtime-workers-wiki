@@ -15,7 +15,10 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** RFC 4180 parser: quoted fields, escaped quotes, and newlines inside a cell. */
 export function parseCsv(input) {
-  const text = input.charCodeAt(0) === 0xfe_ff ? input.slice(1) : input;
+  const withoutBom = input.charCodeAt(0) === 0xfe_ff ? input.slice(1) : input;
+  // Outside a quoted field the parser already drops the CR half of CRLF. Normalize
+  // first so a multiline quoted field gets the same newline representation.
+  const text = withoutBom.replaceAll("\r\n", "\n");
   const rows = [];
   let row = [];
   let field = "";

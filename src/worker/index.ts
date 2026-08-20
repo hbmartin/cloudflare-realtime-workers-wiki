@@ -643,10 +643,10 @@ app.post("/api/pages/batch", async (c) => {
   // so a batch spanning two parents has no meaningful global ordering, and a caller
   // pairing its input to this response by index would silently mismatch.
   const rows = new Map(created.results.map((row) => [row.id, row]));
-  const pages = parsed.flatMap((page) => {
-    const row = rows.get(page.id);
-    return row ? [pageJson(row)] : [];
-  });
+  if (created.results.length !== parsed.length || rows.size !== parsed.length) {
+    throw new HttpError(500, "batch_read_incomplete", "The created page batch could not be read back completely.");
+  }
+  const pages = parsed.map((page) => pageJson(rows.get(page.id)!));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages });
   return c.json({ pages }, 201);
 });

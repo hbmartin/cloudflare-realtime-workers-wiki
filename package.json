@@ -4,11 +4,14 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.18.0",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "scripts": {
     "dev": "vite",
     "dev:e2e": "node scripts/e2e-server.mjs",
     "build": "pnpm typecheck && vite build",
-    "build:worker": "wrangler deploy --dry-run --outdir .wrangler/dry-run",
+    "build:worker": "wrangler deploy --env production --dry-run --outdir .wrangler/dry-run",
     "preview": "vite preview",
     "test": "pnpm test:unit && pnpm test:worker",
     "test:unit": "vitest run",
@@ -35,10 +38,10 @@
     "cf-typegen": "wrangler types --env-interface CloudflareBindings --include-runtime false --env-file worker-typegen.env",
     "cf-typegen:check": "node scripts/check-worker-types.mjs",
     "db:local": "wrangler d1 migrations apply DB --local",
-    "db:remote": "wrangler d1 migrations apply DB --remote",
+    "db:remote": "wrangler d1 migrations apply DB --env production --remote",
     "db:export": "node scripts/d1-export.mjs",
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker",
-    "deploy": "pnpm build && wrangler deploy"
+    "deploy": "pnpm build && wrangler deploy --env production"
   },
   "dependencies": {
     "@blocknote/core": "0.54.0",

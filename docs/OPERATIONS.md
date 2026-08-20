@@ -36,7 +36,7 @@ written so that deleting the whole workspace is still possible.
 To confirm the current membership:
 
 ```sh
-pnpm wrangler d1 execute DB --remote --command \
+pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT u.email, m.role FROM workspace_members m JOIN user u ON u.id = m.user_id ORDER BY m.role, u.email;"
 ```
 
@@ -46,8 +46,8 @@ The token is only meaningful before the owner exists. After bootstrap, `/api/ins
 `already_initialized` regardless of the token.
 
 ```sh
-pnpm wrangler secret list                     # confirm what is set
-pnpm wrangler secret delete BOOTSTRAP_TOKEN   # after the owner is created
+pnpm wrangler secret list --env production                     # confirm what is set
+pnpm wrangler secret delete BOOTSTRAP_TOKEN --env production   # after the owner is created
 ```
 
 If you need to re-run bootstrap against an empty installation, set a fresh strong token rather than
@@ -70,13 +70,13 @@ Expected blast radius:
 Procedure:
 
 ```sh
-pnpm wrangler secret put BETTER_AUTH_SECRET   # paste at least 32 random bytes
+pnpm wrangler secret put BETTER_AUTH_SECRET --env production   # paste at least 32 random bytes
 ```
 
 Then confirm recovery:
 
 ```sh
-pnpm wrangler d1 execute DB --remote --command \
+pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT COUNT(*) pending FROM archive_disconnect_targets;"
 ```
 
@@ -94,13 +94,13 @@ Permanent deletion returns `202` and commits a job. The job purges each document
 then deletes exact attachment keys and complete `documents/{pageId}/` prefixes.
 
 ```sh
-pnpm wrangler d1 execute DB --remote --command \
+pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT id, root_page_id, attempts, datetime(next_attempt_at/1000,'unixepoch') AS next_attempt, last_error
      FROM deletion_jobs ORDER BY next_attempt_at;"
 ```
 
 ```sh
-pnpm wrangler d1 execute DB --remote --command \
+pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT job_id, kind, target, attempts, last_error
      FROM deletion_targets WHERE completed_at IS NULL ORDER BY job_id;"
 ```
@@ -114,7 +114,7 @@ A chunked upload holds R2 parts from the moment it starts until it completes or 
 accepted part pushes the row's deadline out, so only an upload nobody is still feeding becomes due.
 
 ```sh
-pnpm wrangler d1 execute DB --remote --command \
+pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT id, page_id, name, size, part_count, attempts,
           datetime(next_attempt_at/1000,'unixepoch') AS next_attempt, last_error
      FROM attachment_uploads ORDER BY next_attempt_at;"
@@ -138,7 +138,7 @@ room. The page disappears from clients immediately; the row exists to guarantee 
 closed.
 
 ```sh
-pnpm wrangler d1 execute DB --remote --command \
+pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT page_id, room, attempts, datetime(next_attempt_at/1000,'unixepoch') AS next_attempt, last_error
      FROM archive_disconnect_targets ORDER BY next_attempt_at;"
 ```
@@ -172,7 +172,7 @@ Held in `table_leases`, one row per page, storing a SHA-256 hash of an opaque to
 itself. Clients renew every 20 seconds.
 
 ```sh
-pnpm wrangler d1 execute DB --remote --command \
+pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT page_id, holder_user_id, datetime(expires_at/1000,'unixepoch') AS expires,
           expires_at > unixepoch()*1000 AS active FROM table_leases;"
 ```
@@ -194,7 +194,7 @@ Two tabs of the same session can both acquire, because the acquire condition als
 Documents warn at 16 MiB and are forced read-only by the server at 24 MiB.
 
 ```sh
-pnpm wrangler d1 execute DB --remote --command \
+pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT id, title, oversized, length(plain_text) AS text_len FROM pages WHERE oversized = 1;"
 ```
 
@@ -245,13 +245,19 @@ installation cannot represent shows up — while it is still free to do somethin
 | `--email`               | An owner or editor. A viewer is rejected before anything is created.                                                                 |
 | `--manifest <path>`     | Progress record. Re-running with the same manifest resumes; default `./notion-import.manifest.json`.                                 |
 | `--parent <pageId>`     | Import beneath an existing page instead of at the top level.                                                                         |
-| `--limit <n>`           | Import only the first n pages, for a smoke test.                                                                                     |
+| `--limit <n>`           | Import the first n pages plus their ancestors, for a tree-safe smoke test.                                                           |
 | `--rps <n>`             | Request rate, default 20. **The Worker has no rate limiting and never returns 429, so this is the only backpressure in the system.** |
+| `--linger-ms <n>`       | How long each document stays open after a write so the compaction alarm is armed; default 1200.                                      |
+| `--verbose`             | Print one progress line per page instead of a throttled summary.                                                                     |
+| `NOTES_IMPORT_BASE_URL` | Default for `--base-url`; otherwise `http://127.0.0.1:4173`.                                                                         |
+| `NOTES_IMPORT_EMAIL`    | Default for `--email`.                                                                                                               |
+| `NOTES_IMPORT_RPS`      | Default for `--rps`; otherwise 20.                                                                                                   |
 
-**Re-running is safe.** Pages already created are skipped, attachments are matched by name against what the
-page already has, and content is re-pushed only if it differs — block ids are derived from the source, so an
-unchanged page produces no Yjs update at all. A manifest is refused if the export it was created from has
-changed, since the Notion-to-page mapping would no longer hold.
+**Re-running is safe with the manifest.** Pages and attachments already recorded in it are skipped, and
+content is re-pushed only if it differs — block ids are derived from the source, so an unchanged page
+produces no Yjs update at all. Without the manifest, pages and attachments are created again. A manifest
+is refused if its export, workspace, target URL, or root parent differs, since the Notion-to-page mapping
+would no longer hold.
 
 **What an export cannot carry.** Notion never includes comments, version history, permissions, or custom
 emoji in an export, and omits pages the exporting user cannot see. Those cannot be migrated by any importer.
@@ -289,15 +295,15 @@ pnpm load:realtime
 
 ## Known gaps
 
-- **No staging environment.** The top-level `wrangler.jsonc` configuration is production. The only
-  named environment, `notes-checks-e2e`, is for the local Playwright harness. `nightly.yml` refers to a
-  `STAGING_BASE_URL` repository variable, but nothing in this repository deploys such an environment.
+- **No staging environment.** `wrangler.jsonc` defines `production` and the local-only
+  `notes-checks-e2e` harness. `nightly.yml` refers to a `STAGING_BASE_URL` repository variable, but
+  nothing in this repository deploys such an environment.
 - **`nightly.yml` holds live account credentials.** `STAGING_LOAD_EMAIL` and `STAGING_LOAD_PASSWORD`
   are real sign-in credentials for whatever `STAGING_BASE_URL` points at. Scope that account to the
   minimum role and never point it at production.
 - **No application rate limiting.** The Worker never returns `429`. Bootstrap, invite acceptance, and
   sign-in must be protected by Cloudflare WAF rules; see [Deployment](DEPLOYMENT.md#4-configure-rate-limiting).
 - **`/api/health` cannot identify the running revision.** Its `version` field is a hardcoded string.
-  Use `pnpm wrangler deployments list`.
+  Use `pnpm wrangler deployments list --env production`.
 - **Durable Object placement is permanent.** A workspace's location hint is fixed at bootstrap and
   Durable Objects do not relocate after creation.

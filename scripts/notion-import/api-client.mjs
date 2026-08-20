@@ -14,6 +14,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { jitteredBackoff } from "../../src/shared/retry.ts";
 
 const RETRYABLE_ATTEMPTS = 5;
+const REQUEST_TIMEOUT_MS = 120_000;
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "DELETE"]);
 
 class Throttle {
   #interval;
@@ -53,10 +55,18 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
     if (init.body !== undefined && !(init.body instanceof FormData) && !headers.has("content-type")) {
       headers.set("content-type", "application/json");
     }
-    return fetch(new URL(path, baseURL), { ...init, headers });
+    return fetch(new URL(path, baseURL), {
+      ...init,
+      headers,
+      signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
   }
 
-  const install = await (await send("/api/install")).json();
+  const installResponse = await send("/api/install");
+  if (!installResponse.ok) {
+    throw new Error(`${baseURL} did not answer /api/install (${installResponse.status}). Check --base-url.`);
+  }
+  const install = await installResponse.json();
   if (!install.initialized) {
     throw new Error(`${baseURL} has not been set up yet. Complete the first-run screen before importing.`);
   }
@@ -70,19 +80,21 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
   const cookie = signIn.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
   if (!cookie) throw new Error("Sign in succeeded but returned no session cookie.");
 
-  async function request(path, init = {}) {
+  async function request(path, init = {}, policy = {}) {
+    const method = (init.method ?? "GET").toUpperCase();
+    const retryable = policy.retryable ?? SAFE_METHODS.has(method);
     for (let attempt = 0; ; attempt += 1) {
       let response;
       try {
         response = await send(path, init, cookie);
       } catch (cause) {
-        // A transport failure is worth retrying; a rejected request is not.
-        if (attempt >= RETRYABLE_ATTEMPTS - 1) throw cause;
+        // An ambiguous transport failure is retried only when this operation is repeatable.
+        if (!retryable || attempt >= RETRYABLE_ATTEMPTS - 1) throw cause;
         await delay(jitteredBackoff(attempt, 500, 15_000));
         continue;
       }
       if (response.ok) return response.status === 204 ? null : response.json();
-      if (response.status >= 500 && attempt < RETRYABLE_ATTEMPTS - 1) {
+      if (retryable && response.status >= 500 && attempt < RETRYABLE_ATTEMPTS - 1) {
         await delay(jitteredBackoff(attempt, 500, 15_000));
         continue;
       }
@@ -114,19 +126,25 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
     async createPages(pages) {
       // One request per tree level rather than per page: each create otherwise
       // broadcasts a workspace event that every connected client acts on.
-      const result = await request("/api/pages/batch", { method: "POST", body: JSON.stringify({ pages }) });
+      const result = await request(
+        "/api/pages/batch",
+        { method: "POST", body: JSON.stringify({ pages }) },
+        { retryable: false },
+      );
       return result.pages;
     },
 
     async uploadAttachment(pageId, name, mime, bytes) {
       const body = new FormData();
       body.set("file", new File([bytes], name, { type: mime }));
-      const result = await request(`/api/pages/${pageId}/attachments`, { method: "POST", body });
+      const result = await request(`/api/pages/${pageId}/attachments`, { method: "POST", body }, { retryable: false });
       return result.attachment;
     },
 
     async acquireTableLease(pageId) {
-      return request(`/api/tables/${pageId}/lease`, { method: "POST", body: "{}" });
+      // Reacquiring from the same session replaces the first token. If its response was
+      // lost, the replacement returned by a retry is the only token the caller observes.
+      return request(`/api/tables/${pageId}/lease`, { method: "POST", body: "{}" }, { retryable: true });
     },
 
     async releaseTableLease(pageId, leaseToken) {
@@ -134,7 +152,13 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
     },
 
     async bulkTableWrite(pageId, body) {
-      return request(`/api/tables/${pageId}/bulk`, { method: "POST", body: JSON.stringify(body) });
+      // The import supplies clientRequestId, and the server stores the response in the
+      // same transaction as the rows, so an ambiguous response can be replayed safely.
+      return request(
+        `/api/tables/${pageId}/bulk`,
+        { method: "POST", body: JSON.stringify(body) },
+        { retryable: typeof body.clientRequestId === "string" && body.clientRequestId.length > 0 },
+      );
     },
 
     async readTable(pageId) {
