@@ -10,3 +10,4 @@ coverage
 review_triage/
 reviews_triage/
 triage_decisions.db
+wrangler.jsonc
