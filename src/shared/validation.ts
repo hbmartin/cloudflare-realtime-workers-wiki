@@ -2,6 +2,12 @@ import type { ColumnType, PageKind, Role } from "./types";
 
 export class ValidationError extends Error {}
 
+/**
+ * Longest stored page title. Shared with the import CLI's preflight so a title the
+ * routes would reject is shortened before the run starts, not rejected mid-run.
+ */
+export const PAGE_TITLE_MAX = 200;
+
 export function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new ValidationError("Expected an object");
   return value as Record<string, unknown>;

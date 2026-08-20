@@ -100,7 +100,7 @@ interface UploadReapRow {
 
 interface DueUploadRow {
   id: string;
-  state: "active" | "completing" | "reaping" | "aborting";
+  state: "active" | "completing" | "r2_complete" | "reaping" | "aborting";
 }
 
 function uploadRetryDelay(attempts: number) {
@@ -115,7 +115,7 @@ async function rescheduleUpload(
   env: Env,
   row: Pick<UploadReapRow, "id" | "attempts">,
   leaseUntil: number,
-  state: "active" | "completing" | "reaping" | "aborting",
+  state: "active" | "completing" | "r2_complete" | "reaping" | "aborting",
   error: unknown,
 ) {
   const timestamp = Date.now();
@@ -230,12 +230,14 @@ async function inspectStaleCompletion(env: Env, id: string) {
   try {
     const object = await env.BUCKET.head(claimed.r2_key);
     if (object) {
+      // Give the client one more session lifetime to commit the metadata; after that
+      // the reaper resolves the row terminally rather than leaving it parked forever.
       await env.DB.prepare(
         `UPDATE attachment_uploads
             SET state = 'r2_complete', next_attempt_at = ?, last_error = NULL, updated_at = ?
           WHERE id = ? AND state = 'completing' AND next_attempt_at = ?`,
       )
-        .bind(Number.MAX_SAFE_INTEGER, Date.now(), id, leaseUntil)
+        .bind(Date.now() + UPLOAD_SESSION_TTL_MS, Date.now(), id, leaseUntil)
         .run();
       return true;
     }
@@ -259,22 +261,81 @@ async function inspectStaleCompletion(env: Env, id: string) {
 }
 
 /**
+ * Resolves an 'r2_complete' session whose client never returned for the metadata
+ * commit.
+ *
+ * The upload crossed R2's irreversible completion boundary, so the bytes are whole and
+ * every column the attachments row needs is already on the session. When the page still
+ * exists the reaper finishes the commit the client abandoned - the same idempotent
+ * batch the complete route runs, so a late client retry replays it as committed. When
+ * the page is gone the metadata can never commit, and the object and row are deleted.
+ */
+async function resolveCompletedUpload(env: Env, id: string) {
+  const claimedAt = Date.now();
+  const leaseUntil = claimedAt + UPLOAD_REAP_LEASE_MS;
+  const claimed = await env.DB.prepare(
+    `UPDATE attachment_uploads
+        SET attempts = attempts + 1, next_attempt_at = ?, updated_at = ?
+      WHERE id = ? AND state = 'r2_complete' AND next_attempt_at <= ?
+      RETURNING id, r2_key, r2_upload_id, attempts, page_id`,
+  )
+    .bind(leaseUntil, claimedAt, id, claimedAt)
+    .first<UploadReapRow & { page_id: string }>();
+  if (!claimed) return false;
+
+  try {
+    const page = await env.DB.prepare(`SELECT 1 found FROM pages WHERE id = ?`).bind(claimed.page_id).first();
+    if (page) {
+      const timestamp = Date.now();
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO attachments
+               (id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, created_at)
+             SELECT id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, ?
+               FROM attachment_uploads WHERE id = ? AND state = 'r2_complete'`,
+        ).bind(timestamp, id),
+        env.DB.prepare(
+          `UPDATE attachment_uploads SET state = 'committed', updated_at = ? WHERE id = ? AND state = 'r2_complete'`,
+        ).bind(timestamp, id),
+        env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ? AND state = 'committed'`).bind(id),
+      ]);
+      return true;
+    }
+    await env.BUCKET.delete(claimed.r2_key);
+    await env.DB.prepare(
+      `DELETE FROM attachment_uploads WHERE id = ? AND state = 'r2_complete' AND next_attempt_at = ?`,
+    )
+      .bind(id, leaseUntil)
+      .run();
+    return true;
+  } catch (error) {
+    await rescheduleUpload(env, claimed, leaseUntil, "r2_complete", error).catch((retryError) => {
+      console.error("Failed to reschedule completed upload resolution", retryError);
+    });
+    return false;
+  }
+}
+
+/**
  * Aborts upload sessions whose deadline has passed, freeing the parts R2 is holding.
  *
  * Every accepted part pushes the deadline forward, so an upload that is merely slow is
- * never collected; only one nobody is still feeding. An R2 lifecycle rule aborting
- * incomplete multipart uploads is the backstop for sessions whose D1 row was lost.
+ * never collected; only one nobody is still feeding. A completed-but-uncommitted
+ * session ('r2_complete') is resolved terminally after one further session lifetime
+ * instead of leaking its object. An R2 lifecycle rule aborting incomplete multipart
+ * uploads is the backstop for sessions whose D1 row was lost.
  */
 export async function processDueUploadReaps(env: Env, limit = UPLOAD_REAP_BATCH_SIZE) {
   const due = await env.DB.prepare(
     `SELECT id, state FROM attachment_uploads
-      WHERE state IN ('active', 'completing', 'reaping', 'aborting') AND next_attempt_at <= ?
+      WHERE state IN ('active', 'completing', 'r2_complete', 'reaping', 'aborting') AND next_attempt_at <= ?
       ORDER BY created_at LIMIT ?`,
   )
     .bind(Date.now(), limit)
     .all<DueUploadRow>();
   for (const row of due.results) {
     if (row.state === "completing") await inspectStaleCompletion(env, row.id);
+    else if (row.state === "r2_complete") await resolveCompletedUpload(env, row.id);
     else if (row.state === "active") await reapUpload(env, row.id);
     else await retryTerminalAbort(env, row.id, row.state);
   }

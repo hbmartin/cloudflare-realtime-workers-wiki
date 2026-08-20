@@ -23,6 +23,14 @@ export const TABLE_PAGE_MAX = 500;
 export const TABLE_SORT_MAX_OFFSET = 5_000;
 
 /**
+ * Field-level ceilings the write routes enforce, shared with the import CLI's
+ * preflight so a value the server would 422 is caught before the run starts.
+ */
+export const TABLE_COLUMN_NAME_MAX = 200;
+export const TABLE_SELECT_LABEL_MAX = 200;
+export const TABLE_TEXT_CELL_MAX = 10_000;
+
+/**
  * Caps for one bulk table write. Sized so a request stays far inside D1's limits:
  * each statement binds a single JSON blob plus its guards (well under 100 bound
  * parameters), and the whole batch is 7 statements against a 1000-query ceiling.

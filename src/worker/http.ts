@@ -1,4 +1,5 @@
 import type { Context } from "hono";
+import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
 
 export class HttpError extends Error {
@@ -62,14 +63,7 @@ export function assertSameOrigin(request: Request, baseUrl: string) {
   }
 }
 
-export function normalizeFilename(name: string) {
-  return (
-    name
-      .replace(/[\r\n"\\/]/g, "_")
-      .trim()
-      .slice(0, 180) || "download"
-  );
-}
+export { normalizeFilename };
 
 export function attachmentDisposition(name: string, inline: boolean) {
   const safe = normalizeFilename(name).replace(/[^\x20-\x7e]/g, "_");

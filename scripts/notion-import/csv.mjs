@@ -12,7 +12,6 @@ const SELECT_MAX_DISTINCT = 40;
 const BOOLEAN_VALUES = /^(yes|no|true|false)$/i;
 const TRUE_VALUES = /^(yes|true)$/i;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-const CANONICAL_DECIMAL = /^-?(?:0|[1-9]\d*)\.\d*[1-9]$/;
 
 function isValidDate(value) {
   if (!ISO_DATE.test(value)) return false;
@@ -21,28 +20,11 @@ function isValidDate(value) {
 }
 
 function isSafeNumber(value) {
-  // Integer-shaped exports are commonly ids. Require an explicit decimal point and a
-  // canonical JS round trip; padded, exponent, and precision-changing forms stay text.
-  if (!CANONICAL_DECIMAL.test(value)) return false;
+  // Only display strings that survive a canonical JS round trip become numbers, so the
+  // stored number regenerates the source string exactly and verification hashes match.
+  // Padded ("007", "1.0"), exponent ("1e3"), and precision-losing forms stay text.
   const number = Number(value);
-  if (!Number.isFinite(number) || Object.is(number, -0)) return false;
-  const negative = value.startsWith("-");
-  const unsigned = negative ? value.slice(1) : value;
-  const [integer, fraction] = unsigned.split(".");
-  const decimalNumerator = BigInt(`${integer}${fraction}`) * (negative ? -1n : 1n);
-  const decimalDenominator = 10n ** BigInt(fraction.length);
-
-  const view = new DataView(new ArrayBuffer(8));
-  view.setFloat64(0, number, false);
-  const bits = view.getBigUint64(0, false);
-  const sign = bits >> 63n ? -1n : 1n;
-  const rawExponent = Number((bits >> 52n) & 0x7ffn);
-  const fractionBits = bits & ((1n << 52n) - 1n);
-  const mantissa = rawExponent === 0 ? fractionBits : (1n << 52n) | fractionBits;
-  const binaryExponent = (rawExponent === 0 ? 1 - 1023 : rawExponent - 1023) - 52;
-  const binaryNumerator = sign * (binaryExponent >= 0 ? mantissa << BigInt(binaryExponent) : mantissa);
-  const binaryDenominator = binaryExponent >= 0 ? 1n : 1n << BigInt(-binaryExponent);
-  return decimalNumerator * binaryDenominator === binaryNumerator * decimalDenominator;
+  return Number.isFinite(number) && String(number) === value;
 }
 
 /** RFC 4180 parser: quoted fields, escaped quotes, and newlines inside a cell. */

@@ -43,22 +43,27 @@ export function hashFileContent(path) {
  * Identifies the export a manifest belongs to.
  *
  * Resuming against a re-downloaded or edited export would map Notion ids onto pages that
- * no longer correspond to them, so a mismatch is refused rather than reconciled.
+ * no longer correspond to them, so a mismatch is refused rather than reconciled. The
+ * fingerprint is derived from per-file digests so each file is read exactly once; the
+ * digests are returned for the upload pass to reuse instead of re-hashing every asset.
  */
 export function fingerprintExport(root) {
   const { files } = walkExport(root);
+  const digests = new Map();
   const hash = createHash("sha256");
   for (const path of files) {
+    const digest = hashFileContent(join(root, path));
+    digests.set(path, digest);
     hash.update(path);
     hash.update("\0");
-    hashFile(hash, join(root, path));
+    hash.update(digest);
     hash.update("\0");
   }
-  return hash.digest("hex");
+  return { fingerprint: hash.digest("hex"), digests };
 }
 
-export function createManifest({ path, root, baseURL, workspaceId, rootParentId }) {
-  const fingerprint = fingerprintExport(root);
+export function createManifest({ path, root, baseURL, workspaceId, rootParentId, adoptRootParent = false }) {
+  const { fingerprint, digests } = fingerprintExport(root);
   let state;
 
   if (existsSync(path)) {
@@ -102,7 +107,9 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId 
     if (state.workspaceId !== workspaceId) {
       throw new Error(`${path} was created against a different workspace. Move it aside to start over.`);
     }
-    if (state.rootParentId !== (rootParentId ?? null)) {
+    // A read-only command (verify) adopts the recorded parent rather than demanding
+    // the flag be repeated; a run must still match, or resuming would re-root the tree.
+    if (!(adoptRootParent && (rootParentId ?? null) === null) && state.rootParentId !== (rootParentId ?? null)) {
       throw new Error(`${path} was created with a different --parent. Move it aside to start over.`);
     }
   } else {
@@ -145,6 +152,10 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId 
 
   return {
     state,
+    /** SHA-256 of one export file, from the fingerprint pass, keyed by relative path. */
+    contentSha256(relativePath) {
+      return digests.get(relativePath) ?? null;
+    },
     node(notionKey) {
       return state.nodes[notionKey] ?? null;
     },

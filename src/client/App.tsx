@@ -361,6 +361,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     return () => window.removeEventListener(PAGE_NAVIGATE_EVENT, navigate);
   }, []);
 
+  // Render-phase adjustment, not just a display fallback: a deleted page's id left in
+  // selectedId would be persisted below, and would yank the editor back to that page
+  // if a collaborator later restores it from trash.
+  if (pagesLoaded && selectedId && !pages.some((page) => page.id === selectedId)) {
+    setSelectedId(pages[0]?.id ?? null);
+  }
   const selected =
     pages.find((page) => page.id === selectedId) ?? (pagesLoaded && selectedId ? (pages[0] ?? null) : null);
   const resolvedSelectedId = selected?.id ?? selectedId;

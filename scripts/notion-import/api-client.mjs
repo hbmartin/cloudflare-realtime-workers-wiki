@@ -12,15 +12,34 @@
  */
 import { setTimeout as delay } from "node:timers/promises";
 import { open, readFile } from "node:fs/promises";
+import { normalizeFilename } from "../../src/shared/filename.ts";
 import { jitteredBackoff } from "../../src/shared/retry.ts";
 import { canonicalJson, sha256Hex } from "../../src/shared/import-integrity.ts";
+import { MAX_ATTACHMENT_BYTES } from "../../src/worker/attachments.ts";
 
 const RETRYABLE_ATTEMPTS = 5;
 const REQUEST_TIMEOUT_MS = 120_000;
+// Floor for body transmission when sizing a request timeout. Slower uplinks exist, but
+// a fixed deadline has to end somewhere; this keeps an 8 MiB part inside its budget on
+// any link that could plausibly finish a multi-gigabyte import at all.
+const UPLOAD_BYTES_PER_SECOND = 50 * 1024;
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "DELETE"]);
 const SINGLE_SHOT_BYTES = 8 * 1024 * 1024;
-const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024 * 1024;
 const LOOPBACK_HOSTS = new Set(["localhost", "[::1]"]);
+
+/** A flat deadline would abort any large body on a slow uplink; scale it to the size. */
+function requestTimeoutMs(body) {
+  const bytes =
+    body instanceof Uint8Array
+      ? body.byteLength
+      : typeof body === "string"
+        ? Buffer.byteLength(body)
+        : body instanceof FormData
+          ? // A form body is only used for single-shot uploads, which are capped.
+            SINGLE_SHOT_BYTES
+          : 0;
+  return REQUEST_TIMEOUT_MS + Math.ceil((bytes / UPLOAD_BYTES_PER_SECOND) * 1000);
+}
 
 export function validateBaseURL(value) {
   const url = new URL(value);
@@ -85,7 +104,7 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
       ...init,
       headers,
       redirect: "error",
-      signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: init.signal ?? AbortSignal.timeout(requestTimeoutMs(init.body)),
     });
   }
 
@@ -169,12 +188,6 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
     workspaceId: me.workspace.id,
     request,
 
-    async hasAttachment(id) {
-      const response = await send(`/api/attachments/${id}`, { headers: { range: "bytes=0-0" } }, cookie);
-      await response.body?.cancel().catch(() => undefined);
-      return response.ok;
-    },
-
     async listAttachments(pageId) {
       return (await request(`/api/pages/${pageId}/attachments`)).attachments;
     },
@@ -211,12 +224,9 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
       if (!/^[a-f\d]{64}$/i.test(contentSha256 ?? "")) {
         throw new Error(`Attachment ${name} has no valid content SHA-256 digest.`);
       }
-      // Must match normalizeFilename in the Worker before computing the canonical hash.
-      const normalizedName =
-        name
-          .replace(/[\r\n"\\/]/g, "_")
-          .trim()
-          .slice(0, 180) || "download";
+      // The exact function the Worker applies before storing a name, so the canonical
+      // hash computed here matches the one the Worker recomputes.
+      const normalizedName = normalizeFilename(name);
       const requestHash = await sha256Hex(
         canonicalJson({ attachmentId, pageId, name: normalizedName, mime, size, contentSha256 }),
       );
@@ -231,23 +241,22 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
         return result.attachment;
       }
 
+      // The server keys the session by the supplied attachment id, so a lost response
+      // is always recoverable by asking for that id before starting a new session.
       let session;
       let completedParts = new Set();
-      if (options.uploadId ?? attachmentId) {
-        let resumed;
-        try {
-          resumed = await request(`/api/uploads/${options.uploadId ?? attachmentId}`);
-        } catch (error) {
-          if (!(error instanceof ApiError) || error.status !== 404) throw error;
-          resumed = null;
-        }
-        if (resumed?.status === "committed") return resumed.attachment;
-        if (resumed) {
-          session = resumed.upload;
-          completedParts = new Set((resumed.parts ?? []).map((part) => part.partNumber));
-        }
+      let resumed;
+      try {
+        resumed = await request(`/api/uploads/${attachmentId}`);
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 404) throw error;
+        resumed = null;
       }
-      if (!session) {
+      if (resumed?.status === "committed") return resumed.attachment;
+      if (resumed) {
+        session = resumed.upload;
+        completedParts = new Set((resumed.parts ?? []).map((part) => part.partNumber));
+      } else {
         const started = await request(
           `/api/pages/${pageId}/uploads`,
           {
@@ -258,7 +267,6 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
         );
         if (started.status === "committed") return started.attachment;
         session = started.upload;
-        await options.onSession?.(session.id);
       }
       if (
         session.id !== attachmentId ||
@@ -322,14 +330,8 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
       );
     },
 
-    async readTable(pageId, options = {}) {
-      const query = new URLSearchParams({
-        count: options.count === false ? "false" : "true",
-        limit: String(options.limit ?? 1),
-      });
-      if (options.afterPosition !== undefined) query.set("afterPosition", String(options.afterPosition));
-      if (options.afterId !== undefined) query.set("afterId", options.afterId);
-      return request(`/api/tables/${pageId}?${query}`);
+    async readTable(pageId) {
+      return request(`/api/tables/${pageId}?count=true&limit=1`);
     },
 
     async tree() {

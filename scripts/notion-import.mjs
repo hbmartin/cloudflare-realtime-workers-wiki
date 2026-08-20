@@ -42,7 +42,7 @@ const { normalizeNotionHtml } = normalizer;
 const { createClient } = api;
 const { createManifest } = manifests;
 const { createReport } = reports;
-const { preflightTable, runImport } = runner;
+const { planTable, runImport } = runner;
 const { verifyImport } = verifier;
 
 const COMMANDS = new Set(["inspect", "plan", "run", "verify"]);
@@ -181,7 +181,7 @@ async function planImport(index, limit) {
       blocks += (await htmlToBlocks(editor, html)).length;
       converted += 1;
       if (page.kind === "database") {
-        preflightTable(index, page, (code, detail) => record(code, detail, page.title));
+        await planTable(index, page, (code, detail) => record(code, detail, page.title));
       }
     } catch (error) {
       failed += 1;
@@ -203,7 +203,7 @@ function reportIssues(issues) {
   }
 }
 
-async function connect(options, root) {
+async function connect(options, root, { adoptRootParent = false } = {}) {
   const client = await createClient({
     baseURL: options.baseURL,
     email: options.email,
@@ -216,6 +216,7 @@ async function connect(options, root) {
     baseURL: client.baseURL,
     workspaceId: client.workspaceId,
     rootParentId: options.parent,
+    adoptRootParent,
   });
   return { client, manifest };
 }
@@ -272,7 +273,9 @@ if (options.command === "inspect") {
       `No manifest at ${options.manifest}. Run the import first, or pass --manifest <path> for the run you want to verify.`,
     );
   }
-  const { client, manifest } = await connect(options, root);
+  // Verification is read-only, so a manifest imported with --parent is adopted as
+  // recorded rather than requiring the flag to be repeated.
+  const { client, manifest } = await connect(options, root, { adoptRootParent: true });
   const problems = await verifyImport({ client, manifest, index, timeoutMs: options.verifyTimeoutMs });
   if (problems > 0) process.exitCode = 1;
 }

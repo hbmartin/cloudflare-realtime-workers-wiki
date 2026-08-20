@@ -32,12 +32,25 @@ import {
   TABLE_BULK_MAX_CELLS,
   TABLE_BULK_MAX_COLUMNS,
   TABLE_BULK_MAX_ROWS,
+  TABLE_COLUMN_NAME_MAX,
   TABLE_MAX_ROWS,
   TABLE_PAGE_DEFAULT,
   TABLE_PAGE_MAX,
+  TABLE_SELECT_LABEL_MAX,
   TABLE_SORT_MAX_OFFSET,
+  TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
-import { columnType, documentRoom, ID_PATTERN, nullableId, object, pageKind, role, text } from "../shared/validation";
+import {
+  columnType,
+  documentRoom,
+  ID_PATTERN,
+  nullableId,
+  object,
+  PAGE_TITLE_MAX,
+  pageKind,
+  role,
+  text,
+} from "../shared/validation";
 import type { ClientMemberContext, Page, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
@@ -562,7 +575,7 @@ app.post("/api/pages", async (c) => {
     .first<{ position: string }>();
   const id = crypto.randomUUID();
   const kind = pageKind(body.kind ?? "document");
-  const title = typeof body.title === "string" ? text(body.title, "title", 200) : "Untitled";
+  const title = typeof body.title === "string" ? text(body.title, "title", PAGE_TITLE_MAX) : "Untitled";
   const timestamp = now();
   await c.env.DB.batch([
     c.env.DB.prepare(
@@ -621,7 +634,7 @@ app.post("/api/pages/batch", async (c) => {
       id: requestedId,
       parentId: nullableId(entry.parentId, `pages[${index}].parentId`),
       kind: pageKind(entry.kind ?? "document"),
-      title: typeof entry.title === "string" ? text(entry.title, `pages[${index}].title`, 200) : "Untitled",
+      title: typeof entry.title === "string" ? text(entry.title, `pages[${index}].title`, PAGE_TITLE_MAX) : "Untitled",
     };
   });
   if (new Set(parsed.map(({ id }) => id)).size !== parsed.length) {
@@ -749,7 +762,7 @@ app.patch("/api/pages/:id", async (c) => {
   const page = await pageForMember(c.env, member, c.req.param("id"));
   const body = await jsonBody(c.req.raw);
   const revision = Number(body.revision);
-  const titleValue = body.title === undefined ? page.title : text(body.title, "title", 200);
+  const titleValue = body.title === undefined ? page.title : text(body.title, "title", PAGE_TITLE_MAX);
   const iconValue = body.icon === undefined ? page.icon : body.icon === null ? null : text(body.icon, "icon", 20);
   const result = await c.env.DB.prepare(
     `UPDATE pages SET title = ?, icon = ?, revision = revision + 1, updated_at = ?
@@ -1359,7 +1372,9 @@ app.post("/api/pages/:id/attachments", async (c) => {
     if (replay && sameAttachment(replay, expected)) {
       return c.json({ attachment: attachmentJson(replay), replayed: true });
     }
-    await c.env.BUCKET.delete(key);
+    // A conflicting row with the same content hash committed this same deterministic
+    // key concurrently; deleting it would strand that row without its object.
+    if (replay?.r2_key !== key) await c.env.BUCKET.delete(key);
     if (replay) {
       throw new HttpError(409, "idempotency_key_reused", "That attachment id already describes another file.");
     }
@@ -1893,14 +1908,59 @@ app.post("/api/pages/:id/restore-version", async (c) => {
   return c.json({ pageId: page.id, contentEpoch: result.contentEpoch });
 });
 
+/**
+ * Runs `read` between two revision reads of table_state and retries once when a
+ * concurrent writer moved the table, so no caller can assemble a torn snapshot.
+ * The fence lives in exactly one place; every table read route shares it.
+ */
+async function stableTableSnapshot<T>(
+  env: Env,
+  pageId: string,
+  wantsCount: boolean,
+  read: () => Promise<T>,
+): Promise<{ snapshot: T; revision: number; rowCount: number | null }> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const stateBefore = await env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
+      .bind(pageId)
+      .first<{ revision: number }>();
+    const snapshot = await read();
+    const stateAfter = await env.DB.prepare(
+      `SELECT revision${wantsCount ? ", (SELECT COUNT(*) FROM table_rows WHERE page_id = ?) row_count" : ""}
+         FROM table_state WHERE page_id = ?`,
+    )
+      .bind(...(wantsCount ? [pageId, pageId] : [pageId]))
+      .first<{ revision: number; row_count?: number }>();
+    if (stateBefore?.revision === stateAfter?.revision) {
+      return {
+        snapshot,
+        revision: stateAfter?.revision ?? 1,
+        rowCount: wantsCount ? Number(stateAfter?.row_count ?? 0) : null,
+      };
+    }
+  }
+  throw new HttpError(409, "table_snapshot_changed", "The table changed while this page was assembled. Retry it.");
+}
+
+/** Folds the joined row/cell statement back into one entry per row, in query order. */
+function collectRowCells(results: Record<string, unknown>[]) {
+  const rows = new Map<
+    string,
+    { id: string; position: number; cells: Record<string, string | number | boolean | null> }
+  >();
+  for (const item of results) {
+    const rowId = String(item.row_id);
+    const row = rows.get(rowId) ?? { id: rowId, position: Number(item.row_position), cells: {} };
+    if (typeof item.column_id === "string") row.cells[item.column_id] = cellValue(item);
+    rows.set(rowId, row);
+  }
+  return [...rows.values()];
+}
+
 app.get("/api/tables/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const wantsCount = c.req.query("count") === "true";
   const page = await activeTablePage(c.env, member, c.req.param("pageId"));
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const stateBefore = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
-      .bind(page.id)
-      .first<{ revision: number }>();
+  const { snapshot, revision, rowCount } = await stableTableSnapshot(c.env, page.id, wantsCount, async () => {
     const [columns, options] = await Promise.all([
       c.env.DB.prepare(`SELECT * FROM table_columns WHERE page_id = ? ORDER BY position, id`)
         .bind(page.id)
@@ -1913,10 +1973,9 @@ app.get("/api/tables/:pageId", async (c) => {
         .all<{ id: string; column_id: string; label: string; position: number }>(),
     ]);
     const rowQuery = buildTableRowQuery(page.id, columns.results, c.req.query());
-    // Row identity and cells are assembled by one joined statement. The revision
-    // reads fence the remaining column/option reads; a concurrent writer causes one
-    // complete retry rather than returning a torn table.
-    const snapshot = await c.env.DB.prepare(
+    // Row identity and cells are assembled by one joined statement; the fence covers
+    // the remaining column/option reads.
+    const rows = await c.env.DB.prepare(
       `WITH page_rows AS (${rowQuery.sql})
        SELECT page_rows.id row_id, page_rows.position row_position,
               cell.column_id, cell.text_value, cell.number_value, cell.boolean_value,
@@ -1926,79 +1985,59 @@ app.get("/api/tables/:pageId", async (c) => {
     )
       .bind(...tableRowBinds(rowQuery, rowQuery.limit + 1))
       .all<Record<string, unknown>>();
-    const stateAfter = await c.env.DB.prepare(
-      `SELECT revision${wantsCount ? ", (SELECT COUNT(*) FROM table_rows WHERE page_id = ?) row_count" : ""}
-         FROM table_state WHERE page_id = ?`,
-    )
-      .bind(...(wantsCount ? [page.id, page.id] : [page.id]))
-      .first<{ revision: number; row_count?: number }>();
-    if (stateBefore?.revision !== stateAfter?.revision) {
-      if (attempt === 0) continue;
-      throw new HttpError(409, "table_snapshot_changed", "The table changed while this page was assembled. Retry it.");
-    }
-
-    const rowMap = new Map<
-      string,
-      { id: string; position: number; cells: Record<string, string | number | boolean | null> }
-    >();
-    for (const item of snapshot.results) {
-      const rowId = String(item.row_id);
-      const row = rowMap.get(rowId) ?? { id: rowId, position: Number(item.row_position), cells: {} };
-      if (typeof item.column_id === "string") row.cells[item.column_id] = cellValue(item);
-      rowMap.set(rowId, row);
-    }
-    const allRows = [...rowMap.values()];
-    const pageRows = allRows.slice(0, rowQuery.limit);
-    const hasMoreRows = allRows.length > pageRows.length;
-    const truncated = Boolean(
-      rowQuery.sort && hasMoreRows && rowQuery.offset + rowQuery.limit >= TABLE_SORT_MAX_OFFSET,
-    );
-    const hasMore = hasMoreRows && !truncated;
-    const lastRow = pageRows.at(-1);
-    const lease = await c.env.DB.prepare(
-      `SELECT l.expires_at, l.holder_session_id, u.name holder_name
-         FROM table_leases l JOIN user u ON u.id = l.holder_user_id WHERE l.page_id = ? AND l.expires_at > ?`,
-    )
-      .bind(page.id, now())
-      .first<{ expires_at: number; holder_session_id: string; holder_name: string }>();
-    return c.json({
-      table: {
-        pageId: page.id,
-        revision: stateAfter?.revision ?? 1,
-        columns: columns.results.map((column) => ({
-          ...column,
-          options: options.results
-            .filter((option) => option.column_id === column.id)
-            .map((option) => ({ id: option.id, label: option.label, position: option.position })),
-        })),
-        rows: pageRows,
-        lease: {
-          heldByMe: lease?.holder_session_id === member.session.id,
-          holderName: lease?.holder_name ?? null,
-          expiresAt: lease?.expires_at ?? null,
-        },
-        limit: rowQuery.limit,
-        sort: rowQuery.sort,
-        dir: rowQuery.dir,
-        hasMore,
-        nextCursor: hasMore && !rowQuery.sort && lastRow ? { position: lastRow.position, rowId: lastRow.id } : null,
-        nextOffset: hasMore && rowQuery.sort ? rowQuery.offset + pageRows.length : null,
-        truncated,
-        rowCount: wantsCount ? Number(stateAfter?.row_count ?? 0) : null,
+    return { columns, options, rowQuery, rows };
+  });
+  const { columns, options, rowQuery } = snapshot;
+  const allRows = collectRowCells(snapshot.rows.results);
+  const pageRows = allRows.slice(0, rowQuery.limit);
+  const hasMoreRows = allRows.length > pageRows.length;
+  // The follow-up request must satisfy nextOffset + limit <= TABLE_SORT_MAX_OFFSET or
+  // buildTableRowQuery 422s it, so a page whose successor cannot fit is the truncation
+  // point - not only a page that itself reaches the cap.
+  const truncated = Boolean(
+    rowQuery.sort && hasMoreRows && rowQuery.offset + 2 * rowQuery.limit > TABLE_SORT_MAX_OFFSET,
+  );
+  const hasMore = hasMoreRows && !truncated;
+  const lastRow = pageRows.at(-1);
+  const lease = await c.env.DB.prepare(
+    `SELECT l.expires_at, l.holder_session_id, u.name holder_name
+       FROM table_leases l JOIN user u ON u.id = l.holder_user_id WHERE l.page_id = ? AND l.expires_at > ?`,
+  )
+    .bind(page.id, now())
+    .first<{ expires_at: number; holder_session_id: string; holder_name: string }>();
+  return c.json({
+    table: {
+      pageId: page.id,
+      revision,
+      columns: columns.results.map((column) => ({
+        ...column,
+        options: options.results
+          .filter((option) => option.column_id === column.id)
+          .map((option) => ({ id: option.id, label: option.label, position: option.position })),
+      })),
+      rows: pageRows,
+      lease: {
+        heldByMe: lease?.holder_session_id === member.session.id,
+        holderName: lease?.holder_name ?? null,
+        expiresAt: lease?.expires_at ?? null,
       },
-    });
-  }
-  throw new HttpError(409, "table_snapshot_changed", "The table changed while this page was assembled. Retry it.");
+      limit: rowQuery.limit,
+      sort: rowQuery.sort,
+      dir: rowQuery.dir,
+      hasMore,
+      nextCursor: hasMore && !rowQuery.sort && lastRow ? { position: lastRow.position, rowId: lastRow.id } : null,
+      nextOffset: hasMore && rowQuery.sort ? rowQuery.offset + pageRows.length : null,
+      truncated,
+      rowCount,
+    },
+  });
 });
 
 app.get("/api/tables/:pageId/verification", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await activeTablePage(c.env, member, c.req.param("pageId"));
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const stateBefore = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
-      .bind(page.id)
-      .first<{ revision: number }>();
-    const [columns, options, snapshot] = await Promise.all([
+  const { snapshot, revision } = await stableTableSnapshot(c.env, page.id, false, async () => {
+    const [columns, options, rows] = await Promise.all([
       c.env.DB.prepare(`SELECT id, name, type, position FROM table_columns WHERE page_id = ? ORDER BY position, id`)
         .bind(page.id)
         .all<{ id: string; name: string; type: string; position: number }>(),
@@ -2018,41 +2057,28 @@ app.get("/api/tables/:pageId/verification", async (c) => {
         .bind(page.id)
         .all<Record<string, unknown>>(),
     ]);
-    const stateAfter = await c.env.DB.prepare(`SELECT revision FROM table_state WHERE page_id = ?`)
-      .bind(page.id)
-      .first<{ revision: number }>();
-    if (stateBefore?.revision !== stateAfter?.revision) {
-      if (attempt === 0) continue;
-      throw new HttpError(409, "table_snapshot_changed", "The table changed while verification was assembled.");
-    }
-    const cellRows = new Map<string, Record<string, string | number | boolean | null>>();
-    for (const item of snapshot.results) {
-      const rowId = String(item.row_id);
-      const cells = cellRows.get(rowId) ?? {};
-      if (typeof item.column_id === "string") cells[item.column_id] = cellValue(item);
-      cellRows.set(rowId, cells);
-    }
-    const optionLabels = new Map(options.results.map((option) => [option.id, option.label]));
-    const canonicalColumns = columns.results.map((column) => ({
-      name: column.name,
-      type: column.type,
-      options: options.results.filter((option) => option.column_id === column.id).map(({ label }) => label),
-    }));
-    const canonicalRows = [...cellRows.values()].map((cells) =>
-      columns.results.map((column) => {
-        const value = cells[column.id] ?? null;
-        return column.type === "select" && typeof value === "string" ? (optionLabels.get(value) ?? null) : value;
-      }),
-    );
-    return c.json({
-      verification: {
-        revision: stateAfter?.revision ?? 1,
-        contentHash: await tableContentHash(canonicalColumns, canonicalRows),
-        rowCount: canonicalRows.length,
-      },
-    });
-  }
-  throw new HttpError(409, "table_snapshot_changed", "The table changed while verification was assembled.");
+    return { columns, options, rows };
+  });
+  const { columns, options } = snapshot;
+  const optionLabels = new Map(options.results.map((option) => [option.id, option.label]));
+  const canonicalColumns = columns.results.map((column) => ({
+    name: column.name,
+    type: column.type,
+    options: options.results.filter((option) => option.column_id === column.id).map(({ label }) => label),
+  }));
+  const canonicalRows = collectRowCells(snapshot.rows.results).map(({ cells }) =>
+    columns.results.map((column) => {
+      const value = cells[column.id] ?? null;
+      return column.type === "select" && typeof value === "string" ? (optionLabels.get(value) ?? null) : value;
+    }),
+  );
+  return c.json({
+    verification: {
+      revision,
+      contentHash: await tableContentHash(canonicalColumns, canonicalRows),
+      rowCount: canonicalRows.length,
+    },
+  });
 });
 
 app.post("/api/tables/:pageId/lease", async (c) => {
@@ -2338,7 +2364,7 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
     const entry = object(raw);
     const id = crypto.randomUUID();
     const type = columnType(entry.type);
-    const name = text(entry.name, `columns[${index}].name`, 200);
+    const name = text(entry.name, `columns[${index}].name`, TABLE_COLUMN_NAME_MAX);
     const ref = entry.ref === undefined ? null : text(entry.ref, `columns[${index}].ref`, 64);
     if (ref && columnsByKey.has(`ref:${ref}`)) {
       throw new HttpError(422, "invalid_bulk_reference", `The column ref ${ref} is used twice.`);
@@ -2348,7 +2374,7 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
     if (ref) columnsByKey.set(`ref:${ref}`, { id, type });
     const options = Array.isArray(entry.options) ? entry.options : [];
     for (const option of options) {
-      declareOption(id, text(object(option).label, `columns[${index}].options[].label`, 200));
+      declareOption(id, text(object(option).label, `columns[${index}].options[].label`, TABLE_SELECT_LABEL_MAX));
     }
   });
 
@@ -2381,7 +2407,10 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
       // an option id, matching the per-cell route exactly.
       let resolved: unknown = value;
       if (column.type === "select" && value && typeof value === "object" && "option" in value) {
-        resolved = declareOption(column.id, text((value as { option: unknown }).option, "option", 200));
+        resolved = declareOption(
+          column.id,
+          text((value as { option: unknown }).option, "option", TABLE_SELECT_LABEL_MAX),
+        );
       }
       const [textValue, numberValue, booleanValue, dateValue, selectValue] = typedCell(column.type, resolved);
       if (selectValue !== null && !optionIds.has(selectValue)) {
@@ -2707,7 +2736,7 @@ function typedCell(
   value: unknown,
 ): [string | null, number | null, number | null, string | null, string | null] {
   if (value === null || value === "") return [null, null, null, null, null];
-  if (type === "text") return [text(value, "value", 10_000), null, null, null, null];
+  if (type === "text") return [text(value, "value", TABLE_TEXT_CELL_MAX), null, null, null, null];
   if (type === "number") {
     const number = Number(value);
     if (!Number.isFinite(number)) throw new HttpError(422, "invalid_cell", "This cell requires a finite number.");
