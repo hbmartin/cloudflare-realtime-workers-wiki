@@ -2033,6 +2033,37 @@ describe("TablePage", () => {
     expect(await screen.findByDisplayValue("Two")).toBeInTheDocument();
   });
 
+  it("disables load more while a background table refresh is active", async () => {
+    vi.useFakeTimers();
+    const first: TableData = {
+      ...table,
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row" },
+      rowCount: 2,
+    };
+    const refresh = deferred<{ table: TableData }>();
+    vi.mocked(api)
+      .mockResolvedValueOnce({ table: first })
+      .mockImplementationOnce(() => refresh.promise);
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const loadMore = screen.getByRole("button", { name: "Load more rows" });
+    expect(loadMore).toBeEnabled();
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+
+    expect(api).toHaveBeenCalledTimes(2);
+    expect(loadMore).toBeDisabled();
+    fireEvent.click(loadMore);
+    expect(api).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      refresh.resolve({ table: first });
+      await refresh.promise;
+    });
+    expect(loadMore).toBeEnabled();
+  });
+
   it("discards an appended page when the sort changes before its response arrives", async () => {
     const stalePage = deferred<{ table: TableData }>();
     const ascending: TableData = {

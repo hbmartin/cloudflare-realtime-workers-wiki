@@ -18,14 +18,15 @@ const MANIFEST_VERSION = 2;
 const SAVE_DEBOUNCE_MS = 500;
 const HASH_BUFFER_BYTES = 1024 * 1024;
 
-function hashFile(hash, path) {
+function hashFile(path, ...hashes) {
   const metadata = lstatSync(path);
   if (!metadata.isFile()) throw new Error(`Refusing to import non-regular file ${path}.`);
   const descriptor = openSync(path, "r");
   const buffer = Buffer.allocUnsafe(HASH_BUFFER_BYTES);
   try {
     for (let bytes = readSync(descriptor, buffer, 0, buffer.length, null); bytes > 0;) {
-      hash.update(buffer.subarray(0, bytes));
+      const chunk = buffer.subarray(0, bytes);
+      for (const hash of hashes) hash.update(chunk);
       bytes = readSync(descriptor, buffer, 0, buffer.length, null);
     }
   } finally {
@@ -35,7 +36,7 @@ function hashFile(hash, path) {
 
 export function hashFileContent(path) {
   const hash = createHash("sha256");
-  hashFile(hash, path);
+  hashFile(path, hash);
   return hash.digest("hex");
 }
 
@@ -44,20 +45,21 @@ export function hashFileContent(path) {
  *
  * Resuming against a re-downloaded or edited export would map Notion ids onto pages that
  * no longer correspond to them, so a mismatch is refused rather than reconciled. The
- * fingerprint is derived from per-file digests so each file is read exactly once; the
- * digests are returned for the upload pass to reuse instead of re-hashing every asset.
+ * The aggregate preserves version 2's path-plus-raw-bytes representation. Each file is
+ * still read exactly once: the same chunks update its individual digest, which the
+ * upload pass reuses instead of re-hashing every asset.
  */
 export function fingerprintExport(root) {
   const { files } = walkExport(root);
   const digests = new Map();
   const hash = createHash("sha256");
   for (const path of files) {
-    const digest = hashFileContent(join(root, path));
-    digests.set(path, digest);
     hash.update(path);
     hash.update("\0");
-    hash.update(digest);
+    const fileHash = createHash("sha256");
+    hashFile(join(root, path), hash, fileHash);
     hash.update("\0");
+    digests.set(path, fileHash.digest("hex"));
   }
   return { fingerprint: hash.digest("hex"), digests };
 }

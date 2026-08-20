@@ -19,6 +19,16 @@ type MutationOptions = {
   resetKey?: string;
 };
 
+function changeTableLoadCount(
+  loadsInFlight: { current: number },
+  mounted: { current: boolean },
+  setBusy: (busy: boolean) => void,
+  delta: 1 | -1,
+) {
+  loadsInFlight.current += delta;
+  if (mounted.current) setBusy(loadsInFlight.current > 0);
+}
+
 const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing.";
 const LEASE_EXPIRED_MESSAGE = "The editing lease expired. Reloaded the authoritative table.";
 const LEASE_VERIFICATION_MESSAGE =
@@ -151,7 +161,7 @@ export function TablePage({
   // Pages appended past the first. While any are loaded the background poll stands
   // down, so browsing deep into a table is not yanked back to the top every 5s.
   const appendedPagesRef = useRef(0);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const [tableBusy, setTableBusy] = useState(false);
   const [title, setTitle] = useState(page.title);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [cellResetGenerations, setCellResetGenerations] = useState<Record<string, number>>({});
@@ -260,7 +270,7 @@ export function TablePage({
     async (isCurrent: IsCurrent) => {
       const generation = ++loadGenerationRef.current;
       const leaseConflictGeneration = leaseConflictGenerationRef.current;
-      loadsInFlightRef.current += 1;
+      changeTableLoadCount(loadsInFlightRef, mountedRef, setTableBusy, 1);
       try {
         const params = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
         if (sortRef.current.column) {
@@ -308,7 +318,7 @@ export function TablePage({
         }
         throw cause;
       } finally {
-        loadsInFlightRef.current -= 1;
+        changeTableLoadCount(loadsInFlightRef, mountedRef, setTableBusy, -1);
       }
     },
     [markPageUnavailable, page.id],
@@ -334,8 +344,7 @@ export function TablePage({
 
     const generation = loadGenerationRef.current;
     const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
-    loadsInFlightRef.current += 1;
-    setLoadingMore(true);
+    changeTableLoadCount(loadsInFlightRef, mountedRef, setTableBusy, 1);
     try {
       const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -362,8 +371,7 @@ export function TablePage({
         };
       });
     } finally {
-      loadsInFlightRef.current -= 1;
-      if (mountedRef.current) setLoadingMore(false);
+      changeTableLoadCount(loadsInFlightRef, mountedRef, setTableBusy, -1);
     }
   }
 
@@ -1093,7 +1101,7 @@ export function TablePage({
             {table.hasMore && (table.nextCursor || table.nextOffset !== null) && (
               <button
                 className="load-more"
-                disabled={loadingMore}
+                disabled={tableBusy}
                 onClick={() => void loadMore(table).catch(() => undefined)}
               >
                 Load more rows
