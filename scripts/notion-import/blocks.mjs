@@ -125,7 +125,24 @@ export function assignStableIds(blocks, seed) {
  * importer resumable without hashing content or marking imported pages server-side:
  * re-running over a page that already landed is free and provably a no-op.
  */
-export async function writeBlocksToFragment(editor, blocks, doc, fragmentName = DOCUMENT_FRAGMENT) {
+export class DocumentStateChangedError extends Error {
+  constructor() {
+    super("The document changed after the importer checked its contents.");
+    this.name = "DocumentStateChangedError";
+  }
+}
+
+function sameBytes(left, right) {
+  return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]);
+}
+
+export async function writeBlocksToFragment(
+  editor,
+  blocks,
+  doc,
+  fragmentName = DOCUMENT_FRAGMENT,
+  expectedStateVector = null,
+) {
   const Y = await import("yjs");
   const { prosemirrorToYXmlFragment } = await import("y-prosemirror");
   editor.replaceBlocks(editor.document, blocks);
@@ -136,6 +153,12 @@ export async function writeBlocksToFragment(editor, blocks, doc, fragmentName = 
   };
   doc.on("update", count);
   try {
+    // Hashing and recording the comparison point both yield to the event loop. Refuse
+    // the replacement if a remote Yjs update landed in that window; there are no
+    // further awaits between this check and the transaction below.
+    if (expectedStateVector && !sameBytes(Y.encodeStateVector(doc), expectedStateVector)) {
+      throw new DocumentStateChangedError();
+    }
     // The origin must not be the provider, or its update handler suppresses the
     // broadcast and the server never sees the import.
     doc.transact(() => prosemirrorToYXmlFragment(editor.prosemirrorState.doc, fragment), "notion-import");

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,6 +60,33 @@ describe("createManifest", () => {
     writeFileSync(join(files.root, "Page 11111111111111111111111111111111.html"), "<p>Fake</p>");
 
     expect(() => open(files)).toThrow(/different copy of this export/);
+  });
+
+  it("opens a legacy version 2 manifest for an unchanged export", () => {
+    const files = fixture();
+    const relativePath = "Page 11111111111111111111111111111111.html";
+    const legacyFingerprint = createHash("sha256")
+      .update(relativePath)
+      .update("\0")
+      .update(readFileSync(join(files.root, relativePath)))
+      .update("\0")
+      .digest("hex");
+    writeFileSync(
+      files.path,
+      JSON.stringify({
+        version: 2,
+        importId: "a".repeat(32),
+        startedAt: Date.now(),
+        baseURL: "https://notes.example.test",
+        workspaceId: "workspace-1",
+        exportRoot: files.root,
+        exportFingerprint: legacyFingerprint,
+        rootParentId: null,
+        nodes: {},
+      }),
+    );
+
+    expect(open(files).state.importId).toBe("a".repeat(32));
   });
 
   it("uses a random import id and explicitly rejects version 1", () => {
