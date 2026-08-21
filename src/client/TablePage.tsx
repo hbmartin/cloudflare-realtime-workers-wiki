@@ -172,6 +172,7 @@ export function TablePage({
   // "Load more rows" for the duration of each background request.
   const userLoadsInFlightRef = useRef(0);
   const mountedRef = useRef(true);
+  const mountedPageIdRef = useRef<string | null>(page.id);
   const loadGenerationRef = useRef(0);
   // Mirrors terminalPageUnavailable for async code that must not act on stale
   // render state, e.g. a queued mutation deciding whether a missing lease is
@@ -186,8 +187,10 @@ export function TablePage({
 
   useEffect(() => {
     mountedRef.current = true;
+    mountedPageIdRef.current = page.id;
     return () => {
       mountedRef.current = false;
+      if (mountedPageIdRef.current === page.id) mountedPageIdRef.current = null;
       const currentLease = leaseTokenRef.current;
       leaseTokenRef.current = null;
       leaseMonotonicDeadlineRef.current = null;
@@ -314,9 +317,12 @@ export function TablePage({
           setLeaseError((current) => (current === LEASE_CONFLICT_MESSAGE ? null : current));
         }
       } catch (cause) {
-        if (isCurrent() && generation === loadGenerationRef.current) {
-          if (isPageUnavailableError(cause)) markPageUnavailable(cause.message);
-          else setLoadError(errorMessage(cause, "Table could not be loaded."));
+        if (mountedRef.current && mountedPageIdRef.current === page.id && isPageUnavailableError(cause)) {
+          // Unlike ordinary stale responses, page deletion is terminal for every
+          // generation that still belongs to this mounted page.
+          markPageUnavailable(cause.message);
+        } else if (isCurrent() && generation === loadGenerationRef.current) {
+          setLoadError(errorMessage(cause, "Table could not be loaded."));
         }
         throw cause;
       } finally {
@@ -329,7 +335,17 @@ export function TablePage({
   // Appends the next keyset or offset page. Deliberately separate from `load`,
   // which always returns to the first page so a refresh has one predictable meaning.
   async function loadMore(currentPage: TableData) {
-    if (userLoadsInFlightRef.current || !currentPage.hasMore) return;
+    // An unknown revision means a full-page load is restoring the authoritative
+    // mutation base. Pagination must neither supersede that load nor keep future
+    // recovery polls from running.
+    if (
+      userLoadsInFlightRef.current ||
+      revisionRef.current === null ||
+      revisionRef.current !== currentPage.revision ||
+      !currentPage.hasMore
+    ) {
+      return;
+    }
 
     const params = new URLSearchParams({ limit: String(currentPage.limit) });
     if (currentPage.sort) {
@@ -360,6 +376,13 @@ export function TablePage({
         requestedSort !== activeSort ||
         tableSortKey(result.table.sort, result.table.dir) !== requestedSort
       ) {
+        return;
+      }
+      // Cursors and offsets describe one table snapshot. Never splice a newer
+      // page into older displayed rows; recover a consistent page one instead.
+      if (result.table.revision !== currentPage.revision || revisionRef.current !== currentPage.revision) {
+        invalidateRevision();
+        await load(isMounted).catch(() => undefined);
         return;
       }
       appendedPagesRef.current += 1;
@@ -601,7 +624,9 @@ export function TablePage({
     let active = true;
     const isCurrent = () => active && mountedRef.current;
     const poll = window.setInterval(() => {
-      if (!loadsInFlightRef.current && !appendedPagesRef.current) void load(isCurrent, true).catch(() => undefined);
+      if (!loadsInFlightRef.current && (!appendedPagesRef.current || revisionRef.current === null)) {
+        void load(isCurrent, true).catch(() => undefined);
+      }
     }, 5_000);
     return () => {
       active = false;
@@ -1105,7 +1130,7 @@ export function TablePage({
             {table.hasMore && (table.nextCursor || table.nextOffset !== null) && (
               <button
                 className="load-more"
-                disabled={tableBusy}
+                disabled={tableBusy || !revisionKnown}
                 onClick={() => void loadMore(table).catch(() => undefined)}
               >
                 Load more rows

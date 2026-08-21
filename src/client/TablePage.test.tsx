@@ -1549,6 +1549,76 @@ describe("TablePage", () => {
     expect(mutations[1]).toMatchObject({ expectedRevision: 7 });
   });
 
+  it("keeps appended pages from blocking revision recovery and disables pagination while it runs", async () => {
+    vi.useFakeTimers();
+    const first: TableData = {
+      ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "Ready" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 3,
+    };
+    const second: TableData = {
+      ...table,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
+      hasMore: true,
+      nextCursor: { position: 1, rowId: "row-2" },
+      rowCount: null,
+    };
+    const recovery = deferred<{ table: TableData }>();
+    let fullLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/lease") && init?.method === "DELETE") return Promise.resolve({ ok: true });
+      if (path.includes("/cells/")) {
+        return Promise.reject(new DOMException("The operation timed out.", "TimeoutError"));
+      }
+      if (path.includes("afterPosition=")) return Promise.resolve({ table: second });
+      fullLoads += 1;
+      if (fullLoads === 3) {
+        return Promise.reject(new ApiClientError(503, "table_unavailable", "Table temporarily unavailable."));
+      }
+      if (fullLoads === 4) return recovery.promise;
+      return Promise.resolve({ table: first });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Unsaved" } });
+    fireEvent.blur(input);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Editing paused while table reloads")).toBeInTheDocument();
+    const loadMore = screen.getByRole("button", { name: "Load more rows" });
+    expect(loadMore).toBeDisabled();
+    expect(fullLoads).toBe(3);
+
+    // A prior append must not suppress the poll that restores the unknown revision.
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(fullLoads).toBe(4);
+    const callsDuringRecovery = vi.mocked(api).mock.calls.length;
+    fireEvent.click(loadMore);
+    expect(api).toHaveBeenCalledTimes(callsDuringRecovery);
+
+    await act(async () => {
+      recovery.resolve({ table: tableWithValue("Authoritative", 7) });
+      await recovery.promise;
+    });
+    expect(screen.getByDisplayValue("Authoritative")).toBeEnabled();
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+  });
+
   it("keeps a save failure visible across a successful lease renewal", async () => {
     vi.useFakeTimers();
     vi.mocked(api).mockImplementation(async (path, init) => {
@@ -2078,6 +2148,94 @@ describe("TablePage", () => {
     });
     expect(screen.getByDisplayValue("One")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
+  });
+
+  it("reloads page one instead of appending rows from a different table revision", async () => {
+    const first: TableData = {
+      ...table,
+      revision: 1,
+      rows: [{ id: "row-1", position: 0, cells: { status: "Old first page" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const mismatchedPage: TableData = {
+      ...table,
+      revision: 2,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Incompatible second page" } }],
+      rowCount: null,
+    };
+    const refreshed: TableData = {
+      ...table,
+      revision: 2,
+      rows: [{ id: "row-new", position: 0, cells: { status: "Consistent first page" } }],
+      rowCount: 1,
+    };
+    vi.mocked(api)
+      .mockResolvedValueOnce({ table: first })
+      .mockResolvedValueOnce({ table: mismatchedPage })
+      .mockResolvedValueOnce({ table: refreshed });
+    renderViewer();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Consistent first page")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Old first page")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Incompatible second page")).not.toBeInTheDocument();
+    expect(api).toHaveBeenNthCalledWith(3, "/api/tables/table-page?limit=500&count=true", {
+      signal: expect.any(AbortSignal),
+    });
+  });
+
+  it("treats page deletion from a superseded background refresh as terminal", async () => {
+    vi.useFakeTimers();
+    const onPageUnavailable = vi.fn();
+    const first: TableData = {
+      ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "One" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const second: TableData = {
+      ...table,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
+      rowCount: null,
+    };
+    const refresh = deferred<{ table: TableData }>();
+    vi.mocked(api)
+      .mockResolvedValueOnce({ table: first })
+      .mockImplementationOnce(() => refresh.promise)
+      .mockResolvedValueOnce({ table: second });
+    render(
+      <TablePage
+        page={page}
+        member={member("viewer")}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={onPageUnavailable}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const loadMore = screen.getByRole("button", { name: "Load more rows" });
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    fireEvent.click(loadMore);
+    await act(async () => {});
+    expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
+
+    await act(async () => {
+      refresh.reject(new ApiClientError(404, "page_not_found", "Page not found."));
+      await refresh.promise.catch(() => undefined);
+    });
+
+    expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
+    expect(screen.getByText("Page not found.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
+    expect(api).toHaveBeenCalledTimes(3);
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(api).toHaveBeenCalledTimes(3);
   });
 
   it("discards an appended page when the sort changes before its response arrives", async () => {

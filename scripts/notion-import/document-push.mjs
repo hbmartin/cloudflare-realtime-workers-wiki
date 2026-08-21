@@ -173,7 +173,7 @@ export async function pushDocument({
   lingerMs = 1_200,
   barrierTimeoutMs = 30_000,
   expectedProjectionHashes = null,
-  beforeWrite = () => {},
+  beforeWrite = async () => {},
 }) {
   if (expectedProjectionHashes && expectedProjectionHashes.length === 0) {
     // A truthy empty list would silently conflict with every possible live hash.
@@ -201,7 +201,7 @@ export async function pushDocument({
     if (expectedProjectionHashes && !expectedProjectionHashes.includes(liveProjectionHash)) {
       return { conflict: true, liveProjectionHash };
     }
-    beforeWrite(liveProjectionHash);
+    await beforeWrite(liveProjectionHash);
     let written;
     try {
       written = await writeBlocksToFragment(editor, blocks, doc, DOCUMENT_FRAGMENT, () => remoteUpdateSeen);
