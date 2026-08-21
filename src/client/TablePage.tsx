@@ -19,16 +19,6 @@ type MutationOptions = {
   resetKey?: string;
 };
 
-function changeTableLoadCount(
-  loadsInFlight: { current: number },
-  mounted: { current: boolean },
-  setBusy: (busy: boolean) => void,
-  delta: 1 | -1,
-) {
-  loadsInFlight.current += delta;
-  if (mounted.current) setBusy(loadsInFlight.current > 0);
-}
-
 const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing.";
 const LEASE_EXPIRED_MESSAGE = "The editing lease expired. Reloaded the authoritative table.";
 const LEASE_VERIFICATION_MESSAGE =
@@ -176,6 +166,11 @@ export function TablePage({
   const pendingCellResetsRef = useRef(new Set<string>());
   const leaseConflictGenerationRef = useRef(0);
   const loadsInFlightRef = useRef(0);
+  // User-initiated loads only. The 5-second background poll counts toward
+  // loadsInFlightRef (so polls never overlap other requests) but not here: driving
+  // tableBusy from every poll tick would re-render the page and flicker-disable
+  // "Load more rows" for the duration of each background request.
+  const userLoadsInFlightRef = useRef(0);
   const mountedRef = useRef(true);
   const loadGenerationRef = useRef(0);
   // Mirrors terminalPageUnavailable for async code that must not act on stale
@@ -266,11 +261,18 @@ export function TablePage({
     setRevisionKnown(false);
   }, []);
 
+  const changeLoadCount = useCallback((delta: 1 | -1, background: boolean) => {
+    loadsInFlightRef.current += delta;
+    if (background) return;
+    userLoadsInFlightRef.current += delta;
+    if (mountedRef.current) setTableBusy(userLoadsInFlightRef.current > 0);
+  }, []);
+
   const load = useCallback(
-    async (isCurrent: IsCurrent) => {
+    async (isCurrent: IsCurrent, background = false) => {
       const generation = ++loadGenerationRef.current;
       const leaseConflictGeneration = leaseConflictGenerationRef.current;
-      changeTableLoadCount(loadsInFlightRef, mountedRef, setTableBusy, 1);
+      changeLoadCount(1, background);
       try {
         const params = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
         if (sortRef.current.column) {
@@ -318,16 +320,16 @@ export function TablePage({
         }
         throw cause;
       } finally {
-        changeTableLoadCount(loadsInFlightRef, mountedRef, setTableBusy, -1);
+        changeLoadCount(-1, background);
       }
     },
-    [markPageUnavailable, page.id],
+    [changeLoadCount, markPageUnavailable, page.id],
   );
 
   // Appends the next keyset or offset page. Deliberately separate from `load`,
   // which always returns to the first page so a refresh has one predictable meaning.
   async function loadMore(currentPage: TableData) {
-    if (loadsInFlightRef.current || !currentPage.hasMore) return;
+    if (userLoadsInFlightRef.current || !currentPage.hasMore) return;
 
     const params = new URLSearchParams({ limit: String(currentPage.limit) });
     if (currentPage.sort) {
@@ -342,9 +344,11 @@ export function TablePage({
       params.set("afterId", cursor.rowId);
     }
 
-    const generation = loadGenerationRef.current;
+    // Advancing the generation discards a background refresh still in flight, so its
+    // page-one result cannot land after this append and yank the view back to the top.
+    const generation = ++loadGenerationRef.current;
     const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
-    changeTableLoadCount(loadsInFlightRef, mountedRef, setTableBusy, 1);
+    changeLoadCount(1, false);
     try {
       const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -371,7 +375,7 @@ export function TablePage({
         };
       });
     } finally {
-      changeTableLoadCount(loadsInFlightRef, mountedRef, setTableBusy, -1);
+      changeLoadCount(-1, false);
     }
   }
 
@@ -597,7 +601,7 @@ export function TablePage({
     let active = true;
     const isCurrent = () => active && mountedRef.current;
     const poll = window.setInterval(() => {
-      if (!loadsInFlightRef.current && !appendedPagesRef.current) void load(isCurrent).catch(() => undefined);
+      if (!loadsInFlightRef.current && !appendedPagesRef.current) void load(isCurrent, true).catch(() => undefined);
     }, 5_000);
     return () => {
       active = false;

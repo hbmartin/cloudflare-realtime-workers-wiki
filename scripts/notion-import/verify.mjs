@@ -1,10 +1,9 @@
 /** Exact, read-only verification of a completed import against its local export. */
 import { setTimeout as delay } from "node:timers/promises";
 import { PAGE_TITLE_MAX } from "../../src/shared/validation.ts";
-import { projectDocument } from "../../src/shared/document-projection.ts";
-import { documentProjectionHash, tableContentHash } from "../../src/shared/import-integrity.ts";
+import { tableContentHash } from "../../src/shared/import-integrity.ts";
 import { createImportEditor } from "./blocks.mjs";
-import { documentJsonForBlocks } from "./document-push.mjs";
+import { documentJsonForBlocks, documentJsonProjectionHash } from "./document-push.mjs";
 import {
   assetUrlsFor,
   canonicalSourceTable,
@@ -25,7 +24,7 @@ export async function expectedDocumentProjectionHash({ index, page, manifest, in
     report: { issue() {}, error() {} },
     assetUrls: assets,
   });
-  return documentProjectionHash(projectDocument(await documentJsonForBlocks(editor, blocks)));
+  return documentJsonProjectionHash(await documentJsonForBlocks(editor, blocks));
 }
 
 function expectedPageMetadata(node, sourcePage, manifest) {

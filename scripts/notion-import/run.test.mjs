@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { tableContentHash } from "../../src/shared/import-integrity.ts";
+import { documentProjectionHash, tableContentHash } from "../../src/shared/import-integrity.ts";
 import {
   canonicalSourceTable,
   deterministicResourceId,
@@ -107,7 +107,6 @@ describe("runImport", () => {
     const documentPush = vi.fn(async () => ({
       conflict: true,
       liveProjectionHash: "collaborator-document",
-      updates: 0,
     }));
     const report = {
       errorCount: 0,
@@ -146,6 +145,94 @@ describe("runImport", () => {
       acceptedRemoteHash: "collaborator-document",
     });
     expect(report.issue).toHaveBeenCalledWith("destination_document_kept", "Page");
+  });
+
+  it("recovers a page whose first push failed before observing the live document", async () => {
+    const page = {
+      path: "Page.html",
+      parent: null,
+      kind: "document",
+      title: "Page",
+      assets: [],
+    };
+    const root = mkdtempSync(join(tmpdir(), "notion-run-test-"));
+    writeFileSync(join(root, page.path), '<html><body><div class="page-body"><p>Imported</p></div></body></html>');
+    const state = { importId: "a".repeat(32), nodes: {} };
+    const update = (path, patch) => {
+      state.nodes[path] = { ...state.nodes[path], ...patch };
+    };
+    const manifest = {
+      state,
+      node: (path) => state.nodes[path] ?? null,
+      record: vi.fn(update),
+      recordNow: vi.fn(update),
+      flush: vi.fn(),
+    };
+    const report = {
+      errorCount: 0,
+      error: vi.fn(),
+      issue: vi.fn(),
+      progress: vi.fn(),
+      inPage: vi.fn(),
+    };
+    const index = {
+      pages: [page],
+      root,
+      pagesByPath: new Map([[page.path, page]]),
+      assetsByPath: new Map(),
+      byPath: new Map([[page.path, [page]]]),
+      assetIndex: new Map(),
+    };
+    const client = {
+      createPages: vi.fn(async (pages) => pages.map(({ id }) => ({ id, contentEpoch: 1 }))),
+      pageVerification: vi.fn(async () => ({
+        page: { kind: "document", title: "Page", parentId: null, contentEpoch: 1 },
+      })),
+      listAttachments: vi.fn(async () => []),
+    };
+    const emptyHash = await documentProjectionHash({ plainText: "", pageReferences: [], memberMentions: [] });
+
+    // Run 1: the connection times out before pushDocument's beforeWrite could observe
+    // the live document, so no base was captured for this attempt. The failure record
+    // must fall back to the empty document a fresh page is known to hold, or every
+    // later run would misread the untouched destination as a collaborator edit.
+    await runImport({
+      index,
+      client,
+      manifest,
+      report,
+      rootParentId: null,
+      limit: 1,
+      lingerMs: 0,
+      documentPush: vi.fn(async () => {
+        throw new Error("Timed out waiting for the document to sync.");
+      }),
+    });
+    expect(report.error).toHaveBeenCalledWith("content_failed", expect.stringContaining("Timed out"));
+    expect(state.nodes[page.path].content).toMatchObject({
+      status: "failed",
+      projectionHash: expect.stringMatching(/^[a-f\d]{64}$/),
+      baseRemoteHash: emptyHash,
+    });
+
+    // Run 2: the still-empty destination matches the recorded base, so the retry writes.
+    const documentPush = vi.fn(async ({ expectedProjectionHashes, beforeWrite }) => {
+      expect(expectedProjectionHashes).toContain(emptyHash);
+      beforeWrite(emptyHash);
+      return { updates: 1, byteLength: 1 };
+    });
+    await runImport({
+      index,
+      client,
+      manifest,
+      report,
+      rootParentId: null,
+      limit: 1,
+      lingerMs: 0,
+      documentPush,
+    });
+    expect(documentPush).toHaveBeenCalledTimes(1);
+    expect(state.nodes[page.path].content).toMatchObject({ status: "written" });
   });
 
   it("names the database when table batch planning fails", async () => {
@@ -218,7 +305,7 @@ describe("reconcileCommitted", () => {
     expect(report.error).not.toHaveBeenCalled();
   });
 
-  it("accepts destination edits independently for metadata, content, and attachments", async () => {
+  it("accepts destination metadata and attachment edits and leaves content to the write pass", async () => {
     const page = { path: "Page.html", kind: "document", title: "Page" };
     const state = {
       nodes: {
@@ -256,7 +343,6 @@ describe("reconcileCommitted", () => {
       client: {
         pageVerification: vi.fn(async () => ({
           page: { kind: "document", title: "Edited", parentId: "other-parent" },
-          projectionHash: "remote-document",
         })),
         listAttachments: vi.fn(async () => [
           {
@@ -268,15 +354,15 @@ describe("reconcileCommitted", () => {
           },
         ]),
       },
-      documentHash: vi.fn(async () => "remote-document"),
     });
 
     expect(state.nodes[page.path].expectedPage).toMatchObject({
       acceptedRemoteTitle: "Edited",
       acceptedRemoteParentId: "other-parent",
     });
-    expect(state.nodes[page.path].content.status).toBe("destination-owned");
-    expect(state.nodes[page.path].content.acceptedRemoteHash).toBe("remote-document");
+    // Content is not classified here: the write pass compares the live document inside
+    // pushDocument's own connection, so reconciliation must leave the record alone.
+    expect(state.nodes[page.path].content).toEqual({ status: "written", projectionHash: "local-document" });
     expect(state.nodes[page.path].assets["asset.txt"].acceptedRemote.contentSha256).toBe("remote-asset");
     expect(report.error).not.toHaveBeenCalled();
   });
@@ -474,6 +560,213 @@ describe("reconcileCommitted", () => {
       phase: "complete",
       rowOffset: 1,
       columnsByRef: { c0: "column-1" },
+    });
+  });
+
+  it("recovers a table left several batches ahead by a manifest that lost checkpoints", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const state = {
+      importId: "a".repeat(32),
+      nodes: {
+        [page.path]: {
+          pageId: "page-1",
+          expectedPage: { kind: "table", title: "Table", parentId: null },
+          table: {
+            phase: "columns",
+            revision: 1,
+            columnOffset: 0,
+            rowOffset: 0,
+            columnsByRef: {},
+            expectedColumns: 1,
+            expectedRows: 1,
+            contentHash: plan.contentHash,
+          },
+        },
+      },
+    };
+    const update = (path, patch) => {
+      state.nodes[path] = { ...state.nodes[path], ...patch };
+    };
+    const manifest = {
+      state,
+      node: (path) => state.nodes[path],
+      record: vi.fn(update),
+      recordNow: vi.fn(update),
+    };
+    // Both the column batch and the row batch committed (live matches the full source
+    // at revision 3 = 1 + two batches), but neither checkpoint reached the manifest.
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 3, contentHash: plan.contentHash, rowCount: 1 })),
+      acquireTableLease: vi.fn(async () => ({ leaseToken: "reconcile-lease" })),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(async () => ({
+        revision: 2,
+        columns: [{ ref: "c0", id: "column-1" }],
+        rows: [],
+        replayed: true,
+      })),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    // Only the column batch is replayed - its response is the sole source of the
+    // generated ids. The row batch advances by content match alone.
+    expect(client.bulkTableWrite).toHaveBeenCalledTimes(1);
+    expect(client.bulkTableWrite).toHaveBeenCalledWith(
+      "page-1",
+      expect.objectContaining({ expectedRevision: 1, clientRequestId: expect.stringContaining(":columns:0:") }),
+    );
+    expect(state.nodes[page.path].table).toMatchObject({
+      revision: 3,
+      columnOffset: 1,
+      rowOffset: 1,
+      columnsByRef: { c0: "column-1" },
+    });
+    expect(report.issue).not.toHaveBeenCalled();
+    expect(report.error).not.toHaveBeenCalled();
+  });
+
+  it("fails only the table when the recovery replay cannot take the lease", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const committedColumn = canonicalSourceTable(table, 1, 0);
+    const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
+    const state = {
+      importId: "a".repeat(32),
+      nodes: {
+        [page.path]: {
+          pageId: "page-1",
+          expectedPage: { kind: "table", title: "Table", parentId: null },
+          table: {
+            phase: "columns",
+            revision: 1,
+            columnOffset: 0,
+            rowOffset: 0,
+            columnsByRef: {},
+            expectedColumns: 1,
+            expectedRows: 1,
+            contentHash: plan.contentHash,
+          },
+        },
+      },
+    };
+    const update = (path, patch) => {
+      state.nodes[path] = { ...state.nodes[path], ...patch };
+    };
+    const manifest = {
+      state,
+      node: (path) => state.nodes[path],
+      record: vi.fn(update),
+      recordNow: vi.fn(update),
+    };
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
+      acquireTableLease: vi.fn(async () => {
+        throw Object.assign(new Error("Another editor currently holds this table lease."), { status: 409 });
+      }),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    // A held lease is transient, so the run must not abort and the table must not be
+    // frozen as destination-owned: untouched offsets let the next attempt retry.
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(report.error).toHaveBeenCalledWith("table_failed", expect.stringContaining("Table"));
+    expect(report.issue).not.toHaveBeenCalled();
+    expect(client.bulkTableWrite).not.toHaveBeenCalled();
+    expect(state.nodes[page.path].table).toMatchObject({ phase: "columns", columnOffset: 0, rowOffset: 0 });
+    expect(state.nodes[page.path].tableError).toContain("lease");
+  });
+
+  it("keeps the destination when content matches an own batch but the revision moved past it", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const committedColumn = canonicalSourceTable(table, 1, 0);
+    const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
+    const state = {
+      importId: "a".repeat(32),
+      nodes: {
+        [page.path]: {
+          pageId: "page-1",
+          expectedPage: { kind: "table", title: "Table", parentId: null },
+          table: {
+            phase: "columns",
+            revision: 1,
+            columnOffset: 0,
+            rowOffset: 0,
+            columnsByRef: {},
+            expectedColumns: 1,
+            expectedRows: 1,
+            contentHash: plan.contentHash,
+          },
+        },
+      },
+    };
+    const update = (path, patch) => {
+      state.nodes[path] = { ...state.nodes[path], ...patch };
+    };
+    const manifest = {
+      state,
+      node: (path) => state.nodes[path],
+      record: vi.fn(update),
+      recordNow: vi.fn(update),
+    };
+    // Content equals the committed column batch, but revision 4 !== 1 + one batch: a
+    // destination edit was made and undone, so the table belongs to the destination.
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 4, contentHash: committedColumnHash, rowCount: 0 })),
+      acquireTableLease: vi.fn(),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(client.acquireTableLease).not.toHaveBeenCalled();
+    expect(report.issue).toHaveBeenCalledWith("destination_table_kept", "Table");
+    expect(report.error).not.toHaveBeenCalled();
+    expect(state.nodes[page.path].table).toMatchObject({
+      phase: "complete",
+      acceptedRemoteHash: committedColumnHash,
+      acceptedRemoteRowCount: 0,
     });
   });
 });

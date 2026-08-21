@@ -89,6 +89,38 @@ describe("createManifest", () => {
     expect(open(files).state.importId).toBe("a".repeat(32));
   });
 
+  it("opens a version 2 manifest whose fingerprint hashed per-file digests", () => {
+    // The digest-based aggregate also shipped stamped version 2, so manifests written
+    // by that importer must resume rather than be refused as a different export copy.
+    const files = fixture();
+    const relativePath = "Page 11111111111111111111111111111111.html";
+    const digest = createHash("sha256")
+      .update(readFileSync(join(files.root, relativePath)))
+      .digest("hex");
+    const digestFingerprint = createHash("sha256")
+      .update(relativePath)
+      .update("\0")
+      .update(digest)
+      .update("\0")
+      .digest("hex");
+    writeFileSync(
+      files.path,
+      JSON.stringify({
+        version: 2,
+        importId: "b".repeat(32),
+        startedAt: Date.now(),
+        baseURL: "https://notes.example.test",
+        workspaceId: "workspace-1",
+        exportRoot: files.root,
+        exportFingerprint: digestFingerprint,
+        rootParentId: null,
+        nodes: {},
+      }),
+    );
+
+    expect(open(files).state.importId).toBe("b".repeat(32));
+  });
+
   it("uses a random import id and explicitly rejects version 1", () => {
     const first = fixture();
     const manifest = open(first);

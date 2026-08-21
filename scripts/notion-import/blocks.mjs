@@ -132,16 +132,12 @@ export class DocumentStateChangedError extends Error {
   }
 }
 
-function sameBytes(left, right) {
-  return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]);
-}
-
 export async function writeBlocksToFragment(
   editor,
   blocks,
   doc,
   fragmentName = DOCUMENT_FRAGMENT,
-  expectedStateVector = null,
+  documentChanged = null,
 ) {
   const Y = await import("yjs");
   const { prosemirrorToYXmlFragment } = await import("y-prosemirror");
@@ -153,10 +149,11 @@ export async function writeBlocksToFragment(
   };
   doc.on("update", count);
   try {
-    // Hashing and recording the comparison point both yield to the event loop. Refuse
-    // the replacement if a remote Yjs update landed in that window; there are no
-    // further awaits between this check and the transaction below.
-    if (expectedStateVector && !sameBytes(Y.encodeStateVector(doc), expectedStateVector)) {
+    // Hashing and recording the comparison point both yield to the event loop. The
+    // caller reports through this predicate whether any remote update - including a
+    // delete-only one, which a state-vector comparison cannot see - landed since its
+    // baseline; there are no further awaits between this check and the transaction.
+    if (documentChanged?.()) {
       throw new DocumentStateChangedError();
     }
     // The origin must not be the provider, or its update handler suppresses the
