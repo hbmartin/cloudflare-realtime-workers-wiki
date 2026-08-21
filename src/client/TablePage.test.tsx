@@ -2033,35 +2033,51 @@ describe("TablePage", () => {
     expect(await screen.findByDisplayValue("Two")).toBeInTheDocument();
   });
 
-  it("disables load more while a background table refresh is active", async () => {
+  it("keeps load more clickable during a background refresh and discards the stale refresh", async () => {
     vi.useFakeTimers();
     const first: TableData = {
       ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "One" } }],
       hasMore: true,
-      nextCursor: { position: 0, rowId: "row" },
+      nextCursor: { position: 0, rowId: "row-1" },
       rowCount: 2,
     };
     const refresh = deferred<{ table: TableData }>();
     vi.mocked(api)
       .mockResolvedValueOnce({ table: first })
-      .mockImplementationOnce(() => refresh.promise);
+      .mockImplementationOnce(() => refresh.promise)
+      .mockResolvedValueOnce({
+        table: {
+          ...table,
+          rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
+          hasMore: false,
+          nextCursor: null,
+          rowCount: 2,
+        },
+      });
     renderViewer();
     await act(() => vi.advanceTimersByTimeAsync(0));
     const loadMore = screen.getByRole("button", { name: "Load more rows" });
     expect(loadMore).toBeEnabled();
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
-
     expect(api).toHaveBeenCalledTimes(2);
-    expect(loadMore).toBeDisabled();
+
+    // The background poll neither disables the button nor swallows the click.
+    expect(loadMore).toBeEnabled();
     fireEvent.click(loadMore);
-    expect(api).toHaveBeenCalledTimes(2);
+    expect(api).toHaveBeenCalledTimes(3);
+    await act(async () => {});
+    expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
 
+    // The poll's page-one response lands after the append and must be discarded, not
+    // yank the view back to the first page.
     await act(async () => {
       refresh.resolve({ table: first });
       await refresh.promise;
     });
-    expect(loadMore).toBeEnabled();
+    expect(screen.getByDisplayValue("One")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
   });
 
   it("discards an appended page when the sort changes before its response arrives", async () => {

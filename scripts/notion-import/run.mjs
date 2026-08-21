@@ -22,12 +22,11 @@ import {
 } from "../../src/shared/table-limits.ts";
 import { PAGE_TITLE_MAX } from "../../src/shared/validation.ts";
 import { MAX_ATTACHMENT_BYTES } from "../../src/worker/attachments.ts";
-import { projectDocument } from "../../src/shared/document-projection.ts";
 import { documentProjectionHash, tableContentHash } from "../../src/shared/import-integrity.ts";
 import { assignStableIds, createImportEditor, htmlToBlocks } from "./blocks.mjs";
 import { readPageHtml, resolveLink } from "./export-tree.mjs";
 import { normalizeNotionHtml } from "./normalize-html.mjs";
-import { documentJsonForBlocks, pushDocument, readDocumentJson } from "./document-push.mjs";
+import { documentJsonForBlocks, documentJsonProjectionHash, pushDocument } from "./document-push.mjs";
 import { tableFromCsv } from "./csv.mjs";
 import { hashFileContent } from "./manifest.mjs";
 
@@ -331,12 +330,6 @@ function expectedPageFor(page, manifest, rootParentId) {
   };
 }
 
-/** Accepts post-import destination edits facet-by-facet without hiding deletions. */
-async function currentDocumentProjectionHash(client, pageId, contentEpoch) {
-  const document = await readDocumentJson({ client, pageId, epoch: contentEpoch });
-  return documentProjectionHash(projectDocument(document));
-}
-
 /**
  * The table state exactly one committed bulk batch ahead of the manifest, or null when
  * no further batch exists. A process killed between the server's commit and the
@@ -379,18 +372,65 @@ function mergeColumnMap(columnsByRef, requestedColumns, result) {
   return merged;
 }
 
-async function replayCommittedColumnBatch({ client, manifest, database, pageId, revision, offset, columns }) {
+/**
+ * The exact body of a column bulk write. The server keys its idempotency receipt on the
+ * clientRequestId and a hash over {columns, rows}, so the original send in importTable
+ * and the recovery replay in reconcileCommitted must construct byte-identical requests;
+ * that is why both go through this one builder.
+ */
+function columnBatchRequest(manifest, database, { leaseToken, revision, offset, columns }) {
+  return {
+    leaseToken,
+    expectedRevision: revision,
+    clientRequestId: tableRequestId(manifest, database, "columns", offset),
+    columns,
+    rows: [],
+  };
+}
+
+async function withTableLease(client, pageId, action) {
   const lease = await client.acquireTableLease(pageId);
   try {
-    return await client.bulkTableWrite(pageId, {
-      leaseToken: lease.leaseToken,
-      expectedRevision: revision,
-      clientRequestId: tableRequestId(manifest, database, "columns", offset),
-      columns,
-      rows: [],
-    });
+    return await action(lease.leaseToken);
   } finally {
     await client.releaseTableLease(pageId, lease.leaseToken).catch(() => undefined);
+  }
+}
+
+/** A replayed receipt that contradicts the live table: destination interference. */
+class ColumnReceiptMismatchError extends Error {
+  constructor() {
+    super("The recovered column receipt does not match the live table revision.");
+    this.name = "ColumnReceiptMismatchError";
+  }
+}
+
+/**
+ * The batches this import committed beyond what the manifest recorded, or null when the
+ * live table matches no committed prefix. Ordinarily a kill between the server commit
+ * and the recordNow checkpoint leaves the live table exactly one batch ahead, but a
+ * manifest written by an importer that debounced these checkpoints can trail by
+ * several, so the walk continues until the live content is reproduced.
+ */
+async function advancedCommitMatch(plan, columnOffset, rowOffset, live) {
+  const columnBatches = [];
+  let steps = 0;
+  let nextColumnOffset = columnOffset;
+  let nextRowOffset = rowOffset;
+  while (true) {
+    const next = await advancedCommitFor(plan, nextColumnOffset, nextRowOffset);
+    // Row offsets only grow, so once the live count falls behind a candidate no later
+    // prefix can match either; stopping bounds the walk on destination-edited tables.
+    if (!next || live.rowCount < next.rowOffset) return null;
+    steps += 1;
+    if (next.columnOffset > nextColumnOffset) {
+      columnBatches.push({ offset: nextColumnOffset, endOffset: next.columnOffset, step: steps });
+    }
+    if (live.contentHash === next.contentHash && live.rowCount === next.rowOffset) {
+      return { columnOffset: next.columnOffset, rowOffset: next.rowOffset, steps, columnBatches };
+    }
+    nextColumnOffset = next.columnOffset;
+    nextRowOffset = next.rowOffset;
   }
 }
 
@@ -400,7 +440,6 @@ export async function reconcileCommitted({
   manifest,
   report,
   tablePlans = new Map(),
-  documentHash = currentDocumentProjectionHash,
   skipPaths = new Set(),
 }) {
   for (const page of selected) {
@@ -453,27 +492,11 @@ export async function reconcileCommitted({
       remoteKindMismatch: null,
     };
 
-    if (page.kind === "document" && node.content?.projectionHash) {
-      const content = { ...node.content };
-      // The indexed projection can lag a durable WebSocket write until compaction.
-      // Reconcile against the live Yjs document so an interrupted run cannot mistake
-      // its own unindexed write for a destination edit and accept stale content.
-      const liveHash = await documentHash(client, pageId, livePage.contentEpoch);
-      if (liveHash !== content.projectionHash) {
-        // An interrupted own write keeps its 'writing'/'failed' marker: only the write
-        // pass can tell a never-landed write (live still equals the recorded base)
-        // from a destination edit, and its recovery check needs that status intact.
-        if (content.status !== "writing" && content.status !== "failed") {
-          content.status = "destination-owned";
-          content.acceptedRemoteHash = liveHash;
-          report.issue("destination_document_kept", page.title);
-        }
-      } else {
-        if (content.status === "destination-owned") content.status = "unchanged";
-        delete content.acceptedRemoteHash;
-      }
-      patch.content = content;
-    }
+    // Document content is deliberately not reconciled here. The write pass compares
+    // the live document against its expected bases inside pushDocument's own
+    // synchronized connection and fully re-derives the conflict classification, so a
+    // read here would cost one WebSocket sync per resumed document to compute a result
+    // the write pass immediately overwrites.
 
     if (node.assets) {
       const remoteAssets = new Map((await client.listAttachments(pageId)).map((asset) => [asset.id, asset]));
@@ -529,49 +552,72 @@ export async function reconcileCommitted({
             rowOffset,
             columnsByRef: progress?.columnsByRef ?? {},
           };
-          // A process killed after the server committed a bulk batch but before the
-          // manifest recorded it leaves the live table exactly one batch ahead. That
-          // is this import's own write, so the offsets advance and the run resumes.
-          const advanced = complete ? null : await advancedCommitFor(plan, columnOffset, rowOffset);
-          if (matchesLastCommit) {
-            delete table.acceptedRemoteHash;
-            delete table.acceptedRemoteRowCount;
-          } else if (advanced && live.contentHash === advanced.contentHash && live.rowCount === advanced.rowOffset) {
-            if (advanced.columnOffset > columnOffset) {
-              // The response is the only durable source of the generated column ids.
-              // Replaying the deterministic request returns its stored receipt before
-              // lease or revision guards, without creating a second column batch.
-              const columns = source.columns.slice(columnOffset, advanced.columnOffset);
-              const replayed = await replayCommittedColumnBatch({
-                client,
-                manifest,
-                database: page,
-                pageId,
-                revision: table.revision,
-                offset: columnOffset,
-                columns,
-              });
-              if (!replayed.replayed || replayed.revision !== live.revision) {
-                throw new Error("The recovered column receipt does not match the live table revision.");
-              }
-              table.columnsByRef = mergeColumnMap(table.columnsByRef, columns, replayed);
-            }
-            table.columnOffset = advanced.columnOffset;
-            table.rowOffset = advanced.rowOffset;
-            table.revision = live.revision;
-            delete table.acceptedRemoteHash;
-            delete table.acceptedRemoteRowCount;
-          } else {
-            // Destination edits win the whole table facet, including when they race an
-            // incomplete import. Stop further batches so user-owned rows are never
-            // combined with the remaining source rows into a hybrid table.
+          patch.table = table;
+          patch.tableError = null;
+          // Destination edits win the whole table facet, including when they race an
+          // incomplete import. Stop further batches so user-owned rows are never
+          // combined with the remaining source rows into a hybrid table.
+          const keepDestinationTable = () => {
             table.phase = "complete";
             table.acceptedRemoteHash = live.contentHash;
             table.acceptedRemoteRowCount = live.rowCount;
             report.issue("destination_table_kept", page.title);
+          };
+          // A process killed after the server committed bulk batches but before the
+          // manifest recorded them leaves the live table ahead by those batches. They
+          // are this import's own writes, so the offsets advance and the run resumes.
+          // Every bulk write advances the revision by exactly one, so a live revision
+          // beyond the base plus the matched batches means the destination was edited
+          // even though the content coincides (an edit undone), not an own write.
+          const advanced =
+            complete || matchesLastCommit ? null : await advancedCommitMatch(plan, columnOffset, rowOffset, live);
+          if (matchesLastCommit) {
+            delete table.acceptedRemoteHash;
+            delete table.acceptedRemoteRowCount;
+          } else if (advanced && live.revision === table.revision + advanced.steps) {
+            try {
+              if (advanced.columnBatches.length > 0) {
+                // The response is the only durable source of the generated column ids.
+                // Replaying each deterministic request returns its stored receipt
+                // before lease or revision guards, without a second column batch.
+                await withTableLease(client, pageId, async (leaseToken) => {
+                  for (const batch of advanced.columnBatches) {
+                    const columns = source.columns.slice(batch.offset, batch.endOffset);
+                    const replayed = await client.bulkTableWrite(
+                      pageId,
+                      columnBatchRequest(manifest, page, {
+                        leaseToken,
+                        revision: table.revision + batch.step - 1,
+                        offset: batch.offset,
+                        columns,
+                      }),
+                    );
+                    if (!replayed.replayed || replayed.revision !== table.revision + batch.step) {
+                      throw new ColumnReceiptMismatchError();
+                    }
+                    table.columnsByRef = mergeColumnMap(table.columnsByRef, columns, replayed);
+                  }
+                });
+              }
+              table.columnOffset = advanced.columnOffset;
+              table.rowOffset = advanced.rowOffset;
+              table.revision = live.revision;
+              delete table.acceptedRemoteHash;
+              delete table.acceptedRemoteRowCount;
+            } catch (error) {
+              if (error instanceof ColumnReceiptMismatchError) {
+                keepDestinationTable();
+              } else {
+                // A held lease or a transient failure classifies nothing. Leave the
+                // recorded offsets untouched so a later run retries cleanly, and fail
+                // this table alone rather than aborting every page in the run.
+                patch.tableError = errorMessage(error);
+                report.error("table_failed", `${page.title}: ${errorMessage(error)}`);
+              }
+            }
+          } else {
+            keepDestinationTable();
           }
-          patch.table = table;
-          patch.tableError = null;
         }
       } catch (error) {
         if (error?.status !== 404) throw error;
@@ -643,7 +689,7 @@ export async function runImport({
   }
   manifest.state.selectedPaths = selectedPaths;
   // Paths this run is the first to plan. They have no committed server state, so
-  // reconciliation skips them and the content pass knows their documents start empty.
+  // reconciliation skips them; probing each would be one guaranteed 404 per page.
   const freshPaths = new Set();
   for (const page of selected) {
     const expectedPage = expectedPages.get(page);
@@ -791,10 +837,12 @@ export async function runImport({
     }
     let projectionHash = null;
     let baseRemoteHash = null;
+    // Captured before any write can replace the record: the catch below carries this
+    // run's recovery knowledge forward from what earlier runs had established.
+    const prior = record.content;
     try {
       const blocks = await convertDocument({ index, page, manifest, included, editor, report, assetUrls });
-      projectionHash = await documentProjectionHash(projectDocument(await documentJsonForBlocks(editor, blocks)));
-      const prior = record.content;
+      projectionHash = await documentJsonProjectionHash(await documentJsonForBlocks(editor, blocks));
       const expectedBeforeWrite = prior?.projectionHash ?? (await EMPTY_DOCUMENT_PROJECTION_HASH);
       const expectedProjectionHashes = [expectedBeforeWrite];
       if ((prior?.status === "writing" || prior?.status === "failed") && prior.baseRemoteHash) {
@@ -819,12 +867,14 @@ export async function runImport({
         },
       });
       if (result.conflict) {
-        baseRemoteHash = result.liveProjectionHash;
+        // baseRemoteHash stays owned by beforeWrite: recording the destination's hash
+        // there would let a later failure persist it as a writable base, and the next
+        // run would overwrite the very edit this branch exists to keep.
         manifest.record(keyOf(page), {
           content: {
             status: "destination-owned",
             projectionHash,
-            acceptedRemoteHash: baseRemoteHash,
+            acceptedRemoteHash: result.liveProjectionHash,
           },
           contentError: null,
         });
@@ -840,11 +890,22 @@ export async function runImport({
       });
       if (result.updates > 0) written += 1;
     } catch (error) {
+      // A push that failed before its connection synced never observed the live
+      // document, so beforeWrite recorded no base for this attempt. Without one the
+      // next run could not tell the untouched destination from an edit and would
+      // permanently keep it, so the base falls back to what is already known: a prior
+      // attempt's base, the last content this import wrote, or - for a page that has
+      // never held content - the empty document.
+      const fallbackBase =
+        baseRemoteHash ??
+        prior?.baseRemoteHash ??
+        (prior?.status === "written" || prior?.status === "unchanged" ? prior.projectionHash : null) ??
+        (prior ? null : await EMPTY_DOCUMENT_PROJECTION_HASH);
       manifest.record(keyOf(page), {
         content: {
           status: "failed",
           ...(projectionHash ? { projectionHash } : {}),
-          ...(baseRemoteHash ? { baseRemoteHash } : {}),
+          ...(fallbackBase ? { baseRemoteHash: fallbackBase } : {}),
         },
         contentError: errorMessage(error),
       });
@@ -926,8 +987,7 @@ export async function importTable({ index, client, manifest, report, database, r
     return 0;
   }
 
-  const lease = await client.acquireTableLease(record.pageId);
-  try {
+  await withTableLease(client, record.pageId, async (leaseToken) => {
     let progress = record.table;
     if (!progress) {
       const live = (await client.readTable(record.pageId)).table;
@@ -959,13 +1019,10 @@ export async function importTable({ index, client, manifest, report, database, r
     while (progress.columnOffset < table.columns.length) {
       const offset = progress.columnOffset;
       const columns = table.columns.slice(offset, offset + TABLE_BULK_MAX_COLUMNS);
-      const result = await client.bulkTableWrite(record.pageId, {
-        leaseToken: lease.leaseToken,
-        expectedRevision: progress.revision,
-        clientRequestId: tableRequestId(manifest, database, "columns", offset),
-        columns,
-        rows: [],
-      });
+      const result = await client.bulkTableWrite(
+        record.pageId,
+        columnBatchRequest(manifest, database, { leaseToken, revision: progress.revision, offset, columns }),
+      );
       progress = {
         ...progress,
         revision: result.revision,
@@ -987,7 +1044,7 @@ export async function importTable({ index, client, manifest, report, database, r
       if (!batch) throw new Error(`Saved row offset ${progress.rowOffset} is not a valid batch boundary.`);
       const rows = table.rows.slice(batch.start, batch.end).map((row) => mapRow(row, columnIds));
       const body = {
-        leaseToken: lease.leaseToken,
+        leaseToken,
         expectedRevision: progress.revision,
         clientRequestId: tableRequestId(manifest, database, "rows", batch.start),
         columns: [],
@@ -1011,8 +1068,6 @@ export async function importTable({ index, client, manifest, report, database, r
     }
     progress = { ...progress, phase: "complete" };
     manifest.record(keyOf(database), { table: progress, tableError: null });
-  } finally {
-    await client.releaseTableLease(record.pageId, lease.leaseToken).catch(() => undefined);
-  }
+  });
   return table.rows.length;
 }

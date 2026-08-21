@@ -44,28 +44,36 @@ export function hashFileContent(path) {
  * Identifies the export a manifest belongs to.
  *
  * Resuming against a re-downloaded or edited export would map Notion ids onto pages that
- * no longer correspond to them, so a mismatch is refused rather than reconciled. The
- * The aggregate preserves version 2's path-plus-raw-bytes representation. Each file is
- * still read exactly once: the same chunks update its individual digest, which the
- * upload pass reuses instead of re-hashing every asset.
+ * no longer correspond to them, so a mismatch is refused rather than reconciled. Two
+ * aggregate representations shipped under version 2 - path-plus-raw-bytes and
+ * path-plus-hex-digest - so both are computed and a manifest holding either is accepted;
+ * new manifests record the raw-bytes form. Each file is still read exactly once: the
+ * same chunks update its individual digest, which the upload pass reuses instead of
+ * re-hashing every asset.
  */
 export function fingerprintExport(root) {
   const { files } = walkExport(root);
   const digests = new Map();
   const hash = createHash("sha256");
+  const digestAggregate = createHash("sha256");
   for (const path of files) {
     hash.update(path);
     hash.update("\0");
     const fileHash = createHash("sha256");
     hashFile(join(root, path), hash, fileHash);
     hash.update("\0");
-    digests.set(path, fileHash.digest("hex"));
+    const digest = fileHash.digest("hex");
+    digests.set(path, digest);
+    digestAggregate.update(path);
+    digestAggregate.update("\0");
+    digestAggregate.update(digest);
+    digestAggregate.update("\0");
   }
-  return { fingerprint: hash.digest("hex"), digests };
+  return { fingerprint: hash.digest("hex"), digestFingerprint: digestAggregate.digest("hex"), digests };
 }
 
 export function createManifest({ path, root, baseURL, workspaceId, rootParentId, adoptRootParent = false }) {
-  const { fingerprint, digests } = fingerprintExport(root);
+  const { fingerprint, digestFingerprint, digests } = fingerprintExport(root);
   let state;
 
   if (existsSync(path)) {
@@ -97,7 +105,7 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId,
     if (!/^[0-9a-f]{32}$/.test(state.importId ?? "")) {
       throw new Error(`${path} does not contain a valid version 2 import id. Move it aside to start over.`);
     }
-    if (state.exportFingerprint !== fingerprint) {
+    if (state.exportFingerprint !== fingerprint && state.exportFingerprint !== digestFingerprint) {
       throw new Error(
         `${path} belongs to a different copy of this export. Move it aside to start over, ` +
           "or point the importer at the directory it was created from.",

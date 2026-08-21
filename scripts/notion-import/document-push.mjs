@@ -102,11 +102,24 @@ function closeProvider(provider, doc, pageId) {
   }
 }
 
+function fragmentJson(doc) {
+  return yXmlFragmentToProsemirrorJSON(doc.getXmlFragment(DOCUMENT_FRAGMENT));
+}
+
+/**
+ * Projection hash of a ProseMirror document JSON. This hash is the importer's
+ * conflict-detection currency: every comparison assumes each side was computed through
+ * this exact pipeline, so it lives here rather than being recomposed at each call site.
+ */
+export function documentJsonProjectionHash(document) {
+  return documentProjectionHash(projectDocument(document));
+}
+
 export async function documentJsonForBlocks(editor, blocks) {
   const doc = new Y.Doc();
   try {
     await writeBlocksToFragment(editor, blocks, doc);
-    return yXmlFragmentToProsemirrorJSON(doc.getXmlFragment(DOCUMENT_FRAGMENT));
+    return fragmentJson(doc);
   } finally {
     doc.destroy();
   }
@@ -118,14 +131,14 @@ export async function readDocumentJson({ client, pageId, epoch }) {
   try {
     await provider.connect();
     await waitForSync(provider);
-    return yXmlFragmentToProsemirrorJSON(doc.getXmlFragment(DOCUMENT_FRAGMENT));
+    return fragmentJson(doc);
   } finally {
     closeProvider(provider, doc, pageId);
   }
 }
 
 function currentProjectionHash(doc) {
-  return documentProjectionHash(projectDocument(yXmlFragmentToProsemirrorJSON(doc.getXmlFragment(DOCUMENT_FRAGMENT))));
+  return documentJsonProjectionHash(fragmentJson(doc));
 }
 
 /**
@@ -162,28 +175,44 @@ export async function pushDocument({
   expectedProjectionHashes = null,
   beforeWrite = () => {},
 }) {
+  if (expectedProjectionHashes && expectedProjectionHashes.length === 0) {
+    // A truthy empty list would silently conflict with every possible live hash.
+    throw new Error("expectedProjectionHashes must be null or contain at least one hash.");
+  }
   const doc = new Y.Doc();
   const provider = createProvider(client, pageId, epoch, doc);
 
   try {
     await provider.connect();
     await waitForSync(provider);
-    // Compare and replace through one synchronized Y.Doc. The state vector closes the
+    // Compare and replace through one synchronized Y.Doc. The update flag closes the
     // remaining async window: if another client writes while the hash is calculated or
-    // its baseline is persisted, writeBlocksToFragment refuses the transaction.
-    const stateVector = Y.encodeStateVector(doc);
-    let liveProjectionHash = await currentProjectionHash(doc);
+    // its baseline is persisted, writeBlocksToFragment refuses the transaction. A flag
+    // rather than a state-vector comparison, because a delete-only edit advances no
+    // insertion clock but still fires the update event.
+    let remoteUpdateSeen = false;
+    const markRemoteUpdate = () => {
+      remoteUpdateSeen = true;
+    };
+    doc.on("update", markRemoteUpdate);
+    // The doc is read synchronously when the call is evaluated, so the listener above
+    // and this baseline describe the same state.
+    const liveProjectionHash = await currentProjectionHash(doc);
     if (expectedProjectionHashes && !expectedProjectionHashes.includes(liveProjectionHash)) {
-      return { conflict: true, liveProjectionHash, updates: 0 };
+      return { conflict: true, liveProjectionHash };
     }
     beforeWrite(liveProjectionHash);
     let written;
     try {
-      written = await writeBlocksToFragment(editor, blocks, doc, DOCUMENT_FRAGMENT, stateVector);
+      written = await writeBlocksToFragment(editor, blocks, doc, DOCUMENT_FRAGMENT, () => remoteUpdateSeen);
     } catch (error) {
       if (!(error instanceof DocumentStateChangedError)) throw error;
-      liveProjectionHash = await currentProjectionHash(doc);
-      return { conflict: true, liveProjectionHash, updates: 0 };
+      // Read at an arbitrary instant: a multi-message edit may still be streaming in,
+      // so this hash can name a transient state. The next run's guarded compare
+      // re-reads the settled document, so the record self-corrects.
+      return { conflict: true, liveProjectionHash: await currentProjectionHash(doc) };
+    } finally {
+      doc.off("update", markRemoteUpdate);
     }
     // Zero updates means the page already held exactly this content, which is what makes
     // a resumed import free rather than a rewrite.

@@ -75,8 +75,13 @@ describe("headless BlockNote conversion", () => {
     const editor = await createImportEditor();
     const doc = new Y.Doc();
     await writeBlocksToFragment(editor, await htmlToBlocks(editor, "<p>Original</p>"), doc);
-    const checkedState = Y.encodeStateVector(doc);
+    let changed = false;
+    const markChanged = () => {
+      changed = true;
+    };
+    doc.on("update", markChanged);
     await writeBlocksToFragment(editor, await htmlToBlocks(editor, "<p>Collaborator edit</p>"), doc);
+    doc.off("update", markChanged);
 
     await expect(
       writeBlocksToFragment(
@@ -84,11 +89,39 @@ describe("headless BlockNote conversion", () => {
         await htmlToBlocks(editor, "<p>Imported replacement</p>"),
         doc,
         DOCUMENT_FRAGMENT,
-        checkedState,
+        () => changed,
       ),
     ).rejects.toBeInstanceOf(DocumentStateChangedError);
     expect(projectFragment(doc).plainText).toContain("Collaborator edit");
     expect(projectFragment(doc).plainText).not.toContain("Imported replacement");
+  });
+
+  it("refuses a guarded replacement after a delete-only edit no state vector records", async () => {
+    const editor = await createImportEditor();
+    const doc = new Y.Doc();
+    await writeBlocksToFragment(editor, await htmlToBlocks(editor, "<p>Original</p>"), doc);
+    const baselineVector = Y.encodeStateVector(doc);
+    let changed = false;
+    const markChanged = () => {
+      changed = true;
+    };
+    doc.on("update", markChanged);
+    const fragment = doc.getXmlFragment(DOCUMENT_FRAGMENT);
+    doc.transact(() => fragment.delete(0, fragment.length));
+    doc.off("update", markChanged);
+    // A pure deletion advances no insertion clock, so the state-vector comparison this
+    // guard replaced would have let the overwrite through.
+    expect(Y.encodeStateVector(doc)).toEqual(baselineVector);
+
+    await expect(
+      writeBlocksToFragment(
+        editor,
+        await htmlToBlocks(editor, "<p>Imported replacement</p>"),
+        doc,
+        DOCUMENT_FRAGMENT,
+        () => changed,
+      ),
+    ).rejects.toBeInstanceOf(DocumentStateChangedError);
   });
 
   it("derives block ids from the page, so two pages never collide", async () => {
