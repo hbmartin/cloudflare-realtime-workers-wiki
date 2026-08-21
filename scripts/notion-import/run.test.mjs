@@ -646,11 +646,16 @@ describe("reconcileCommitted", () => {
       client,
     });
 
-    expect(report.error).toHaveBeenCalledWith("table_failed", expect.stringContaining("Table"));
+    // Not reported here: the write pass retries this table in the same run, so its
+    // failure is reported exactly once, by the pass that made the final attempt.
+    expect(report.error).not.toHaveBeenCalled();
     expect(report.issue).not.toHaveBeenCalled();
     expect(client.bulkTableWrite).not.toHaveBeenCalled();
     expect(state.nodes[page.path].table).toMatchObject({ phase: "columns", columnOffset: 0, rowOffset: 0 });
     expect(state.nodes[page.path].tableError).toContain("lease");
+    await expect(
+      importTable({ index: {}, client, manifest, report, database: page, record: state.nodes[page.path], plan }),
+    ).rejects.toThrow(/lease/);
   });
 
   it("keeps the destination when content matches an own batch but the revision moved past it", async () => {
@@ -748,6 +753,224 @@ describe("reconcileCommitted", () => {
       acceptedRemoteHash: checkpointHash,
       acceptedRemoteRowCount: 0,
     });
+  });
+
+  it("keeps the destination when a matched batch has no stored receipt to prove it", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const committedColumn = canonicalSourceTable(table, 1, 0);
+    const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: columnProgress(plan.contentHash),
+      },
+    });
+    const { state } = manifest;
+    // The revision walk matches a column batch, but the server holds no receipt for
+    // its request id (for example, receipts written before their request hashes were
+    // recorded have been cleared), so the guarded replay is refused as a stale write.
+    // An own write always leaves a receipt, so this batch was not the import's; the
+    // table must settle as destination-owned instead of retrying the same 409 forever.
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
+      acquireTableLease: vi.fn(async () => ({ leaseToken: "reconcile-lease" })),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(async () => {
+        throw Object.assign(new Error("The table changed. Reloading before retrying the update."), {
+          status: 409,
+          code: "table_revision_conflict",
+        });
+      }),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(report.issue).toHaveBeenCalledWith("destination_table_kept", "Table");
+    expect(report.error).not.toHaveBeenCalled();
+    expect(state.nodes[page.path].tableError).toBeNull();
+    expect(state.nodes[page.path].table).toMatchObject({
+      phase: "complete",
+      acceptedRemoteHash: committedColumnHash,
+      acceptedRemoteRowCount: 0,
+    });
+  });
+
+  it("classifies recovery against the table read under its lease, not the earlier probe", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const committedColumn = canonicalSourceTable(table, 1, 0);
+    const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: columnProgress(plan.contentHash),
+      },
+    });
+    const { state } = manifest;
+    // The pre-lease probe looks like an own unrecorded column batch, but an editor
+    // commits before the lease is taken. The recorded classification must describe
+    // the leased table - destination-owned at its actual values - not the stale probe.
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi
+        .fn()
+        .mockResolvedValueOnce({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })
+        .mockResolvedValueOnce({ revision: 5, contentHash: "d".repeat(64), rowCount: 3 }),
+      acquireTableLease: vi.fn(async () => ({ leaseToken: "reconcile-lease" })),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(client.tableVerification).toHaveBeenCalledTimes(2);
+    expect(client.bulkTableWrite).not.toHaveBeenCalled();
+    expect(report.issue).toHaveBeenCalledWith("destination_table_kept", "Table");
+    expect(state.nodes[page.path].table).toMatchObject({
+      phase: "complete",
+      acceptedRemoteHash: "d".repeat(64),
+      acceptedRemoteRowCount: 3,
+    });
+  });
+
+  it("adopts an untouched empty table as the baseline when no progress was recorded", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const empty = canonicalSourceTable(table, 0, 0);
+    const emptyHash = await tableContentHash(empty.columns, empty.rows);
+    const manifest = stubManifest({
+      [page.path]: { pageId: "page-1", expectedPage: { kind: "table", title: "Table", parentId: null } },
+    });
+    const { state } = manifest;
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 1, contentHash: emptyHash, rowCount: 0 })),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(report.issue).not.toHaveBeenCalled();
+    expect(report.error).not.toHaveBeenCalled();
+    expect(state.nodes[page.path].table).toMatchObject({
+      phase: "columns",
+      revision: 1,
+      columnOffset: 0,
+      rowOffset: 0,
+    });
+  });
+
+  it("keeps an empty table whose revision shows the destination emptied it", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const empty = canonicalSourceTable(table, 0, 0);
+    const emptyHash = await tableContentHash(empty.columns, empty.rows);
+    const manifest = stubManifest({
+      [page.path]: { pageId: "page-1", expectedPage: { kind: "table", title: "Table", parentId: null } },
+    });
+    const { state } = manifest;
+    // Fresh tables start at revision 1 and an own write never leaves a table empty, so
+    // an empty table at revision 3 was written to and emptied by the destination; its
+    // edit-and-revert claims the facet exactly as it would with a recorded checkpoint.
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 3, contentHash: emptyHash, rowCount: 0 })),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(report.issue).toHaveBeenCalledWith("destination_table_kept", "Table");
+    expect(state.nodes[page.path].table).toMatchObject({
+      phase: "complete",
+      acceptedRemoteHash: emptyHash,
+      acceptedRemoteRowCount: 0,
+    });
+  });
+
+  it("leaves a non-empty table with no recorded baseline for the write pass to refuse", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const manifest = stubManifest({
+      [page.path]: { pageId: "page-1", expectedPage: { kind: "table", title: "Table", parentId: null } },
+    });
+    const { state } = manifest;
+    // With no baseline there is no revision to fence own writes against, so neither
+    // resuming nor destination ownership can be proven. Recording either would guess;
+    // the write pass's no-progress guard turns this into one loud operator decision.
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 4, contentHash: "e".repeat(64), rowCount: 2 })),
+      acquireTableLease: vi.fn(async () => ({ leaseToken: "import-lease" })),
+      releaseTableLease: vi.fn(async () => undefined),
+      readTable: vi.fn(async () => ({ table: { revision: 4, columns: [{}], rowCount: 2 } })),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(report.issue).not.toHaveBeenCalled();
+    expect(report.error).not.toHaveBeenCalled();
+    expect(state.nodes[page.path].table).toBeUndefined();
+    await expect(
+      importTable({ index: {}, client, manifest, report, database: page, record: state.nodes[page.path], plan }),
+    ).rejects.toThrow(/no table progress/);
   });
 });
 

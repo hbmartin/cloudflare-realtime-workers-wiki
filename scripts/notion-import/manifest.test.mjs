@@ -62,7 +62,10 @@ describe("createManifest", () => {
     expect(() => open(files)).toThrow(/different copy of this export/);
   });
 
-  it("opens a legacy version 2 manifest for an unchanged export", () => {
+  it("opens a legacy raw-bytes version 2 manifest and rewrites it to the digest form", () => {
+    // The raw-bytes aggregate also shipped stamped version 2, so manifests written by
+    // that importer must resume rather than be refused as a different export copy. Its
+    // NUL framing is ambiguous, so an accepted manifest is migrated to the digest form.
     const files = fixture();
     const relativePath = "Page 11111111111111111111111111111111.html";
     const legacyFingerprint = createHash("sha256")
@@ -86,12 +89,14 @@ describe("createManifest", () => {
       }),
     );
 
+    const manifest = open(files);
+    expect(manifest.state.importId).toBe("a".repeat(32));
+    manifest.flush();
+    expect(JSON.parse(readFileSync(files.path, "utf8")).exportFingerprint).not.toBe(legacyFingerprint);
     expect(open(files).state.importId).toBe("a".repeat(32));
   });
 
   it("opens a version 2 manifest whose fingerprint hashed per-file digests", () => {
-    // The digest-based aggregate also shipped stamped version 2, so manifests written
-    // by that importer must resume rather than be refused as a different export copy.
     const files = fixture();
     const relativePath = "Page 11111111111111111111111111111111.html";
     const digest = createHash("sha256")
@@ -119,6 +124,27 @@ describe("createManifest", () => {
     );
 
     expect(open(files).state.importId).toBe("b".repeat(32));
+  });
+
+  it("distinguishes exports whose raw byte streams collide across NUL frames", () => {
+    // One file containing "x\0<other path>\0y" and two files containing "x" and "y"
+    // concatenate to the same path\0bytes\0 stream, so the raw-bytes aggregate cannot
+    // tell these exports apart; the digest aggregate's fixed-width frames must.
+    const directory = mkdtempSync(join(tmpdir(), "notion-manifest-"));
+    temporaryDirectories.push(directory);
+    const first = "Page 11111111111111111111111111111111.html";
+    const second = "Page 22222222222222222222222222222222.html";
+    const rootA = join(directory, "export-a");
+    mkdirSync(rootA);
+    writeFileSync(join(rootA, first), Buffer.from(`x\0${second}\0y`, "utf8"));
+    const rootB = join(directory, "export-b");
+    mkdirSync(rootB);
+    writeFileSync(join(rootB, first), "x");
+    writeFileSync(join(rootB, second), "y");
+    const path = join(directory, "manifest.json");
+
+    open({ root: rootA, path }).flush();
+    expect(() => open({ root: rootB, path })).toThrow(/different copy of this export/);
   });
 
   it("uses a random import id and explicitly rejects version 1", () => {

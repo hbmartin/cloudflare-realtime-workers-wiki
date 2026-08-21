@@ -2187,7 +2187,133 @@ describe("TablePage", () => {
     });
   });
 
-  it("treats page deletion from a superseded background refresh as terminal", async () => {
+  it("appends the next page when the user's own save commits while it loads", async () => {
+    const first: TableData = {
+      ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "One" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const append = deferred<{ table: TableData }>();
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.includes("afterPosition")) return append.promise;
+      if (init?.method === "PUT") return Promise.resolve({ revision: 2 });
+      return Promise.resolve({ table: first });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    const cell = screen.getByDisplayValue("One");
+    fireEvent.change(cell, { target: { value: "One edited" } });
+    fireEvent.blur(cell);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        expect.stringContaining("/cells/row-1/status"),
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+
+    // The save moved the table to revision 2 before the append's response landed.
+    // The appended page was read at revision 2, the same snapshot the merged save
+    // left on screen, so it must extend the view rather than reset it to page one.
+    await act(async () => {
+      append.resolve({
+        table: {
+          ...first,
+          revision: 2,
+          rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
+          hasMore: false,
+          nextCursor: null,
+          rowCount: null,
+        },
+      });
+      await append.promise;
+    });
+
+    expect(screen.getByDisplayValue("One edited")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
+    const fullLoads = vi.mocked(api).mock.calls.filter(([path]) => String(path).includes("count=true"));
+    expect(fullLoads).toHaveLength(2);
+  });
+
+  it("refetches a load snapshot that is older than an already merged save", async () => {
+    let sortLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.resolve({ revision: 2 });
+      if (String(path).includes("sort=")) {
+        sortLoads += 1;
+        // The first sorted read raced the save and was computed at revision 1;
+        // adopting it would revert the user's committed edit on screen.
+        return Promise.resolve({
+          table: sortLoads === 1 ? { ...table, sort: "status" } : tableWithValue("Ready edited", 2),
+        });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    const cell = screen.getByDisplayValue("Ready");
+    fireEvent.change(cell, { target: { value: "Ready edited" } });
+    fireEvent.blur(cell);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(expect.stringContaining("/cells/"), expect.objectContaining({ method: "PUT" })),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await waitFor(() => expect(sortLoads).toBe(2));
+    expect(screen.getByDisplayValue("Ready edited")).toBeInTheDocument();
+  });
+
+  it("discards a page-not-found response that a newer successful load superseded", async () => {
+    vi.useFakeTimers();
+    const onPageUnavailable = vi.fn();
+    const sorted: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-1", position: 0, cells: { status: "Restored" } }],
+    };
+    const refresh = deferred<{ table: TableData }>();
+    vi.mocked(api)
+      .mockResolvedValueOnce({ table })
+      .mockImplementationOnce(() => refresh.promise)
+      .mockResolvedValue({ table: sorted });
+    render(
+      <TablePage
+        page={page}
+        member={member("viewer")}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={onPageUnavailable}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(api).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(async () => {});
+    expect(screen.getByDisplayValue("Restored")).toBeInTheDocument();
+
+    // The page was archived while the poll was in flight and restored before its
+    // response landed; the sort load that superseded the poll saw it live, so the
+    // stale rejection must not bury a working table under a terminal notice.
+    await act(async () => {
+      refresh.reject(new ApiClientError(404, "page_not_found", "Page not found."));
+      await refresh.promise.catch(() => undefined);
+    });
+
+    expect(onPageUnavailable).not.toHaveBeenCalled();
+    expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
+    expect(screen.getByDisplayValue("Restored")).toBeInTheDocument();
+    // A genuinely deleted page is still noticed: polling keeps running.
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(api).toHaveBeenCalledTimes(4);
+  });
+
+  it("treats page deletion discovered by pagination as terminal", async () => {
     vi.useFakeTimers();
     const onPageUnavailable = vi.fn();
     const first: TableData = {
@@ -2197,16 +2323,11 @@ describe("TablePage", () => {
       nextCursor: { position: 0, rowId: "row-1" },
       rowCount: 2,
     };
-    const second: TableData = {
-      ...table,
-      rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
-      rowCount: null,
-    };
     const refresh = deferred<{ table: TableData }>();
     vi.mocked(api)
       .mockResolvedValueOnce({ table: first })
       .mockImplementationOnce(() => refresh.promise)
-      .mockResolvedValueOnce({ table: second });
+      .mockRejectedValueOnce(new ApiClientError(404, "page_not_found", "Page not found."));
     render(
       <TablePage
         page={page}
@@ -2220,19 +2341,19 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
     const loadMore = screen.getByRole("button", { name: "Load more rows" });
 
+    // The poll in flight will be superseded by the pagination request, so that
+    // request is the one that discovers the deletion, and its rejection is
+    // swallowed by the click handler rather than surfacing anywhere else.
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     fireEvent.click(loadMore);
     await act(async () => {});
-    expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
-
-    await act(async () => {
-      refresh.reject(new ApiClientError(404, "page_not_found", "Page not found."));
-      await refresh.promise.catch(() => undefined);
-    });
 
     expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
     expect(screen.getByText("Page not found.")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
+    await act(async () => {
+      refresh.resolve({ table: first });
+      await refresh.promise;
+    });
     expect(api).toHaveBeenCalledTimes(3);
     await act(() => vi.advanceTimersByTimeAsync(10_000));
     expect(api).toHaveBeenCalledTimes(3);
