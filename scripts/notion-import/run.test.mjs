@@ -22,6 +22,33 @@ async function planFor(table) {
   };
 }
 
+function stubManifest(nodes, importId = "a".repeat(32)) {
+  const state = { importId, nodes };
+  const update = (path, patch) => {
+    state.nodes[path] = { ...state.nodes[path], ...patch };
+  };
+  return {
+    state,
+    node: (path) => state.nodes[path] ?? null,
+    record: vi.fn(update),
+    recordNow: vi.fn(update),
+    flush: vi.fn(),
+  };
+}
+
+function columnProgress(contentHash) {
+  return {
+    phase: "columns",
+    revision: 1,
+    columnOffset: 0,
+    rowOffset: 0,
+    columnsByRef: {},
+    expectedColumns: 1,
+    expectedRows: 1,
+    contentHash,
+  };
+}
+
 describe("selectPages", () => {
   it("includes ancestors when a limited child sorts before its parent", () => {
     const parent = { path: "Cool 3333333333333333333333333333cccc.html", parent: null };
@@ -93,17 +120,8 @@ describe("runImport", () => {
     };
     const root = mkdtempSync(join(tmpdir(), "notion-run-test-"));
     writeFileSync(join(root, page.path), '<html><body><div class="page-body"><p>Imported</p></div></body></html>');
-    const state = { importId: "a".repeat(32), nodes: {} };
-    const update = (path, patch) => {
-      state.nodes[path] = { ...state.nodes[path], ...patch };
-    };
-    const manifest = {
-      state,
-      node: (path) => state.nodes[path] ?? null,
-      record: vi.fn(update),
-      recordNow: vi.fn(update),
-      flush: vi.fn(),
-    };
+    const manifest = stubManifest({});
+    const { state } = manifest;
     const documentPush = vi.fn(async () => ({
       conflict: true,
       liveProjectionHash: "collaborator-document",
@@ -157,17 +175,8 @@ describe("runImport", () => {
     };
     const root = mkdtempSync(join(tmpdir(), "notion-run-test-"));
     writeFileSync(join(root, page.path), '<html><body><div class="page-body"><p>Imported</p></div></body></html>');
-    const state = { importId: "a".repeat(32), nodes: {} };
-    const update = (path, patch) => {
-      state.nodes[path] = { ...state.nodes[path], ...patch };
-    };
-    const manifest = {
-      state,
-      node: (path) => state.nodes[path] ?? null,
-      record: vi.fn(update),
-      recordNow: vi.fn(update),
-      flush: vi.fn(),
-    };
+    const manifest = stubManifest({});
+    const { state } = manifest;
     const report = {
       errorCount: 0,
       error: vi.fn(),
@@ -476,34 +485,14 @@ describe("reconcileCommitted", () => {
     const plan = await planFor(table);
     const committedColumn = canonicalSourceTable(table, 1, 0);
     const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
-    const state = {
-      importId: "a".repeat(32),
-      nodes: {
-        [page.path]: {
-          pageId: "page-1",
-          expectedPage: { kind: "table", title: "Table", parentId: null },
-          table: {
-            phase: "columns",
-            revision: 1,
-            columnOffset: 0,
-            rowOffset: 0,
-            columnsByRef: {},
-            expectedColumns: 1,
-            expectedRows: 1,
-            contentHash: plan.contentHash,
-          },
-        },
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: columnProgress(plan.contentHash),
       },
-    };
-    const update = (path, patch) => {
-      state.nodes[path] = { ...state.nodes[path], ...patch };
-    };
-    const manifest = {
-      state,
-      node: (path) => state.nodes[path],
-      record: vi.fn(update),
-      recordNow: vi.fn(update),
-    };
+    });
+    const { state } = manifest;
     const client = {
       pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
       tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
@@ -570,34 +559,14 @@ describe("reconcileCommitted", () => {
       rows: [{ cells: { "ref:c0": "imported" } }],
     };
     const plan = await planFor(table);
-    const state = {
-      importId: "a".repeat(32),
-      nodes: {
-        [page.path]: {
-          pageId: "page-1",
-          expectedPage: { kind: "table", title: "Table", parentId: null },
-          table: {
-            phase: "columns",
-            revision: 1,
-            columnOffset: 0,
-            rowOffset: 0,
-            columnsByRef: {},
-            expectedColumns: 1,
-            expectedRows: 1,
-            contentHash: plan.contentHash,
-          },
-        },
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: columnProgress(plan.contentHash),
       },
-    };
-    const update = (path, patch) => {
-      state.nodes[path] = { ...state.nodes[path], ...patch };
-    };
-    const manifest = {
-      state,
-      node: (path) => state.nodes[path],
-      record: vi.fn(update),
-      recordNow: vi.fn(update),
-    };
+    });
+    const { state } = manifest;
     // Both the column batch and the row batch committed (live matches the full source
     // at revision 3 = 1 + two batches), but neither checkpoint reached the manifest.
     const client = {
@@ -648,34 +617,14 @@ describe("reconcileCommitted", () => {
     const plan = await planFor(table);
     const committedColumn = canonicalSourceTable(table, 1, 0);
     const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
-    const state = {
-      importId: "a".repeat(32),
-      nodes: {
-        [page.path]: {
-          pageId: "page-1",
-          expectedPage: { kind: "table", title: "Table", parentId: null },
-          table: {
-            phase: "columns",
-            revision: 1,
-            columnOffset: 0,
-            rowOffset: 0,
-            columnsByRef: {},
-            expectedColumns: 1,
-            expectedRows: 1,
-            contentHash: plan.contentHash,
-          },
-        },
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: columnProgress(plan.contentHash),
       },
-    };
-    const update = (path, patch) => {
-      state.nodes[path] = { ...state.nodes[path], ...patch };
-    };
-    const manifest = {
-      state,
-      node: (path) => state.nodes[path],
-      record: vi.fn(update),
-      recordNow: vi.fn(update),
-    };
+    });
+    const { state } = manifest;
     const client = {
       pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
       tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
@@ -713,34 +662,14 @@ describe("reconcileCommitted", () => {
     const plan = await planFor(table);
     const committedColumn = canonicalSourceTable(table, 1, 0);
     const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
-    const state = {
-      importId: "a".repeat(32),
-      nodes: {
-        [page.path]: {
-          pageId: "page-1",
-          expectedPage: { kind: "table", title: "Table", parentId: null },
-          table: {
-            phase: "columns",
-            revision: 1,
-            columnOffset: 0,
-            rowOffset: 0,
-            columnsByRef: {},
-            expectedColumns: 1,
-            expectedRows: 1,
-            contentHash: plan.contentHash,
-          },
-        },
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: columnProgress(plan.contentHash),
       },
-    };
-    const update = (path, patch) => {
-      state.nodes[path] = { ...state.nodes[path], ...patch };
-    };
-    const manifest = {
-      state,
-      node: (path) => state.nodes[path],
-      record: vi.fn(update),
-      recordNow: vi.fn(update),
-    };
+    });
+    const { state } = manifest;
     // Content equals the committed column batch, but revision 4 !== 1 + one batch: a
     // destination edit was made and undone, so the table belongs to the destination.
     const client = {
