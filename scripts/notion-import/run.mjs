@@ -540,11 +540,16 @@ export async function reconcileCommitted({
           const rowOffset = complete ? source.rows.length : (progress?.rowOffset ?? 0);
           const lastCommitted = canonicalSourceTable(source, columnOffset, rowOffset);
           const lastCommittedHash = await tableContentHash(lastCommitted.columns, lastCommitted.rows);
-          const matchesLastCommit = live.contentHash === lastCommittedHash && live.rowCount === rowOffset;
+          const savedRevision = progress?.revision ?? live.revision;
+          // Matching content is not enough: an edit followed by an exact revert leaves
+          // the same hash at a later revision. Treat that as destination-owned instead
+          // of resuming from a revision the server will reject forever.
+          const matchesLastCommit =
+            live.contentHash === lastCommittedHash && live.rowCount === rowOffset && live.revision === savedRevision;
           const table = {
             ...progress,
             phase: progress?.phase ?? "columns",
-            revision: progress?.revision ?? live.revision,
+            revision: savedRevision,
             contentHash: plan.contentHash,
             expectedColumns: source.columns.length,
             expectedRows: source.rows.length,
@@ -1064,6 +1069,14 @@ export async function importTable({ index, client, manifest, report, database, r
     if (live.columns.length !== table.columns.length || live.rowCount !== table.rows.length) {
       throw new Error(
         `The completed table has ${live.columns.length} columns/${live.rowCount} rows; expected ${table.columns.length}/${table.rows.length}.`,
+      );
+    }
+    // Reconciliation and the write pass take separate leases. When recovery already
+    // advanced both offsets to the end, no bulk request remains to revision-fence an
+    // edit made in that gap, so fence the final read before declaring completion.
+    if (live.revision !== progress.revision) {
+      throw new Error(
+        `The completed table is at revision ${live.revision}; expected imported revision ${progress.revision}.`,
       );
     }
     progress = { ...progress, phase: "complete" };

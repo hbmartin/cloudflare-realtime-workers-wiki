@@ -698,6 +698,57 @@ describe("reconcileCommitted", () => {
       acceptedRemoteRowCount: 0,
     });
   });
+
+  it("keeps the destination when an exact saved checkpoint was edited and reverted", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "remaining" } }],
+    };
+    const plan = await planFor(table);
+    const checkpoint = canonicalSourceTable(table, 1, 0);
+    const checkpointHash = await tableContentHash(checkpoint.columns, checkpoint.rows);
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: {
+          ...columnProgress(plan.contentHash),
+          phase: "rows",
+          revision: 2,
+          columnOffset: 1,
+          columnsByRef: { c0: "column-1" },
+        },
+      },
+    });
+    const { state } = manifest;
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      // The content is exactly the saved revision-2 checkpoint, but an edit and revert
+      // advanced the authoritative revision twice.
+      tableVerification: vi.fn(async () => ({ revision: 4, contentHash: checkpointHash, rowCount: 0 })),
+      acquireTableLease: vi.fn(),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(client.acquireTableLease).not.toHaveBeenCalled();
+    expect(report.issue).toHaveBeenCalledWith("destination_table_kept", "Table");
+    expect(report.error).not.toHaveBeenCalled();
+    expect(state.nodes[page.path].table).toMatchObject({
+      phase: "complete",
+      revision: 2,
+      acceptedRemoteHash: checkpointHash,
+      acceptedRemoteRowCount: 0,
+    });
+  });
 });
 
 describe("table batching", () => {
@@ -811,5 +862,51 @@ describe("table batching", () => {
       expectedRows: 201,
       contentHash: expect.stringMatching(/^[a-f\d]{64}$/),
     });
+  });
+
+  it("refuses to finalize recovered offsets after the live revision changes", async () => {
+    const database = { path: "Table.html", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const manifest = stubManifest({
+      [database.path]: {
+        pageId: "page-1",
+        table: {
+          ...columnProgress(plan.contentHash),
+          phase: "rows",
+          revision: 3,
+          columnOffset: 1,
+          rowOffset: 1,
+          columnsByRef: { c0: "column-1" },
+        },
+      },
+    });
+    const client = {
+      acquireTableLease: vi.fn(async () => ({ leaseToken: "lease" })),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(),
+      // A collaborator changed content after reconciliation but before this lease was
+      // acquired. Counts still match, so only the revision fence exposes the race.
+      readTable: vi.fn(async () => ({ table: { revision: 4, columns: [{}], rowCount: 1 } })),
+    };
+
+    await expect(
+      importTable({
+        index: {},
+        client,
+        manifest,
+        report: { issue: vi.fn(), progress: vi.fn() },
+        database,
+        record: manifest.node(database.path),
+        plan,
+      }),
+    ).rejects.toThrow("revision 4; expected imported revision 3");
+
+    expect(client.bulkTableWrite).not.toHaveBeenCalled();
+    expect(client.releaseTableLease).toHaveBeenCalledWith("page-1", "lease");
+    expect(manifest.node(database.path).table.phase).toBe("rows");
   });
 });
