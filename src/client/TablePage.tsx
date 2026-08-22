@@ -379,12 +379,12 @@ export function TablePage({
       ) {
         return;
       }
-      // Cursors and offsets describe one table snapshot. The comparison point is
-      // revisionRef, which this client's own serialized saves keep current, so a
-      // save that committed before this request reads as the same snapshot rather
-      // than a foreign edit; a table a foreign writer moved recovers a consistent
-      // page one instead of splicing.
-      if (result.table.revision !== revisionRef.current) {
+      // Sorted offsets are positions in one exact snapshot: a save can move a row
+      // across the boundary and make a cross-revision append omit its replacement.
+      // Unsorted keyset cursors remain stable across this client's serialized saves,
+      // so those may compare with the current mutation revision instead.
+      const expectedRevision = currentPage.sort ? currentPage.revision : revisionRef.current;
+      if (result.table.revision !== expectedRevision) {
         invalidateRevision();
         await load(isMounted).catch(() => undefined);
         return;
