@@ -125,20 +125,35 @@ export async function documentJsonForBlocks(editor, blocks) {
   }
 }
 
-export async function readDocumentJson({ client, pageId, epoch }) {
-  const doc = new Y.Doc();
-  const provider = createProvider(client, pageId, epoch, doc);
-  try {
-    await provider.connect();
-    await waitForSync(provider);
-    return fragmentJson(doc);
-  } finally {
-    closeProvider(provider, doc, pageId);
-  }
-}
-
 function currentProjectionHash(doc) {
   return documentJsonProjectionHash(fragmentJson(doc));
+}
+
+/**
+ * Hashes the document once the edit that interrupted a guarded write stops streaming.
+ *
+ * A multi-message edit may still be arriving when the write is refused; a hash taken at
+ * that instant names a state the destination never kept, and it would be persisted as
+ * the accepted destination hash that verify compares against. Bounded: an editor still
+ * typing at the deadline yields a transient hash, which the next run's guarded compare
+ * corrects.
+ */
+function settledProjectionHash(doc, { quietMs = 1_000, maxWaitMs = 10_000 } = {}) {
+  return new Promise((resolve) => {
+    let quiet = setTimeout(finish, quietMs);
+    const deadline = setTimeout(finish, maxWaitMs);
+    function onUpdate() {
+      clearTimeout(quiet);
+      quiet = setTimeout(finish, quietMs);
+    }
+    function finish() {
+      clearTimeout(quiet);
+      clearTimeout(deadline);
+      doc.off("update", onUpdate);
+      resolve(currentProjectionHash(doc));
+    }
+    doc.on("update", onUpdate);
+  });
 }
 
 /**
@@ -207,10 +222,7 @@ export async function pushDocument({
       written = await writeBlocksToFragment(editor, blocks, doc, DOCUMENT_FRAGMENT, () => remoteUpdateSeen);
     } catch (error) {
       if (!(error instanceof DocumentStateChangedError)) throw error;
-      // Read at an arbitrary instant: a multi-message edit may still be streaming in,
-      // so this hash can name a transient state. The next run's guarded compare
-      // re-reads the settled document, so the record self-corrects.
-      return { conflict: true, liveProjectionHash: await currentProjectionHash(doc) };
+      return { conflict: true, liveProjectionHash: await settledProjectionHash(doc) };
     } finally {
       doc.off("update", markRemoteUpdate);
     }

@@ -172,7 +172,6 @@ export function TablePage({
   // "Load more rows" for the duration of each background request.
   const userLoadsInFlightRef = useRef(0);
   const mountedRef = useRef(true);
-  const mountedPageIdRef = useRef<string | null>(page.id);
   const loadGenerationRef = useRef(0);
   // Mirrors terminalPageUnavailable for async code that must not act on stale
   // render state, e.g. a queued mutation deciding whether a missing lease is
@@ -187,10 +186,8 @@ export function TablePage({
 
   useEffect(() => {
     mountedRef.current = true;
-    mountedPageIdRef.current = page.id;
     return () => {
       mountedRef.current = false;
-      if (mountedPageIdRef.current === page.id) mountedPageIdRef.current = null;
       const currentLease = leaseTokenRef.current;
       leaseTokenRef.current = null;
       leaseMonotonicDeadlineRef.current = null;
@@ -272,7 +269,7 @@ export function TablePage({
   }, []);
 
   const load = useCallback(
-    async (isCurrent: IsCurrent, background = false) => {
+    async function loadTable(isCurrent: IsCurrent, background = false): Promise<void> {
       const generation = ++loadGenerationRef.current;
       const leaseConflictGeneration = leaseConflictGenerationRef.current;
       changeLoadCount(1, background);
@@ -286,6 +283,13 @@ export function TablePage({
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
         if (!isCurrent() || generation !== loadGenerationRef.current) return;
+        // A snapshot read before a mutation this client already merged would
+        // revert that edit on screen and regress the mutation base, so fetch a
+        // fresh one instead of adopting it. Only own saves, which are serialized,
+        // can move revisionRef past a load, so the retry cannot loop on its own.
+        if (revisionRef.current !== null && result.table.revision < revisionRef.current) {
+          return loadTable(isCurrent, background);
+        }
         revisionRef.current = result.table.revision;
         setRevisionKnown(true);
         const validRows = new Set(result.table.rows.map((row) => row.id));
@@ -317,9 +321,11 @@ export function TablePage({
           setLeaseError((current) => (current === LEASE_CONFLICT_MESSAGE ? null : current));
         }
       } catch (cause) {
-        if (mountedRef.current && mountedPageIdRef.current === page.id && isPageUnavailableError(cause)) {
-          // Unlike ordinary stale responses, page deletion is terminal for every
-          // generation that still belongs to this mounted page.
+        if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
+          // Terminal even when the effect that issued this load is gone, but only
+          // while no newer load superseded it: a stale page_not_found can belong
+          // to a page that was archived and has since been restored, and whatever
+          // load superseded this one re-checks the page either way.
           markPageUnavailable(cause.message);
         } else if (isCurrent() && generation === loadGenerationRef.current) {
           setLoadError(errorMessage(cause, "Table could not be loaded."));
@@ -338,12 +344,7 @@ export function TablePage({
     // An unknown revision means a full-page load is restoring the authoritative
     // mutation base. Pagination must neither supersede that load nor keep future
     // recovery polls from running.
-    if (
-      userLoadsInFlightRef.current ||
-      revisionRef.current === null ||
-      revisionRef.current !== currentPage.revision ||
-      !currentPage.hasMore
-    ) {
+    if (userLoadsInFlightRef.current || revisionRef.current === null || !currentPage.hasMore) {
       return;
     }
 
@@ -378,25 +379,43 @@ export function TablePage({
       ) {
         return;
       }
-      // Cursors and offsets describe one table snapshot. Never splice a newer
-      // page into older displayed rows; recover a consistent page one instead.
-      if (result.table.revision !== currentPage.revision || revisionRef.current !== currentPage.revision) {
+      // Cursors and offsets describe one table snapshot. The comparison point is
+      // revisionRef, which this client's own serialized saves keep current, so a
+      // save that committed before this request reads as the same snapshot rather
+      // than a foreign edit; a table a foreign writer moved recovers a consistent
+      // page one instead of splicing.
+      if (result.table.revision !== revisionRef.current) {
         invalidateRevision();
         await load(isMounted).catch(() => undefined);
         return;
       }
       appendedPagesRef.current += 1;
       setTable((current) => {
-        if (!current || tableSortKey(current.sort, current.dir) !== requestedSort) return current;
+        if (
+          !current ||
+          tableSortKey(current.sort, current.dir) !== requestedSort ||
+          current.revision !== result.table.revision
+        ) {
+          return current;
+        }
+        const loaded = new Set(current.rows.map((row) => row.id));
         return {
           ...current,
-          rows: [...current.rows, ...result.table.rows],
+          rows: [...current.rows, ...result.table.rows.filter((row) => !loaded.has(row.id))],
           hasMore: result.table.hasMore,
           nextCursor: result.table.nextCursor,
           nextOffset: result.table.nextOffset,
           truncated: result.table.truncated,
         };
       });
+    } catch (cause) {
+      // Pagination can be the request that discovers the page is gone, and its
+      // rejection is swallowed by the click handler; latch the terminal state here
+      // under the same currency rule as load.
+      if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
+        markPageUnavailable(cause.message);
+      }
+      throw cause;
     } finally {
       changeLoadCount(-1, false);
     }

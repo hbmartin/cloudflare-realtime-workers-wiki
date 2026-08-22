@@ -44,36 +44,48 @@ export function hashFileContent(path) {
  * Identifies the export a manifest belongs to.
  *
  * Resuming against a re-downloaded or edited export would map Notion ids onto pages that
- * no longer correspond to them, so a mismatch is refused rather than reconciled. Two
- * aggregate representations shipped under version 2 - path-plus-raw-bytes and
- * path-plus-hex-digest - so both are computed and a manifest holding either is accepted;
- * new manifests record the raw-bytes form. Each file is still read exactly once: the
- * same chunks update its individual digest, which the upload pass reuses instead of
- * re-hashing every asset.
+ * no longer correspond to them, so a mismatch is refused rather than reconciled. The
+ * aggregate hashes each file's fixed-width hex digest between NUL frames, which neither
+ * a path nor a digest can contain, so no two file sets can produce one byte stream. The
+ * per-file digests are returned for the upload pass to reuse instead of re-hashing
+ * every asset.
  */
 export function fingerprintExport(root) {
   const { files } = walkExport(root);
   const digests = new Map();
   const hash = createHash("sha256");
-  const digestAggregate = createHash("sha256");
+  for (const path of files) {
+    const digest = hashFileContent(join(root, path));
+    digests.set(path, digest);
+    hash.update(path);
+    hash.update("\0");
+    hash.update(digest);
+    hash.update("\0");
+  }
+  return { fingerprint: hash.digest("hex"), digests };
+}
+
+/**
+ * The aggregate an earlier version 2 importer recorded: NUL-framed raw file bytes.
+ * That framing is ambiguous - file bytes may themselves contain NULs, so two different
+ * file sets can share one stream - which is why it is computed only when a stored
+ * fingerprint fails the digest comparison and is never recorded again: an accepted
+ * legacy manifest is rewritten to the digest form on open.
+ */
+function legacyFingerprintExport(root) {
+  const { files } = walkExport(root);
+  const hash = createHash("sha256");
   for (const path of files) {
     hash.update(path);
     hash.update("\0");
-    const fileHash = createHash("sha256");
-    hashFile(join(root, path), hash, fileHash);
+    hashFile(join(root, path), hash);
     hash.update("\0");
-    const digest = fileHash.digest("hex");
-    digests.set(path, digest);
-    digestAggregate.update(path);
-    digestAggregate.update("\0");
-    digestAggregate.update(digest);
-    digestAggregate.update("\0");
   }
-  return { fingerprint: hash.digest("hex"), digestFingerprint: digestAggregate.digest("hex"), digests };
+  return hash.digest("hex");
 }
 
 export function createManifest({ path, root, baseURL, workspaceId, rootParentId, adoptRootParent = false }) {
-  const { fingerprint, digestFingerprint, digests } = fingerprintExport(root);
+  const { fingerprint, digests } = fingerprintExport(root);
   let state;
 
   if (existsSync(path)) {
@@ -105,11 +117,16 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId,
     if (!/^[0-9a-f]{32}$/.test(state.importId ?? "")) {
       throw new Error(`${path} does not contain a valid version 2 import id. Move it aside to start over.`);
     }
-    if (state.exportFingerprint !== fingerprint && state.exportFingerprint !== digestFingerprint) {
-      throw new Error(
-        `${path} belongs to a different copy of this export. Move it aside to start over, ` +
-          "or point the importer at the directory it was created from.",
-      );
+    if (state.exportFingerprint !== fingerprint) {
+      if (state.exportFingerprint !== legacyFingerprintExport(root)) {
+        throw new Error(
+          `${path} belongs to a different copy of this export. Move it aside to start over, ` +
+            "or point the importer at the directory it was created from.",
+        );
+      }
+      // Migrate on open, so the ambiguous legacy aggregate retires with the manifests
+      // that recorded it instead of being re-verified on every future open.
+      state.exportFingerprint = fingerprint;
     }
     if (state.baseURL !== baseURL) {
       throw new Error(`${path} was created against ${state.baseURL}, not ${baseURL}.`);

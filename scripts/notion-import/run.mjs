@@ -331,28 +331,22 @@ function expectedPageFor(page, manifest, rootParentId) {
 }
 
 /**
- * The table state exactly one committed bulk batch ahead of the manifest, or null when
- * no further batch exists. A process killed between the server's commit and the
- * manifest write leaves the live table in precisely this state, and it must resume,
- * not be mistaken for a destination edit.
+ * The batch offsets exactly one committed bulk write ahead, or null when no further
+ * batch exists. Columns advance to exhaustion before any rows, mirroring importTable's
+ * write order. The boundaries come from the current plan (TABLE_BULK_MAX_COLUMNS and
+ * the byte-size row batches), so a manifest written by an importer with different
+ * boundaries models a different write sequence than the one that ran; its own
+ * unrecorded batches then fail the revision fence and are kept as destination edits
+ * rather than resumed - a known limit of receipt-free recovery.
  */
-async function advancedCommitFor(plan, columnOffset, rowOffset) {
+function advancedOffsetsFor(plan, columnOffset, rowOffset) {
   const { table, batches } = plan;
-  let nextColumnOffset = columnOffset;
-  let nextRowOffset = rowOffset;
   if (columnOffset < table.columns.length) {
-    nextColumnOffset = Math.min(columnOffset + TABLE_BULK_MAX_COLUMNS, table.columns.length);
-  } else {
-    const batch = batches.find((candidate) => candidate.start === rowOffset);
-    if (!batch) return null;
-    nextRowOffset = batch.end;
+    return { columnOffset: Math.min(columnOffset + TABLE_BULK_MAX_COLUMNS, table.columns.length), rowOffset };
   }
-  const canonical = canonicalSourceTable(table, nextColumnOffset, nextRowOffset);
-  return {
-    columnOffset: nextColumnOffset,
-    rowOffset: nextRowOffset,
-    contentHash: await tableContentHash(canonical.columns, canonical.rows),
-  };
+  const batch = batches.find((candidate) => candidate.start === rowOffset);
+  if (!batch) return null;
+  return { columnOffset, rowOffset: batch.end };
 }
 
 function mergeColumnMap(columnsByRef, requestedColumns, result) {
@@ -407,31 +401,37 @@ class ColumnReceiptMismatchError extends Error {
 
 /**
  * The batches this import committed beyond what the manifest recorded, or null when the
- * live table matches no committed prefix. Ordinarily a kill between the server commit
- * and the recordNow checkpoint leaves the live table exactly one batch ahead, but a
- * manifest written by an importer that debounced these checkpoints can trail by
- * several, so the walk continues until the live content is reproduced.
+ * live table cannot be that committed prefix. Ordinarily a kill between the server
+ * commit and the recordNow checkpoint leaves the live table exactly one batch ahead,
+ * but a manifest written by an importer that debounced these checkpoints can trail by
+ * several. Every bulk write advances the revision by exactly one, so only the prefix
+ * exactly (live.revision - savedRevision) batches ahead can be this import's own
+ * writes; a live revision anywhere else means the destination was edited even when the
+ * content coincides (an edit undone). That fence selects the single admissible
+ * candidate before any content is hashed, so the walk costs one prefix hash however
+ * large the table is.
  */
-async function advancedCommitMatch(plan, columnOffset, rowOffset, live) {
+async function advancedCommitMatch(plan, columnOffset, rowOffset, savedRevision, live) {
+  const steps = live.revision - savedRevision;
+  if (!Number.isInteger(steps) || steps < 1) return null;
   const columnBatches = [];
-  let steps = 0;
   let nextColumnOffset = columnOffset;
   let nextRowOffset = rowOffset;
-  while (true) {
-    const next = await advancedCommitFor(plan, nextColumnOffset, nextRowOffset);
+  for (let step = 1; step <= steps; step += 1) {
+    const next = advancedOffsetsFor(plan, nextColumnOffset, nextRowOffset);
     // Row offsets only grow, so once the live count falls behind a candidate no later
     // prefix can match either; stopping bounds the walk on destination-edited tables.
     if (!next || live.rowCount < next.rowOffset) return null;
-    steps += 1;
     if (next.columnOffset > nextColumnOffset) {
-      columnBatches.push({ offset: nextColumnOffset, endOffset: next.columnOffset, step: steps });
-    }
-    if (live.contentHash === next.contentHash && live.rowCount === next.rowOffset) {
-      return { columnOffset: next.columnOffset, rowOffset: next.rowOffset, steps, columnBatches };
+      columnBatches.push({ offset: nextColumnOffset, endOffset: next.columnOffset, step });
     }
     nextColumnOffset = next.columnOffset;
     nextRowOffset = next.rowOffset;
   }
+  if (live.rowCount !== nextRowOffset) return null;
+  const canonical = canonicalSourceTable(plan.table, nextColumnOffset, nextRowOffset);
+  if (live.contentHash !== (await tableContentHash(canonical.columns, canonical.rows))) return null;
+  return { columnOffset: nextColumnOffset, rowOffset: nextRowOffset, columnBatches };
 }
 
 export async function reconcileCommitted({
@@ -536,92 +536,127 @@ export async function reconcileCommitted({
           const source = plan.table;
           const progress = node.table;
           const complete = progress?.phase === "complete";
+          // A record saved without a revision predates the fence below; nothing can be
+          // attributed by arithmetic from it, so it is accepted on content alone.
+          const savedRevision = Number.isInteger(progress?.revision) ? progress.revision : null;
           const columnOffset = complete ? source.columns.length : (progress?.columnOffset ?? 0);
           const rowOffset = complete ? source.rows.length : (progress?.rowOffset ?? 0);
           const lastCommitted = canonicalSourceTable(source, columnOffset, rowOffset);
           const lastCommittedHash = await tableContentHash(lastCommitted.columns, lastCommitted.rows);
-          const savedRevision = progress?.revision ?? live.revision;
           // Matching content is not enough: an edit followed by an exact revert leaves
           // the same hash at a later revision. Treat that as destination-owned instead
           // of resuming from a revision the server will reject forever.
-          const matchesLastCommit =
-            live.contentHash === lastCommittedHash && live.rowCount === rowOffset && live.revision === savedRevision;
-          const table = {
-            ...progress,
-            phase: progress?.phase ?? "columns",
-            revision: savedRevision,
-            contentHash: plan.contentHash,
-            expectedColumns: source.columns.length,
-            expectedRows: source.rows.length,
-            columnOffset,
-            rowOffset,
-            columnsByRef: progress?.columnsByRef ?? {},
-          };
-          patch.table = table;
-          patch.tableError = null;
-          // Destination edits win the whole table facet, including when they race an
-          // incomplete import. Stop further batches so user-owned rows are never
-          // combined with the remaining source rows into a hybrid table.
-          const keepDestinationTable = () => {
-            table.phase = "complete";
-            table.acceptedRemoteHash = live.contentHash;
-            table.acceptedRemoteRowCount = live.rowCount;
-            report.issue("destination_table_kept", page.title);
-          };
-          // A process killed after the server committed bulk batches but before the
-          // manifest recorded them leaves the live table ahead by those batches. They
-          // are this import's own writes, so the offsets advance and the run resumes.
-          // Every bulk write advances the revision by exactly one, so a live revision
-          // beyond the base plus the matched batches means the destination was edited
-          // even though the content coincides (an edit undone), not an own write.
-          const advanced =
-            complete || matchesLastCommit ? null : await advancedCommitMatch(plan, columnOffset, rowOffset, live);
-          if (matchesLastCommit) {
-            delete table.acceptedRemoteHash;
-            delete table.acceptedRemoteRowCount;
-          } else if (advanced && live.revision === table.revision + advanced.steps) {
-            try {
-              if (advanced.columnBatches.length > 0) {
-                // The response is the only durable source of the generated column ids.
-                // Replaying each deterministic request returns its stored receipt
-                // before lease or revision guards, without a second column batch.
-                await withTableLease(client, pageId, async (leaseToken) => {
-                  for (const batch of advanced.columnBatches) {
-                    const columns = source.columns.slice(batch.offset, batch.endOffset);
-                    const replayed = await client.bulkTableWrite(
-                      pageId,
-                      columnBatchRequest(manifest, page, {
-                        leaseToken,
-                        revision: table.revision + batch.step - 1,
-                        offset: batch.offset,
-                        columns,
-                      }),
-                    );
-                    if (!replayed.replayed || replayed.revision !== table.revision + batch.step) {
-                      throw new ColumnReceiptMismatchError();
-                    }
-                    table.columnsByRef = mergeColumnMap(table.columnsByRef, columns, replayed);
-                  }
-                });
-              }
-              table.columnOffset = advanced.columnOffset;
-              table.rowOffset = advanced.rowOffset;
-              table.revision = live.revision;
+          const matchesLastCommit = (current) =>
+            current.contentHash === lastCommittedHash &&
+            current.rowCount === rowOffset &&
+            (savedRevision === null || current.revision === savedRevision);
+          if (!progress && !matchesLastCommit(live)) {
+            // Committed content with no recorded baseline cannot be attributed: there
+            // is no revision to fence own writes against, so classifying here could
+            // only guess between a half-recovered import and a destination table.
+            // Leave the record without table progress; importTable's guard fails this
+            // table loudly, which is an operator decision rather than a silent one.
+          } else {
+            const table = {
+              ...progress,
+              phase: progress?.phase ?? "columns",
+              revision: savedRevision ?? live.revision,
+              contentHash: plan.contentHash,
+              expectedColumns: source.columns.length,
+              expectedRows: source.rows.length,
+              columnOffset,
+              rowOffset,
+              columnsByRef: progress?.columnsByRef ?? {},
+            };
+            patch.table = table;
+            patch.tableError = null;
+            // Destination edits win the whole table facet, including when they race an
+            // incomplete import. Stop further batches so user-owned rows are never
+            // combined with the remaining source rows into a hybrid table.
+            const keepDestinationTable = (current) => {
+              table.phase = "complete";
+              table.acceptedRemoteHash = current.contentHash;
+              table.acceptedRemoteRowCount = current.rowCount;
+              report.issue("destination_table_kept", page.title);
+            };
+            const adoptOwnBaseline = () => {
               delete table.acceptedRemoteHash;
               delete table.acceptedRemoteRowCount;
-            } catch (error) {
-              if (error instanceof ColumnReceiptMismatchError) {
-                keepDestinationTable();
-              } else {
+            };
+            if (matchesLastCommit(live)) {
+              // With no recorded baseline, the empty table itself needs attribution:
+              // fresh tables start at revision 1, and an own write never leaves a
+              // table empty, so an empty table at any later revision was emptied by
+              // the destination and its edit-and-revert claims the facet.
+              if (progress || live.revision === 1) adoptOwnBaseline();
+              else keepDestinationTable(live);
+            } else if (complete || savedRevision === null) {
+              keepDestinationTable(live);
+            } else if (!(await advancedCommitMatch(plan, columnOffset, rowOffset, savedRevision, live))) {
+              keepDestinationTable(live);
+            } else {
+              // A process killed after the server committed bulk batches but before
+              // the manifest recorded them leaves the live table ahead by those
+              // batches: this import's own writes, so the offsets advance and the run
+              // resumes. The offsets recovery records must describe a table no other
+              // writer is moving, so the classification is repeated and applied under
+              // the table lease, whose guards exclude every other writer.
+              try {
+                await withTableLease(client, pageId, async (leaseToken) => {
+                  const leased = await client.tableVerification(pageId);
+                  if (matchesLastCommit(leased)) return adoptOwnBaseline();
+                  const advanced = await advancedCommitMatch(plan, columnOffset, rowOffset, savedRevision, leased);
+                  if (!advanced) return keepDestinationTable(leased);
+                  try {
+                    for (const batch of advanced.columnBatches) {
+                      // The response is the only durable source of the generated
+                      // column ids. Replaying each deterministic request returns its
+                      // stored receipt before lease or revision guards, without a
+                      // second column batch.
+                      const columns = source.columns.slice(batch.offset, batch.endOffset);
+                      let replayed;
+                      try {
+                        replayed = await client.bulkTableWrite(
+                          pageId,
+                          columnBatchRequest(manifest, page, {
+                            leaseToken,
+                            revision: table.revision + batch.step - 1,
+                            offset: batch.offset,
+                            columns,
+                          }),
+                        );
+                      } catch (error) {
+                        // The guarded write reaches these rejections only when no
+                        // receipt answers this request id; an own write always leaves
+                        // one, so the matched batch was not this import's.
+                        const code = error?.status === 409 ? error.code : null;
+                        if (code === "table_revision_conflict" || code === "idempotency_key_reused") {
+                          throw new ColumnReceiptMismatchError();
+                        }
+                        throw error;
+                      }
+                      if (!replayed.replayed || replayed.revision !== table.revision + batch.step) {
+                        throw new ColumnReceiptMismatchError();
+                      }
+                      table.columnsByRef = mergeColumnMap(table.columnsByRef, columns, replayed);
+                    }
+                  } catch (error) {
+                    if (error instanceof ColumnReceiptMismatchError) return keepDestinationTable(leased);
+                    throw error;
+                  }
+                  table.columnOffset = advanced.columnOffset;
+                  table.rowOffset = advanced.rowOffset;
+                  table.revision = leased.revision;
+                  adoptOwnBaseline();
+                });
+              } catch (error) {
                 // A held lease or a transient failure classifies nothing. Leave the
-                // recorded offsets untouched so a later run retries cleanly, and fail
-                // this table alone rather than aborting every page in the run.
+                // recorded offsets untouched so a later run retries cleanly. Not
+                // reported here: the write pass retries this table in the same run and
+                // reports once if its own attempt still cannot proceed.
                 patch.tableError = errorMessage(error);
-                report.error("table_failed", `${page.title}: ${errorMessage(error)}`);
               }
             }
-          } else {
-            keepDestinationTable();
           }
         }
       } catch (error) {
