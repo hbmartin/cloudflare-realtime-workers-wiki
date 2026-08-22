@@ -755,65 +755,68 @@ describe("reconcileCommitted", () => {
     });
   });
 
-  it("marks recovery ambiguous when a matched batch has no stored receipt to prove it", async () => {
-    const page = { path: "Table.html", kind: "database", title: "Table" };
-    const table = {
-      columns: [{ ref: "c0", name: "Value", type: "text" }],
-      rows: [{ cells: { "ref:c0": "imported" } }],
-    };
-    const plan = await planFor(table);
-    const committedColumn = canonicalSourceTable(table, 1, 0);
-    const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
-    const manifest = stubManifest({
-      [page.path]: {
-        pageId: "page-1",
-        expectedPage: { kind: "table", title: "Table", parentId: null },
-        table: columnProgress(plan.contentHash),
-      },
-    });
-    const { state } = manifest;
-    // The revision walk matches a column batch, but the server holds no receipt for
-    // its request id (for example, receipts written before their request hashes were
-    // recorded have been cleared), so the guarded replay is refused as a stale write.
-    // The absence of that receipt cannot distinguish a legacy importer-owned commit
-    // from a destination edit, so recovery must stop without blessing either origin.
-    const client = {
-      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
-      tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
-      acquireTableLease: vi.fn(async () => ({ leaseToken: "reconcile-lease" })),
-      releaseTableLease: vi.fn(async () => undefined),
-      bulkTableWrite: vi.fn(async () => {
-        throw Object.assign(new Error("The table changed. Reloading before retrying the update."), {
-          status: 409,
-          code: "table_revision_conflict",
-        });
-      }),
-    };
-    const report = { issue: vi.fn(), error: vi.fn() };
+  it.each(["table_revision_conflict", "idempotency_key_reused"])(
+    "marks recovery ambiguous when a matched batch replay returns %s",
+    async (conflictCode) => {
+      const page = { path: "Table.html", kind: "database", title: "Table" };
+      const table = {
+        columns: [{ ref: "c0", name: "Value", type: "text" }],
+        rows: [{ cells: { "ref:c0": "imported" } }],
+      };
+      const plan = await planFor(table);
+      const committedColumn = canonicalSourceTable(table, 1, 0);
+      const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
+      const manifest = stubManifest({
+        [page.path]: {
+          pageId: "page-1",
+          expectedPage: { kind: "table", title: "Table", parentId: null },
+          table: columnProgress(plan.contentHash),
+        },
+      });
+      const { state } = manifest;
+      // The revision walk matches a column batch, but the server holds no receipt for
+      // its request id (for example, receipts written before their request hashes were
+      // recorded have been cleared), so the guarded replay is refused as a stale write.
+      // The absence of that receipt cannot distinguish a legacy importer-owned commit
+      // from a destination edit, so recovery must stop without blessing either origin.
+      const client = {
+        pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+        tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
+        acquireTableLease: vi.fn(async () => ({ leaseToken: "reconcile-lease" })),
+        releaseTableLease: vi.fn(async () => undefined),
+        bulkTableWrite: vi.fn(async () => {
+          throw Object.assign(new Error("The table changed. Reloading before retrying the update."), {
+            status: 409,
+            code: conflictCode,
+          });
+        }),
+      };
+      const report = { issue: vi.fn(), error: vi.fn() };
 
-    await reconcileCommitted({
-      selected: [page],
-      manifest,
-      report,
-      tablePlans: new Map([[page, plan]]),
-      client,
-    });
+      await reconcileCommitted({
+        selected: [page],
+        manifest,
+        report,
+        tablePlans: new Map([[page, plan]]),
+        client,
+      });
 
-    expect(report.issue).not.toHaveBeenCalled();
-    expect(report.error).toHaveBeenCalledWith(
-      "table_recovery_ambiguous",
-      expect.stringMatching(/^Table: .*no durable receipt proves who committed it/),
-    );
-    expect(state.nodes[page.path].tableError).toMatch(/no durable receipt proves who committed it/);
-    expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(true);
-    expect(state.nodes[page.path].table).toMatchObject({
-      phase: "columns",
-      revision: 1,
-      columnOffset: 0,
-      rowOffset: 0,
-    });
-    expect(state.nodes[page.path].table.acceptedRemoteHash).toBeUndefined();
-  });
+      expect(report.issue).not.toHaveBeenCalled();
+      expect(report.error).toHaveBeenCalledWith(
+        "table_recovery_ambiguous",
+        expect.stringMatching(/^Table: .*no durable receipt proves who committed it/),
+      );
+      expect(state.nodes[page.path].tableError).toMatch(/no durable receipt proves who committed it/);
+      expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(true);
+      expect(state.nodes[page.path].table).toMatchObject({
+        phase: "columns",
+        revision: 1,
+        columnOffset: 0,
+        rowOffset: 0,
+      });
+      expect(state.nodes[page.path].table.acceptedRemoteHash).toBeUndefined();
+    },
+  );
 
   it("classifies recovery against the table read under its lease, not the earlier probe", async () => {
     const page = { path: "Table.html", kind: "database", title: "Table" };
