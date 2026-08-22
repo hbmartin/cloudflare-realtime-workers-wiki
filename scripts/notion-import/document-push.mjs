@@ -138,19 +138,27 @@ function currentProjectionHash(doc) {
  * typing at the deadline yields a transient hash, which the next run's guarded compare
  * corrects.
  */
-function settledProjectionHash(doc, { quietMs = 1_000, maxWaitMs = 10_000 } = {}) {
-  return new Promise((resolve) => {
+export function settledProjectionHash(doc, { quietMs = 1_000, maxWaitMs = 10_000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
     let quiet = setTimeout(finish, quietMs);
     const deadline = setTimeout(finish, maxWaitMs);
     function onUpdate() {
+      if (settled) return;
       clearTimeout(quiet);
       quiet = setTimeout(finish, quietMs);
     }
     function finish() {
+      if (settled) return;
+      settled = true;
       clearTimeout(quiet);
       clearTimeout(deadline);
       doc.off("update", onUpdate);
-      resolve(currentProjectionHash(doc));
+      try {
+        resolve(currentProjectionHash(doc));
+      } catch (error) {
+        reject(error);
+      }
     }
     doc.on("update", onUpdate);
   });

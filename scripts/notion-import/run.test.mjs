@@ -755,7 +755,7 @@ describe("reconcileCommitted", () => {
     });
   });
 
-  it("keeps the destination when a matched batch has no stored receipt to prove it", async () => {
+  it("marks recovery ambiguous when a matched batch has no stored receipt to prove it", async () => {
     const page = { path: "Table.html", kind: "database", title: "Table" };
     const table = {
       columns: [{ ref: "c0", name: "Value", type: "text" }],
@@ -775,8 +775,8 @@ describe("reconcileCommitted", () => {
     // The revision walk matches a column batch, but the server holds no receipt for
     // its request id (for example, receipts written before their request hashes were
     // recorded have been cleared), so the guarded replay is refused as a stale write.
-    // An own write always leaves a receipt, so this batch was not the import's; the
-    // table must settle as destination-owned instead of retrying the same 409 forever.
+    // The absence of that receipt cannot distinguish a legacy importer-owned commit
+    // from a destination edit, so recovery must stop without blessing either origin.
     const client = {
       pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
       tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
@@ -799,14 +799,20 @@ describe("reconcileCommitted", () => {
       client,
     });
 
-    expect(report.issue).toHaveBeenCalledWith("destination_table_kept", "Table");
-    expect(report.error).not.toHaveBeenCalled();
-    expect(state.nodes[page.path].tableError).toBeNull();
+    expect(report.issue).not.toHaveBeenCalled();
+    expect(report.error).toHaveBeenCalledWith(
+      "table_recovery_ambiguous",
+      expect.stringMatching(/^Table: .*no durable receipt proves who committed it/),
+    );
+    expect(state.nodes[page.path].tableError).toMatch(/no durable receipt proves who committed it/);
+    expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(true);
     expect(state.nodes[page.path].table).toMatchObject({
-      phase: "complete",
-      acceptedRemoteHash: committedColumnHash,
-      acceptedRemoteRowCount: 0,
+      phase: "columns",
+      revision: 1,
+      columnOffset: 0,
+      rowOffset: 0,
     });
+    expect(state.nodes[page.path].table.acceptedRemoteHash).toBeUndefined();
   });
 
   it("classifies recovery against the table read under its lease, not the earlier probe", async () => {

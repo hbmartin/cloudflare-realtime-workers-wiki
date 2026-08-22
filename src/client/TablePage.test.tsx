@@ -2238,6 +2238,72 @@ describe("TablePage", () => {
     expect(fullLoads).toHaveLength(2);
   });
 
+  it("reloads sorted page one when the user's own save crosses an offset snapshot", async () => {
+    const sortedFirst: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-1", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 501,
+    };
+    const append = deferred<{ table: TableData }>();
+    const refreshed: TableData = {
+      ...table,
+      revision: 2,
+      sort: "status",
+      rows: [{ id: "row-displaced", position: 500, cells: { status: "Middle" } }],
+      hasMore: false,
+      nextCursor: null,
+      nextOffset: null,
+      rowCount: 501,
+    };
+    let sortedPageLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.resolve({ revision: 2 });
+      if (String(path).includes("offset=500")) return append.promise;
+      if (String(path).includes("sort=status")) {
+        sortedPageLoads += 1;
+        return Promise.resolve({ table: sortedPageLoads === 1 ? sortedFirst : refreshed });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    expect(await screen.findByDisplayValue("Alpha")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    const cell = screen.getByDisplayValue("Alpha");
+    fireEvent.change(cell, { target: { value: "Zulu" } });
+    fireEvent.blur(cell);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        expect.stringContaining("/cells/row-1/status"),
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+
+    await act(async () => {
+      append.resolve({
+        table: {
+          ...sortedFirst,
+          revision: 2,
+          rows: [{ id: "row-1", position: 0, cells: { status: "Zulu" } }],
+          hasMore: false,
+          nextOffset: null,
+          rowCount: null,
+        },
+      });
+      await append.promise;
+    });
+
+    expect(await screen.findByDisplayValue("Middle")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Zulu")).not.toBeInTheDocument();
+    expect(sortedPageLoads).toBe(2);
+  });
+
   it("refetches a load snapshot that is older than an already merged save", async () => {
     let sortLoads = 0;
     vi.mocked(api).mockImplementation((path, init) => {

@@ -391,11 +391,11 @@ async function withTableLease(client, pageId, action) {
   }
 }
 
-/** A replayed receipt that contradicts the live table: destination interference. */
-class ColumnReceiptMismatchError extends Error {
+/** A live imported prefix whose ownership cannot be proved by a durable receipt. */
+class ColumnRecoveryAmbiguousError extends Error {
   constructor() {
-    super("The recovered column receipt does not match the live table revision.");
-    this.name = "ColumnReceiptMismatchError";
+    super("The live table matches an unrecorded import batch, but no durable receipt proves who committed it.");
+    this.name = "ColumnRecoveryAmbiguousError";
   }
 }
 
@@ -570,6 +570,7 @@ export async function reconcileCommitted({
             };
             patch.table = table;
             patch.tableError = null;
+            patch.tableRecoveryAmbiguous = node.tableRecoveryAmbiguous ?? false;
             // Destination edits win the whole table facet, including when they race an
             // incomplete import. Stop further batches so user-owned rows are never
             // combined with the remaining source rows into a hybrid table.
@@ -577,11 +578,13 @@ export async function reconcileCommitted({
               table.phase = "complete";
               table.acceptedRemoteHash = current.contentHash;
               table.acceptedRemoteRowCount = current.rowCount;
+              patch.tableRecoveryAmbiguous = false;
               report.issue("destination_table_kept", page.title);
             };
             const adoptOwnBaseline = () => {
               delete table.acceptedRemoteHash;
               delete table.acceptedRemoteRowCount;
+              patch.tableRecoveryAmbiguous = false;
             };
             if (matchesLastCommit(live)) {
               // With no recorded baseline, the empty table itself needs attribution:
@@ -607,42 +610,38 @@ export async function reconcileCommitted({
                   if (matchesLastCommit(leased)) return adoptOwnBaseline();
                   const advanced = await advancedCommitMatch(plan, columnOffset, rowOffset, savedRevision, leased);
                   if (!advanced) return keepDestinationTable(leased);
-                  try {
-                    for (const batch of advanced.columnBatches) {
-                      // The response is the only durable source of the generated
-                      // column ids. Replaying each deterministic request returns its
-                      // stored receipt before lease or revision guards, without a
-                      // second column batch.
-                      const columns = source.columns.slice(batch.offset, batch.endOffset);
-                      let replayed;
-                      try {
-                        replayed = await client.bulkTableWrite(
-                          pageId,
-                          columnBatchRequest(manifest, page, {
-                            leaseToken,
-                            revision: table.revision + batch.step - 1,
-                            offset: batch.offset,
-                            columns,
-                          }),
-                        );
-                      } catch (error) {
-                        // The guarded write reaches these rejections only when no
-                        // receipt answers this request id; an own write always leaves
-                        // one, so the matched batch was not this import's.
-                        const code = error?.status === 409 ? error.code : null;
-                        if (code === "table_revision_conflict" || code === "idempotency_key_reused") {
-                          throw new ColumnReceiptMismatchError();
-                        }
-                        throw error;
+                  for (const batch of advanced.columnBatches) {
+                    // The response is the only durable source of the generated
+                    // column ids. Replaying each deterministic request returns its
+                    // stored receipt before lease or revision guards, without a
+                    // second column batch.
+                    const columns = source.columns.slice(batch.offset, batch.endOffset);
+                    let replayed;
+                    try {
+                      replayed = await client.bulkTableWrite(
+                        pageId,
+                        columnBatchRequest(manifest, page, {
+                          leaseToken,
+                          revision: table.revision + batch.step - 1,
+                          offset: batch.offset,
+                          columns,
+                        }),
+                      );
+                    } catch (error) {
+                      // A missing receipt cannot distinguish a destination edit from
+                      // an importer-owned batch whose legacy receipt was cleared.
+                      // Preserve the recorded offsets and require operator recovery
+                      // instead of silently accepting a potentially partial table.
+                      const code = error?.status === 409 ? error.code : null;
+                      if (code === "table_revision_conflict" || code === "idempotency_key_reused") {
+                        throw new ColumnRecoveryAmbiguousError();
                       }
-                      if (!replayed.replayed || replayed.revision !== table.revision + batch.step) {
-                        throw new ColumnReceiptMismatchError();
-                      }
-                      table.columnsByRef = mergeColumnMap(table.columnsByRef, columns, replayed);
+                      throw error;
                     }
-                  } catch (error) {
-                    if (error instanceof ColumnReceiptMismatchError) return keepDestinationTable(leased);
-                    throw error;
+                    if (!replayed.replayed || replayed.revision !== table.revision + batch.step) {
+                      throw new ColumnRecoveryAmbiguousError();
+                    }
+                    table.columnsByRef = mergeColumnMap(table.columnsByRef, columns, replayed);
                   }
                   table.columnOffset = advanced.columnOffset;
                   table.rowOffset = advanced.rowOffset;
@@ -650,11 +649,18 @@ export async function reconcileCommitted({
                   adoptOwnBaseline();
                 });
               } catch (error) {
-                // A held lease or a transient failure classifies nothing. Leave the
-                // recorded offsets untouched so a later run retries cleanly. Not
-                // reported here: the write pass retries this table in the same run and
-                // reports once if its own attempt still cannot proceed.
-                patch.tableError = errorMessage(error);
+                // A held lease or transient failure classifies nothing. A receipt
+                // ambiguity is durable and reported here; the write pass then skips it
+                // instead of issuing another mutation from an unproven baseline.
+                if (error instanceof ColumnRecoveryAmbiguousError) {
+                  patch.tableError = errorMessage(error);
+                  patch.tableRecoveryAmbiguous = true;
+                } else if (!patch.tableRecoveryAmbiguous) {
+                  patch.tableError = errorMessage(error);
+                }
+                if (patch.tableRecoveryAmbiguous) {
+                  report.error("table_recovery_ambiguous", `${page.title}: ${patch.tableError}`);
+                }
               }
             }
           }
@@ -965,6 +971,9 @@ export async function runImport({
     if (record.remoteMissing || record.remoteKindMismatch || record.remoteTableMissing) continue;
     if (record.table?.phase === "complete") {
       rowsWritten += record.table.acceptedRemoteRowCount ?? record.table.expectedRows ?? 0;
+      continue;
+    }
+    if (record.tableRecoveryAmbiguous) {
       continue;
     }
     try {
