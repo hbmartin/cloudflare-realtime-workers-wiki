@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createManifest } from "./manifest.mjs";
+import { createManifest, fingerprintExport } from "./manifest.mjs";
 
 const temporaryDirectories = [];
 
@@ -29,6 +29,17 @@ function open({ root, path }, overrides = {}) {
     rootParentId: null,
     ...overrides,
   });
+}
+
+function legacyAggregate(root, relativePaths) {
+  const hash = createHash("sha256");
+  for (const relativePath of relativePaths) {
+    hash.update(relativePath);
+    hash.update("\0");
+    hash.update(readFileSync(join(root, relativePath)));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
 }
 
 describe("createManifest", () => {
@@ -68,12 +79,7 @@ describe("createManifest", () => {
     // silently promoting whichever export happens to reproduce the old aggregate.
     const files = fixture();
     const relativePath = "Page 11111111111111111111111111111111.html";
-    const legacyFingerprint = createHash("sha256")
-      .update(relativePath)
-      .update("\0")
-      .update(readFileSync(join(files.root, relativePath)))
-      .update("\0")
-      .digest("hex");
+    const legacyFingerprint = legacyAggregate(files.root, [relativePath]);
     writeFileSync(
       files.path,
       JSON.stringify({
@@ -123,7 +129,7 @@ describe("createManifest", () => {
     expect(open(files).state.importId).toBe("b".repeat(32));
   });
 
-  it("distinguishes exports whose raw byte streams collide across NUL frames", () => {
+  it("rejects a legacy manifest whose raw aggregate collides with another export", () => {
     // One file containing "x\0<other path>\0y" and two files containing "x" and "y"
     // concatenate to the same path\0bytes\0 stream, so the raw-bytes aggregate cannot
     // tell these exports apart; the digest aggregate's fixed-width frames must.
@@ -139,30 +145,10 @@ describe("createManifest", () => {
     writeFileSync(join(rootB, first), "x");
     writeFileSync(join(rootB, second), "y");
     const path = join(directory, "manifest.json");
+    const collidingLegacyFingerprint = legacyAggregate(rootA, [first]);
 
-    open({ root: rootA, path }).flush();
-    expect(() => open({ root: rootB, path })).toThrow(/different copy of this export/);
-  });
-
-  it("rejects a different export that collides with a stored legacy fingerprint", () => {
-    const directory = mkdtempSync(join(tmpdir(), "notion-manifest-"));
-    temporaryDirectories.push(directory);
-    const page = "Page 11111111111111111111111111111111.html";
-    const asset = "z.bin";
-    const rootA = join(directory, "export-a");
-    mkdirSync(rootA);
-    writeFileSync(join(rootA, page), Buffer.from(`x\0${asset}\0y`, "utf8"));
-    const rootB = join(directory, "export-b");
-    mkdirSync(rootB);
-    writeFileSync(join(rootB, page), "x");
-    writeFileSync(join(rootB, asset), "y");
-    const path = join(directory, "manifest.json");
-    const collidingLegacyFingerprint = createHash("sha256")
-      .update(page)
-      .update("\0")
-      .update(readFileSync(join(rootA, page)))
-      .update("\0")
-      .digest("hex");
+    expect(legacyAggregate(rootB, [first, second])).toBe(collidingLegacyFingerprint);
+    expect(fingerprintExport(rootB).fingerprint).not.toBe(fingerprintExport(rootA).fingerprint);
     writeFileSync(
       path,
       JSON.stringify({
