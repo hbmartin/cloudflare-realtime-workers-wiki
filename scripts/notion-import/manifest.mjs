@@ -65,25 +65,6 @@ export function fingerprintExport(root) {
   return { fingerprint: hash.digest("hex"), digests };
 }
 
-/**
- * The aggregate an earlier version 2 importer recorded: NUL-framed raw file bytes.
- * That framing is ambiguous - file bytes may themselves contain NULs, so two different
- * file sets can share one stream - which is why it is computed only when a stored
- * fingerprint fails the digest comparison and is never recorded again: an accepted
- * legacy manifest is rewritten to the digest form on open.
- */
-function legacyFingerprintExport(root) {
-  const { files } = walkExport(root);
-  const hash = createHash("sha256");
-  for (const path of files) {
-    hash.update(path);
-    hash.update("\0");
-    hashFile(join(root, path), hash);
-    hash.update("\0");
-  }
-  return hash.digest("hex");
-}
-
 export function createManifest({ path, root, baseURL, workspaceId, rootParentId, adoptRootParent = false }) {
   const { fingerprint, digests } = fingerprintExport(root);
   let state;
@@ -118,15 +99,11 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId,
       throw new Error(`${path} does not contain a valid version 2 import id. Move it aside to start over.`);
     }
     if (state.exportFingerprint !== fingerprint) {
-      if (state.exportFingerprint !== legacyFingerprintExport(root)) {
-        throw new Error(
-          `${path} belongs to a different copy of this export. Move it aside to start over, ` +
-            "or point the importer at the directory it was created from.",
-        );
-      }
-      // Migrate on open, so the ambiguous legacy aggregate retires with the manifests
-      // that recorded it instead of being re-verified on every future open.
-      state.exportFingerprint = fingerprint;
+      throw new Error(
+        `${path} belongs to a different copy of this export, or was written with an older version 2 ` +
+          "raw-byte fingerprint. Raw-byte fingerprints cannot be resumed safely. Move it aside to start " +
+          "over, or point the importer at the exact export it was created from.",
+      );
     }
     if (state.baseURL !== baseURL) {
       throw new Error(`${path} was created against ${state.baseURL}, not ${baseURL}.`);
