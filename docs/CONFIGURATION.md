@@ -62,10 +62,15 @@ Never rename or delete a class or binding without a Cloudflare Durable Object mi
 | `compatibility_flags`       | `nodejs_compat`            | Required by Better Auth                                                  |
 | `observability.enabled`     | `true`                     | Workers Logs                                                             |
 | `upload_source_maps`        | `true`                     | Symbolicated stack traces in logs                                        |
-| `preview_urls`              | `true`                     | Per-version preview URLs                                                 |
+| `preview_urls`              | `true`                     | Per-version preview URLs; **inert here**, see below                      |
 | `assets.not_found_handling` | `single-page-application`  | SPA fallback                                                             |
 | `assets.run_worker_first`   | `["/api/*", "/parties/*"]` | Everything else is served by the asset layer without invoking the Worker |
 | `triggers.crons`            | `0 * * * *`                | Hourly cleanup; **required**                                             |
+
+Cloudflare does not generate preview URLs for Workers that implement a Durable Object, and this
+Worker exports two classes, so `preview_urls` has no effect on this deployment. It is left enabled
+because the setting is otherwise harmless and would become correct if the classes were ever removed.
+See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md#preview-urls-do-not-exist-for-this-worker).
 
 ## R2 key layout
 

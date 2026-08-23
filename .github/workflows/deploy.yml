@@ -2,6 +2,8 @@ name: Deploy
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -17,9 +19,11 @@ concurrency:
 
 jobs:
   # D1 migrations are forward-only, so the release gate has to pass before the
-  # deploy job starts rather than alongside it. `pnpm check` is the same gate
-  # `pnpm dev` users run locally; it is repeated here rather than inherited from
-  # CI because workflow_dispatch can select any ref, including one CI never saw.
+  # deploy job starts rather than alongside it. A push (to main or a v* tag)
+  # also starts CI on the same commit, and CI covers everything `pnpm check`
+  # does plus the browser suite, so for pushes the gate is just that wait.
+  # workflow_dispatch can select any ref, including one CI never saw, so it runs
+  # `pnpm check` here instead.
   gate:
     name: Release gate
     runs-on: ubuntu-latest
@@ -38,18 +42,21 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       # format:check, lint, typecheck, unit and Worker coverage, analyze,
-      # cf-typegen:check, and both builds.
-      - run: pnpm check
+      # cf-typegen:check, and both builds. Skipped for pushes, where CI already
+      # covers this exact commit.
+      - name: Full check
+        if: github.event_name == 'workflow_dispatch'
+        run: pnpm check
 
-      # `pnpm check` omits the browser suite, which CI runs. A tag push starts
-      # both workflows at once, so wait for CI on this exact commit rather than
-      # racing it. A ref CI never ran on has no conclusion to read and is
-      # covered by the gate above.
+      # A push starts CI and this workflow at once, so wait for CI on this exact
+      # commit rather than racing it. Only a dispatched ref can legitimately
+      # have no CI run at all; that case is covered by `pnpm check` above.
       - name: Require CI to have passed for this commit
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           for attempt in $(seq 1 20); do
             run=$(gh api \
@@ -58,8 +65,13 @@ jobs:
             status=${run% *}
             conclusion=${run#* }
             if [ -z "${status}" ]; then
-              echo "No CI run for ${SHA}; the release gate above is the only check."
-              exit 0
+              if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+                echo "No CI run for ${SHA}; the release gate above is the only check."
+                exit 0
+              fi
+              echo "Attempt ${attempt}: CI for ${SHA} has not appeared yet; waiting."
+              sleep 60
+              continue
             fi
             if [ "${status}" = "completed" ]; then
               echo "CI for ${SHA} concluded: ${conclusion}"
