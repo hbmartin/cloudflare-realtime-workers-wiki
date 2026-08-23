@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createManifest } from "./manifest.mjs";
+import { createManifest, fingerprintExport } from "./manifest.mjs";
 
 const temporaryDirectories = [];
 
@@ -29,6 +29,17 @@ function open({ root, path }, overrides = {}) {
     rootParentId: null,
     ...overrides,
   });
+}
+
+function legacyAggregate(root, relativePaths) {
+  const hash = createHash("sha256");
+  for (const relativePath of relativePaths) {
+    hash.update(relativePath);
+    hash.update("\0");
+    hash.update(readFileSync(join(root, relativePath)));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
 }
 
 describe("createManifest", () => {
@@ -62,18 +73,13 @@ describe("createManifest", () => {
     expect(() => open(files)).toThrow(/different copy of this export/);
   });
 
-  it("opens a legacy raw-bytes version 2 manifest and rewrites it to the digest form", () => {
-    // The raw-bytes aggregate also shipped stamped version 2, so manifests written by
-    // that importer must resume rather than be refused as a different export copy. Its
-    // NUL framing is ambiguous, so an accepted manifest is migrated to the digest form.
+  it("rejects a legacy raw-bytes version 2 manifest", () => {
+    // The raw-bytes aggregate also shipped stamped version 2, but its NUL framing
+    // cannot bind a manifest to one export unambiguously. Restarting is safer than
+    // silently promoting whichever export happens to reproduce the old aggregate.
     const files = fixture();
     const relativePath = "Page 11111111111111111111111111111111.html";
-    const legacyFingerprint = createHash("sha256")
-      .update(relativePath)
-      .update("\0")
-      .update(readFileSync(join(files.root, relativePath)))
-      .update("\0")
-      .digest("hex");
+    const legacyFingerprint = legacyAggregate(files.root, [relativePath]);
     writeFileSync(
       files.path,
       JSON.stringify({
@@ -89,11 +95,8 @@ describe("createManifest", () => {
       }),
     );
 
-    const manifest = open(files);
-    expect(manifest.state.importId).toBe("a".repeat(32));
-    manifest.flush();
-    expect(JSON.parse(readFileSync(files.path, "utf8")).exportFingerprint).not.toBe(legacyFingerprint);
-    expect(open(files).state.importId).toBe("a".repeat(32));
+    expect(() => open(files)).toThrow(/raw-byte fingerprints cannot be resumed safely/i);
+    expect(JSON.parse(readFileSync(files.path, "utf8")).exportFingerprint).toBe(legacyFingerprint);
   });
 
   it("opens a version 2 manifest whose fingerprint hashed per-file digests", () => {
@@ -126,14 +129,14 @@ describe("createManifest", () => {
     expect(open(files).state.importId).toBe("b".repeat(32));
   });
 
-  it("distinguishes exports whose raw byte streams collide across NUL frames", () => {
+  it("rejects a legacy manifest whose raw aggregate collides with another export", () => {
     // One file containing "x\0<other path>\0y" and two files containing "x" and "y"
     // concatenate to the same path\0bytes\0 stream, so the raw-bytes aggregate cannot
     // tell these exports apart; the digest aggregate's fixed-width frames must.
     const directory = mkdtempSync(join(tmpdir(), "notion-manifest-"));
     temporaryDirectories.push(directory);
     const first = "Page 11111111111111111111111111111111.html";
-    const second = "Page 22222222222222222222222222222222.html";
+    const second = "z.bin";
     const rootA = join(directory, "export-a");
     mkdirSync(rootA);
     writeFileSync(join(rootA, first), Buffer.from(`x\0${second}\0y`, "utf8"));
@@ -142,9 +145,27 @@ describe("createManifest", () => {
     writeFileSync(join(rootB, first), "x");
     writeFileSync(join(rootB, second), "y");
     const path = join(directory, "manifest.json");
+    const collidingLegacyFingerprint = legacyAggregate(rootA, [first]);
 
-    open({ root: rootA, path }).flush();
-    expect(() => open({ root: rootB, path })).toThrow(/different copy of this export/);
+    expect(legacyAggregate(rootB, [first, second])).toBe(collidingLegacyFingerprint);
+    expect(fingerprintExport(rootB).fingerprint).not.toBe(fingerprintExport(rootA).fingerprint);
+    writeFileSync(
+      path,
+      JSON.stringify({
+        version: 2,
+        importId: "c".repeat(32),
+        startedAt: Date.now(),
+        baseURL: "https://notes.example.test",
+        workspaceId: "workspace-1",
+        exportRoot: rootA,
+        exportFingerprint: collidingLegacyFingerprint,
+        rootParentId: null,
+        nodes: {},
+      }),
+    );
+
+    expect(() => open({ root: rootB, path })).toThrow(/raw-byte fingerprints cannot be resumed safely/i);
+    expect(JSON.parse(readFileSync(path, "utf8")).exportFingerprint).toBe(collidingLegacyFingerprint);
   });
 
   it("uses a random import id and explicitly rejects version 1", () => {
