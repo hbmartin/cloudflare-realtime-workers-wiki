@@ -73,10 +73,12 @@ describe("createManifest", () => {
     expect(() => open(files)).toThrow(/different copy of this export/);
   });
 
-  it("rejects a legacy raw-bytes version 2 manifest", () => {
+  it("refuses a legacy raw-bytes version 2 manifest until the operator adopts it", () => {
     // The raw-bytes aggregate also shipped stamped version 2, but its NUL framing
-    // cannot bind a manifest to one export unambiguously. Restarting is safer than
-    // silently promoting whichever export happens to reproduce the old aggregate.
+    // cannot bind a manifest to one export unambiguously, so it is never promoted
+    // silently. Starting over is not the alternative it looks like: a fresh manifest
+    // mints a new importId and re-creates everything this one already imported, so
+    // the operator can assert the export is the right one and migrate in place.
     const files = fixture();
     const relativePath = "Page 11111111111111111111111111111111.html";
     const legacyFingerprint = legacyAggregate(files.root, [relativePath]);
@@ -95,8 +97,17 @@ describe("createManifest", () => {
       }),
     );
 
-    expect(() => open(files)).toThrow(/raw-byte fingerprints cannot be resumed safely/i);
+    expect(() => open(files)).toThrow(/not accepted by default/i);
     expect(JSON.parse(readFileSync(files.path, "utf8")).exportFingerprint).toBe(legacyFingerprint);
+
+    const adopted = open(files, { adoptLegacyFingerprint: true });
+    // Adoption resumes the same import rather than starting a second one, and retires
+    // the weak aggregate so no later open has to check it again.
+    expect(adopted.state.importId).toBe("a".repeat(32));
+    adopted.flush();
+    expect(JSON.parse(readFileSync(files.path, "utf8")).exportFingerprint).toBe(
+      fingerprintExport(files.root).fingerprint,
+    );
   });
 
   it("opens a version 2 manifest whose fingerprint hashed per-file digests", () => {
@@ -164,8 +175,25 @@ describe("createManifest", () => {
       }),
     );
 
-    expect(() => open({ root: rootB, path })).toThrow(/raw-byte fingerprints cannot be resumed safely/i);
+    expect(() => open({ root: rootB, path })).toThrow(/not accepted by default/i);
     expect(JSON.parse(readFileSync(path, "utf8")).exportFingerprint).toBe(collidingLegacyFingerprint);
+
+    // This is exactly what --adopt-legacy-fingerprint costs, and why it is opt-in: the
+    // legacy aggregate cannot tell rootB from rootA, so the flag is the operator
+    // asserting which export the manifest belongs to. The digest aggregate that
+    // replaces it on open cannot be fooled the same way again.
+    const adopted = open({ root: rootB, path }, { adoptLegacyFingerprint: true });
+    adopted.flush();
+    expect(JSON.parse(readFileSync(path, "utf8")).exportFingerprint).toBe(fingerprintExport(rootB).fingerprint);
+    expect(() => open({ root: rootA, path })).toThrow(/different copy of this export/);
+  });
+
+  it("refuses an adopted manifest that matches neither fingerprint", () => {
+    const files = fixture();
+    open(files).flush();
+    writeFileSync(join(files.root, "Page 11111111111111111111111111111111.html"), "<p>Fake</p>");
+
+    expect(() => open(files, { adoptLegacyFingerprint: true })).toThrow(/under both fingerprints/);
   });
 
   it("uses a random import id and explicitly rejects version 1", () => {

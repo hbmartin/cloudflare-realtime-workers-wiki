@@ -65,7 +65,35 @@ export function fingerprintExport(root) {
   return { fingerprint: hash.digest("hex"), digests };
 }
 
-export function createManifest({ path, root, baseURL, workspaceId, rootParentId, adoptRootParent = false }) {
+/**
+ * The aggregate an earlier version 2 importer recorded: NUL-framed raw file bytes.
+ * That framing is ambiguous - file bytes may themselves contain NULs, so two different
+ * file sets can share one stream - so it is never recorded again and is only computed
+ * when an operator has explicitly asked for a legacy manifest to be adopted. An accepted
+ * legacy manifest is rewritten to the digest form on open, retiring the weak aggregate
+ * with the manifest that recorded it rather than re-checking it on every future open.
+ */
+function legacyFingerprintExport(root) {
+  const { files } = walkExport(root);
+  const hash = createHash("sha256");
+  for (const path of files) {
+    hash.update(path);
+    hash.update("\0");
+    hashFile(join(root, path), hash);
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+export function createManifest({
+  path,
+  root,
+  baseURL,
+  workspaceId,
+  rootParentId,
+  adoptRootParent = false,
+  adoptLegacyFingerprint = false,
+}) {
   const { fingerprint, digests } = fingerprintExport(root);
   let state;
 
@@ -99,11 +127,26 @@ export function createManifest({ path, root, baseURL, workspaceId, rootParentId,
       throw new Error(`${path} does not contain a valid version 2 import id. Move it aside to start over.`);
     }
     if (state.exportFingerprint !== fingerprint) {
-      throw new Error(
-        `${path} belongs to a different copy of this export, or was written with an older version 2 ` +
-          "raw-byte fingerprint. Raw-byte fingerprints cannot be resumed safely. Move it aside to start " +
-          "over, or point the importer at the exact export it was created from.",
-      );
+      // Deliberately not "move it aside to start over": a new manifest mints a new
+      // importId, every deterministic resource id is derived from it, and a resumed
+      // import would recreate the whole tree beside the copy it already created.
+      if (!adoptLegacyFingerprint) {
+        throw new Error(
+          `${path} belongs to a different copy of this export, or was written with an older version 2 ` +
+            "raw-byte fingerprint. Raw-byte fingerprints are ambiguous, so they are not accepted by " +
+            "default. Point the importer at the exact export this manifest was created from, and if it " +
+            "already is that export, re-run with --adopt-legacy-fingerprint to check the manifest " +
+            "against the legacy aggregate once and migrate it. Starting over with a fresh manifest " +
+            "would duplicate everything this one has already created.",
+        );
+      }
+      if (state.exportFingerprint !== legacyFingerprintExport(root)) {
+        throw new Error(
+          `${path} belongs to a different copy of this export under both fingerprints. Point the ` +
+            "importer at the directory it was created from.",
+        );
+      }
+      state.exportFingerprint = fingerprint;
     }
     if (state.baseURL !== baseURL) {
       throw new Error(`${path} was created against ${state.baseURL}, not ${baseURL}.`);

@@ -818,6 +818,219 @@ describe("reconcileCommitted", () => {
     },
   );
 
+  it("settles an ambiguous table as the destination's when the operator opts in", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const committedColumn = canonicalSourceTable(table, 1, 0);
+    const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: columnProgress(plan.contentHash),
+        tableError:
+          "The live table matches an unrecorded import batch, but no durable receipt proves who committed it.",
+        tableRecoveryAmbiguous: true,
+      },
+    });
+    const { state } = manifest;
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
+      acquireTableLease: vi.fn(async () => ({ leaseToken: "reconcile-lease" })),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(async () => {
+        throw Object.assign(new Error("The table changed. Reloading before retrying the update."), {
+          status: 409,
+          code: "idempotency_key_reused",
+        });
+      }),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    // Without this the ambiguity is terminal: every rerun re-derives it identically, the
+    // write pass skips the table, and verify fails forever on a table never completed.
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+      keepAmbiguousTable: true,
+    });
+
+    expect(report.error).not.toHaveBeenCalled();
+    expect(report.issue).toHaveBeenCalledWith("ambiguous_table_kept", "Table");
+    expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(false);
+    expect(state.nodes[page.path].table).toMatchObject({
+      phase: "complete",
+      acceptedRemoteHash: committedColumnHash,
+      acceptedRemoteRowCount: 0,
+    });
+  });
+
+  it("reports the transient failure that stopped a rerun over an inherited ambiguity", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const committedColumn = canonicalSourceTable(table, 1, 0);
+    const committedColumnHash = await tableContentHash(committedColumn.columns, committedColumn.rows);
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: columnProgress(plan.contentHash),
+        tableError:
+          "The live table matches an unrecorded import batch, but no durable receipt proves who committed it.",
+        tableRecoveryAmbiguous: true,
+      },
+    });
+    const { state } = manifest;
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 2, contentHash: committedColumnHash, rowCount: 0 })),
+      acquireTableLease: vi.fn(async () => {
+        throw Object.assign(new Error("Another editor currently holds this table lease."), { status: 409 });
+      }),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    // The prior verdict stands -- nothing here disproved it -- but what stopped this
+    // attempt was the lease, and that message must not be lost to the inherited flag.
+    expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(true);
+    expect(state.nodes[page.path].tableError).toContain("lease");
+    expect(report.error).toHaveBeenCalledWith("table_recovery_ambiguous", expect.stringContaining("lease"));
+    expect(report.error).not.toHaveBeenCalledWith("table_recovery_ambiguous", expect.stringContaining("null"));
+  });
+
+  it("records no recovered column ids when a later batch replay is ambiguous", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    // 51 columns is two bulk column batches, so the replay can succeed once and then
+    // fail: the manifest must not keep ids for columns its offsets do not cover.
+    const table = {
+      columns: Array.from({ length: 51 }, (_, index) => ({ ref: `c${index}`, name: `Value ${index}`, type: "text" })),
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const committed = canonicalSourceTable(table, 51, 0);
+    const committedHash = await tableContentHash(committed.columns, committed.rows);
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: {
+          phase: "columns",
+          revision: 1,
+          columnOffset: 0,
+          rowOffset: 0,
+          columnsByRef: {},
+          expectedColumns: 51,
+          expectedRows: 1,
+          contentHash: plan.contentHash,
+        },
+      },
+    });
+    const { state } = manifest;
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 3, contentHash: committedHash, rowCount: 0 })),
+      acquireTableLease: vi.fn(async () => ({ leaseToken: "reconcile-lease" })),
+      releaseTableLease: vi.fn(async () => undefined),
+      bulkTableWrite: vi.fn(async (_pageId, request) => {
+        if (request.expectedRevision === 1) {
+          return {
+            replayed: true,
+            revision: 2,
+            columns: request.columns.map((column) => ({ ref: column.ref, id: `column-${column.ref}` })),
+          };
+        }
+        throw Object.assign(new Error("The table changed. Reloading before retrying the update."), {
+          status: 409,
+          code: "idempotency_key_reused",
+        });
+      }),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(client.bulkTableWrite).toHaveBeenCalledTimes(2);
+    expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(true);
+    expect(state.nodes[page.path].table).toMatchObject({
+      phase: "columns",
+      revision: 1,
+      columnOffset: 0,
+      rowOffset: 0,
+    });
+    // toMatchObject treats {} as a subset of anything, so the map is compared exactly.
+    expect(state.nodes[page.path].table.columnsByRef).toEqual({});
+  });
+
+  it("clears an ambiguity verdict this run cannot re-derive", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    // No recorded table progress, so nothing can be attributed and the classification
+    // below is skipped entirely. A verdict left by an earlier run must not survive it:
+    // the write pass skips an ambiguous table in silence, and this table needs to reach
+    // importTable's guard and fail loudly instead.
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        tableError:
+          "The live table matches an unrecorded import batch, but no durable receipt proves who committed it.",
+        tableRecoveryAmbiguous: true,
+      },
+    });
+    const { state } = manifest;
+    const client = {
+      pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+      tableVerification: vi.fn(async () => ({ revision: 5, contentHash: "unrelated-destination-hash", rowCount: 7 })),
+      acquireTableLease: vi.fn(),
+      releaseTableLease: vi.fn(),
+      bulkTableWrite: vi.fn(),
+    };
+    const report = { issue: vi.fn(), error: vi.fn() };
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report,
+      tablePlans: new Map([[page, plan]]),
+      client,
+    });
+
+    expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(false);
+    expect(state.nodes[page.path].table).toBeUndefined();
+  });
+
   it("classifies recovery against the table read under its lease, not the earlier probe", async () => {
     const page = { path: "Table.html", kind: "database", title: "Table" };
     const table = {
