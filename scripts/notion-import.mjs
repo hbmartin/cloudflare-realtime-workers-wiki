@@ -59,6 +59,8 @@ function parseArguments(argv) {
     requestsPerSecond: Number.parseInt(process.env.NOTES_IMPORT_RPS || "20", 10),
     lingerMs: 1_200,
     verifyTimeoutMs: Number(process.env.NOTES_IMPORT_VERIFY_TIMEOUT_MS || 120_000),
+    keepAmbiguousTable: false,
+    adoptLegacyFingerprint: false,
     verbose: false,
   };
   const positional = [];
@@ -82,6 +84,8 @@ function parseArguments(argv) {
     else if (flag === "--rps") options.requestsPerSecond = takeNumber();
     else if (flag === "--linger-ms") options.lingerMs = takeNumber();
     else if (flag === "--verify-timeout-ms") options.verifyTimeoutMs = takeNumber();
+    else if (flag === "--keep-ambiguous-table") options.keepAmbiguousTable = true;
+    else if (flag === "--adopt-legacy-fingerprint") options.adoptLegacyFingerprint = true;
     else if (flag === "--verbose") options.verbose = true;
     else if (flag.startsWith("--")) throw new Error(`Unknown option ${flag}.`);
     else positional.push(argument);
@@ -103,6 +107,11 @@ function usage() {
   console.error("  --rps <n>          Global request rate. Defaults to NOTES_IMPORT_RPS or 20.");
   console.error("  --linger-ms <n>    How long to hold each document open so compaction is armed promptly.");
   console.error("  --verify-timeout-ms <n>  Maximum time for exact post-import verification.");
+  console.error("  --keep-ambiguous-table   Settle a table reported as table_recovery_ambiguous by");
+  console.error("                     accepting the live table as the destination's. The import stops");
+  console.error("                     writing to it; nothing else can clear that state.");
+  console.error("  --adopt-legacy-fingerprint  Resume a manifest written with the older raw-byte export");
+  console.error("                     fingerprint, checking it once and migrating it to the digest form.");
   console.error("  --verbose          One line per page instead of a summary.");
 }
 
@@ -217,6 +226,7 @@ async function connect(options, root, { adoptRootParent = false } = {}) {
     workspaceId: client.workspaceId,
     rootParentId: options.parent,
     adoptRootParent,
+    adoptLegacyFingerprint: options.adoptLegacyFingerprint,
   });
   return { client, manifest };
 }
@@ -252,6 +262,7 @@ if (options.command === "inspect") {
       rootParentId: options.parent,
       limit: options.limit,
       lingerMs: options.lingerMs,
+      keepAmbiguousTable: options.keepAmbiguousTable,
     });
     report.print(summary);
   } finally {

@@ -143,8 +143,9 @@ export function settledProjectionHash(doc, { quietMs = 1_000, maxWaitMs = 10_000
     let settled = false;
     let quiet = setTimeout(finish, quietMs);
     const deadline = setTimeout(finish, maxWaitMs);
+    // No `settled` guard here: `finish` runs only from a timer, and it removes this
+    // listener in the same turn it sets the flag, so there is no emit left to ignore.
     function onUpdate() {
-      if (settled) return;
       clearTimeout(quiet);
       quiet = setTimeout(finish, quietMs);
     }
