@@ -239,9 +239,9 @@ If the release contained no migration, `pnpm wrangler rollback` alone is suffici
 
 ## Automated deployment
 
-`.github/workflows/deploy.yml` deploys on every push to `main`, on a pushed `v*` tag, and on a manual
-`workflow_dispatch`. There is no staging environment, so a bad commit on `main` reaches users; the CI
-run on that exact commit is the only gate. The workflow applies D1 migrations before deploying,
+`.github/workflows/deploy.yml` deploys after successful CI for the current tip of `main`, and on a
+manual `workflow_dispatch` after running `pnpm check`. There is no staging environment, so a bad
+commit on `main` reaches users if its CI passes; the workflow applies D1 migrations before deploying,
 matching the manual order above.
 
 It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository or environment secrets and
@@ -249,7 +249,7 @@ It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository or env
 managed by the workflow; they persist across deploys and are set once, manually, per the steps above.
 
 See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md) for the gate's behavior, the credentials, the
-optional manual-approval gate, how to revert to tag-only releases, and what Workers Builds, gradual
+optional manual-approval gate, how to switch to manual releases, and what Workers Builds, gradual
 deployments, or a staging environment would trade instead. The workflow has not been exercised
 against a live Cloudflare account in this repository; validate it on a throwaway Worker before
 relying on it.

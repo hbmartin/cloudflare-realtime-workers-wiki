@@ -68,6 +68,33 @@ describe("deterministic import resources", () => {
 });
 
 describe("runImport", () => {
+  it("rejects an ambiguous-table settlement that was not already recorded", async () => {
+    const database = {
+      path: "Table.html",
+      parent: null,
+      kind: "database",
+      title: "Table",
+      assets: [],
+    };
+    const manifest = stubManifest({
+      [database.path]: { pageId: "page-1", tableRecoveryAmbiguous: false },
+    });
+
+    await expect(
+      runImport({
+        index: { pages: [database], root: "/unused" },
+        client: {},
+        manifest,
+        report: { issue: vi.fn(), progress: vi.fn(), inPage: vi.fn() },
+        rootParentId: null,
+        limit: 1,
+        lingerMs: 0,
+        keepAmbiguousTables: [database.path],
+      }),
+    ).rejects.toThrow('target "Table.html" is not recorded as table_recovery_ambiguous');
+    expect(manifest.record).not.toHaveBeenCalled();
+  });
+
   it("rejects a short page batch before recording shifted ids", async () => {
     const page = {
       path: "Page.html",
@@ -860,7 +887,7 @@ describe("reconcileCommitted", () => {
       report,
       tablePlans: new Map([[page, plan]]),
       client,
-      keepAmbiguousTable: true,
+      keepAmbiguousTables: new Set([page.path]),
     });
 
     expect(report.error).not.toHaveBeenCalled();

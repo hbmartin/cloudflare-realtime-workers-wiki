@@ -1,8 +1,9 @@
 # Continuous deployment
 
-`.github/workflows/deploy.yml` deploys the production Worker on every push to `main`, on a pushed
-`v*` tag, and on manual `workflow_dispatch`. This document covers what that trigger implies, the
-gate that protects it, and the account credentials it needs.
+`.github/workflows/deploy.yml` considers every completed `main`-branch CI run and deploys only when
+that run passed for the current tip of `main`. It also supports manual `workflow_dispatch`. This
+document covers what those triggers imply, the gate that protects them, and the account credentials
+they need.
 
 [Deployment](DEPLOYMENT.md) remains the reference for standing an installation up by hand;
 everything the workflow does is the manual sequence in
@@ -20,46 +21,48 @@ before enabling this:
 - **A red CI run blocks the deploy, but a passing one is not proof of a good release.** CI does not
   exercise a live Cloudflare account — no real D1, R2, or Durable Object.
 
-If that trade is not acceptable for an installation, revert to tag-only releases; see
-[Reverting to tag-only releases](#reverting-to-tag-only-releases).
+If that trade is not acceptable for an installation, require approval on the production
+environment or switch to manual releases; see [Switching to manual releases](#switching-to-manual-releases).
 
 ## Triggers
 
 ```yaml
 on:
-  push:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
     branches:
       - main
-    tags:
-      - "v*"
   workflow_dispatch:
 ```
 
-The trigger rules differ by event. A push uses the workflow file from the pushed ref, so a `v*` tag
-on a commit outside `main` can activate a changed workflow before that change reaches `main`.
-`workflow_dispatch` becomes available only when the workflow file exists on the default branch, but
-the person dispatching it may select another branch or tag as the run's ref.
+CI still starts directly on every push. The deploy workflow starts from its `workflow_run`
+completion event, eliminating a fixed polling window that could expire while the Chromium job was
+still queued or running. A `workflow_run` uses the workflow definition on the default branch; the
+deploy job explicitly checks out the triggering run's `head_sha`, not the event's default-branch
+SHA. `workflow_dispatch` also becomes available from the default-branch definition, but the person
+dispatching it may select another branch or tag as the run's ref.
 
 ## The release gate
 
 The `gate` job must pass before the `deploy` job starts, rather than running alongside it, because
 migrations are forward-only. What it runs depends on how the workflow was triggered:
 
-| Event                        | `pnpm check` in the gate | CI on the same commit                             |
-| ---------------------------- | ------------------------ | ------------------------------------------------- |
-| Push to `main` or a `v*` tag | Skipped                  | Required; must conclude `success`                 |
-| `workflow_dispatch`          | Runs                     | Used if one exists; a missing run is not an error |
+| Event                      | `pnpm check` in the gate | Deployment condition                                  |
+| -------------------------- | ------------------------ | ----------------------------------------------------- |
+| Completed CI run on `main` | Skipped                  | CI passed and its SHA is still the current `main` tip |
+| `workflow_dispatch`        | Runs                     | The selected ref passes the full local check          |
 
 `.github/workflows/ci.yml` triggers on `on: push` with no branch filter, so every push to `main`
 starts CI on the same SHA. Its five jobs — static checks, unit, Worker integration, build, and the
-Chromium e2e suite — cover everything `pnpm check` does and more, so repeating `pnpm check` serially
-ahead of each deploy would add roughly twenty minutes per push for no additional coverage. A
-dispatched run can name any ref, including one CI never saw, so the full check runs there instead.
-
-The gate polls the CI run for its commit twenty times at sixty-second intervals. A commit whose CI
-concluded anything other than `success` is refused. For a push, a CI run that never appears is also
-refused after the poll window; only a dispatched ref may deploy with no CI run at all, and that path
-is covered by the `pnpm check` it ran itself.
+Chromium e2e suite — cover everything `pnpm check` does and more, so the automatic path trusts the
+completed CI result instead of repeating that suite serially. Failed or cancelled CI completion
+events produce no deploy job. Before accepting a successful result, the gate reads the current
+`main` ref and skips a superseded SHA; rerunning an old CI job therefore cannot roll production
+backward. A dispatched run can name any ref, including one CI never saw, so it runs the full check
+itself.
 
 ## Credentials
 
@@ -98,17 +101,16 @@ by hand, per [Set secrets](DEPLOYMENT.md#3-set-secrets).
 
 ## Concurrency and rapid pushes
 
-The deploy workflow uses `concurrency: deploy-production` with `cancel-in-progress: false`, so
-deploys serialize and a migration never interleaves with another deploy. GitHub holds at most one
-_pending_ run per concurrency group: during a burst of pushes the in-progress deploy finishes
-untouched, the newest push queues behind it, and intermediate pending runs are cancelled. Production
-therefore converges on the newest commit rather than replaying every commit in the burst.
+The deploy job uses `concurrency: deploy-production` with `cancel-in-progress: false`, so deploys
+serialize and a migration never interleaves with another deploy. GitHub holds at most one _pending_
+job per concurrency group: during a burst of successful pushes the in-progress deploy finishes
+untouched, the newest eligible SHA queues behind it, and intermediate pending jobs are cancelled.
+The concurrency scope begins only after the gate, so failed and superseded CI events cannot replace
+an eligible pending deployment.
 
-CI, by contrast, sets `cancel-in-progress: true` on its ref. Pushing twice in quick succession
-cancels the first CI run, and the deploy waiting on that commit sees a `cancelled` conclusion and
-fails. This is the gate working as designed — it refuses to ship a commit whose checks did not
-pass — but it surfaces as a failed workflow run for a commit that was simply superseded. Production
-is unaffected and the newer commit deploys normally.
+CI sets `cancel-in-progress: true` on its ref. Pushing twice in quick succession cancels the first
+CI run; its completion event is skipped, while the newer commit proceeds once its own CI passes and
+it is still the tip of `main`.
 
 ## Requiring manual approval
 
@@ -205,8 +207,8 @@ unless version affinity is configured.
 
 The direct fix for the risk this document opens with. Add a third block beside `production` and
 `notes-checks-e2e` in `wrangler.jsonc` with its own D1 database, R2 buckets, and `BETTER_AUTH_URL`;
-point pushes to `main` at it and keep `v*` tags for production. Durable Object storage is per
-environment, so staging traffic never touches production rooms.
+point pushes to `main` at it and keep production on an approved manual dispatch. Durable Object
+storage is per environment, so staging traffic never touches production rooms.
 
 It costs a second set of resources, a second migration run per release, and a second set of Worker
 secrets. It is the option to take if deploying `main` straight to users is unacceptable but manual
@@ -220,8 +222,9 @@ repository instead declares bindings in `wrangler.jsonc` and creates the resourc
 failure, so adopting Terraform means moving resource creation out of the deployment docs entirely —
 worth it across many Workers, not for one.
 
-## Reverting to tag-only releases
+## Switching to manual releases
 
-Delete the `branches` block from the `push` trigger. Releases then happen only on a pushed `v*` tag
-or a manual dispatch, and the rest of the gate continues to behave correctly: a tag push also starts
-CI on that commit, so the wait still finds a run to require.
+Delete the `workflow_run` block and retain `workflow_dispatch`. Manual runs execute `pnpm check`
+before entering the serialized production deploy job, and the dispatcher can select a branch, tag,
+or commit. This avoids maintaining a second automatic tag path whose pending run could displace a
+newer `main` deployment.
