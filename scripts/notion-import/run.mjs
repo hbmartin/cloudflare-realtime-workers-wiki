@@ -441,6 +441,7 @@ export async function reconcileCommitted({
   report,
   tablePlans = new Map(),
   skipPaths = new Set(),
+  keepAmbiguousTable = false,
 }) {
   for (const page of selected) {
     const key = keyOf(page);
@@ -531,6 +532,11 @@ export async function reconcileCommitted({
       try {
         const live = await client.tableVerification(pageId);
         patch.remoteTableMissing = false;
+        // Re-derived from scratch on every run, before any branch below can decline to
+        // classify. runImport skips an ambiguous table in silence, so a verdict left in
+        // the record by an earlier run would otherwise end a later run with no error
+        // reported and no rows written.
+        patch.tableRecoveryAmbiguous = false;
         const plan = tablePlans.get(page);
         if (plan) {
           const source = plan.table;
@@ -570,7 +576,6 @@ export async function reconcileCommitted({
             };
             patch.table = table;
             patch.tableError = null;
-            patch.tableRecoveryAmbiguous = node.tableRecoveryAmbiguous ?? false;
             // Destination edits win the whole table facet, including when they race an
             // incomplete import. Stop further batches so user-owned rows are never
             // combined with the remaining source rows into a hybrid table.
@@ -578,13 +583,11 @@ export async function reconcileCommitted({
               table.phase = "complete";
               table.acceptedRemoteHash = current.contentHash;
               table.acceptedRemoteRowCount = current.rowCount;
-              patch.tableRecoveryAmbiguous = false;
               report.issue("destination_table_kept", page.title);
             };
             const adoptOwnBaseline = () => {
               delete table.acceptedRemoteHash;
               delete table.acceptedRemoteRowCount;
-              patch.tableRecoveryAmbiguous = false;
             };
             if (matchesLastCommit(live)) {
               // With no recorded baseline, the empty table itself needs attribution:
@@ -610,39 +613,55 @@ export async function reconcileCommitted({
                   if (matchesLastCommit(leased)) return adoptOwnBaseline();
                   const advanced = await advancedCommitMatch(plan, columnOffset, rowOffset, savedRevision, leased);
                   if (!advanced) return keepDestinationTable(leased);
-                  for (const batch of advanced.columnBatches) {
-                    // The response is the only durable source of the generated
-                    // column ids. Replaying each deterministic request returns its
-                    // stored receipt before lease or revision guards, without a
-                    // second column batch.
-                    const columns = source.columns.slice(batch.offset, batch.endOffset);
-                    let replayed;
-                    try {
-                      replayed = await client.bulkTableWrite(
-                        pageId,
-                        columnBatchRequest(manifest, page, {
-                          leaseToken,
-                          revision: table.revision + batch.step - 1,
-                          offset: batch.offset,
-                          columns,
-                        }),
-                      );
-                    } catch (error) {
-                      // A missing receipt cannot distinguish a destination edit from
-                      // an importer-owned batch whose legacy receipt was cleared.
-                      // Preserve the recorded offsets and require operator recovery
-                      // instead of silently accepting a potentially partial table.
-                      const code = error?.status === 409 ? error.code : null;
-                      if (code === "table_revision_conflict" || code === "idempotency_key_reused") {
+                  // Merged locally so a batch that replays before a later one fails
+                  // cannot leave recovered column ids in the record while the catch
+                  // below deliberately leaves the offsets that describe them unadvanced.
+                  let recoveredColumns = table.columnsByRef;
+                  try {
+                    for (const batch of advanced.columnBatches) {
+                      // The response is the only durable source of the generated
+                      // column ids. Replaying each deterministic request returns its
+                      // stored receipt before lease or revision guards, without a
+                      // second column batch.
+                      const columns = source.columns.slice(batch.offset, batch.endOffset);
+                      let replayed;
+                      try {
+                        replayed = await client.bulkTableWrite(
+                          pageId,
+                          columnBatchRequest(manifest, page, {
+                            leaseToken,
+                            revision: table.revision + batch.step - 1,
+                            offset: batch.offset,
+                            columns,
+                          }),
+                        );
+                      } catch (error) {
+                        // A missing receipt cannot distinguish a destination edit from
+                        // an importer-owned batch whose legacy receipt was cleared.
+                        // Preserve the recorded offsets and require operator recovery
+                        // instead of silently accepting a potentially partial table.
+                        const code = error?.status === 409 ? error.code : null;
+                        if (code === "table_revision_conflict" || code === "idempotency_key_reused") {
+                          throw new ColumnRecoveryAmbiguousError();
+                        }
+                        throw error;
+                      }
+                      if (!replayed.replayed || replayed.revision !== table.revision + batch.step) {
                         throw new ColumnRecoveryAmbiguousError();
                       }
-                      throw error;
+                      recoveredColumns = mergeColumnMap(recoveredColumns, columns, replayed);
                     }
-                    if (!replayed.replayed || replayed.revision !== table.revision + batch.step) {
-                      throw new ColumnRecoveryAmbiguousError();
-                    }
-                    table.columnsByRef = mergeColumnMap(table.columnsByRef, columns, replayed);
+                  } catch (error) {
+                    if (!(error instanceof ColumnRecoveryAmbiguousError) || !keepAmbiguousTable) throw error;
+                    // The one settlement that needs no missing receipt, and the only way
+                    // out of an ambiguity that every rerun re-derives identically: the
+                    // operator has decided the live table is the destination's, so it is
+                    // accepted whole and the import stops writing to it. Taken under the
+                    // lease, against the same verification the classification used.
+                    report.issue("ambiguous_table_kept", page.title);
+                    return keepDestinationTable(leased);
                   }
+                  table.columnsByRef = recoveredColumns;
                   table.columnOffset = advanced.columnOffset;
                   table.rowOffset = advanced.rowOffset;
                   table.revision = leased.revision;
@@ -652,14 +671,21 @@ export async function reconcileCommitted({
                 // A held lease or transient failure classifies nothing. A receipt
                 // ambiguity is durable and reported here; the write pass then skips it
                 // instead of issuing another mutation from an unproven baseline.
+                patch.tableError = errorMessage(error);
                 if (error instanceof ColumnRecoveryAmbiguousError) {
-                  patch.tableError = errorMessage(error);
                   patch.tableRecoveryAmbiguous = true;
-                } else if (!patch.tableRecoveryAmbiguous) {
-                  patch.tableError = errorMessage(error);
-                }
-                if (patch.tableRecoveryAmbiguous) {
-                  report.error("table_recovery_ambiguous", `${page.title}: ${patch.tableError}`);
+                  report.error(
+                    "table_recovery_ambiguous",
+                    `${page.title}: ${patch.tableError} Re-run with --keep-ambiguous-table to accept the live table as the destination's.`,
+                  );
+                } else {
+                  // This attempt proved nothing either way, so an ambiguity an earlier
+                  // run recorded still stands. What stopped this attempt is the transient
+                  // failure, and that is the message worth surfacing.
+                  patch.tableRecoveryAmbiguous = node.tableRecoveryAmbiguous ?? false;
+                  if (patch.tableRecoveryAmbiguous) {
+                    report.error("table_recovery_ambiguous", `${page.title}: ${patch.tableError}`);
+                  }
                 }
               }
             }
@@ -683,6 +709,7 @@ export async function runImport({
   rootParentId,
   limit,
   lingerMs,
+  keepAmbiguousTable = false,
   documentPush = pushDocument,
 }) {
   const selected = selectPages(index.pages, limit);
@@ -754,6 +781,7 @@ export async function runImport({
     report,
     tablePlans,
     skipPaths: freshPaths,
+    keepAmbiguousTable,
   });
 
   // Pass 1: every page, no content.

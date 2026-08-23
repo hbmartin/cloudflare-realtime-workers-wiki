@@ -200,8 +200,9 @@ The last item must be measured on a deployed account; Miniflare cannot prove bil
 1. Export D1 with `pnpm db:export --remote` and back up R2, as described in
    [Backup and recovery](BACKUP_AND_RECOVERY.md). Confirm the export is non-empty before continuing;
    `wrangler d1 export` on its own fails on this schema.
-2. Build and test the exact revision locally with `pnpm check`. The deploy workflow runs the same gate
-   and refuses to proceed without it, so a failure here is a failure there.
+2. Build and test the exact revision locally with `pnpm check`. CI runs a superset of the same gate on
+   every push and the deploy workflow refuses to proceed unless it passed, so a failure here is a
+   failure there.
 3. Run `pnpm db:remote` and confirm every migration in `migrations/` reports success before deploying.
    The directory is the source of truth for what must be applied; do not rely on a list enumerated in
    documentation, which drifts.
@@ -238,22 +239,17 @@ If the release contained no migration, `pnpm wrangler rollback` alone is suffici
 
 ## Automated deployment
 
-`.github/workflows/deploy.yml` deploys on a pushed `v*` tag or a manual `workflow_dispatch`. It is
-deliberately not wired to every push on the default branch: there is no staging environment, so a bad
-deploy reaches users directly.
+`.github/workflows/deploy.yml` deploys on every push to `main`, on a pushed `v*` tag, and on a manual
+`workflow_dispatch`. There is no staging environment, so a bad commit on `main` reaches users; the CI
+run on that exact commit is the only gate. The workflow applies D1 migrations before deploying,
+matching the manual order above.
 
-Configure the `production` GitHub Environment with these secrets and variables, and add required
-reviewers if you want a manual approval gate:
+It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository or environment secrets and
+`PRODUCTION_BASE_URL` as a variable. Secrets set with `wrangler secret put --env production` are not
+managed by the workflow; they persist across deploys and are set once, manually, per the steps above.
 
-| Name                    | Kind     | Purpose                         |
-| ----------------------- | -------- | ------------------------------- |
-| `CLOUDFLARE_API_TOKEN`  | secret   | Wrangler authentication         |
-| `CLOUDFLARE_ACCOUNT_ID` | secret   | Target account                  |
-| `PRODUCTION_BASE_URL`   | variable | Post-deploy health probe target |
-
-The workflow applies D1 migrations before deploying, matching the manual order. It has not been
-exercised against a live Cloudflare account in this repository; validate it on a throwaway Worker
-before relying on it.
-
-Secrets set with `wrangler secret put --env production` are not managed by the workflow. They persist
-across deploys and must be set once, manually, per the steps above.
+See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md) for the gate's behavior, the credentials, the
+optional manual-approval gate, how to revert to tag-only releases, and what Workers Builds, gradual
+deployments, or a staging environment would trade instead. The workflow has not been exercised
+against a live Cloudflare account in this repository; validate it on a throwaway Worker before
+relying on it.

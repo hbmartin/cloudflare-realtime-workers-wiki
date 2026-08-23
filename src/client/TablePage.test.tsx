@@ -2304,6 +2304,74 @@ describe("TablePage", () => {
     expect(sortedPageLoads).toBe(2);
   });
 
+  it("reloads sorted page one when a save landed before the load-more click", async () => {
+    // The in-flight ordering is covered above. Here the save commits first, so the
+    // table's revision has already moved to 2 while `nextOffset` still describes the
+    // revision 1 ordering: comparing the response against the table's own revision
+    // would accept the stale offset and lose the row displaced across the boundary.
+    const sortedFirst: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-1", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 501,
+    };
+    const refreshed: TableData = {
+      ...table,
+      revision: 2,
+      sort: "status",
+      rows: [{ id: "row-displaced", position: 500, cells: { status: "Middle" } }],
+      hasMore: false,
+      nextCursor: null,
+      nextOffset: null,
+      rowCount: 501,
+    };
+    let sortedPageLoads = 0;
+    let appendRequests = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.resolve({ revision: 2 });
+      if (String(path).includes("offset=500")) {
+        appendRequests += 1;
+        // Served at revision 2, where row-1 has sorted to the end of the table.
+        return Promise.resolve({
+          table: {
+            ...sortedFirst,
+            revision: 2,
+            rows: [{ id: "row-1", position: 500, cells: { status: "Zulu" } }],
+            hasMore: false,
+            nextOffset: null,
+          },
+        });
+      }
+      if (String(path).includes("sort=status")) {
+        sortedPageLoads += 1;
+        return Promise.resolve({ table: sortedPageLoads === 1 ? sortedFirst : refreshed });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    const cell = await screen.findByDisplayValue("Alpha");
+    fireEvent.change(cell, { target: { value: "Zulu" } });
+    fireEvent.blur(cell);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        expect.stringContaining("/cells/row-1/status"),
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Middle")).toBeInTheDocument();
+    expect(appendRequests).toBe(1);
+    expect(sortedPageLoads).toBe(2);
+  });
+
   it("refetches a load snapshot that is older than an already merged save", async () => {
     let sortLoads = 0;
     vi.mocked(api).mockImplementation((path, init) => {

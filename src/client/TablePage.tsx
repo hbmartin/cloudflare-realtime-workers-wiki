@@ -151,6 +151,10 @@ export function TablePage({
   // Pages appended past the first. While any are loaded the background poll stands
   // down, so browsing deep into a table is not yanked back to the top every 5s.
   const appendedPagesRef = useRef(0);
+  // The revision the currently loaded page boundary was computed against. Only
+  // `load` and `loadMore` may move it: `nextOffset` is a position in one exact
+  // snapshot, and own saves bump `table.revision` in place without recomputing it.
+  const pageSnapshotRevisionRef = useRef<number | null>(null);
   const [tableBusy, setTableBusy] = useState(false);
   const [title, setTitle] = useState(page.title);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
@@ -315,6 +319,7 @@ export function TablePage({
           return changed ? next : current;
         });
         appendedPagesRef.current = 0;
+        pageSnapshotRevisionRef.current = result.table.revision;
         setTable(result.table);
         setLoadError(null);
         if (result.table.lease.expiresAt === null && leaseConflictGeneration === leaseConflictGenerationRef.current) {
@@ -365,6 +370,7 @@ export function TablePage({
     // page-one result cannot land after this append and yank the view back to the top.
     const generation = ++loadGenerationRef.current;
     const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
+    const snapshotRevision = pageSnapshotRevisionRef.current;
     changeLoadCount(1, false);
     try {
       const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
@@ -381,15 +387,26 @@ export function TablePage({
       }
       // Sorted offsets are positions in one exact snapshot: a save can move a row
       // across the boundary and make a cross-revision append omit its replacement.
+      // `table.revision` is no use as that snapshot's identity because every own save
+      // bumps it in place while leaving `nextOffset` describing the older ordering,
+      // so the offset is bound to the revision `load`/`loadMore` last recorded.
       // Unsorted keyset cursors remain stable across this client's serialized saves,
       // so those may compare with the current mutation revision instead.
-      const expectedRevision = currentPage.sort ? currentPage.revision : revisionRef.current;
-      if (result.table.revision !== expectedRevision) {
+      const expectedRevision = currentPage.sort ? snapshotRevision : revisionRef.current;
+      // The mutation base has to still be that same revision as well, or a response
+      // older than a save this client already merged would be spliced into rows it
+      // does not describe -- and the inner guard below would drop it with no reload.
+      if (
+        expectedRevision === null ||
+        result.table.revision !== expectedRevision ||
+        revisionRef.current !== expectedRevision
+      ) {
         invalidateRevision();
         await load(isMounted).catch(() => undefined);
         return;
       }
       appendedPagesRef.current += 1;
+      pageSnapshotRevisionRef.current = result.table.revision;
       setTable((current) => {
         if (
           !current ||
