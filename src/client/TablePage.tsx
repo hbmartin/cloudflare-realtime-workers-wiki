@@ -376,6 +376,12 @@ export function TablePage({
       const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
+      // A sorted response can resolve at the old revision while a save is still
+      // unresolved and has not bumped revisionRef yet. Let already-queued saves
+      // settle before deciding whether this offset still describes the table.
+      // A rejected save leaves the revision unchanged, so its same-revision page
+      // remains valid; a committed save trips the revision guard and reloads.
+      if (currentPage.sort) await mutationQueue.current;
       const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
       if (
         !mountedRef.current ||

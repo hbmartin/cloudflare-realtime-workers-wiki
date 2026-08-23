@@ -104,7 +104,6 @@ describe("createManifest", () => {
     // Adoption resumes the same import rather than starting a second one, and retires
     // the weak aggregate so no later open has to check it again.
     expect(adopted.state.importId).toBe("a".repeat(32));
-    adopted.flush();
     expect(JSON.parse(readFileSync(files.path, "utf8")).exportFingerprint).toBe(
       fingerprintExport(files.root).fingerprint,
     );
@@ -182,8 +181,7 @@ describe("createManifest", () => {
     // legacy aggregate cannot tell rootB from rootA, so the flag is the operator
     // asserting which export the manifest belongs to. The digest aggregate that
     // replaces it on open cannot be fooled the same way again.
-    const adopted = open({ root: rootB, path }, { adoptLegacyFingerprint: true });
-    adopted.flush();
+    open({ root: rootB, path }, { adoptLegacyFingerprint: true });
     expect(JSON.parse(readFileSync(path, "utf8")).exportFingerprint).toBe(fingerprintExport(rootB).fingerprint);
     expect(() => open({ root: rootA, path })).toThrow(/different copy of this export/);
   });

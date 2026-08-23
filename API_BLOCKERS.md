@@ -2,7 +2,7 @@
 
 This document compares the Notion public API (pinned at `Notion-Version: 2026-03-11`, well past the September 2025 database/data-source split — Views, Markdown, Move Page, and Templates all shipped since) against this repository's actual data model and worker routes. It exists to answer one question before anyone attempts a Notion-API-shaped integration layer on top of this app: what specifically stops that layer from moving significant ground, and what's already sitting there for the taking.
 
-Fourteen Notion resource areas were surveyed. Four came back "ready now" — thin wrappers over data that already exists, no schema change, no new auth. The other ten trace back almost entirely to four recurring architectural gaps, not ten unrelated problems. Fix — or knowingly accept — those four, and most of the remaining surface area becomes tractable.
+Fourteen Notion resource areas were surveyed. Three came back "ready now" — thin wrappers over data that already exists, no schema change, no new auth — and one has a narrow but explicit compatibility limit. The other ten trace back almost entirely to four recurring architectural gaps, not ten unrelated problems. Fix — or knowingly accept — those four, and most of the remaining surface area becomes tractable.
 
 ## The four recurring blockers
 
@@ -45,13 +45,13 @@ This app has no outbound HTTP delivery mechanism anywhere — no Cloudflare Queu
 
 Turning this into real webhooks means building, from nothing: a subscription table (URL, secret, event-type filter, active/paused status), a delivery mechanism (most naturally Cloudflare Queues, which isn't a binding in this project today) with retry/backoff for failed deliveries, and HMAC signing on the outbound payload. The one thing that _doesn't_ need reinventing is the event taxonomy — `WorkspaceEvent`'s existing shape (`src/shared/types.ts`) is already a reasonable starting vocabulary to extend outward instead of designing from scratch.
 
-## Follow-up: the four areas that need none of this
+## Follow-up: three ready areas and one compatibility limit
 
-These don't touch any of the four blockers above. Each is a thin translation layer over a route or index that already exists, callable today by whatever auth mechanism ends up fronting a new API surface.
+The three ready areas don't touch any of the four blockers above. Each is a thin translation layer over a route or index that already exists, callable today by whatever auth mechanism ends up fronting a new API surface. The Users API is close, but its remaining gaps depend on the auth adapter rather than response-envelope naming alone.
 
 **Search API** (`POST /v1/search` in Notion's shape). `GET /api/search` (`index.ts:722-738`) already queries the `page_search` FTS5 virtual table (`migrations/0001_initial.sql:128-134`), ranks by `bm25()`, and returns highlighted snippets — and it matches on **title and body text**, where Notion's own search API only matches page/data-source titles. A wrapper here is strictly a narrowing of what's already exposed, not a climb.
 
-**Users API** (`GET /v1/users`, `/v1/users/{id}`, `/v1/users/me`). `GET /api/members` (`index.ts:326-336`) and `GET /api/me` (`index.ts:311-319`) already cover list/retrieve/current-user. The only cosmetic gap is Notion's `person`/`bot` user-type distinction — trivially satisfied with a hardcoded `type: "person"` until a PAT or OAuth identity (blocker #3) gives a token its own bot-user identity to report.
+**Users API — compatibility-limited** (`GET /v1/users`, `/v1/users/{id}`, `/v1/users/me`). `GET /api/members` and `GET /api/me` provide useful source data, but they do not cover the Notion surface directly: there is no member-by-ID `GET` route, and `/api/me` returns the person authenticated by the browser session while Notion's `/v1/users/me` returns the identity associated with the authorization token. A real adapter therefore needs a workspace-scoped member lookup plus an explicit mapping from each PAT or OAuth token to the Notion user it represents (a person or a connection bot), including the appropriate capability-based field redaction. It must derive `type` and the corresponding `person` or `bot` object from that mapping rather than hard-coding `type: "person"`. Until blocker #3 supplies those token identities, a session-only adapter can expose member people but cannot claim compatible `/v1/users/{id}` or `/v1/users/me` behavior.
 
 **Move Page** (`POST /v1/pages/{id}/move`). `POST /api/pages/:id/move` (`index.ts:478-523`) already does this, and does slightly more than Notion's version: it accepts a target parent plus `beforeId`/`afterId` siblings and computes a new fractional-index position in the same call, with cycle prevention via a recursive CTE (`index.ts:486-494`) rather than requiring a separate reorder step.
 

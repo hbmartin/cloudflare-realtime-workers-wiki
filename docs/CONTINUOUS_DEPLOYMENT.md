@@ -35,7 +35,10 @@ on:
   workflow_dispatch:
 ```
 
-A change to this file takes effect only once it is on `main`.
+The trigger rules differ by event. A push uses the workflow file from the pushed ref, so a `v*` tag
+on a commit outside `main` can activate a changed workflow before that change reaches `main`.
+`workflow_dispatch` becomes available only when the workflow file exists on the default branch, but
+the person dispatching it may select another branch or tag as the run's ref.
 
 ## The release gate
 
@@ -77,15 +80,17 @@ gh variable set PRODUCTION_BASE_URL -b "https://notes.example.com"
 gh secret list && gh variable list                     # confirm all three
 ```
 
-Create the token under **My Profile → API Tokens → Create Token** from the **Edit Cloudflare
-Workers** template, then confirm it carries the permissions listed in
-[Prerequisites](DEPLOYMENT.md#0-prerequisites) — Workers Scripts Edit, D1 Edit, R2 Edit, Workers
-Observability, and account-level Durable Objects — and add any the template omits. A token missing
-D1 Edit fails at the migration step, after the gate has passed and before the Worker is deployed.
+Create an account-owned token under **Manage Account → Account API Tokens**, restrict its account
+resources to the target account, and grant only the account permissions this workflow exercises:
+**D1 Edit** for migrations and **Workers Scripts Write** for the dry run, deployment, and deployment
+listing. The workflow does not run separate Durable Objects, R2, or Workers Observability commands,
+so it does not require their standalone permissions. Prefer an account-owned token for CI; a
+user-owned token acts as its owner and may stop working if that person leaves the account.
 
-`PRODUCTION_BASE_URL` is not optional in practice. The health-check step is guarded by
-`if: vars.PRODUCTION_BASE_URL != ''`, so an unset variable produces a green deploy that was never
-probed. Set it to the exact origin in the production `BETTER_AUTH_URL`.
+`PRODUCTION_BASE_URL` is required. Before any build, migration, or deploy command, the workflow
+fails if the variable is unset or differs from the exact origin configured by production
+`BETTER_AUTH_URL` in `wrangler.jsonc`. The health check always probes that origin, so a deploy cannot
+succeed without it.
 
 Secrets set with `wrangler secret put --env production` — `BETTER_AUTH_SECRET`, `BOOTSTRAP_TOKEN`,
 `DO_LOCATION_HINT` — are not managed by the workflow. They persist across deploys and are set once,
@@ -95,7 +100,7 @@ by hand, per [Set secrets](DEPLOYMENT.md#3-set-secrets).
 
 The deploy workflow uses `concurrency: deploy-production` with `cancel-in-progress: false`, so
 deploys serialize and a migration never interleaves with another deploy. GitHub holds at most one
-*pending* run per concurrency group: during a burst of pushes the in-progress deploy finishes
+_pending_ run per concurrency group: during a burst of pushes the in-progress deploy finishes
 untouched, the newest push queues behind it, and intermediate pending runs are cancelled. Production
 therefore converges on the newest commit rather than replaying every commit in the burst.
 
@@ -151,7 +156,7 @@ What it cannot do here is the gate. Builds are a single container with a hard **
 so the suite runs serially where CI runs five jobs in parallel — the Chromium e2e job alone is
 allowed 25 minutes. The build image ships no browsers, so Playwright would have to install them
 inside that same budget. It also has no equivalent of required reviewers, no post-deploy health
-probe, and no way to refuse a commit because a *different* system's checks failed.
+probe, and no way to refuse a commit because a _different_ system's checks failed.
 
 Two smaller mismatches: the build image defaults to Node 24 and ships pnpm 10.11.1, against this
 repository's Node 22 and the `packageManager` pin of pnpm 11.18.0. Node pins cleanly with a

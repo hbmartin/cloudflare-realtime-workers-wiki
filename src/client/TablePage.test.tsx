@@ -2304,6 +2304,78 @@ describe("TablePage", () => {
     expect(sortedPageLoads).toBe(2);
   });
 
+  it("reloads sorted page one when an old append resolves before a concurrent save", async () => {
+    const sortedFirst: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-1", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 501,
+    };
+    const append = deferred<{ table: TableData }>();
+    const save = deferred<{ revision: number }>();
+    const refreshed: TableData = {
+      ...table,
+      revision: 2,
+      sort: "status",
+      rows: [{ id: "row-displaced", position: 500, cells: { status: "Middle" } }],
+      hasMore: false,
+      nextCursor: null,
+      nextOffset: null,
+      rowCount: 501,
+    };
+    let sortedPageLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return save.promise;
+      if (String(path).includes("offset=500")) return append.promise;
+      if (String(path).includes("sort=status")) {
+        sortedPageLoads += 1;
+        return Promise.resolve({ table: sortedPageLoads === 1 ? sortedFirst : refreshed });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    const cell = await screen.findByDisplayValue("Alpha");
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    fireEvent.change(cell, { target: { value: "Zulu" } });
+    fireEvent.blur(cell);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        expect.stringContaining("/cells/row-1/status"),
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+
+    await act(async () => {
+      append.resolve({
+        table: {
+          ...sortedFirst,
+          rows: [{ id: "row-stale", position: 500, cells: { status: "Stale append" } }],
+          hasMore: false,
+          nextOffset: null,
+          rowCount: null,
+        },
+      });
+      await append.promise;
+    });
+    expect(sortedPageLoads).toBe(1);
+    expect(screen.queryByDisplayValue("Stale append")).not.toBeInTheDocument();
+
+    await act(async () => {
+      save.resolve({ revision: 2 });
+      await save.promise;
+    });
+
+    expect(await screen.findByDisplayValue("Middle")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Stale append")).not.toBeInTheDocument();
+    expect(sortedPageLoads).toBe(2);
+  });
+
   it("reloads sorted page one when a save landed before the load-more click", async () => {
     // The in-flight ordering is covered above. Here the save commits first, so the
     // table's revision has already moved to 2 while `nextOffset` still describes the

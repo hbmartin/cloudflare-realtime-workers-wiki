@@ -96,6 +96,7 @@ export function createManifest({
 }) {
   const { fingerprint, digests } = fingerprintExport(root);
   let state;
+  let migratedLegacyFingerprint = false;
 
   if (existsSync(path)) {
     try {
@@ -147,6 +148,7 @@ export function createManifest({
         );
       }
       state.exportFingerprint = fingerprint;
+      migratedLegacyFingerprint = true;
     }
     if (state.baseURL !== baseURL) {
       throw new Error(`${path} was created against ${state.baseURL}, not ${baseURL}.`);
@@ -190,6 +192,8 @@ export function createManifest({
     writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     renameSync(temporary, path);
   }
+
+  if (migratedLegacyFingerprint) flush();
 
   function save() {
     if (pending) return;
