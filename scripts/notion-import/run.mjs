@@ -589,7 +589,9 @@ export async function reconcileCommitted({
               table.phase = "complete";
               table.acceptedRemoteHash = current.contentHash;
               table.acceptedRemoteRowCount = current.rowCount;
-              if (shouldReport) report.issue("destination_table_kept", page.title);
+              if (shouldReport && !table.settledByOperator) {
+                report.issue("destination_table_kept", page.title);
+              }
             };
             const adoptOwnBaseline = () => {
               delete table.acceptedRemoteHash;

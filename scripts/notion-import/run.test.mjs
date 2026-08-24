@@ -161,6 +161,7 @@ describe("runImport", () => {
       }),
     ).resolves.toMatchObject({ databases: 1, errors: 0 });
     expect(manifest.state.nodes[database.path].table.settledByOperator).toBe(true);
+    expect(report.issue).not.toHaveBeenCalledWith("destination_table_kept", "Table");
   });
 
   it("rejects a short page batch before recording shifted ids", async () => {
