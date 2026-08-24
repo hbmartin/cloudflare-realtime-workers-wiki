@@ -48,42 +48,32 @@ export function hashFileContent(path) {
  * aggregate hashes each file's fixed-width hex digest between NUL frames, which neither
  * a path nor a digest can contain, so no two file sets can produce one byte stream. The
  * per-file digests are returned for the upload pass to reuse instead of re-hashing
- * every asset.
+ * every asset. Explicit legacy adoption also computes the earlier ambiguous raw-byte
+ * aggregate during that same file read; normal opens do not pay for the extra hash.
  */
-export function fingerprintExport(root) {
+export function fingerprintExport(root, { includeLegacyFingerprint = false } = {}) {
   const { files } = walkExport(root);
   const digests = new Map();
   const hash = createHash("sha256");
+  const legacyHash = includeLegacyFingerprint ? createHash("sha256") : null;
   for (const path of files) {
-    const digest = hashFileContent(join(root, path));
+    const contentHash = createHash("sha256");
+    legacyHash?.update(path);
+    legacyHash?.update("\0");
+    hashFile(join(root, path), ...[contentHash, legacyHash].filter(Boolean));
+    legacyHash?.update("\0");
+    const digest = contentHash.digest("hex");
     digests.set(path, digest);
     hash.update(path);
     hash.update("\0");
     hash.update(digest);
     hash.update("\0");
   }
-  return { fingerprint: hash.digest("hex"), digests };
-}
-
-/**
- * The aggregate an earlier version 2 importer recorded: NUL-framed raw file bytes.
- * That framing is ambiguous - file bytes may themselves contain NULs, so two different
- * file sets can share one stream - so it is never recorded again and is only computed
- * when an operator has explicitly asked for a legacy manifest to be adopted. An accepted
- * legacy manifest uses the digest form for every normal open. The weak aggregate is kept
- * only as a recovery key, so another explicit adoption can undo a mistaken choice between
- * two exports that collide under the old framing.
- */
-function legacyFingerprintExport(root) {
-  const { files } = walkExport(root);
-  const hash = createHash("sha256");
-  for (const path of files) {
-    hash.update(path);
-    hash.update("\0");
-    hashFile(join(root, path), hash);
-    hash.update("\0");
-  }
-  return hash.digest("hex");
+  return {
+    fingerprint: hash.digest("hex"),
+    digests,
+    legacyFingerprint: legacyHash?.digest("hex") ?? null,
+  };
 }
 
 export function createManifest({
@@ -95,7 +85,15 @@ export function createManifest({
   adoptRootParent = false,
   adoptLegacyFingerprint = false,
 }) {
-  const { fingerprint, digests } = fingerprintExport(root);
+  // Explicit adoption needs both aggregates. Feed the same file read into both
+  // hashes instead of walking and reading a large export twice.
+  const {
+    fingerprint,
+    digests,
+    legacyFingerprint: computedLegacyFingerprint,
+  } = fingerprintExport(root, {
+    includeLegacyFingerprint: adoptLegacyFingerprint,
+  });
   let state;
   let migratedLegacyFingerprint = false;
 
@@ -142,14 +140,14 @@ export function createManifest({
             "would duplicate everything this one has already created.",
         );
       }
-      const legacyFingerprint = state.legacyExportFingerprint ?? state.exportFingerprint;
-      if (legacyFingerprint !== legacyFingerprintExport(root)) {
+      const recordedLegacyFingerprint = state.legacyExportFingerprint ?? state.exportFingerprint;
+      if (recordedLegacyFingerprint !== computedLegacyFingerprint) {
         throw new Error(
           `${path} belongs to a different copy of this export under both fingerprints. Point the ` +
             "importer at the directory it was created from.",
         );
       }
-      state.legacyExportFingerprint = legacyFingerprint;
+      state.legacyExportFingerprint = recordedLegacyFingerprint;
       state.exportFingerprint = fingerprint;
       migratedLegacyFingerprint = true;
     }

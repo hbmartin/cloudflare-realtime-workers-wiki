@@ -33,6 +33,18 @@ describe("notion importer CLI", () => {
     expect(result.stderr).toContain("--linger-ms must be an integer between 0 and 60000");
   });
 
+  it("normalizes an ambiguous-table path before validating it", () => {
+    const result = spawnSync(
+      process.execPath,
+      [entrypoint, "inspect", fixture, "--keep-ambiguous-table", "  --not-a-source-path  "],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("--keep-ambiguous-table requires an exact source path");
+    expect(result.stderr).not.toContain("--keep-ambiguous-table is only valid with the run command");
+  });
+
   it("rejects a missing verification manifest before connecting", () => {
     const directory = mkdtempSync(join(tmpdir(), "notion-cli-"));
     temporaryDirectories.push(directory);

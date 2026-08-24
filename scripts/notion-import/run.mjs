@@ -533,14 +533,15 @@ export async function reconcileCommitted({
       try {
         const live = await client.tableVerification(pageId);
         patch.remoteTableMissing = false;
-        // Re-derived from scratch on every run, before any branch below can decline to
-        // classify. runImport skips an ambiguous table in silence, so a verdict left in
-        // the record by an earlier run would otherwise end a later run with no error
-        // reported and no rows written.
-        patch.tableRecoveryAmbiguous = false;
-        patch.tableError = null;
         const plan = tablePlans.get(page);
         if (plan) {
+          // Re-derived from scratch on every planned table, before any branch below can
+          // decline to classify. runImport skips an ambiguous table in silence, so a
+          // verdict left in the record by an earlier run would otherwise end a later run
+          // with no error reported and no rows written. Without a plan there is no basis
+          // for replacing either durable verdict.
+          patch.tableRecoveryAmbiguous = false;
+          patch.tableError = null;
           const source = plan.table;
           const progress = node.table;
           const complete = progress?.phase === "complete";
@@ -580,11 +581,11 @@ export async function reconcileCommitted({
             // Destination edits win the whole table facet, including when they race an
             // incomplete import. Stop further batches so user-owned rows are never
             // combined with the remaining source rows into a hybrid table.
-            const keepDestinationTable = (current) => {
+            const keepDestinationTable = (current, shouldReport = true) => {
               table.phase = "complete";
               table.acceptedRemoteHash = current.contentHash;
               table.acceptedRemoteRowCount = current.rowCount;
-              report.issue("destination_table_kept", page.title);
+              if (shouldReport) report.issue("destination_table_kept", page.title);
             };
             const adoptOwnBaseline = () => {
               delete table.acceptedRemoteHash;
@@ -669,7 +670,7 @@ export async function reconcileCommitted({
                     // lease, against the same verification the classification used.
                     report.issue("ambiguous_table_kept", page.title);
                     table.settledByOperator = true;
-                    return keepDestinationTable(leased);
+                    return keepDestinationTable(leased, false);
                   }
                   table.columnsByRef = recoveredColumns;
                   table.columnOffset = advanced.columnOffset;
@@ -734,7 +735,8 @@ export async function runImport({
     if (!selectedTable) {
       throw new Error(`--keep-ambiguous-table target ${JSON.stringify(path)} is not a selected database source path.`);
     }
-    if (manifest.node(path)?.tableRecoveryAmbiguous !== true) {
+    const recovery = manifest.node(path);
+    if (recovery?.tableRecoveryAmbiguous !== true && recovery?.table?.settledByOperator !== true) {
       throw new Error(
         `--keep-ambiguous-table target ${JSON.stringify(path)} is not recorded as table_recovery_ambiguous.`,
       );

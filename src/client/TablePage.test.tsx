@@ -2215,14 +2215,13 @@ describe("TablePage", () => {
       ),
     );
 
-    // The save moved the table to revision 2 before the append's response landed.
-    // The appended page was read at revision 2, the same snapshot the merged save
-    // left on screen, so it must extend the view rather than reset it to page one.
+    // The save moved the table to revision 2 after the keyset page was read at
+    // revision 1. Cell edits cannot move an unsorted boundary, so the older response
+    // must still extend the locally edited view rather than reset it to page one.
     await act(async () => {
       append.resolve({
         table: {
           ...first,
-          revision: 2,
           rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
           hasMore: false,
           nextCursor: null,
@@ -2523,6 +2522,157 @@ describe("TablePage", () => {
     expect(offset500Loads).toBe(2);
   });
 
+  it("keeps a sorted offset valid when an edit changes another column", async () => {
+    const sortedFirst: TableData = {
+      ...tableWithTwoTextCells(),
+      sort: "status",
+      rows: [{ id: "row-alpha", position: 0, cells: { status: "Alpha", notes: "Stable" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 501,
+    };
+    const second: TableData = {
+      ...sortedFirst,
+      rows: [{ id: "row-beta", position: 500, cells: { status: "Beta", notes: "Second" } }],
+      hasMore: false,
+      nextOffset: null,
+      rowCount: null,
+    };
+    let sortedFirstLoads = 0;
+    let offsetLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.resolve({ revision: 2 });
+      if (String(path).includes("offset=500")) {
+        offsetLoads += 1;
+        return Promise.resolve({ table: second });
+      }
+      if (String(path).includes("sort=status")) {
+        sortedFirstLoads += 1;
+        return Promise.resolve({ table: sortedFirst });
+      }
+      return Promise.resolve({ table: tableWithTwoTextCells() });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await screen.findByDisplayValue("Alpha");
+    const notes = screen.getByDisplayValue("Stable");
+    fireEvent.change(notes, { target: { value: "Updated" } });
+    fireEvent.blur(notes);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        expect.stringContaining("/cells/row-alpha/notes"),
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Beta")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Updated")).toBeInTheDocument();
+    expect(sortedFirstLoads).toBe(1);
+    expect(offsetLoads).toBe(1);
+  });
+
+  it("reports a failed sorted-depth restore and keeps the revision invalidated", async () => {
+    const sortedFirst: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-alpha", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 501,
+    };
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.resolve({ revision: 2 });
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        if (sortedLoads > 1) return Promise.reject(new Error("Sorted recovery unavailable."));
+        return Promise.resolve({ table: sortedFirst });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    const cell = await screen.findByDisplayValue("Alpha");
+    fireEvent.change(cell, { target: { value: "Zulu" } });
+    fireEvent.blur(cell);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        expect.stringContaining("/cells/row-alpha/status"),
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByText("Sorted recovery unavailable.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load more rows" })).toBeDisabled();
+  });
+
+  it("applies a queued cell reset when sorted-depth recovery adopts the authoritative table", async () => {
+    const sortedFirst: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-alpha", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 501,
+    };
+    const refreshedFirst: TableData = { ...sortedFirst, revision: 2 };
+    const refreshedSecond: TableData = {
+      ...sortedFirst,
+      revision: 2,
+      rows: [{ id: "row-beta", position: 500, cells: { status: "Beta" } }],
+      hasMore: false,
+      nextOffset: null,
+      rowCount: null,
+    };
+    let sortedLoads = 0;
+    let offsetLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/lease") && init?.method === "DELETE") return Promise.resolve({ ok: true });
+      if (init?.method === "PUT") {
+        return Promise.reject(new ApiClientError(409, "lease_conflict", "The editing lease was lost."));
+      }
+      if (String(path).includes("offset=500")) {
+        offsetLoads += 1;
+        return Promise.resolve({ table: offsetLoads === 1 ? { ...refreshedSecond, revision: 2 } : refreshedSecond });
+      }
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        if (sortedLoads === 2) return Promise.reject(new Error("Initial recovery unavailable."));
+        return Promise.resolve({ table: sortedLoads === 1 ? sortedFirst : refreshedFirst });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    const cell = await screen.findByDisplayValue("Alpha");
+    fireEvent.change(cell, { target: { value: "Draft" } });
+    fireEvent.blur(cell);
+    expect(
+      await screen.findByText("The table update was not saved because editing access was lost."),
+    ).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Draft")).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Beta")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Alpha")).toBeDisabled();
+    expect(screen.queryByDisplayValue("Draft")).not.toBeInTheDocument();
+    expect(offsetLoads).toBe(2);
+  });
+
   it("refetches a load snapshot that is older than an already merged save", async () => {
     let sortLoads = 0;
     vi.mocked(api).mockImplementation((path, init) => {
@@ -2550,6 +2700,31 @@ describe("TablePage", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
     await waitFor(() => expect(sortLoads).toBe(2));
     expect(screen.getByDisplayValue("Ready edited")).toBeInTheDocument();
+  });
+
+  it("bounds retries when table loads keep returning an older revision", async () => {
+    let sortLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.resolve({ revision: 2 });
+      if (String(path).includes("sort=status")) {
+        sortLoads += 1;
+        return Promise.resolve({ table: { ...table, sort: "status" } });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    const cell = screen.getByDisplayValue("Ready");
+    fireEvent.change(cell, { target: { value: "Ready edited" } });
+    fireEvent.blur(cell);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(expect.stringContaining("/cells/"), expect.objectContaining({ method: "PUT" })),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+
+    expect(await screen.findByText("The table kept returning an older revision.")).toBeInTheDocument();
+    expect(sortLoads).toBe(3);
   });
 
   it("discards a page-not-found response that a newer successful load superseded", async () => {
