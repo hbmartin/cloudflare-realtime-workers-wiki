@@ -1251,6 +1251,7 @@ export function TablePage({
     }
     let active = true;
     let pollTimer: number | undefined;
+    let pollRunning = false;
     let delayedFailures = 0;
     let consecutiveRecoveryErrors = 0;
     const isCurrent = () => active && mountedRef.current;
@@ -1263,10 +1264,13 @@ export function TablePage({
       pollTimer = window.setTimeout(() => void poll(), delay);
     };
     async function poll() {
+      if (!active || pollRunning) return;
       if (loadsInFlightRef.current || pendingMutationsRef.current) {
+        pollRunning = false;
         schedulePoll();
         return;
       }
+      pollRunning = true;
       let delayedOutcome: TableLoadOutcome | null = null;
       let recoveryError: unknown = null;
       try {
@@ -1299,6 +1303,7 @@ export function TablePage({
         consecutiveRecoveryErrors = 0;
         setRevisionRecoveryError(null);
       }
+      pollRunning = false;
       schedulePoll();
     }
     const wakePoll = () => {
