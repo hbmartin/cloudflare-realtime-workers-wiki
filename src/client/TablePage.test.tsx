@@ -1598,7 +1598,7 @@ describe("TablePage", () => {
     expect(mutations[1]).toMatchObject({ expectedRevision: 7 });
   });
 
-  it("recovers an unsorted appended table from page one before loading more again", async () => {
+  it("recovers an unsorted appended table at its existing depth", async () => {
     vi.useFakeTimers();
     const first: TableData = {
       ...table,
@@ -1688,16 +1688,10 @@ describe("TablePage", () => {
     });
     expect(screen.getByDisplayValue("Authoritative")).toBeEnabled();
     expect(screen.queryByDisplayValue("Two")).not.toBeInTheDocument();
-    expect(keysetLoads).toBe(1);
-    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
     expect(screen.getByDisplayValue("Authoritative two")).toBeEnabled();
     expect(keysetLoads).toBe(2);
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
   });
 
   it("keeps a save failure visible across a successful lease renewal", async () => {
@@ -2392,7 +2386,7 @@ describe("TablePage", () => {
       }
       plainLoads += 1;
       if (plainLoads === 1) return Promise.resolve({ table: current });
-      return Promise.resolve({ table: plainLoads <= 7 ? stale : fresh });
+      return Promise.resolve({ table: plainLoads <= 5 ? stale : fresh });
     });
     renderViewer();
     await act(() => vi.advanceTimersByTimeAsync(0));
@@ -2404,18 +2398,17 @@ describe("TablePage", () => {
     expect(plainLoads).toBe(4);
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-
-    // One bounded background attempt is three requests, not two consecutive
-    // three-request loads caused by recoverRevision's final fallback.
-    expect(plainLoads).toBe(7);
+    // Delayed polling probes once, rather than repeating the foreground
+    // three-attempt stale-revision sequence.
+    expect(plainLoads).toBe(5);
     expect(screen.getByDisplayValue("Current")).toBeInTheDocument();
     expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(plainLoads).toBe(5);
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(screen.getByDisplayValue("Fresh")).toBeInTheDocument();
-    expect(plainLoads).toBe(8);
+    expect(plainLoads).toBe(6);
   });
 
   it("does not overlap repeated load-more requests", async () => {
@@ -2748,6 +2741,7 @@ describe("TablePage", () => {
       rows: [{ id: "row-stale", position: 1, cells: { status: "Stale editor row" } }],
       rowCount: null,
     };
+    const freshSecond: TableData = { ...staleSecond, revision: 2 };
     let pageOneLoads = 0;
     let replicaFresh = false;
     vi.mocked(api).mockImplementation((path, init) => {
@@ -2756,7 +2750,7 @@ describe("TablePage", () => {
         pageOneLoads += 1;
         return Promise.resolve({ table: pageOneLoads <= 2 || replicaFresh ? first : staleFirst });
       }
-      return Promise.resolve({ table: staleSecond });
+      return Promise.resolve({ table: replicaFresh ? freshSecond : staleSecond });
     });
     await renderActiveEditor();
 
@@ -2807,21 +2801,27 @@ describe("TablePage", () => {
       nextCursor: null,
       rowCount: null,
     };
+    const freshThird: TableData = {
+      ...staleThird,
+      revision: 2,
+      rows: [{ id: "row-3", position: 2, cells: { status: "Current third page" } }],
+    };
     let pageOneLoads = 0;
     let secondPageLoads = 0;
     let thirdPageLoads = 0;
-    let replicaFresh = false;
+    let pageOneFresh = false;
+    let depthFresh = false;
     vi.mocked(api).mockImplementation((path) => {
       if (String(path).includes("count=true")) {
         pageOneLoads += 1;
-        return Promise.resolve({ table: pageOneLoads === 1 || replicaFresh ? first : staleFirst });
+        return Promise.resolve({ table: pageOneLoads === 1 || pageOneFresh ? first : staleFirst });
       }
       if (String(path).includes("afterId=row-1")) {
         secondPageLoads += 1;
-        return Promise.resolve({ table: second });
+        return Promise.resolve({ table: secondPageLoads === 1 || depthFresh ? second : { ...second, revision: 3 } });
       }
       thirdPageLoads += 1;
-      return Promise.resolve({ table: staleThird });
+      return Promise.resolve({ table: depthFresh ? freshThird : staleThird });
     });
     renderViewer();
     await act(() => vi.advanceTimersByTimeAsync(0));
@@ -2842,17 +2842,206 @@ describe("TablePage", () => {
     expect(thirdPageLoads).toBe(3);
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
-    replicaFresh = true;
+    pageOneFresh = true;
     await act(() => vi.advanceTimersByTimeAsync(5_000));
 
     expect(pageOneLoads).toBe(5);
     expect(secondPageLoads).toBe(2);
+    // Churn after the page-one probe must not let a background recovery adopt
+    // page one and discard the depth already on screen.
     expect(screen.getByDisplayValue("Current first page")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Current second page")).toBeInTheDocument();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+
+    depthFresh = true;
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(pageOneLoads).toBe(6);
+    expect(secondPageLoads).toBe(3);
+    expect(screen.getByDisplayValue("Current third page")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("Stale third page")).not.toBeInTheDocument();
     expect(
       screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
     ).not.toBeInTheDocument();
+  });
+
+  it("keeps delayed depth recovery armed across a transient poll failure", async () => {
+    vi.useFakeTimers();
+    const first: TableData = {
+      ...table,
+      revision: 2,
+      rows: [{ id: "row-1", position: 0, cells: { status: "Current first" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const staleFirst = { ...first, revision: 1 };
+    const staleSecond: TableData = {
+      ...first,
+      revision: 1,
+      rows: [{ id: "row-stale", position: 1, cells: { status: "Stale second" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    const freshSecond: TableData = {
+      ...staleSecond,
+      revision: 2,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Current second" } }],
+    };
+    let pageOneLoads = 0;
+    let appendLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("count=true")) {
+        pageOneLoads += 1;
+        if (pageOneLoads === 1 || pageOneLoads >= 6) return Promise.resolve({ table: first });
+        if (pageOneLoads === 5) return Promise.reject(new Error("Replica temporarily unavailable."));
+        return Promise.resolve({ table: staleFirst });
+      }
+      appendLoads += 1;
+      return Promise.resolve({ table: appendLoads <= 3 ? staleSecond : freshSecond });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    expect(pageOneLoads).toBe(4);
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(pageOneLoads).toBe(5);
+    expect(screen.getByDisplayValue("Current first")).toBeInTheDocument();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+    expect(screen.queryByText("Replica temporarily unavailable.")).not.toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(pageOneLoads).toBe(6);
+    expect(screen.getByDisplayValue("Current second")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not dismiss delayed recovery when only an appended page reaches its floor", async () => {
+    vi.useFakeTimers();
+    const first: TableData = {
+      ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "Older first page" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 3,
+    };
+    const second: TableData = {
+      ...first,
+      revision: 2,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Second page" } }],
+      nextCursor: { position: 1, rowId: "row-2" },
+      rowCount: null,
+    };
+    const staleThird: TableData = {
+      ...first,
+      rows: [{ id: "row-stale", position: 2, cells: { status: "Stale third" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    const freshThird: TableData = {
+      ...staleThird,
+      revision: 2,
+      rows: [{ id: "row-3", position: 2, cells: { status: "Fresh third" } }],
+    };
+    let thirdLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("count=true")) return Promise.resolve({ table: first });
+      if (String(path).includes("afterId=row-1")) return Promise.resolve({ table: second });
+      thirdLoads += 1;
+      return Promise.resolve({ table: thirdLoads <= 3 ? staleThird : freshThird });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    expect(screen.getByDisplayValue("Fresh third")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Older first page")).toBeInTheDocument();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+  });
+
+  it("lets an edit supersede an in-flight background depth recovery", async () => {
+    vi.useFakeTimers();
+    const first: TableData = {
+      ...table,
+      revision: 2,
+      rows: [{ id: "row", position: 0, cells: { status: "Current" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row" },
+      rowCount: 2,
+    };
+    const staleFirst = { ...first, revision: 1 };
+    const staleSecond: TableData = {
+      ...first,
+      revision: 1,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Stale" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    const background = deferred<{ table: TableData }>();
+    let pageOneLoads = 0;
+    let saves = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") {
+        saves += 1;
+        return Promise.resolve({ revision: 3 });
+      }
+      if (String(path).includes("count=true")) {
+        pageOneLoads += 1;
+        if (pageOneLoads <= 2) return Promise.resolve({ table: first });
+        if (pageOneLoads <= 5) return Promise.resolve({ table: staleFirst });
+        return background.promise;
+      }
+      return Promise.resolve({ table: staleSecond });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(pageOneLoads).toBe(6);
+
+    const input = screen.getByDisplayValue("Current");
+    fireEvent.change(input, { target: { value: "Saved while polling" } });
+    fireEvent.blur(input);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(saves).toBe(1);
+
+    await act(async () => {
+      background.resolve({ table: first });
+      await background.promise;
+    });
+    expect(screen.getByDisplayValue("Saved while polling")).toBeEnabled();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
   });
 
   it("keeps a newer unsorted boundary as the floor for the following append", async () => {
@@ -3461,11 +3650,14 @@ describe("TablePage", () => {
       nextOffset: null,
       rowCount: null,
     };
+    const compatibleOffset = { ...unusableOffset, revision: 5 };
     const staleSorted = { ...sortedFirst, revision: 4 };
     let sortedLoads = 0;
     let replicaFresh = false;
     vi.mocked(api).mockImplementation((path) => {
-      if (String(path).includes("offset=500")) return Promise.resolve({ table: unusableOffset });
+      if (String(path).includes("offset=500")) {
+        return Promise.resolve({ table: replicaFresh ? compatibleOffset : unusableOffset });
+      }
       if (String(path).includes("sort=status")) {
         sortedLoads += 1;
         return Promise.resolve({ table: sortedLoads === 1 || replicaFresh ? sortedFirst : staleSorted });
@@ -3486,18 +3678,15 @@ describe("TablePage", () => {
     expect(sortedLoads).toBe(4);
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-
-    expect(sortedLoads).toBe(7);
+    expect(sortedLoads).toBe(5);
     expect(screen.getByDisplayValue("Alpha")).toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
     expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
 
     replicaFresh = true;
-    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
 
-    expect(sortedLoads).toBe(8);
+    expect(sortedLoads).toBe(6);
     expect(
       screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
     ).not.toBeInTheDocument();
@@ -3662,18 +3851,16 @@ describe("TablePage", () => {
     fireEvent.change(notes, { target: { value: "Uncertain" } });
     fireEvent.blur(notes);
     await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-
-    expect(sortedLoads).toBe(5);
+    expect(sortedLoads).toBe(2);
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
     expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
-    expect(screen.getByText("Editing paused while table reloads")).toBeInTheDocument();
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
 
     replicaFresh = true;
     await act(() => vi.advanceTimersByTimeAsync(5_000));
 
-    expect(sortedLoads).toBe(6);
+    expect(sortedLoads).toBe(3);
+    expect(screen.getByDisplayValue("Beta")).toBeEnabled();
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
     expect(
       screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
@@ -3789,6 +3976,35 @@ describe("TablePage", () => {
 
     expect(await screen.findByText("The table kept returning an older revision.")).toBeInTheDocument();
     expect(sortLoads).toBe(3);
+  });
+
+  it("replaces a stale exhaustion error with the active recovery notice", async () => {
+    vi.useFakeTimers();
+    const stale = { ...table, revision: 0 };
+    let tableLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.reject(new DOMException("The operation timed out.", "TimeoutError"));
+      tableLoads += 1;
+      return Promise.resolve({ table: tableLoads <= 2 ? table : stale });
+    });
+    await renderActiveEditor();
+
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Uncertain" } });
+    fireEvent.blur(input);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+
+    expect(screen.getByText("The table kept returning an older revision.")).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+
+    expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
   });
 
   it("discards a page-not-found response that a newer successful load superseded", async () => {
