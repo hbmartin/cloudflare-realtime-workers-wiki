@@ -24,6 +24,12 @@ type RevisionRecoveryOptions = {
   background?: boolean;
   deferDepthRestore?: boolean;
 };
+type TableSortRequest = {
+  column: string | null;
+  dir: "asc" | "desc";
+  minimumRevision: number | null;
+  recoverStaleInBackground: boolean;
+};
 
 const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing.";
 const LEASE_EXPIRED_MESSAGE = "The editing lease expired. Reloaded the authoritative table.";
@@ -85,10 +91,25 @@ function nextTablePageParams(currentPage: TableData) {
   return params;
 }
 
+class StaleTableRevisionError extends Error {
+  constructor() {
+    super("The table kept returning an older revision.");
+    this.name = "StaleTableRevisionError";
+  }
+}
+
 function waitForStaleRevisionRetry(attempt: number) {
   const delay = STALE_REVISION_RETRY_DELAYS_MS[attempt];
-  if (delay === undefined) throw new Error("The table kept returning an older revision.");
+  if (delay === undefined) throw new StaleTableRevisionError();
   return new Promise<void>((resolve) => window.setTimeout(resolve, delay));
+}
+
+function revisionFloor(...revisions: (number | null | undefined)[]) {
+  let floor: number | null = null;
+  for (const revision of revisions) {
+    if (revision !== null && revision !== undefined && (floor === null || revision > floor)) floor = revision;
+  }
+  return floor;
 }
 
 function normalizedInputValue(column: TableColumn, value: string | number | boolean | null) {
@@ -179,8 +200,13 @@ export function TablePage({
   // outcome drops the revision, and polling has to resume to recover it.
   const [revisionKnown, setRevisionKnown] = useState(false);
   const [filter, setFilter] = useState("");
-  const [sortColumn, setSortColumn] = useState<string | null>(null);
-  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [sortRequest, setSortRequest] = useState<TableSortRequest>({
+    column: null,
+    dir: "asc",
+    minimumRevision: null,
+    recoverStaleInBackground: false,
+  });
+  const { column: sortColumn, dir: sortDir } = sortRequest;
   // Mirrored so `load` can read the current sort without taking it as a dependency:
   // the mount effect keys off `load`, and rebuilding it would re-acquire the lease.
   const sortRef = useRef<{ column: string | null; dir: "asc" | "desc" }>({ column: null, dir: "asc" });
@@ -188,9 +214,14 @@ export function TablePage({
     sortRef.current = { column: sortColumn, dir: sortDir };
   }, [sortColumn, sortDir]);
   const clearSort = useCallback(() => {
-    // Invalid-sort recovery can issue its replacement load before effects flush.
+    // Keep async request guards current before the state-driven load effect runs.
     sortRef.current = { ...sortRef.current, column: null };
-    setSortColumn(null);
+    setSortRequest((current) => ({
+      ...current,
+      column: null,
+      minimumRevision: null,
+      recoverStaleInBackground: false,
+    }));
   }, []);
   // Pages appended past the first. While any are loaded the background poll stands
   // down, so browsing deep into a table is not yanked back to the top every 5s.
@@ -207,8 +238,17 @@ export function TablePage({
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [cellResetGenerations, setCellResetGenerations] = useState<Record<string, number>>({});
   const revisionRef = useRef<number | null>(null);
+  // When a revision is invalidated, retain the strongest known floor until an
+  // authoritative load satisfies it. This lets background recovery continue an
+  // interrupted mutation or sort recovery without regressing to displayed data.
+  const revisionRecoveryFloorRef = useRef<number | null>(null);
   const leaseTokenRef = useRef<string | null>(null);
   const mutationQueue = useRef<Promise<void>>(Promise.resolve());
+  // Only row additions and removals can disturb the default (position, id)
+  // presentation while a keyset request is in flight. Cell and schema saves do
+  // not need to delay unsorted pagination.
+  const rowOrderMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const unsortedSnapshotDirtyRef = useRef(false);
   const leaseActionRef = useRef<{ owner: IsCurrent; promise: Promise<void> } | null>(null);
   const leaseMonotonicDeadlineRef = useRef<number | null>(null);
   const leaseWallDeadlineRef = useRef<number | null>(null);
@@ -224,10 +264,6 @@ export function TablePage({
   const userLoadsInFlightRef = useRef(0);
   const mountedRef = useRef(true);
   const loadGenerationRef = useRef(0);
-  // Invalid-sort recovery clears the sort through React state, whose effect owns
-  // the replacement load. Carry the issuing request's revision floor across that
-  // state transition so the replacement cannot adopt an older table snapshot.
-  const pendingSortRecoveryFloorRef = useRef<number | null>(null);
   // Mirrors terminalPageUnavailable for async code that must not act on stale
   // render state, e.g. a queued mutation deciding whether a missing lease is
   // worth reporting.
@@ -316,6 +352,11 @@ export function TablePage({
   }, []);
 
   const invalidateRevision = useCallback(() => {
+    revisionRecoveryFloorRef.current = revisionFloor(
+      revisionRecoveryFloorRef.current,
+      revisionRef.current,
+      pageSnapshotRevisionRef.current,
+    );
     revisionRef.current = null;
     setRevisionKnown(false);
   }, []);
@@ -325,6 +366,21 @@ export function TablePage({
     if (background) return;
     userLoadsInFlightRef.current += delta;
     if (mountedRef.current) setTableBusy(userLoadsInFlightRef.current > 0);
+  }, []);
+
+  const currentRevisionFloor = useCallback(
+    (...revisions: (number | null | undefined)[]) =>
+      revisionFloor(
+        revisionRecoveryFloorRef.current,
+        revisionRef.current,
+        pageSnapshotRevisionRef.current,
+        ...revisions,
+      ),
+    [],
+  );
+
+  const preserveRevisionFloor = useCallback((...revisions: (number | null | undefined)[]) => {
+    revisionRecoveryFloorRef.current = revisionFloor(revisionRecoveryFloorRef.current, ...revisions);
   }, []);
 
   const recoverInvalidSort = useCallback(
@@ -338,15 +394,19 @@ export function TablePage({
       ) {
         return false;
       }
-      const recoveryFloor = Math.max(minimumRevision ?? 0, revisionRef.current ?? 0);
-      if (recoveryFloor > 0) {
-        pendingSortRecoveryFloorRef.current = Math.max(pendingSortRecoveryFloorRef.current ?? 0, recoveryFloor);
-      }
-      clearSort();
+      const recoveryFloor = currentRevisionFloor(minimumRevision);
+      preserveRevisionFloor(recoveryFloor);
+      sortRef.current = { ...sortRef.current, column: null };
+      setSortRequest((current) => ({
+        ...current,
+        column: null,
+        minimumRevision: recoveryFloor,
+        recoverStaleInBackground: true,
+      }));
       setLoadError(null);
       return true;
     },
-    [clearSort],
+    [currentRevisionFloor, preserveRevisionFloor],
   );
 
   const adoptAuthoritativeTable = useCallback(
@@ -377,7 +437,9 @@ export function TablePage({
       });
       appendedPagesRef.current = appendedPages;
       pageSnapshotRevisionRef.current = authoritative.revision;
+      revisionRecoveryFloorRef.current = null;
       sortedSnapshotDirtyRef.current = false;
+      unsortedSnapshotDirtyRef.current = false;
       setTable(authoritative);
       setLoadError(null);
       if (authoritative.lease.expiresAt === null && leaseConflictGeneration === leaseConflictGenerationRef.current) {
@@ -393,6 +455,7 @@ export function TablePage({
       background = false,
       minimumRevision: number | null = null,
       staleRevisionRetries = 0,
+      recoverStaleInBackground = false,
     ): Promise<void> {
       const generation = ++loadGenerationRef.current;
       const leaseConflictGeneration = leaseConflictGenerationRef.current;
@@ -407,14 +470,23 @@ export function TablePage({
         // revert that edit on screen and regress the mutation base, so fetch a
         // fresh one instead of adopting it. Bound the retry in case a lagging or
         // broken backend keeps returning a revision older than the local mutation base.
-        const requiredRevision = Math.max(minimumRevision ?? 0, revisionRef.current ?? 0);
-        if (result.table.revision < requiredRevision) {
+        const requiredRevision = currentRevisionFloor(minimumRevision);
+        if (requiredRevision !== null && result.table.revision < requiredRevision) {
           await waitForStaleRevisionRetry(staleRevisionRetries);
           if (!isCurrent() || generation !== loadGenerationRef.current) return;
-          return loadTable(isCurrent, background, minimumRevision, staleRevisionRetries + 1);
+          return loadTable(isCurrent, background, minimumRevision, staleRevisionRetries + 1, recoverStaleInBackground);
         }
         adoptAuthoritativeTable(result.table, 0, leaseConflictGeneration);
       } catch (cause) {
+        if (cause instanceof StaleTableRevisionError && (background || recoverStaleInBackground)) {
+          // Keep the last usable table visible and let the five-second recovery
+          // poll continue from the preserved snapshot floor. Invalid-sort
+          // recovery is expected to be transparent even when a replica lags.
+          preserveRevisionFloor(minimumRevision);
+          invalidateRevision();
+          setLoadError(null);
+          return;
+        }
         if (recoverInvalidSort(cause, generation, isCurrent, minimumRevision)) return;
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           // Terminal even when the effect that issued this load is gone, but only
@@ -430,7 +502,16 @@ export function TablePage({
         changeLoadCount(-1, background);
       }
     },
-    [adoptAuthoritativeTable, changeLoadCount, markPageUnavailable, page.id, recoverInvalidSort],
+    [
+      adoptAuthoritativeTable,
+      changeLoadCount,
+      currentRevisionFloor,
+      invalidateRevision,
+      markPageUnavailable,
+      page.id,
+      preserveRevisionFloor,
+      recoverInvalidSort,
+    ],
   );
 
   const restoreDepthNow = useCallback(
@@ -503,7 +584,7 @@ export function TablePage({
         if (!isCurrent()) return;
         adoptAuthoritativeTable(restored, appendedPages, leaseConflictGeneration);
       } catch (cause) {
-        const recoveryFloor = Math.max(minimumRevision ?? 0, currentPage.revision);
+        const recoveryFloor = currentRevisionFloor(minimumRevision, currentPage.revision);
         if (recoverInvalidSort(cause, generation, isCurrent, recoveryFloor)) return;
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           markPageUnavailable(cause.message);
@@ -518,6 +599,7 @@ export function TablePage({
     [
       adoptAuthoritativeTable,
       changeLoadCount,
+      currentRevisionFloor,
       invalidateRevision,
       isMounted,
       load,
@@ -531,7 +613,8 @@ export function TablePage({
     async (currentPage: TableData, appendedPageTarget: number) => {
       // Block later mutations behind this rebuild. They need one authoritative revision,
       // while every page boundary is re-derived from that same revision in sequence.
-      const restore = () => restoreDepthNow(currentPage, appendedPageTarget, revisionRef.current);
+      const restore = () =>
+        restoreDepthNow(currentPage, appendedPageTarget, currentRevisionFloor(currentPage.revision));
       const pending = mutationQueue.current.then(restore, restore);
       mutationQueue.current = pending.then(
         () => undefined,
@@ -539,7 +622,7 @@ export function TablePage({
       );
       await pending;
     },
-    [restoreDepthNow],
+    [currentRevisionFloor, restoreDepthNow],
   );
 
   // Appends the next keyset or offset page. Deliberately separate from `load`,
@@ -559,53 +642,69 @@ export function TablePage({
     // page-one result cannot land after this append and yank the view back to the top.
     const generation = ++loadGenerationRef.current;
     const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
-    const snapshotRevision = pageSnapshotRevisionRef.current;
+    const snapshotRevision = pageSnapshotRevisionRef.current ?? currentPage.revision;
     const requestedAppendedPages = appendedPagesRef.current + 1;
     changeLoadCount(1, false);
     try {
-      if (currentPage.sort && sortedSnapshotDirtyRef.current) {
-        await restoreDepth(currentPage, requestedAppendedPages);
-        return;
-      }
-      const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      // A sorted response can resolve at the old revision while a save is still
-      // unresolved and has not bumped revisionRef yet. Let already-queued saves
-      // settle before deciding whether this offset still describes the table.
-      // A rejected save leaves the revision unchanged, so its same-revision page
-      // remains valid; a committed save trips the revision guard and reloads.
-      if (currentPage.sort) await mutationQueue.current;
-      const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
       if (
-        !mountedRef.current ||
-        generation !== loadGenerationRef.current ||
-        requestedSort !== activeSort ||
-        tableSortKey(result.table.sort, result.table.dir) !== requestedSort
-      ) {
-        return;
-      }
-      // Sorted offsets are positions in one exact snapshot: a save can move a row
-      // across the boundary and make a cross-revision append omit its replacement.
-      // The boundary remains usable across this client's serialized saves when they
-      // cannot change its ordering. The response may therefore name any revision from
-      // the boundary snapshot through the current local mutation revision. A response
-      // outside that range came from a different table state and must not be appended.
-      const currentRevision = revisionRef.current;
-      const responseMatchesUsableSnapshot =
-        snapshotRevision !== null &&
-        currentRevision !== null &&
-        result.table.revision >= snapshotRevision &&
-        result.table.revision <= currentRevision;
-      // An unsorted keyset boundary remains usable across newer revisions, but an
-      // older response can reintroduce rows that were already changed or deleted.
-      const responsePredatesSnapshot = snapshotRevision === null || result.table.revision < snapshotRevision;
-      if (
-        responsePredatesSnapshot ||
-        (currentPage.sort && (sortedSnapshotDirtyRef.current || !responseMatchesUsableSnapshot))
+        (currentPage.sort && sortedSnapshotDirtyRef.current) ||
+        (!currentPage.sort && unsortedSnapshotDirtyRef.current)
       ) {
         await restoreDepth(currentPage, requestedAppendedPages);
         return;
+      }
+      let result: { table: TableData };
+      for (let staleRevisionRetries = 0; ; staleRevisionRetries += 1) {
+        result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+        // Offset pages wait for every mutation because any sorted value can move a
+        // row across the boundary. Keyset pages wait only for additions/removals;
+        // loaded-row cell edits are merged locally and do not disturb the cursor.
+        if (currentPage.sort) await mutationQueue.current;
+        else await rowOrderMutationQueueRef.current;
+
+        const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
+        if (
+          !mountedRef.current ||
+          generation !== loadGenerationRef.current ||
+          requestedSort !== activeSort ||
+          tableSortKey(result.table.sort, result.table.dir) !== requestedSort
+        ) {
+          return;
+        }
+        if (!currentPage.sort) {
+          if (unsortedSnapshotDirtyRef.current) {
+            await restoreDepth(currentPage, requestedAppendedPages);
+            return;
+          }
+          if (result.table.revision < snapshotRevision) {
+            await waitForStaleRevisionRetry(staleRevisionRetries);
+            if (
+              !mountedRef.current ||
+              generation !== loadGenerationRef.current ||
+              requestedSort !== tableSortKey(sortRef.current.column, sortRef.current.dir)
+            ) {
+              return;
+            }
+            continue;
+          }
+          break;
+        }
+
+        // Sorted offsets are positions in one exact snapshot. Saves that do not
+        // affect the ordering may advance the local mutation revision, but the
+        // response must remain between that revision and the boundary snapshot.
+        const currentRevision = revisionRef.current;
+        const responseMatchesUsableSnapshot =
+          currentRevision !== null &&
+          result.table.revision >= snapshotRevision &&
+          result.table.revision <= currentRevision;
+        if (sortedSnapshotDirtyRef.current || !responseMatchesUsableSnapshot) {
+          await restoreDepth(currentPage, requestedAppendedPages);
+          return;
+        }
+        break;
       }
       appendedPagesRef.current += 1;
       pageSnapshotRevisionRef.current = result.table.revision;
@@ -628,7 +727,7 @@ export function TablePage({
         mountedRef.current &&
         generation === loadGenerationRef.current &&
         requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir);
-      const recoveryFloor = Math.max(snapshotRevision ?? 0, currentPage.revision);
+      const recoveryFloor = currentRevisionFloor(snapshotRevision, currentPage.revision);
       if (recoverInvalidSort(cause, generation, isCurrent, recoveryFloor)) return;
       // Pagination can be the request that discovers the page is gone, and its
       // rejection is swallowed by the click handler; latch the terminal state here
@@ -642,15 +741,14 @@ export function TablePage({
     }
   }
 
-  const sortKey = tableSortKey(sortColumn, sortDir);
-  const appliedSortRef = useRef(sortKey);
+  const appliedSortRequestRef = useRef(sortRequest);
   useEffect(() => {
-    if (appliedSortRef.current === sortKey) return;
-    appliedSortRef.current = sortKey;
-    const recoveryFloor = pendingSortRecoveryFloorRef.current;
-    pendingSortRecoveryFloorRef.current = null;
-    void load(isMounted, false, recoveryFloor).catch(() => undefined);
-  }, [isMounted, load, sortKey]);
+    if (appliedSortRequestRef.current === sortRequest) return;
+    appliedSortRequestRef.current = sortRequest;
+    void load(isMounted, false, sortRequest.minimumRevision, 0, sortRequest.recoverStaleInBackground).catch(
+      () => undefined,
+    );
+  }, [isMounted, load, sortRequest]);
 
   const recoverRevision = useCallback(
     async ({
@@ -663,7 +761,8 @@ export function TablePage({
       try {
         const currentPage = tableRef.current;
         const appendedPageTarget = appendedPagesRef.current;
-        const recoveryFloor = minimumRevision ?? currentPage?.revision ?? null;
+        const recoveryFloor = currentRevisionFloor(minimumRevision, currentPage?.revision);
+        preserveRevisionFloor(recoveryFloor);
         const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
         const canRestoreCurrentDepth =
           currentPage && currentPage.sort !== null && tableSortKey(currentPage.sort, currentPage.dir) === activeSort;
@@ -693,7 +792,7 @@ export function TablePage({
         return false;
       }
     },
-    [isMounted, load, restoreDepth, restoreDepthNow],
+    [currentRevisionFloor, isMounted, load, preserveRevisionFloor, restoreDepth, restoreDepthNow],
   );
 
   const endLease = useCallback(
@@ -1080,6 +1179,7 @@ export function TablePage({
           ) {
             sortedSnapshotDirtyRef.current = true;
           }
+          if (affectsSortedOrder === true) unsortedSnapshotDirtyRef.current = true;
           setSaveError(null);
           setTable((current) => (current ? { ...current, revision: result.revision } : current));
           return result;
@@ -1159,6 +1259,7 @@ export function TablePage({
       () => undefined,
       () => undefined,
     );
+    if (affectsSortedOrder === true) rowOrderMutationQueueRef.current = mutationQueue.current;
     return pending;
   }
 
@@ -1373,10 +1474,20 @@ export function TablePage({
                         className="column-sort"
                         onClick={() => {
                           if (sortColumn !== column.id) {
-                            setSortColumn(column.id);
-                            setSortDir("asc");
-                          } else if (sortDir === "asc") setSortDir("desc");
-                          else clearSort();
+                            setSortRequest({
+                              column: column.id,
+                              dir: "asc",
+                              minimumRevision: null,
+                              recoverStaleInBackground: false,
+                            });
+                          } else if (sortDir === "asc") {
+                            setSortRequest({
+                              column: column.id,
+                              dir: "desc",
+                              minimumRevision: null,
+                              recoverStaleInBackground: false,
+                            });
+                          } else clearSort();
                         }}
                       >
                         {column.name} <small>{column.type}</small>
