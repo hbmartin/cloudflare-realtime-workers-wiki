@@ -1417,6 +1417,55 @@ describe("TablePage", () => {
     expect(screen.queryByText("The table changed. Reloading before retrying.")).not.toBeInTheDocument();
   });
 
+  it("recovers against the live sort when a sort change supersedes a failed-save reload", async () => {
+    const staleRecovery = deferred<{ table: TableData }>();
+    const supersededSortLoad = deferred<{ table: TableData }>();
+    let plainLoads = 0;
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/lease") && init?.method === "DELETE") return Promise.resolve({ ok: true });
+      if (init?.method === "PUT") return Promise.reject(new DOMException("The operation timed out.", "TimeoutError"));
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        if (sortedLoads === 1) return supersededSortLoad.promise;
+        return Promise.resolve({
+          table: { ...tableWithValue("Sorted authoritative", 2), sort: "status" },
+        });
+      }
+      plainLoads += 1;
+      if (plainLoads <= 2) return Promise.resolve({ table });
+      return staleRecovery.promise;
+    });
+    await renderActiveEditor();
+
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Unsaved" } });
+    fireEvent.blur(input);
+    await waitFor(() => expect(plainLoads).toBe(3));
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await waitFor(() => expect(sortedLoads).toBe(1));
+
+    await act(async () => {
+      staleRecovery.resolve({ table: tableWithValue("Superseded", 2) });
+      await staleRecovery.promise;
+    });
+
+    expect(await screen.findByDisplayValue("Sorted authoritative")).toBeEnabled();
+    expect(sortedLoads).toBe(2);
+    expect(
+      screen.queryByText(
+        "The table update was not saved because the authoritative table revision could not be reloaded.",
+      ),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      supersededSortLoad.resolve({ table: { ...tableWithValue("Stale sorted", 2), sort: "status" } });
+      await supersededSortLoad.promise;
+    });
+    expect(screen.getByDisplayValue("Sorted authoritative")).toBeEnabled();
+  });
+
   it("leaves option position assignment to the server across revision recovery", async () => {
     const mutations: Array<Record<string, unknown>> = [];
     let loads = 0;

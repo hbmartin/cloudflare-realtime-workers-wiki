@@ -27,6 +27,16 @@ const CLOSE_REASONS = new Map([
   [4429, "the document already has the maximum number of connections"],
 ]);
 
+function connectionClosedError(event) {
+  const code = event?.code;
+  const reason = CLOSE_REASONS.get(code);
+  return new Error(
+    reason
+      ? `The document connection closed: ${reason} (${code}).`
+      : `The document connection closed (${code ?? "no code"}).`,
+  );
+}
+
 /**
  * y-partyserver builds its socket as `new provider._WS(url)` with no second argument,
  * so a subclass closing over the credentials is the only seam for the session cookie.
@@ -45,26 +55,21 @@ function settleOnce(provider, timeoutMs, message, subscribe) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => finish(new Error(message)), timeoutMs);
     const listeners = [];
-    function finish(error) {
+    let settled = false;
+    function finish(error, value) {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       for (const [event, handler] of listeners) provider.off(event, handler);
       if (error) reject(error);
-      else resolve();
+      else resolve(value);
     }
     function on(event, handler) {
       listeners.push([event, handler]);
       provider.on(event, handler);
     }
     on("connection-close", (event) => {
-      const code = event?.code;
-      const reason = CLOSE_REASONS.get(code);
-      finish(
-        new Error(
-          reason
-            ? `The document connection closed: ${reason} (${code}).`
-            : `The document connection closed (${code ?? "no code"}).`,
-        ),
-      );
+      finish(connectionClosedError(event));
     });
     on("connection-error", () => finish(new Error("The document connection failed.")));
     subscribe(on, finish);
@@ -129,6 +134,23 @@ function currentProjectionHash(doc) {
   return documentJsonProjectionHash(fragmentJson(doc));
 }
 
+export function connectedProjectionHash(provider, doc) {
+  return settleOnce(provider, SYNC_TIMEOUT_MS, "Timed out while hashing the synchronized document.", (_on, finish) => {
+    if (provider.wsconnected === false) {
+      finish(connectionClosedError());
+      return;
+    }
+    try {
+      currentProjectionHash(doc).then(
+        (hash) => finish(null, hash),
+        (error) => finish(error),
+      );
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
 /**
  * Hashes the document once the edit that interrupted a guarded write stops streaming.
  *
@@ -136,25 +158,35 @@ function currentProjectionHash(doc) {
  * that instant names a state the destination never kept, and it would be persisted as
  * the accepted destination hash that verify compares against. Bounded: an editor still
  * typing at the deadline yields a transient hash, which the next run's guarded compare
- * corrects.
+ * corrects. When a provider is supplied, losing its connection invalidates the local
+ * state instead of allowing that state to be accepted as the live destination.
  */
-export function settledProjectionHash(doc, { quietMs = 1_000, maxWaitMs = 10_000 } = {}) {
+export function settledProjectionHash(doc, { quietMs = 1_000, maxWaitMs = 10_000, provider = null } = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let quiet = setTimeout(finish, quietMs);
     const deadline = setTimeout(finish, maxWaitMs);
-    // No `settled` guard here: `finish` runs only from a timer, and it removes this
-    // listener in the same turn it sets the flag, so there is no emit left to ignore.
+    const providerListeners = [];
     function onUpdate() {
       clearTimeout(quiet);
       quiet = setTimeout(finish, quietMs);
     }
-    function finish() {
-      if (settled) return;
-      settled = true;
+    function cleanup() {
       clearTimeout(quiet);
       clearTimeout(deadline);
       doc.off("update", onUpdate);
+      for (const [event, handler] of providerListeners) provider.off(event, handler);
+    }
+    function fail(error) {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    }
+    function finish() {
+      if (settled) return;
+      settled = true;
+      cleanup();
       try {
         resolve(currentProjectionHash(doc));
       } catch (error) {
@@ -162,6 +194,15 @@ export function settledProjectionHash(doc, { quietMs = 1_000, maxWaitMs = 10_000
       }
     }
     doc.on("update", onUpdate);
+    if (provider) {
+      const on = (event, handler) => {
+        providerListeners.push([event, handler]);
+        provider.on(event, handler);
+      };
+      on("connection-close", (event) => fail(connectionClosedError(event)));
+      on("connection-error", () => fail(new Error("The document connection failed.")));
+      if (provider.wsconnected === false) fail(connectionClosedError());
+    }
   });
 }
 
@@ -221,9 +262,12 @@ export async function pushDocument({
     doc.on("update", markRemoteUpdate);
     // The doc is read synchronously when the call is evaluated, so the listener above
     // and this baseline describe the same state.
-    const liveProjectionHash = await currentProjectionHash(doc);
+    const liveProjectionHash = await connectedProjectionHash(provider, doc);
     if (expectedProjectionHashes && !expectedProjectionHashes.includes(liveProjectionHash)) {
-      return { conflict: true, liveProjectionHash: await settledProjectionHash(doc) };
+      return {
+        conflict: true,
+        liveProjectionHash: remoteUpdateSeen ? await settledProjectionHash(doc, { provider }) : liveProjectionHash,
+      };
     }
     await beforeWrite(liveProjectionHash);
     let written;
@@ -231,7 +275,7 @@ export async function pushDocument({
       written = await writeBlocksToFragment(editor, blocks, doc, DOCUMENT_FRAGMENT, () => remoteUpdateSeen);
     } catch (error) {
       if (!(error instanceof DocumentStateChangedError)) throw error;
-      return { conflict: true, liveProjectionHash: await settledProjectionHash(doc) };
+      return { conflict: true, liveProjectionHash: await settledProjectionHash(doc, { provider }) };
     } finally {
       doc.off("update", markRemoteUpdate);
     }
