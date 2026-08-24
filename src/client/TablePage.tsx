@@ -224,6 +224,10 @@ export function TablePage({
   const userLoadsInFlightRef = useRef(0);
   const mountedRef = useRef(true);
   const loadGenerationRef = useRef(0);
+  // Invalid-sort recovery clears the sort through React state, whose effect owns
+  // the replacement load. Carry the issuing request's revision floor across that
+  // state transition so the replacement cannot adopt an older table snapshot.
+  const pendingSortRecoveryFloorRef = useRef<number | null>(null);
   // Mirrors terminalPageUnavailable for async code that must not act on stale
   // render state, e.g. a queued mutation deciding whether a missing lease is
   // worth reporting.
@@ -324,7 +328,7 @@ export function TablePage({
   }, []);
 
   const recoverInvalidSort = useCallback(
-    (cause: unknown, generation: number, isCurrent: IsCurrent) => {
+    (cause: unknown, generation: number, isCurrent: IsCurrent, minimumRevision: number | null = null) => {
       if (
         !isCurrent() ||
         generation !== loadGenerationRef.current ||
@@ -333,6 +337,10 @@ export function TablePage({
         !sortRef.current.column
       ) {
         return false;
+      }
+      const recoveryFloor = Math.max(minimumRevision ?? 0, revisionRef.current ?? 0);
+      if (recoveryFloor > 0) {
+        pendingSortRecoveryFloorRef.current = Math.max(pendingSortRecoveryFloorRef.current ?? 0, recoveryFloor);
       }
       clearSort();
       setLoadError(null);
@@ -407,7 +415,7 @@ export function TablePage({
         }
         adoptAuthoritativeTable(result.table, 0, leaseConflictGeneration);
       } catch (cause) {
-        if (recoverInvalidSort(cause, generation, isCurrent)) return;
+        if (recoverInvalidSort(cause, generation, isCurrent, minimumRevision)) return;
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           // Terminal even when the effect that issued this load is gone, but only
           // while no newer load superseded it: a stale page_not_found can belong
@@ -495,7 +503,8 @@ export function TablePage({
         if (!isCurrent()) return;
         adoptAuthoritativeTable(restored, appendedPages, leaseConflictGeneration);
       } catch (cause) {
-        if (recoverInvalidSort(cause, generation, isCurrent)) return;
+        const recoveryFloor = Math.max(minimumRevision ?? 0, currentPage.revision);
+        if (recoverInvalidSort(cause, generation, isCurrent, recoveryFloor)) return;
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           markPageUnavailable(cause.message);
         } else if (isCurrent()) {
@@ -588,7 +597,13 @@ export function TablePage({
         currentRevision !== null &&
         result.table.revision >= snapshotRevision &&
         result.table.revision <= currentRevision;
-      if (currentPage.sort && (sortedSnapshotDirtyRef.current || !responseMatchesUsableSnapshot)) {
+      // An unsorted keyset boundary remains usable across newer revisions, but an
+      // older response can reintroduce rows that were already changed or deleted.
+      const responsePredatesSnapshot = snapshotRevision === null || result.table.revision < snapshotRevision;
+      if (
+        responsePredatesSnapshot ||
+        (currentPage.sort && (sortedSnapshotDirtyRef.current || !responseMatchesUsableSnapshot))
+      ) {
         await restoreDepth(currentPage, requestedAppendedPages);
         return;
       }
@@ -613,7 +628,8 @@ export function TablePage({
         mountedRef.current &&
         generation === loadGenerationRef.current &&
         requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir);
-      if (recoverInvalidSort(cause, generation, isCurrent)) return;
+      const recoveryFloor = Math.max(snapshotRevision ?? 0, currentPage.revision);
+      if (recoverInvalidSort(cause, generation, isCurrent, recoveryFloor)) return;
       // Pagination can be the request that discovers the page is gone, and its
       // rejection is swallowed by the click handler; latch the terminal state here
       // under the same currency rule as load.
@@ -631,7 +647,9 @@ export function TablePage({
   useEffect(() => {
     if (appliedSortRef.current === sortKey) return;
     appliedSortRef.current = sortKey;
-    void load(isMounted).catch(() => undefined);
+    const recoveryFloor = pendingSortRecoveryFloorRef.current;
+    pendingSortRecoveryFloorRef.current = null;
+    void load(isMounted, false, recoveryFloor).catch(() => undefined);
   }, [isMounted, load, sortKey]);
 
   const recoverRevision = useCallback(
