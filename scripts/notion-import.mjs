@@ -11,7 +11,9 @@
  *   plan      also converts every page in memory, reporting each degradation. Still no
  *             network, so a rule can be corrected before anything is created.
  *   run       performs the import.
- *   verify    re-checks an existing import against the live workspace.
+ *   verify    re-checks an existing import against the live workspace. It does not
+ *             mutate the workspace; explicit legacy-fingerprint adoption can update
+ *             the local manifest.
  *
  * The export must be unpacked first: Node ships no zip reader and this repository
  * carries no archive dependency.
@@ -59,7 +61,7 @@ function parseArguments(argv) {
     requestsPerSecond: Number.parseInt(process.env.NOTES_IMPORT_RPS || "20", 10),
     lingerMs: 1_200,
     verifyTimeoutMs: Number(process.env.NOTES_IMPORT_VERIFY_TIMEOUT_MS || 120_000),
-    keepAmbiguousTable: false,
+    keepAmbiguousTables: [],
     adoptLegacyFingerprint: false,
     verbose: false,
   };
@@ -84,8 +86,13 @@ function parseArguments(argv) {
     else if (flag === "--rps") options.requestsPerSecond = takeNumber();
     else if (flag === "--linger-ms") options.lingerMs = takeNumber();
     else if (flag === "--verify-timeout-ms") options.verifyTimeoutMs = takeNumber();
-    else if (flag === "--keep-ambiguous-table") options.keepAmbiguousTable = true;
-    else if (flag === "--adopt-legacy-fingerprint") options.adoptLegacyFingerprint = true;
+    else if (flag === "--keep-ambiguous-table") {
+      const path = take();
+      if (typeof path !== "string" || !path.trim() || path.startsWith("--")) {
+        throw new Error("--keep-ambiguous-table requires an exact source path from the import report.");
+      }
+      options.keepAmbiguousTables.push(path);
+    } else if (flag === "--adopt-legacy-fingerprint") options.adoptLegacyFingerprint = true;
     else if (flag === "--verbose") options.verbose = true;
     else if (flag.startsWith("--")) throw new Error(`Unknown option ${flag}.`);
     else positional.push(argument);
@@ -107,11 +114,12 @@ function usage() {
   console.error("  --rps <n>          Global request rate. Defaults to NOTES_IMPORT_RPS or 20.");
   console.error("  --linger-ms <n>    How long to hold each document open so compaction is armed promptly.");
   console.error("  --verify-timeout-ms <n>  Maximum time for exact post-import verification.");
-  console.error("  --keep-ambiguous-table   Settle a table reported as table_recovery_ambiguous by");
-  console.error("                     accepting the live table as the destination's. The import stops");
-  console.error("                     writing to it; nothing else can clear that state.");
+  console.error("  --keep-ambiguous-table <source-path>  Settle one table already recorded as");
+  console.error("                     table_recovery_ambiguous by accepting the live table as the");
+  console.error("                     destination's. Repeat for each exact path to settle.");
   console.error("  --adopt-legacy-fingerprint  Resume a manifest written with the older raw-byte export");
-  console.error("                     fingerprint, checking it once and migrating it to the digest form.");
+  console.error("                     fingerprint, migrating it to the digest form while retaining");
+  console.error("                     the legacy value for explicit recovery from a mistaken adoption.");
   console.error("  --verbose          One line per page instead of a summary.");
 }
 
@@ -153,6 +161,9 @@ function validate(options) {
   }
   if ((options.command === "run" || options.command === "verify") && !process.env.NOTES_IMPORT_PASSWORD) {
     throw new Error("Set NOTES_IMPORT_PASSWORD. The password is never taken from the command line.");
+  }
+  if (options.keepAmbiguousTables.length && options.command !== "run") {
+    throw new Error("--keep-ambiguous-table is only valid with the run command.");
   }
   return root;
 }
@@ -262,7 +273,7 @@ if (options.command === "inspect") {
       rootParentId: options.parent,
       limit: options.limit,
       lingerMs: options.lingerMs,
-      keepAmbiguousTable: options.keepAmbiguousTable,
+      keepAmbiguousTables: options.keepAmbiguousTables,
     });
     report.print(summary);
   } finally {
@@ -284,8 +295,9 @@ if (options.command === "inspect") {
       `No manifest at ${options.manifest}. Run the import first, or pass --manifest <path> for the run you want to verify.`,
     );
   }
-  // Verification is read-only, so a manifest imported with --parent is adopted as
-  // recorded rather than requiring the flag to be repeated.
+  // Verification is remote-read-only, so a manifest imported with --parent is adopted
+  // as recorded rather than requiring the flag to be repeated. Explicit fingerprint
+  // adoption may still update the local manifest.
   const { client, manifest } = await connect(options, root, { adoptRootParent: true });
   const problems = await verifyImport({ client, manifest, index, timeoutMs: options.verifyTimeoutMs });
   if (problems > 0) process.exitCode = 1;

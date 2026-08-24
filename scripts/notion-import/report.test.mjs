@@ -24,4 +24,17 @@ describe("createReport", () => {
     expect(log).toHaveBeenCalledWith("Data errors (the import is incomplete):");
     log.mockRestore();
   });
+
+  it("prints complete recovery instructions without truncating them", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const report = createReport();
+    const instruction =
+      'Quarterly Metrics: receipt missing. Re-run with --keep-ambiguous-table "Quarterly Metrics.html".';
+    report.error("table_recovery_ambiguous", instruction);
+
+    report.print({ pages: 1, written: 0, databases: 1, rows: 0 });
+
+    expect(log).toHaveBeenCalledWith(`    ${instruction}`);
+    log.mockRestore();
+  });
 });

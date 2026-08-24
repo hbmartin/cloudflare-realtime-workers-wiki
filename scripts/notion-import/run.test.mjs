@@ -68,6 +68,33 @@ describe("deterministic import resources", () => {
 });
 
 describe("runImport", () => {
+  it("rejects an ambiguous-table settlement that was not already recorded", async () => {
+    const database = {
+      path: "Table.html",
+      parent: null,
+      kind: "database",
+      title: "Table",
+      assets: [],
+    };
+    const manifest = stubManifest({
+      [database.path]: { pageId: "page-1", tableRecoveryAmbiguous: false },
+    });
+
+    await expect(
+      runImport({
+        index: { pages: [database], root: "/unused" },
+        client: {},
+        manifest,
+        report: { issue: vi.fn(), progress: vi.fn(), inPage: vi.fn() },
+        rootParentId: null,
+        limit: 1,
+        lingerMs: 0,
+        keepAmbiguousTables: [database.path],
+      }),
+    ).rejects.toThrow('target "Table.html" is not recorded as table_recovery_ambiguous');
+    expect(manifest.record).not.toHaveBeenCalled();
+  });
+
   it("rejects a short page batch before recording shifted ids", async () => {
     const page = {
       path: "Page.html",
@@ -474,6 +501,7 @@ describe("reconcileCommitted", () => {
     });
     expect(report.issue).toHaveBeenCalledWith("destination_table_kept", "Table");
     expect(report.error).not.toHaveBeenCalled();
+    expect(state.nodes[page.path].table.settledByOperator).toBeUndefined();
   });
 
   it("replays an interrupted column commit to recover its generated ids", async () => {
@@ -702,6 +730,7 @@ describe("reconcileCommitted", () => {
       acceptedRemoteHash: committedColumnHash,
       acceptedRemoteRowCount: 0,
     });
+    expect(state.nodes[page.path].table.settledByOperator).toBeUndefined();
   });
 
   it("keeps the destination when an exact saved checkpoint was edited and reverted", async () => {
@@ -860,7 +889,7 @@ describe("reconcileCommitted", () => {
       report,
       tablePlans: new Map([[page, plan]]),
       client,
-      keepAmbiguousTable: true,
+      keepAmbiguousTables: new Set([page.path]),
     });
 
     expect(report.error).not.toHaveBeenCalled();
@@ -870,6 +899,7 @@ describe("reconcileCommitted", () => {
       phase: "complete",
       acceptedRemoteHash: committedColumnHash,
       acceptedRemoteRowCount: 0,
+      settledByOperator: true,
     });
   });
 
@@ -1029,6 +1059,7 @@ describe("reconcileCommitted", () => {
 
     expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(false);
     expect(state.nodes[page.path].table).toBeUndefined();
+    expect(state.nodes[page.path].tableError).toBeNull();
   });
 
   it("classifies recovery against the table read under its lease, not the earlier probe", async () => {

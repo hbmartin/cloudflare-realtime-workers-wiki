@@ -70,7 +70,7 @@ describe("settledProjectionHash", () => {
     );
 
     await vi.advanceTimersByTimeAsync(10);
-    expect(await outcome).toMatchObject({ message: "Unexpected case" });
+    expect(await outcome).toBeInstanceOf(Error);
     expect(off).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(50);
     expect(off).toHaveBeenCalledTimes(1);

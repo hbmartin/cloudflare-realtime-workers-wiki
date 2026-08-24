@@ -13,9 +13,10 @@ function printEntries(heading, entries) {
   if (!entries.size) return;
   console.log(heading);
   const sorted = [...entries.entries()].sort((left, right) => right[1].count - left[1].count);
-  for (const [key, entry] of sorted) {
+  for (const [, entry] of sorted) {
     const where = entry.firstSeenIn ? ` first in "${entry.firstSeenIn}"` : "";
-    console.log(`  ${key.slice(0, 52).padEnd(54)} ${String(entry.count).padStart(6)}${where}`);
+    console.log(`  ${entry.code.padEnd(32)} ${String(entry.count).padStart(6)}${where}`);
+    if (entry.detail) console.log(`    ${entry.detail}`);
   }
 }
 
@@ -27,7 +28,7 @@ export function createReport({ verbose = false } = {}) {
 
   const record = (target, code, detail) => {
     const key = detail ? `${code}:${detail}` : code;
-    const entry = target.get(key) ?? { count: 0, firstSeenIn: context };
+    const entry = target.get(key) ?? { code, detail, count: 0, firstSeenIn: context };
     entry.count += 1;
     target.set(key, entry);
   };

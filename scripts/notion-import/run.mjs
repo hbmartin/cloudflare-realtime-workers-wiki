@@ -441,8 +441,9 @@ export async function reconcileCommitted({
   report,
   tablePlans = new Map(),
   skipPaths = new Set(),
-  keepAmbiguousTable = false,
+  keepAmbiguousTables = new Set(),
 }) {
+  const ambiguousTablePaths = keepAmbiguousTables instanceof Set ? keepAmbiguousTables : new Set(keepAmbiguousTables);
   for (const page of selected) {
     const key = keyOf(page);
     // A node first planned by this run has provably no committed server state to
@@ -537,6 +538,7 @@ export async function reconcileCommitted({
         // the record by an earlier run would otherwise end a later run with no error
         // reported and no rows written.
         patch.tableRecoveryAmbiguous = false;
+        patch.tableError = null;
         const plan = tablePlans.get(page);
         if (plan) {
           const source = plan.table;
@@ -575,7 +577,6 @@ export async function reconcileCommitted({
               columnsByRef: progress?.columnsByRef ?? {},
             };
             patch.table = table;
-            patch.tableError = null;
             // Destination edits win the whole table facet, including when they race an
             // incomplete import. Stop further batches so user-owned rows are never
             // combined with the remaining source rows into a hybrid table.
@@ -588,6 +589,7 @@ export async function reconcileCommitted({
             const adoptOwnBaseline = () => {
               delete table.acceptedRemoteHash;
               delete table.acceptedRemoteRowCount;
+              delete table.settledByOperator;
             };
             if (matchesLastCommit(live)) {
               // With no recorded baseline, the empty table itself needs attribution:
@@ -652,13 +654,21 @@ export async function reconcileCommitted({
                       recoveredColumns = mergeColumnMap(recoveredColumns, columns, replayed);
                     }
                   } catch (error) {
-                    if (!(error instanceof ColumnRecoveryAmbiguousError) || !keepAmbiguousTable) throw error;
+                    const wasAlreadyAmbiguous = node.tableRecoveryAmbiguous === true;
+                    if (
+                      !(error instanceof ColumnRecoveryAmbiguousError) ||
+                      !wasAlreadyAmbiguous ||
+                      !ambiguousTablePaths.has(key)
+                    ) {
+                      throw error;
+                    }
                     // The one settlement that needs no missing receipt, and the only way
                     // out of an ambiguity that every rerun re-derives identically: the
                     // operator has decided the live table is the destination's, so it is
                     // accepted whole and the import stops writing to it. Taken under the
                     // lease, against the same verification the classification used.
                     report.issue("ambiguous_table_kept", page.title);
+                    table.settledByOperator = true;
                     return keepDestinationTable(leased);
                   }
                   table.columnsByRef = recoveredColumns;
@@ -676,7 +686,7 @@ export async function reconcileCommitted({
                   patch.tableRecoveryAmbiguous = true;
                   report.error(
                     "table_recovery_ambiguous",
-                    `${page.title}: ${patch.tableError} Re-run with --keep-ambiguous-table to accept the live table as the destination's.`,
+                    `${page.title}: ${patch.tableError} Re-run with --keep-ambiguous-table ${JSON.stringify(key)} to accept only this live table as the destination's.`,
                   );
                 } else {
                   // This attempt proved nothing either way, so an ambiguity an earlier
@@ -709,7 +719,7 @@ export async function runImport({
   rootParentId,
   limit,
   lingerMs,
-  keepAmbiguousTable = false,
+  keepAmbiguousTables = [],
   documentPush = pushDocument,
 }) {
   const selected = selectPages(index.pages, limit);
@@ -717,6 +727,18 @@ export async function runImport({
   const selectedPaths = selected.map((page) => page.path);
   if (manifest.state.selectedPaths && !sameStringSets(manifest.state.selectedPaths, selectedPaths)) {
     throw new Error("This manifest was started with a different --limit selection.");
+  }
+  const ambiguousTablePaths = new Set(keepAmbiguousTables);
+  for (const path of ambiguousTablePaths) {
+    const selectedTable = selected.find((page) => page.path === path && page.kind === "database");
+    if (!selectedTable) {
+      throw new Error(`--keep-ambiguous-table target ${JSON.stringify(path)} is not a selected database source path.`);
+    }
+    if (manifest.node(path)?.tableRecoveryAmbiguous !== true) {
+      throw new Error(
+        `--keep-ambiguous-table target ${JSON.stringify(path)} is not recorded as table_recovery_ambiguous.`,
+      );
+    }
   }
   const expectedPages = new Map();
   for (const page of selected) {
@@ -781,7 +803,7 @@ export async function runImport({
     report,
     tablePlans,
     skipPaths: freshPaths,
-    keepAmbiguousTable,
+    keepAmbiguousTables: ambiguousTablePaths,
   });
 
   // Pass 1: every page, no content.

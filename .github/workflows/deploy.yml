@@ -1,97 +1,93 @@
 name: Deploy
 
 on:
-  push:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
     branches:
       - main
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: read
-  # Reading the CI conclusion for this commit.
-  actions: read
-
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
 
 jobs:
   # D1 migrations are forward-only, so the release gate has to pass before the
-  # deploy job starts rather than alongside it. A push (to main or a v* tag)
-  # also starts CI on the same commit, and CI covers everything `pnpm check`
-  # does plus the browser suite, so for pushes the gate is just that wait.
-  # workflow_dispatch can select any ref, including one CI never saw, so it runs
-  # `pnpm check` here instead.
+  # deploy job starts rather than alongside it. Successful main-branch CI runs
+  # trigger this workflow after completion; a manual dispatch can select a ref
+  # CI never saw, so that path runs `pnpm check` here instead.
   gate:
     name: Release gate
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      should_deploy: ${{ steps.target.outputs.should_deploy }}
+      deploy_sha: ${{ steps.target.outputs.deploy_sha }}
     steps:
+      - name: Select deployment target
+        id: target
+        env:
+          CI_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "${EVENT_NAME}" = "workflow_run" ]; then
+            if [ "${CI_CONCLUSION}" != "success" ]; then
+              echo "CI concluded ${CI_CONCLUSION}; no deployment will start."
+              echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            current_sha=$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+            if [ "${CI_SHA}" != "${current_sha}" ]; then
+              echo "CI passed for superseded commit ${CI_SHA}; main is ${current_sha}."
+              echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            deploy_sha=${CI_SHA}
+          else
+            deploy_sha=${MANUAL_SHA}
+          fi
+          echo "Deploying ${deploy_sha}."
+          echo "should_deploy=true" >> "${GITHUB_OUTPUT}"
+          echo "deploy_sha=${deploy_sha}" >> "${GITHUB_OUTPUT}"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'workflow_dispatch'
         with:
           persist-credentials: false
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        if: github.event_name == 'workflow_dispatch'
         with:
           version: 11.18.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: github.event_name == 'workflow_dispatch'
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - if: github.event_name == 'workflow_dispatch'
+        run: pnpm install --frozen-lockfile
 
       # format:check, lint, typecheck, unit and Worker coverage, analyze,
-      # cf-typegen:check, and both builds. Skipped for pushes, where CI already
-      # covers this exact commit.
+      # cf-typegen:check, and both builds. Successful CI completion covers the
+      # automatic path, so only a manual deployment repeats this local suite.
       - name: Full check
         if: github.event_name == 'workflow_dispatch'
         run: pnpm check
 
-      # A push starts CI and this workflow at once, so wait for CI on this exact
-      # commit rather than racing it. Only a dispatched ref can legitimately
-      # have no CI run at all; that case is covered by `pnpm check` above.
-      - name: Require CI to have passed for this commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          for attempt in $(seq 1 20); do
-            run=$(gh api \
-              "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=1" \
-              --jq '.workflow_runs[0] | "\(.status // "") \(.conclusion // "")"')
-            status=${run% *}
-            conclusion=${run#* }
-            if [ -z "${status}" ]; then
-              if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
-                echo "No CI run for ${SHA}; the release gate above is the only check."
-                exit 0
-              fi
-              echo "Attempt ${attempt}: CI for ${SHA} has not appeared yet; waiting."
-              sleep 60
-              continue
-            fi
-            if [ "${status}" = "completed" ]; then
-              echo "CI for ${SHA} concluded: ${conclusion}"
-              if [ "${conclusion}" = "success" ]; then
-                exit 0
-              fi
-              echo "Refusing to deploy a commit whose CI did not pass." >&2
-              exit 1
-            fi
-            echo "Attempt ${attempt}: CI for ${SHA} is ${status}; waiting."
-            sleep 60
-          done
-          echo "CI for ${SHA} did not complete in time." >&2
-          exit 1
-
   deploy:
     name: Deploy to production
     needs: gate
+    if: needs.gate.outputs.should_deploy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
     environment:
       name: production
       url: ${{ vars.PRODUCTION_BASE_URL }}
@@ -102,6 +98,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ needs.gate.outputs.deploy_sha }}
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.18.0
@@ -110,6 +107,11 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+
+      - name: Validate production health origin
+        env:
+          PRODUCTION_BASE_URL: ${{ vars.PRODUCTION_BASE_URL }}
+        run: node scripts/check-production-origin.mjs
 
       - name: Production build
         run: pnpm build
@@ -127,7 +129,6 @@ jobs:
         run: pnpm wrangler deploy --env production
 
       - name: Health check
-        if: vars.PRODUCTION_BASE_URL != ''
         env:
           BASE_URL: ${{ vars.PRODUCTION_BASE_URL }}
         run: |
