@@ -30,7 +30,7 @@ const REVISION_RECOVERY_SAVE_MESSAGE =
   "The table update was not saved because the authoritative table revision could not be reloaded.";
 const REVISION_CONFLICT_SAVE_MESSAGE =
   "The table update was not saved because the table kept changing. Reloaded the authoritative table.";
-const SORTED_DEPTH_RESTORE_MESSAGE = "The sorted table depth could not be restored.";
+const DEPTH_RESTORE_MESSAGE = "The table depth could not be restored.";
 const REQUEST_TIMEOUT_MS = 15_000;
 const STALE_REVISION_RETRY_DELAYS_MS = [50, 200] as const;
 // Must stay above REQUEST_TIMEOUT_MS so a renewal cannot still be in flight
@@ -131,6 +131,7 @@ export function TablePage({
 }: TablePageProps) {
   const canEdit = member.role !== "viewer";
   const [table, setTable] = useState<TableData | null>(null);
+  const tableRef = useRef<TableData | null>(null);
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
   const [leasePending, setLeasePending] = useState(canEdit);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -189,6 +190,10 @@ export function TablePage({
   const pageUnavailableRef = useRef(false);
   const onPageUnavailableRef = useRef(onPageUnavailable);
   const tableLoaded = table !== null;
+
+  useEffect(() => {
+    tableRef.current = table;
+  }, [table]);
 
   useEffect(() => {
     onPageUnavailableRef.current = onPageUnavailable;
@@ -361,87 +366,117 @@ export function TablePage({
     [adoptAuthoritativeTable, changeLoadCount, markPageUnavailable, page.id],
   );
 
-  async function restoreSortedDepth(currentPage: TableData, appendedPageTarget: number) {
-    const sortedColumn = currentPage.sort;
-    if (!sortedColumn) return;
-    const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
-    let recoveryGeneration: number | null = null;
-    const restore = async () => {
-      // Block later mutations behind this rebuild. They need one authoritative revision,
-      // while every offset is re-derived from that same revision in sequence.
+  const restoreDepthNow = useCallback(
+    async (
+      currentPage: TableData,
+      appendedPageTarget: number,
+      minimumRevision: number | null,
+      ownerIsCurrent: IsCurrent = isMounted,
+    ) => {
+      const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
+      changeLoadCount(1, false);
       invalidateRevision();
       const generation = ++loadGenerationRef.current;
-      recoveryGeneration = generation;
       const leaseConflictGeneration = leaseConflictGenerationRef.current;
       const isCurrent = () =>
+        ownerIsCurrent() &&
         mountedRef.current &&
         generation === loadGenerationRef.current &&
         requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir);
-      const firstParams = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
-      firstParams.set("sort", sortedColumn);
-      firstParams.set("dir", currentPage.dir);
-      const first = await api<{ table: TableData }>(`/api/tables/${page.id}?${firstParams}`, {
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!isCurrent()) return;
-      if (tableSortKey(first.table.sort, first.table.dir) !== requestedSort) {
-        await load(isMounted);
-        return;
-      }
-
-      const snapshotRevision = first.table.revision;
-      let restored = first.table;
-      let appendedPages = 0;
-      const loaded = new Set(restored.rows.map((row) => row.id));
-      while (appendedPages < appendedPageTarget && restored.hasMore && restored.nextOffset !== null) {
-        const params = new URLSearchParams({
-          limit: String(restored.limit),
-          sort: sortedColumn,
-          dir: currentPage.dir,
-          offset: String(restored.nextOffset),
-        });
-        const next = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        });
-        if (!isCurrent()) return;
-        if (
-          next.table.revision !== snapshotRevision ||
-          tableSortKey(next.table.sort, next.table.dir) !== requestedSort
-        ) {
-          // Another writer moved the table while its depth was being rebuilt. A
-          // page-one load is the only bounded snapshot we can adopt under churn.
-          await load(isMounted);
+      try {
+        const firstParams = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
+        if (currentPage.sort) {
+          firstParams.set("sort", currentPage.sort);
+          firstParams.set("dir", currentPage.dir);
+        }
+        let first: { table: TableData } | null = null;
+        for (let staleRevisionRetries = 0; ; staleRevisionRetries += 1) {
+          first = await api<{ table: TableData }>(`/api/tables/${page.id}?${firstParams}`, {
+            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          });
+          if (!isCurrent()) return;
+          if (minimumRevision === null || first.table.revision >= minimumRevision) break;
+          const delay = STALE_REVISION_RETRY_DELAYS_MS[staleRevisionRetries];
+          if (delay === undefined) throw new Error("The table kept returning an older revision.");
+          await new Promise((resolve) => window.setTimeout(resolve, delay));
+          if (!isCurrent()) return;
+        }
+        if (!first || tableSortKey(first.table.sort, first.table.dir) !== requestedSort) {
+          await load(ownerIsCurrent);
           return;
         }
-        const rows = next.table.rows.filter((row) => !loaded.has(row.id));
-        rows.forEach((row) => loaded.add(row.id));
-        restored = {
-          ...restored,
-          rows: [...restored.rows, ...rows],
-          hasMore: next.table.hasMore,
-          nextCursor: next.table.nextCursor,
-          nextOffset: next.table.nextOffset,
-          truncated: next.table.truncated,
-        };
-        appendedPages += 1;
+
+        const snapshotRevision = first.table.revision;
+        let restored = first.table;
+        let appendedPages = 0;
+        const loaded = new Set(restored.rows.map((row) => row.id));
+        while (appendedPages < appendedPageTarget && restored.hasMore) {
+          const params = new URLSearchParams({ limit: String(restored.limit) });
+          if (currentPage.sort) {
+            if (restored.nextOffset === null) break;
+            params.set("sort", currentPage.sort);
+            params.set("dir", currentPage.dir);
+            params.set("offset", String(restored.nextOffset));
+          } else {
+            if (!restored.nextCursor) break;
+            params.set("afterPosition", String(restored.nextCursor.position));
+            params.set("afterId", restored.nextCursor.rowId);
+          }
+          const next = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
+            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          });
+          if (!isCurrent()) return;
+          if (
+            next.table.revision !== snapshotRevision ||
+            tableSortKey(next.table.sort, next.table.dir) !== requestedSort
+          ) {
+            // Another writer moved the table while its depth was being rebuilt. A
+            // page-one load is the only bounded snapshot we can adopt under churn.
+            await load(ownerIsCurrent);
+            return;
+          }
+          const rows = next.table.rows.filter((row) => !loaded.has(row.id));
+          rows.forEach((row) => loaded.add(row.id));
+          restored = {
+            ...restored,
+            rows: [...restored.rows, ...rows],
+            hasMore: next.table.hasMore,
+            nextCursor: next.table.nextCursor,
+            nextOffset: next.table.nextOffset,
+            truncated: next.table.truncated,
+          };
+          appendedPages += 1;
+        }
+        if (!isCurrent()) return;
+        adoptAuthoritativeTable(restored, appendedPages, leaseConflictGeneration);
+      } catch (cause) {
+        if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
+          markPageUnavailable(cause.message);
+        } else if (mountedRef.current && generation === loadGenerationRef.current) {
+          setLoadError(errorMessage(cause, DEPTH_RESTORE_MESSAGE));
+        }
+        throw cause;
+      } finally {
+        changeLoadCount(-1, false);
       }
-      if (!isCurrent()) return;
-      adoptAuthoritativeTable(restored, appendedPages, leaseConflictGeneration);
-    };
-    const pending = mutationQueue.current.then(restore, restore).catch((cause) => {
-      if (mountedRef.current && recoveryGeneration === loadGenerationRef.current && isPageUnavailableError(cause)) {
-        markPageUnavailable(cause.message);
-      } else if (mountedRef.current && recoveryGeneration === loadGenerationRef.current) {
-        setLoadError(errorMessage(cause, SORTED_DEPTH_RESTORE_MESSAGE));
-      }
-      throw cause;
-    });
-    mutationQueue.current = pending.then(
-      () => undefined,
-      () => undefined,
-    );
-    await pending;
-  }
+    },
+    [adoptAuthoritativeTable, changeLoadCount, invalidateRevision, isMounted, load, markPageUnavailable, page.id],
+  );
+
+  const restoreDepth = useCallback(
+    async (currentPage: TableData, appendedPageTarget: number) => {
+      // Block later mutations behind this rebuild. They need one authoritative revision,
+      // while every page boundary is re-derived from that same revision in sequence.
+      const restore = () => restoreDepthNow(currentPage, appendedPageTarget, revisionRef.current);
+      const pending = mutationQueue.current.then(restore, restore);
+      mutationQueue.current = pending.then(
+        () => undefined,
+        () => undefined,
+      );
+      await pending;
+    },
+    [restoreDepthNow],
+  );
 
   // Appends the next keyset or offset page. Deliberately separate from `load`,
   // which always returns to the first page so a refresh has one predictable meaning.
@@ -475,7 +510,7 @@ export function TablePage({
     changeLoadCount(1, false);
     try {
       if (currentPage.sort && sortedSnapshotDirtyRef.current) {
-        await restoreSortedDepth(currentPage, requestedAppendedPages);
+        await restoreDepth(currentPage, requestedAppendedPages);
         return;
       }
       const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
@@ -509,15 +544,11 @@ export function TablePage({
         result.table.revision >= snapshotRevision &&
         result.table.revision <= currentRevision;
       if (currentPage.sort && sortedSnapshotDirtyRef.current) {
-        await restoreSortedDepth(currentPage, requestedAppendedPages);
+        await restoreDepth(currentPage, requestedAppendedPages);
         return;
       }
       if (!responseMatchesUsableSnapshot) {
-        if (currentPage.sort) await restoreSortedDepth(currentPage, requestedAppendedPages);
-        else {
-          invalidateRevision();
-          await load(isMounted).catch(() => undefined);
-        }
+        await restoreDepth(currentPage, requestedAppendedPages);
         return;
       }
       appendedPagesRef.current += 1;
@@ -557,15 +588,26 @@ export function TablePage({
     void load(isMounted).catch(() => undefined);
   }, [isMounted, load, sortKey]);
 
-  const recoverRevision = useCallback(async () => {
-    if (revisionRef.current !== null) return true;
-    try {
-      await load(isMounted);
-      return revisionRef.current !== null;
-    } catch {
-      return false;
-    }
-  }, [isMounted, load]);
+  const recoverRevision = useCallback(
+    async (minimumRevision: number | null = null, ownerIsCurrent: IsCurrent = isMounted) => {
+      if (revisionRef.current !== null) return true;
+      try {
+        const currentPage = tableRef.current;
+        if (currentPage) {
+          await restoreDepthNow(
+            currentPage,
+            appendedPagesRef.current,
+            minimumRevision ?? currentPage.revision,
+            ownerIsCurrent,
+          );
+        } else await load(ownerIsCurrent);
+        return revisionRef.current !== null;
+      } catch {
+        return false;
+      }
+    },
+    [isMounted, load, restoreDepthNow],
+  );
 
   const endLease = useCallback(
     async (token: string, message: string, shouldRelease = true) => {
@@ -772,14 +814,15 @@ export function TablePage({
     const isCurrent = () => active && mountedRef.current;
     const poll = window.setInterval(() => {
       if (!loadsInFlightRef.current && (!appendedPagesRef.current || revisionRef.current === null)) {
-        void load(isCurrent, true).catch(() => undefined);
+        if (revisionRef.current === null) void recoverRevision(null, isCurrent);
+        else void load(isCurrent, true).catch(() => undefined);
       }
     }, 5_000);
     return () => {
       active = false;
       window.clearInterval(poll);
     };
-  }, [leaseToken, load, revisionKnown, tableLoaded, terminalPageUnavailable]);
+  }, [leaseToken, load, recoverRevision, revisionKnown, tableLoaded, terminalPageUnavailable]);
 
   useEffect(() => {
     if (!leaseToken) return undefined;
@@ -970,7 +1013,7 @@ export function TablePage({
             const terminalConflict = revisionConflictRetried;
             if (terminalConflict) resetCellInputAfterLoad(resetKey);
             else setSaveError(cause.message);
-            const recovered = await recoverRevision();
+            const recovered = await recoverRevision(currentRevision);
             if (leaseTokenRef.current !== currentLease) return failForLostLease();
             if (!recovered) {
               resetCellInputAfterLoad(resetKey);
@@ -999,7 +1042,7 @@ export function TablePage({
             invalidateRevision();
             setSaveError(cause.message);
             resetCellInputAfterLoad(resetKey);
-            await recoverRevision();
+            await recoverRevision(currentRevision);
             return null;
           }
           // A handled client rejection is definitive: the server rejected the
@@ -1015,7 +1058,7 @@ export function TablePage({
           invalidateRevision();
           setSaveError(errorMessage(cause, SAVE_FAILED_MESSAGE));
           resetCellInputAfterLoad(resetKey);
-          await recoverRevision();
+          await recoverRevision(currentRevision);
           return null;
         }
       }

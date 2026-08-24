@@ -1567,13 +1567,26 @@ describe("TablePage", () => {
     };
     const recovery = deferred<{ table: TableData }>();
     let fullLoads = 0;
+    let keysetLoads = 0;
     vi.mocked(api).mockImplementation((path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
       if (path.endsWith("/lease") && init?.method === "DELETE") return Promise.resolve({ ok: true });
       if (path.includes("/cells/")) {
         return Promise.reject(new DOMException("The operation timed out.", "TimeoutError"));
       }
-      if (path.includes("afterPosition=")) return Promise.resolve({ table: second });
+      if (path.includes("afterPosition=")) {
+        keysetLoads += 1;
+        return Promise.resolve({
+          table:
+            keysetLoads === 1
+              ? second
+              : {
+                  ...second,
+                  revision: 7,
+                  rows: [{ id: "row-2", position: 1, cells: { status: "Authoritative two" } }],
+                },
+        });
+      }
       fullLoads += 1;
       if (fullLoads === 3) {
         return Promise.reject(new ApiClientError(503, "table_unavailable", "Table temporarily unavailable."));
@@ -1612,10 +1625,17 @@ describe("TablePage", () => {
     expect(api).toHaveBeenCalledTimes(callsDuringRecovery);
 
     await act(async () => {
-      recovery.resolve({ table: tableWithValue("Authoritative", 7) });
+      recovery.resolve({
+        table: {
+          ...first,
+          revision: 7,
+          rows: [{ id: "row-1", position: 0, cells: { status: "Authoritative" } }],
+        },
+      });
       await recovery.promise;
     });
     expect(screen.getByDisplayValue("Authoritative")).toBeEnabled();
+    expect(screen.getByDisplayValue("Authoritative two")).toBeEnabled();
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
   });
 
@@ -2150,7 +2170,7 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
   });
 
-  it("reloads page one instead of appending rows from a different table revision", async () => {
+  it("rebuilds the viewed keyset depth when a newer remote revision arrives", async () => {
     const first: TableData = {
       ...table,
       revision: 1,
@@ -2165,24 +2185,37 @@ describe("TablePage", () => {
       rows: [{ id: "row-2", position: 1, cells: { status: "Incompatible second page" } }],
       rowCount: null,
     };
-    const refreshed: TableData = {
+    const refreshedFirst: TableData = {
       ...table,
       revision: 2,
       rows: [{ id: "row-new", position: 0, cells: { status: "Consistent first page" } }],
-      rowCount: 1,
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-new" },
+      rowCount: 2,
+    };
+    const refreshedSecond: TableData = {
+      ...table,
+      revision: 2,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Consistent second page" } }],
+      rowCount: null,
     };
     vi.mocked(api)
       .mockResolvedValueOnce({ table: first })
       .mockResolvedValueOnce({ table: mismatchedPage })
-      .mockResolvedValueOnce({ table: refreshed });
+      .mockResolvedValueOnce({ table: refreshedFirst })
+      .mockResolvedValueOnce({ table: refreshedSecond });
     renderViewer();
 
     fireEvent.click(await screen.findByRole("button", { name: "Load more rows" }));
 
     expect(await screen.findByDisplayValue("Consistent first page")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Consistent second page")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("Old first page")).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue("Incompatible second page")).not.toBeInTheDocument();
     expect(api).toHaveBeenNthCalledWith(3, "/api/tables/table-page?limit=500&count=true", {
+      signal: expect.any(AbortSignal),
+    });
+    expect(api).toHaveBeenNthCalledWith(4, "/api/tables/table-page?limit=500&afterPosition=0&afterId=row-new", {
       signal: expect.any(AbortSignal),
     });
   });
@@ -2435,6 +2468,9 @@ describe("TablePage", () => {
         expect.objectContaining({ method: "PUT" }),
       ),
     );
+    // The PUT being issued does not prove its continuation updated the mutation
+    // revision. A committed cell update replaces this keyed uncontrolled input.
+    await waitFor(() => expect(cell).not.toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
 
@@ -2520,6 +2556,59 @@ describe("TablePage", () => {
     expect(screen.queryByDisplayValue("Zulu")).not.toBeInTheDocument();
     expect(sortedFirstLoads).toBe(2);
     expect(offset500Loads).toBe(2);
+  });
+
+  it("rejects a regressed first page while restoring sorted depth", async () => {
+    const sortedFirst: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-alpha", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 501,
+    };
+    const refreshedFirst: TableData = {
+      ...sortedFirst,
+      revision: 2,
+      rows: [{ id: "row-beta", position: 0, cells: { status: "Beta" } }],
+    };
+    const refreshedSecond: TableData = {
+      ...sortedFirst,
+      revision: 2,
+      rows: [{ id: "row-gamma", position: 500, cells: { status: "Gamma" } }],
+      hasMore: false,
+      nextOffset: null,
+      rowCount: null,
+    };
+    let sortedFirstLoads = 0;
+    let offsetLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.resolve({ revision: 2 });
+      if (String(path).includes("offset=500")) {
+        offsetLoads += 1;
+        return Promise.resolve({ table: refreshedSecond });
+      }
+      if (String(path).includes("sort=status")) {
+        sortedFirstLoads += 1;
+        return Promise.resolve({ table: sortedFirstLoads < 3 ? sortedFirst : refreshedFirst });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    const cell = await screen.findByDisplayValue("Alpha");
+    fireEvent.change(cell, { target: { value: "Zulu" } });
+    fireEvent.blur(cell);
+    await waitFor(() => expect(cell).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Beta")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Gamma")).toBeInTheDocument();
+    expect(sortedFirstLoads).toBe(3);
+    expect(offsetLoads).toBe(1);
   });
 
   it("keeps a sorted offset valid when an edit changes another column", async () => {

@@ -92,6 +92,10 @@ function keyOf(page) {
 
 const errorMessage = (error) => (error instanceof Error ? error.message : String(error));
 
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
 function recordConversionIssue(report, code, detail) {
   if (code === "link_unresolved" || code === "link_ambiguous" || code === "attachment_missing") {
     report.error(code, detail);
@@ -687,7 +691,7 @@ export async function reconcileCommitted({
                   patch.tableRecoveryAmbiguous = true;
                   report.error(
                     "table_recovery_ambiguous",
-                    `${page.title}: ${patch.tableError} Re-run with --keep-ambiguous-table ${JSON.stringify(key)} to accept only this live table as the destination's.`,
+                    `${page.title}: ${patch.tableError} Re-run with --keep-ambiguous-table ${shellQuote(key)} to accept only this live table as the destination's.`,
                   );
                 } else {
                   // This attempt proved nothing either way, so an ambiguity an earlier

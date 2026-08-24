@@ -855,7 +855,7 @@ describe("reconcileCommitted", () => {
   it.each(["table_revision_conflict", "idempotency_key_reused"])(
     "marks recovery ambiguous when a matched batch replay returns %s",
     async (conflictCode) => {
-      const page = { path: "Table.html", kind: "database", title: "Table" };
+      const page = { path: "Q1 $Budget 'draft'.html", kind: "database", title: "Table" };
       const table = {
         columns: [{ ref: "c0", name: "Value", type: "text" }],
         rows: [{ cells: { "ref:c0": "imported" } }],
@@ -902,6 +902,10 @@ describe("reconcileCommitted", () => {
       expect(report.error).toHaveBeenCalledWith(
         "table_recovery_ambiguous",
         expect.stringMatching(/^Table: .*no durable receipt proves who committed it/),
+      );
+      expect(report.error).toHaveBeenCalledWith(
+        "table_recovery_ambiguous",
+        expect.stringContaining(`--keep-ambiguous-table 'Q1 $Budget '"'"'draft'"'"'.html'`),
       );
       expect(state.nodes[page.path].tableError).toMatch(/no durable receipt proves who committed it/);
       expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(true);
