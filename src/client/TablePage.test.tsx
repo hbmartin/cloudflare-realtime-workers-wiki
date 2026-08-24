@@ -2518,6 +2518,7 @@ describe("TablePage", () => {
     expect(api).toHaveBeenCalledTimes(4);
     expect(loadMore).toBeEnabled();
     expect(screen.getByDisplayValue("Current")).toBeInTheDocument();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
     expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
   });
 
@@ -2630,6 +2631,70 @@ describe("TablePage", () => {
     expect(pageOneLoads).toBe(2);
     expect(appendLoads).toBe(4);
     expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
+  });
+
+  it("keeps the current unsorted revision when the stale append rebuild also exhausts", async () => {
+    vi.useFakeTimers();
+    const first: TableData = {
+      ...table,
+      revision: 2,
+      rows: [{ id: "row-1", position: 0, cells: { status: "Current first page" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const staleFirst = { ...first, revision: 1 };
+    const staleSecond: TableData = {
+      ...first,
+      revision: 1,
+      rows: [{ id: "row-stale", position: 1, cells: { status: "Deleted stale row" } }],
+      rowCount: null,
+    };
+    const freshSecond: TableData = {
+      ...first,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Current second page" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    let pageOneLoads = 0;
+    let appendLoads = 0;
+    let replicaFresh = false;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("count=true")) {
+        pageOneLoads += 1;
+        return Promise.resolve({ table: pageOneLoads === 1 || replicaFresh ? first : staleFirst });
+      }
+      appendLoads += 1;
+      return Promise.resolve({ table: replicaFresh ? freshSecond : staleSecond });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    const loadMore = screen.getByRole("button", { name: "Load more rows" });
+    fireEvent.click(loadMore);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+
+    expect(pageOneLoads).toBe(4);
+    expect(appendLoads).toBe(3);
+    expect(loadMore).toBeEnabled();
+    expect(screen.getByDisplayValue("Current first page")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Deleted stale row")).not.toBeInTheDocument();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+    expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
+
+    replicaFresh = true;
+    fireEvent.click(loadMore);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    expect(screen.getByDisplayValue("Current second page")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps a newer unsorted boundary as the floor for the following append", async () => {
