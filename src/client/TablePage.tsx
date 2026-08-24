@@ -412,12 +412,14 @@ export function TablePage({
   }, []);
 
   const handleStaleRevisionFailure = useCallback(
-    (cause: unknown, failure: StaleRevisionFailure, minimumRevision: number | null) => {
+    (cause: unknown, failure: StaleRevisionFailure, minimumRevision: number | null, isCurrent: IsCurrent) => {
       if (!(cause instanceof StaleTableRevisionError) || failure === "throw") return false;
+      // The final retry rejection crosses a promise boundary before reaching its
+      // caller's catch block. A newer load can supersede it in that gap.
+      if (!isCurrent()) return true;
       preserveRevisionFloor(minimumRevision);
       if (failure === "invalidate") invalidateRevision();
       setRevisionRefreshDelayed(true);
-      setLoadError(null);
       return true;
     },
     [invalidateRevision, preserveRevisionFloor],
@@ -519,7 +521,8 @@ export function TablePage({
         adoptAuthoritativeTable(result.table, 0, leaseConflictGeneration);
         return "adopted";
       } catch (cause) {
-        if (handleStaleRevisionFailure(cause, staleRevisionFailure, minimumRevision)) return "stale";
+        const recoveryFloor = currentRevisionFloor(minimumRevision);
+        if (handleStaleRevisionFailure(cause, staleRevisionFailure, recoveryFloor, requestIsCurrent)) return "stale";
         const invalidSortRecovery = recoverInvalidSort(cause, generation, isCurrent, minimumRevision);
         if (invalidSortRecovery) {
           return loadTable(isCurrent, {
@@ -563,6 +566,13 @@ export function TablePage({
     ): Promise<TableLoadOutcome> => {
       const { ownerIsCurrent = isMounted, background = false, staleRevisionFailure = "throw" } = options;
       const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
+      if (
+        !ownerIsCurrent() ||
+        !mountedRef.current ||
+        requestedSort !== tableSortKey(sortRef.current.column, sortRef.current.dir)
+      ) {
+        return "superseded";
+      }
       changeLoadCount(1, background);
       if (staleRevisionFailure !== "keep-current") invalidateRevision();
       const generation = ++loadGenerationRef.current;
@@ -631,7 +641,7 @@ export function TablePage({
         return "adopted";
       } catch (cause) {
         const recoveryFloor = currentRevisionFloor(minimumRevision, currentPage.revision);
-        if (handleStaleRevisionFailure(cause, staleRevisionFailure, recoveryFloor)) return "stale";
+        if (handleStaleRevisionFailure(cause, staleRevisionFailure, recoveryFloor, isCurrent)) return "stale";
         const invalidSortRecovery = recoverInvalidSort(cause, generation, isCurrent, recoveryFloor);
         if (invalidSortRecovery) {
           return load(ownerIsCurrent, {
@@ -666,17 +676,14 @@ export function TablePage({
   );
 
   const restoreDepth = useCallback(
-    async (
-      currentPage: TableData,
-      appendedPageTarget: number,
-      staleRevisionFailure: StaleRevisionFailure = "throw",
-    ) => {
+    async (currentPage: TableData, appendedPageTarget: number, options: RestoreDepthOptions = {}) => {
       // Block later mutations behind this rebuild. They need one authoritative revision,
       // while every page boundary is re-derived from that same revision in sequence.
-      const restore = () =>
-        restoreDepthNow(currentPage, appendedPageTarget, currentRevisionFloor(currentPage.revision), {
-          staleRevisionFailure,
-        });
+      const queuedGeneration = loadGenerationRef.current;
+      const restore = () => {
+        if (queuedGeneration !== loadGenerationRef.current) return "superseded" as const;
+        return restoreDepthNow(currentPage, appendedPageTarget, currentRevisionFloor(currentPage.revision), options);
+      };
       const pending = mutationQueue.current.then(restore, restore);
       mutationQueue.current = pending.then(
         () => undefined,
@@ -717,7 +724,7 @@ export function TablePage({
         (currentPage.sort && sortedSnapshotDirtyRef.current) ||
         (!currentPage.sort && unsortedSnapshotDirtyRef.current)
       ) {
-        await restoreDepth(currentPage, requestedAppendedPages);
+        await restoreDepth(currentPage, requestedAppendedPages, { staleRevisionFailure: "invalidate" });
         return;
       }
       let result: { table: TableData } | null;
@@ -740,7 +747,7 @@ export function TablePage({
           result.table.revision >= snapshotRevision &&
           result.table.revision <= currentRevision;
         if (sortedSnapshotDirtyRef.current || !responseMatchesUsableSnapshot) {
-          await restoreDepth(currentPage, requestedAppendedPages);
+          await restoreDepth(currentPage, requestedAppendedPages, { staleRevisionFailure: "invalidate" });
           return;
         }
       } else {
@@ -766,14 +773,14 @@ export function TablePage({
           canAppend,
         );
         if (shouldRestoreDepth && canAppend()) {
-          await restoreDepth(currentPage, requestedAppendedPages);
+          await restoreDepth(currentPage, requestedAppendedPages, { staleRevisionFailure: "invalidate" });
           return;
         }
       }
-      if (!result) return;
+      if (!result || !canAppend()) return;
+      const recoveryFloor = revisionRecoveryFloorRef.current;
       appendedPagesRef.current += 1;
       pageSnapshotRevisionRef.current = result.table.revision;
-      setRevisionRefreshDelayed(false);
       setTable((current) => {
         if (!current || tableSortKey(current.sort, current.dir) !== requestedSort) {
           return current;
@@ -788,10 +795,14 @@ export function TablePage({
           truncated: result.table.truncated,
         };
       });
+      if (recoveryFloor === null || result.table.revision >= recoveryFloor) {
+        revisionRecoveryFloorRef.current = null;
+        setRevisionRefreshDelayed(false);
+      }
     } catch (cause) {
       const recoveryFloor = currentRevisionFloor(snapshotRevision, currentPage.revision);
       if (cause instanceof StaleTableRevisionError && isCurrent()) {
-        await restoreDepth(currentPage, requestedAppendedPages, "keep-current");
+        await restoreDepth(currentPage, requestedAppendedPages, { staleRevisionFailure: "keep-current" });
         return;
       }
       const invalidSortRecovery = recoverInvalidSort(cause, generation, isCurrent, recoveryFloor);
@@ -862,7 +873,14 @@ export function TablePage({
           ownerIsCurrent() &&
           tableSortKey(currentPage.sort, currentPage.dir) === tableSortKey(sortRef.current.column, sortRef.current.dir)
         ) {
-          void restoreDepth(currentPage, appendedPageTarget).catch(() => undefined);
+          // This rebuild is deliberately detached from the recovery that restored
+          // page one. Treat it as background work and let polling retry if its
+          // replica has not reached the recovered revision yet.
+          void restoreDepth(currentPage, appendedPageTarget, {
+            ownerIsCurrent,
+            background: true,
+            staleRevisionFailure: "invalidate",
+          }).catch(() => undefined);
         }
         return revisionRef.current !== null;
       } catch {
@@ -1072,22 +1090,42 @@ export function TablePage({
   }, [load, acquire, canEdit, reportLeaseError]);
 
   useEffect(() => {
-    if (terminalPageUnavailable || (leaseToken && tableLoaded && revisionKnown)) return undefined;
+    if (terminalPageUnavailable || (!revisionRefreshDelayed && leaseToken && tableLoaded && revisionKnown)) {
+      return undefined;
+    }
     let active = true;
     const isCurrent = () => active && mountedRef.current;
     const poll = window.setInterval(() => {
-      if (!loadsInFlightRef.current && (!appendedPagesRef.current || revisionRef.current === null)) {
-        if (revisionRef.current === null) void recoverRevision({ ownerIsCurrent: isCurrent, background: true });
-        else {
-          void load(isCurrent, { background: true, staleRevisionFailure: "keep-current" }).catch(() => undefined);
-        }
+      if (loadsInFlightRef.current) return;
+      if (revisionRef.current === null) {
+        void recoverRevision({ ownerIsCurrent: isCurrent, background: true });
+      } else if (revisionRefreshDelayed && tableRef.current) {
+        // Ordinary polling stands down at depth to avoid yanking the viewport to
+        // page one. A delayed rebuild is different: queue it behind mutations and
+        // retry the displayed depth in place until the replica reaches its floor.
+        void restoreDepth(tableRef.current, appendedPagesRef.current, {
+          ownerIsCurrent: isCurrent,
+          background: true,
+          staleRevisionFailure: "keep-current",
+        }).catch(() => undefined);
+      } else if (!appendedPagesRef.current) {
+        void load(isCurrent, { background: true, staleRevisionFailure: "keep-current" }).catch(() => undefined);
       }
     }, 5_000);
     return () => {
       active = false;
       window.clearInterval(poll);
     };
-  }, [leaseToken, load, recoverRevision, revisionKnown, tableLoaded, terminalPageUnavailable]);
+  }, [
+    leaseToken,
+    load,
+    recoverRevision,
+    restoreDepth,
+    revisionKnown,
+    revisionRefreshDelayed,
+    tableLoaded,
+    terminalPageUnavailable,
+  ]);
 
   useEffect(() => {
     if (!leaseToken) return undefined;
