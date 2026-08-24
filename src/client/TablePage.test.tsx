@@ -2276,8 +2276,10 @@ describe("TablePage", () => {
   });
 
   it("clears an invalid sort discovered while rebuilding sorted depth", async () => {
+    vi.useFakeTimers();
     const sortedFirst: TableData = {
       ...table,
+      revision: 5,
       sort: "status",
       rows: [{ id: "row-alpha", position: 0, cells: { status: "Alpha" } }],
       hasMore: true,
@@ -2287,7 +2289,7 @@ describe("TablePage", () => {
     };
     const newerOffset: TableData = {
       ...sortedFirst,
-      revision: 2,
+      revision: 6,
       rows: [{ id: "row-beta", position: 500, cells: { status: "Beta" } }],
       hasMore: false,
       nextOffset: null,
@@ -2295,11 +2297,12 @@ describe("TablePage", () => {
     };
     const withoutStatus: TableData = {
       ...table,
-      revision: 2,
+      revision: 6,
       columns: [],
       rows: [],
       rowCount: 0,
     };
+    const staleUnsorted = tableWithValue("Stale unsorted", 4);
     let plainLoads = 0;
     let sortedLoads = 0;
     vi.mocked(api).mockImplementation((path) => {
@@ -2314,17 +2317,26 @@ describe("TablePage", () => {
         return Promise.resolve({ table: sortedFirst });
       }
       plainLoads += 1;
-      return Promise.resolve({ table: plainLoads > 1 ? withoutStatus : table });
+      return Promise.resolve({ table: plainLoads === 1 ? table : plainLoads === 2 ? staleUnsorted : withoutStatus });
     });
     renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
 
-    fireEvent.click(await screen.findByRole("button", { name: /^Status/ }));
-    expect(await screen.findByDisplayValue("Alpha")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByDisplayValue("Alpha")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
 
-    expect(await screen.findByText("Add a property to start this table.")).toBeInTheDocument();
-    expect(sortedLoads).toBe(2);
+    // The unsorted replacement first sees revision 4. It must retain the
+    // revision-5 floor from the failed depth rebuild and retry instead of adopting it.
     expect(plainLoads).toBe(2);
+    expect(screen.queryByDisplayValue("Stale unsorted")).not.toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(50));
+
+    expect(screen.getByText("Add a property to start this table.")).toBeInTheDocument();
+    expect(sortedLoads).toBe(2);
+    expect(plainLoads).toBe(3);
     expect(screen.queryByText("The sort column does not belong to this table.")).not.toBeInTheDocument();
   });
 
@@ -2430,6 +2442,49 @@ describe("TablePage", () => {
     expect(await screen.findByDisplayValue("Newer second page")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Old first page")).toBeInTheDocument();
     expect(api).toHaveBeenCalledTimes(2);
+  });
+
+  it("rebuilds unsorted depth when an appended page predates its keyset snapshot", async () => {
+    const first: TableData = {
+      ...table,
+      revision: 2,
+      rows: [{ id: "row-1", position: 0, cells: { status: "Current first page" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const staleSecond: TableData = {
+      ...table,
+      revision: 1,
+      rows: [{ id: "row-stale", position: 1, cells: { status: "Deleted stale row" } }],
+      rowCount: null,
+    };
+    const refreshedFirst: TableData = {
+      ...first,
+      rows: [{ id: "row-current", position: 0, cells: { status: "Refreshed first page" } }],
+      nextCursor: { position: 0, rowId: "row-current" },
+    };
+    const refreshedSecond: TableData = {
+      ...first,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Current second page" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    vi.mocked(api)
+      .mockResolvedValueOnce({ table: first })
+      .mockResolvedValueOnce({ table: staleSecond })
+      .mockResolvedValueOnce({ table: refreshedFirst })
+      .mockResolvedValueOnce({ table: refreshedSecond });
+    renderViewer();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Refreshed first page")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Current second page")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Current first page")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Deleted stale row")).not.toBeInTheDocument();
+    expect(api).toHaveBeenCalledTimes(4);
   });
 
   it("appends the next page when the user's own save commits while it loads", async () => {
@@ -2988,6 +3043,58 @@ describe("TablePage", () => {
     expect(descendingLoads).toBe(3);
     expect(screen.getByDisplayValue("Fresh descending")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("Stale descending")).not.toBeInTheDocument();
+  });
+
+  it("keeps the revision floor when invalid-sort recovery supersedes its fallback load", async () => {
+    vi.useFakeTimers();
+    const sorted: TableData = {
+      ...tableWithValue("Sorted", 5),
+      sort: "status",
+    };
+    const staleUnsorted = tableWithValue("Stale unsorted", 4);
+    const freshUnsorted = tableWithValue("Fresh unsorted", 6);
+    const fallback = deferred<{ table: TableData }>();
+    let plainLoads = 0;
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.reject(new DOMException("The operation timed out.", "TimeoutError"));
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        if (sortedLoads === 1) return Promise.resolve({ table: sorted });
+        return Promise.reject(
+          new ApiClientError(422, "invalid_table_sort", "The sort column does not belong to this table."),
+        );
+      }
+      plainLoads += 1;
+      if (plainLoads <= 2) return Promise.resolve({ table });
+      if (plainLoads === 3) return fallback.promise;
+      return Promise.resolve({ table: plainLoads === 4 ? staleUnsorted : freshUnsorted });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const input = screen.getByDisplayValue("Sorted");
+    fireEvent.change(input, { target: { value: "Uncertain" } });
+    fireEvent.blur(input);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    // recoverRevision owns the third plain load with a floor of 5. Clearing the
+    // invalid sort starts the fourth load and supersedes it, so that effect-owned
+    // request must carry the same floor and reject this revision-4 response.
+    expect(sortedLoads).toBe(2);
+    expect(plainLoads).toBe(4);
+    expect(screen.queryByDisplayValue("Stale unsorted")).not.toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    expect(screen.getByDisplayValue("Fresh unsorted")).toBeInTheDocument();
+    expect(plainLoads).toBe(5);
+
+    await act(async () => {
+      fallback.resolve({ table: freshUnsorted });
+      await fallback.promise;
+    });
+    expect(screen.getByDisplayValue("Fresh unsorted")).toBeInTheDocument();
   });
 
   it("applies a queued cell reset when sorted-depth recovery adopts the authoritative table", async () => {
