@@ -11,7 +11,9 @@
  *   plan      also converts every page in memory, reporting each degradation. Still no
  *             network, so a rule can be corrected before anything is created.
  *   run       performs the import.
- *   verify    re-checks an existing import against the live workspace.
+ *   verify    re-checks an existing import against the live workspace. It does not
+ *             mutate the workspace; explicit legacy-fingerprint adoption can update
+ *             the local manifest.
  *
  * The export must be unpacked first: Node ships no zip reader and this repository
  * carries no archive dependency.
@@ -116,7 +118,8 @@ function usage() {
   console.error("                     table_recovery_ambiguous by accepting the live table as the");
   console.error("                     destination's. Repeat for each exact path to settle.");
   console.error("  --adopt-legacy-fingerprint  Resume a manifest written with the older raw-byte export");
-  console.error("                     fingerprint, checking it once and migrating it to the digest form.");
+  console.error("                     fingerprint, migrating it to the digest form while retaining");
+  console.error("                     the legacy value for explicit recovery from a mistaken adoption.");
   console.error("  --verbose          One line per page instead of a summary.");
 }
 
@@ -292,8 +295,9 @@ if (options.command === "inspect") {
       `No manifest at ${options.manifest}. Run the import first, or pass --manifest <path> for the run you want to verify.`,
     );
   }
-  // Verification is read-only, so a manifest imported with --parent is adopted as
-  // recorded rather than requiring the flag to be repeated.
+  // Verification is remote-read-only, so a manifest imported with --parent is adopted
+  // as recorded rather than requiring the flag to be repeated. Explicit fingerprint
+  // adoption may still update the local manifest.
   const { client, manifest } = await connect(options, root, { adoptRootParent: true });
   const problems = await verifyImport({ client, manifest, index, timeoutMs: options.verifyTimeoutMs });
   if (problems > 0) process.exitCode = 1;

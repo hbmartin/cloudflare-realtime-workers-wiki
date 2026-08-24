@@ -538,6 +538,7 @@ export async function reconcileCommitted({
         // the record by an earlier run would otherwise end a later run with no error
         // reported and no rows written.
         patch.tableRecoveryAmbiguous = false;
+        patch.tableError = null;
         const plan = tablePlans.get(page);
         if (plan) {
           const source = plan.table;
@@ -576,7 +577,6 @@ export async function reconcileCommitted({
               columnsByRef: progress?.columnsByRef ?? {},
             };
             patch.table = table;
-            patch.tableError = null;
             // Destination edits win the whole table facet, including when they race an
             // incomplete import. Stop further batches so user-owned rows are never
             // combined with the remaining source rows into a hybrid table.
@@ -589,6 +589,7 @@ export async function reconcileCommitted({
             const adoptOwnBaseline = () => {
               delete table.acceptedRemoteHash;
               delete table.acceptedRemoteRowCount;
+              delete table.settledByOperator;
             };
             if (matchesLastCommit(live)) {
               // With no recorded baseline, the empty table itself needs attribution:
@@ -667,6 +668,7 @@ export async function reconcileCommitted({
                     // accepted whole and the import stops writing to it. Taken under the
                     // lease, against the same verification the classification used.
                     report.issue("ambiguous_table_kept", page.title);
+                    table.settledByOperator = true;
                     return keepDestinationTable(leased);
                   }
                   table.columnsByRef = recoveredColumns;

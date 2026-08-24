@@ -70,8 +70,9 @@ export function fingerprintExport(root) {
  * That framing is ambiguous - file bytes may themselves contain NULs, so two different
  * file sets can share one stream - so it is never recorded again and is only computed
  * when an operator has explicitly asked for a legacy manifest to be adopted. An accepted
- * legacy manifest is rewritten to the digest form on open, retiring the weak aggregate
- * with the manifest that recorded it rather than re-checking it on every future open.
+ * legacy manifest uses the digest form for every normal open. The weak aggregate is kept
+ * only as a recovery key, so another explicit adoption can undo a mistaken choice between
+ * two exports that collide under the old framing.
  */
 function legacyFingerprintExport(root) {
   const { files } = walkExport(root);
@@ -141,12 +142,14 @@ export function createManifest({
             "would duplicate everything this one has already created.",
         );
       }
-      if (state.exportFingerprint !== legacyFingerprintExport(root)) {
+      const legacyFingerprint = state.legacyExportFingerprint ?? state.exportFingerprint;
+      if (legacyFingerprint !== legacyFingerprintExport(root)) {
         throw new Error(
           `${path} belongs to a different copy of this export under both fingerprints. Point the ` +
             "importer at the directory it was created from.",
         );
       }
+      state.legacyExportFingerprint = legacyFingerprint;
       state.exportFingerprint = fingerprint;
       migratedLegacyFingerprint = true;
     }

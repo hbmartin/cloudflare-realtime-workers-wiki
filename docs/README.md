@@ -15,6 +15,7 @@ Cloudflare Workers Paid, D1, R2, and two SQLite-backed Durable Object classes.
 | Diagnose an error code, close code, or failed deploy    | [Troubleshooting](TROUBLESHOOTING.md)                 |
 | Set up monitoring and alerts                            | [Observability](OBSERVABILITY.md)                     |
 | Back up, restore, or recover data                       | [Backup and recovery](BACKUP_AND_RECOVERY.md)         |
+| Assess compatibility with the Notion public API         | [Notion API compatibility](API_COMPATIBILITY.md)      |
 | Report a vulnerability                                  | [Security policy](../SECURITY.md)                     |
 | Understand what the architecture cannot do              | [Limitations](../Limitations.md)                      |
 

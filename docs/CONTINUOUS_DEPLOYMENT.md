@@ -93,7 +93,9 @@ user-owned token acts as its owner and may stop working if that person leaves th
 `PRODUCTION_BASE_URL` is required. Before any build, migration, or deploy command, the workflow
 fails if the variable is unset or differs from the exact origin configured by production
 `BETTER_AUTH_URL` in `wrangler.jsonc`. The health check always probes that origin, so a deploy cannot
-succeed without it.
+succeed without it. The workflow runs `scripts/check-production-origin.mjs`; its validation logic and
+Wrangler configuration reader execute in the unit suite, rather than living as untested JavaScript
+inside the workflow YAML.
 
 Secrets set with `wrangler secret put --env production` — `BETTER_AUTH_SECRET`, `BOOTSTRAP_TOKEN`,
 `DO_LOCATION_HINT` — are not managed by the workflow. They persist across deploys and are set once,

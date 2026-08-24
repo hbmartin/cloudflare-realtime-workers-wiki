@@ -1,4 +1,4 @@
-/** Exact, read-only verification of a completed import against its local export. */
+/** Exact, remote-read-only verification of a completed import against its local export. */
 import { setTimeout as delay } from "node:timers/promises";
 import { PAGE_TITLE_MAX } from "../../src/shared/validation.ts";
 import { tableContentHash } from "../../src/shared/import-integrity.ts";

@@ -107,6 +107,7 @@ describe("createManifest", () => {
     expect(JSON.parse(readFileSync(files.path, "utf8")).exportFingerprint).toBe(
       fingerprintExport(files.root).fingerprint,
     );
+    expect(JSON.parse(readFileSync(files.path, "utf8")).legacyExportFingerprint).toBe(legacyFingerprint);
   });
 
   it("opens a version 2 manifest whose fingerprint hashed per-file digests", () => {
@@ -180,10 +181,19 @@ describe("createManifest", () => {
     // This is exactly what --adopt-legacy-fingerprint costs, and why it is opt-in: the
     // legacy aggregate cannot tell rootB from rootA, so the flag is the operator
     // asserting which export the manifest belongs to. The digest aggregate that
-    // replaces it on open cannot be fooled the same way again.
+    // replaces it is authoritative for normal opens; the retained legacy aggregate
+    // lets the operator reverse a mistaken assertion explicitly.
     open({ root: rootB, path }, { adoptLegacyFingerprint: true });
-    expect(JSON.parse(readFileSync(path, "utf8")).exportFingerprint).toBe(fingerprintExport(rootB).fingerprint);
+    let adopted = JSON.parse(readFileSync(path, "utf8"));
+    expect(adopted.exportFingerprint).toBe(fingerprintExport(rootB).fingerprint);
+    expect(adopted.legacyExportFingerprint).toBe(collidingLegacyFingerprint);
     expect(() => open({ root: rootA, path })).toThrow(/different copy of this export/);
+
+    open({ root: rootA, path }, { adoptLegacyFingerprint: true });
+    adopted = JSON.parse(readFileSync(path, "utf8"));
+    expect(adopted.exportFingerprint).toBe(fingerprintExport(rootA).fingerprint);
+    expect(adopted.legacyExportFingerprint).toBe(collidingLegacyFingerprint);
+    expect(() => open({ root: rootB, path })).toThrow(/different copy of this export/);
   });
 
   it("refuses an adopted manifest that matches neither fingerprint", () => {

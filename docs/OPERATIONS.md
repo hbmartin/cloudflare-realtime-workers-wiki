@@ -273,14 +273,18 @@ fails it. Compare the live table against the source CSV; if the destination's co
 re-run with `--keep-ambiguous-table "<source-path>"` to accept that exact table whole and stop
 writing to it. Repeat the option to settle multiple tables. The path must identify a selected
 database already recorded as ambiguous; newly discovered or unlisted ambiguities still fail the run.
-There is no flag to adopt
-the prefix instead — the receipt that held the generated column ids is what went missing.
+The manifest records `settledByOperator: true` on that table so later audits can distinguish the
+override from an ordinary destination edit. There is no flag to adopt the prefix instead — the receipt
+that held the generated column ids is what went missing.
 
 `belongs to a different copy of this export` on a manifest you believe is correct means it records the
 older raw-byte fingerprint. Re-run with `--adopt-legacy-fingerprint` to check it against that aggregate
 once and migrate it to the current one. **Do not move the manifest aside to start over**: a new manifest
 mints a new import id, every page id is derived from it, and the run recreates the whole tree beside the
-copy it already imported.
+copy it already imported. This explicit flag updates the local manifest even when used with `verify`.
+Because the legacy framing can collide, the manifest retains that prior fingerprint as a recovery key:
+if the wrong colliding export was chosen, point back at the correct export and repeat the flag. Keep a
+manifest backup before any operator recovery regardless.
 
 **What an export cannot carry.** Notion never includes comments, version history, permissions, or custom
 emoji in an export, and omits pages the exporting user cannot see. Those cannot be migrated by any importer.

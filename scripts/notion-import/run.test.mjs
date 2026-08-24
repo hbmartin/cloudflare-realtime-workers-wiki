@@ -501,6 +501,7 @@ describe("reconcileCommitted", () => {
     });
     expect(report.issue).toHaveBeenCalledWith("destination_table_kept", "Table");
     expect(report.error).not.toHaveBeenCalled();
+    expect(state.nodes[page.path].table.settledByOperator).toBeUndefined();
   });
 
   it("replays an interrupted column commit to recover its generated ids", async () => {
@@ -729,6 +730,7 @@ describe("reconcileCommitted", () => {
       acceptedRemoteHash: committedColumnHash,
       acceptedRemoteRowCount: 0,
     });
+    expect(state.nodes[page.path].table.settledByOperator).toBeUndefined();
   });
 
   it("keeps the destination when an exact saved checkpoint was edited and reverted", async () => {
@@ -897,6 +899,7 @@ describe("reconcileCommitted", () => {
       phase: "complete",
       acceptedRemoteHash: committedColumnHash,
       acceptedRemoteRowCount: 0,
+      settledByOperator: true,
     });
   });
 
@@ -1056,6 +1059,7 @@ describe("reconcileCommitted", () => {
 
     expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(false);
     expect(state.nodes[page.path].table).toBeUndefined();
+    expect(state.nodes[page.path].tableError).toBeNull();
   });
 
   it("classifies recovery against the table read under its lease, not the earlier probe", async () => {

@@ -343,6 +343,94 @@ export function TablePage({
     [changeLoadCount, markPageUnavailable, page.id],
   );
 
+  async function restoreSortedDepth(currentPage: TableData, appendedPageTarget: number) {
+    const sortedColumn = currentPage.sort;
+    if (!sortedColumn) return;
+    const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
+    let recoveryGeneration: number | null = null;
+    const restore = async () => {
+      // Block later mutations behind this rebuild. They need one authoritative revision,
+      // while every offset is re-derived from that same revision in sequence.
+      invalidateRevision();
+      const generation = ++loadGenerationRef.current;
+      recoveryGeneration = generation;
+      const leaseConflictGeneration = leaseConflictGenerationRef.current;
+      const isCurrent = () =>
+        mountedRef.current &&
+        generation === loadGenerationRef.current &&
+        requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir);
+      const firstParams = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
+      firstParams.set("sort", sortedColumn);
+      firstParams.set("dir", currentPage.dir);
+      const first = await api<{ table: TableData }>(`/api/tables/${page.id}?${firstParams}`, {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (!isCurrent()) return;
+      if (tableSortKey(first.table.sort, first.table.dir) !== requestedSort) {
+        await load(isMounted);
+        return;
+      }
+
+      const snapshotRevision = first.table.revision;
+      let restored = first.table;
+      let appendedPages = 0;
+      const loaded = new Set(restored.rows.map((row) => row.id));
+      while (appendedPages < appendedPageTarget && restored.hasMore && restored.nextOffset !== null) {
+        const params = new URLSearchParams({
+          limit: String(restored.limit),
+          sort: sortedColumn,
+          dir: currentPage.dir,
+          offset: String(restored.nextOffset),
+        });
+        const next = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+        if (!isCurrent()) return;
+        if (
+          next.table.revision !== snapshotRevision ||
+          tableSortKey(next.table.sort, next.table.dir) !== requestedSort
+        ) {
+          // Another writer moved the table while its depth was being rebuilt. A
+          // page-one load is the only bounded snapshot we can adopt under churn.
+          await load(isMounted);
+          return;
+        }
+        const rows = next.table.rows.filter((row) => !loaded.has(row.id));
+        rows.forEach((row) => loaded.add(row.id));
+        restored = {
+          ...restored,
+          rows: [...restored.rows, ...rows],
+          hasMore: next.table.hasMore,
+          nextCursor: next.table.nextCursor,
+          nextOffset: next.table.nextOffset,
+          truncated: next.table.truncated,
+        };
+        appendedPages += 1;
+      }
+      if (!isCurrent()) return;
+      revisionRef.current = snapshotRevision;
+      setRevisionKnown(true);
+      appendedPagesRef.current = appendedPages;
+      pageSnapshotRevisionRef.current = snapshotRevision;
+      setTable(restored);
+      setLoadError(null);
+      if (restored.lease.expiresAt === null && leaseConflictGeneration === leaseConflictGenerationRef.current) {
+        setLeaseError((current) => (current === LEASE_CONFLICT_MESSAGE ? null : current));
+      }
+    };
+    const pending = mutationQueue.current.then(restore, restore).catch((cause) => {
+      if (mountedRef.current && recoveryGeneration === loadGenerationRef.current && isPageUnavailableError(cause)) {
+        markPageUnavailable(cause.message);
+      }
+      throw cause;
+    });
+    mutationQueue.current = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    await pending;
+  }
+
   // Appends the next keyset or offset page. Deliberately separate from `load`,
   // which always returns to the first page so a refresh has one predictable meaning.
   async function loadMore(currentPage: TableData) {
@@ -371,8 +459,13 @@ export function TablePage({
     const generation = ++loadGenerationRef.current;
     const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
     const snapshotRevision = pageSnapshotRevisionRef.current;
+    const requestedAppendedPages = appendedPagesRef.current + 1;
     changeLoadCount(1, false);
     try {
+      if (currentPage.sort && snapshotRevision !== revisionRef.current) {
+        await restoreSortedDepth(currentPage, requestedAppendedPages);
+        return;
+      }
       const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
@@ -407,8 +500,11 @@ export function TablePage({
         result.table.revision !== expectedRevision ||
         revisionRef.current !== expectedRevision
       ) {
-        invalidateRevision();
-        await load(isMounted).catch(() => undefined);
+        if (currentPage.sort) await restoreSortedDepth(currentPage, requestedAppendedPages);
+        else {
+          invalidateRevision();
+          await load(isMounted).catch(() => undefined);
+        }
         return;
       }
       appendedPagesRef.current += 1;

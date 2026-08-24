@@ -2440,8 +2440,87 @@ describe("TablePage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
 
     expect(await screen.findByDisplayValue("Middle")).toBeInTheDocument();
-    expect(appendRequests).toBe(1);
+    // The stale boundary is known before a request is sent, so recovery starts from
+    // page one without spending a request on revision 1's offset.
+    expect(appendRequests).toBe(0);
     expect(sortedPageLoads).toBe(2);
+  });
+
+  it("rebuilds the viewed sorted depth after an edit before loading the next page", async () => {
+    const sortedFirst: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-alpha", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 1_500,
+    };
+    const oldSecond: TableData = {
+      ...sortedFirst,
+      rows: [{ id: "row-middle-old", position: 500, cells: { status: "Middle old" } }],
+      nextOffset: 1_000,
+      rowCount: null,
+    };
+    const refreshedFirst: TableData = {
+      ...sortedFirst,
+      revision: 2,
+      rows: [{ id: "row-beta", position: 0, cells: { status: "Beta" } }],
+    };
+    const refreshedSecond: TableData = {
+      ...oldSecond,
+      revision: 2,
+      rows: [{ id: "row-gamma", position: 500, cells: { status: "Gamma" } }],
+    };
+    const refreshedThird: TableData = {
+      ...oldSecond,
+      revision: 2,
+      rows: [{ id: "row-omega", position: 1_000, cells: { status: "Omega" } }],
+      hasMore: false,
+      nextOffset: null,
+    };
+    let sortedFirstLoads = 0;
+    let offset500Loads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return Promise.resolve({ revision: 2 });
+      if (String(path).includes("offset=1000")) return Promise.resolve({ table: refreshedThird });
+      if (String(path).includes("offset=500")) {
+        offset500Loads += 1;
+        return Promise.resolve({ table: offset500Loads === 1 ? oldSecond : refreshedSecond });
+      }
+      if (String(path).includes("sort=status")) {
+        sortedFirstLoads += 1;
+        return Promise.resolve({ table: sortedFirstLoads === 1 ? sortedFirst : refreshedFirst });
+      }
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    const alpha = await screen.findByDisplayValue("Alpha");
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    expect(await screen.findByDisplayValue("Middle old")).toBeInTheDocument();
+
+    fireEvent.change(alpha, { target: { value: "Zulu" } });
+    fireEvent.blur(alpha);
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        expect.stringContaining("/cells/row-alpha/status"),
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+    await act(async () => {});
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Beta")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Gamma")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Omega")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Middle old")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Zulu")).not.toBeInTheDocument();
+    expect(sortedFirstLoads).toBe(2);
+    expect(offset500Loads).toBe(2);
   });
 
   it("refetches a load snapshot that is older than an already merged save", async () => {
