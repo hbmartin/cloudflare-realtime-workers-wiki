@@ -95,6 +95,74 @@ describe("runImport", () => {
     expect(manifest.record).not.toHaveBeenCalled();
   });
 
+  it("accepts a repeated settlement flag after the table was settled successfully", async () => {
+    const database = {
+      path: "Table.html",
+      csvPath: "Table.csv",
+      parent: null,
+      kind: "database",
+      title: "Table",
+      assets: [],
+    };
+    const root = mkdtempSync(join(tmpdir(), "notion-run-test-"));
+    writeFileSync(join(root, database.csvPath), "Value\nimported\n");
+    const plan = await planFor({
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    });
+    const manifest = stubManifest({
+      [database.path]: {
+        pageId: "page-1",
+        contentEpoch: 1,
+        expectedPage: { id: "page-1", kind: "table", title: "Table", parentId: null },
+        tableRecoveryAmbiguous: false,
+        table: {
+          phase: "complete",
+          revision: 2,
+          contentHash: plan.contentHash,
+          expectedColumns: 1,
+          expectedRows: 1,
+          columnOffset: 1,
+          rowOffset: 1,
+          columnsByRef: { c0: "column-1" },
+          acceptedRemoteHash: "d".repeat(64),
+          acceptedRemoteRowCount: 0,
+          settledByOperator: true,
+        },
+      },
+    });
+    const report = {
+      errorCount: 0,
+      error: vi.fn(),
+      issue: vi.fn(),
+      progress: vi.fn(),
+      inPage: vi.fn(),
+    };
+
+    await expect(
+      runImport({
+        index: { pages: [database], root },
+        client: {
+          pageVerification: vi.fn(async () => ({
+            page: { id: "page-1", kind: "table", title: "Table", parentId: null, contentEpoch: 1 },
+          })),
+          tableVerification: vi.fn(async () => ({
+            revision: 3,
+            contentHash: "d".repeat(64),
+            rowCount: 0,
+          })),
+        },
+        manifest,
+        report,
+        rootParentId: null,
+        limit: 1,
+        lingerMs: 0,
+        keepAmbiguousTables: [database.path],
+      }),
+    ).resolves.toMatchObject({ databases: 1, errors: 0 });
+    expect(manifest.state.nodes[database.path].table.settledByOperator).toBe(true);
+  });
+
   it("rejects a short page batch before recording shifted ids", async () => {
     const page = {
       path: "Page.html",
@@ -787,7 +855,7 @@ describe("reconcileCommitted", () => {
   it.each(["table_revision_conflict", "idempotency_key_reused"])(
     "marks recovery ambiguous when a matched batch replay returns %s",
     async (conflictCode) => {
-      const page = { path: "Table.html", kind: "database", title: "Table" };
+      const page = { path: "Q1 $Budget 'draft'.html", kind: "database", title: "Table" };
       const table = {
         columns: [{ ref: "c0", name: "Value", type: "text" }],
         rows: [{ cells: { "ref:c0": "imported" } }],
@@ -834,6 +902,10 @@ describe("reconcileCommitted", () => {
       expect(report.error).toHaveBeenCalledWith(
         "table_recovery_ambiguous",
         expect.stringMatching(/^Table: .*no durable receipt proves who committed it/),
+      );
+      expect(report.error).toHaveBeenCalledWith(
+        "table_recovery_ambiguous",
+        expect.stringContaining(`--keep-ambiguous-table 'Q1 $Budget '"'"'draft'"'"'.html'`),
       );
       expect(state.nodes[page.path].tableError).toMatch(/no durable receipt proves who committed it/);
       expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(true);
@@ -894,6 +966,7 @@ describe("reconcileCommitted", () => {
 
     expect(report.error).not.toHaveBeenCalled();
     expect(report.issue).toHaveBeenCalledWith("ambiguous_table_kept", "Table");
+    expect(report.issue).not.toHaveBeenCalledWith("destination_table_kept", "Table");
     expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(false);
     expect(state.nodes[page.path].table).toMatchObject({
       phase: "complete",
@@ -1060,6 +1133,33 @@ describe("reconcileCommitted", () => {
     expect(state.nodes[page.path].tableRecoveryAmbiguous).toBe(false);
     expect(state.nodes[page.path].table).toBeUndefined();
     expect(state.nodes[page.path].tableError).toBeNull();
+  });
+
+  it("preserves an ambiguity verdict when no table plan can re-derive it", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        tableRecoveryAmbiguous: true,
+        tableError: "Receipt ownership is still ambiguous.",
+      },
+    });
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report: { issue: vi.fn(), error: vi.fn() },
+      client: {
+        pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+        tableVerification: vi.fn(async () => ({ revision: 5, contentHash: "e".repeat(64), rowCount: 2 })),
+      },
+    });
+
+    expect(manifest.state.nodes[page.path]).toMatchObject({
+      tableRecoveryAmbiguous: true,
+      tableError: "Receipt ownership is still ambiguous.",
+    });
   });
 
   it("classifies recovery against the table read under its lease, not the earlier probe", async () => {

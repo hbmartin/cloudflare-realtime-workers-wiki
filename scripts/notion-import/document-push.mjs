@@ -223,7 +223,7 @@ export async function pushDocument({
     // and this baseline describe the same state.
     const liveProjectionHash = await currentProjectionHash(doc);
     if (expectedProjectionHashes && !expectedProjectionHashes.includes(liveProjectionHash)) {
-      return { conflict: true, liveProjectionHash };
+      return { conflict: true, liveProjectionHash: await settledProjectionHash(doc) };
     }
     await beforeWrite(liveProjectionHash);
     let written;

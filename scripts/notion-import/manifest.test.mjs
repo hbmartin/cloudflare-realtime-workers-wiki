@@ -110,6 +110,16 @@ describe("createManifest", () => {
     expect(JSON.parse(readFileSync(files.path, "utf8")).legacyExportFingerprint).toBe(legacyFingerprint);
   });
 
+  it("computes the legacy and digest aggregates from the same fingerprint pass", () => {
+    const files = fixture();
+    const relativePath = "Page 11111111111111111111111111111111.html";
+
+    const combined = fingerprintExport(files.root, { includeLegacyFingerprint: true });
+
+    expect(combined.fingerprint).toBe(fingerprintExport(files.root).fingerprint);
+    expect(combined.legacyFingerprint).toBe(legacyAggregate(files.root, [relativePath]));
+  });
+
   it("opens a version 2 manifest whose fingerprint hashed per-file digests", () => {
     const files = fixture();
     const relativePath = "Page 11111111111111111111111111111111.html";

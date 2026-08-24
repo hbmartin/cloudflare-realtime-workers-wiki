@@ -88,10 +88,11 @@ function parseArguments(argv) {
     else if (flag === "--verify-timeout-ms") options.verifyTimeoutMs = takeNumber();
     else if (flag === "--keep-ambiguous-table") {
       const path = take();
-      if (typeof path !== "string" || !path.trim() || path.startsWith("--")) {
+      const normalizedPath = typeof path === "string" ? path.trim() : "";
+      if (!normalizedPath || normalizedPath.startsWith("--")) {
         throw new Error("--keep-ambiguous-table requires an exact source path from the import report.");
       }
-      options.keepAmbiguousTables.push(path);
+      options.keepAmbiguousTables.push(normalizedPath);
     } else if (flag === "--adopt-legacy-fingerprint") options.adoptLegacyFingerprint = true;
     else if (flag === "--verbose") options.verbose = true;
     else if (flag.startsWith("--")) throw new Error(`Unknown option ${flag}.`);
