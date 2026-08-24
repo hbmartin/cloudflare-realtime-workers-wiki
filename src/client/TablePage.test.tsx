@@ -2378,6 +2378,46 @@ describe("TablePage", () => {
     expect(screen.queryByDisplayValue("Stale")).not.toBeInTheDocument();
   });
 
+  it("does not duplicate an exhausted background revision recovery", async () => {
+    vi.useFakeTimers();
+    const current = tableWithValue("Current", 5);
+    const stale = tableWithValue("Stale", 4);
+    const fresh = tableWithValue("Fresh", 6);
+    let plainLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("sort=status")) {
+        return Promise.reject(
+          new ApiClientError(422, "invalid_table_sort", "The sort column does not belong to this table."),
+        );
+      }
+      plainLoads += 1;
+      if (plainLoads === 1) return Promise.resolve({ table: current });
+      return Promise.resolve({ table: plainLoads <= 7 ? stale : fresh });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    expect(plainLoads).toBe(4);
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+
+    // One bounded background attempt is three requests, not two consecutive
+    // three-request loads caused by recoverRevision's final fallback.
+    expect(plainLoads).toBe(7);
+    expect(screen.getByDisplayValue("Current")).toBeInTheDocument();
+    expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(screen.getByDisplayValue("Fresh")).toBeInTheDocument();
+    expect(plainLoads).toBe(8);
+  });
+
   it("does not overlap repeated load-more requests", async () => {
     const first: TableData = {
       ...table,
@@ -2457,6 +2497,30 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
   });
 
+  it("keeps a valid revision usable when an ordinary background refresh stays stale", async () => {
+    vi.useFakeTimers();
+    const current: TableData = {
+      ...tableWithValue("Current", 5),
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row" },
+      rowCount: 2,
+    };
+    const stale = { ...current, revision: 4 };
+    vi.mocked(api).mockResolvedValueOnce({ table: current }).mockResolvedValue({ table: stale });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const loadMore = screen.getByRole("button", { name: "Load more rows" });
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+
+    expect(api).toHaveBeenCalledTimes(4);
+    expect(loadMore).toBeEnabled();
+    expect(screen.getByDisplayValue("Current")).toBeInTheDocument();
+    expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
+  });
+
   it("appends a newer remote revision across an unsorted keyset boundary", async () => {
     const first: TableData = {
       ...table,
@@ -2517,6 +2581,55 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Current first page")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("Deleted stale row")).not.toBeInTheDocument();
     expect(api).toHaveBeenCalledTimes(3);
+  });
+
+  it("rebuilds unsorted depth after stale keyset retries are exhausted", async () => {
+    vi.useFakeTimers();
+    const first: TableData = {
+      ...table,
+      revision: 2,
+      rows: [{ id: "row-1", position: 0, cells: { status: "Current first page" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const staleSecond: TableData = {
+      ...first,
+      revision: 1,
+      rows: [{ id: "row-stale", position: 1, cells: { status: "Deleted stale row" } }],
+      rowCount: null,
+    };
+    const rebuiltSecond: TableData = {
+      ...first,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Rebuilt second page" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    let pageOneLoads = 0;
+    let appendLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("count=true")) {
+        pageOneLoads += 1;
+        return Promise.resolve({ table: first });
+      }
+      appendLoads += 1;
+      return Promise.resolve({ table: appendLoads <= 3 ? staleSecond : rebuiltSecond });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+
+    expect(screen.getByDisplayValue("Current first page")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Rebuilt second page")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Deleted stale row")).not.toBeInTheDocument();
+    expect(pageOneLoads).toBe(2);
+    expect(appendLoads).toBe(4);
+    expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
   });
 
   it("keeps a newer unsorted boundary as the floor for the following append", async () => {
@@ -3105,6 +3218,57 @@ describe("TablePage", () => {
     expect(screen.getByRole("button", { name: "Load more rows" })).toBeDisabled();
   });
 
+  it("keeps exhausted sorted background recovery transparent", async () => {
+    vi.useFakeTimers();
+    const sortedFirst: TableData = {
+      ...table,
+      revision: 5,
+      sort: "status",
+      rows: [{ id: "row-alpha", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 501,
+    };
+    const unusableOffset: TableData = {
+      ...sortedFirst,
+      revision: 6,
+      rows: [{ id: "row-beta", position: 500, cells: { status: "Beta" } }],
+      hasMore: false,
+      nextOffset: null,
+      rowCount: null,
+    };
+    const staleSorted = { ...sortedFirst, revision: 4 };
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("offset=500")) return Promise.resolve({ table: unusableOffset });
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        return Promise.resolve({ table: sortedLoads === 1 ? sortedFirst : staleSorted });
+      }
+      return Promise.resolve({ table });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    expect(screen.getByText("The table kept returning an older revision.")).toBeInTheDocument();
+    expect(sortedLoads).toBe(4);
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+
+    expect(sortedLoads).toBe(7);
+    expect(screen.getByDisplayValue("Alpha")).toBeInTheDocument();
+    expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
+  });
+
   it("keeps the displayed revision as the floor when recovery changes sort", async () => {
     vi.useFakeTimers();
     const sortedFirst: TableData = {
@@ -3178,7 +3342,7 @@ describe("TablePage", () => {
     expect(screen.queryByDisplayValue("Stale descending")).not.toBeInTheDocument();
   });
 
-  it("keeps the revision floor when invalid-sort recovery supersedes its fallback load", async () => {
+  it("keeps the revision floor during direct invalid-sort recovery", async () => {
     vi.useFakeTimers();
     const sorted: TableData = {
       ...tableWithValue("Sorted", 5),
@@ -3186,7 +3350,6 @@ describe("TablePage", () => {
     };
     const staleUnsorted = tableWithValue("Stale unsorted", 4);
     const freshUnsorted = tableWithValue("Fresh unsorted", 6);
-    const fallback = deferred<{ table: TableData }>();
     let plainLoads = 0;
     let sortedLoads = 0;
     vi.mocked(api).mockImplementation((path, init) => {
@@ -3201,8 +3364,7 @@ describe("TablePage", () => {
       }
       plainLoads += 1;
       if (plainLoads <= 2) return Promise.resolve({ table });
-      if (plainLoads === 3) return fallback.promise;
-      return Promise.resolve({ table: plainLoads === 4 ? staleUnsorted : freshUnsorted });
+      return Promise.resolve({ table: plainLoads === 3 ? staleUnsorted : freshUnsorted });
     });
     await renderActiveEditor();
 
@@ -3213,21 +3375,14 @@ describe("TablePage", () => {
     fireEvent.blur(input);
     await act(() => vi.advanceTimersByTimeAsync(0));
 
-    // recoverRevision owns the third plain load with a floor of 5. Clearing the
-    // invalid sort starts the fourth load and supersedes it, so that effect-owned
-    // request must carry the same floor and reject this revision-4 response.
+    // Invalid-sort recovery owns the third plain load directly and carries its
+    // revision-5 floor across the sort transition, rejecting revision 4.
     expect(sortedLoads).toBe(2);
-    expect(plainLoads).toBe(4);
+    expect(plainLoads).toBe(3);
     expect(screen.queryByDisplayValue("Stale unsorted")).not.toBeInTheDocument();
     await act(() => vi.advanceTimersByTimeAsync(50));
     expect(screen.getByDisplayValue("Fresh unsorted")).toBeInTheDocument();
-    expect(plainLoads).toBe(5);
-
-    await act(async () => {
-      fallback.resolve({ table: freshUnsorted });
-      await fallback.promise;
-    });
-    expect(screen.getByDisplayValue("Fresh unsorted")).toBeInTheDocument();
+    expect(plainLoads).toBe(4);
   });
 
   it("applies a queued cell reset when sorted-depth recovery adopts the authoritative table", async () => {
