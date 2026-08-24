@@ -323,6 +323,24 @@ export function TablePage({
     if (mountedRef.current) setTableBusy(userLoadsInFlightRef.current > 0);
   }, []);
 
+  const recoverInvalidSort = useCallback(
+    (cause: unknown, generation: number, isCurrent: IsCurrent) => {
+      if (
+        !isCurrent() ||
+        generation !== loadGenerationRef.current ||
+        !(cause instanceof ApiClientError) ||
+        cause.code !== "invalid_table_sort" ||
+        !sortRef.current.column
+      ) {
+        return false;
+      }
+      clearSort();
+      setLoadError(null);
+      return true;
+    },
+    [clearSort],
+  );
+
   const adoptAuthoritativeTable = useCallback(
     (authoritative: TableData, appendedPages: number, leaseConflictGeneration: number) => {
       revisionRef.current = authoritative.revision;
@@ -389,17 +407,7 @@ export function TablePage({
         }
         adoptAuthoritativeTable(result.table, 0, leaseConflictGeneration);
       } catch (cause) {
-        if (
-          isCurrent() &&
-          generation === loadGenerationRef.current &&
-          cause instanceof ApiClientError &&
-          cause.code === "invalid_table_sort" &&
-          sortRef.current.column
-        ) {
-          clearSort();
-          setLoadError(null);
-          return;
-        }
+        if (recoverInvalidSort(cause, generation, isCurrent)) return;
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           // Terminal even when the effect that issued this load is gone, but only
           // while no newer load superseded it: a stale page_not_found can belong
@@ -414,7 +422,7 @@ export function TablePage({
         changeLoadCount(-1, background);
       }
     },
-    [adoptAuthoritativeTable, changeLoadCount, clearSort, markPageUnavailable, page.id],
+    [adoptAuthoritativeTable, changeLoadCount, markPageUnavailable, page.id, recoverInvalidSort],
   );
 
   const restoreDepthNow = useCallback(
@@ -487,6 +495,7 @@ export function TablePage({
         if (!isCurrent()) return;
         adoptAuthoritativeTable(restored, appendedPages, leaseConflictGeneration);
       } catch (cause) {
+        if (recoverInvalidSort(cause, generation, isCurrent)) return;
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           markPageUnavailable(cause.message);
         } else if (isCurrent()) {
@@ -497,7 +506,16 @@ export function TablePage({
         changeLoadCount(-1, background);
       }
     },
-    [adoptAuthoritativeTable, changeLoadCount, invalidateRevision, isMounted, load, markPageUnavailable, page.id],
+    [
+      adoptAuthoritativeTable,
+      changeLoadCount,
+      invalidateRevision,
+      isMounted,
+      load,
+      markPageUnavailable,
+      page.id,
+      recoverInvalidSort,
+    ],
   );
 
   const restoreDepth = useCallback(
@@ -591,6 +609,11 @@ export function TablePage({
         };
       });
     } catch (cause) {
+      const isCurrent = () =>
+        mountedRef.current &&
+        generation === loadGenerationRef.current &&
+        requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir);
+      if (recoverInvalidSort(cause, generation, isCurrent)) return;
       // Pagination can be the request that discovers the page is gone, and its
       // rejection is swallowed by the click handler; latch the terminal state here
       // under the same currency rule as load.

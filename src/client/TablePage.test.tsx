@@ -2215,6 +2215,107 @@ describe("TablePage", () => {
     });
   });
 
+  it("clears an invalid sort discovered after appending a sorted page", async () => {
+    const sortedFirst: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-alpha", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 1_001,
+    };
+    const sortedSecond: TableData = {
+      ...sortedFirst,
+      rows: [{ id: "row-beta", position: 500, cells: { status: "Beta" } }],
+      nextOffset: 1_000,
+      rowCount: null,
+    };
+    const withoutStatus: TableData = {
+      ...table,
+      revision: 2,
+      columns: [],
+      rows: [],
+      rowCount: 0,
+    };
+    let plainLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("offset=1000")) {
+        return Promise.reject(
+          new ApiClientError(422, "invalid_table_sort", "The sort column does not belong to this table."),
+        );
+      }
+      if (String(path).includes("offset=500")) return Promise.resolve({ table: sortedSecond });
+      if (String(path).includes("sort=status")) return Promise.resolve({ table: sortedFirst });
+      plainLoads += 1;
+      return Promise.resolve({ table: plainLoads > 1 ? withoutStatus : table });
+    });
+    renderViewer();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Status/ }));
+    expect(await screen.findByDisplayValue("Alpha")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    expect(await screen.findByDisplayValue("Beta")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByText("Add a property to start this table.")).toBeInTheDocument();
+    expect(plainLoads).toBe(2);
+    expect(screen.queryByText("The sort column does not belong to this table.")).not.toBeInTheDocument();
+  });
+
+  it("clears an invalid sort discovered while rebuilding sorted depth", async () => {
+    const sortedFirst: TableData = {
+      ...table,
+      sort: "status",
+      rows: [{ id: "row-alpha", position: 0, cells: { status: "Alpha" } }],
+      hasMore: true,
+      nextCursor: null,
+      nextOffset: 500,
+      rowCount: 501,
+    };
+    const newerOffset: TableData = {
+      ...sortedFirst,
+      revision: 2,
+      rows: [{ id: "row-beta", position: 500, cells: { status: "Beta" } }],
+      hasMore: false,
+      nextOffset: null,
+      rowCount: null,
+    };
+    const withoutStatus: TableData = {
+      ...table,
+      revision: 2,
+      columns: [],
+      rows: [],
+      rowCount: 0,
+    };
+    let plainLoads = 0;
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("offset=500")) return Promise.resolve({ table: newerOffset });
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        if (sortedLoads > 1) {
+          return Promise.reject(
+            new ApiClientError(422, "invalid_table_sort", "The sort column does not belong to this table."),
+          );
+        }
+        return Promise.resolve({ table: sortedFirst });
+      }
+      plainLoads += 1;
+      return Promise.resolve({ table: plainLoads > 1 ? withoutStatus : table });
+    });
+    renderViewer();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Status/ }));
+    expect(await screen.findByDisplayValue("Alpha")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByText("Add a property to start this table.")).toBeInTheDocument();
+    expect(sortedLoads).toBe(2);
+    expect(plainLoads).toBe(2);
+    expect(screen.queryByText("The sort column does not belong to this table.")).not.toBeInTheDocument();
+  });
+
   it("does not overlap repeated load-more requests", async () => {
     const first: TableData = {
       ...table,
