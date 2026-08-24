@@ -187,6 +187,11 @@ export function TablePage({
   useEffect(() => {
     sortRef.current = { column: sortColumn, dir: sortDir };
   }, [sortColumn, sortDir]);
+  const clearSort = useCallback(() => {
+    // Invalid-sort recovery can issue its replacement load before effects flush.
+    sortRef.current = { ...sortRef.current, column: null };
+    setSortColumn(null);
+  }, []);
   // Pages appended past the first. While any are loaded the background poll stands
   // down, so browsing deep into a table is not yanked back to the top every 5s.
   const appendedPagesRef = useRef(0);
@@ -384,6 +389,17 @@ export function TablePage({
         }
         adoptAuthoritativeTable(result.table, 0, leaseConflictGeneration);
       } catch (cause) {
+        if (
+          isCurrent() &&
+          generation === loadGenerationRef.current &&
+          cause instanceof ApiClientError &&
+          cause.code === "invalid_table_sort" &&
+          sortRef.current.column
+        ) {
+          clearSort();
+          setLoadError(null);
+          return;
+        }
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           // Terminal even when the effect that issued this load is gone, but only
           // while no newer load superseded it: a stale page_not_found can belong
@@ -398,7 +414,7 @@ export function TablePage({
         changeLoadCount(-1, background);
       }
     },
-    [adoptAuthoritativeTable, changeLoadCount, markPageUnavailable, page.id],
+    [adoptAuthoritativeTable, changeLoadCount, clearSort, markPageUnavailable, page.id],
   );
 
   const restoreDepthNow = useCallback(
@@ -554,7 +570,7 @@ export function TablePage({
         currentRevision !== null &&
         result.table.revision >= snapshotRevision &&
         result.table.revision <= currentRevision;
-      if ((currentPage.sort && sortedSnapshotDirtyRef.current) || !responseMatchesUsableSnapshot) {
+      if (currentPage.sort && (sortedSnapshotDirtyRef.current || !responseMatchesUsableSnapshot)) {
         await restoreDepth(currentPage, requestedAppendedPages);
         return;
       }
@@ -606,24 +622,19 @@ export function TablePage({
       try {
         const currentPage = tableRef.current;
         const appendedPageTarget = appendedPagesRef.current;
+        const recoveryFloor = minimumRevision ?? currentPage?.revision ?? null;
         const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
         const canRestoreCurrentDepth = currentPage && tableSortKey(currentPage.sort, currentPage.dir) === activeSort;
         if (canRestoreCurrentDepth && !deferDepthRestore) {
-          await restoreDepthNow(
-            currentPage,
-            appendedPageTarget,
-            minimumRevision ?? currentPage.revision,
-            ownerIsCurrent,
-            background,
-          );
+          await restoreDepthNow(currentPage, appendedPageTarget, recoveryFloor, ownerIsCurrent, background);
         } else {
-          await load(ownerIsCurrent, background, minimumRevision);
+          await load(ownerIsCurrent, background, recoveryFloor);
         }
         // A sort change can supersede the request above before its replacement
         // finishes. Own one final page-one load for the live sort instead of
         // reporting an unrecoverable revision while that replacement is in flight.
         if (revisionRef.current === null && ownerIsCurrent()) {
-          await load(ownerIsCurrent, background, minimumRevision);
+          await load(ownerIsCurrent, background, recoveryFloor);
         }
         if (
           deferDepthRestore &&
@@ -1139,6 +1150,7 @@ export function TablePage({
     if (result) {
       const suffix = `:${column.id}`;
       forgetCellInputs((key) => key.endsWith(suffix));
+      if (sortRef.current.column === column.id) clearSort();
       setTable((current) =>
         current ? { ...current, columns: current.columns.filter((item) => item.id !== column.id) } : current,
       );
@@ -1322,7 +1334,7 @@ export function TablePage({
                             setSortColumn(column.id);
                             setSortDir("asc");
                           } else if (sortDir === "asc") setSortDir("desc");
-                          else setSortColumn(null);
+                          else clearSort();
                         }}
                       >
                         {column.name} <small>{column.type}</small>

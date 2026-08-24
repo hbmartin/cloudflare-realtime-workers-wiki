@@ -573,6 +573,50 @@ describe("reconcileCommitted", () => {
     expect(state.nodes[page.path].table.settledByOperator).toBeUndefined();
   });
 
+  it("preserves legacy column ids while reconciling resumable row progress", async () => {
+    const page = { path: "Table.html", kind: "database", title: "Table" };
+    const table = {
+      columns: [{ ref: "c0", name: "Value", type: "text" }],
+      rows: [{ cells: { "ref:c0": "imported" } }],
+    };
+    const plan = await planFor(table);
+    const committedColumns = canonicalSourceTable(table, 1, 0);
+    const committedColumnsHash = await tableContentHash(committedColumns.columns, committedColumns.rows);
+    const manifest = stubManifest({
+      [page.path]: {
+        pageId: "page-1",
+        expectedPage: { kind: "table", title: "Table", parentId: null },
+        table: {
+          phase: "rows",
+          revision: 2,
+          columnOffset: 1,
+          rowOffset: 0,
+          columnIds: { c0: "legacy-column-1" },
+          expectedColumns: 1,
+          expectedRows: 1,
+          contentHash: plan.contentHash,
+        },
+      },
+    });
+
+    await reconcileCommitted({
+      selected: [page],
+      manifest,
+      report: { issue: vi.fn(), error: vi.fn() },
+      tablePlans: new Map([[page, plan]]),
+      client: {
+        pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
+        tableVerification: vi.fn(async () => ({
+          revision: 2,
+          contentHash: committedColumnsHash,
+          rowCount: 0,
+        })),
+      },
+    });
+
+    expect(manifest.state.nodes[page.path].table.columnsByRef).toEqual({ c0: "legacy-column-1" });
+  });
+
   it("replays an interrupted column commit to recover its generated ids", async () => {
     const page = { path: "Table.html", kind: "database", title: "Table" };
     const table = {

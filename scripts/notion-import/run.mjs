@@ -577,7 +577,7 @@ export async function reconcileCommitted({
               expectedRows: source.rows.length,
               columnOffset,
               rowOffset,
-              columnsByRef: progress?.columnsByRef ?? {},
+              columnsByRef: progress?.columnsByRef ?? progress?.columnIds ?? {},
             };
             patch.table = table;
             // Destination edits win the whole table facet, including when they race an
