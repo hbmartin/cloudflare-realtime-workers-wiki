@@ -1598,7 +1598,7 @@ describe("TablePage", () => {
     expect(mutations[1]).toMatchObject({ expectedRevision: 7 });
   });
 
-  it("keeps appended pages from blocking revision recovery and disables pagination while it runs", async () => {
+  it("recovers an unsorted appended table from page one before loading more again", async () => {
     vi.useFakeTimers();
     const first: TableData = {
       ...table,
@@ -1609,6 +1609,7 @@ describe("TablePage", () => {
     };
     const second: TableData = {
       ...table,
+      revision: 2,
       rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
       hasMore: true,
       nextCursor: { position: 1, rowId: "row-2" },
@@ -1633,6 +1634,8 @@ describe("TablePage", () => {
                   ...second,
                   revision: 7,
                   rows: [{ id: "row-2", position: 1, cells: { status: "Authoritative two" } }],
+                  hasMore: false,
+                  nextCursor: null,
                 },
         });
       }
@@ -1684,8 +1687,17 @@ describe("TablePage", () => {
       await recovery.promise;
     });
     expect(screen.getByDisplayValue("Authoritative")).toBeEnabled();
-    expect(screen.getByDisplayValue("Authoritative two")).toBeEnabled();
+    expect(screen.queryByDisplayValue("Two")).not.toBeInTheDocument();
+    expect(keysetLoads).toBe(1);
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByDisplayValue("Authoritative two")).toBeEnabled();
+    expect(keysetLoads).toBe(2);
   });
 
   it("keeps a save failure visible across a successful lease renewal", async () => {

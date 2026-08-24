@@ -647,7 +647,8 @@ export function TablePage({
         const appendedPageTarget = appendedPagesRef.current;
         const recoveryFloor = minimumRevision ?? currentPage?.revision ?? null;
         const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
-        const canRestoreCurrentDepth = currentPage && tableSortKey(currentPage.sort, currentPage.dir) === activeSort;
+        const canRestoreCurrentDepth =
+          currentPage && currentPage.sort !== null && tableSortKey(currentPage.sort, currentPage.dir) === activeSort;
         if (canRestoreCurrentDepth && !deferDepthRestore) {
           await restoreDepthNow(currentPage, appendedPageTarget, recoveryFloor, ownerIsCurrent, background);
         } else {
@@ -661,7 +662,7 @@ export function TablePage({
         }
         if (
           deferDepthRestore &&
-          currentPage &&
+          canRestoreCurrentDepth &&
           appendedPageTarget > 0 &&
           revisionRef.current !== null &&
           ownerIsCurrent() &&
