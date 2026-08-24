@@ -53,8 +53,13 @@ const REVISION_RECOVERY_SAVE_MESSAGE =
 const REVISION_CONFLICT_SAVE_MESSAGE =
   "The table update was not saved because the table kept changing. Reloaded the authoritative table.";
 const DEPTH_RESTORE_MESSAGE = "The table depth could not be restored.";
+const STALE_REFRESH_MESSAGE = "Table refresh is delayed while waiting for the latest revision.";
 const REQUEST_TIMEOUT_MS = 15_000;
 const STALE_REVISION_RETRY_DELAYS_MS = [50, 200] as const;
+// An invalid server sort cannot remain the active view. Keep recovery polling
+// until an authoritative unsorted page can replace it, even if its caller was
+// only an ordinary background refresh.
+const INVALID_SORT_STALE_REVISION_FAILURE: StaleRevisionFailure = "invalidate";
 // Must stay above REQUEST_TIMEOUT_MS so a renewal cannot still be in flight
 // when the next one is due.
 const LEASE_RENEWAL_INTERVAL_MS = 20_000;
@@ -217,6 +222,7 @@ export function TablePage({
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
   const [leasePending, setLeasePending] = useState(canEdit);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [revisionRefreshDelayed, setRevisionRefreshDelayed] = useState(false);
   const [leaseError, setLeaseError] = useState<string | null>(null);
   const [terminalPageUnavailable, setTerminalPageUnavailable] = useState(false);
   // Kept apart from leaseError: a successful renewal clears the lease notice on
@@ -331,6 +337,7 @@ export function TablePage({
       if (currentLease) releaseTableLease(page.id, currentLease);
       setTerminalPageUnavailable(true);
       setSaveError(null);
+      setRevisionRefreshDelayed(false);
       setLoadError(null);
       setLeaseError(message);
       onPageUnavailableRef.current?.(page.id);
@@ -404,6 +411,18 @@ export function TablePage({
     revisionRecoveryFloorRef.current = revisionFloor(revisionRecoveryFloorRef.current, ...revisions);
   }, []);
 
+  const handleStaleRevisionFailure = useCallback(
+    (cause: unknown, failure: StaleRevisionFailure, minimumRevision: number | null) => {
+      if (!(cause instanceof StaleTableRevisionError) || failure === "throw") return false;
+      preserveRevisionFloor(minimumRevision);
+      if (failure === "invalidate") invalidateRevision();
+      setRevisionRefreshDelayed(true);
+      setLoadError(null);
+      return true;
+    },
+    [invalidateRevision, preserveRevisionFloor],
+  );
+
   const recoverInvalidSort = useCallback(
     (cause: unknown, generation: number, isCurrent: IsCurrent, minimumRevision: number | null = null) => {
       if (
@@ -463,6 +482,7 @@ export function TablePage({
       revisionRecoveryFloorRef.current = null;
       sortedSnapshotDirtyRef.current = false;
       unsortedSnapshotDirtyRef.current = false;
+      setRevisionRefreshDelayed(false);
       setTable(authoritative);
       setLoadError(null);
       if (authoritative.lease.expiresAt === null && leaseConflictGeneration === leaseConflictGenerationRef.current) {
@@ -499,18 +519,13 @@ export function TablePage({
         adoptAuthoritativeTable(result.table, 0, leaseConflictGeneration);
         return "adopted";
       } catch (cause) {
-        if (cause instanceof StaleTableRevisionError && staleRevisionFailure !== "throw") {
-          preserveRevisionFloor(minimumRevision);
-          if (staleRevisionFailure === "invalidate") invalidateRevision();
-          setLoadError(null);
-          return "stale";
-        }
+        if (handleStaleRevisionFailure(cause, staleRevisionFailure, minimumRevision)) return "stale";
         const invalidSortRecovery = recoverInvalidSort(cause, generation, isCurrent, minimumRevision);
         if (invalidSortRecovery) {
           return loadTable(isCurrent, {
             background,
             minimumRevision: invalidSortRecovery.minimumRevision,
-            staleRevisionFailure: "invalidate",
+            staleRevisionFailure: INVALID_SORT_STALE_REVISION_FAILURE,
           });
         }
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
@@ -520,6 +535,7 @@ export function TablePage({
           // load superseded this one re-checks the page either way.
           markPageUnavailable(cause.message);
         } else if (isCurrent() && generation === loadGenerationRef.current) {
+          setRevisionRefreshDelayed(false);
           setLoadError(errorMessage(cause, "Table could not be loaded."));
         }
         throw cause;
@@ -531,10 +547,9 @@ export function TablePage({
       adoptAuthoritativeTable,
       changeLoadCount,
       currentRevisionFloor,
-      invalidateRevision,
+      handleStaleRevisionFailure,
       markPageUnavailable,
       page.id,
-      preserveRevisionFloor,
       recoverInvalidSort,
     ],
   );
@@ -549,7 +564,7 @@ export function TablePage({
       const { ownerIsCurrent = isMounted, background = false, staleRevisionFailure = "throw" } = options;
       const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
       changeLoadCount(1, background);
-      invalidateRevision();
+      if (staleRevisionFailure !== "keep-current") invalidateRevision();
       const generation = ++loadGenerationRef.current;
       const leaseConflictGeneration = leaseConflictGenerationRef.current;
       const isCurrent = () =>
@@ -616,23 +631,19 @@ export function TablePage({
         return "adopted";
       } catch (cause) {
         const recoveryFloor = currentRevisionFloor(minimumRevision, currentPage.revision);
-        if (cause instanceof StaleTableRevisionError && staleRevisionFailure !== "throw") {
-          preserveRevisionFloor(recoveryFloor);
-          if (staleRevisionFailure === "invalidate") invalidateRevision();
-          setLoadError(null);
-          return "stale";
-        }
+        if (handleStaleRevisionFailure(cause, staleRevisionFailure, recoveryFloor)) return "stale";
         const invalidSortRecovery = recoverInvalidSort(cause, generation, isCurrent, recoveryFloor);
         if (invalidSortRecovery) {
           return load(ownerIsCurrent, {
             background,
             minimumRevision: invalidSortRecovery.minimumRevision,
-            staleRevisionFailure: "invalidate",
+            staleRevisionFailure: INVALID_SORT_STALE_REVISION_FAILURE,
           });
         }
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           markPageUnavailable(cause.message);
         } else if (isCurrent()) {
+          setRevisionRefreshDelayed(false);
           setLoadError(errorMessage(cause, DEPTH_RESTORE_MESSAGE));
         }
         throw cause;
@@ -644,22 +655,28 @@ export function TablePage({
       adoptAuthoritativeTable,
       changeLoadCount,
       currentRevisionFloor,
+      handleStaleRevisionFailure,
       invalidateRevision,
       isMounted,
       load,
       markPageUnavailable,
       page.id,
-      preserveRevisionFloor,
       recoverInvalidSort,
     ],
   );
 
   const restoreDepth = useCallback(
-    async (currentPage: TableData, appendedPageTarget: number) => {
+    async (
+      currentPage: TableData,
+      appendedPageTarget: number,
+      staleRevisionFailure: StaleRevisionFailure = "throw",
+    ) => {
       // Block later mutations behind this rebuild. They need one authoritative revision,
       // while every page boundary is re-derived from that same revision in sequence.
       const restore = () =>
-        restoreDepthNow(currentPage, appendedPageTarget, currentRevisionFloor(currentPage.revision));
+        restoreDepthNow(currentPage, appendedPageTarget, currentRevisionFloor(currentPage.revision), {
+          staleRevisionFailure,
+        });
       const pending = mutationQueue.current.then(restore, restore);
       mutationQueue.current = pending.then(
         () => undefined,
@@ -687,7 +704,7 @@ export function TablePage({
     // page-one result cannot land after this append and yank the view back to the top.
     const generation = ++loadGenerationRef.current;
     const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
-    const snapshotRevision = pageSnapshotRevisionRef.current;
+    const snapshotRevision = pageSnapshotRevisionRef.current ?? currentPage.revision;
     const requestedAppendedPages = appendedPagesRef.current + 1;
     const isCurrent = () =>
       mountedRef.current &&
@@ -696,10 +713,6 @@ export function TablePage({
     const canAppend = () => isCurrent() && revisionRef.current !== null;
     changeLoadCount(1, false);
     try {
-      if (snapshotRevision === null) {
-        await restoreDepth(currentPage, requestedAppendedPages);
-        return;
-      }
       if (
         (currentPage.sort && sortedSnapshotDirtyRef.current) ||
         (!currentPage.sort && unsortedSnapshotDirtyRef.current)
@@ -731,6 +744,7 @@ export function TablePage({
           return;
         }
       } else {
+        let shouldRestoreDepth = false;
         result = await readWithStaleRevisionRetries(
           () =>
             api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
@@ -744,17 +758,22 @@ export function TablePage({
               return "cancel";
             }
             if (unsortedSnapshotDirtyRef.current) {
-              await restoreDepth(currentPage, requestedAppendedPages);
+              shouldRestoreDepth = true;
               return "cancel";
             }
             return candidate.table.revision < snapshotRevision ? "retry" : "accept";
           },
           canAppend,
         );
+        if (shouldRestoreDepth && canAppend()) {
+          await restoreDepth(currentPage, requestedAppendedPages);
+          return;
+        }
       }
       if (!result) return;
       appendedPagesRef.current += 1;
       pageSnapshotRevisionRef.current = result.table.revision;
+      setRevisionRefreshDelayed(false);
       setTable((current) => {
         if (!current || tableSortKey(current.sort, current.dir) !== requestedSort) {
           return current;
@@ -772,14 +791,14 @@ export function TablePage({
     } catch (cause) {
       const recoveryFloor = currentRevisionFloor(snapshotRevision, currentPage.revision);
       if (cause instanceof StaleTableRevisionError && isCurrent()) {
-        await restoreDepth(currentPage, requestedAppendedPages);
+        await restoreDepth(currentPage, requestedAppendedPages, "keep-current");
         return;
       }
       const invalidSortRecovery = recoverInvalidSort(cause, generation, isCurrent, recoveryFloor);
       if (invalidSortRecovery) {
         await load(isMounted, {
           minimumRevision: invalidSortRecovery.minimumRevision,
-          staleRevisionFailure: "invalidate",
+          staleRevisionFailure: INVALID_SORT_STALE_REVISION_FAILURE,
         });
         return;
       }
@@ -1502,6 +1521,7 @@ export function TablePage({
       </div>
       {leaseError && <div className="notice">{leaseError}</div>}
       {saveError && <div className="notice notice-danger">{saveError}</div>}
+      {revisionRefreshDelayed && <div className="notice">{STALE_REFRESH_MESSAGE}</div>}
       {loadError && <div className="notice notice-danger">{loadError}</div>}
       <article className="table-paper">
         <input
