@@ -2340,6 +2340,44 @@ describe("TablePage", () => {
     expect(screen.queryByText("The sort column does not belong to this table.")).not.toBeInTheDocument();
   });
 
+  it("keeps invalid-sort recovery in the background while a replica remains stale", async () => {
+    vi.useFakeTimers();
+    const current = tableWithValue("Current", 5);
+    const stale = tableWithValue("Stale", 4);
+    const fresh = tableWithValue("Fresh", 6);
+    let plainLoads = 0;
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        return Promise.reject(
+          new ApiClientError(422, "invalid_table_sort", "The sort column does not belong to this table."),
+        );
+      }
+      plainLoads += 1;
+      if (plainLoads === 1) return Promise.resolve({ table: current });
+      return Promise.resolve({ table: plainLoads <= 4 ? stale : fresh });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    await act(() => vi.advanceTimersByTimeAsync(200));
+
+    expect(sortedLoads).toBe(1);
+    expect(plainLoads).toBe(4);
+    expect(screen.getByDisplayValue("Current")).toBeInTheDocument();
+    expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+
+    expect(screen.getByDisplayValue("Fresh")).toBeInTheDocument();
+    expect(plainLoads).toBe(5);
+    expect(screen.queryByDisplayValue("Stale")).not.toBeInTheDocument();
+  });
+
   it("does not overlap repeated load-more requests", async () => {
     const first: TableData = {
       ...table,
@@ -2444,7 +2482,7 @@ describe("TablePage", () => {
     expect(api).toHaveBeenCalledTimes(2);
   });
 
-  it("rebuilds unsorted depth when an appended page predates its keyset snapshot", async () => {
+  it("retries an unsorted append when its response predates the keyset snapshot", async () => {
     const first: TableData = {
       ...table,
       revision: 2,
@@ -2459,11 +2497,6 @@ describe("TablePage", () => {
       rows: [{ id: "row-stale", position: 1, cells: { status: "Deleted stale row" } }],
       rowCount: null,
     };
-    const refreshedFirst: TableData = {
-      ...first,
-      rows: [{ id: "row-current", position: 0, cells: { status: "Refreshed first page" } }],
-      nextCursor: { position: 0, rowId: "row-current" },
-    };
     const refreshedSecond: TableData = {
       ...first,
       rows: [{ id: "row-2", position: 1, cells: { status: "Current second page" } }],
@@ -2472,18 +2505,63 @@ describe("TablePage", () => {
       rowCount: null,
     };
     vi.mocked(api)
+      .mockRejectedValue(new Error("Unexpected API request in stale keyset retry test."))
       .mockResolvedValueOnce({ table: first })
       .mockResolvedValueOnce({ table: staleSecond })
-      .mockResolvedValueOnce({ table: refreshedFirst })
       .mockResolvedValueOnce({ table: refreshedSecond });
     renderViewer();
 
     fireEvent.click(await screen.findByRole("button", { name: "Load more rows" }));
 
-    expect(await screen.findByDisplayValue("Refreshed first page")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("Current second page")).toBeInTheDocument();
-    expect(screen.queryByDisplayValue("Current first page")).not.toBeInTheDocument();
+    expect(await screen.findByDisplayValue("Current second page")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Current first page")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("Deleted stale row")).not.toBeInTheDocument();
+    expect(api).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps a newer unsorted boundary as the floor for the following append", async () => {
+    const first: TableData = {
+      ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "First" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 3,
+    };
+    const newerSecond: TableData = {
+      ...first,
+      revision: 2,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Second" } }],
+      nextCursor: { position: 1, rowId: "row-2" },
+      rowCount: null,
+    };
+    const staleThird: TableData = {
+      ...first,
+      rows: [{ id: "row-stale", position: 2, cells: { status: "Stale third" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    const freshThird: TableData = {
+      ...staleThird,
+      revision: 2,
+      rows: [{ id: "row-3", position: 2, cells: { status: "Third" } }],
+    };
+    vi.mocked(api)
+      .mockRejectedValue(new Error("Unexpected API request after newer keyset boundary."))
+      .mockResolvedValueOnce({ table: first })
+      .mockResolvedValueOnce({ table: newerSecond })
+      .mockResolvedValueOnce({ table: staleThird })
+      .mockResolvedValueOnce({ table: freshThird });
+    renderViewer();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Load more rows" }));
+    expect(await screen.findByDisplayValue("Second")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+
+    expect(await screen.findByDisplayValue("Third")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Stale third")).not.toBeInTheDocument();
+    const pageOneLoads = vi.mocked(api).mock.calls.filter(([path]) => String(path).includes("count=true"));
+    expect(pageOneLoads).toHaveLength(1);
     expect(api).toHaveBeenCalledTimes(4);
   });
 
@@ -2535,6 +2613,61 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
     const fullLoads = vi.mocked(api).mock.calls.filter(([path]) => String(path).includes("count=true"));
     expect(fullLoads).toHaveLength(2);
+  });
+
+  it("rebuilds unsorted rows when an insertion commits during a keyset request", async () => {
+    const first: TableData = {
+      ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "One" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const staleSecond: TableData = {
+      ...first,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    const restored: TableData = {
+      ...first,
+      revision: 2,
+      rows: [first.rows[0]!, staleSecond.rows[0]!, { id: "row-3", position: 2, cells: {} }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: 3,
+    };
+    const append = deferred<{ table: TableData }>();
+    let pageOneLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/rows") && init?.method === "POST") {
+        return Promise.resolve({ revision: 2, row: restored.rows[2] });
+      }
+      if (path.includes("afterPosition")) return append.promise;
+      pageOneLoads += 1;
+      return Promise.resolve({ table: pageOneLoads <= 2 ? first : restored });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    fireEvent.click(screen.getByRole("button", { name: "+ New row" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith("/api/tables/table-page/rows", expect.objectContaining({ method: "POST" })),
+    );
+    await act(async () => {
+      append.resolve({ table: staleSecond });
+      await append.promise;
+    });
+
+    await waitFor(() => expect(screen.getAllByLabelText("Status")).toHaveLength(3));
+    expect(screen.getAllByLabelText("Status").map((input) => (input as HTMLInputElement).value)).toEqual([
+      "One",
+      "Two",
+      "",
+    ]);
+    expect(pageOneLoads).toBe(3);
   });
 
   it("reloads sorted page one when the user's own save crosses an offset snapshot", async () => {
