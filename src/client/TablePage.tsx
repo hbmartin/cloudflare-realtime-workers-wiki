@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TABLE_MAX_ROWS, TABLE_PAGE_DEFAULT, TABLE_SORT_MAX_OFFSET } from "../shared/table-limits";
-import type { TableCursor } from "../shared/types";
 import type { ClientMemberContext } from "../shared/types";
 import type {
   ColumnType,
@@ -17,7 +16,13 @@ import { BacklinksPanel } from "./BacklinksPanel";
 type IsCurrent = () => boolean;
 type MutationOptions = {
   resetKey?: string;
-  affectsSortedOrder?: boolean | string;
+  affectsSortedOrder: boolean | string;
+};
+type RevisionRecoveryOptions = {
+  minimumRevision?: number | null;
+  ownerIsCurrent?: IsCurrent;
+  background?: boolean;
+  deferDepthRestore?: boolean;
 };
 
 const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing.";
@@ -54,6 +59,36 @@ function cellInputKey(rowId: string, columnId: string) {
 
 function tableSortKey(column: string | null, dir: "asc" | "desc") {
   return column ? `${column}:${dir}` : "";
+}
+
+function firstTablePageParams(sort: string | null, dir: "asc" | "desc") {
+  const params = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
+  if (sort) {
+    params.set("sort", sort);
+    params.set("dir", dir);
+  }
+  return params;
+}
+
+function nextTablePageParams(currentPage: TableData) {
+  const params = new URLSearchParams({ limit: String(currentPage.limit) });
+  if (currentPage.sort) {
+    if (currentPage.nextOffset === null) return null;
+    params.set("sort", currentPage.sort);
+    params.set("dir", currentPage.dir);
+    params.set("offset", String(currentPage.nextOffset));
+  } else {
+    if (!currentPage.nextCursor) return null;
+    params.set("afterPosition", String(currentPage.nextCursor.position));
+    params.set("afterId", currentPage.nextCursor.rowId);
+  }
+  return params;
+}
+
+function waitForStaleRevisionRetry(attempt: number) {
+  const delay = STALE_REVISION_RETRY_DELAYS_MS[attempt];
+  if (delay === undefined) throw new Error("The table kept returning an older revision.");
+  return new Promise<void>((resolve) => window.setTimeout(resolve, delay));
 }
 
 function normalizedInputValue(column: TableColumn, value: string | number | boolean | null) {
@@ -322,16 +357,17 @@ export function TablePage({
   );
 
   const load = useCallback(
-    async function loadTable(isCurrent: IsCurrent, background = false, staleRevisionRetries = 0): Promise<void> {
+    async function loadTable(
+      isCurrent: IsCurrent,
+      background = false,
+      minimumRevision: number | null = null,
+      staleRevisionRetries = 0,
+    ): Promise<void> {
       const generation = ++loadGenerationRef.current;
       const leaseConflictGeneration = leaseConflictGenerationRef.current;
       changeLoadCount(1, background);
       try {
-        const params = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
-        if (sortRef.current.column) {
-          params.set("sort", sortRef.current.column);
-          params.set("dir", sortRef.current.dir);
-        }
+        const params = firstTablePageParams(sortRef.current.column, sortRef.current.dir);
         const result = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
@@ -340,12 +376,11 @@ export function TablePage({
         // revert that edit on screen and regress the mutation base, so fetch a
         // fresh one instead of adopting it. Bound the retry in case a lagging or
         // broken backend keeps returning a revision older than the local mutation base.
-        if (revisionRef.current !== null && result.table.revision < revisionRef.current) {
-          const delay = STALE_REVISION_RETRY_DELAYS_MS[staleRevisionRetries];
-          if (delay === undefined) throw new Error("The table kept returning an older revision.");
-          await new Promise((resolve) => window.setTimeout(resolve, delay));
+        const requiredRevision = Math.max(minimumRevision ?? 0, revisionRef.current ?? 0);
+        if (result.table.revision < requiredRevision) {
+          await waitForStaleRevisionRetry(staleRevisionRetries);
           if (!isCurrent() || generation !== loadGenerationRef.current) return;
-          return loadTable(isCurrent, background, staleRevisionRetries + 1);
+          return loadTable(isCurrent, background, minimumRevision, staleRevisionRetries + 1);
         }
         adoptAuthoritativeTable(result.table, 0, leaseConflictGeneration);
       } catch (cause) {
@@ -372,9 +407,10 @@ export function TablePage({
       appendedPageTarget: number,
       minimumRevision: number | null,
       ownerIsCurrent: IsCurrent = isMounted,
+      background = false,
     ) => {
       const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
-      changeLoadCount(1, false);
+      changeLoadCount(1, background);
       invalidateRevision();
       const generation = ++loadGenerationRef.current;
       const leaseConflictGeneration = leaseConflictGenerationRef.current;
@@ -384,11 +420,7 @@ export function TablePage({
         generation === loadGenerationRef.current &&
         requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir);
       try {
-        const firstParams = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
-        if (currentPage.sort) {
-          firstParams.set("sort", currentPage.sort);
-          firstParams.set("dir", currentPage.dir);
-        }
+        const firstParams = firstTablePageParams(currentPage.sort, currentPage.dir);
         let first: { table: TableData } | null = null;
         for (let staleRevisionRetries = 0; ; staleRevisionRetries += 1) {
           first = await api<{ table: TableData }>(`/api/tables/${page.id}?${firstParams}`, {
@@ -396,13 +428,11 @@ export function TablePage({
           });
           if (!isCurrent()) return;
           if (minimumRevision === null || first.table.revision >= minimumRevision) break;
-          const delay = STALE_REVISION_RETRY_DELAYS_MS[staleRevisionRetries];
-          if (delay === undefined) throw new Error("The table kept returning an older revision.");
-          await new Promise((resolve) => window.setTimeout(resolve, delay));
+          await waitForStaleRevisionRetry(staleRevisionRetries);
           if (!isCurrent()) return;
         }
         if (!first || tableSortKey(first.table.sort, first.table.dir) !== requestedSort) {
-          await load(ownerIsCurrent);
+          await load(ownerIsCurrent, background, minimumRevision);
           return;
         }
 
@@ -411,17 +441,8 @@ export function TablePage({
         let appendedPages = 0;
         const loaded = new Set(restored.rows.map((row) => row.id));
         while (appendedPages < appendedPageTarget && restored.hasMore) {
-          const params = new URLSearchParams({ limit: String(restored.limit) });
-          if (currentPage.sort) {
-            if (restored.nextOffset === null) break;
-            params.set("sort", currentPage.sort);
-            params.set("dir", currentPage.dir);
-            params.set("offset", String(restored.nextOffset));
-          } else {
-            if (!restored.nextCursor) break;
-            params.set("afterPosition", String(restored.nextCursor.position));
-            params.set("afterId", restored.nextCursor.rowId);
-          }
+          const params = nextTablePageParams(restored);
+          if (!params) break;
           const next = await api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           });
@@ -432,7 +453,7 @@ export function TablePage({
           ) {
             // Another writer moved the table while its depth was being rebuilt. A
             // page-one load is the only bounded snapshot we can adopt under churn.
-            await load(ownerIsCurrent);
+            await load(ownerIsCurrent, background, minimumRevision);
             return;
           }
           const rows = next.table.rows.filter((row) => !loaded.has(row.id));
@@ -452,12 +473,12 @@ export function TablePage({
       } catch (cause) {
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           markPageUnavailable(cause.message);
-        } else if (mountedRef.current && generation === loadGenerationRef.current) {
+        } else if (isCurrent()) {
           setLoadError(errorMessage(cause, DEPTH_RESTORE_MESSAGE));
         }
         throw cause;
       } finally {
-        changeLoadCount(-1, false);
+        changeLoadCount(-1, background);
       }
     },
     [adoptAuthoritativeTable, changeLoadCount, invalidateRevision, isMounted, load, markPageUnavailable, page.id],
@@ -488,18 +509,8 @@ export function TablePage({
       return;
     }
 
-    const params = new URLSearchParams({ limit: String(currentPage.limit) });
-    if (currentPage.sort) {
-      if (currentPage.nextOffset === null) return;
-      params.set("sort", currentPage.sort);
-      params.set("dir", currentPage.dir);
-      params.set("offset", String(currentPage.nextOffset));
-    } else {
-      const cursor: TableCursor | null = currentPage.nextCursor;
-      if (!cursor) return;
-      params.set("afterPosition", String(cursor.position));
-      params.set("afterId", cursor.rowId);
-    }
+    const params = nextTablePageParams(currentPage);
+    if (!params) return;
 
     // Advancing the generation discards a background refresh still in flight, so its
     // page-one result cannot land after this append and yank the view back to the top.
@@ -543,11 +554,7 @@ export function TablePage({
         currentRevision !== null &&
         result.table.revision >= snapshotRevision &&
         result.table.revision <= currentRevision;
-      if (currentPage.sort && sortedSnapshotDirtyRef.current) {
-        await restoreDepth(currentPage, requestedAppendedPages);
-        return;
-      }
-      if (!responseMatchesUsableSnapshot) {
+      if ((currentPage.sort && sortedSnapshotDirtyRef.current) || !responseMatchesUsableSnapshot) {
         await restoreDepth(currentPage, requestedAppendedPages);
         return;
       }
@@ -589,24 +596,51 @@ export function TablePage({
   }, [isMounted, load, sortKey]);
 
   const recoverRevision = useCallback(
-    async (minimumRevision: number | null = null, ownerIsCurrent: IsCurrent = isMounted) => {
+    async ({
+      minimumRevision = null,
+      ownerIsCurrent = isMounted,
+      background = false,
+      deferDepthRestore = false,
+    }: RevisionRecoveryOptions = {}) => {
       if (revisionRef.current !== null) return true;
       try {
         const currentPage = tableRef.current;
-        if (currentPage) {
+        const appendedPageTarget = appendedPagesRef.current;
+        const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
+        const canRestoreCurrentDepth = currentPage && tableSortKey(currentPage.sort, currentPage.dir) === activeSort;
+        if (canRestoreCurrentDepth && !deferDepthRestore) {
           await restoreDepthNow(
             currentPage,
-            appendedPagesRef.current,
+            appendedPageTarget,
             minimumRevision ?? currentPage.revision,
             ownerIsCurrent,
+            background,
           );
-        } else await load(ownerIsCurrent);
+        } else {
+          await load(ownerIsCurrent, background, minimumRevision);
+        }
+        // A sort change can supersede the request above before its replacement
+        // finishes. Own one final page-one load for the live sort instead of
+        // reporting an unrecoverable revision while that replacement is in flight.
+        if (revisionRef.current === null && ownerIsCurrent()) {
+          await load(ownerIsCurrent, background, minimumRevision);
+        }
+        if (
+          deferDepthRestore &&
+          currentPage &&
+          appendedPageTarget > 0 &&
+          revisionRef.current !== null &&
+          ownerIsCurrent() &&
+          tableSortKey(currentPage.sort, currentPage.dir) === tableSortKey(sortRef.current.column, sortRef.current.dir)
+        ) {
+          void restoreDepth(currentPage, appendedPageTarget).catch(() => undefined);
+        }
         return revisionRef.current !== null;
       } catch {
         return false;
       }
     },
-    [isMounted, load, restoreDepthNow],
+    [isMounted, load, restoreDepth, restoreDepthNow],
   );
 
   const endLease = useCallback(
@@ -814,7 +848,7 @@ export function TablePage({
     const isCurrent = () => active && mountedRef.current;
     const poll = window.setInterval(() => {
       if (!loadsInFlightRef.current && (!appendedPagesRef.current || revisionRef.current === null)) {
-        if (revisionRef.current === null) void recoverRevision(null, isCurrent);
+        if (revisionRef.current === null) void recoverRevision({ ownerIsCurrent: isCurrent, background: true });
         else void load(isCurrent, true).catch(() => undefined);
       }
     }, 5_000);
@@ -940,7 +974,7 @@ export function TablePage({
     path: string,
     method: string,
     body: Record<string, unknown>,
-    { resetKey, affectsSortedOrder = false }: MutationOptions = {},
+    { resetKey, affectsSortedOrder }: MutationOptions,
   ) {
     const execute = async () => {
       const failForLostLease = () => {
@@ -957,7 +991,7 @@ export function TablePage({
       let revisionConflictRetried = false;
       while (leaseTokenRef.current === currentLease) {
         if (revisionRef.current === null) {
-          const recovered = await recoverRevision();
+          const recovered = await recoverRevision({ deferDepthRestore: true });
           if (leaseTokenRef.current !== currentLease) return failForLostLease();
           if (!recovered) {
             resetCellInputAfterLoad(resetKey);
@@ -1013,7 +1047,10 @@ export function TablePage({
             const terminalConflict = revisionConflictRetried;
             if (terminalConflict) resetCellInputAfterLoad(resetKey);
             else setSaveError(cause.message);
-            const recovered = await recoverRevision(currentRevision);
+            const recovered = await recoverRevision({
+              minimumRevision: currentRevision,
+              deferDepthRestore: true,
+            });
             if (leaseTokenRef.current !== currentLease) return failForLostLease();
             if (!recovered) {
               resetCellInputAfterLoad(resetKey);
@@ -1042,7 +1079,7 @@ export function TablePage({
             invalidateRevision();
             setSaveError(cause.message);
             resetCellInputAfterLoad(resetKey);
-            await recoverRevision(currentRevision);
+            await recoverRevision({ minimumRevision: currentRevision, deferDepthRestore: true });
             return null;
           }
           // A handled client rejection is definitive: the server rejected the
@@ -1058,7 +1095,7 @@ export function TablePage({
           invalidateRevision();
           setSaveError(errorMessage(cause, SAVE_FAILED_MESSAGE));
           resetCellInputAfterLoad(resetKey);
-          await recoverRevision(currentRevision);
+          await recoverRevision({ minimumRevision: currentRevision, deferDepthRestore: true });
           return null;
         }
       }
@@ -1078,7 +1115,12 @@ export function TablePage({
     if (!name) return;
     const type = (prompt("Type: text, number, checkbox, date, or select", "text") ?? "") as ColumnType;
     if (!["text", "number", "checkbox", "date", "select"].includes(type)) return;
-    const result = await mutation<{ column: TableColumn }>(`/api/tables/${page.id}/columns`, "POST", { name, type });
+    const result = await mutation<{ column: TableColumn }>(
+      `/api/tables/${page.id}/columns`,
+      "POST",
+      { name, type },
+      { affectsSortedOrder: false },
+    );
     if (result) {
       setTable((current) =>
         current ? { ...current, columns: [...current.columns, { ...result.column, options: [] }] } : current,
@@ -1110,6 +1152,7 @@ export function TablePage({
       `/api/tables/${page.id}/columns/${column.id}/options`,
       "POST",
       { label },
+      { affectsSortedOrder: false },
     );
     if (result)
       setTable((current) =>

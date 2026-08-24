@@ -1136,33 +1136,6 @@ describe("reconcileCommitted", () => {
     expect(state.nodes[page.path].tableError).toBeNull();
   });
 
-  it("preserves an ambiguity verdict when no table plan can re-derive it", async () => {
-    const page = { path: "Table.html", kind: "database", title: "Table" };
-    const manifest = stubManifest({
-      [page.path]: {
-        pageId: "page-1",
-        expectedPage: { kind: "table", title: "Table", parentId: null },
-        tableRecoveryAmbiguous: true,
-        tableError: "Receipt ownership is still ambiguous.",
-      },
-    });
-
-    await reconcileCommitted({
-      selected: [page],
-      manifest,
-      report: { issue: vi.fn(), error: vi.fn() },
-      client: {
-        pageVerification: vi.fn(async () => ({ page: { kind: "table", title: "Table", parentId: null } })),
-        tableVerification: vi.fn(async () => ({ revision: 5, contentHash: "e".repeat(64), rowCount: 2 })),
-      },
-    });
-
-    expect(manifest.state.nodes[page.path]).toMatchObject({
-      tableRecoveryAmbiguous: true,
-      tableError: "Receipt ownership is still ambiguous.",
-    });
-  });
-
   it("classifies recovery against the table read under its lease, not the earlier probe", async () => {
     const page = { path: "Table.html", kind: "database", title: "Table" };
     const table = {

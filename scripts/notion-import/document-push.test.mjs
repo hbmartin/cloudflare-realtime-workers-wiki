@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { DOCUMENT_FRAGMENT } from "./blocks.mjs";
-import { settledProjectionHash } from "./document-push.mjs";
+import { connectedProjectionHash, settledProjectionHash } from "./document-push.mjs";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -100,6 +100,38 @@ describe("settledProjectionHash", () => {
     expect(off).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(50);
     expect(off).toHaveBeenCalledTimes(1);
+    doc.destroy();
+  });
+});
+
+describe("connectedProjectionHash", () => {
+  it("returns the synchronized hash without waiting for a quiet-period timer", async () => {
+    vi.useFakeTimers();
+    const doc = new Y.Doc();
+    const provider = new EventEmitter();
+    provider.wsconnected = true;
+
+    await expect(connectedProjectionHash(provider, doc)).resolves.toMatch(/^[0-9a-f]{64}$/);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(provider.listenerCount("connection-close")).toBe(0);
+    expect(provider.listenerCount("connection-error")).toBe(0);
+    doc.destroy();
+  });
+
+  it.each([
+    ["connection-close", { code: 4411 }, /page was deleted/],
+    ["connection-error", undefined, /connection failed/],
+  ])("rejects when the provider emits %s while hashing", async (event, detail, message) => {
+    const doc = new Y.Doc();
+    const provider = new EventEmitter();
+    provider.wsconnected = true;
+    const hash = connectedProjectionHash(provider, doc);
+
+    provider.emit(event, detail);
+
+    await expect(hash).rejects.toThrow(message);
+    expect(provider.listenerCount("connection-close")).toBe(0);
+    expect(provider.listenerCount("connection-error")).toBe(0);
     doc.destroy();
   });
 });
