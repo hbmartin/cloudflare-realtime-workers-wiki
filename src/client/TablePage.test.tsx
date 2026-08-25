@@ -77,6 +77,8 @@ function pagedTable(overrides: Partial<TableData> & { rows: TableData["rows"] })
 }
 
 async function drainStaleRetries() {
+  // Mirrors the private production retry schedule while keeping callers focused
+  // on draining the behavior rather than importing scheduler implementation state.
   await act(() => vi.advanceTimersByTimeAsync(0));
   await act(() => vi.advanceTimersByTimeAsync(50));
   await act(() => vi.advanceTimersByTimeAsync(200));
@@ -3165,7 +3167,7 @@ describe("TablePage", () => {
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
   });
 
-  it("does not report background rejections superseded by newly queued edits", async () => {
+  it("backs off and reports background rejections superseded by newly queued edits", async () => {
     vi.useFakeTimers();
     const first = pagedTable({
       revision: 2,
@@ -3181,6 +3183,7 @@ describe("TablePage", () => {
       rowCount: null,
     };
     const backgrounds = [
+      deferred<{ table: TableData }>(),
       deferred<{ table: TableData }>(),
       deferred<{ table: TableData }>(),
       deferred<{ table: TableData }>(),
@@ -3211,8 +3214,11 @@ describe("TablePage", () => {
     await drainStaleRetries();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
-    for (const [index, background] of backgrounds.entries()) {
-      await act(() => vi.advanceTimersByTimeAsync(5_000));
+    for (const [index, background] of backgrounds.slice(0, 3).entries()) {
+      const retryDelay = 5_000 * 2 ** index;
+      await act(() => vi.advanceTimersByTimeAsync(retryDelay - 1));
+      expect(backgroundLoads).toBe(index);
+      await act(() => vi.advanceTimersByTimeAsync(1));
       expect(backgroundLoads).toBe(index + 1);
       const value = `Saved while polling ${index + 1}`;
       const input = screen.getByDisplayValue(index === 0 ? "Current" : `Saved while polling ${index}`);
@@ -3226,11 +3232,26 @@ describe("TablePage", () => {
       });
 
       expect(screen.getByDisplayValue(value)).toBeEnabled();
-      expect(screen.queryByText("Obsolete background failure.")).not.toBeInTheDocument();
+      expect(screen.queryByText("Obsolete background failure.") !== null).toBe(index === 2);
     }
 
-    expect(pageOneLoads).toBe(8);
-    expect(screen.queryByText("Obsolete background failure.")).not.toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(39_999));
+    expect(backgroundLoads).toBe(3);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(backgroundLoads).toBe(4);
+    const input = screen.getByDisplayValue("Saved while polling 3");
+    fireEvent.change(input, { target: { value: "Saved while final poll" } });
+    fireEvent.blur(input);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(async () => {
+      backgrounds[3]!.resolve({ table: first });
+      await backgrounds[3]!.promise;
+    });
+
+    expect(pageOneLoads).toBe(9);
+    expect(screen.getByDisplayValue("Saved while final poll")).toBeEnabled();
+    expect(screen.getByText("Obsolete background failure.")).toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
   });
 
