@@ -1412,7 +1412,7 @@ export function TablePage({
           if (consecutiveRecoveryErrors >= REVISION_RECOVERY_ERROR_THRESHOLD) {
             setRevisionRecoveryError(errorMessage(failure.cause, DEPTH_RESTORE_MESSAGE));
           }
-        } else {
+        } else if (delayedResult?.outcome !== "superseded") {
           consecutiveRecoveryErrors = 0;
           setRevisionRecoveryError(null);
         }
@@ -1422,6 +1422,7 @@ export function TablePage({
       if (
         recoveryActive &&
         delayedResult?.outcome === "superseded" &&
+        delayedResult.failure === null &&
         mutationGeneration !== mutationGenerationRef.current
       ) {
         // Keep any recorded backoff, but do not make recovery wait for it after
@@ -1727,7 +1728,7 @@ export function TablePage({
       pendingMutationsRef.current -= 1;
       if (
         !pendingMutationsRef.current &&
-        revisionRecoveryPendingRef.current &&
+        (revisionRecoveryPendingRef.current || revisionRef.current === null) &&
         revisionRecoveryWakePendingRef.current
       ) {
         wakeRevisionRecoveryRef.current();
