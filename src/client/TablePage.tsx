@@ -1335,12 +1335,12 @@ export function TablePage({
     let pollRunning = false;
     let wakeAfterRunning = false;
     let delayedFailures = 0;
-    let consecutiveRecoveryErrors = 0;
+    let recoveryFailureStreak = 0;
     const isCurrent = () => active && mode !== "off" && mountedRef.current;
     const recoveryIsActive = () => revisionRecoveryPendingRef.current || revisionRef.current === null;
     const resetFailureState = () => {
       delayedFailures = 0;
-      consecutiveRecoveryErrors = 0;
+      recoveryFailureStreak = 0;
       if (mountedRef.current) setRevisionRecoveryError(null);
     };
     const clearPollTimer = () => {
@@ -1408,12 +1408,12 @@ export function TablePage({
 
         const failure = delayedResult?.failure;
         if (recoveryWasActive && failure && revisionRecoveryPendingRef.current) {
-          consecutiveRecoveryErrors += 1;
-          if (consecutiveRecoveryErrors >= REVISION_RECOVERY_ERROR_THRESHOLD) {
+          recoveryFailureStreak += 1;
+          if (recoveryFailureStreak >= REVISION_RECOVERY_ERROR_THRESHOLD) {
             setRevisionRecoveryError(errorMessage(failure.cause, DEPTH_RESTORE_MESSAGE));
           }
         } else if (delayedResult?.outcome !== "superseded") {
-          consecutiveRecoveryErrors = 0;
+          recoveryFailureStreak = 0;
           setRevisionRecoveryError(null);
         }
       } else {
@@ -1425,8 +1425,8 @@ export function TablePage({
         delayedResult.failure === null &&
         mutationGeneration !== mutationGenerationRef.current
       ) {
-        // Keep any recorded backoff, but do not make recovery wait for it after
-        // the edit that superseded this request has settled.
+        // Preserve the accounting above, but let the edit that superseded this
+        // failure-free request trigger one prompt retry after it settles.
         revisionRecoveryWakePendingRef.current = true;
         if (!pendingMutationsRef.current) wakeAfterRunning = true;
       }

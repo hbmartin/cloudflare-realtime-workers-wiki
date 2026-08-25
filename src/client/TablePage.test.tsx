@@ -3193,6 +3193,7 @@ describe("TablePage", () => {
     ];
     let pageOneLoads = 0;
     let backgroundLoads = 0;
+    let unexpectedBackgroundLoads = 0;
     let mutationRevision = 2;
     vi.mocked(api).mockImplementation((path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
@@ -3204,8 +3205,12 @@ describe("TablePage", () => {
         pageOneLoads += 1;
         if (pageOneLoads <= 2) return Promise.resolve({ table: first });
         if (pageOneLoads <= 5) return Promise.resolve({ table: staleFirst });
-        const background = backgrounds[backgroundLoads++];
-        if (!background) throw new Error("Unexpected extra background page-one load.");
+        const background = backgrounds[backgroundLoads];
+        if (!background) {
+          unexpectedBackgroundLoads += 1;
+          throw new Error("Unexpected extra background page-one load.");
+        }
+        backgroundLoads += 1;
         return background.promise;
       }
       return Promise.resolve({ table: staleSecond });
@@ -3217,32 +3222,43 @@ describe("TablePage", () => {
     await drainStaleRetries();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
+    const pollInterval = 5_000;
+    const retryFailures = [
+      new Error("Obsolete background failure."),
+      new Error("Obsolete background failure."),
+      undefined,
+    ];
+    let displayedValue = "Current";
+    const recoveryWarningCounts: number[] = [];
     for (const [index, background] of backgrounds.slice(0, 3).entries()) {
-      const retryDelay = 5_000 * 2 ** index;
+      const retryDelay = pollInterval * 2 ** index;
       await act(() => vi.advanceTimersByTimeAsync(retryDelay - 1));
       expect(backgroundLoads).toBe(index);
       await act(() => vi.advanceTimersByTimeAsync(1));
       expect(backgroundLoads).toBe(index + 1);
       const value = `Saved while polling ${index + 1}`;
-      const input = screen.getByDisplayValue(index === 0 ? "Current" : `Saved while polling ${index}`);
+      const input = screen.getByDisplayValue(displayedValue);
       fireEvent.change(input, { target: { value } });
       fireEvent.blur(input);
       await act(() => vi.advanceTimersByTimeAsync(0));
 
       await act(async () => {
-        background.reject(new Error("Obsolete background failure."));
+        background.reject(retryFailures[index]);
         await background.promise.catch(() => undefined);
       });
 
+      displayedValue = value;
       expect(screen.getByDisplayValue(value)).toBeEnabled();
-      expect(screen.queryByText("Obsolete background failure.") !== null).toBe(index === 2);
+      recoveryWarningCounts.push(screen.queryAllByText("The table depth could not be restored.").length);
     }
+    expect(recoveryWarningCounts).toEqual([0, 0, 1]);
 
-    await act(() => vi.advanceTimersByTimeAsync(39_999));
+    const finalRetryDelay = pollInterval * 2 ** retryFailures.length;
+    await act(() => vi.advanceTimersByTimeAsync(finalRetryDelay - 1));
     expect(backgroundLoads).toBe(3);
     await act(() => vi.advanceTimersByTimeAsync(1));
     expect(backgroundLoads).toBe(4);
-    const input = screen.getByDisplayValue("Saved while polling 3");
+    const input = screen.getByDisplayValue(displayedValue);
     fireEvent.change(input, { target: { value: "Saved while final poll" } });
     fireEvent.blur(input);
     await act(() => vi.advanceTimersByTimeAsync(0));
@@ -3254,8 +3270,9 @@ describe("TablePage", () => {
 
     expect(pageOneLoads).toBe(9);
     expect(screen.getByDisplayValue("Saved while final poll")).toBeEnabled();
-    expect(screen.getByText("Obsolete background failure.")).toBeInTheDocument();
+    expect(screen.getByText("The table depth could not be restored.")).toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+    expect(unexpectedBackgroundLoads).toBe(0);
   });
 
   it("wakes unknown-revision recovery after a mutation clears the last depth target", async () => {
@@ -3341,12 +3358,19 @@ describe("TablePage", () => {
       await failedSaveReload.promise.catch(() => undefined);
     });
     expect(screen.getByText("Editing paused while table reloads")).toBeInTheDocument();
+    expect(screen.getByText("Table temporarily unavailable.")).toBeInTheDocument();
     expect(sortedLoads).toBe(2);
 
     await act(() => vi.advanceTimersByTimeAsync(0));
 
     expect(sortedLoads).toBe(3);
     expect(screen.getByDisplayValue("Recovered")).toBeEnabled();
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+    expect(screen.queryByText("Editing paused while table reloads")).not.toBeInTheDocument();
+    expect(screen.queryByText("Table temporarily unavailable.")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
+    ).not.toBeInTheDocument();
   });
 
   it("lets a foreground page-one reload retire a deeper recovery target", async () => {
