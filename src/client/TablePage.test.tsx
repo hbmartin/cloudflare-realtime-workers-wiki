@@ -64,6 +64,22 @@ function tableWithValue(value: string, revision: number): TableData {
   };
 }
 
+function pagedTable(overrides: Partial<TableData> & { rows: TableData["rows"] }): TableData {
+  return {
+    ...table,
+    hasMore: true,
+    nextCursor: { position: 0, rowId: overrides.rows[0]!.id },
+    rowCount: 2,
+    ...overrides,
+  };
+}
+
+async function drainStaleRetries() {
+  await act(() => vi.advanceTimersByTimeAsync(0));
+  await act(() => vi.advanceTimersByTimeAsync(50));
+  await act(() => vi.advanceTimersByTimeAsync(200));
+}
+
 function tableWithTwoTextCells(revision = 1): TableData {
   return {
     ...table,
@@ -2356,9 +2372,7 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
 
     fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
 
     expect(sortedLoads).toBe(1);
     expect(plainLoads).toBe(4);
@@ -2392,9 +2406,7 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
 
     fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
     expect(plainLoads).toBe(4);
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
@@ -2505,8 +2517,7 @@ describe("TablePage", () => {
     const loadMore = screen.getByRole("button", { name: "Load more rows" });
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
 
     expect(api).toHaveBeenCalledTimes(4);
     expect(loadMore).toBeEnabled();
@@ -2536,8 +2547,7 @@ describe("TablePage", () => {
     expect(screen.getByText("Sorted table could not be loaded.")).toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
 
     expect(sortedLoads).toBe(4);
     expect(screen.getByText("Sorted table could not be loaded.")).toBeInTheDocument();
@@ -2570,14 +2580,10 @@ describe("TablePage", () => {
   });
 
   it("retries an unsorted append when its response predates the keyset snapshot", async () => {
-    const first: TableData = {
-      ...table,
+    const first = pagedTable({
       revision: 2,
       rows: [{ id: "row-1", position: 0, cells: { status: "Current first page" } }],
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row-1" },
-      rowCount: 2,
-    };
+    });
     const staleSecond: TableData = {
       ...table,
       revision: 1,
@@ -2643,9 +2649,7 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
 
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
 
     expect(screen.getByDisplayValue("Current first page")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Rebuilt second page")).toBeInTheDocument();
@@ -2657,14 +2661,10 @@ describe("TablePage", () => {
 
   it("keeps the current unsorted revision and automatically clears delayed refresh at page one", async () => {
     vi.useFakeTimers();
-    const first: TableData = {
-      ...table,
+    const first = pagedTable({
       revision: 2,
       rows: [{ id: "row-1", position: 0, cells: { status: "Current first page" } }],
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row-1" },
-      rowCount: 2,
-    };
+    });
     const staleFirst = { ...first, revision: 1 };
     const staleSecond: TableData = {
       ...first,
@@ -2695,11 +2695,8 @@ describe("TablePage", () => {
 
     const loadMore = screen.getByRole("button", { name: "Load more rows" });
     fireEvent.click(loadMore);
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
+    await drainStaleRetries();
 
     expect(pageOneLoads).toBe(4);
     expect(appendLoads).toBe(3);
@@ -2726,14 +2723,10 @@ describe("TablePage", () => {
 
   it("automatically retries a delayed stale rebuild while an editor lease is active", async () => {
     vi.useFakeTimers();
-    const first: TableData = {
-      ...table,
+    const first = pagedTable({
       revision: 2,
       rows: [{ id: "row-1", position: 0, cells: { status: "Current editor page" } }],
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row-1" },
-      rowCount: 2,
-    };
+    });
     const staleFirst = { ...first, revision: 1 };
     const staleSecond: TableData = {
       ...first,
@@ -2755,11 +2748,8 @@ describe("TablePage", () => {
     await renderActiveEditor();
 
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
+    await drainStaleRetries();
 
     expect(pageOneLoads).toBe(5);
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
@@ -2778,14 +2768,11 @@ describe("TablePage", () => {
 
   it("automatically rebuilds a delayed viewer at the already displayed depth", async () => {
     vi.useFakeTimers();
-    const first: TableData = {
-      ...table,
+    const first = pagedTable({
       revision: 2,
       rows: [{ id: "row-1", position: 0, cells: { status: "Current first page" } }],
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row-1" },
       rowCount: 3,
-    };
+    });
     const second: TableData = {
       ...first,
       rows: [{ id: "row-2", position: 1, cells: { status: "Current second page" } }],
@@ -2831,11 +2818,8 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Current second page")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
+    await drainStaleRetries();
 
     expect(pageOneLoads).toBe(4);
     expect(secondPageLoads).toBe(1);
@@ -2867,14 +2851,10 @@ describe("TablePage", () => {
 
   it("keeps delayed depth recovery armed across a transient poll failure", async () => {
     vi.useFakeTimers();
-    const first: TableData = {
-      ...table,
+    const first = pagedTable({
       revision: 2,
       rows: [{ id: "row-1", position: 0, cells: { status: "Current first" } }],
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row-1" },
-      rowCount: 2,
-    };
+    });
     const staleFirst = { ...first, revision: 1 };
     const staleSecond: TableData = {
       ...first,
@@ -2905,11 +2885,8 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
 
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
+    await drainStaleRetries();
     expect(pageOneLoads).toBe(4);
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
@@ -2948,8 +2925,7 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
@@ -3011,11 +2987,8 @@ describe("TablePage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
     await act(() => vi.advanceTimersByTimeAsync(0));
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
+    await drainStaleRetries();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
@@ -3028,14 +3001,10 @@ describe("TablePage", () => {
 
   it("lets an edit supersede an in-flight background depth recovery", async () => {
     vi.useFakeTimers();
-    const first: TableData = {
-      ...table,
+    const first = pagedTable({
       revision: 2,
       rows: [{ id: "row", position: 0, cells: { status: "Current" } }],
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row" },
-      rowCount: 2,
-    };
+    });
     const staleFirst = { ...first, revision: 1 };
     const staleSecond: TableData = {
       ...first,
@@ -3065,11 +3034,8 @@ describe("TablePage", () => {
     await renderActiveEditor();
 
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
+    await drainStaleRetries();
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(pageOneLoads).toBe(6);
 
@@ -3089,12 +3055,10 @@ describe("TablePage", () => {
 
   it("does not report a background rejection superseded by a newly queued edit", async () => {
     vi.useFakeTimers();
-    const first: TableData = {
-      ...tableWithValue("Current", 2),
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row" },
-      rowCount: 2,
-    };
+    const first = pagedTable({
+      revision: 2,
+      rows: [{ id: "row", position: 0, cells: { status: "Current" } }],
+    });
     const staleFirst = { ...first, revision: 1 };
     const staleSecond: TableData = {
       ...first,
@@ -3126,11 +3090,8 @@ describe("TablePage", () => {
     await renderActiveEditor();
 
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
+    await drainStaleRetries();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
     for (const [index, background] of backgrounds.entries()) {
@@ -3157,12 +3118,10 @@ describe("TablePage", () => {
 
   it("lets a foreground page-one reload retire a deeper recovery target", async () => {
     vi.useFakeTimers();
-    const first: TableData = {
-      ...tableWithValue("Current", 2),
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row" },
-      rowCount: 2,
-    };
+    const first = pagedTable({
+      revision: 2,
+      rows: [{ id: "row", position: 0, cells: { status: "Current" } }],
+    });
     const staleFirst = { ...first, revision: 1 };
     const staleSecond: TableData = {
       ...first,
@@ -3195,11 +3154,8 @@ describe("TablePage", () => {
     await renderActiveEditor();
 
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
+    await drainStaleRetries();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
     expect(appendLoads).toBe(3);
 
@@ -3265,13 +3221,9 @@ describe("TablePage", () => {
   });
 
   it("appends the next page when the user's own save commits while it loads", async () => {
-    const first: TableData = {
-      ...table,
+    const first = pagedTable({
       rows: [{ id: "row-1", position: 0, cells: { status: "One" } }],
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row-1" },
-      rowCount: 2,
-    };
+    });
     const append = deferred<{ table: TableData }>();
     vi.mocked(api).mockImplementation((path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
@@ -3315,13 +3267,9 @@ describe("TablePage", () => {
   });
 
   it("rebuilds unsorted rows when an insertion commits during a keyset request", async () => {
-    const first: TableData = {
-      ...table,
+    const first = pagedTable({
       rows: [{ id: "row-1", position: 0, cells: { status: "One" } }],
-      hasMore: true,
-      nextCursor: { position: 0, rowId: "row-1" },
-      rowCount: 2,
-    };
+    });
     const staleSecond: TableData = {
       ...first,
       rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
@@ -3970,9 +3918,7 @@ describe("TablePage", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
     await act(() => vi.advanceTimersByTimeAsync(0));
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
     expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
     expect(sortedLoads).toBe(4);
@@ -4386,15 +4332,12 @@ describe("TablePage", () => {
     const input = screen.getByDisplayValue("Ready");
     fireEvent.change(input, { target: { value: "Uncertain" } });
     fireEvent.blur(input);
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
 
     expect(screen.getByText("The table kept returning an older revision.")).toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
-    await act(() => vi.advanceTimersByTimeAsync(50));
-    await act(() => vi.advanceTimersByTimeAsync(200));
+    await drainStaleRetries();
 
     expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
