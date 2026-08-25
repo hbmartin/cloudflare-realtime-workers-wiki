@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import type { ClientMemberContext } from "../shared/types";
 import type { Page, TableData, TableLeaseResponse, TableLeaseTiming } from "../shared/types";
 import { ApiClientError, api } from "./api";
-import { STALE_REVISION_RETRY_DELAYS_MS, TablePage } from "./TablePage";
+import { TablePage } from "./TablePage";
 
 vi.mock("./api", async (importOriginal) => {
   const original = await importOriginal<typeof import("./api")>();
@@ -78,9 +78,8 @@ function pagedTable(overrides: Partial<TableData> & { rows: TableData["rows"] })
 
 async function drainStaleRetries() {
   await act(() => vi.advanceTimersByTimeAsync(0));
-  for (const delay of STALE_REVISION_RETRY_DELAYS_MS) {
-    await act(() => vi.advanceTimersByTimeAsync(delay));
-  }
+  await act(() => vi.advanceTimersByTimeAsync(50));
+  await act(() => vi.advanceTimersByTimeAsync(200));
 }
 
 function tableWithTwoTextCells(revision = 1): TableData {
@@ -2907,7 +2906,7 @@ describe("TablePage", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("keeps background depth recovery armed across incomplete pagination", async () => {
+  it("keeps background depth recovery armed across persistent incomplete pagination", async () => {
     vi.useFakeTimers();
     const first = pagedTable({
       revision: 2,
@@ -2930,11 +2929,12 @@ describe("TablePage", () => {
     };
     let pageOneLoads = 0;
     let appendLoads = 0;
+    let paginationFixed = false;
     vi.mocked(api).mockImplementation((path) => {
       if (String(path).includes("count=true")) {
         pageOneLoads += 1;
-        if (pageOneLoads === 1 || pageOneLoads >= 6) return Promise.resolve({ table: first });
-        if (pageOneLoads === 5) return Promise.resolve({ table: malformedFirst });
+        if (pageOneLoads === 1 || paginationFixed) return Promise.resolve({ table: first });
+        if (pageOneLoads >= 5) return Promise.resolve({ table: malformedFirst });
         return Promise.resolve({ table: staleFirst });
       }
       appendLoads += 1;
@@ -2956,9 +2956,22 @@ describe("TablePage", () => {
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(10_000));
-
     expect(pageOneLoads).toBe(6);
+    expect(screen.queryByText("The table returned incomplete pagination information.")).not.toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+
+    expect(pageOneLoads).toBe(7);
+    expect(screen.getByDisplayValue("Current first")).toBeInTheDocument();
+    expect(screen.getByText("The table returned incomplete pagination information.")).toBeInTheDocument();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+
+    paginationFixed = true;
+    await act(() => vi.advanceTimersByTimeAsync(40_000));
+
+    expect(pageOneLoads).toBe(8);
     expect(screen.getByDisplayValue("Current second")).toBeInTheDocument();
+    expect(screen.queryByText("The table returned incomplete pagination information.")).not.toBeInTheDocument();
     expect(
       screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
     ).not.toBeInTheDocument();
@@ -3004,6 +3017,45 @@ describe("TablePage", () => {
     expect(
       screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
     ).not.toBeInTheDocument();
+  });
+
+  it("rearms the ordinary refresh interval after recovery backoff", async () => {
+    vi.useFakeTimers();
+    const current = tableWithValue("Current", 2);
+    const stale = tableWithValue("Stale", 1);
+    const sorted = { ...current, sort: "status" };
+    let plainLoads = 0;
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        return Promise.resolve({ table: sorted });
+      }
+      plainLoads += 1;
+      return Promise.resolve({ table: plainLoads === 1 ? current : stale });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await drainStaleRetries();
+    expect(plainLoads).toBe(4);
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(plainLoads).toBe(5);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(sortedLoads).toBe(1);
+    expect(
+      screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
+    ).not.toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(4_999));
+    expect(sortedLoads).toBe(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(sortedLoads).toBe(2);
   });
 
   it("does not dismiss delayed recovery when only an appended page reaches its floor", async () => {
@@ -3113,7 +3165,7 @@ describe("TablePage", () => {
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
   });
 
-  it("backs off and reports repeated background rejections superseded by newly queued edits", async () => {
+  it("does not report background rejections superseded by newly queued edits", async () => {
     vi.useFakeTimers();
     const first = pagedTable({
       revision: 2,
@@ -3160,7 +3212,7 @@ describe("TablePage", () => {
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
     for (const [index, background] of backgrounds.entries()) {
-      await act(() => vi.advanceTimersByTimeAsync(5_000 * 2 ** index));
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
       expect(backgroundLoads).toBe(index + 1);
       const value = `Saved while polling ${index + 1}`;
       const input = screen.getByDisplayValue(index === 0 ? "Current" : `Saved while polling ${index}`);
@@ -3174,11 +3226,11 @@ describe("TablePage", () => {
       });
 
       expect(screen.getByDisplayValue(value)).toBeEnabled();
-      expect(screen.queryByText("Obsolete background failure.") !== null).toBe(index === backgrounds.length - 1);
+      expect(screen.queryByText("Obsolete background failure.")).not.toBeInTheDocument();
     }
 
     expect(pageOneLoads).toBe(8);
-    expect(screen.getByText("Obsolete background failure.")).toBeInTheDocument();
+    expect(screen.queryByText("Obsolete background failure.")).not.toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
   });
 
