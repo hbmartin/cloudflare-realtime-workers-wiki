@@ -22,6 +22,7 @@ type RevisionRecoveryOptions = {
   minimumRevision?: number | null;
   ownerIsCurrent?: IsCurrent;
   background?: boolean;
+  onFailure?: (cause: unknown) => void;
 };
 type TableSortState = {
   column: string | null;
@@ -32,12 +33,14 @@ type StaleRevisionFailure = "throw" | "keep-current" | "invalidate";
 type LoadOptions = {
   background?: boolean;
   minimumRevision?: number | null;
+  onFailure?: (cause: unknown) => void;
   staleRevisionFailure?: StaleRevisionFailure;
   retryStaleRevision?: boolean;
 };
 type RestoreDepthOptions = {
   ownerIsCurrent?: IsCurrent;
   background?: boolean;
+  onFailure?: (cause: unknown) => void;
   staleRevisionFailure?: StaleRevisionFailure;
   preserveDepthOnChurn?: boolean;
   retryStaleRevision?: boolean;
@@ -48,6 +51,7 @@ type RevisionRecoveryTarget = {
   sortKey: string;
   appendedPageTarget: number;
 };
+type RevisionPollMode = "off" | "recovery" | "refresh";
 
 const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing.";
 const LEASE_EXPIRED_MESSAGE = "The editing lease expired. Reloaded the authoritative table.";
@@ -64,7 +68,7 @@ const STALE_REFRESH_MESSAGE = "Table refresh is delayed while waiting for the la
 const STALE_TABLE_REVISION_MESSAGE = "The table kept returning an older revision.";
 const INVALID_TABLE_PAGINATION_MESSAGE = "The table returned incomplete pagination information.";
 const REQUEST_TIMEOUT_MS = 15_000;
-const STALE_REVISION_RETRY_DELAYS_MS = [50, 200] as const;
+export const STALE_REVISION_RETRY_DELAYS_MS = [50, 200] as const;
 const REVISION_POLL_INTERVAL_MS = 5_000;
 const REVISION_POLL_MAX_BACKOFF_MS = 60_000;
 const REVISION_RECOVERY_ERROR_THRESHOLD = 3;
@@ -123,6 +127,13 @@ class StaleTableRevisionError extends Error {
   constructor() {
     super(STALE_TABLE_REVISION_MESSAGE);
     this.name = "StaleTableRevisionError";
+  }
+}
+
+class IncompleteTablePaginationError extends Error {
+  constructor() {
+    super(INVALID_TABLE_PAGINATION_MESSAGE);
+    this.name = "IncompleteTablePaginationError";
   }
 }
 
@@ -312,9 +323,9 @@ export function TablePage({
   const mutationGenerationRef = useRef(0);
   const pendingMutationsRef = useRef(0);
   const wakeRevisionRecoveryRef = useRef<() => boolean>(() => false);
+  const configureRevisionPollingRef = useRef<(mode: RevisionPollMode) => void>(() => undefined);
+  const revisionPollModeRef = useRef<RevisionPollMode>("off");
   const revisionRecoveryWakePendingRef = useRef(false);
-  const revisionRecoveryDelayedFailuresRef = useRef(0);
-  const revisionRecoveryConsecutiveErrorsRef = useRef(0);
   const mountedRef = useRef(true);
   const loadGenerationRef = useRef(0);
   // A generation can advance before its request settles. Remember which
@@ -348,8 +359,6 @@ export function TablePage({
     revisionRecoveryTargetRef.current = null;
     revisionRecoveryPendingRef.current = false;
     revisionRecoveryWakePendingRef.current = false;
-    revisionRecoveryDelayedFailuresRef.current = 0;
-    revisionRecoveryConsecutiveErrorsRef.current = 0;
     setRevisionRecoveryPending(false);
     setRevisionRecoveryError(null);
   }, []);
@@ -476,9 +485,18 @@ export function TablePage({
 
   const changeLoadCount = useCallback((delta: 1 | -1, background: boolean) => {
     loadsInFlightRef.current += delta;
-    if (background) return;
-    userLoadsInFlightRef.current += delta;
-    if (mountedRef.current) setTableBusy(userLoadsInFlightRef.current > 0);
+    if (!background) {
+      userLoadsInFlightRef.current += delta;
+      if (mountedRef.current) setTableBusy(userLoadsInFlightRef.current > 0);
+    }
+    if (
+      delta === -1 &&
+      !loadsInFlightRef.current &&
+      !pendingMutationsRef.current &&
+      revisionRecoveryWakePendingRef.current
+    ) {
+      wakeRevisionRecoveryRef.current();
+    }
   }, []);
 
   const handleStaleRevisionFailure = useCallback(
@@ -528,13 +546,19 @@ export function TablePage({
   );
 
   const adoptAuthoritativeTable = useCallback(
-    (authoritative: TableData, appendedPages: number, leaseConflictGeneration: number, background: boolean) => {
+    (
+      authoritative: TableData,
+      appendedPages: number,
+      leaseConflictGeneration: number,
+      background: boolean,
+      loadGeneration: number,
+    ) => {
       const recoveryFloor = revisionRecoveryFloorRef.current;
       if (recoveryFloor !== null && authoritative.revision < recoveryFloor) {
         throw new StaleTableRevisionError();
       }
       revisionRef.current = authoritative.revision;
-      authoritativeLoadGenerationRef.current = loadGenerationRef.current;
+      authoritativeLoadGenerationRef.current = loadGeneration;
       setRevisionKnown(true);
       const validRows = new Set(authoritative.rows.map((row) => row.id));
       const validColumns = new Set(authoritative.columns.map((column) => column.id));
@@ -587,6 +611,7 @@ export function TablePage({
       const {
         background = false,
         minimumRevision = null,
+        onFailure,
         staleRevisionFailure = "throw",
         retryStaleRevision = true,
       } = options;
@@ -614,8 +639,8 @@ export function TablePage({
           requestIsCurrent,
           retryStaleRevision ? STALE_REVISION_RETRY_DELAYS_MS : [],
         );
-        if (!result) return "superseded";
-        adoptAuthoritativeTable(result.table, 0, leaseConflictGeneration, background);
+        if (!result || !requestIsCurrent()) return "superseded";
+        adoptAuthoritativeTable(result.table, 0, leaseConflictGeneration, background, generation);
         return "adopted";
       } catch (cause) {
         const recoveryFloor = currentRevisionFloor(minimumRevision);
@@ -626,6 +651,7 @@ export function TablePage({
           return loadTable(isCurrent, {
             background,
             minimumRevision: invalidSortRecovery.minimumRevision,
+            onFailure,
             staleRevisionFailure: INVALID_SORT_STALE_REVISION_FAILURE,
             retryStaleRevision,
           });
@@ -637,9 +663,13 @@ export function TablePage({
           // load superseded this one re-checks the page either way.
           markPageUnavailable(cause.message);
         } else if (!requestIsCurrent()) {
+          onFailure?.(cause);
           return "superseded";
-        } else if (!background || !revisionRecoveryPendingRef.current) {
-          setLoadError(errorMessage(cause, "Table could not be loaded."));
+        } else {
+          onFailure?.(cause);
+          if (!background || !revisionRecoveryPendingRef.current) {
+            setLoadError(errorMessage(cause, "Table could not be loaded."));
+          }
         }
         throw cause;
       } finally {
@@ -667,6 +697,7 @@ export function TablePage({
       const {
         ownerIsCurrent = isMounted,
         background = false,
+        onFailure,
         staleRevisionFailure = "throw",
         preserveDepthOnChurn = false,
         retryStaleRevision = true,
@@ -703,6 +734,7 @@ export function TablePage({
         return load(ownerIsCurrent, {
           background,
           minimumRevision,
+          onFailure,
           staleRevisionFailure,
           retryStaleRevision,
         });
@@ -768,9 +800,12 @@ export function TablePage({
         if (requiredRevision !== null && restored.revision < requiredRevision) {
           throw new StaleTableRevisionError();
         }
-        adoptAuthoritativeTable(restored, appendedPages, leaseConflictGeneration, background);
+        if (incompletePagination && background) {
+          deferRevisionRecovery(requiredRevision, currentPage, appendedPageTarget);
+          throw new IncompleteTablePaginationError();
+        }
+        adoptAuthoritativeTable(restored, appendedPages, leaseConflictGeneration, background, generation);
         if (incompletePagination) {
-          clearRevisionRecovery();
           setLoadError(INVALID_TABLE_PAGINATION_MESSAGE);
         }
         return "adopted";
@@ -790,6 +825,7 @@ export function TablePage({
           return load(ownerIsCurrent, {
             background,
             minimumRevision: invalidSortRecovery.minimumRevision,
+            onFailure,
             staleRevisionFailure: INVALID_SORT_STALE_REVISION_FAILURE,
             retryStaleRevision,
           });
@@ -797,9 +833,13 @@ export function TablePage({
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
           markPageUnavailable(cause.message);
         } else if (!isCurrent()) {
+          onFailure?.(cause);
           return "superseded";
-        } else if (!background || !revisionRecoveryPendingRef.current) {
-          setLoadError(errorMessage(cause, DEPTH_RESTORE_MESSAGE));
+        } else {
+          onFailure?.(cause);
+          if (!background || !revisionRecoveryPendingRef.current) {
+            setLoadError(errorMessage(cause, DEPTH_RESTORE_MESSAGE));
+          }
         }
         throw cause;
       } finally {
@@ -809,7 +849,6 @@ export function TablePage({
     [
       adoptAuthoritativeTable,
       changeLoadCount,
-      clearRevisionRecovery,
       currentRevisionFloor,
       deferRevisionRecovery,
       handleStaleRevisionFailure,
@@ -993,6 +1032,7 @@ export function TablePage({
       minimumRevision = null,
       ownerIsCurrent = isMounted,
       background = false,
+      onFailure,
     }: RevisionRecoveryOptions = {}): Promise<TableLoadOutcome> => {
       const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
       const pendingTarget = revisionRecoveryTargetRef.current;
@@ -1003,34 +1043,34 @@ export function TablePage({
       const recoveryFloor = currentRevisionFloor(minimumRevision, currentPage?.revision);
       preserveRevisionFloor(recoveryFloor);
       const canRestoreCurrentDepth = currentPage && tableSortKey(currentPage.sort, currentPage.dir) === activeSort;
-      let outcome: TableLoadOutcome;
-      let recoveryLoadGeneration: number | null = null;
       if (background && canRestoreCurrentDepth) {
         // Every background revision-recovery poll is one bounded depth probe. Its
         // outer scheduler owns retries and backoff.
-        outcome = await restoreDepthNow(currentPage, appendedPageTarget, recoveryFloor, {
+        return restoreDepthNow(currentPage, appendedPageTarget, recoveryFloor, {
           ownerIsCurrent,
           background: true,
+          onFailure,
           staleRevisionFailure: "keep-current",
           preserveDepthOnChurn: true,
           retryStaleRevision: false,
         });
-      } else {
-        const pendingLoad = load(ownerIsCurrent, {
-          background,
-          minimumRevision: recoveryFloor,
-          staleRevisionFailure: background ? "keep-current" : "throw",
-          retryStaleRevision: !background,
-        });
-        recoveryLoadGeneration = loadGenerationRef.current;
-        outcome = await pendingLoad;
       }
+      let pendingLoad = load(ownerIsCurrent, {
+        background,
+        minimumRevision: recoveryFloor,
+        onFailure,
+        staleRevisionFailure: background ? "keep-current" : "throw",
+        retryStaleRevision: !background,
+      });
+      let recoveryLoadGeneration = loadGenerationRef.current;
+      let outcome = await pendingLoad;
       // A foreground sort change can supersede this request before its replacement
       // finishes. Own one final page-one load for the live sort. Background polls
       // return the supersession outcome so their scheduler can retry promptly.
       if (outcome === "superseded" && revisionRef.current === null && ownerIsCurrent() && !background) {
-        const pendingLoad = load(ownerIsCurrent, {
+        pendingLoad = load(ownerIsCurrent, {
           minimumRevision: recoveryFloor,
+          onFailure,
           staleRevisionFailure: "throw",
         });
         recoveryLoadGeneration = loadGenerationRef.current;
@@ -1039,7 +1079,6 @@ export function TablePage({
       if (
         !background &&
         outcome === "adopted" &&
-        recoveryLoadGeneration !== null &&
         authoritativeLoadGenerationRef.current === recoveryLoadGeneration &&
         canRestoreCurrentDepth &&
         appendedPageTarget > 0 &&
@@ -1269,18 +1308,39 @@ export function TablePage({
     };
   }, [load, acquire, canEdit, reportLeaseError]);
 
+  const revisionPollMode: RevisionPollMode = terminalPageUnavailable
+    ? "off"
+    : revisionRecoveryPending || !revisionKnown
+      ? "recovery"
+      : leaseToken && tableLoaded
+        ? "off"
+        : "refresh";
+
+  // Keep one scheduler alive across the recovery state transitions caused by its
+  // own requests. A small mode effect below starts and stops it without discarding
+  // backoff or an in-flight attempt's accounting.
   useEffect(() => {
-    if (terminalPageUnavailable || (!revisionRecoveryPending && leaseToken && tableLoaded && revisionKnown)) {
-      return undefined;
-    }
+    revisionPollModeRef.current = revisionPollMode;
+    configureRevisionPollingRef.current(revisionPollMode);
+  }, [revisionPollMode]);
+
+  useEffect(() => {
     let active = true;
+    let mode: RevisionPollMode = "off";
     let pollTimer: number | undefined;
     let pollRunning = false;
     let wakeAfterRunning = false;
-    const isCurrent = () => active && mountedRef.current;
+    let delayedFailures = 0;
+    let consecutiveRecoveryErrors = 0;
+    const isCurrent = () => active && mode !== "off" && mountedRef.current;
     const recoveryIsActive = () => revisionRecoveryPendingRef.current || revisionRef.current === null;
+    const resetFailureState = () => {
+      delayedFailures = 0;
+      consecutiveRecoveryErrors = 0;
+      if (mountedRef.current) setRevisionRecoveryError(null);
+    };
     const armPoll = (delay: number) => {
-      if (!active) return;
+      if (!active || mode === "off") return;
       if (pollTimer !== undefined) window.clearTimeout(pollTimer);
       pollTimer = window.setTimeout(() => {
         pollTimer = undefined;
@@ -1290,20 +1350,16 @@ export function TablePage({
     const schedulePoll = () =>
       armPoll(
         recoveryIsActive()
-          ? Math.min(
-              REVISION_POLL_INTERVAL_MS * 2 ** revisionRecoveryDelayedFailuresRef.current,
-              REVISION_POLL_MAX_BACKOFF_MS,
-            )
+          ? Math.min(REVISION_POLL_INTERVAL_MS * 2 ** delayedFailures, REVISION_POLL_MAX_BACKOFF_MS)
           : REVISION_POLL_INTERVAL_MS,
       );
     async function poll() {
-      if (!active) return;
-      if (pollRunning) {
-        wakeAfterRunning = true;
-        return;
-      }
+      if (!isCurrent()) return;
       if (loadsInFlightRef.current || pendingMutationsRef.current) {
-        schedulePoll();
+        // A requested wake stays prompt while another foreground operation owns
+        // the load slot. Its completion also calls wakePoll through changeLoadCount.
+        if (revisionRecoveryWakePendingRef.current) armPoll(REVISION_POLL_INTERVAL_MS);
+        else schedulePoll();
         return;
       }
       pollRunning = true;
@@ -1313,47 +1369,55 @@ export function TablePage({
       const pollRequestIsCurrent = () => isCurrent() && mutationGeneration === mutationGenerationRef.current;
       let delayedOutcome: TableLoadOutcome | null = null;
       let recoveryError: unknown = null;
+      const recordFailure = (cause: unknown) => {
+        recoveryError ??= cause;
+      };
       try {
         if (recoveryWasActive) {
-          const pendingRecovery = attemptRevisionRecovery({ ownerIsCurrent: isCurrent, background: true });
-          delayedOutcome = await pendingRecovery;
+          delayedOutcome = await attemptRevisionRecovery({
+            ownerIsCurrent: isCurrent,
+            background: true,
+            onFailure: recordFailure,
+          });
         } else if (!appendedPagesRef.current) {
-          const pendingLoad = load(isCurrent, { background: true, staleRevisionFailure: "keep-current" });
-          delayedOutcome = await pendingLoad;
+          delayedOutcome = await load(isCurrent, {
+            background: true,
+            onFailure: recordFailure,
+            staleRevisionFailure: "keep-current",
+          });
         }
       } catch (cause) {
-        if (!pollRequestIsCurrent()) {
-          delayedOutcome = "superseded";
-        } else {
-          delayedOutcome = "retry";
-          recoveryError = cause;
-        }
+        recordFailure(cause);
+        delayedOutcome = pollRequestIsCurrent() ? "retry" : "superseded";
       }
       if (!active) {
         pollRunning = false;
         return;
       }
+      if (mode === "off") {
+        pollRunning = false;
+        return;
+      }
       if (recoveryIsActive()) {
-        // A user action that superseded the poll should get another prompt retry;
-        // successful progress also resets backoff, while replica failures and
-        // churn back off to avoid multiplying deep reads.
-        revisionRecoveryDelayedFailuresRef.current =
-          !recoveryWasActive || delayedOutcome === "superseded" || delayedOutcome === "adopted"
+        // Superseded data is harmless, but a request that rejected before being
+        // superseded still contributes to transport backoff and error reporting.
+        delayedFailures =
+          !recoveryWasActive || delayedOutcome === "adopted"
             ? 0
-            : Math.min(revisionRecoveryDelayedFailuresRef.current + 1, 4);
-        if (recoveryWasActive && recoveryError && revisionRecoveryPendingRef.current) {
-          revisionRecoveryConsecutiveErrorsRef.current += 1;
-          if (revisionRecoveryConsecutiveErrorsRef.current >= REVISION_RECOVERY_ERROR_THRESHOLD) {
+            : recoveryError || delayedOutcome !== "superseded"
+              ? Math.min(delayedFailures + 1, 4)
+              : 0;
+        if (recoveryWasActive && delayedOutcome !== "adopted" && recoveryError && revisionRecoveryPendingRef.current) {
+          consecutiveRecoveryErrors += 1;
+          if (consecutiveRecoveryErrors >= REVISION_RECOVERY_ERROR_THRESHOLD) {
             setRevisionRecoveryError(errorMessage(recoveryError, DEPTH_RESTORE_MESSAGE));
           }
         } else {
-          revisionRecoveryConsecutiveErrorsRef.current = 0;
+          consecutiveRecoveryErrors = 0;
           setRevisionRecoveryError(null);
         }
       } else {
-        revisionRecoveryDelayedFailuresRef.current = 0;
-        revisionRecoveryConsecutiveErrorsRef.current = 0;
-        setRevisionRecoveryError(null);
+        resetFailureState();
       }
       pollRunning = false;
       if (wakeAfterRunning) {
@@ -1364,34 +1428,45 @@ export function TablePage({
       }
     }
     const wakePoll = () => {
-      if (!active) return false;
+      if (!active || mode === "off") return false;
       revisionRecoveryWakePendingRef.current = true;
       if (pollRunning) wakeAfterRunning = true;
       else armPoll(0);
       return true;
     };
+    const configurePoll = (nextMode: RevisionPollMode) => {
+      if (!active || mode === nextMode) return;
+      const previousMode = mode;
+      mode = nextMode;
+      if (mode === "off") {
+        if (pollTimer !== undefined) {
+          window.clearTimeout(pollTimer);
+          pollTimer = undefined;
+        }
+        wakeAfterRunning = false;
+        revisionRecoveryWakePendingRef.current = false;
+        resetFailureState();
+        return;
+      }
+      if (previousMode === "recovery" && mode !== "recovery") resetFailureState();
+      if (pollRunning || pollTimer !== undefined) return;
+      if (revisionRecoveryWakePendingRef.current && !pendingMutationsRef.current) wakePoll();
+      else schedulePoll();
+    };
     wakeRevisionRecoveryRef.current = wakePoll;
-    if (revisionRecoveryWakePendingRef.current && !pendingMutationsRef.current) {
-      wakePoll();
-    } else {
-      schedulePoll();
-    }
+    configureRevisionPollingRef.current = configurePoll;
+    configurePoll(revisionPollModeRef.current);
     return () => {
       active = false;
       if (wakeRevisionRecoveryRef.current === wakePoll) {
         wakeRevisionRecoveryRef.current = () => false;
       }
+      if (configureRevisionPollingRef.current === configurePoll) {
+        configureRevisionPollingRef.current = () => undefined;
+      }
       if (pollTimer !== undefined) window.clearTimeout(pollTimer);
     };
-  }, [
-    attemptRevisionRecovery,
-    leaseToken,
-    load,
-    revisionKnown,
-    revisionRecoveryPending,
-    tableLoaded,
-    terminalPageUnavailable,
-  ]);
+  }, [attemptRevisionRecovery, load]);
 
   useEffect(() => {
     if (!leaseToken) return undefined;
