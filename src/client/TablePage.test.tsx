@@ -3165,9 +3165,12 @@ describe("TablePage", () => {
     });
     expect(screen.getByDisplayValue("Saved while polling")).toBeEnabled();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(pageOneLoads).toBe(7);
   });
 
-  it("preserves failure backoff while retrying promptly after superseding edits", async () => {
+  it("backs off and reports background rejections superseded by newly queued edits", async () => {
     vi.useFakeTimers();
     const first = pagedTable({
       revision: 2,
@@ -3214,52 +3217,32 @@ describe("TablePage", () => {
     await drainStaleRetries();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
-    const initialRetryDelay = 5_000 * 2 ** 0;
-    await act(() => vi.advanceTimersByTimeAsync(initialRetryDelay - 1));
-    expect(backgroundLoads).toBe(0);
-    await act(() => vi.advanceTimersByTimeAsync(1));
-    expect(backgroundLoads).toBe(1);
+    for (const [index, background] of backgrounds.slice(0, 3).entries()) {
+      const retryDelay = 5_000 * 2 ** index;
+      await act(() => vi.advanceTimersByTimeAsync(retryDelay - 1));
+      expect(backgroundLoads).toBe(index);
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(backgroundLoads).toBe(index + 1);
+      const value = `Saved while polling ${index + 1}`;
+      const input = screen.getByDisplayValue(index === 0 ? "Current" : `Saved while polling ${index}`);
+      fireEvent.change(input, { target: { value } });
+      fireEvent.blur(input);
+      await act(() => vi.advanceTimersByTimeAsync(0));
 
-    const firstInput = screen.getByDisplayValue("Current");
-    fireEvent.change(firstInput, { target: { value: "Saved while first poll" } });
-    fireEvent.blur(firstInput);
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(async () => {
-      backgrounds[0]!.reject();
-      await backgrounds[0]!.promise.catch(() => undefined);
-    });
-    expect(screen.getByDisplayValue("Saved while first poll")).toBeEnabled();
-    expect(screen.queryByText("The table depth could not be restored.")).not.toBeInTheDocument();
+      await act(async () => {
+        background.reject(new Error("Obsolete background failure."));
+        await background.promise.catch(() => undefined);
+      });
 
-    // The completed edit wakes one immediate retry, while the falsy rejection
-    // above still counts toward both backoff and the consecutive-error threshold.
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    expect(backgroundLoads).toBe(2);
-    await act(async () => {
-      backgrounds[1]!.reject(new Error("Obsolete background failure."));
-      await backgrounds[1]!.promise.catch(() => undefined);
-    });
-    expect(screen.queryByText("Obsolete background failure.")).not.toBeInTheDocument();
+      expect(screen.getByDisplayValue(value)).toBeEnabled();
+      expect(screen.queryByText("Obsolete background failure.") !== null).toBe(index === 2);
+    }
 
-    const thirdRetryDelay = 5_000 * 2 ** 2;
-    await act(() => vi.advanceTimersByTimeAsync(thirdRetryDelay - 1));
-    expect(backgroundLoads).toBe(2);
-    await act(() => vi.advanceTimersByTimeAsync(1));
+    await act(() => vi.advanceTimersByTimeAsync(39_999));
     expect(backgroundLoads).toBe(3);
-
-    const thirdInput = screen.getByDisplayValue("Saved while first poll");
-    fireEvent.change(thirdInput, { target: { value: "Saved while third poll" } });
-    fireEvent.blur(thirdInput);
-    await act(() => vi.advanceTimersByTimeAsync(0));
-    await act(async () => {
-      backgrounds[2]!.reject(new Error("Obsolete background failure."));
-      await backgrounds[2]!.promise.catch(() => undefined);
-    });
-    expect(screen.getByText("Obsolete background failure.")).toBeInTheDocument();
-
-    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(1));
     expect(backgroundLoads).toBe(4);
-    const input = screen.getByDisplayValue("Saved while third poll");
+    const input = screen.getByDisplayValue("Saved while polling 3");
     fireEvent.change(input, { target: { value: "Saved while final poll" } });
     fireEvent.blur(input);
     await act(() => vi.advanceTimersByTimeAsync(0));
@@ -3271,8 +3254,99 @@ describe("TablePage", () => {
 
     expect(pageOneLoads).toBe(9);
     expect(screen.getByDisplayValue("Saved while final poll")).toBeEnabled();
-    expect(screen.queryByText("Obsolete background failure.")).not.toBeInTheDocument();
+    expect(screen.getByText("Obsolete background failure.")).toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+  });
+
+  it("wakes unknown-revision recovery after a mutation clears the last depth target", async () => {
+    vi.useFakeTimers();
+    const first = pagedTable({
+      revision: 2,
+      rows: [{ id: "row", position: 0, cells: { status: "Current" } }],
+    });
+    const staleFirst = { ...first, revision: 1 };
+    const staleSecond: TableData = {
+      ...first,
+      revision: 1,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Stale" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    const sorted: TableData = {
+      ...first,
+      sort: "status",
+      hasMore: false,
+      nextCursor: null,
+      nextOffset: null,
+      rowCount: 1,
+    };
+    const backgroundPoll = deferred<{ table: TableData }>();
+    const save = deferred<{ revision: number }>();
+    const failedSaveReload = deferred<{ table: TableData }>();
+    let pageOneLoads = 0;
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (init?.method === "PUT") return save.promise;
+      if (String(path).includes("count=true") && String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        if (sortedLoads === 1) return Promise.resolve({ table: sorted });
+        if (sortedLoads === 2) return failedSaveReload.promise;
+        return Promise.resolve({
+          table: {
+            ...sorted,
+            revision: 3,
+            rows: [{ id: "row", position: 0, cells: { status: "Recovered" } }],
+          },
+        });
+      }
+      if (String(path).includes("count=true")) {
+        pageOneLoads += 1;
+        if (pageOneLoads <= 2) return Promise.resolve({ table: first });
+        if (pageOneLoads <= 5) return Promise.resolve({ table: staleFirst });
+        return backgroundPoll.promise;
+      }
+      return Promise.resolve({ table: staleSecond });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await drainStaleRetries();
+    await drainStaleRetries();
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(pageOneLoads).toBe(6);
+
+    const input = screen.getByDisplayValue("Current");
+    fireEvent.change(input, { target: { value: "Uncertain" } });
+    fireEvent.blur(input);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(sortedLoads).toBe(1);
+
+    await act(async () => {
+      save.reject(new DOMException("The operation timed out.", "TimeoutError"));
+      await save.promise.catch(() => undefined);
+    });
+    expect(sortedLoads).toBe(2);
+
+    await act(async () => {
+      backgroundPoll.resolve({ table: first });
+      await backgroundPoll.promise;
+    });
+    await act(async () => {
+      failedSaveReload.reject(new ApiClientError(503, "table_unavailable", "Table temporarily unavailable."));
+      await failedSaveReload.promise.catch(() => undefined);
+    });
+    expect(screen.getByText("Editing paused while table reloads")).toBeInTheDocument();
+    expect(sortedLoads).toBe(2);
+
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    expect(sortedLoads).toBe(3);
+    expect(screen.getByDisplayValue("Recovered")).toBeEnabled();
   });
 
   it("lets a foreground page-one reload retire a deeper recovery target", async () => {
