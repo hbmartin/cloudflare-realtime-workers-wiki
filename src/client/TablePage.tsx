@@ -220,7 +220,7 @@ function releaseTableLease(pageId: string, leaseToken: string) {
 
 function errorMessage(cause: unknown, fallback: string) {
   if (!(cause instanceof Error)) return fallback;
-  return cause.name === "TimeoutError" ? fallback : cause.message;
+  return cause.name === "TimeoutError" ? fallback : cause.message || fallback;
 }
 
 // The table's page was archived or deleted underneath this view. Terminal for
@@ -294,6 +294,7 @@ export function TablePage({
   const clearSort = useCallback(() => requestSort(null, sortRef.current.dir), [requestSort]);
   // Pages appended past the first. While any are loaded the background poll stands
   // down, so browsing deep into a table is not yanked back to the top every 5s.
+  const [appendedPageCount, setAppendedPageCount] = useState(0);
   const appendedPagesRef = useRef(0);
   // The revision the currently loaded page boundary was computed against. Only
   // `load` and `loadMore` may move it: `nextOffset` is a position in one exact
@@ -600,6 +601,7 @@ export function TablePage({
         return changed ? next : current;
       });
       appendedPagesRef.current = appendedPages;
+      setAppendedPageCount(appendedPages);
       pageSnapshotRevisionRef.current = authoritative.revision;
       sortedSnapshotDirtyRef.current = false;
       unsortedSnapshotDirtyRef.current = false;
@@ -984,6 +986,7 @@ export function TablePage({
       }
       if (!result || !canAppend()) return;
       appendedPagesRef.current += 1;
+      setAppendedPageCount(appendedPagesRef.current);
       pageSnapshotRevisionRef.current = result.table.revision;
       if (revisionRecoveryPendingRef.current) {
         deferRevisionRecovery(currentRevisionFloor(result.table.revision), currentPage, appendedPagesRef.current);
@@ -1316,7 +1319,7 @@ export function TablePage({
     ? "off"
     : revisionRecoveryPending || !revisionKnown
       ? "recovery"
-      : leaseToken && tableLoaded
+      : appendedPageCount > 0 || (leaseToken && tableLoaded)
         ? "off"
         : "refresh";
 
@@ -1338,10 +1341,13 @@ export function TablePage({
     let recoveryFailureStreak = 0;
     const isCurrent = () => active && mode !== "off" && mountedRef.current;
     const recoveryIsActive = () => revisionRecoveryPendingRef.current || revisionRef.current === null;
-    const resetFailureState = () => {
-      delayedFailures = 0;
+    const resetRecoveryFailureState = () => {
       recoveryFailureStreak = 0;
       if (mountedRef.current) setRevisionRecoveryError(null);
+    };
+    const resetFailureState = () => {
+      delayedFailures = 0;
+      resetRecoveryFailureState();
     };
     const clearPollTimer = () => {
       if (pollTimer === undefined) return;
@@ -1357,11 +1363,7 @@ export function TablePage({
       }, delay);
     };
     const schedulePoll = () =>
-      armPoll(
-        recoveryIsActive()
-          ? Math.min(REVISION_POLL_INTERVAL_MS * 2 ** delayedFailures, REVISION_POLL_MAX_BACKOFF_MS)
-          : REVISION_POLL_INTERVAL_MS,
-      );
+      armPoll(Math.min(REVISION_POLL_INTERVAL_MS * 2 ** delayedFailures, REVISION_POLL_MAX_BACKOFF_MS));
     async function poll() {
       if (!isCurrent()) return;
       if (loadsInFlightRef.current || pendingMutationsRef.current) {
@@ -1383,7 +1385,7 @@ export function TablePage({
             ownerIsCurrent: isCurrent,
             background: true,
           });
-        } else if (!appendedPagesRef.current) {
+        } else {
           delayedResult = await load(isCurrent, {
             background: true,
             staleRevisionFailure: "keep-current",
@@ -1399,13 +1401,15 @@ export function TablePage({
         return;
       }
       const recoveryActive = recoveryIsActive();
+      // Superseded data is harmless, but a request that rejected before being
+      // superseded still contributes to transport backoff.
+      if (delayedResult?.outcome === "adopted") delayedFailures = 0;
+      else if (delayedResult?.countsTowardBackoff && (recoveryWasActive || delayedResult.failure !== null)) {
+        delayedFailures += 1;
+      } else {
+        delayedFailures = 0;
+      }
       if (recoveryActive) {
-        // Superseded data is harmless, but a request that rejected before being
-        // superseded still contributes to transport backoff and error reporting.
-        if (!recoveryWasActive || delayedResult?.outcome === "adopted") delayedFailures = 0;
-        else if (delayedResult?.countsTowardBackoff) delayedFailures += 1;
-        else delayedFailures = 0;
-
         const failure = delayedResult?.failure;
         if (recoveryWasActive && failure && revisionRecoveryPendingRef.current) {
           recoveryFailureStreak += 1;
@@ -1417,7 +1421,7 @@ export function TablePage({
           setRevisionRecoveryError(null);
         }
       } else {
-        resetFailureState();
+        resetRecoveryFailureState();
       }
       if (
         recoveryActive &&
