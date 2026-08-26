@@ -1131,17 +1131,23 @@ describe("TablePage", () => {
     [
       "contains malformed JSON",
       () => {
-        throw new InvalidApiResponseError(200);
+        throw new InvalidApiResponseError(
+          200,
+          "/api/tables/table-page/cells/row/status",
+          "application/json",
+          new SyntaxError("Unexpected end of JSON input"),
+        );
       },
     ],
   ])("rejects stale snapshots after a committed mutation response %s", async (_case, invalidResponse) => {
     let loads = 0;
     let mutations = 0;
+    const committedTableBase = tableWithTwoTextCells(2);
     const committedTable: TableData = {
-      ...tableWithTwoTextCells(2),
+      ...committedTableBase,
       rows: [
         {
-          ...tableWithTwoTextCells(2).rows[0]!,
+          ...committedTableBase.rows[0]!,
           cells: { status: "Unconfirmed", notes: "Stable" },
         },
       ],
@@ -4842,7 +4848,16 @@ describe("TablePage", () => {
       rowCount: null,
     };
     const staleFirst = { ...sortedFirst, revision: 4 };
-    const freshUnsorted = tableWithTwoTextCells(5);
+    const freshUnsortedBase = tableWithTwoTextCells(5);
+    const freshUnsorted: TableData = {
+      ...freshUnsortedBase,
+      rows: [
+        {
+          ...freshUnsortedBase.rows[0]!,
+          cells: { status: "Fresh unsorted", notes: "Stable" },
+        },
+      ],
+    };
     const background = deferred<{ table: TableData }>();
     const pendingSave = deferred<{ revision: number }>();
     let puts = 0;
@@ -4911,7 +4926,7 @@ describe("TablePage", () => {
     });
 
     expect(screen.getByDisplayValue("Pending note")).toBeEnabled();
-    const refreshedStatus = screen.getByDisplayValue("Ready");
+    const refreshedStatus = screen.getByDisplayValue("Fresh unsorted");
     fireEvent.change(refreshedStatus, { target: { value: "Saved after recovery" } });
     fireEvent.blur(refreshedStatus);
     await act(() => vi.advanceTimersByTimeAsync(0));

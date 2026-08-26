@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { api, InvalidApiResponseError, json, onApiUnauthorized } from "./api";
+import { api, InvalidApiResponseError, json, onApiUnauthorized, UnreadableApiResponseError } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -68,9 +68,36 @@ describe("api", () => {
   it("distinguishes malformed successful responses", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("not-json", { status: 201 })));
 
-    const request = api("/api/example");
-    await expect(request).rejects.toBeInstanceOf(InvalidApiResponseError);
-    await expect(request).rejects.toMatchObject({ status: 201 });
+    const error = await api("/api/example").catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(InvalidApiResponseError);
+    expect(error).toMatchObject({
+      status: 201,
+      requestPath: "/api/example",
+      contentType: "text/plain;charset=UTF-8",
+      cause: expect.any(SyntaxError),
+    });
+  });
+
+  it("preserves successful response body read failures", async () => {
+    const bodyError = new DOMException("The operation timed out.", "TimeoutError");
+    const response = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "application/json" }),
+      text: vi.fn().mockRejectedValue(bodyError),
+    } as unknown as Response;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+
+    const error = await api("/api/example?view=summary").catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(UnreadableApiResponseError);
+    expect(error).toMatchObject({
+      status: 200,
+      requestPath: "/api/example?view=summary",
+      contentType: "application/json",
+      cause: bodyError,
+    });
   });
 
   it("normalizes API error codes and messages and replaces blank values", async () => {
