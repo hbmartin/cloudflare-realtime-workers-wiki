@@ -13,7 +13,6 @@ import type {
 } from "../shared/types";
 import { ApiClientError, api, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
-import { mergeMutationRevision } from "./table-revision";
 
 type IsCurrent = () => boolean;
 type MutationOptions = {
@@ -71,7 +70,8 @@ const EDITING_ACCESS_LOST_MESSAGE = "Editing access is no longer available. Relo
 const LEASE_VERIFICATION_MESSAGE =
   "Editing was paused because the lease could not be verified after the system clock changed.";
 const SAVE_FAILED_MESSAGE = "The table update could not be saved.";
-const INVALID_MUTATION_RESPONSE_MESSAGE = "The table update was saved, but the server returned an invalid response.";
+const INVALID_MUTATION_RESPONSE_MESSAGE =
+  "The table update outcome could not be confirmed because the server returned an invalid response.";
 const LEASE_LOST_SAVE_MESSAGE = "The table update was not saved because editing access was lost.";
 const REVISION_RECOVERY_SAVE_MESSAGE =
   "The table update was not saved because the authoritative table revision could not be reloaded.";
@@ -201,19 +201,19 @@ function revisionFloor(...revisions: (number | null | undefined)[]) {
   return floor;
 }
 
+class InvalidMutationResponseError extends Error {
+  constructor() {
+    super("A successful table mutation response omitted a valid revision.");
+    this.name = "InvalidMutationResponseError";
+  }
+}
+
 function mutationRevision(result: unknown) {
   const revision = (result as { revision?: unknown } | null)?.revision;
   if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) {
     throw new InvalidMutationResponseError();
   }
   return revision;
-}
-
-class InvalidMutationResponseError extends Error {
-  constructor() {
-    super("A successful table mutation response omitted a valid revision.");
-    this.name = "InvalidMutationResponseError";
-  }
 }
 
 function normalizedInputValue(column: TableColumn, value: string | number | boolean | null) {
@@ -1357,8 +1357,11 @@ export function TablePage({
     };
   }, [load, acquire, canEdit, reportLeaseError]);
 
-  const revisionPollBaseMode: RevisionPollBaseMode =
-    appendedPageCount > 0 || (leaseToken && tableLoaded) ? "off" : "refresh";
+  const revisionPollBaseMode: RevisionPollBaseMode = terminalPageUnavailable
+    ? "off"
+    : appendedPageCount > 0 || (leaseToken && tableLoaded)
+      ? "off"
+      : "refresh";
 
   // The scheduler overlays synchronous recovery refs on this stable render mode.
   // Recovery state can clear and re-arm inside one batched render, so using the
@@ -1735,9 +1738,9 @@ export function TablePage({
           // a newer snapshot while this request was in flight. Never turn an
           // unknown revision back into a known one or regress a newer snapshot;
           // otherwise the committed response can safely advance the known base.
-          const mergedRevision = mergeMutationRevision(revisionRef.current, committedRevision);
-          if (mergedRevision !== null) {
-            revisionRef.current = mergedRevision;
+          const knownRevision = revisionRef.current;
+          if (knownRevision !== null) {
+            revisionRef.current = Math.max(knownRevision, committedRevision);
             setRevisionKnown(true);
           } else {
             preserveRevisionFloor(committedRevision);
@@ -1769,12 +1772,10 @@ export function TablePage({
             return failForLostLease();
           }
           if (cause instanceof InvalidMutationResponseError) {
-            const committedRevisionFloor = currentRevision + 1;
-            preserveRevisionFloor(committedRevisionFloor);
             invalidateRevision();
             setSaveError(INVALID_MUTATION_RESPONSE_MESSAGE);
             resetCellInputAfterLoad(resetKey);
-            await recoverRevision({ minimumRevision: committedRevisionFloor });
+            await recoverRevision({ minimumRevision: currentRevision });
             return null;
           }
           if (cause instanceof ApiClientError && cause.code === "table_revision_conflict") {
