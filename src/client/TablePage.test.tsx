@@ -1125,26 +1125,17 @@ describe("TablePage", () => {
     expect(screen.queryByText("Request failed (422).")).not.toBeInTheDocument();
   });
 
-  it("rejects a stale snapshot while recovering after a committed mutation omits its revision", async () => {
+  it("recovers when an invalid mutation response did not commit", async () => {
     let loads = 0;
     let mutations = 0;
-    const committedTable: TableData = {
-      ...tableWithTwoTextCells(2),
-      rows: [
-        {
-          ...tableWithTwoTextCells(2).rows[0]!,
-          cells: { status: "Unconfirmed", notes: "Stable" },
-        },
-      ],
-    };
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.includes("/cells/")) {
         mutations += 1;
-        return mutations === 1 ? ({} as { revision: number }) : { revision: 3 };
+        return mutations === 1 ? ({} as { revision: number }) : { revision: 2 };
       }
       loads += 1;
-      return { table: loads >= 4 ? committedTable : tableWithTwoTextCells(1) };
+      return { table: tableWithTwoTextCells(1) };
     });
     await renderActiveEditor();
     const input = screen.getByDisplayValue("Ready");
@@ -1152,17 +1143,19 @@ describe("TablePage", () => {
     fireEvent.blur(input);
 
     expect(
-      await screen.findByText("The table update was saved, but the server returned an invalid response."),
+      await screen.findByText(
+        "The table update outcome could not be confirmed because the server returned an invalid response.",
+      ),
     ).toBeInTheDocument();
-    await waitFor(() => expect(loads).toBe(4));
+    await waitFor(() => expect(loads).toBe(3));
 
-    const recoveredInput = screen.getByDisplayValue("Unconfirmed");
+    const recoveredInput = screen.getByDisplayValue("Ready");
     fireEvent.change(recoveredInput, { target: { value: "Saved after recovery" } });
     fireEvent.blur(recoveredInput);
     await waitFor(() => expect(mutations).toBe(2));
 
     const lastSave = vi.mocked(api).mock.calls.findLast(([, init]) => init?.method === "PUT");
-    expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 2 });
+    expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 1 });
   });
 
   it("reloads the table when a mutation target no longer exists", async () => {

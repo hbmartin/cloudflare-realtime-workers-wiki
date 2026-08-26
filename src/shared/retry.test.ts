@@ -43,9 +43,16 @@ describe("jitteredInterval", () => {
   });
 
   it.each([
-    [5_000, 0],
-    [5_000, 4_999],
-  ])("accepts interval %s with boundary spread %s", (interval, spread) => {
-    expect(() => jitteredInterval(interval, spread)).not.toThrow();
-  });
+    [5_000, 0, 0, 5_000],
+    [5_000, 4_999, 0, 1],
+    [5_000, 4_999, 1 - Number.EPSILON, 9_999],
+    [5_000, 4_999.9, 0, 1],
+  ])(
+    "returns a positive delay for interval %s, spread %s, and random value %s",
+    (interval, spread, random, expected) => {
+      vi.spyOn(Math, "random").mockReturnValue(random);
+
+      expect(jitteredInterval(interval, spread)).toBe(expected);
+    },
+  );
 });
