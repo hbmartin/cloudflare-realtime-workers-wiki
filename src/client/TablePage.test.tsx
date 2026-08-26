@@ -162,13 +162,19 @@ async function renderActiveEditor() {
 }
 
 describe("TablePage", () => {
+  let randomSpy: ReturnType<typeof vi.spyOn>;
+
   beforeEach(() => {
     vi.mocked(api).mockReset();
+    // Keep existing interval assertions deterministic. Individual tests can
+    // override this to exercise the lower edge of the jitter window.
+    randomSpy = vi.spyOn(Math, "random").mockReturnValue(1);
   });
 
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
+    randomSpy.mockRestore();
   });
 
   it("keeps viewers read-only and never requests an editing lease", async () => {
@@ -2498,6 +2504,8 @@ describe("TablePage", () => {
 
     expect(api).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(0);
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(api).toHaveBeenCalledTimes(2);
   });
 
   it("keeps load more clickable during a background refresh and discards the stale refresh", async () => {
@@ -2545,6 +2553,8 @@ describe("TablePage", () => {
     });
     expect(screen.getByDisplayValue("One")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Two")).toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(api).toHaveBeenCalledTimes(3);
   });
 
   it("keeps a valid revision usable when an ordinary background refresh stays stale", async () => {
@@ -2602,6 +2612,96 @@ describe("TablePage", () => {
     expect(loads).toBe(4);
     await act(() => vi.advanceTimersByTimeAsync(1));
     expect(loads).toBe(5);
+  });
+
+  it("resets ordinary refresh backoff after a successful foreground load", async () => {
+    vi.useFakeTimers();
+    const current = tableWithValue("Current", 1);
+    const sorted: TableData = { ...tableWithValue("Sorted", 2), sort: "status" };
+    let plainLoads = 0;
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        return Promise.resolve({ table: sorted });
+      }
+      plainLoads += 1;
+      if (plainLoads === 1) return Promise.resolve({ table: current });
+      return Promise.reject(new Error("Refresh unavailable."));
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(plainLoads).toBe(3);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByDisplayValue("Sorted")).toBeInTheDocument();
+    expect(sortedLoads).toBe(1);
+
+    await act(() => vi.advanceTimersByTimeAsync(4_999));
+    expect(sortedLoads).toBe(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(sortedLoads).toBe(2);
+  });
+
+  it("does not restore backoff when an obsolete poll fails after a successful foreground load", async () => {
+    vi.useFakeTimers();
+    const refresh = deferred<{ table: TableData }>();
+    const sorted: TableData = { ...tableWithValue("Sorted", 2), sort: "status" };
+    let plainLoads = 0;
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        return Promise.resolve({ table: sorted });
+      }
+      plainLoads += 1;
+      if (plainLoads === 1) return Promise.resolve({ table: tableWithValue("Current", 1) });
+      return refresh.promise;
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(plainLoads).toBe(2);
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(sortedLoads).toBe(1);
+
+    await act(async () => {
+      refresh.reject(new Error("Obsolete refresh failure."));
+      await refresh.promise.catch(() => undefined);
+    });
+
+    await act(() => vi.advanceTimersByTimeAsync(4_999));
+    expect(sortedLoads).toBe(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(sortedLoads).toBe(2);
+  });
+
+  it("jitters failed ordinary refresh backoff", async () => {
+    vi.useFakeTimers();
+    randomSpy.mockReturnValue(0);
+    let loads = 0;
+    vi.mocked(api).mockImplementation(() => {
+      loads += 1;
+      if (loads === 1) return Promise.resolve({ table });
+      if (loads === 2) return Promise.reject(new Error("Refresh unavailable."));
+      return Promise.resolve({ table: tableWithValue("Recovered", 2) });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(loads).toBe(2);
+    await act(() => vi.advanceTimersByTimeAsync(4_999));
+    expect(loads).toBe(2);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(loads).toBe(3);
+    expect(screen.getByDisplayValue("Recovered")).toBeInTheDocument();
   });
 
   it("does not erase a load failure when a later background refresh stays stale", async () => {
@@ -3267,6 +3367,7 @@ describe("TablePage", () => {
     ];
     let pageOneLoads = 0;
     let backgroundLoads = 0;
+    let unexpectedBackgroundLoads = 0;
     let mutationRevision = 2;
     vi.mocked(api).mockImplementation((path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
@@ -3279,7 +3380,10 @@ describe("TablePage", () => {
         if (pageOneLoads <= 2) return Promise.resolve({ table: first });
         if (pageOneLoads <= 5) return Promise.resolve({ table: staleFirst });
         const background = backgrounds[backgroundLoads];
-        if (!background) throw new Error("Unexpected extra background page-one load.");
+        if (!background) {
+          unexpectedBackgroundLoads += 1;
+          throw new Error("Unexpected extra background page-one load.");
+        }
         backgroundLoads += 1;
         return background.promise;
       }
@@ -3340,6 +3444,7 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Saved while final poll")).toBeEnabled();
     expect(screen.getByText("The table depth could not be restored.")).toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+    expect(unexpectedBackgroundLoads).toBe(0);
   });
 
   it("wakes unknown-revision recovery after a mutation clears the last depth target", async () => {
@@ -4717,7 +4822,7 @@ describe("TablePage", () => {
     expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
     expect(screen.getByDisplayValue("Restored")).toBeInTheDocument();
     // A genuinely deleted page is still noticed: polling keeps running.
-    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(api).toHaveBeenCalledTimes(4);
   });
 
