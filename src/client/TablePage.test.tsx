@@ -168,7 +168,7 @@ describe("TablePage", () => {
     vi.mocked(api).mockReset();
     // Keep existing interval assertions deterministic. Individual tests can
     // override this to exercise the lower edge of the jitter window.
-    randomSpy = vi.spyOn(Math, "random").mockReturnValue(1);
+    randomSpy = vi.spyOn(Math, "random").mockReturnValue(1 - Number.EPSILON);
   });
 
   afterEach(() => {
@@ -2647,6 +2647,20 @@ describe("TablePage", () => {
     expect(sortedLoads).toBe(2);
   });
 
+  it("jitters healthy ordinary refresh polling around the five-second mean", async () => {
+    vi.useFakeTimers();
+    let randomCalls = 0;
+    randomSpy.mockImplementation(() => (randomCalls++ % 2 === 0 ? 0 : 1 - Number.EPSILON));
+    vi.mocked(api).mockResolvedValue({ table });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(() => vi.advanceTimersByTimeAsync(3_999));
+    expect(api).toHaveBeenCalledTimes(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(api).toHaveBeenCalledTimes(2);
+  });
+
   it("does not restore backoff when an obsolete poll fails after a successful foreground load", async () => {
     vi.useFakeTimers();
     const refresh = deferred<{ table: TableData }>();
@@ -3342,6 +3356,93 @@ describe("TablePage", () => {
 
     await act(() => vi.advanceTimersByTimeAsync(0));
     expect(pageOneLoads).toBe(7);
+  });
+
+  it("preserves depth-recovery backoff after a foreground page-one adoption", async () => {
+    vi.useFakeTimers();
+    const first = pagedTable({
+      revision: 2,
+      rows: [{ id: "row", position: 0, cells: { status: "Current" } }],
+    });
+    const staleFirst = { ...first, revision: 1 };
+    const staleSecond: TableData = {
+      ...first,
+      revision: 1,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Stale" } }],
+      hasMore: false,
+      nextCursor: null,
+      rowCount: null,
+    };
+    const backgroundPolls = Array.from({ length: 3 }, () => deferred<{ table: TableData }>());
+    const pageOneLoadTimes: number[] = [];
+    let pageOneLoads = 0;
+    let saves = 0;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      if (path.endsWith("/lease") && init?.method === "PATCH") {
+        return Promise.resolve({ leaseDurationMs: LEASE_DURATION_MS });
+      }
+      if (init?.method === "PUT") {
+        saves += 1;
+        if (saves === 1) {
+          return Promise.reject(
+            new ApiClientError(409, "table_revision_conflict", "The table changed. Reloading before retrying."),
+          );
+        }
+        return Promise.resolve({ revision: 3 });
+      }
+      if (String(path).includes("count=true")) {
+        pageOneLoadTimes.push(Date.now());
+        pageOneLoads += 1;
+        if (pageOneLoads <= 2) return Promise.resolve({ table: first });
+        if (pageOneLoads <= 5) return Promise.resolve({ table: staleFirst });
+        if (pageOneLoads === 7) return Promise.resolve({ table: first });
+        const background = backgroundPolls[pageOneLoads === 6 ? 0 : pageOneLoads - 7];
+        if (!background) throw new Error("Unexpected extra background page-one load.");
+        return background.promise;
+      }
+      return Promise.resolve({ table: staleSecond });
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await drainStaleRetries();
+    await drainStaleRetries();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(pageOneLoads).toBe(6);
+
+    const input = screen.getByDisplayValue("Current");
+    fireEvent.change(input, { target: { value: "Saved after conflict" } });
+    fireEvent.blur(input);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(saves).toBe(2);
+    expect(pageOneLoads).toBe(7);
+
+    await act(async () => {
+      backgroundPolls[0]!.reject(new ApiClientError(503, "table_unavailable", ""));
+      await backgroundPolls[0]!.promise.catch(() => undefined);
+    });
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(pageOneLoads).toBe(8);
+    const promptPollAt = pageOneLoadTimes.at(-1)!;
+
+    await act(async () => {
+      backgroundPolls[1]!.reject(new ApiClientError(503, "table_unavailable", ""));
+      await backgroundPolls[1]!.promise.catch(() => undefined);
+    });
+    await act(() => vi.advanceTimersByTimeAsync(19_999));
+    expect(pageOneLoads).toBe(8);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(pageOneLoads).toBe(9);
+    expect(pageOneLoadTimes.at(-1)! - promptPollAt).toBe(20_000);
+
+    await act(async () => {
+      backgroundPolls[2]!.reject(new ApiClientError(503, "table_unavailable", ""));
+      await backgroundPolls[2]!.promise.catch(() => undefined);
+    });
+    expect(screen.getByText("The table depth could not be restored.")).toBeInTheDocument();
   });
 
   it("backs off and reports background rejections superseded by newly queued edits", async () => {

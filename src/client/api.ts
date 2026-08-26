@@ -35,8 +35,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       error?: { code?: unknown; message?: unknown };
     } | null;
     const error = payload?.error ?? payload;
-    const code = typeof error?.code === "string" ? error.code : fallback.code;
-    const message = typeof error?.message === "string" && error.message.trim() ? error.message : fallback.message;
+    const normalizedCode = typeof error?.code === "string" ? error.code.trim() : "";
+    const normalizedMessage = typeof error?.message === "string" ? error.message.trim() : "";
+    const code = normalizedCode || fallback.code;
+    const message = normalizedMessage || fallback.message;
     const clientError = new ApiClientError(response.status, code, message);
     if (response.status === 401) {
       for (const handler of unauthorizedHandlers) {
