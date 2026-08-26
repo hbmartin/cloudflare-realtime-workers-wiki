@@ -12,7 +12,9 @@ describe("jitteredBackoff", () => {
     [40, 300_000],
     [2_000, 300_000],
   ])("applies equal jitter below the capped ceiling for attempt %i", (attempt, ceiling) => {
-    vi.spyOn(Math, "random").mockReturnValueOnce(0).mockReturnValueOnce(1);
+    vi.spyOn(Math, "random")
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(1 - Number.EPSILON);
 
     expect(jitteredBackoff(attempt, 5_000, 300_000)).toBe(ceiling / 2);
     expect(jitteredBackoff(attempt, 5_000, 300_000)).toBe(ceiling);

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { jitteredBackoff } from "../shared/retry";
 import { TABLE_MAX_ROWS, TABLE_PAGE_DEFAULT, TABLE_SORT_MAX_OFFSET } from "../shared/table-limits";
 import type { ClientMemberContext } from "../shared/types";
 import type {
@@ -77,6 +78,7 @@ const INVALID_TABLE_PAGINATION_MESSAGE = "The table returned incomplete paginati
 const REQUEST_TIMEOUT_MS = 15_000;
 const STALE_REVISION_RETRY_DELAYS_MS = [50, 200] as const;
 const REVISION_POLL_INTERVAL_MS = 5_000;
+const REVISION_POLL_HEALTHY_JITTER_MS = 1_000;
 const REVISION_POLL_MAX_BACKOFF_MS = 60_000;
 const REVISION_RECOVERY_ERROR_THRESHOLD = 3;
 // An invalid server sort cannot remain the active view. Keep recovery polling
@@ -102,9 +104,12 @@ function tableLoadResult(outcome: TableLoadOutcome, options: TableLoadResultOpti
 }
 
 function revisionPollDelay(failures: number) {
-  const maximum = Math.min(REVISION_POLL_INTERVAL_MS * 2 ** failures, REVISION_POLL_MAX_BACKOFF_MS);
-  if (!failures) return maximum;
-  return Math.round(maximum / 2 + Math.random() * (maximum / 2));
+  if (failures) {
+    return jitteredBackoff(failures, REVISION_POLL_INTERVAL_MS, REVISION_POLL_MAX_BACKOFF_MS);
+  }
+  // Difference-of-uniforms jitter keeps the healthy mean at five seconds while
+  // preventing viewers that loaded together from polling in permanent lockstep.
+  return REVISION_POLL_INTERVAL_MS + Math.round((Math.random() - Math.random()) * REVISION_POLL_HEALTHY_JITTER_MS);
 }
 
 type LeaseClock = { monotonic: number; wall: number };
@@ -352,7 +357,7 @@ export function TablePage({
   const pendingMutationsRef = useRef(0);
   const wakeRevisionRecoveryRef = useRef<() => void>(() => undefined);
   const configureRevisionPollingRef = useRef<(mode: RevisionPollMode) => void>(() => undefined);
-  const resetRevisionPollingBackoffRef = useRef<(appendedPages: number) => void>(() => undefined);
+  const resetRevisionPollingBackoffRef = useRef<() => void>(() => undefined);
   const revisionPollModeRef = useRef<RevisionPollMode>("off");
   const revisionRecoveryWakePendingRef = useRef(false);
   const mountedRef = useRef(true);
@@ -628,7 +633,7 @@ export function TablePage({
       }
       setTable(authoritative);
       setLoadError(null);
-      if (!background) resetRevisionPollingBackoffRef.current(appendedPages);
+      if (!background) resetRevisionPollingBackoffRef.current();
       if (authoritative.lease.expiresAt === null && leaseConflictGeneration === leaseConflictGenerationRef.current) {
         setLeaseError((current) => (current === LEASE_CONFLICT_MESSAGE ? null : current));
       }
@@ -1373,18 +1378,19 @@ export function TablePage({
         void poll();
       }, delay);
     };
+    const refreshShouldStandDown = () => !recoveryIsActive() && appendedPagesRef.current > 0;
     const schedulePoll = () => {
-      if (!recoveryIsActive() && appendedPagesRef.current) {
+      if (refreshShouldStandDown()) {
         clearPollTimer();
         return;
       }
       armPoll(revisionPollDelay(delayedFailures));
     };
-    const resetBackoffAfterForegroundLoad = (appendedPages: number) => {
+    const resetBackoffAfterForegroundLoad = () => {
       backoffResetVersion += 1;
       resetFailureState();
       clearPollTimer();
-      if (!active || mode === "off" || pollRunning || appendedPages > 0) return;
+      if (!active || mode === "off" || pollRunning) return;
       schedulePoll();
     };
     async function poll() {
@@ -1399,7 +1405,7 @@ export function TablePage({
       pollRunning = true;
       revisionRecoveryWakePendingRef.current = false;
       const recoveryWasActive = recoveryIsActive();
-      if (!recoveryWasActive && appendedPagesRef.current) {
+      if (refreshShouldStandDown()) {
         pollRunning = false;
         return;
       }
@@ -1429,10 +1435,12 @@ export function TablePage({
         return;
       }
       const recoveryActive = recoveryIsActive();
-      // Superseded data is harmless. A failed request still contributes unless
-      // a newer foreground request adopted authoritative data while it was in flight.
-      if (pollBackoffResetVersion !== backoffResetVersion || delayedResult.outcome === "adopted") delayedFailures = 0;
-      else if (delayedResult.countsTowardBackoff && (recoveryWasActive || delayedResult.failure !== null)) {
+      // A foreground adoption retires an ordinary refresh failure, but a page-one
+      // adoption can leave deeper recovery pending. In that case the failed depth
+      // probe remains evidence for both retry backoff and the recovery warning.
+      if (delayedResult.outcome === "adopted" || (pollBackoffResetVersion !== backoffResetVersion && !recoveryActive)) {
+        delayedFailures = 0;
+      } else if (delayedResult.countsTowardBackoff && (recoveryWasActive || delayedResult.failure !== null)) {
         delayedFailures += 1;
       } else {
         delayedFailures = 0;
@@ -1476,7 +1484,12 @@ export function TablePage({
       if (pollRunning) wakeAfterRunning = true;
       else armPoll(0);
     };
-    const configurePoll = (nextMode: RevisionPollMode) => {
+    const configurePoll = (requestedMode: RevisionPollMode) => {
+      // Recovery refs are updated synchronously, while their render state can
+      // briefly pass through refresh/off when a foreground page-one load clears
+      // and immediately re-defers a depth target. Do not let that stale render
+      // transition discard the live scheduler's failure accounting.
+      const nextMode = !pageUnavailableRef.current && recoveryIsActive() ? "recovery" : requestedMode;
       if (!active || mode === nextMode) return;
       const previousMode = mode;
       mode = nextMode;

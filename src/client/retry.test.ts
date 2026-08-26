@@ -11,7 +11,9 @@ describe("connectionRetryDelay", () => {
     [5, 30_000],
     [20, 30_000],
   ])("applies equal jitter below the capped ceiling for attempt %i", (attempt, ceiling) => {
-    vi.spyOn(Math, "random").mockReturnValueOnce(0).mockReturnValueOnce(1);
+    vi.spyOn(Math, "random")
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(1 - Number.EPSILON);
 
     expect(connectionRetryDelay(attempt)).toBe(ceiling / 2);
     expect(connectionRetryDelay(attempt)).toBe(ceiling);

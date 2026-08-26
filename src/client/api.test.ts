@@ -65,22 +65,25 @@ describe("api", () => {
     );
   });
 
-  it("replaces empty API error messages with the request fallback", async () => {
+  it("normalizes API error codes and messages and replaces blank values", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "unavailable", message: "" }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "   ", message: "" }), { status: 503 }))
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ error: { code: "unavailable", message: "   " } }), { status: 503 }),
+        new Response(
+          JSON.stringify({ error: { code: "  unavailable  ", message: "  Service temporarily unavailable.  " } }),
+          { status: 503 },
+        ),
       );
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(api("/api/empty-message")).rejects.toMatchObject({
-      code: "unavailable",
+      code: "request_failed",
       message: "Request failed (503).",
     });
-    await expect(api("/api/blank-message")).rejects.toMatchObject({
+    await expect(api("/api/padded-error")).rejects.toMatchObject({
       code: "unavailable",
-      message: "Request failed (503).",
+      message: "Service temporarily unavailable.",
     });
   });
 
