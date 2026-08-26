@@ -167,7 +167,7 @@ describe("TablePage", () => {
   beforeEach(() => {
     vi.mocked(api).mockReset();
     // Keep existing interval assertions deterministic. Individual tests can
-    // override this to exercise the lower edge of the jitter window.
+    // override this to exercise specific edges of the jitter window.
     randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
   });
 
@@ -217,6 +217,22 @@ describe("TablePage", () => {
 
   it("uses the table-load fallback when the API supplies only its generic fallback", async () => {
     vi.mocked(api).mockRejectedValue(new ApiClientError(503, "request_failed", "Request failed (503).", true));
+
+    render(
+      <TablePage
+        page={page}
+        member={member("viewer")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    expect(await screen.findByText("Table could not be loaded.")).toBeInTheDocument();
+  });
+
+  it("uses the table-load fallback when an error message is empty", async () => {
+    vi.mocked(api).mockRejectedValue(new ApiClientError(503, "table_unavailable", ""));
 
     render(
       <TablePage
@@ -1092,6 +1108,52 @@ describe("TablePage", () => {
     await waitFor(() => expect(mutations).toBe(2));
   });
 
+  it("uses the save fallback for a definitive rejection without a server message", async () => {
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.includes("/cells/")) {
+        throw new ApiClientError(422, "invalid_cell", "Request failed (422).", true);
+      }
+      return { table };
+    });
+    await renderActiveEditor();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Invalid" } });
+    fireEvent.blur(input);
+
+    expect(await screen.findByText("The table update could not be saved.")).toBeInTheDocument();
+    expect(screen.queryByText("Request failed (422).")).not.toBeInTheDocument();
+  });
+
+  it("invalidates and recovers after a mutation response omits its revision", async () => {
+    let loads = 0;
+    let mutations = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.includes("/cells/")) {
+        mutations += 1;
+        return mutations === 1 ? ({} as { revision: number }) : { revision: 3 };
+      }
+      loads += 1;
+      return { table: tableWithTwoTextCells(loads >= 3 ? 2 : 1) };
+    });
+    await renderActiveEditor();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Unconfirmed" } });
+    fireEvent.blur(input);
+
+    expect(await screen.findByText("The table update could not be saved.")).toBeInTheDocument();
+    await waitFor(() => expect(loads).toBe(3));
+
+    const recoveredInput = screen.getByDisplayValue("Ready");
+    fireEvent.change(recoveredInput, { target: { value: "Saved after recovery" } });
+    fireEvent.blur(recoveredInput);
+    await waitFor(() => expect(mutations).toBe(2));
+
+    const lastSave = vi.mocked(api).mock.calls.findLast(([, init]) => init?.method === "PUT");
+    expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 2 });
+  });
+
   it("reloads the table when a mutation target no longer exists", async () => {
     let loads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
@@ -1116,7 +1178,7 @@ describe("TablePage", () => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
       if (path.includes("/cells/")) {
-        throw new ApiClientError(403, "read_only", "Your workspace role is read-only.");
+        throw new ApiClientError(403, "read_only", "Request failed (403).", true);
       }
       return { table };
     });
@@ -1125,7 +1187,9 @@ describe("TablePage", () => {
     fireEvent.change(input, { target: { value: "Unsaved draft" } });
     fireEvent.blur(input);
 
-    expect(await screen.findByText("Your workspace role is read-only.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("The editing lease was lost. Reloaded the authoritative table."),
+    ).toBeInTheDocument();
     expect(screen.getByText("The table update was not saved because editing access was lost.")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Unsaved draft")).toBeDisabled();
     expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
@@ -1168,7 +1232,9 @@ describe("TablePage", () => {
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
-      if (path.includes("/cells/")) throw new ApiClientError(404, "page_not_found", "Page not found.");
+      if (path.includes("/cells/")) {
+        throw new ApiClientError(404, "page_not_found", "Request failed (404).", true);
+      }
       loads += 1;
       return { table };
     });
@@ -1189,6 +1255,8 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
 
     expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
+    expect(screen.getByText("This table is no longer available.")).toBeInTheDocument();
+    expect(screen.queryByText("Request failed (404).")).not.toBeInTheDocument();
     expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
       method: "DELETE",
       body: JSON.stringify({ leaseToken: "lease-token" }),
@@ -2689,6 +2757,52 @@ describe("TablePage", () => {
     await act(async () => {
       refresh.reject(new Error("Obsolete refresh failure."));
       await refresh.promise.catch(() => undefined);
+    });
+
+    await act(() => vi.advanceTimersByTimeAsync(4_999));
+    expect(sortedLoads).toBe(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(sortedLoads).toBe(2);
+  });
+
+  it("does not restore recovery backoff when an obsolete probe fails after foreground recovery", async () => {
+    vi.useFakeTimers();
+    const current = tableWithValue("Current", 2);
+    const stale = tableWithValue("Stale", 1);
+    const sorted: TableData = { ...current, sort: "status" };
+    const recoveryProbe = deferred<{ table: TableData }>();
+    let plainLoads = 0;
+    let sortedLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("sort=status")) {
+        sortedLoads += 1;
+        return Promise.resolve({ table: sorted });
+      }
+      plainLoads += 1;
+      if (plainLoads === 1) return Promise.resolve({ table: current });
+      if (plainLoads <= 4) return Promise.resolve({ table: stale });
+      return recoveryProbe.promise;
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await drainStaleRetries();
+    expect(plainLoads).toBe(4);
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(plainLoads).toBe(5);
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(sortedLoads).toBe(1);
+    expect(
+      screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      recoveryProbe.reject(new Error("Obsolete recovery failure."));
+      await recoveryProbe.promise.catch(() => undefined);
     });
 
     await act(() => vi.advanceTimersByTimeAsync(4_999));

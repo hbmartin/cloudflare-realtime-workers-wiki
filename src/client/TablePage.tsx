@@ -13,7 +13,6 @@ import type {
 } from "../shared/types";
 import { ApiClientError, api, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
-import { mergeMutationRevision } from "./table-revision";
 
 type IsCurrent = () => boolean;
 type MutationOptions = {
@@ -61,9 +60,12 @@ type RevisionRecoveryTarget = {
   appendedPageTarget: number;
 };
 type RevisionPollMode = "off" | "recovery" | "refresh";
+type RevisionPollBaseMode = Exclude<RevisionPollMode, "recovery">;
 
 const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing.";
 const LEASE_EXPIRED_MESSAGE = "The editing lease expired. Reloaded the authoritative table.";
+const LEASE_LOST_MESSAGE = "The editing lease was lost. Reloaded the authoritative table.";
+const LEASE_RENEWAL_MESSAGE = "The editing lease could not be renewed.";
 const LEASE_VERIFICATION_MESSAGE =
   "Editing was paused because the lease could not be verified after the system clock changed.";
 const SAVE_FAILED_MESSAGE = "The table update could not be saved.";
@@ -73,6 +75,8 @@ const REVISION_RECOVERY_SAVE_MESSAGE =
 const REVISION_CONFLICT_SAVE_MESSAGE =
   "The table update was not saved because the table kept changing. Reloaded the authoritative table.";
 const DEPTH_RESTORE_MESSAGE = "The table depth could not be restored.";
+const PAGE_UNAVAILABLE_MESSAGE = "This table is no longer available.";
+const REVISION_CONFLICT_RETRY_MESSAGE = "The table changed. Reloading before retrying.";
 const STALE_REFRESH_MESSAGE = "Table refresh is delayed while waiting for the latest revision.";
 const STALE_TABLE_REVISION_MESSAGE = "The table kept returning an older revision.";
 const INVALID_TABLE_PAGINATION_MESSAGE = "The table returned incomplete pagination information.";
@@ -192,6 +196,18 @@ function revisionFloor(...revisions: (number | null | undefined)[]) {
     if (revision !== null && revision !== undefined && (floor === null || revision > floor)) floor = revision;
   }
   return floor;
+}
+
+function mergeMutationRevision(knownRevision: number | null, committedRevision: number) {
+  return knownRevision === null ? null : Math.max(knownRevision, committedRevision);
+}
+
+function mutationRevision(result: unknown) {
+  const revision = (result as { revision?: unknown } | null)?.revision;
+  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) {
+    throw new Error(SAVE_FAILED_MESSAGE);
+  }
+  return revision;
 }
 
 function normalizedInputValue(column: TableColumn, value: string | number | boolean | null) {
@@ -357,9 +373,9 @@ export function TablePage({
   const mutationGenerationRef = useRef(0);
   const pendingMutationsRef = useRef(0);
   const wakeRevisionRecoveryRef = useRef<() => void>(() => undefined);
-  const configureRevisionPollingRef = useRef<(mode: RevisionPollMode) => void>(() => undefined);
+  const configureRevisionPollingRef = useRef<(mode: RevisionPollBaseMode) => void>(() => undefined);
   const resetRevisionPollingBackoffRef = useRef<() => void>(() => undefined);
-  const revisionPollModeRef = useRef<RevisionPollMode>("off");
+  const revisionPollModeRef = useRef<RevisionPollBaseMode>("off");
   const revisionRecoveryWakePendingRef = useRef(false);
   const mountedRef = useRef(true);
   const loadGenerationRef = useRef(0);
@@ -459,7 +475,7 @@ export function TablePage({
   // acquisition or renewal, a mutation) funnels through here, so polling,
   // renewal, and queued edits stop no matter which request noticed first.
   const markPageUnavailable = useCallback(
-    (message: string) => {
+    (cause: unknown) => {
       if (pageUnavailableRef.current || !mountedRef.current) return;
       pageUnavailableRef.current = true;
       const currentLease = leaseTokenRef.current;
@@ -469,7 +485,7 @@ export function TablePage({
       setSaveError(null);
       clearRevisionRecovery();
       setLoadError(null);
-      setLeaseError(message);
+      setLeaseError(errorMessage(cause, PAGE_UNAVAILABLE_MESSAGE));
       onPageUnavailableRef.current?.(page.id);
     },
     [clearLocalLease, clearRevisionRecovery, page.id],
@@ -697,7 +713,7 @@ export function TablePage({
           // while no newer load superseded it: a stale page_not_found can belong
           // to a page that was archived and has since been restored, and whatever
           // load superseded this one re-checks the page either way.
-          markPageUnavailable(cause.message);
+          markPageUnavailable(cause);
         } else if (!requestIsCurrent()) {
           return tableLoadResult("superseded", { failure: { cause } });
         } else {
@@ -862,7 +878,7 @@ export function TablePage({
           });
         }
         if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
-          markPageUnavailable(cause.message);
+          markPageUnavailable(cause);
         } else if (!isCurrent()) {
           return tableLoadResult("superseded", { failure: { cause } });
         } else {
@@ -1041,7 +1057,7 @@ export function TablePage({
       // rejection is swallowed by the click handler; latch the terminal state here
       // under the same currency rule as load.
       if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
-        markPageUnavailable(cause.message);
+        markPageUnavailable(cause);
       }
       throw cause;
     } finally {
@@ -1171,7 +1187,7 @@ export function TablePage({
           // Renewal is the only request an idle editor keeps making, so it is
           // usually where an archived table is first noticed. Clearing the
           // lease here turns every caller's lease-ending fallback into a no-op.
-          if (isPageUnavailableError(cause)) markPageUnavailable(cause.message);
+          if (isPageUnavailableError(cause)) markPageUnavailable(cause);
           throw cause;
         },
       );
@@ -1208,7 +1224,9 @@ export function TablePage({
         if (leaseTokenRef.current === token) {
           await endLease(
             token,
-            cause instanceof ApiClientError && cause.status === 409 ? cause.message : LEASE_VERIFICATION_MESSAGE,
+            cause instanceof ApiClientError && cause.status === 409
+              ? errorMessage(cause, LEASE_LOST_MESSAGE)
+              : LEASE_VERIFICATION_MESSAGE,
             !(cause instanceof ApiClientError && cause.status === 409),
           );
         }
@@ -1256,7 +1274,7 @@ export function TablePage({
       } catch (cause) {
         if (!isCurrent()) return;
         if (isPageUnavailableError(cause)) {
-          markPageUnavailable(cause.message);
+          markPageUnavailable(cause);
           return;
         }
         if (cause instanceof ApiClientError && cause.code === "lease_conflict") {
@@ -1333,7 +1351,7 @@ export function TablePage({
     };
   }, [load, acquire, canEdit, reportLeaseError]);
 
-  const revisionPollBaseMode: RevisionPollMode = terminalPageUnavailable
+  const revisionPollBaseMode: RevisionPollBaseMode = terminalPageUnavailable
     ? "off"
     : appendedPageCount > 0 || (leaseToken && tableLoaded)
       ? "off"
@@ -1351,7 +1369,7 @@ export function TablePage({
   useEffect(() => {
     let active = true;
     let mode: RevisionPollMode = "off";
-    let requestedMode: RevisionPollMode = "off";
+    let requestedMode: RevisionPollBaseMode = "off";
     let pollTimer: number | undefined;
     let pollRunning = false;
     let wakeAfterRunning = false;
@@ -1359,8 +1377,10 @@ export function TablePage({
     let recoveryFailureStreak = 0;
     let backoffResetVersion = 0;
     const recoveryIsActive = () => revisionRecoveryPendingRef.current || revisionRef.current === null;
-    const resolvedMode = (): RevisionPollMode =>
-      !pageUnavailableRef.current && recoveryIsActive() ? "recovery" : requestedMode;
+    const resolvedMode = (): RevisionPollMode => {
+      if (pageUnavailableRef.current) return "off";
+      return recoveryIsActive() ? "recovery" : requestedMode;
+    };
     const isCurrent = () => active && resolvedMode() !== "off" && mountedRef.current;
     const resetRecoveryFailureState = () => {
       recoveryFailureStreak = 0;
@@ -1415,7 +1435,7 @@ export function TablePage({
       backoffResetVersion += 1;
       resetFailureState();
       clearPollTimer();
-      if (!active || mode === "off" || pollRunning) return;
+      if (!reconcilePollMode() || pollRunning) return;
       schedulePoll();
     };
     async function poll() {
@@ -1465,7 +1485,7 @@ export function TablePage({
       // probe remains evidence for both retry backoff and the recovery warning.
       if (
         delayedResult.outcome === "adopted" ||
-        (pollBackoffResetVersion !== backoffResetVersion && !recoveryWasActive)
+        (pollBackoffResetVersion !== backoffResetVersion && (!recoveryWasActive || !recoveryActive))
       ) {
         delayedFailures = 0;
       } else if (delayedResult.countsTowardBackoff && (recoveryWasActive || delayedResult.failure !== null)) {
@@ -1512,7 +1532,7 @@ export function TablePage({
       if (pollRunning) wakeAfterRunning = true;
       else armPoll(0);
     };
-    const configurePoll = (nextRequestedMode: RevisionPollMode) => {
+    const configurePoll = (nextRequestedMode: RevisionPollBaseMode) => {
       // Recovery refs are updated synchronously, while their render state can
       // briefly pass through refresh/off when a foreground page-one load clears
       // and immediately re-defers a depth target. Do not let that stale render
@@ -1624,13 +1644,13 @@ export function TablePage({
             );
             return;
           }
-          setLeaseError(`${errorMessage(cause, "The editing lease could not be renewed.")} Retrying.`);
+          setLeaseError(`${errorMessage(cause, LEASE_RENEWAL_MESSAGE)} Retrying.`);
           return;
         }
         stopRenewal();
         await endLease(
           leaseToken,
-          cause.status === 409 ? "The editing lease was lost. Reloaded the authoritative table." : cause.message,
+          cause.status === 409 ? LEASE_LOST_MESSAGE : errorMessage(cause, LEASE_RENEWAL_MESSAGE),
           cause.status !== 401,
         );
       } finally {
@@ -1707,16 +1727,17 @@ export function TablePage({
           // returned after another lease was acquired. Its result belongs to the
           // authoritative reload for that lease, not this local state.
           if (leaseTokenRef.current !== currentLease) return null;
+          const committedRevision = mutationRevision(result);
           // A concurrent load may have invalidated the mutation base or adopted
           // a newer snapshot while this request was in flight. Never turn an
           // unknown revision back into a known one or regress a newer snapshot;
           // otherwise the committed response can safely advance the known base.
-          const mergedRevision = mergeMutationRevision(revisionRef.current, result.revision);
+          const mergedRevision = mergeMutationRevision(revisionRef.current, committedRevision);
           if (mergedRevision !== null) {
             revisionRef.current = mergedRevision;
             setRevisionKnown(true);
           } else {
-            preserveRevisionFloor(result.revision);
+            preserveRevisionFloor(committedRevision);
           }
           if (
             sortRef.current.column &&
@@ -1726,9 +1747,11 @@ export function TablePage({
           }
           if (affectsSortedOrder === true) unsortedSnapshotDirtyRef.current = true;
           setSaveError(null);
-          setTable((current) =>
-            current ? { ...current, revision: Math.max(current.revision, result.revision) } : current,
-          );
+          setTable((current) => {
+            if (!current) return current;
+            const revision = mergeMutationRevision(current.revision, committedRevision);
+            return revision === null || revision === current.revision ? current : { ...current, revision };
+          });
           return result;
         } catch (cause) {
           if (!isMounted()) return null;
@@ -1736,7 +1759,7 @@ export function TablePage({
           // lease-identity check: a 404 that lands after the local lease
           // expired must still stop polling instead of reading as lease loss.
           if (isPageUnavailableError(cause)) {
-            markPageUnavailable(cause.message);
+            markPageUnavailable(cause);
             return null;
           }
           if (leaseTokenRef.current !== currentLease) {
@@ -1746,7 +1769,7 @@ export function TablePage({
             invalidateRevision();
             const terminalConflict = revisionConflictRetried;
             if (terminalConflict) resetCellInputAfterLoad(resetKey);
-            else setSaveError(cause.message);
+            else setSaveError(errorMessage(cause, REVISION_CONFLICT_RETRY_MESSAGE));
             const recovered = await recoverRevision({
               minimumRevision: currentRevision,
             });
@@ -1765,18 +1788,18 @@ export function TablePage({
           }
           if (cause instanceof ApiClientError && cause.status === 409) {
             resetCellInputAfterLoad(resetKey);
-            await endLease(currentLease, cause.message);
+            await endLease(currentLease, errorMessage(cause, LEASE_LOST_MESSAGE));
             setSaveError(LEASE_LOST_SAVE_MESSAGE);
             return null;
           }
           if (cause instanceof ApiClientError && cause.status === 403) {
-            await endLease(currentLease, cause.message);
+            await endLease(currentLease, errorMessage(cause, LEASE_LOST_MESSAGE));
             setSaveError(LEASE_LOST_SAVE_MESSAGE);
             return null;
           }
           if (cause instanceof ApiClientError && cause.status === 404) {
             invalidateRevision();
-            setSaveError(cause.message);
+            setSaveError(errorMessage(cause, SAVE_FAILED_MESSAGE));
             resetCellInputAfterLoad(resetKey);
             await recoverRevision({ minimumRevision: currentRevision });
             return null;
@@ -1785,7 +1808,7 @@ export function TablePage({
           // request before applying it, so keep the known revision and the
           // user's input available for correction.
           if (isDefinitiveMutationRejection(cause)) {
-            setSaveError(cause.message);
+            setSaveError(errorMessage(cause, SAVE_FAILED_MESSAGE));
             return null;
           }
           // A timed-out or failed request may still have been applied. Its
