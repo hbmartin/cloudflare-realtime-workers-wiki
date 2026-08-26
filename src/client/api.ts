@@ -36,7 +36,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     } | null;
     const error = payload?.error ?? payload;
     const code = typeof error?.code === "string" ? error.code : fallback.code;
-    const message = typeof error?.message === "string" ? error.message : fallback.message;
+    const message = typeof error?.message === "string" && error.message.trim() ? error.message : fallback.message;
     const clientError = new ApiClientError(response.status, code, message);
     if (response.status === 401) {
       for (const handler of unauthorizedHandlers) {

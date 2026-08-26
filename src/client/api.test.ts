@@ -65,6 +65,25 @@ describe("api", () => {
     );
   });
 
+  it("replaces empty API error messages with the request fallback", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "unavailable", message: "" }), { status: 503 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: "unavailable", message: "   " } }), { status: 503 }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api("/api/empty-message")).rejects.toMatchObject({
+      code: "unavailable",
+      message: "Request failed (503).",
+    });
+    await expect(api("/api/blank-message")).rejects.toMatchObject({
+      code: "unavailable",
+      message: "Request failed (503).",
+    });
+  });
+
   it("notifies subscribers when an API request is unauthorized", async () => {
     vi.stubGlobal(
       "fetch",

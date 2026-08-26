@@ -101,6 +101,12 @@ function tableLoadResult(outcome: TableLoadOutcome, options: TableLoadResultOpti
   };
 }
 
+function revisionPollDelay(failures: number) {
+  const maximum = Math.min(REVISION_POLL_INTERVAL_MS * 2 ** failures, REVISION_POLL_MAX_BACKOFF_MS);
+  if (!failures) return maximum;
+  return Math.round(maximum / 2 + Math.random() * (maximum / 2));
+}
+
 type LeaseClock = { monotonic: number; wall: number };
 type LocalLeaseStatus = "valid" | "expired" | "wall-clock-disagreement";
 
@@ -296,6 +302,10 @@ export function TablePage({
   // down, so browsing deep into a table is not yanked back to the top every 5s.
   const [appendedPageCount, setAppendedPageCount] = useState(0);
   const appendedPagesRef = useRef(0);
+  const updateAppendedPageCount = useCallback((count: number) => {
+    appendedPagesRef.current = count;
+    setAppendedPageCount(count);
+  }, []);
   // The revision the currently loaded page boundary was computed against. Only
   // `load` and `loadMore` may move it: `nextOffset` is a position in one exact
   // snapshot, and own saves bump `table.revision` in place without recomputing it.
@@ -342,6 +352,7 @@ export function TablePage({
   const pendingMutationsRef = useRef(0);
   const wakeRevisionRecoveryRef = useRef<() => void>(() => undefined);
   const configureRevisionPollingRef = useRef<(mode: RevisionPollMode) => void>(() => undefined);
+  const resetRevisionPollingBackoffRef = useRef<(appendedPages: number) => void>(() => undefined);
   const revisionPollModeRef = useRef<RevisionPollMode>("off");
   const revisionRecoveryWakePendingRef = useRef(false);
   const mountedRef = useRef(true);
@@ -600,8 +611,7 @@ export function TablePage({
         }
         return changed ? next : current;
       });
-      appendedPagesRef.current = appendedPages;
-      setAppendedPageCount(appendedPages);
+      updateAppendedPageCount(appendedPages);
       pageSnapshotRevisionRef.current = authoritative.revision;
       sortedSnapshotDirtyRef.current = false;
       unsortedSnapshotDirtyRef.current = false;
@@ -618,11 +628,12 @@ export function TablePage({
       }
       setTable(authoritative);
       setLoadError(null);
+      if (!background) resetRevisionPollingBackoffRef.current(appendedPages);
       if (authoritative.lease.expiresAt === null && leaseConflictGeneration === leaseConflictGenerationRef.current) {
         setLeaseError((current) => (current === LEASE_CONFLICT_MESSAGE ? null : current));
       }
     },
-    [clearRevisionRecovery],
+    [clearRevisionRecovery, updateAppendedPageCount],
   );
 
   const load = useCallback(
@@ -985,11 +996,10 @@ export function TablePage({
         }
       }
       if (!result || !canAppend()) return;
-      appendedPagesRef.current += 1;
-      setAppendedPageCount(appendedPagesRef.current);
+      updateAppendedPageCount(requestedAppendedPages);
       pageSnapshotRevisionRef.current = result.table.revision;
       if (revisionRecoveryPendingRef.current) {
-        deferRevisionRecovery(currentRevisionFloor(result.table.revision), currentPage, appendedPagesRef.current);
+        deferRevisionRecovery(currentRevisionFloor(result.table.revision), currentPage, requestedAppendedPages);
       }
       setTable((current) => {
         if (!current || tableSortKey(current.sort, current.dir) !== requestedSort) {
@@ -1339,6 +1349,7 @@ export function TablePage({
     let wakeAfterRunning = false;
     let delayedFailures = 0;
     let recoveryFailureStreak = 0;
+    let backoffResetVersion = 0;
     const isCurrent = () => active && mode !== "off" && mountedRef.current;
     const recoveryIsActive = () => revisionRecoveryPendingRef.current || revisionRef.current === null;
     const resetRecoveryFailureState = () => {
@@ -1362,8 +1373,20 @@ export function TablePage({
         void poll();
       }, delay);
     };
-    const schedulePoll = () =>
-      armPoll(Math.min(REVISION_POLL_INTERVAL_MS * 2 ** delayedFailures, REVISION_POLL_MAX_BACKOFF_MS));
+    const schedulePoll = () => {
+      if (!recoveryIsActive() && appendedPagesRef.current) {
+        clearPollTimer();
+        return;
+      }
+      armPoll(revisionPollDelay(delayedFailures));
+    };
+    const resetBackoffAfterForegroundLoad = (appendedPages: number) => {
+      backoffResetVersion += 1;
+      resetFailureState();
+      clearPollTimer();
+      if (!active || mode === "off" || pollRunning || appendedPages > 0) return;
+      schedulePoll();
+    };
     async function poll() {
       if (!isCurrent()) return;
       if (loadsInFlightRef.current || pendingMutationsRef.current) {
@@ -1376,9 +1399,14 @@ export function TablePage({
       pollRunning = true;
       revisionRecoveryWakePendingRef.current = false;
       const recoveryWasActive = recoveryIsActive();
+      if (!recoveryWasActive && appendedPagesRef.current) {
+        pollRunning = false;
+        return;
+      }
+      const pollBackoffResetVersion = backoffResetVersion;
       const mutationGeneration = mutationGenerationRef.current;
       const pollRequestIsCurrent = () => isCurrent() && mutationGeneration === mutationGenerationRef.current;
-      let delayedResult: TableLoadResult | null = null;
+      let delayedResult: TableLoadResult;
       try {
         if (recoveryWasActive) {
           delayedResult = await attemptRevisionRecovery({
@@ -1401,22 +1429,22 @@ export function TablePage({
         return;
       }
       const recoveryActive = recoveryIsActive();
-      // Superseded data is harmless, but a request that rejected before being
-      // superseded still contributes to transport backoff.
-      if (delayedResult?.outcome === "adopted") delayedFailures = 0;
-      else if (delayedResult?.countsTowardBackoff && (recoveryWasActive || delayedResult.failure !== null)) {
+      // Superseded data is harmless. A failed request still contributes unless
+      // a newer foreground request adopted authoritative data while it was in flight.
+      if (pollBackoffResetVersion !== backoffResetVersion || delayedResult.outcome === "adopted") delayedFailures = 0;
+      else if (delayedResult.countsTowardBackoff && (recoveryWasActive || delayedResult.failure !== null)) {
         delayedFailures += 1;
       } else {
         delayedFailures = 0;
       }
       if (recoveryActive) {
-        const failure = delayedResult?.failure;
+        const failure = delayedResult.failure;
         if (recoveryWasActive && failure && revisionRecoveryPendingRef.current) {
           recoveryFailureStreak += 1;
           if (recoveryFailureStreak >= REVISION_RECOVERY_ERROR_THRESHOLD) {
             setRevisionRecoveryError(errorMessage(failure.cause, DEPTH_RESTORE_MESSAGE));
           }
-        } else if (delayedResult?.outcome !== "superseded") {
+        } else if (delayedResult.outcome !== "superseded") {
           recoveryFailureStreak = 0;
           setRevisionRecoveryError(null);
         }
@@ -1425,7 +1453,7 @@ export function TablePage({
       }
       if (
         recoveryActive &&
-        delayedResult?.outcome === "superseded" &&
+        delayedResult.outcome === "superseded" &&
         delayedResult.failure === null &&
         mutationGeneration !== mutationGenerationRef.current
       ) {
@@ -1469,6 +1497,7 @@ export function TablePage({
     };
     wakeRevisionRecoveryRef.current = wakePoll;
     configureRevisionPollingRef.current = configurePoll;
+    resetRevisionPollingBackoffRef.current = resetBackoffAfterForegroundLoad;
     configurePoll(revisionPollModeRef.current);
     return () => {
       active = false;
@@ -1477,6 +1506,9 @@ export function TablePage({
       }
       if (configureRevisionPollingRef.current === configurePoll) {
         configureRevisionPollingRef.current = () => undefined;
+      }
+      if (resetRevisionPollingBackoffRef.current === resetBackoffAfterForegroundLoad) {
+        resetRevisionPollingBackoffRef.current = () => undefined;
       }
       clearPollTimer();
     };
