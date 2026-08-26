@@ -209,6 +209,22 @@ describe("TablePage", () => {
     expect(screen.queryByText("The operation timed out.")).not.toBeInTheDocument();
   });
 
+  it("uses the table-load fallback when the API error message is empty", async () => {
+    vi.mocked(api).mockRejectedValue(new ApiClientError(503, "table_unavailable", ""));
+
+    render(
+      <TablePage
+        page={page}
+        member={member("viewer")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    expect(await screen.findByText("Table could not be loaded.")).toBeInTheDocument();
+  });
+
   it("acquires an editor lease and exposes table mutations", async () => {
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
@@ -2058,7 +2074,7 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(screen.getByText("Table temporarily unavailable.")).toBeInTheDocument();
 
-    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
     expect(screen.queryByText("Table temporarily unavailable.")).not.toBeInTheDocument();
     expect(screen.getByDisplayValue("Ready")).toBe(input);
   });
@@ -2459,6 +2475,31 @@ describe("TablePage", () => {
     expect(await screen.findByDisplayValue("Two")).toBeInTheDocument();
   });
 
+  it("stops ordinary refresh polling after appending another page", async () => {
+    vi.useFakeTimers();
+    const first: TableData = {
+      ...table,
+      rows: [{ id: "row-1", position: 0, cells: { status: "One" } }],
+      hasMore: true,
+      nextCursor: { position: 0, rowId: "row-1" },
+      rowCount: 2,
+    };
+    const second: TableData = {
+      ...table,
+      rows: [{ id: "row-2", position: 1, cells: { status: "Two" } }],
+      rowCount: null,
+    };
+    vi.mocked(api).mockResolvedValueOnce({ table: first }).mockResolvedValueOnce({ table: second });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    expect(api).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("keeps load more clickable during a background refresh and discards the stale refresh", async () => {
     vi.useFakeTimers();
     const first: TableData = {
@@ -2528,6 +2569,39 @@ describe("TablePage", () => {
     expect(screen.getByDisplayValue("Current")).toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
     expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
+  });
+
+  it("backs off ordinary refresh failures and resets the interval after success", async () => {
+    vi.useFakeTimers();
+    const current = tableWithValue("Current", 1);
+    const refreshed = tableWithValue("Refreshed", 2);
+    let loads = 0;
+    vi.mocked(api).mockImplementation(() => {
+      loads += 1;
+      if (loads === 1) return Promise.resolve({ table: current });
+      if (loads <= 3) return Promise.reject(new Error("Refresh unavailable."));
+      return Promise.resolve({ table: refreshed });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(loads).toBe(2);
+    await act(() => vi.advanceTimersByTimeAsync(9_999));
+    expect(loads).toBe(2);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(loads).toBe(3);
+    await act(() => vi.advanceTimersByTimeAsync(19_999));
+    expect(loads).toBe(3);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+
+    expect(loads).toBe(4);
+    expect(screen.getByDisplayValue("Refreshed")).toBeInTheDocument();
+    expect(screen.queryByText("Refresh unavailable.")).not.toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(4_999));
+    expect(loads).toBe(4);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(loads).toBe(5);
   });
 
   it("does not erase a load failure when a later background refresh stays stale", async () => {
@@ -3193,7 +3267,6 @@ describe("TablePage", () => {
     ];
     let pageOneLoads = 0;
     let backgroundLoads = 0;
-    let unexpectedBackgroundLoads = 0;
     let mutationRevision = 2;
     vi.mocked(api).mockImplementation((path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
@@ -3206,10 +3279,7 @@ describe("TablePage", () => {
         if (pageOneLoads <= 2) return Promise.resolve({ table: first });
         if (pageOneLoads <= 5) return Promise.resolve({ table: staleFirst });
         const background = backgrounds[backgroundLoads];
-        if (!background) {
-          unexpectedBackgroundLoads += 1;
-          throw new Error("Unexpected extra background page-one load.");
-        }
+        if (!background) throw new Error("Unexpected extra background page-one load.");
         backgroundLoads += 1;
         return background.promise;
       }
@@ -3223,14 +3293,11 @@ describe("TablePage", () => {
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
     const pollInterval = 5_000;
-    const retryFailures = [
-      new Error("Obsolete background failure."),
-      new Error("Obsolete background failure."),
-      undefined,
-    ];
+    const retryFailures = Array.from({ length: 3 }, () => new ApiClientError(503, "table_unavailable", ""));
     let displayedValue = "Current";
     const recoveryWarningCounts: number[] = [];
-    for (const [index, background] of backgrounds.slice(0, 3).entries()) {
+    for (const [index, failure] of retryFailures.entries()) {
+      const background = backgrounds[index]!;
       const retryDelay = pollInterval * 2 ** index;
       await act(() => vi.advanceTimersByTimeAsync(retryDelay - 1));
       expect(backgroundLoads).toBe(index);
@@ -3243,7 +3310,7 @@ describe("TablePage", () => {
       await act(() => vi.advanceTimersByTimeAsync(0));
 
       await act(async () => {
-        background.reject(retryFailures[index]);
+        background.reject(failure);
         await background.promise.catch(() => undefined);
       });
 
@@ -3253,26 +3320,26 @@ describe("TablePage", () => {
     }
     expect(recoveryWarningCounts).toEqual([0, 0, 1]);
 
+    const finalBackground = backgrounds[retryFailures.length]!;
     const finalRetryDelay = pollInterval * 2 ** retryFailures.length;
     await act(() => vi.advanceTimersByTimeAsync(finalRetryDelay - 1));
-    expect(backgroundLoads).toBe(3);
+    expect(backgroundLoads).toBe(retryFailures.length);
     await act(() => vi.advanceTimersByTimeAsync(1));
-    expect(backgroundLoads).toBe(4);
+    expect(backgroundLoads).toBe(retryFailures.length + 1);
     const input = screen.getByDisplayValue(displayedValue);
     fireEvent.change(input, { target: { value: "Saved while final poll" } });
     fireEvent.blur(input);
     await act(() => vi.advanceTimersByTimeAsync(0));
 
     await act(async () => {
-      backgrounds[3]!.resolve({ table: first });
-      await backgrounds[3]!.promise;
+      finalBackground.resolve({ table: first });
+      await finalBackground.promise;
     });
 
     expect(pageOneLoads).toBe(9);
     expect(screen.getByDisplayValue("Saved while final poll")).toBeEnabled();
     expect(screen.getByText("The table depth could not be restored.")).toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
-    expect(unexpectedBackgroundLoads).toBe(0);
   });
 
   it("wakes unknown-revision recovery after a mutation clears the last depth target", async () => {
@@ -4650,7 +4717,7 @@ describe("TablePage", () => {
     expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
     expect(screen.getByDisplayValue("Restored")).toBeInTheDocument();
     // A genuinely deleted page is still noticed: polling keeps running.
-    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
     expect(api).toHaveBeenCalledTimes(4);
   });
 
