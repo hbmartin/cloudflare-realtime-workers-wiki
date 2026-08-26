@@ -7,6 +7,7 @@ export class ApiClientError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    readonly messageFromFallback = false,
   ) {
     super(message);
   }
@@ -39,7 +40,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     const normalizedMessage = typeof error?.message === "string" ? error.message.trim() : "";
     const code = normalizedCode || fallback.code;
     const message = normalizedMessage || fallback.message;
-    const clientError = new ApiClientError(response.status, code, message);
+    const clientError = new ApiClientError(response.status, code, message, !normalizedMessage);
     if (response.status === 401) {
       for (const handler of unauthorizedHandlers) {
         try {

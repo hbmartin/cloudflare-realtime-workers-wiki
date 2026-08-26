@@ -6,3 +6,9 @@ export function jitteredBackoff(attempt: number, baseMs: number, capMs: number) 
   const ceiling = Math.min(capMs, baseMs * 2 ** attempt);
   return Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
 }
+
+// Uniform jitter around a steady interval. Unlike difference-of-uniforms
+// jitter, this does not concentrate callers around the unjittered midpoint.
+export function jitteredInterval(intervalMs: number, spreadMs: number) {
+  return Math.round(intervalMs - spreadMs + Math.random() * spreadMs * 2);
+}

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { jitteredBackoff } from "./retry";
+import { jitteredBackoff, jitteredInterval } from "./retry";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -18,5 +18,17 @@ describe("jitteredBackoff", () => {
 
     expect(jitteredBackoff(attempt, 5_000, 300_000)).toBe(ceiling / 2);
     expect(jitteredBackoff(attempt, 5_000, 300_000)).toBe(ceiling);
+  });
+});
+
+describe("jitteredInterval", () => {
+  it.each([
+    [0, 4_000],
+    [0.5, 5_000],
+    [1 - Number.EPSILON, 6_000],
+  ])("maps random value %f across the complete interval", (random, expected) => {
+    vi.spyOn(Math, "random").mockReturnValue(random);
+
+    expect(jitteredInterval(5_000, 1_000)).toBe(expected);
   });
 });
