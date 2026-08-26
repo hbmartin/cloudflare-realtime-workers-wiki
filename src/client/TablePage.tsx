@@ -11,7 +11,7 @@ import type {
   TableLeaseTiming,
   TableRow,
 } from "../shared/types";
-import { ApiClientError, api, json } from "./api";
+import { ApiClientError, api, InvalidApiResponseError, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 
 type IsCurrent = () => boolean;
@@ -70,8 +70,7 @@ const EDITING_ACCESS_LOST_MESSAGE = "Editing access is no longer available. Relo
 const LEASE_VERIFICATION_MESSAGE =
   "Editing was paused because the lease could not be verified after the system clock changed.";
 const SAVE_FAILED_MESSAGE = "The table update could not be saved.";
-const INVALID_MUTATION_RESPONSE_MESSAGE =
-  "The table update outcome could not be confirmed because the server returned an invalid response.";
+const INVALID_MUTATION_RESPONSE_MESSAGE = "The table update was saved, but the server returned an invalid response.";
 const LEASE_LOST_SAVE_MESSAGE = "The table update was not saved because editing access was lost.";
 const REVISION_RECOVERY_SAVE_MESSAGE =
   "The table update was not saved because the authoritative table revision could not be reloaded.";
@@ -203,14 +202,14 @@ function revisionFloor(...revisions: (number | null | undefined)[]) {
 
 class InvalidMutationResponseError extends Error {
   constructor() {
-    super("A successful table mutation response omitted a valid revision.");
+    super("A successful table mutation response did not include the expected revision.");
     this.name = "InvalidMutationResponseError";
   }
 }
 
-function mutationRevision(result: unknown) {
+function mutationRevision(result: unknown, expectedRevision: number) {
   const revision = (result as { revision?: unknown } | null)?.revision;
-  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) {
+  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision !== expectedRevision + 1) {
     throw new InvalidMutationResponseError();
   }
   return revision;
@@ -484,6 +483,8 @@ export function TablePage({
     (cause: ApiClientError) => {
       if (pageUnavailableRef.current || !mountedRef.current) return;
       pageUnavailableRef.current = true;
+      revisionPollModeRef.current = "off";
+      configureRevisionPollingRef.current("off");
       const currentLease = leaseTokenRef.current;
       clearLocalLease();
       if (currentLease) releaseTableLease(page.id, currentLease);
@@ -1357,11 +1358,8 @@ export function TablePage({
     };
   }, [load, acquire, canEdit, reportLeaseError]);
 
-  const revisionPollBaseMode: RevisionPollBaseMode = terminalPageUnavailable
-    ? "off"
-    : appendedPageCount > 0 || (leaseToken && tableLoaded)
-      ? "off"
-      : "refresh";
+  const revisionPollBaseMode: RevisionPollBaseMode =
+    appendedPageCount > 0 || (leaseToken && tableLoaded) ? "off" : "refresh";
 
   // The scheduler overlays synchronous recovery refs on this stable render mode.
   // Recovery state can clear and re-arm inside one batched render, so using the
@@ -1733,7 +1731,7 @@ export function TablePage({
           // returned after another lease was acquired. Its result belongs to the
           // authoritative reload for that lease, not this local state.
           if (leaseTokenRef.current !== currentLease) return null;
-          const committedRevision = mutationRevision(result);
+          const committedRevision = mutationRevision(result, currentRevision);
           // A concurrent load may have invalidated the mutation base or adopted
           // a newer snapshot while this request was in flight. Never turn an
           // unknown revision back into a known one or regress a newer snapshot;
@@ -1771,11 +1769,13 @@ export function TablePage({
           if (leaseTokenRef.current !== currentLease) {
             return failForLostLease();
           }
-          if (cause instanceof InvalidMutationResponseError) {
+          if (cause instanceof InvalidMutationResponseError || cause instanceof InvalidApiResponseError) {
+            const committedRevisionFloor = currentRevision + 1;
+            preserveRevisionFloor(committedRevisionFloor);
             invalidateRevision();
             setSaveError(INVALID_MUTATION_RESPONSE_MESSAGE);
             resetCellInputAfterLoad(resetKey);
-            await recoverRevision({ minimumRevision: currentRevision });
+            await recoverRevision({ minimumRevision: committedRevisionFloor });
             return null;
           }
           if (cause instanceof ApiClientError && cause.code === "table_revision_conflict") {

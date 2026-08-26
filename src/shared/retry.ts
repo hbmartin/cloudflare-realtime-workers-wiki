@@ -3,6 +3,15 @@
 // callers that failed together does not retry in lockstep. Whole milliseconds,
 // since alarm and timer APIs truncate anything finer.
 export function jitteredBackoff(attempt: number, baseMs: number, capMs: number) {
+  if (!Number.isSafeInteger(attempt) || attempt < 0) {
+    throw new RangeError("attempt must be a non-negative safe integer.");
+  }
+  if (!Number.isFinite(baseMs) || baseMs < 1) {
+    throw new RangeError("baseMs must be finite and at least one millisecond.");
+  }
+  if (!Number.isFinite(capMs) || capMs < 1) {
+    throw new RangeError("capMs must be finite and at least one millisecond.");
+  }
   const ceiling = Math.min(capMs, baseMs * 2 ** attempt);
   return Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
 }

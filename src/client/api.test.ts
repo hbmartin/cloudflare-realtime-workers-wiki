@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { api, json, onApiUnauthorized } from "./api";
+import { api, InvalidApiResponseError, json, onApiUnauthorized } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -63,6 +63,14 @@ describe("api", () => {
         message: "Request failed (502).",
       }),
     );
+  });
+
+  it("distinguishes malformed successful responses", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("not-json", { status: 201 })));
+
+    const request = api("/api/example");
+    await expect(request).rejects.toBeInstanceOf(InvalidApiResponseError);
+    await expect(request).rejects.toMatchObject({ status: 201 });
   });
 
   it("normalizes API error codes and messages and replaces blank values", async () => {

@@ -5,7 +5,7 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { Page, TableData, TableLeaseResponse, TableLeaseTiming } from "../shared/types";
-import { ApiClientError, api } from "./api";
+import { ApiClientError, api, InvalidApiResponseError } from "./api";
 import { TablePage } from "./TablePage";
 
 vi.mock("./api", async (importOriginal) => {
@@ -1125,17 +1125,35 @@ describe("TablePage", () => {
     expect(screen.queryByText("Request failed (422).")).not.toBeInTheDocument();
   });
 
-  it("recovers when an invalid mutation response did not commit", async () => {
+  it.each([
+    ["omits its revision", () => ({}) as { revision: number }],
+    ["returns an unexpected revision", () => ({ revision: Number.MAX_SAFE_INTEGER })],
+    [
+      "contains malformed JSON",
+      () => {
+        throw new InvalidApiResponseError(200);
+      },
+    ],
+  ])("rejects stale snapshots after a committed mutation response %s", async (_case, invalidResponse) => {
     let loads = 0;
     let mutations = 0;
+    const committedTable: TableData = {
+      ...tableWithTwoTextCells(2),
+      rows: [
+        {
+          ...tableWithTwoTextCells(2).rows[0]!,
+          cells: { status: "Unconfirmed", notes: "Stable" },
+        },
+      ],
+    };
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.includes("/cells/")) {
         mutations += 1;
-        return mutations === 1 ? ({} as { revision: number }) : { revision: 2 };
+        return mutations === 1 ? invalidResponse() : { revision: 3 };
       }
       loads += 1;
-      return { table: tableWithTwoTextCells(1) };
+      return { table: loads >= 4 ? committedTable : tableWithTwoTextCells(1) };
     });
     await renderActiveEditor();
     const input = screen.getByDisplayValue("Ready");
@@ -1143,19 +1161,17 @@ describe("TablePage", () => {
     fireEvent.blur(input);
 
     expect(
-      await screen.findByText(
-        "The table update outcome could not be confirmed because the server returned an invalid response.",
-      ),
+      await screen.findByText("The table update was saved, but the server returned an invalid response."),
     ).toBeInTheDocument();
-    await waitFor(() => expect(loads).toBe(3));
+    await waitFor(() => expect(loads).toBe(4));
 
-    const recoveredInput = screen.getByDisplayValue("Ready");
+    const recoveredInput = screen.getByDisplayValue("Unconfirmed");
     fireEvent.change(recoveredInput, { target: { value: "Saved after recovery" } });
     fireEvent.blur(recoveredInput);
     await waitFor(() => expect(mutations).toBe(2));
 
     const lastSave = vi.mocked(api).mock.calls.findLast(([, init]) => init?.method === "PUT");
-    expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 1 });
+    expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 2 });
   });
 
   it("reloads the table when a mutation target no longer exists", async () => {
@@ -4281,8 +4297,10 @@ describe("TablePage", () => {
       nextOffset: 500,
       rowCount: 501,
     };
+    const refreshedUnsorted = { ...unsorted, revision: 3 };
+    const refreshedAscending = { ...ascending, revision: 3 };
     const descending: TableData = {
-      ...ascending,
+      ...refreshedAscending,
       dir: "desc",
       rows: [{ id: "row", position: 0, cells: { status: "Zulu", notes: "Stable" } }],
     };
@@ -4290,24 +4308,30 @@ describe("TablePage", () => {
     let saves = 0;
     let ascendingLoads = 0;
     let offsetLoads = 0;
+    let plainLoads = 0;
+    let pendingExpectedRevision = 0;
     vi.mocked(api).mockImplementation((path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
       if (init?.method === "PUT") {
         saves += 1;
-        return saves === 1 ? Promise.resolve({ revision: 2 }) : pendingSave.promise;
+        const expectedRevision = Number(JSON.parse(String(init.body)).expectedRevision);
+        if (saves === 1) return Promise.resolve({ revision: expectedRevision + 1 });
+        pendingExpectedRevision = expectedRevision;
+        return pendingSave.promise;
       }
       if (String(path).includes("offset=500")) {
         offsetLoads += 1;
-        return Promise.resolve({ table: { ...ascending, hasMore: false, nextOffset: null } });
+        return Promise.resolve({ table: { ...refreshedAscending, hasMore: false, nextOffset: null } });
       }
       if (String(path).includes("sort=status") && String(path).includes("dir=desc")) {
         return Promise.resolve({ table: descending });
       }
       if (String(path).includes("sort=status")) {
         ascendingLoads += 1;
-        return Promise.resolve({ table: ascending });
+        return Promise.resolve({ table: ascendingLoads === 1 ? ascending : refreshedAscending });
       }
-      return Promise.resolve({ table: unsorted });
+      plainLoads += 1;
+      return Promise.resolve({ table: plainLoads <= 2 ? unsorted : refreshedUnsorted });
     });
     await renderActiveEditor();
 
@@ -4335,7 +4359,7 @@ describe("TablePage", () => {
     expect(ascendingLoads).toBe(2);
 
     await act(async () => {
-      pendingSave.resolve({ revision: 3 });
+      pendingSave.resolve({ revision: pendingExpectedRevision + 1 });
       await pendingSave.promise;
     });
 
@@ -4818,7 +4842,7 @@ describe("TablePage", () => {
       rowCount: null,
     };
     const staleFirst = { ...sortedFirst, revision: 4 };
-    const freshUnsorted = tableWithTwoTextCells(6);
+    const freshUnsorted = tableWithTwoTextCells(5);
     const background = deferred<{ table: TableData }>();
     const pendingSave = deferred<{ revision: number }>();
     let puts = 0;
@@ -4829,7 +4853,9 @@ describe("TablePage", () => {
       if (init?.method === "PUT") {
         puts += 1;
         if (puts === 1) return Promise.reject(new DOMException("The operation timed out.", "TimeoutError"));
-        return puts === 2 ? pendingSave.promise : Promise.resolve({ revision: 8 });
+        if (puts === 2) return pendingSave.promise;
+        const expectedRevision = Number(JSON.parse(String(init.body)).expectedRevision);
+        return Promise.resolve({ revision: expectedRevision + 1 });
       }
       if (String(path).includes("offset=500")) return Promise.resolve({ table: sortedSecond });
       if (String(path).includes("sort=status")) {
@@ -4880,7 +4906,7 @@ describe("TablePage", () => {
     ).not.toBeInTheDocument();
 
     await act(async () => {
-      pendingSave.resolve({ revision: 7 });
+      pendingSave.resolve({ revision: 6 });
       await pendingSave.promise;
     });
 
@@ -4891,7 +4917,7 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
     expect(puts).toBe(3);
     const lastSave = vi.mocked(api).mock.calls.findLast(([, init]) => init?.method === "PUT");
-    expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 7 });
+    expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 6 });
   });
 
   it("keeps a stale deferred depth restore in background recovery", async () => {
