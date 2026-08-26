@@ -31,4 +31,14 @@ describe("jitteredInterval", () => {
 
     expect(jitteredInterval(5_000, 1_000)).toBe(expected);
   });
+
+  it.each([
+    [0, 0],
+    [Number.POSITIVE_INFINITY, 1],
+    [5_000, -1],
+    [5_000, 5_000],
+    [5_000, Number.NaN],
+  ])("rejects an invalid interval %s and spread %s", (interval, spread) => {
+    expect(() => jitteredInterval(interval, spread)).toThrow(RangeError);
+  });
 });
