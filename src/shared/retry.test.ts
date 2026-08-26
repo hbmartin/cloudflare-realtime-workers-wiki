@@ -41,4 +41,11 @@ describe("jitteredInterval", () => {
   ])("rejects an invalid interval %s and spread %s", (interval, spread) => {
     expect(() => jitteredInterval(interval, spread)).toThrow(RangeError);
   });
+
+  it.each([
+    [5_000, 0],
+    [5_000, 4_999],
+  ])("accepts interval %s with boundary spread %s", (interval, spread) => {
+    expect(() => jitteredInterval(interval, spread)).not.toThrow();
+  });
 });
