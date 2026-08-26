@@ -19,6 +19,26 @@ describe("jitteredBackoff", () => {
     expect(jitteredBackoff(attempt, 5_000, 300_000)).toBe(ceiling / 2);
     expect(jitteredBackoff(attempt, 5_000, 300_000)).toBe(ceiling);
   });
+
+  it.each([
+    [-1, 5_000, 300_000],
+    [0.5, 5_000, 300_000],
+    [Number.NaN, 5_000, 300_000],
+    [0, 0, 300_000],
+    [0, 0.1, 300_000],
+    [0, Number.POSITIVE_INFINITY, 300_000],
+    [0, 5_000, 0],
+    [0, 5_000, 0.1],
+    [0, 5_000, Number.POSITIVE_INFINITY],
+  ])("rejects invalid backoff inputs %s, %s, and %s", (attempt, base, cap) => {
+    expect(() => jitteredBackoff(attempt, base, cap)).toThrow(RangeError);
+  });
+
+  it("returns a positive delay at the minimum valid interval", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+
+    expect(jitteredBackoff(0, 1, 1)).toBe(1);
+  });
 });
 
 describe("jitteredInterval", () => {

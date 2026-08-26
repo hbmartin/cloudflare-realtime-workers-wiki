@@ -13,6 +13,13 @@ export class ApiClientError extends Error {
   }
 }
 
+export class InvalidApiResponseError extends Error {
+  constructor(readonly status: number) {
+    super("The server returned an invalid successful response.");
+    this.name = "InvalidApiResponseError";
+  }
+}
+
 export type UnauthorizedHandler = (error: ApiClientError) => void;
 
 const unauthorizedHandlers = new Set<UnauthorizedHandler>();
@@ -52,7 +59,11 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw clientError;
   }
-  return response.json() as Promise<T>;
+  try {
+    return (await response.json()) as T;
+  } catch {
+    throw new InvalidApiResponseError(response.status);
+  }
 }
 
 export function json(value: unknown) {
