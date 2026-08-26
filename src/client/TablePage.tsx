@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { jitteredBackoff } from "../shared/retry";
+import { jitteredBackoff, jitteredInterval } from "../shared/retry";
 import { TABLE_MAX_ROWS, TABLE_PAGE_DEFAULT, TABLE_SORT_MAX_OFFSET } from "../shared/table-limits";
 import type { ClientMemberContext } from "../shared/types";
 import type {
@@ -13,6 +13,7 @@ import type {
 } from "../shared/types";
 import { ApiClientError, api, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
+import { mergeMutationRevision } from "./table-revision";
 
 type IsCurrent = () => boolean;
 type MutationOptions = {
@@ -107,9 +108,7 @@ function revisionPollDelay(failures: number) {
   if (failures) {
     return jitteredBackoff(failures, REVISION_POLL_INTERVAL_MS, REVISION_POLL_MAX_BACKOFF_MS);
   }
-  // Difference-of-uniforms jitter keeps the healthy mean at five seconds while
-  // preventing viewers that loaded together from polling in permanent lockstep.
-  return REVISION_POLL_INTERVAL_MS + Math.round((Math.random() - Math.random()) * REVISION_POLL_HEALTHY_JITTER_MS);
+  return jitteredInterval(REVISION_POLL_INTERVAL_MS, REVISION_POLL_HEALTHY_JITTER_MS);
 }
 
 type LeaseClock = { monotonic: number; wall: number };
@@ -231,7 +230,9 @@ function releaseTableLease(pageId: string, leaseToken: string) {
 
 function errorMessage(cause: unknown, fallback: string) {
   if (!(cause instanceof Error)) return fallback;
-  return cause.name === "TimeoutError" ? fallback : cause.message || fallback;
+  return cause.name === "TimeoutError" || (cause instanceof ApiClientError && cause.messageFromFallback)
+    ? fallback
+    : cause.message || fallback;
 }
 
 // The table's page was archived or deleted underneath this view. Terminal for
@@ -419,6 +420,7 @@ export function TablePage({
       }
       revisionRecoveryPendingRef.current = true;
       setRevisionRecoveryPending(true);
+      configureRevisionPollingRef.current(revisionPollModeRef.current);
       // Preserve unrelated transport or sort errors, but replace the terminal-
       // sounding stale exhaustion message now that automatic recovery is active.
       setLoadError((current) => (current === STALE_TABLE_REVISION_MESSAGE ? null : current));
@@ -515,6 +517,7 @@ export function TablePage({
     );
     revisionRef.current = null;
     setRevisionKnown(false);
+    configureRevisionPollingRef.current(revisionPollModeRef.current);
   }, []);
 
   const changeLoadCount = useCallback((delta: 1 | -1, background: boolean) => {
@@ -1330,33 +1333,35 @@ export function TablePage({
     };
   }, [load, acquire, canEdit, reportLeaseError]);
 
-  const revisionPollMode: RevisionPollMode = terminalPageUnavailable
+  const revisionPollBaseMode: RevisionPollMode = terminalPageUnavailable
     ? "off"
-    : revisionRecoveryPending || !revisionKnown
-      ? "recovery"
-      : appendedPageCount > 0 || (leaseToken && tableLoaded)
-        ? "off"
-        : "refresh";
+    : appendedPageCount > 0 || (leaseToken && tableLoaded)
+      ? "off"
+      : "refresh";
 
-  // Keep one scheduler alive across the recovery state transitions caused by its
-  // own requests. A small mode effect below starts and stops it without discarding
-  // backoff or an in-flight attempt's accounting.
+  // The scheduler overlays synchronous recovery refs on this stable render mode.
+  // Recovery state can clear and re-arm inside one batched render, so using the
+  // rendered recovery mirror as the requested mode could miss the transition
+  // back to refresh/off and leave the scheduler running indefinitely.
   useEffect(() => {
-    revisionPollModeRef.current = revisionPollMode;
-    configureRevisionPollingRef.current(revisionPollMode);
-  }, [revisionPollMode]);
+    revisionPollModeRef.current = revisionPollBaseMode;
+    configureRevisionPollingRef.current(revisionPollBaseMode);
+  }, [revisionPollBaseMode]);
 
   useEffect(() => {
     let active = true;
     let mode: RevisionPollMode = "off";
+    let requestedMode: RevisionPollMode = "off";
     let pollTimer: number | undefined;
     let pollRunning = false;
     let wakeAfterRunning = false;
     let delayedFailures = 0;
     let recoveryFailureStreak = 0;
     let backoffResetVersion = 0;
-    const isCurrent = () => active && mode !== "off" && mountedRef.current;
     const recoveryIsActive = () => revisionRecoveryPendingRef.current || revisionRef.current === null;
+    const resolvedMode = (): RevisionPollMode =>
+      !pageUnavailableRef.current && recoveryIsActive() ? "recovery" : requestedMode;
+    const isCurrent = () => active && resolvedMode() !== "off" && mountedRef.current;
     const resetRecoveryFailureState = () => {
       recoveryFailureStreak = 0;
       if (mountedRef.current) setRevisionRecoveryError(null);
@@ -1370,15 +1375,35 @@ export function TablePage({
       window.clearTimeout(pollTimer);
       pollTimer = undefined;
     };
+    const reconcilePollMode = () => {
+      if (!active) return false;
+      const nextMode = resolvedMode();
+      if (mode === nextMode) return mode !== "off";
+      const previousMode = mode;
+      mode = nextMode;
+      if (mode === "off") {
+        clearPollTimer();
+        wakeAfterRunning = false;
+        revisionRecoveryWakePendingRef.current = false;
+        resetFailureState();
+        return false;
+      }
+      if (previousMode === "recovery" && mode !== "recovery") {
+        resetFailureState();
+        clearPollTimer();
+      }
+      return true;
+    };
     const armPoll = (delay: number) => {
-      if (!active || mode === "off") return;
+      if (!reconcilePollMode()) return;
       clearPollTimer();
       pollTimer = window.setTimeout(() => {
         pollTimer = undefined;
         void poll();
       }, delay);
     };
-    const refreshShouldStandDown = () => !recoveryIsActive() && appendedPagesRef.current > 0;
+    const refreshShouldStandDown = (recoveryActive = recoveryIsActive()) =>
+      !recoveryActive && appendedPagesRef.current > 0;
     const schedulePoll = () => {
       if (refreshShouldStandDown()) {
         clearPollTimer();
@@ -1394,18 +1419,18 @@ export function TablePage({
       schedulePoll();
     };
     async function poll() {
-      if (!isCurrent()) return;
+      if (!reconcilePollMode() || !mountedRef.current) return;
       if (loadsInFlightRef.current || pendingMutationsRef.current) {
         // A requested wake stays prompt while another foreground operation owns
         // the load slot. Its completion also calls wakePoll through changeLoadCount.
-        if (revisionRecoveryWakePendingRef.current) armPoll(REVISION_POLL_INTERVAL_MS);
+        if (revisionRecoveryWakePendingRef.current) armPoll(revisionPollDelay(0));
         else schedulePoll();
         return;
       }
       pollRunning = true;
       revisionRecoveryWakePendingRef.current = false;
       const recoveryWasActive = recoveryIsActive();
-      if (refreshShouldStandDown()) {
+      if (refreshShouldStandDown(recoveryWasActive)) {
         pollRunning = false;
         return;
       }
@@ -1430,7 +1455,7 @@ export function TablePage({
           failure: { cause },
         });
       }
-      if (!active || mode === "off") {
+      if (!active || !reconcilePollMode()) {
         pollRunning = false;
         return;
       }
@@ -1438,7 +1463,10 @@ export function TablePage({
       // A foreground adoption retires an ordinary refresh failure, but a page-one
       // adoption can leave deeper recovery pending. In that case the failed depth
       // probe remains evidence for both retry backoff and the recovery warning.
-      if (delayedResult.outcome === "adopted" || (pollBackoffResetVersion !== backoffResetVersion && !recoveryActive)) {
+      if (
+        delayedResult.outcome === "adopted" ||
+        (pollBackoffResetVersion !== backoffResetVersion && !recoveryWasActive)
+      ) {
         delayedFailures = 0;
       } else if (delayedResult.countsTowardBackoff && (recoveryWasActive || delayedResult.failure !== null)) {
         delayedFailures += 1;
@@ -1479,31 +1507,19 @@ export function TablePage({
       }
     }
     const wakePoll = () => {
-      if (!active || mode === "off") return;
+      if (!reconcilePollMode()) return;
       revisionRecoveryWakePendingRef.current = true;
       if (pollRunning) wakeAfterRunning = true;
       else armPoll(0);
     };
-    const configurePoll = (requestedMode: RevisionPollMode) => {
+    const configurePoll = (nextRequestedMode: RevisionPollMode) => {
       // Recovery refs are updated synchronously, while their render state can
       // briefly pass through refresh/off when a foreground page-one load clears
       // and immediately re-defers a depth target. Do not let that stale render
-      // transition discard the live scheduler's failure accounting.
-      const nextMode = !pageUnavailableRef.current && recoveryIsActive() ? "recovery" : requestedMode;
-      if (!active || mode === nextMode) return;
-      const previousMode = mode;
-      mode = nextMode;
-      if (mode === "off") {
-        clearPollTimer();
-        wakeAfterRunning = false;
-        revisionRecoveryWakePendingRef.current = false;
-        resetFailureState();
-        return;
-      }
-      if (previousMode === "recovery" && mode !== "recovery") {
-        resetFailureState();
-        clearPollTimer();
-      }
+      // transition discard the live scheduler's failure accounting. Remember
+      // the requested mode so the scheduler can reconcile once the refs settle.
+      requestedMode = nextRequestedMode;
+      if (!reconcilePollMode()) return;
       if (pollRunning || pollTimer !== undefined) return;
       if (revisionRecoveryWakePendingRef.current && !pendingMutationsRef.current) wakePoll();
       else schedulePoll();
@@ -1691,7 +1707,17 @@ export function TablePage({
           // returned after another lease was acquired. Its result belongs to the
           // authoritative reload for that lease, not this local state.
           if (leaseTokenRef.current !== currentLease) return null;
-          revisionRef.current = result.revision;
+          // A concurrent load may have invalidated the mutation base or adopted
+          // a newer snapshot while this request was in flight. Never turn an
+          // unknown revision back into a known one or regress a newer snapshot;
+          // otherwise the committed response can safely advance the known base.
+          const mergedRevision = mergeMutationRevision(revisionRef.current, result.revision);
+          if (mergedRevision !== null) {
+            revisionRef.current = mergedRevision;
+            setRevisionKnown(true);
+          } else {
+            preserveRevisionFloor(result.revision);
+          }
           if (
             sortRef.current.column &&
             (affectsSortedOrder === true || affectsSortedOrder === sortRef.current.column)
@@ -1700,7 +1726,9 @@ export function TablePage({
           }
           if (affectsSortedOrder === true) unsortedSnapshotDirtyRef.current = true;
           setSaveError(null);
-          setTable((current) => (current ? { ...current, revision: result.revision } : current));
+          setTable((current) =>
+            current ? { ...current, revision: Math.max(current.revision, result.revision) } : current,
+          );
           return result;
         } catch (cause) {
           if (!isMounted()) return null;

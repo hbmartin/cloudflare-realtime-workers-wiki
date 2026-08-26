@@ -168,7 +168,7 @@ describe("TablePage", () => {
     vi.mocked(api).mockReset();
     // Keep existing interval assertions deterministic. Individual tests can
     // override this to exercise the lower edge of the jitter window.
-    randomSpy = vi.spyOn(Math, "random").mockReturnValue(1 - Number.EPSILON);
+    randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
   });
 
   afterEach(() => {
@@ -215,8 +215,8 @@ describe("TablePage", () => {
     expect(screen.queryByText("The operation timed out.")).not.toBeInTheDocument();
   });
 
-  it("uses the table-load fallback when the API error message is empty", async () => {
-    vi.mocked(api).mockRejectedValue(new ApiClientError(503, "table_unavailable", ""));
+  it("uses the table-load fallback when the API supplies only its generic fallback", async () => {
+    vi.mocked(api).mockRejectedValue(new ApiClientError(503, "request_failed", "Request failed (503).", true));
 
     render(
       <TablePage
@@ -2594,6 +2594,7 @@ describe("TablePage", () => {
     });
     renderViewer();
     await act(() => vi.advanceTimersByTimeAsync(0));
+    randomSpy.mockReturnValue(1 - Number.EPSILON);
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(loads).toBe(2);
@@ -2603,6 +2604,7 @@ describe("TablePage", () => {
     expect(loads).toBe(3);
     await act(() => vi.advanceTimersByTimeAsync(19_999));
     expect(loads).toBe(3);
+    randomSpy.mockReturnValue(0.5);
     await act(() => vi.advanceTimersByTimeAsync(1));
 
     expect(loads).toBe(4);
@@ -2647,10 +2649,9 @@ describe("TablePage", () => {
     expect(sortedLoads).toBe(2);
   });
 
-  it("jitters healthy ordinary refresh polling around the five-second mean", async () => {
+  it("applies healthy jitter to ordinary refresh polling", async () => {
     vi.useFakeTimers();
-    let randomCalls = 0;
-    randomSpy.mockImplementation(() => (randomCalls++ % 2 === 0 ? 0 : 1 - Number.EPSILON));
+    randomSpy.mockReturnValue(0);
     vi.mocked(api).mockResolvedValue({ table });
     renderViewer();
     await act(() => vi.advanceTimersByTimeAsync(0));
@@ -2696,9 +2697,77 @@ describe("TablePage", () => {
     expect(sortedLoads).toBe(2);
   });
 
+  it("retires an obsolete ordinary-refresh failure when depth recovery starts during the poll", async () => {
+    vi.useFakeTimers();
+    const current = pagedTable({
+      revision: 5,
+      rows: [{ id: "row", position: 0, cells: { status: "Current" } }],
+    });
+    const sorted: TableData = {
+      ...current,
+      sort: "status",
+      nextCursor: null,
+      nextOffset: 500,
+    };
+    const staleFirst = { ...sorted, revision: 4 };
+    const staleSecond: TableData = {
+      ...staleFirst,
+      rows: [{ id: "row-stale", position: 500, cells: { status: "Stale" } }],
+      hasMore: false,
+      nextOffset: null,
+      rowCount: null,
+    };
+    const freshFirst = { ...sorted, revision: 6 };
+    const freshSecond: TableData = {
+      ...staleSecond,
+      revision: 6,
+      rows: [{ id: "row-fresh", position: 500, cells: { status: "Fresh" } }],
+    };
+    const obsoleteRefresh = deferred<{ table: TableData }>();
+    let plainLoads = 0;
+    let sortedPageOneLoads = 0;
+    let offsetLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      const request = String(path);
+      if (!request.includes("sort=status")) {
+        plainLoads += 1;
+        return plainLoads === 1 ? Promise.resolve({ table: current }) : obsoleteRefresh.promise;
+      }
+      if (request.includes("offset=500")) {
+        offsetLoads += 1;
+        return Promise.resolve({ table: offsetLoads === 1 ? staleSecond : freshSecond });
+      }
+      sortedPageOneLoads += 1;
+      if (sortedPageOneLoads === 1) return Promise.resolve({ table: sorted });
+      return Promise.resolve({ table: sortedPageOneLoads <= 4 ? staleFirst : freshFirst });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(plainLoads).toBe(2);
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await drainStaleRetries();
+    await drainStaleRetries();
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
+    expect(sortedPageOneLoads).toBe(4);
+
+    await act(async () => {
+      obsoleteRefresh.reject(new Error("Obsolete refresh failure."));
+      await obsoleteRefresh.promise.catch(() => undefined);
+    });
+
+    await act(() => vi.advanceTimersByTimeAsync(4_999));
+    expect(sortedPageOneLoads).toBe(4);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(sortedPageOneLoads).toBe(5);
+    expect(screen.getByDisplayValue("Fresh")).toBeInTheDocument();
+  });
+
   it("jitters failed ordinary refresh backoff", async () => {
     vi.useFakeTimers();
-    randomSpy.mockReturnValue(0);
     let loads = 0;
     vi.mocked(api).mockImplementation(() => {
       loads += 1;
@@ -2708,6 +2777,7 @@ describe("TablePage", () => {
     });
     renderViewer();
     await act(() => vi.advanceTimersByTimeAsync(0));
+    randomSpy.mockReturnValue(0);
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(loads).toBe(2);
@@ -3373,7 +3443,13 @@ describe("TablePage", () => {
       nextCursor: null,
       rowCount: null,
     };
-    const backgroundPolls = Array.from({ length: 3 }, () => deferred<{ table: TableData }>());
+    const terminalFirst: TableData = {
+      ...first,
+      hasMore: false,
+      nextCursor: null,
+      rowCount: 1,
+    };
+    const backgroundPolls = Array.from({ length: 4 }, () => deferred<{ table: TableData }>());
     const pageOneLoadTimes: number[] = [];
     let pageOneLoads = 0;
     let saves = 0;
@@ -3419,9 +3495,10 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
     expect(saves).toBe(2);
     expect(pageOneLoads).toBe(7);
+    randomSpy.mockReturnValue(1 - Number.EPSILON);
 
     await act(async () => {
-      backgroundPolls[0]!.reject(new ApiClientError(503, "table_unavailable", ""));
+      backgroundPolls[0]!.reject(new ApiClientError(503, "request_failed", "Request failed (503).", true));
       await backgroundPolls[0]!.promise.catch(() => undefined);
     });
     await act(() => vi.advanceTimersByTimeAsync(0));
@@ -3429,7 +3506,7 @@ describe("TablePage", () => {
     const promptPollAt = pageOneLoadTimes.at(-1)!;
 
     await act(async () => {
-      backgroundPolls[1]!.reject(new ApiClientError(503, "table_unavailable", ""));
+      backgroundPolls[1]!.reject(new ApiClientError(503, "request_failed", "Request failed (503).", true));
       await backgroundPolls[1]!.promise.catch(() => undefined);
     });
     await act(() => vi.advanceTimersByTimeAsync(19_999));
@@ -3439,10 +3516,23 @@ describe("TablePage", () => {
     expect(pageOneLoadTimes.at(-1)! - promptPollAt).toBe(20_000);
 
     await act(async () => {
-      backgroundPolls[2]!.reject(new ApiClientError(503, "table_unavailable", ""));
+      backgroundPolls[2]!.reject(new ApiClientError(503, "request_failed", "Request failed (503).", true));
       await backgroundPolls[2]!.promise.catch(() => undefined);
     });
     expect(screen.getByText("The table depth could not be restored.")).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(39_999));
+    expect(pageOneLoads).toBe(9);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(pageOneLoads).toBe(10);
+    await act(async () => {
+      backgroundPolls[3]!.resolve({ table: terminalFirst });
+      await backgroundPolls[3]!.promise;
+    });
+    expect(screen.queryByText("The table depth could not be restored.")).not.toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(pageOneLoads).toBe(10);
   });
 
   it("backs off and reports background rejections superseded by newly queued edits", async () => {
@@ -3498,7 +3588,11 @@ describe("TablePage", () => {
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
     const pollInterval = 5_000;
-    const retryFailures = Array.from({ length: 3 }, () => new ApiClientError(503, "table_unavailable", ""));
+    randomSpy.mockReturnValue(1 - Number.EPSILON);
+    const retryFailures = Array.from(
+      { length: 3 },
+      () => new ApiClientError(503, "request_failed", "Request failed (503).", true),
+    );
     let displayedValue = "Current";
     const recoveryWarningCounts: number[] = [];
     for (const [index, failure] of retryFailures.entries()) {
