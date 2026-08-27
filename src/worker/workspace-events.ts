@@ -41,7 +41,12 @@ function validPage(value: unknown) {
 function workspaceEvent(value: unknown): WorkspaceEvent | null {
   const event = record(value);
   if (!event) return null;
-  if (event.type === "pages-upserted" && Array.isArray(event.pages) && event.pages.every(validPage)) {
+  if (
+    event.type === "pages-upserted" &&
+    Array.isArray(event.pages) &&
+    event.pages.every(validPage) &&
+    (event.restored === undefined || typeof event.restored === "boolean")
+  ) {
     return event as WorkspaceEvent;
   }
   if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {

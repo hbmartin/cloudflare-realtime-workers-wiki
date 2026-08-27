@@ -1975,6 +1975,36 @@ describe("Worker integration", () => {
     ).toBe(0);
   });
 
+  it("returns authoritative pages when restoring an archived subtree", async () => {
+    const installed = await bootstrap();
+    const child = await createPage(installed.cookie, "document", installed.pageId);
+    const archiveContext = createExecutionContext();
+    const archived = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }),
+      env,
+      archiveContext,
+    );
+    expect(archived.ok).toBe(true);
+    await waitOnExecutionContext(archiveContext);
+
+    const restoreContext = createExecutionContext();
+    const restored = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/restore`, { method: "POST" }),
+      env,
+      restoreContext,
+    );
+
+    expect(restored.status).toBe(200);
+    const result = await restored.json<{ pages: Array<{ id: string; archivedAt: number | null }> }>();
+    expect(result.pages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: installed.pageId, archivedAt: null }),
+        expect.objectContaining({ id: child.id, archivedAt: null }),
+      ]),
+    );
+    await waitOnExecutionContext(restoreContext);
+  });
+
   it("keeps an archived page committed and retries a failed room disconnect", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
@@ -3349,7 +3379,11 @@ describe("Worker integration", () => {
       context,
     );
     expect(deleted.status).toBe(202);
-    expect(await deleted.json()).toEqual({ ok: true, cleanupPending: true });
+    expect(await deleted.json()).toEqual({
+      ok: true,
+      pageIds: expect.arrayContaining([installed.pageId, child.id]),
+      cleanupPending: true,
+    });
     await waitOnExecutionContext(context);
 
     expect((await env.DB.prepare(`SELECT COUNT(*) count FROM pages`).first<{ count: number }>())?.count).toBe(0);
