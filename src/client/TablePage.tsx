@@ -13,6 +13,7 @@ import type {
 } from "../shared/types";
 import { ApiClientError, api, apiErrorMessage, json, SuccessfulApiResponseError } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
+import { errorMessageKey } from "./error-messages";
 
 type IsCurrent = () => boolean;
 type MutationOptions = {
@@ -277,10 +278,7 @@ function uniqueTableNotices(notices: Array<TableNotice | null>) {
   const unique = new Map<string, TableNotice>();
   for (const notice of notices) {
     if (!notice) continue;
-    const key = notice.message
-      .trim()
-      .replace(/[.!?…]+$/, "")
-      .trim();
+    const key = errorMessageKey(notice.message);
     const previous = unique.get(key);
     if (!previous) unique.set(key, notice);
     else if (notice.danger && !previous.danger) unique.set(key, { ...previous, danger: true });
@@ -1271,13 +1269,13 @@ export function TablePage({
       } catch (cause) {
         if (leaseTokenRef.current === token) {
           const leaseLost = cause instanceof ApiClientError && cause.status === 409;
-          await endLease(
-            token,
-            leaseLost
-              ? apiErrorMessage(cause, LEASE_LOST_MESSAGE)
-              : leaseErrorMessage(cause, LEASE_VERIFICATION_MESSAGE),
-            !leaseLost,
-          );
+          const message =
+            cause instanceof LeaseResponseError
+              ? cause.message
+              : leaseLost
+                ? apiErrorMessage(cause, LEASE_LOST_MESSAGE)
+                : LEASE_VERIFICATION_MESSAGE;
+          await endLease(token, message, !leaseLost);
         }
       }
       return false;

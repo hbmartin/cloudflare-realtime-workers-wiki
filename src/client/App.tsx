@@ -5,6 +5,7 @@ import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent }
 import { ApiClientError, api, apiErrorMessage, authClient, json, onApiUnauthorized } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
+import { errorMessageKey } from "./error-messages";
 import { invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
 import { authoritativePageSnapshot, mergePages, mergePageSnapshot, PageLoadEventBuffer } from "./page-state";
 import { TablePage } from "./TablePage";
@@ -19,20 +20,15 @@ type AppState =
 type WorkspaceErrorSource = "archive" | "mentions" | "page-access" | "page-tree" | "trash";
 type WorkspaceError = { source: WorkspaceErrorSource; message: string };
 
-function errorMessageKey(message: string) {
-  return message
-    .trim()
-    .replace(/[.!?…]+$/, "")
-    .trim();
-}
-
-function appendErrorMessage(current: WorkspaceError[], source: WorkspaceErrorSource, message: string) {
+function updateWorkspaceErrors(current: WorkspaceError[], source: WorkspaceErrorSource, message: string) {
   const next = message.trim();
   if (!next) return current;
   const key = errorMessageKey(next);
-  return current.some((existing) => existing.source === source && errorMessageKey(existing.message) === key)
-    ? current
-    : [...current, { source, message: next }];
+  if (current.some((existing) => existing.source === source && errorMessageKey(existing.message) === key)) {
+    return current;
+  }
+  const retained = source === "page-access" ? current : current.filter((error) => error.source !== source);
+  return [...retained, { source, message: next }];
 }
 
 function formatErrorMessages(errors: WorkspaceError[]) {
@@ -42,6 +38,16 @@ function formatErrorMessages(errors: WorkspaceError[]) {
     if (!messages.has(key)) messages.set(key, /[.!?…]$/.test(message) ? message : `${message}.`);
   }
   return [...messages.values()].join(" ");
+}
+
+function archivePageIds(value: unknown, rootPageId: string) {
+  const pageIds =
+    value !== null && typeof value === "object" && "pageIds" in value ? (value as { pageIds?: unknown }).pageIds : null;
+  if (!Array.isArray(pageIds) || !pageIds.every((pageId) => typeof pageId === "string" && pageId.length > 0)) {
+    return null;
+  }
+  const uniquePageIds = [...new Set(pageIds)];
+  return uniquePageIds.includes(rootPageId) ? uniquePageIds : null;
 }
 
 async function resolveAppState(): Promise<AppState> {
@@ -293,15 +299,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const pageLoadPromise = useRef<Promise<void> | null>(null);
+  const trashLoadPromise = useRef<Promise<boolean> | null>(null);
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
 
   const reportWorkspaceError = useCallback((source: WorkspaceErrorSource, message: string) => {
-    setWorkspaceErrors((current) =>
-      appendErrorMessage(
-        source === "page-access" ? current : current.filter((error) => error.source !== source),
-        source,
-        message,
-      ),
-    );
+    setWorkspaceErrors((current) => updateWorkspaceErrors(current, source, message));
   }, []);
   const clearWorkspaceErrors = useCallback((source: WorkspaceErrorSource) => {
     setWorkspaceErrors((current) => {
@@ -309,6 +314,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       return next.length === current.length ? current : next;
     });
   }, []);
+  const navigateToPage = useCallback(
+    (pageId: string) => {
+      clearWorkspaceErrors("page-access");
+      setSelectedId(pageId);
+      setView("pages");
+      setSidebarOpen(false);
+    },
+    [clearWorkspaceErrors],
+  );
 
   const recordPageUpserts = useCallback((incoming: Page[]) => {
     pendingPageEvents.current.recordUpserts(incoming);
@@ -341,14 +355,23 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     pageLoadPromise.current = loading;
     return loading;
   }, [clearWorkspaceErrors]);
-  const loadTrash = useCallback(async () => {
-    try {
-      const data = await api<{ pages: Page[] }>("/api/pages/tree?archived=true");
-      setTrash(data.pages);
-      clearWorkspaceErrors("trash");
-    } catch (error) {
-      reportWorkspaceError("trash", apiErrorMessage(error, "Trash could not be refreshed."));
-    }
+  const loadTrash = useCallback(() => {
+    if (trashLoadPromise.current) return trashLoadPromise.current;
+    const loading = api<{ pages: Page[] }>("/api/pages/tree?archived=true")
+      .then((data) => {
+        setTrash(data.pages);
+        clearWorkspaceErrors("trash");
+        return true;
+      })
+      .catch((error) => {
+        reportWorkspaceError("trash", apiErrorMessage(error, "Trash could not be refreshed."));
+        return false;
+      })
+      .finally(() => {
+        if (trashLoadPromise.current === loading) trashLoadPromise.current = null;
+      });
+    trashLoadPromise.current = loading;
+    return loading;
   }, [clearWorkspaceErrors, reportWorkspaceError]);
   const loadUnreadMentions = useCallback(
     () =>
@@ -387,7 +410,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         setPages((current) => current.filter((page) => !removedIds.has(page.id)));
         if (event.permanently) {
           setTrash((current) => current.filter((page) => !removedIds.has(page.id)));
-        } else {
+        } else if (viewRef.current === "trash") {
           void loadTrash();
         }
         return;
@@ -413,13 +436,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const navigate = (event: Event) => {
       const pageId = (event as CustomEvent<string>).detail;
       if (!pageId) return;
-      setSelectedId(pageId);
-      setView("pages");
-      setSidebarOpen(false);
+      navigateToPage(pageId);
     };
     window.addEventListener(PAGE_NAVIGATE_EVENT, navigate);
     return () => window.removeEventListener(PAGE_NAVIGATE_EVENT, navigate);
-  }, []);
+  }, [navigateToPage]);
 
   // Render-phase adjustment, not just a display fallback: a deleted page's id left in
   // selectedId would be persisted below, and would yank the editor back to that page
@@ -448,29 +469,30 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const result = await api<{ page: Page }>("/api/pages", { method: "POST", body: json({ kind, parentId }) });
     recordPageUpserts([result.page]);
     setPages((current) => mergePages(current, [result.page]));
-    setSelectedId(result.page.id);
-    setView("pages");
-    setSidebarOpen(false);
+    navigateToPage(result.page.id);
   }
   async function archive(page: Page) {
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
     clearWorkspaceErrors("archive");
-    let archivedPageIds: string[] = [];
+    let archivedPageIds: string[] | null = null;
     let archiveError: string | null = null;
     try {
-      const result = await api<{ pageIds: string[] }>(`/api/pages/${page.id}`, { method: "DELETE" });
-      archivedPageIds = result.pageIds;
+      const result = await api<unknown>(`/api/pages/${page.id}`, { method: "DELETE" });
+      archivedPageIds = archivePageIds(result, page.id);
+      if (!archivedPageIds) {
+        reportWorkspaceError("archive", "The server returned an invalid archive response. Refreshing the page tree.");
+      }
     } catch (error) {
       archiveError = apiErrorMessage(error, "The page could not be archived.");
       reportWorkspaceError("archive", archiveError);
     }
     const reconciliation = loadPages();
-    if (!archiveError) {
+    if (archivedPageIds) {
       recordPageRemovals(archivedPageIds);
       const removedIds = new Set(archivedPageIds);
       for (const pageId of removedIds) invalidatePagePreview(pageId);
       setPages((current) => current.filter((candidate) => !removedIds.has(candidate.id)));
-      void loadTrash();
+      if (viewRef.current === "trash") void loadTrash();
     }
     await reconciliation.catch((error) => {
       const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
@@ -509,10 +531,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   // just opened. Selecting a page already closes it; these do the same.
   async function showTrash() {
     setSidebarOpen(false);
+    clearWorkspaceErrors("page-access");
     await loadTrash();
     setView("trash");
   }
   function showView(next: "search" | "mentions" | "settings") {
+    clearWorkspaceErrors("page-access");
     setView(next);
     setSidebarOpen(false);
   }
@@ -527,6 +551,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     (pageId: string) => {
       const reconciliation = loadPages();
       recordPageRemovals([pageId]);
+      invalidatePagePreview(pageId);
       setPages((current) => current.filter((page) => page.id !== pageId));
       void reconciliation.catch((error) => {
         const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
@@ -545,6 +570,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
 
   const workspaceError = formatErrorMessages(workspaceErrors);
+  const trashLoadFailed = workspaceErrors.some((error) => error.source === "trash");
 
   return (
     <div className="workspace-shell">
@@ -588,11 +614,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             nodes={tree}
             selectedId={resolvedSelectedId}
             editable={member.role !== "viewer"}
-            onSelect={(id) => {
-              setSelectedId(id);
-              setView("pages");
-              setSidebarOpen(false);
-            }}
+            onSelect={navigateToPage}
             onCreate={(parentId) => void createPage("document", parentId)}
             onArchive={(page) => void archive(page)}
             onDropPage={(id, parentId) => void move(id, parentId)}
@@ -642,27 +664,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         </header>
 
         {view === "search" ? (
-          <SearchView
-            value={search}
-            results={searchResults}
-            onChange={runSearch}
-            onSelect={(id) => {
-              setSelectedId(id);
-              setView("pages");
-            }}
-          />
+          <SearchView value={search} results={searchResults} onChange={runSearch} onSelect={navigateToPage} />
         ) : view === "mentions" ? (
-          <MentionsView
-            onSelect={(id) => {
-              setSelectedId(id);
-              setView("pages");
-            }}
-            onRead={handleMentionsRead}
-          />
+          <MentionsView onSelect={navigateToPage} onRead={handleMentionsRead} />
         ) : view === "trash" ? (
           <TrashView
             pages={trash}
             owner={member.role === "owner"}
+            loadFailed={trashLoadFailed}
             onRestore={async (page) => {
               await api(`/api/pages/${page.id}/restore`, { method: "POST" });
               await loadPages();
@@ -685,10 +694,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               onPageChanged={updatePage}
               onPageUnavailable={pageUnavailable}
               onAccessDenied={documentAccessDenied}
-              onSelectPage={(id) => {
-                setSelectedId(id);
-                setView("pages");
-              }}
+              onSelectPage={navigateToPage}
               backlinksRevision={backlinksRevision}
             />
           ) : (
@@ -698,10 +704,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               member={member}
               onPageChanged={updatePage}
               onPageUnavailable={pageUnavailable}
-              onSelectPage={(id) => {
-                setSelectedId(id);
-                setView("pages");
-              }}
+              onSelectPage={navigateToPage}
               backlinksRevision={backlinksRevision}
             />
           )
@@ -955,11 +958,13 @@ function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; on
 function TrashView({
   pages,
   owner,
+  loadFailed,
   onRestore,
   onDelete,
 }: {
   pages: Page[];
   owner: boolean;
+  loadFailed: boolean;
   onRestore: (page: Page) => void;
   onDelete: (page: Page) => void;
 }) {
@@ -982,7 +987,7 @@ function TrashView({
           </div>
         ))}
       </div>
-      {!pages.length && <p className="empty-copy">Trash is empty.</p>}
+      {!pages.length && !loadFailed && <p className="empty-copy">Trash is empty.</p>}
     </main>
   );
 }

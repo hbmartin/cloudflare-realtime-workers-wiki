@@ -874,10 +874,11 @@ app.delete("/api/pages/:id", async (c) => {
   )
     .bind(page.id)
     .all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
+  const pageIds = archived.results.map((item) => item.id);
   const documents = archived.results.filter((item) => item.kind === "document");
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
-    pageIds: archived.results.map((item) => item.id),
+    pageIds,
     permanently: false,
   });
   const pendingPageIds = await processArchiveDisconnectTargets(
@@ -890,7 +891,7 @@ app.delete("/api/pages/:id", async (c) => {
   return c.json(
     {
       ok: true,
-      pageIds: archived.results.map((item) => item.id),
+      pageIds,
       cleanupPending: pendingPageIds.length > 0,
       pendingPageIds,
     },
