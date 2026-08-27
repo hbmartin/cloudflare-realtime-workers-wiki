@@ -5,7 +5,7 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { Page, TableData, TableLeaseResponse, TableLeaseTiming } from "../shared/types";
-import { ApiClientError, api, InvalidApiResponseError } from "./api";
+import { ApiClientError, api, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
 import { TablePage } from "./TablePage";
 
 vi.mock("./api", async (importOriginal) => {
@@ -213,6 +213,31 @@ describe("TablePage", () => {
 
     expect(await screen.findByText("Table could not be loaded.")).toBeInTheDocument();
     expect(screen.queryByText("The operation timed out.")).not.toBeInTheDocument();
+  });
+
+  it("uses the table-load fallback when a response-body timeout is wrapped", async () => {
+    vi.mocked(api).mockRejectedValue(
+      new UnreadableApiResponseError(
+        200,
+        "/api/tables/table-page?limit=500&count=true",
+        "https://example.test/api/tables/table-page?limit=500&count=true",
+        "application/json",
+        new DOMException("The operation timed out.", "TimeoutError"),
+      ),
+    );
+
+    render(
+      <TablePage
+        page={page}
+        member={member("viewer")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    expect(await screen.findByText("Table could not be loaded.")).toBeInTheDocument();
+    expect(screen.queryByText("The successful response body could not be read.")).not.toBeInTheDocument();
   });
 
   it("uses the table-load fallback when the API supplies only its generic fallback", async () => {
@@ -1134,8 +1159,21 @@ describe("TablePage", () => {
         throw new InvalidApiResponseError(
           200,
           "/api/tables/table-page/cells/row/status",
+          "https://example.test/api/tables/table-page/cells/row/status",
           "application/json",
           new SyntaxError("Unexpected end of JSON input"),
+        );
+      },
+    ],
+    [
+      "cannot be read",
+      () => {
+        throw new UnreadableApiResponseError(
+          200,
+          "/api/tables/table-page/cells/row/status",
+          "https://example.test/api/tables/table-page/cells/row/status",
+          "application/json",
+          new TypeError("The response stream terminated."),
         );
       },
     ],
@@ -1178,6 +1216,44 @@ describe("TablePage", () => {
 
     const lastSave = vi.mocked(api).mock.calls.findLast(([, init]) => init?.method === "PUT");
     expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 2 });
+  });
+
+  it("does not assume a non-JSON successful mutation response committed", async () => {
+    let loads = 0;
+    let mutations = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.includes("/cells/")) {
+        mutations += 1;
+        if (mutations === 1) {
+          throw new InvalidApiResponseError(
+            200,
+            String(path),
+            "https://example.test/login",
+            "text/html; charset=utf-8",
+            new SyntaxError("Unexpected token '<'"),
+          );
+        }
+        return { revision: 2 };
+      }
+      loads += 1;
+      return { table: tableWithTwoTextCells(1) };
+    });
+    await renderActiveEditor();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Unconfirmed" } });
+    fireEvent.blur(input);
+
+    expect(await screen.findByText("The table update could not be saved.")).toBeInTheDocument();
+    await waitFor(() => expect(loads).toBe(3));
+
+    const recoveredInput = screen.getByDisplayValue("Ready");
+    fireEvent.change(recoveredInput, { target: { value: "Retried" } });
+    fireEvent.blur(recoveredInput);
+    await waitFor(() => expect(mutations).toBe(2));
+
+    const lastSave = vi.mocked(api).mock.calls.findLast(([, init]) => init?.method === "PUT");
+    expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 1 });
   });
 
   it("reloads the table when a mutation target no longer exists", async () => {
