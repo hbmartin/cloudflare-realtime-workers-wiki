@@ -1,6 +1,7 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { YServer } from "y-partyserver";
 import type { WorkspaceEvent } from "../shared/types";
+import { isPage } from "../shared/validation";
 import type { Env } from "./env";
 
 export interface EventConnectionAuth {
@@ -19,32 +20,13 @@ function stringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
-function validPage(value: unknown) {
-  const page = record(value);
-  if (!page) return false;
-  return (
-    typeof page.id === "string" &&
-    typeof page.workspaceId === "string" &&
-    (page.parentId === null || typeof page.parentId === "string") &&
-    (page.kind === "document" || page.kind === "table") &&
-    typeof page.position === "string" &&
-    typeof page.title === "string" &&
-    (page.icon === null || typeof page.icon === "string") &&
-    typeof page.revision === "number" &&
-    typeof page.contentEpoch === "number" &&
-    (page.archivedAt === null || typeof page.archivedAt === "number") &&
-    typeof page.createdAt === "number" &&
-    typeof page.updatedAt === "number"
-  );
-}
-
 function workspaceEvent(value: unknown): WorkspaceEvent | null {
   const event = record(value);
   if (!event) return null;
   if (
     event.type === "pages-upserted" &&
     Array.isArray(event.pages) &&
-    event.pages.every(validPage) &&
+    event.pages.every(isPage) &&
     (event.restored === undefined || typeof event.restored === "boolean")
   ) {
     return event as WorkspaceEvent;
