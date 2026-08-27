@@ -55,6 +55,7 @@ function isJsonContentType(contentType: string | null) {
   return mediaType === "application/json" || mediaType?.endsWith("+json") === true;
 }
 
+// fallow-ignore-next-line unused-export -- public base of exported response errors used by tests
 export abstract class SuccessfulApiResponseError extends Error {
   readonly hasJsonContentType: boolean;
   readonly requestPath: string;
