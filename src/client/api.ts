@@ -104,6 +104,14 @@ export class EmptyApiResponseError extends SuccessfulApiResponseError {
   }
 }
 
+export function isSuccessfulJsonResponseBodyError(cause: unknown) {
+  return (
+    cause instanceof SuccessfulApiResponseError &&
+    cause.hasJsonContentType &&
+    (cause.responseBodyFailure === "empty" || cause.responseBodyFailure === "parse")
+  );
+}
+
 export type UnauthorizedHandler = (error: ApiClientError) => void;
 
 const unauthorizedHandlers = new Set<UnauthorizedHandler>();

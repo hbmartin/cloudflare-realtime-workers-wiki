@@ -7,9 +7,9 @@ import {
   api,
   apiErrorMessage,
   authClient,
+  isSuccessfulJsonResponseBodyError,
   json,
   onApiUnauthorized,
-  SuccessfulApiResponseError,
 } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
@@ -25,7 +25,7 @@ type AppState =
   | { screen: "invite"; token: string }
   | { screen: "workspace"; member: ClientMemberContext };
 
-type WorkspaceErrorSource = "archive" | "mentions" | "page-access" | "page-tree" | "trash";
+type WorkspaceErrorSource = "archive" | "mentions" | "page-access" | "page-tree" | "trash-load" | "trash-mutation";
 type WorkspaceError = { source: WorkspaceErrorSource; message: string };
 
 function updateWorkspaceErrors(current: WorkspaceError[], source: WorkspaceErrorSource, message: string) {
@@ -327,10 +327,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [backlinksRevision, setBacklinksRevision] = useState(0);
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
   const [trashRefreshVersion, setTrashRefreshVersion] = useState(0);
+  const [trashLoading, setTrashLoading] = useState(false);
+  const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const pageLoadPromise = useRef<Promise<void> | null>(null);
-  const trashRefreshVersionRef = useRef(0);
-  const trashLoadRequest = useRef<{ version: number; promise: Promise<void> } | null>(null);
+  const trashLoadRequest = useRef<{
+    version: number;
+    controller: AbortController;
+    promise: Promise<void>;
+  } | null>(null);
+  const trashMutationIdsRef = useRef(new Set<string>());
 
   const reportWorkspaceError = useCallback((source: WorkspaceErrorSource, message: string) => {
     setWorkspaceErrors((current) => updateWorkspaceErrors(current, source, message));
@@ -357,15 +363,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const recordPageRemovals = useCallback((pageIds: string[]) => {
     pendingPageEvents.current.recordRemovals(pageIds);
   }, []);
-  const supersedeTrashLoad = useCallback(() => {
-    const loadWasPending = trashLoadRequest.current !== null;
-    trashRefreshVersionRef.current += 1;
-    if (loadWasPending) setTrashRefreshVersion(trashRefreshVersionRef.current);
-  }, []);
   const refreshTrash = useCallback(() => {
-    supersedeTrashLoad();
-    setTrashRefreshVersion(trashRefreshVersionRef.current);
-  }, [supersedeTrashLoad]);
+    const pending = trashLoadRequest.current;
+    if (pending) {
+      trashLoadRequest.current = null;
+      pending.controller.abort();
+    }
+    setTrashLoading(true);
+    setTrashRefreshVersion((current) => current + 1);
+  }, []);
 
   const loadPages = useCallback(() => {
     if (pageLoadPromise.current) return pageLoadPromise.current;
@@ -391,30 +397,37 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     pageLoadPromise.current = loading;
     return loading;
   }, [clearWorkspaceErrors]);
-  const loadTrash = useCallback(() => {
-    const version = trashRefreshVersionRef.current;
-    const current = trashLoadRequest.current;
-    if (current?.version === version) return current.promise;
-    const request = { version, promise: Promise.resolve() };
-    const loading = api<{ pages: Page[] }>("/api/pages/tree?archived=true")
-      .then((data) => {
-        if (trashRefreshVersionRef.current !== version) return;
-        setTrash(data.pages);
-        clearWorkspaceErrors("trash");
-      })
-      .catch((error) => {
-        if (trashRefreshVersionRef.current !== version) return;
-        reportWorkspaceError("trash", apiErrorMessage(error, "Trash could not be refreshed."));
-      })
-      .finally(() => {
-        if (trashLoadRequest.current === request) trashLoadRequest.current = null;
-      });
-    request.promise = loading;
-    trashLoadRequest.current = request;
-    return loading;
-  }, [clearWorkspaceErrors, reportWorkspaceError]);
+  const loadTrash = useCallback(
+    (version: number) => {
+      const current = trashLoadRequest.current;
+      if (current?.version === version) return current.promise;
+      current?.controller.abort();
+      const controller = new AbortController();
+      const request = { version, controller, promise: Promise.resolve() };
+      setTrashLoading(true);
+      const loading = api<{ pages: Page[] }>("/api/pages/tree?archived=true", { signal: controller.signal })
+        .then((data) => {
+          if (controller.signal.aborted) return;
+          setTrash(data.pages);
+          clearWorkspaceErrors("trash-load");
+        })
+        .catch((error) => {
+          if (controller.signal.aborted) return;
+          reportWorkspaceError("trash-load", apiErrorMessage(error, "Trash could not be refreshed."));
+        })
+        .finally(() => {
+          if (trashLoadRequest.current !== request) return;
+          trashLoadRequest.current = null;
+          setTrashLoading(false);
+        });
+      request.promise = loading;
+      trashLoadRequest.current = request;
+      return loading;
+    },
+    [clearWorkspaceErrors, reportWorkspaceError],
+  );
   useEffect(() => {
-    if (view === "trash" && trashRefreshVersion === trashRefreshVersionRef.current) void loadTrash();
+    if (view === "trash") void loadTrash(trashRefreshVersion);
   }, [loadTrash, trashRefreshVersion, view]);
   const loadUnreadMentions = useCallback(
     () =>
@@ -443,8 +456,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         recordPageUpserts(event.pages);
         for (const page of event.pages) invalidatePagePreview(page.id);
         setPages((current) => mergePages(current, event.pages));
-        supersedeTrashLoad();
         setTrash((current) => current.filter((page) => !event.pages.some((updated) => updated.id === page.id)));
+        if (event.restored) refreshTrash();
         return;
       }
       if (event.type === "pages-removed") {
@@ -453,7 +466,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         const removedIds = new Set(event.pageIds);
         setPages((current) => current.filter((page) => !removedIds.has(page.id)));
         if (event.permanently) {
-          supersedeTrashLoad();
+          refreshTrash();
           setTrash((current) => current.filter((page) => !removedIds.has(page.id)));
         } else {
           refreshTrash();
@@ -464,7 +477,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setBacklinksRevision((current) => current + 1);
       if (event.mentionTargetUserIds.includes(member.user.id)) void loadUnreadMentions();
     },
-    [loadUnreadMentions, member.user.id, recordPageRemovals, recordPageUpserts, refreshTrash, supersedeTrashLoad],
+    [loadUnreadMentions, member.user.id, recordPageRemovals, recordPageUpserts, refreshTrash],
   );
 
   useEffect(() => {
@@ -531,7 +544,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         reportWorkspaceError("archive", "The server returned an invalid archive response. Refreshing the page tree.");
       }
     } catch (error) {
-      if (error instanceof SuccessfulApiResponseError) {
+      if (isSuccessfulJsonResponseBodyError(error)) {
         archiveCommitted = true;
         reportWorkspaceError("archive", "The server returned an invalid archive response. Refreshing the page tree.");
       } else {
@@ -541,7 +554,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     }
     const reconciliation = loadPages();
     if (archiveCommitted) {
-      const removedIds = new Set([...knownPageIds, ...(archivedPageIds ?? [])]);
+      const removedIds = new Set(archivedPageIds ?? knownPageIds);
       recordPageRemovals([...removedIds]);
       for (const pageId of removedIds) invalidatePagePreview(pageId);
       setPages((current) => current.filter((candidate) => !removedIds.has(candidate.id)));
@@ -586,8 +599,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   function showTrash() {
     setSidebarOpen(false);
     clearWorkspaceErrors("page-access");
+    refreshTrash();
     setView("trash");
-    void loadTrash();
   }
   function showView(next: "search" | "mentions" | "settings") {
     clearWorkspaceErrors("page-access");
@@ -622,35 +635,58 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [pageUnavailable, reportWorkspaceError],
   );
+  function beginTrashMutation(pageIds: string[]) {
+    if (pageIds.some((pageId) => trashMutationIdsRef.current.has(pageId))) return false;
+    for (const pageId of pageIds) trashMutationIdsRef.current.add(pageId);
+    setPendingTrashMutationIds(new Set(trashMutationIdsRef.current));
+    return true;
+  }
+  function endTrashMutation(pageIds: string[]) {
+    for (const pageId of pageIds) trashMutationIdsRef.current.delete(pageId);
+    setPendingTrashMutationIds(new Set(trashMutationIdsRef.current));
+  }
   async function restorePage(page: Page) {
-    const restoredIds = new Set(pageSubtreeIds(trash, page.id));
+    const knownPageIds = pageSubtreeIds(trash, page.id);
+    if (!beginTrashMutation(knownPageIds)) return;
+    clearWorkspaceErrors("trash-mutation");
     try {
-      await api(`/api/pages/${page.id}/restore`, { method: "POST" });
+      const result = await api<{ pages: Page[] }>(`/api/pages/${page.id}/restore`, { method: "POST" });
+      const restoredIds = new Set(result.pages.map((restored) => restored.id));
+      recordPageUpserts(result.pages);
+      for (const restored of result.pages) invalidatePagePreview(restored.id);
+      setPages((current) => mergePages(current, result.pages));
+      setTrash((current) => current.filter((candidate) => !restoredIds.has(candidate.id)));
+      refreshTrash();
+      await loadPages().catch((error) => {
+        reportWorkspaceError("page-tree", apiErrorMessage(error, "The page tree could not be refreshed."));
+      });
     } catch (error) {
-      reportWorkspaceError("trash", apiErrorMessage(error, "The page could not be restored."));
-      return;
+      reportWorkspaceError("trash-mutation", apiErrorMessage(error, "The page could not be restored."));
+    } finally {
+      endTrashMutation(knownPageIds);
     }
-    setTrash((current) => current.filter((candidate) => !restoredIds.has(candidate.id)));
-    refreshTrash();
-    await loadPages().catch((error) => {
-      reportWorkspaceError("page-tree", apiErrorMessage(error, "The page tree could not be refreshed."));
-    });
   }
   async function permanentlyDeletePage(page: Page) {
+    const knownPageIds = pageSubtreeIds(trash, page.id);
+    if (knownPageIds.some((pageId) => trashMutationIdsRef.current.has(pageId))) return;
     if (!confirm(`Permanently delete “${page.title}”? This cannot be undone.`)) return;
-    const deletedIds = new Set(pageSubtreeIds(trash, page.id));
+    if (!beginTrashMutation(knownPageIds)) return;
+    clearWorkspaceErrors("trash-mutation");
     try {
-      await api(`/api/pages/${page.id}/permanent-delete`, { method: "POST" });
+      const result = await api<unknown>(`/api/pages/${page.id}/permanent-delete`, { method: "POST" });
+      const deletedIds = new Set(archivePageIds(result, page.id) ?? knownPageIds);
+      for (const pageId of deletedIds) invalidatePagePreview(pageId);
+      setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
+      refreshTrash();
     } catch (error) {
-      reportWorkspaceError("trash", apiErrorMessage(error, "The page could not be permanently deleted."));
-      return;
+      reportWorkspaceError("trash-mutation", apiErrorMessage(error, "The page could not be permanently deleted."));
+    } finally {
+      endTrashMutation(knownPageIds);
     }
-    setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
-    refreshTrash();
   }
 
   const workspaceError = formatErrorMessages(workspaceErrors);
-  const trashLoadFailed = workspaceErrors.some((error) => error.source === "trash");
+  const trashLoadFailed = workspaceErrors.some((error) => error.source === "trash-load");
 
   return (
     <div className="workspace-shell">
@@ -751,7 +787,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <TrashView
             pages={trash}
             owner={member.role === "owner"}
+            loading={trashLoading}
             loadFailed={trashLoadFailed}
+            pendingPageIds={pendingTrashMutationIds}
             onRestore={restorePage}
             onDelete={permanentlyDeletePage}
           />
@@ -1030,13 +1068,17 @@ function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; on
 function TrashView({
   pages,
   owner,
+  loading,
   loadFailed,
+  pendingPageIds,
   onRestore,
   onDelete,
 }: {
   pages: Page[];
   owner: boolean;
+  loading: boolean;
   loadFailed: boolean;
+  pendingPageIds: ReadonlySet<string>;
   onRestore: (page: Page) => Promise<void>;
   onDelete: (page: Page) => Promise<void>;
 }) {
@@ -1045,21 +1087,28 @@ function TrashView({
       <p className="eyebrow">Archive</p>
       <h1>Trash</h1>
       <p className="muted">Restoring a parent restores its entire archived subtree.</p>
+      {loading && <output className="muted">{pages.length ? "Refreshing trash…" : "Loading trash…"}</output>}
       <div className="trash-list">
-        {pages.map((page) => (
-          <div key={page.id}>
-            <span>{page.kind === "table" ? "▦" : "□"}</span>
-            <strong>{page.title}</strong>
-            <button onClick={() => void onRestore(page)}>Restore</button>
-            {owner && (
-              <button className="text-danger" onClick={() => void onDelete(page)}>
-                Delete forever
+        {pages.map((page) => {
+          const mutationPending = pendingPageIds.has(page.id);
+          const actionsDisabled = loading || mutationPending;
+          return (
+            <div key={page.id}>
+              <span>{page.kind === "table" ? "▦" : "□"}</span>
+              <strong>{page.title}</strong>
+              <button disabled={actionsDisabled} onClick={() => void onRestore(page)}>
+                Restore
               </button>
-            )}
-          </div>
-        ))}
+              {owner && (
+                <button className="text-danger" disabled={actionsDisabled} onClick={() => void onDelete(page)}>
+                  Delete forever
+                </button>
+              )}
+            </div>
+          );
+        })}
       </div>
-      {!pages.length && !loadFailed && <p className="empty-copy">Trash is empty.</p>}
+      {!pages.length && !loading && !loadFailed && <p className="empty-copy">Trash is empty.</p>}
     </main>
   );
 }

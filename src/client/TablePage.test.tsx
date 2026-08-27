@@ -905,6 +905,7 @@ describe("TablePage", () => {
 
     expect(screen.getByDisplayValue("Authoritative")).toBeInTheDocument();
     expect(screen.getByText("The editing lease was lost. Reloaded the authoritative table.")).toBeInTheDocument();
+    expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "DELETE" }));
   });
 
   it("releases the server lease after a terminal renewal failure", async () => {
@@ -2333,6 +2334,32 @@ describe("TablePage", () => {
     expect(
       screen.queryByText("Editing was paused because the lease could not be verified after the system clock changed."),
     ).not.toBeInTheDocument();
+  });
+
+  it("does not try to release a lease after clock-change verification returns 401", async () => {
+    stubMonotonicClock();
+    const acquiredAt = Date.now();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "PATCH") {
+        throw new ApiClientError(401, "session_expired", "Sign in again.");
+      }
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      return { table };
+    });
+    await renderActiveEditor();
+
+    vi.setSystemTime(acquiredAt + LEASE_DURATION_MS + 1);
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(screen.getByText("Sign in again.")).toBeInTheDocument();
+    expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "DELETE" }));
   });
 
   it("ends a lease after system sleep when the server says it was lost", async () => {

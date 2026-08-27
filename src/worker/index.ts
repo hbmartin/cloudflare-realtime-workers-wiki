@@ -939,11 +939,13 @@ app.post("/api/pages/:id/restore", async (c) => {
       ),
     ]),
   );
+  const restoredPages = restored.results.map(pageJson);
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-upserted",
-    pages: restored.results.map(pageJson),
+    pages: restoredPages,
+    restored: true,
   });
-  return c.json({ ok: true });
+  return c.json({ pages: restoredPages });
 });
 
 app.post("/api/pages/:id/permanent-delete", async (c) => {
@@ -1045,7 +1047,7 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
       console.error("Immediate deletion cleanup failed", error);
     }),
   );
-  return c.json({ ok: true, cleanupPending: true }, 202);
+  return c.json({ ok: true, pageIds, cleanupPending: true }, 202);
 });
 
 app.get("/api/search", async (c) => {

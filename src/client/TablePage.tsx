@@ -11,7 +11,7 @@ import type {
   TableLeaseTiming,
   TableRow,
 } from "../shared/types";
-import { ApiClientError, api, apiErrorMessage, json, SuccessfulApiResponseError } from "./api";
+import { ApiClientError, api, apiErrorMessage, isSuccessfulJsonResponseBodyError, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { errorMessageKey } from "./error-messages";
 
@@ -288,11 +288,15 @@ function uniqueTableNotices(notices: Array<TableNotice | null>) {
 
 function isCommittedMutationResponseError(cause: unknown) {
   if (cause instanceof InvalidMutationResponseError) return true;
-  return (
-    cause instanceof SuccessfulApiResponseError &&
-    cause.hasJsonContentType &&
-    (cause.responseBodyFailure === "empty" || cause.responseBodyFailure === "parse")
-  );
+  return isSuccessfulJsonResponseBodyError(cause);
+}
+
+function isNonRetryableLeaseRenewalError(cause: unknown): cause is ApiClientError {
+  return cause instanceof ApiClientError && cause.status !== 429 && cause.status < 500;
+}
+
+function shouldReleaseLeaseAfterRenewalFailure(cause: unknown) {
+  return !(cause instanceof ApiClientError) || (cause.status !== 401 && cause.status !== 409);
 }
 
 // The table's page was archived or deleted underneath this view. Terminal for
@@ -1274,10 +1278,10 @@ export function TablePage({
               ? cause.message
               : leaseLost
                 ? apiErrorMessage(cause, LEASE_LOST_MESSAGE)
-                : cause instanceof ApiClientError && cause.status !== 429 && cause.status < 500
+                : isNonRetryableLeaseRenewalError(cause)
                   ? apiErrorMessage(cause, LEASE_VERIFICATION_MESSAGE)
                   : LEASE_VERIFICATION_MESSAGE;
-          await endLease(token, message, !leaseLost);
+          await endLease(token, message, shouldReleaseLeaseAfterRenewalFailure(cause));
         }
       }
       return false;
@@ -1679,8 +1683,7 @@ export function TablePage({
           await endLease(leaseToken, cause.message);
           return;
         }
-        const retryable = !(cause instanceof ApiClientError) || cause.status === 429 || cause.status >= 500;
-        if (retryable) {
+        if (!isNonRetryableLeaseRenewalError(cause)) {
           const status = localLeaseStatus();
           if (status !== "valid") {
             stopRenewal();
@@ -1698,7 +1701,7 @@ export function TablePage({
         await endLease(
           leaseToken,
           cause.status === 409 ? LEASE_LOST_MESSAGE : apiErrorMessage(cause, LEASE_RENEWAL_MESSAGE),
-          cause.status !== 401,
+          shouldReleaseLeaseAfterRenewalFailure(cause),
         );
       } finally {
         renewing = false;
