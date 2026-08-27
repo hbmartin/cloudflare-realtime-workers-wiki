@@ -16,6 +16,14 @@ type AppState =
   | { screen: "invite"; token: string }
   | { screen: "workspace"; member: ClientMemberContext };
 
+function appendErrorMessage(primary: string, secondary: string) {
+  const first = primary.trim();
+  const second = secondary.trim();
+  if (!first || first === second) return second;
+  if (!second) return first;
+  return `${/[.!?…]$/.test(first) ? first : `${first}.`} ${second}`;
+}
+
 async function resolveAppState(): Promise<AppState> {
   const invite = new URLSearchParams(window.location.search).get("invite");
   if (invite) return { screen: "invite", token: invite };
@@ -216,7 +224,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
     try {
       const result = await authClient.signIn.email(values);
       if (result.error) {
-        setError(result.error.message ?? "Sign in failed.");
+        setError(result.error.message?.trim() || "Sign in failed.");
         return;
       }
       await onComplete();
@@ -407,10 +415,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setWorkspaceError(archiveError);
     }
     await loadPages().catch((error) => {
+      const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
       if (archiveError) {
         console.error("Page tree could not be refreshed after an archive failure", error);
+        setWorkspaceError(appendErrorMessage(archiveError, refreshError));
       } else {
-        setWorkspaceError(apiErrorMessage(error, "The page tree could not be refreshed."));
+        setWorkspaceError(refreshError);
       }
     });
   }
@@ -458,19 +468,21 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     [recordPageUpserts],
   );
   const pageUnavailable = useCallback(
-    (pageId: string) => {
+    (pageId: string, primaryError?: string) => {
       recordPageRemovals([pageId]);
       setPages((current) => current.filter((page) => page.id !== pageId));
       void loadPages().catch((error) => {
-        setWorkspaceError(apiErrorMessage(error, "The page tree could not be refreshed."));
+        const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
+        setWorkspaceError(primaryError ? appendErrorMessage(primaryError, refreshError) : refreshError);
       });
     },
     [loadPages, recordPageRemovals],
   );
   const documentAccessDenied = useCallback(
     (pageId: string, error: ApiClientError) => {
-      setWorkspaceError(apiErrorMessage(error, "You no longer have access to this page."));
-      pageUnavailable(pageId);
+      const accessError = apiErrorMessage(error, "You no longer have access to this page.");
+      setWorkspaceError(accessError);
+      pageUnavailable(pageId, accessError);
     },
     [pageUnavailable],
   );

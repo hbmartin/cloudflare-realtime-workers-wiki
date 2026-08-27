@@ -171,6 +171,19 @@ class IncompleteTablePaginationError extends Error {
   }
 }
 
+function tableLoadErrorMessage(cause: unknown, fallback: string) {
+  if (cause instanceof StaleTableRevisionError || cause instanceof IncompleteTablePaginationError) {
+    return cause.message;
+  }
+  return apiErrorMessage(cause, fallback);
+}
+
+function nextTableLoadError(current: TableLoadError | null, cause: unknown, fallback: string): TableLoadError {
+  const message = tableLoadErrorMessage(cause, fallback);
+  const source = cause instanceof StaleTableRevisionError ? "stale-revision" : "other";
+  return current?.message === message && current.source === source ? current : { message, source };
+}
+
 function waitForStaleRevisionRetry(attempt: number, retryDelays: readonly number[]) {
   const delay = retryDelays[attempt];
   if (delay === undefined) throw new StaleTableRevisionError();
@@ -227,6 +240,10 @@ class LeaseResponseError extends Error {
     super("The lease service returned an invalid response.");
     this.name = "LeaseResponseError";
   }
+}
+
+function leaseErrorMessage(cause: unknown, fallback: string) {
+  return cause instanceof LeaseResponseError ? cause.message : apiErrorMessage(cause, fallback);
 }
 
 function assertLeaseTiming(value: unknown): asserts value is TableLeaseTiming {
@@ -733,10 +750,7 @@ export function TablePage({
           return tableLoadResult("superseded", { failure: { cause } });
         } else {
           if (!background || !revisionRecoveryPendingRef.current) {
-            setLoadError({
-              message: apiErrorMessage(cause, "Table could not be loaded."),
-              source: cause instanceof StaleTableRevisionError ? "stale-revision" : "other",
-            });
+            setLoadError((current) => nextTableLoadError(current, cause, "Table could not be loaded."));
           }
         }
         throw cause;
@@ -901,10 +915,7 @@ export function TablePage({
           return tableLoadResult("superseded", { failure: { cause } });
         } else {
           if (!background || !revisionRecoveryPendingRef.current) {
-            setLoadError({
-              message: apiErrorMessage(cause, DEPTH_RESTORE_MESSAGE),
-              source: cause instanceof StaleTableRevisionError ? "stale-revision" : "other",
-            });
+            setLoadError((current) => nextTableLoadError(current, cause, DEPTH_RESTORE_MESSAGE));
           }
         }
         throw cause;
@@ -1358,7 +1369,7 @@ export function TablePage({
   );
 
   const reportLeaseError = useCallback((cause: unknown) => {
-    if (mountedRef.current) setLeaseError(apiErrorMessage(cause, "The editing lease could not be acquired."));
+    if (mountedRef.current) setLeaseError(leaseErrorMessage(cause, "The editing lease could not be acquired."));
   }, []);
 
   useEffect(() => {
@@ -1516,7 +1527,7 @@ export function TablePage({
         if (recoveryWasActive && failure && revisionRecoveryPendingRef.current) {
           recoveryFailureStreak += 1;
           if (recoveryFailureStreak >= REVISION_RECOVERY_ERROR_THRESHOLD) {
-            setRevisionRecoveryError(apiErrorMessage(failure.cause, DEPTH_RESTORE_MESSAGE));
+            setRevisionRecoveryError(tableLoadErrorMessage(failure.cause, DEPTH_RESTORE_MESSAGE));
           }
         } else if (delayedResult.outcome !== "superseded") {
           recoveryFailureStreak = 0;
@@ -1648,7 +1659,7 @@ export function TablePage({
         // never extend it.
         if (cause instanceof LeaseResponseError) {
           stopRenewal();
-          await endLease(leaseToken, cause.message);
+          await endLease(leaseToken, leaseErrorMessage(cause, LEASE_RENEWAL_MESSAGE));
           return;
         }
         const retryable = !(cause instanceof ApiClientError) || cause.status === 429 || cause.status >= 500;

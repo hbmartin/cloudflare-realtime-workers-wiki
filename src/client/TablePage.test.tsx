@@ -412,7 +412,7 @@ describe("TablePage", () => {
       />,
     );
 
-    expect(await screen.findByText("The editing lease could not be acquired.")).toBeInTheDocument();
+    expect(await screen.findByText("The lease service returned an invalid response.")).toBeInTheDocument();
     expect(screen.getByText("Read-only")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "+ Property" })).not.toBeInTheDocument();
     expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
@@ -1363,6 +1363,15 @@ describe("TablePage", () => {
           responseUrl: null,
           contentType: "application/json",
           cause: new TypeError("The response stream terminated."),
+        }),
+    ],
+    [
+      "an empty non-JSON response",
+      () =>
+        new EmptyApiResponseError(200, {
+          requestPath: "/api/tables/table-page/cells/row/status",
+          responseUrl: null,
+          contentType: "text/html; charset=utf-8",
         }),
     ],
   ])("does not assume %s committed the mutation", async (_case, responseError) => {
@@ -3152,7 +3161,9 @@ describe("TablePage", () => {
     vi.mocked(api).mockImplementation((path) => {
       if (String(path).includes("sort=status")) {
         sortedLoads += 1;
-        if (sortedLoads === 1) return Promise.reject(new Error("Sorted table could not be loaded."));
+        if (sortedLoads === 1) {
+          return Promise.reject(new ApiClientError(503, "table_unavailable", "Sorted table could not be loaded."));
+        }
         return Promise.resolve({ table: staleSorted });
       }
       return Promise.resolve({ table: current });
@@ -3162,13 +3173,13 @@ describe("TablePage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
     await act(() => vi.advanceTimersByTimeAsync(0));
-    expect(screen.getByText("Table could not be loaded.")).toBeInTheDocument();
+    expect(screen.getByText("Sorted table could not be loaded.")).toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     await drainStaleRetries();
 
     expect(sortedLoads).toBe(4);
-    expect(screen.getByText("Table could not be loaded.")).toBeInTheDocument();
+    expect(screen.getByText("Sorted table could not be loaded.")).toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
   });
 
@@ -3568,18 +3579,18 @@ describe("TablePage", () => {
 
     expect(pageOneLoads).toBe(5);
     expect(screen.getByDisplayValue("Current first")).toBeInTheDocument();
-    expect(screen.queryByText("The table depth could not be restored.")).not.toBeInTheDocument();
+    expect(screen.queryByText("The table returned incomplete pagination information.")).not.toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(10_000));
     expect(pageOneLoads).toBe(6);
-    expect(screen.queryByText("The table depth could not be restored.")).not.toBeInTheDocument();
+    expect(screen.queryByText("The table returned incomplete pagination information.")).not.toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(20_000));
 
     expect(pageOneLoads).toBe(7);
     expect(screen.getByDisplayValue("Current first")).toBeInTheDocument();
-    expect(screen.getByText("The table depth could not be restored.")).toBeInTheDocument();
+    expect(screen.getByText("The table returned incomplete pagination information.")).toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
 
     paginationFixed = true;
@@ -3587,7 +3598,7 @@ describe("TablePage", () => {
 
     expect(pageOneLoads).toBe(8);
     expect(screen.getByDisplayValue("Current second")).toBeInTheDocument();
-    expect(screen.queryByText("The table depth could not be restored.")).not.toBeInTheDocument();
+    expect(screen.queryByText("The table returned incomplete pagination information.")).not.toBeInTheDocument();
     expect(
       screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
     ).not.toBeInTheDocument();
@@ -5320,7 +5331,7 @@ describe("TablePage", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
 
-    expect(await screen.findByText("Table could not be loaded.")).toBeInTheDocument();
+    expect(await screen.findByText("The table kept returning an older revision.")).toBeInTheDocument();
     expect(sortLoads).toBe(3);
   });
 
@@ -5341,12 +5352,12 @@ describe("TablePage", () => {
     fireEvent.blur(input);
     await drainStaleRetries();
 
-    expect(screen.getByText("Table could not be loaded.")).toBeInTheDocument();
+    expect(screen.getByText("The table kept returning an older revision.")).toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     await drainStaleRetries();
 
-    expect(screen.queryByText("Table could not be loaded.")).not.toBeInTheDocument();
+    expect(screen.queryByText("The table kept returning an older revision.")).not.toBeInTheDocument();
     expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
   });
 
