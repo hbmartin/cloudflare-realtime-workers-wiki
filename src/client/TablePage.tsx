@@ -1274,7 +1274,9 @@ export function TablePage({
               ? cause.message
               : leaseLost
                 ? apiErrorMessage(cause, LEASE_LOST_MESSAGE)
-                : LEASE_VERIFICATION_MESSAGE;
+                : cause instanceof ApiClientError && cause.status !== 429 && cause.status < 500
+                  ? apiErrorMessage(cause, LEASE_VERIFICATION_MESSAGE)
+                  : LEASE_VERIFICATION_MESSAGE;
           await endLease(token, message, !leaseLost);
         }
       }

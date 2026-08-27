@@ -2307,6 +2307,34 @@ describe("TablePage", () => {
     expect(screen.queryByText("Lease service unavailable.")).not.toBeInTheDocument();
   });
 
+  it("preserves a non-retryable lease-verification reason after a clock change", async () => {
+    stubMonotonicClock();
+    const acquiredAt = Date.now();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "PATCH") {
+        throw new ApiClientError(403, "read_only", "Your workspace role is read-only.");
+      }
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      return { table };
+    });
+    await renderActiveEditor();
+
+    vi.setSystemTime(acquiredAt + LEASE_DURATION_MS + 1);
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(screen.getByText("Your workspace role is read-only.")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Editing was paused because the lease could not be verified after the system clock changed."),
+    ).not.toBeInTheDocument();
+  });
+
   it("ends a lease after system sleep when the server says it was lost", async () => {
     stubMonotonicClock();
     const acquiredAt = Date.now();

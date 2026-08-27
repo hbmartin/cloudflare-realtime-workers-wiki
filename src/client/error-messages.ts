@@ -1,3 +1,4 @@
 export function errorMessageKey(message: string) {
-  return message.trim().replace(/[\s.!?…]+$/, "");
+  const trimmed = message.trim();
+  return trimmed.replace(/[\s.!?…]+$/, "") || trimmed;
 }
