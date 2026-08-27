@@ -110,7 +110,7 @@ describe("api", () => {
       "API response could not be processed",
       expect.objectContaining({
         name: "ApiClientError",
-        stack: expect.any(String),
+        stack: error instanceof Error ? (error.stack ?? null) : null,
         status: 502,
         requestPath: "/api/upstream",
         responseBodyFailure: "parse",

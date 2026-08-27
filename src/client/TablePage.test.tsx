@@ -2232,6 +2232,32 @@ describe("TablePage", () => {
     });
   });
 
+  it("reports an invalid response during clock-change lease verification", async () => {
+    stubMonotonicClock();
+    const acquiredAt = Date.now();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "PATCH") return {};
+      if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
+      return { table };
+    });
+    await renderActiveEditor();
+
+    vi.setSystemTime(acquiredAt + LEASE_DURATION_MS + 1);
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(screen.getByText("The lease service returned an invalid response.")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Editing was paused because the lease could not be verified after the system clock changed."),
+    ).not.toBeInTheDocument();
+  });
+
   it("ends a lease after system sleep when the server says it was lost", async () => {
     stubMonotonicClock();
     const acquiredAt = Date.now();
@@ -3644,6 +3670,34 @@ describe("TablePage", () => {
     expect(
       screen.queryByText("Table refresh is delayed while waiting for the latest revision."),
     ).not.toBeInTheDocument();
+  });
+
+  it("renders a matching load and revision-recovery failure only once", async () => {
+    vi.useFakeTimers();
+    const current = tableWithValue("Current", 2);
+    const stale = tableWithValue("Stale", 1);
+    const failure = new ApiClientError(503, "replica_unavailable", "Replica persistently unavailable.");
+    let plainLoads = 0;
+    vi.mocked(api).mockImplementation((path) => {
+      if (String(path).includes("sort=status")) return Promise.reject(failure);
+      plainLoads += 1;
+      return Promise.resolve({ table: plainLoads === 1 ? current : stale });
+    });
+    renderViewer();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await drainStaleRetries();
+    fireEvent.click(screen.getByRole("button", { name: /^Status/ }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Replica persistently unavailable.")).toBeInTheDocument();
+
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+    await act(() => vi.advanceTimersByTimeAsync(40_000));
+
+    expect(screen.queryAllByText("Replica persistently unavailable.")).toHaveLength(1);
+    expect(screen.getByText("Table refresh is delayed while waiting for the latest revision.")).toBeInTheDocument();
   });
 
   it("rearms the ordinary refresh interval after recovery backoff", async () => {
