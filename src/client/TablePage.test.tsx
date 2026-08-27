@@ -217,10 +217,13 @@ describe("TablePage", () => {
 
   it("uses the table-load fallback when a response-body timeout is wrapped", async () => {
     vi.mocked(api).mockRejectedValue(
-      new UnreadableApiResponseError(200, {
-        contentType: "application/json",
-        cause: new DOMException("The operation timed out.", "TimeoutError"),
-      }),
+      new UnreadableApiResponseError(
+        200,
+        "/api/tables/table-page?limit=500&count=true",
+        null,
+        "application/json",
+        new DOMException("The operation timed out.", "TimeoutError"),
+      ),
     );
 
     render(
@@ -1021,18 +1024,24 @@ describe("TablePage", () => {
     [
       "malformed",
       () =>
-        new InvalidApiResponseError(200, {
-          contentType: "application/json",
-          cause: new SyntaxError("Unexpected end of JSON input"),
-        }),
+        new InvalidApiResponseError(
+          200,
+          "/api/tables/table-page/lease",
+          null,
+          "application/json",
+          new SyntaxError("Unexpected end of JSON input"),
+        ),
     ],
     [
       "unreadable",
       () =>
-        new UnreadableApiResponseError(200, {
-          contentType: "application/json",
-          cause: new TypeError("The response stream terminated."),
-        }),
+        new UnreadableApiResponseError(
+          200,
+          "/api/tables/table-page/lease",
+          null,
+          "application/json",
+          new TypeError("The response stream terminated."),
+        ),
     ],
   ])("keeps the confirmed lease deadline when a renewal response is %s", async (_case, responseError) => {
     vi.useFakeTimers();
@@ -1046,7 +1055,8 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(20_000));
 
     expect(screen.getByText("Editing lease active")).toBeInTheDocument();
-    expect(screen.getByText(`${responseError().message} Retrying.`)).toBeInTheDocument();
+    expect(screen.getByText("The editing lease could not be renewed. Retrying.")).toBeInTheDocument();
+    expect(screen.queryByText(`${responseError().message} Retrying.`)).not.toBeInTheDocument();
     expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "DELETE" }));
 
     await act(() => vi.advanceTimersByTimeAsync(40_001));
@@ -1189,10 +1199,25 @@ describe("TablePage", () => {
     [
       "contains malformed JSON",
       () => {
-        throw new InvalidApiResponseError(200, {
-          contentType: "application/json",
-          cause: new SyntaxError("Unexpected end of JSON input"),
-        });
+        throw new InvalidApiResponseError(
+          200,
+          "/api/tables/table-page/cells/row/status",
+          null,
+          "application/json",
+          new SyntaxError("Unexpected end of JSON input"),
+        );
+      },
+    ],
+    [
+      "cannot be read as JSON",
+      () => {
+        throw new UnreadableApiResponseError(
+          200,
+          "/api/tables/table-page/cells/row/status",
+          null,
+          "application/json",
+          new TypeError("The response stream terminated."),
+        );
       },
     ],
   ])("rejects stale snapshots after a committed mutation response %s", async (_case, invalidResponse) => {
@@ -1240,22 +1265,26 @@ describe("TablePage", () => {
     [
       "a non-JSON response",
       () =>
-        new InvalidApiResponseError(200, {
-          contentType: "text/html; charset=utf-8",
-          cause: new SyntaxError("Unexpected token '<'"),
-        }),
-      "The server returned malformed JSON in a successful response.",
+        new InvalidApiResponseError(
+          200,
+          "/api/tables/table-page/cells/row/status",
+          null,
+          "text/html; charset=utf-8",
+          new SyntaxError("Unexpected token '<'"),
+        ),
     ],
     [
-      "an unreadable response",
+      "an unreadable non-JSON response",
       () =>
-        new UnreadableApiResponseError(200, {
-          contentType: "application/json",
-          cause: new TypeError("The response stream terminated."),
-        }),
-      "The successful response body could not be read.",
+        new UnreadableApiResponseError(
+          200,
+          "/api/tables/table-page/cells/row/status",
+          null,
+          "text/html; charset=utf-8",
+          new TypeError("The response stream terminated."),
+        ),
     ],
-  ])("does not assume %s committed the mutation", async (_case, responseError, expectedMessage) => {
+  ])("does not assume %s committed the mutation", async (_case, responseError) => {
     let loads = 0;
     let mutations = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
@@ -1273,7 +1302,8 @@ describe("TablePage", () => {
     fireEvent.change(input, { target: { value: "Unconfirmed" } });
     fireEvent.blur(input);
 
-    expect(await screen.findByText(expectedMessage)).toBeInTheDocument();
+    expect(await screen.findByText("The table update could not be saved.")).toBeInTheDocument();
+    expect(screen.queryByText(responseError().message)).not.toBeInTheDocument();
     await waitFor(() => expect(loads).toBe(3));
 
     const recoveredInput = screen.getByDisplayValue("Ready");
