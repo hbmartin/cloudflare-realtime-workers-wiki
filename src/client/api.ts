@@ -4,7 +4,7 @@ export const authClient = createAuthClient({ baseURL: window.location.origin });
 
 export type ApiResponseBodyFailure = "read" | "parse";
 
-interface ApiClientErrorDiagnostics {
+export interface ApiClientErrorDiagnostics {
   requestPath?: string;
   responseUrl?: string | null;
   contentType?: string | null;
