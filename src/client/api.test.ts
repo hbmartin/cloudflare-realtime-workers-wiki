@@ -103,7 +103,16 @@ describe("api", () => {
       responseBodyFailure: "parse",
       cause: expect.any(SyntaxError),
     });
-    expect(reported).toHaveBeenCalledWith("API response could not be processed", error);
+    expect(reported).toHaveBeenCalledWith(
+      "API response could not be processed",
+      expect.objectContaining({
+        status: 502,
+        requestPath: "/api/upstream",
+        responseBodyFailure: "parse",
+        causeName: "SyntaxError",
+      }),
+    );
+    expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
   });
 
   it("uses the fallback when an error-response body cannot be read", async () => {
@@ -132,17 +141,33 @@ describe("api", () => {
       responseBodyFailure: "read",
       cause: bodyError,
     });
-    expect(reported).toHaveBeenCalledWith("API response could not be processed", error);
+    expect(reported).toHaveBeenCalledWith(
+      "API response could not be processed",
+      expect.objectContaining({
+        status: 502,
+        requestPath: "/api/upstream",
+        responseBodyFailure: "read",
+        causeName: "TypeError",
+      }),
+    );
   });
 
-  it("treats an empty error-response body as an absent payload", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 502 })));
+  it.each([
+    ["an empty", null],
+    ["a whitespace-only", " \n\t "],
+  ] as const)("treats %s error-response body as an absent payload", async (_case, body) => {
+    const reported = silenceApiResponseReport();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body, { status: 502 })));
 
-    await expect(api("/api/upstream")).rejects.toMatchObject({
+    const error = await api("/api/upstream").catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({
       status: 502,
       code: "request_failed",
       message: "Request failed (502).",
+      responseBodyFailure: null,
     });
+    expect(reported).not.toHaveBeenCalled();
   });
 
   it("classifies malformed successful responses by media type", async () => {
@@ -220,7 +245,16 @@ describe("api", () => {
       contentType: "application/json",
       cause: bodyError,
     });
-    expect(reported).toHaveBeenCalledWith("API response could not be processed", error);
+    expect(reported).toHaveBeenCalledWith(
+      "API response could not be processed",
+      expect.objectContaining({
+        name: "UnreadableApiResponseError",
+        status: 200,
+        requestPath: "/api/example?view=summary",
+        responseBodyFailure: "read",
+        causeName: "TimeoutError",
+      }),
+    );
   });
 
   it("normalizes API error codes and messages and replaces blank values", async () => {
