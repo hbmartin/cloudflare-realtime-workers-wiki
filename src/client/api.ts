@@ -12,11 +12,14 @@ export interface ApiClientErrorDiagnostics {
   cause?: unknown;
 }
 
-export interface SuccessfulApiResponseDiagnostics {
+export interface EmptyApiResponseDiagnostics {
   requestPath: string;
   responseUrl: string | null;
   contentType: string | null;
-  cause?: unknown;
+}
+
+export interface SuccessfulApiResponseDiagnostics extends EmptyApiResponseDiagnostics {
+  cause: unknown;
 }
 
 type ApiErrorPayload = {
@@ -39,6 +42,7 @@ export class ApiClientError extends Error {
     diagnostics: ApiClientErrorDiagnostics = {},
   ) {
     super(message, diagnostics.cause === undefined ? undefined : { cause: diagnostics.cause });
+    this.name = "ApiClientError";
     this.requestPath = diagnostics.requestPath ?? null;
     this.responseUrl = diagnostics.responseUrl ?? null;
     this.contentType = diagnostics.contentType ?? null;
@@ -58,44 +62,44 @@ export abstract class SuccessfulApiResponseError extends Error {
   readonly contentType: string | null;
 
   constructor(
-    message: string,
     readonly status: number,
-    diagnostics: SuccessfulApiResponseDiagnostics,
+    diagnostics: EmptyApiResponseDiagnostics & { cause?: unknown },
     readonly responseBodyFailure: ApiResponseBodyFailure,
   ) {
+    const hasJsonContentType = isJsonContentType(diagnostics.contentType);
+    const message =
+      responseBodyFailure === "empty"
+        ? "The successful response body was empty."
+        : responseBodyFailure === "read"
+          ? "The successful response body could not be read."
+          : hasJsonContentType
+            ? "The server returned malformed JSON in a successful response."
+            : "The server returned an unexpected non-JSON response.";
     super(message, diagnostics.cause === undefined ? undefined : { cause: diagnostics.cause });
     this.requestPath = diagnostics.requestPath;
     this.responseUrl = diagnostics.responseUrl;
     this.contentType = diagnostics.contentType;
-    this.hasJsonContentType = isJsonContentType(diagnostics.contentType);
+    this.hasJsonContentType = hasJsonContentType;
   }
 }
 
 export class InvalidApiResponseError extends SuccessfulApiResponseError {
   constructor(status: number, diagnostics: SuccessfulApiResponseDiagnostics) {
-    const hasJsonContentType = isJsonContentType(diagnostics.contentType);
-    super(
-      hasJsonContentType
-        ? "The server returned malformed JSON in a successful response."
-        : "The server returned an unexpected non-JSON response.",
-      status,
-      diagnostics,
-      "parse",
-    );
+    super(status, diagnostics, "parse");
     this.name = "InvalidApiResponseError";
   }
 }
 
 export class UnreadableApiResponseError extends SuccessfulApiResponseError {
   constructor(status: number, diagnostics: SuccessfulApiResponseDiagnostics) {
-    super("The successful response body could not be read.", status, diagnostics, "read");
+    super(status, diagnostics, "read");
     this.name = "UnreadableApiResponseError";
   }
 }
 
 export class EmptyApiResponseError extends SuccessfulApiResponseError {
-  constructor(status: number, diagnostics: SuccessfulApiResponseDiagnostics) {
-    super("The successful response body was empty.", status, diagnostics, "empty");
+  constructor(status: number, diagnostics: EmptyApiResponseDiagnostics) {
+    super(status, diagnostics, "empty");
     this.name = "EmptyApiResponseError";
   }
 }
@@ -105,7 +109,8 @@ export type UnauthorizedHandler = (error: ApiClientError) => void;
 const unauthorizedHandlers = new Set<UnauthorizedHandler>();
 
 function apiResponseFailureCause(cause: unknown) {
-  if (cause === null || cause === undefined) return { causeName: null, causeType: null };
+  if (cause === undefined) return { causeName: null, causeType: null };
+  if (cause === null) return { causeName: null, causeType: "null" };
   if (typeof cause === "object" && "name" in cause && typeof cause.name === "string") {
     return { causeName: cause.name, causeType: "object" };
   }
@@ -142,14 +147,7 @@ function errorChainIncludesTimeout(cause: unknown) {
 }
 
 export function apiErrorMessage(cause: unknown, fallback: string) {
-  if (
-    !(cause instanceof Error) ||
-    cause instanceof SuccessfulApiResponseError ||
-    cause instanceof TypeError ||
-    cause instanceof DOMException ||
-    errorChainIncludesTimeout(cause) ||
-    (cause instanceof ApiClientError && cause.messageFromFallback)
-  ) {
+  if (!(cause instanceof ApiClientError) || cause.messageFromFallback || errorChainIncludesTimeout(cause)) {
     return fallback;
   }
   return cause.message.trim() || fallback;

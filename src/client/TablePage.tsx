@@ -61,6 +61,7 @@ type RevisionRecoveryTarget = {
 };
 type RevisionPollMode = "off" | "recovery" | "refresh";
 type RevisionPollBaseMode = Exclude<RevisionPollMode, "recovery">;
+type TableLoadError = { message: string; source: "stale-revision" | "other" };
 
 const LEASE_CONFLICT_MESSAGE = "Another editor has this table open for editing.";
 const LEASE_EXPIRED_MESSAGE = "The editing lease expired. Reloaded the authoritative table.";
@@ -257,7 +258,9 @@ function retryingMessage(message: string) {
 function isCommittedMutationResponseError(cause: unknown) {
   if (cause instanceof InvalidMutationResponseError) return true;
   return (
-    cause instanceof SuccessfulApiResponseError && cause.responseBodyFailure === "parse" && cause.hasJsonContentType
+    cause instanceof SuccessfulApiResponseError &&
+    cause.hasJsonContentType &&
+    (cause.responseBodyFailure === "empty" || cause.responseBodyFailure === "parse")
   );
 }
 
@@ -300,7 +303,7 @@ export function TablePage({
   const tableRef = useRef<TableData | null>(null);
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
   const [leasePending, setLeasePending] = useState(canEdit);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<TableLoadError | null>(null);
   const [revisionRecoveryPending, setRevisionRecoveryPending] = useState(false);
   const [revisionRecoveryError, setRevisionRecoveryError] = useState<string | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
@@ -449,7 +452,7 @@ export function TablePage({
       configureRevisionPollingRef.current(revisionPollModeRef.current);
       // Preserve unrelated transport or sort errors, but replace the terminal-
       // sounding stale exhaustion message now that automatic recovery is active.
-      setLoadError((current) => (current === STALE_TABLE_REVISION_MESSAGE ? null : current));
+      setLoadError((current) => (current?.source === "stale-revision" ? null : current));
     },
     [currentRevisionFloor, preserveRevisionFloor],
   );
@@ -730,7 +733,10 @@ export function TablePage({
           return tableLoadResult("superseded", { failure: { cause } });
         } else {
           if (!background || !revisionRecoveryPendingRef.current) {
-            setLoadError(apiErrorMessage(cause, "Table could not be loaded."));
+            setLoadError({
+              message: apiErrorMessage(cause, "Table could not be loaded."),
+              source: cause instanceof StaleTableRevisionError ? "stale-revision" : "other",
+            });
           }
         }
         throw cause;
@@ -866,7 +872,7 @@ export function TablePage({
         }
         adoptAuthoritativeTable(restored, appendedPages, leaseConflictGeneration, background, generation);
         if (incompletePagination) {
-          setLoadError(INVALID_TABLE_PAGINATION_MESSAGE);
+          setLoadError({ message: INVALID_TABLE_PAGINATION_MESSAGE, source: "other" });
         }
         return tableLoadResult("adopted");
       } catch (cause) {
@@ -895,7 +901,10 @@ export function TablePage({
           return tableLoadResult("superseded", { failure: { cause } });
         } else {
           if (!background || !revisionRecoveryPendingRef.current) {
-            setLoadError(apiErrorMessage(cause, DEPTH_RESTORE_MESSAGE));
+            setLoadError({
+              message: apiErrorMessage(cause, DEPTH_RESTORE_MESSAGE),
+              source: cause instanceof StaleTableRevisionError ? "stale-revision" : "other",
+            });
           }
         }
         throw cause;
@@ -2042,7 +2051,7 @@ export function TablePage({
       {saveError && <div className="notice notice-danger">{saveError}</div>}
       {revisionRecoveryPending && <div className="notice">{STALE_REFRESH_MESSAGE}</div>}
       {revisionRecoveryError && <div className="notice notice-danger">{revisionRecoveryError}</div>}
-      {loadError && <div className="notice notice-danger">{loadError}</div>}
+      {loadError && <div className="notice notice-danger">{loadError.message}</div>}
       <article className="table-paper">
         <input
           className="page-title"
