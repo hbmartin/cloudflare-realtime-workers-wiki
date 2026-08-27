@@ -221,7 +221,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
       }
       await onComplete();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Sign in failed.");
+      setError(apiErrorMessage(cause, "Sign in failed."));
     } finally {
       setBusy(false);
     }
@@ -399,15 +399,20 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   async function archive(page: Page) {
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
     setWorkspaceError("");
+    let archiveError: string | null = null;
     try {
       await api(`/api/pages/${page.id}`, { method: "DELETE" });
     } catch (error) {
-      setWorkspaceError(apiErrorMessage(error, "The page could not be archived."));
-    } finally {
-      await loadPages().catch((error) => {
-        setWorkspaceError(apiErrorMessage(error, "The page tree could not be refreshed."));
-      });
+      archiveError = apiErrorMessage(error, "The page could not be archived.");
+      setWorkspaceError(archiveError);
     }
+    await loadPages().catch((error) => {
+      if (archiveError) {
+        console.error("Page tree could not be refreshed after an archive failure", error);
+      } else {
+        setWorkspaceError(apiErrorMessage(error, "The page tree could not be refreshed."));
+      }
+    });
   }
   async function move(
     pageId: string,
@@ -464,7 +469,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const documentAccessDenied = useCallback(
     (pageId: string, error: ApiClientError) => {
-      setWorkspaceError(apiErrorMessage(error, "This page is no longer available."));
+      setWorkspaceError(apiErrorMessage(error, "You no longer have access to this page."));
       pageUnavailable(pageId);
     },
     [pageUnavailable],

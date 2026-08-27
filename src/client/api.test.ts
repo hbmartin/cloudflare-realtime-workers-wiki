@@ -96,6 +96,7 @@ describe("api", () => {
 
     expect(error).toBeInstanceOf(ApiClientError);
     expect(error).toMatchObject({
+      name: "ApiClientError",
       status: 502,
       code: "request_failed",
       message: "Request failed (502).",
@@ -108,6 +109,8 @@ describe("api", () => {
     expect(reported).toHaveBeenCalledWith(
       "API response could not be processed",
       expect.objectContaining({
+        name: "ApiClientError",
+        stack: expect.stringContaining("ApiClientError: Request failed (502)."),
         status: 502,
         requestPath: "/api/upstream",
         responseBodyFailure: "parse",
@@ -125,6 +128,7 @@ describe("api", () => {
       apiErrorMessage(new ApiClientError(503, "request_failed", "Request failed (503).", true), "Try again."),
     ).toBe("Try again.");
     expect(apiErrorMessage(new TypeError("Failed to fetch"), "Try again.")).toBe("Try again.");
+    expect(apiErrorMessage(new Error("Internal implementation detail"), "Try again.")).toBe("Try again.");
     expect(
       apiErrorMessage(
         new ApiClientError(503, "unavailable", "Service unavailable.", false, {
@@ -192,6 +196,27 @@ describe("api", () => {
       expect.objectContaining({ causeName: null, causeType: "string" }),
     );
     expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
+  });
+
+  it("distinguishes a null response-body cause from an absent cause", async () => {
+    const reported = silenceApiResponseReport();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        unreadableResponseAt("https://example.test/upstream", null, {
+          status: 502,
+          headers: { "content-type": "application/problem+json" },
+        }),
+      ),
+    );
+
+    const error = await api("/api/upstream").catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ responseBodyFailure: "read", cause: null });
+    expect(reported).toHaveBeenCalledWith(
+      "API response could not be processed",
+      expect.objectContaining({ causeName: null, causeType: "null" }),
+    );
   });
 
   it.each([
