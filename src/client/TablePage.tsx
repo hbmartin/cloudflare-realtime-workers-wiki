@@ -11,7 +11,7 @@ import type {
   TableLeaseTiming,
   TableRow,
 } from "../shared/types";
-import { ApiClientError, api, InvalidApiResponseError, json, SuccessfulApiResponseError } from "./api";
+import { ApiClientError, api, apiErrorMessage, json, SuccessfulApiResponseError } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 
 type IsCurrent = () => boolean;
@@ -249,27 +249,16 @@ function releaseTableLease(pageId: string, leaseToken: string) {
   }).catch((cause) => console.error("Failed to release table lease", cause));
 }
 
-function errorChainIncludesTimeout(cause: unknown) {
-  const seen = new Set<object>();
-  let current = cause;
-  while (typeof current === "object" && current !== null && !seen.has(current)) {
-    if ("name" in current && current.name === "TimeoutError") return true;
-    seen.add(current);
-    current = "cause" in current ? current.cause : undefined;
-  }
-  return false;
-}
-
-function errorMessage(cause: unknown, fallback: string) {
-  if (!(cause instanceof Error) || cause instanceof SuccessfulApiResponseError) return fallback;
-  return errorChainIncludesTimeout(cause) || (cause instanceof ApiClientError && cause.messageFromFallback)
-    ? fallback
-    : cause.message || fallback;
+function retryingMessage(message: string) {
+  const sentence = /[.!?…]$/.test(message) ? message : `${message}.`;
+  return `${sentence} Retrying.`;
 }
 
 function isCommittedMutationResponseError(cause: unknown) {
   if (cause instanceof InvalidMutationResponseError) return true;
-  return cause instanceof InvalidApiResponseError && cause.hasJsonContentType;
+  return (
+    cause instanceof SuccessfulApiResponseError && cause.responseBodyFailure === "parse" && cause.hasJsonContentType
+  );
 }
 
 // The table's page was archived or deleted underneath this view. Terminal for
@@ -508,7 +497,7 @@ export function TablePage({
       setSaveError(null);
       clearRevisionRecovery();
       setLoadError(null);
-      setLeaseError(errorMessage(cause, PAGE_UNAVAILABLE_MESSAGE));
+      setLeaseError(apiErrorMessage(cause, PAGE_UNAVAILABLE_MESSAGE));
       onPageUnavailableRef.current?.(page.id);
     },
     [clearLocalLease, clearRevisionRecovery, page.id],
@@ -741,7 +730,7 @@ export function TablePage({
           return tableLoadResult("superseded", { failure: { cause } });
         } else {
           if (!background || !revisionRecoveryPendingRef.current) {
-            setLoadError(errorMessage(cause, "Table could not be loaded."));
+            setLoadError(apiErrorMessage(cause, "Table could not be loaded."));
           }
         }
         throw cause;
@@ -906,7 +895,7 @@ export function TablePage({
           return tableLoadResult("superseded", { failure: { cause } });
         } else {
           if (!background || !revisionRecoveryPendingRef.current) {
-            setLoadError(errorMessage(cause, DEPTH_RESTORE_MESSAGE));
+            setLoadError(apiErrorMessage(cause, DEPTH_RESTORE_MESSAGE));
           }
         }
         throw cause;
@@ -1248,7 +1237,7 @@ export function TablePage({
           await endLease(
             token,
             cause instanceof ApiClientError && cause.status === 409
-              ? errorMessage(cause, LEASE_LOST_MESSAGE)
+              ? apiErrorMessage(cause, LEASE_LOST_MESSAGE)
               : LEASE_VERIFICATION_MESSAGE,
             !(cause instanceof ApiClientError && cause.status === 409),
           );
@@ -1360,7 +1349,7 @@ export function TablePage({
   );
 
   const reportLeaseError = useCallback((cause: unknown) => {
-    if (mountedRef.current) setLeaseError(errorMessage(cause, "The editing lease could not be acquired."));
+    if (mountedRef.current) setLeaseError(apiErrorMessage(cause, "The editing lease could not be acquired."));
   }, []);
 
   useEffect(() => {
@@ -1518,7 +1507,7 @@ export function TablePage({
         if (recoveryWasActive && failure && revisionRecoveryPendingRef.current) {
           recoveryFailureStreak += 1;
           if (recoveryFailureStreak >= REVISION_RECOVERY_ERROR_THRESHOLD) {
-            setRevisionRecoveryError(errorMessage(failure.cause, DEPTH_RESTORE_MESSAGE));
+            setRevisionRecoveryError(apiErrorMessage(failure.cause, DEPTH_RESTORE_MESSAGE));
           }
         } else if (delayedResult.outcome !== "superseded") {
           recoveryFailureStreak = 0;
@@ -1665,13 +1654,13 @@ export function TablePage({
             );
             return;
           }
-          setLeaseError(`${errorMessage(cause, LEASE_RENEWAL_MESSAGE)} Retrying.`);
+          setLeaseError(retryingMessage(apiErrorMessage(cause, LEASE_RENEWAL_MESSAGE)));
           return;
         }
         stopRenewal();
         await endLease(
           leaseToken,
-          cause.status === 409 ? LEASE_LOST_MESSAGE : errorMessage(cause, LEASE_RENEWAL_MESSAGE),
+          cause.status === 409 ? LEASE_LOST_MESSAGE : apiErrorMessage(cause, LEASE_RENEWAL_MESSAGE),
           cause.status !== 401,
         );
       } finally {
@@ -1799,7 +1788,7 @@ export function TablePage({
             invalidateRevision();
             const terminalConflict = revisionConflictRetried;
             if (terminalConflict) resetCellInputAfterLoad(resetKey);
-            else setSaveError(errorMessage(cause, REVISION_CONFLICT_RETRY_MESSAGE));
+            else setSaveError(apiErrorMessage(cause, REVISION_CONFLICT_RETRY_MESSAGE));
             const recovered = await recoverRevision({
               minimumRevision: currentRevision,
             });
@@ -1818,18 +1807,18 @@ export function TablePage({
           }
           if (cause instanceof ApiClientError && cause.status === 409) {
             resetCellInputAfterLoad(resetKey);
-            await endLease(currentLease, errorMessage(cause, LEASE_LOST_MESSAGE));
+            await endLease(currentLease, apiErrorMessage(cause, LEASE_LOST_MESSAGE));
             setSaveError(LEASE_LOST_SAVE_MESSAGE);
             return null;
           }
           if (cause instanceof ApiClientError && cause.status === 403) {
-            await endLease(currentLease, errorMessage(cause, EDITING_ACCESS_LOST_MESSAGE));
+            await endLease(currentLease, apiErrorMessage(cause, EDITING_ACCESS_LOST_MESSAGE));
             setSaveError(LEASE_LOST_SAVE_MESSAGE);
             return null;
           }
           if (cause instanceof ApiClientError && cause.status === 404) {
             invalidateRevision();
-            setSaveError(errorMessage(cause, SAVE_FAILED_MESSAGE));
+            setSaveError(apiErrorMessage(cause, SAVE_FAILED_MESSAGE));
             resetCellInputAfterLoad(resetKey);
             await recoverRevision({ minimumRevision: currentRevision });
             return null;
@@ -1838,14 +1827,14 @@ export function TablePage({
           // request before applying it, so keep the known revision and the
           // user's input available for correction.
           if (isDefinitiveMutationRejection(cause)) {
-            setSaveError(errorMessage(cause, SAVE_FAILED_MESSAGE));
+            setSaveError(apiErrorMessage(cause, SAVE_FAILED_MESSAGE));
             return null;
           }
           // A timed-out or failed request may still have been applied. Its
           // outcome is ambiguous, so never replay it; pause edits and reload an
           // authoritative snapshot before the next queued mutation can run.
           invalidateRevision();
-          setSaveError(errorMessage(cause, SAVE_FAILED_MESSAGE));
+          setSaveError(apiErrorMessage(cause, SAVE_FAILED_MESSAGE));
           resetCellInputAfterLoad(resetKey);
           await recoverRevision({ minimumRevision: currentRevision });
           return null;
@@ -2002,7 +1991,7 @@ export function TablePage({
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
       } catch (cause) {
-        if (isMounted()) setLeaseError(errorMessage(cause, "The table could not be force-unlocked."));
+        if (isMounted()) setLeaseError(apiErrorMessage(cause, "The table could not be force-unlocked."));
         return;
       }
       if (!isMounted()) return;

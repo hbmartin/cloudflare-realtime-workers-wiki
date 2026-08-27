@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type
 import type { ClientMemberContext } from "../shared/types";
 import { buildTree } from "../shared/tree-model";
 import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent } from "../shared/types";
-import { ApiClientError, api, authClient, json, onApiUnauthorized } from "./api";
+import { ApiClientError, api, apiErrorMessage, authClient, json, onApiUnauthorized } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
 import { invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
@@ -34,7 +34,11 @@ export function App() {
   const [state, setState] = useState<AppState>({ screen: "loading" });
   const signOut = useCallback(() => setState({ screen: "signin" }), []);
   const sessionExpired = useCallback((error: ApiClientError) => {
-    setState((current) => (current.screen === "workspace" ? { screen: "signin", message: error.message } : current));
+    setState((current) =>
+      current.screen === "workspace"
+        ? { screen: "signin", message: apiErrorMessage(error, "Your session expired. Sign in again.") }
+        : current,
+    );
   }, []);
 
   const load = useCallback(() => resolveAppState().then(setState), []);
@@ -111,7 +115,7 @@ function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
       await api("/api/install/bootstrap", { method: "POST", body: json(Object.fromEntries(values)) });
       await onComplete();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Setup failed.");
+      setError(apiErrorMessage(cause, "Setup failed."));
     } finally {
       setBusy(false);
     }
@@ -167,7 +171,7 @@ function InviteScreen({ token, onComplete }: { token: string; onComplete: () => 
       });
       onComplete();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Invite could not be accepted.");
+      setError(apiErrorMessage(cause, "Invite could not be accepted."));
     } finally {
       setBusy(false);
     }
@@ -306,7 +310,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const handleMentionsRead = useCallback((unreadCount: number) => setUnreadMentions(unreadCount), []);
   useEffect(() => {
     void loadPages().catch((error) => {
-      setWorkspaceError(error instanceof Error ? error.message : "The page tree could not be loaded.");
+      setWorkspaceError(apiErrorMessage(error, "The page tree could not be loaded."));
     });
   }, [loadPages]);
   useEffect(() => {
@@ -342,7 +346,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   useEffect(() => {
     const bundle = createWorkspaceEvents(member.workspace.id, handleWorkspaceEvent, () => {
       void loadPages().catch((error) => {
-        setWorkspaceError(error instanceof Error ? error.message : "The page tree could not be refreshed.");
+        setWorkspaceError(apiErrorMessage(error, "The page tree could not be refreshed."));
       });
       void loadUnreadMentions();
     });
@@ -398,10 +402,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     try {
       await api(`/api/pages/${page.id}`, { method: "DELETE" });
     } catch (error) {
-      setWorkspaceError(error instanceof Error ? error.message : "The page could not be archived.");
+      setWorkspaceError(apiErrorMessage(error, "The page could not be archived."));
     } finally {
       await loadPages().catch((error) => {
-        setWorkspaceError(error instanceof Error ? error.message : "The page tree could not be refreshed.");
+        setWorkspaceError(apiErrorMessage(error, "The page tree could not be refreshed."));
       });
     }
   }
@@ -453,14 +457,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       recordPageRemovals([pageId]);
       setPages((current) => current.filter((page) => page.id !== pageId));
       void loadPages().catch((error) => {
-        setWorkspaceError(error instanceof Error ? error.message : "The page tree could not be refreshed.");
+        setWorkspaceError(apiErrorMessage(error, "The page tree could not be refreshed."));
       });
     },
     [loadPages, recordPageRemovals],
   );
   const documentAccessDenied = useCallback(
     (pageId: string, error: ApiClientError) => {
-      setWorkspaceError(error.message);
+      setWorkspaceError(apiErrorMessage(error, "This page is no longer available."));
       pageUnavailable(pageId);
     },
     [pageUnavailable],

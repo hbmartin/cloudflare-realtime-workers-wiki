@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   ApiClientError,
   api,
+  apiErrorMessage,
+  EmptyApiResponseError,
   InvalidApiResponseError,
   json,
   onApiUnauthorized,
@@ -115,6 +117,24 @@ describe("api", () => {
     expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
   });
 
+  it("only exposes explicit API messages to the UI", () => {
+    expect(apiErrorMessage(new ApiClientError(503, "unavailable", "Service unavailable."), "Try again.")).toBe(
+      "Service unavailable.",
+    );
+    expect(
+      apiErrorMessage(new ApiClientError(503, "request_failed", "Request failed (503).", true), "Try again."),
+    ).toBe("Try again.");
+    expect(apiErrorMessage(new TypeError("Failed to fetch"), "Try again.")).toBe("Try again.");
+    expect(
+      apiErrorMessage(
+        new ApiClientError(503, "unavailable", "Service unavailable.", false, {
+          cause: new DOMException("The operation timed out.", "TimeoutError"),
+        }),
+        "Try again.",
+      ),
+    ).toBe("Try again.");
+  });
+
   it("uses the fallback when an error-response body cannot be read", async () => {
     const reported = silenceApiResponseReport();
     const bodyError = new TypeError("The response stream terminated.");
@@ -152,6 +172,28 @@ describe("api", () => {
     );
   });
 
+  it("classifies a primitive response-body cause without treating its type as a name", async () => {
+    const reported = silenceApiResponseReport();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        unreadableResponseAt("https://example.test/upstream", "stream failed", {
+          status: 502,
+          headers: { "content-type": "application/problem+json" },
+        }),
+      ),
+    );
+
+    const error = await api("/api/upstream").catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ responseBodyFailure: "read", cause: "stream failed" });
+    expect(reported).toHaveBeenCalledWith(
+      "API response could not be processed",
+      expect.objectContaining({ causeName: null, causeType: "string" }),
+    );
+    expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
+  });
+
   it.each([
     ["an empty", null],
     ["a whitespace-only", " \n\t "],
@@ -168,6 +210,45 @@ describe("api", () => {
       responseBodyFailure: null,
     });
     expect(reported).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an empty", null],
+    ["a whitespace-only", " \n\t "],
+  ] as const)("classifies %s successful response body as empty", async (_case, body) => {
+    const reported = silenceApiResponseReport();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        responseAt("https://example.test/api/example", body, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const error = await api("/api/example").catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(EmptyApiResponseError);
+    expect(error).toMatchObject({
+      status: 200,
+      hasJsonContentType: true,
+      requestPath: "/api/example",
+      responseUrl: "https://example.test/api/example",
+      contentType: "application/json",
+      responseBodyFailure: "empty",
+    });
+    expect(reported).toHaveBeenCalledWith(
+      "API response could not be processed",
+      expect.objectContaining({
+        name: "EmptyApiResponseError",
+        responseBodyFailure: "empty",
+        causeName: null,
+        causeType: null,
+        stack: expect.any(String),
+      }),
+    );
+    expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
   });
 
   it("classifies malformed successful responses by media type", async () => {
@@ -255,6 +336,7 @@ describe("api", () => {
         causeName: "TimeoutError",
       }),
     );
+    expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
   });
 
   it("normalizes API error codes and messages and replaces blank values", async () => {

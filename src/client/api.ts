@@ -2,7 +2,7 @@ import { createAuthClient } from "better-auth/react";
 
 export const authClient = createAuthClient({ baseURL: window.location.origin });
 
-export type ApiResponseBodyFailure = "read" | "parse";
+export type ApiResponseBodyFailure = "empty" | "read" | "parse";
 
 export interface ApiClientErrorDiagnostics {
   requestPath?: string;
@@ -16,7 +16,7 @@ export interface SuccessfulApiResponseDiagnostics {
   requestPath: string;
   responseUrl: string | null;
   contentType: string | null;
-  cause: unknown;
+  cause?: unknown;
 }
 
 type ApiErrorPayload = {
@@ -61,13 +61,13 @@ export abstract class SuccessfulApiResponseError extends Error {
     message: string,
     readonly status: number,
     diagnostics: SuccessfulApiResponseDiagnostics,
-    hasJsonContentType: boolean,
+    readonly responseBodyFailure: ApiResponseBodyFailure,
   ) {
-    super(message, { cause: diagnostics.cause });
+    super(message, diagnostics.cause === undefined ? undefined : { cause: diagnostics.cause });
     this.requestPath = diagnostics.requestPath;
     this.responseUrl = diagnostics.responseUrl;
     this.contentType = diagnostics.contentType;
-    this.hasJsonContentType = hasJsonContentType;
+    this.hasJsonContentType = isJsonContentType(diagnostics.contentType);
   }
 }
 
@@ -80,7 +80,7 @@ export class InvalidApiResponseError extends SuccessfulApiResponseError {
         : "The server returned an unexpected non-JSON response.",
       status,
       diagnostics,
-      hasJsonContentType,
+      "parse",
     );
     this.name = "InvalidApiResponseError";
   }
@@ -88,13 +88,15 @@ export class InvalidApiResponseError extends SuccessfulApiResponseError {
 
 export class UnreadableApiResponseError extends SuccessfulApiResponseError {
   constructor(status: number, diagnostics: SuccessfulApiResponseDiagnostics) {
-    super(
-      "The successful response body could not be read.",
-      status,
-      diagnostics,
-      isJsonContentType(diagnostics.contentType),
-    );
+    super("The successful response body could not be read.", status, diagnostics, "read");
     this.name = "UnreadableApiResponseError";
+  }
+}
+
+export class EmptyApiResponseError extends SuccessfulApiResponseError {
+  constructor(status: number, diagnostics: SuccessfulApiResponseDiagnostics) {
+    super("The successful response body was empty.", status, diagnostics, "empty");
+    this.name = "EmptyApiResponseError";
   }
 }
 
@@ -102,30 +104,55 @@ export type UnauthorizedHandler = (error: ApiClientError) => void;
 
 const unauthorizedHandlers = new Set<UnauthorizedHandler>();
 
+function apiResponseFailureCause(cause: unknown) {
+  if (cause === null || cause === undefined) return { causeName: null, causeType: null };
+  if (typeof cause === "object" && "name" in cause && typeof cause.name === "string") {
+    return { causeName: cause.name, causeType: "object" };
+  }
+  return { causeName: null, causeType: typeof cause };
+}
+
 function reportApiResponseFailure(error: ApiClientError | SuccessfulApiResponseError) {
   const cause = error.cause;
-  const causeName =
-    typeof cause === "object" && cause !== null && "name" in cause && typeof cause.name === "string"
-      ? cause.name
-      : cause === undefined
-        ? null
-        : typeof cause;
+  const { causeName, causeType } = apiResponseFailureCause(cause);
   console.error("API response could not be processed", {
     name: error.name,
     message: error.message,
+    stack: error.stack ?? null,
     status: error.status,
     code: error instanceof ApiClientError ? error.code : null,
     requestPath: error.requestPath,
     responseUrl: error.responseUrl,
     contentType: error.contentType,
-    responseBodyFailure:
-      error instanceof ApiClientError
-        ? error.responseBodyFailure
-        : error instanceof InvalidApiResponseError
-          ? "parse"
-          : "read",
+    responseBodyFailure: error.responseBodyFailure,
     causeName,
+    causeType,
   });
+}
+
+function errorChainIncludesTimeout(cause: unknown) {
+  const seen = new Set<object>();
+  let current = cause;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    if ("name" in current && current.name === "TimeoutError") return true;
+    seen.add(current);
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return false;
+}
+
+export function apiErrorMessage(cause: unknown, fallback: string) {
+  if (
+    !(cause instanceof Error) ||
+    cause instanceof SuccessfulApiResponseError ||
+    cause instanceof TypeError ||
+    cause instanceof DOMException ||
+    errorChainIncludesTimeout(cause) ||
+    (cause instanceof ApiClientError && cause.messageFromFallback)
+  ) {
+    return fallback;
+  }
+  return cause.message.trim() || fallback;
 }
 
 export function onApiUnauthorized(handler: UnauthorizedHandler) {
@@ -193,6 +220,15 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       responseUrl,
       contentType,
       cause,
+    });
+    reportApiResponseFailure(error);
+    throw error;
+  }
+  if (!payload.trim()) {
+    const error = new EmptyApiResponseError(response.status, {
+      requestPath: path,
+      responseUrl,
+      contentType,
     });
     reportApiResponseFailure(error);
     throw error;
