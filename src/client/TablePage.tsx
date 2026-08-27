@@ -53,6 +53,7 @@ type TableLoadResultOptions = {
   countsTowardBackoff?: boolean;
   failure?: TableLoadFailure;
 };
+type TableNotice = { message: string; danger: boolean };
 type StaleRevisionDecision = "accept" | "retry" | "cancel";
 type RevisionRecoveryTarget = {
   page: TableData | null;
@@ -270,6 +271,21 @@ function releaseTableLease(pageId: string, leaseToken: string) {
 function retryingMessage(message: string) {
   const sentence = /[.!?…]$/.test(message) ? message : `${message}.`;
   return `${sentence} Retrying.`;
+}
+
+function uniqueTableNotices(notices: Array<TableNotice | null>) {
+  const unique = new Map<string, TableNotice>();
+  for (const notice of notices) {
+    if (!notice) continue;
+    const key = notice.message
+      .trim()
+      .replace(/[.!?…]+$/, "")
+      .trim();
+    const previous = unique.get(key);
+    if (!previous) unique.set(key, notice);
+    else if (notice.danger && !previous.danger) unique.set(key, { ...previous, danger: true });
+  }
+  return [...unique.values()];
 }
 
 function isCommittedMutationResponseError(cause: unknown) {
@@ -1254,14 +1270,13 @@ export function TablePage({
         );
       } catch (cause) {
         if (leaseTokenRef.current === token) {
+          const leaseLost = cause instanceof ApiClientError && cause.status === 409;
           await endLease(
             token,
-            cause instanceof LeaseResponseError
-              ? cause.message
-              : cause instanceof ApiClientError && cause.status === 409
-                ? apiErrorMessage(cause, LEASE_LOST_MESSAGE)
-                : LEASE_VERIFICATION_MESSAGE,
-            !(cause instanceof ApiClientError && cause.status === 409),
+            leaseLost
+              ? apiErrorMessage(cause, LEASE_LOST_MESSAGE)
+              : leaseErrorMessage(cause, LEASE_VERIFICATION_MESSAGE),
+            !leaseLost,
           );
         }
       }
@@ -2023,7 +2038,13 @@ export function TablePage({
     });
 
   const editingReady = Boolean(leaseToken && revisionKnown);
-  const visibleRevisionRecoveryError = revisionRecoveryError === loadError?.message ? null : revisionRecoveryError;
+  const notices = uniqueTableNotices([
+    leaseError ? { message: leaseError, danger: false } : null,
+    saveError ? { message: saveError, danger: true } : null,
+    revisionRecoveryPending ? { message: STALE_REFRESH_MESSAGE, danger: false } : null,
+    revisionRecoveryError ? { message: revisionRecoveryError, danger: true } : null,
+    loadError ? { message: loadError.message, danger: true } : null,
+  ]);
 
   return (
     <main className="page-canvas table-canvas">
@@ -2061,11 +2082,11 @@ export function TablePage({
           Backlinks
         </button>
       </div>
-      {leaseError && <div className="notice">{leaseError}</div>}
-      {saveError && <div className="notice notice-danger">{saveError}</div>}
-      {revisionRecoveryPending && <div className="notice">{STALE_REFRESH_MESSAGE}</div>}
-      {visibleRevisionRecoveryError && <div className="notice notice-danger">{visibleRevisionRecoveryError}</div>}
-      {loadError && <div className="notice notice-danger">{loadError.message}</div>}
+      {notices.map((notice) => (
+        <div className={`notice${notice.danger ? " notice-danger" : ""}`} key={notice.message}>
+          {notice.message}
+        </div>
+      ))}
       <article className="table-paper">
         <input
           className="page-title"

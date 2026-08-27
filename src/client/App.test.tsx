@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     provider: {},
   })),
   editorAction: vi.fn(),
+  invalidatePagePreview: vi.fn(),
   signInEmail: vi.fn(),
   signOut: vi.fn(),
 }));
@@ -30,6 +31,10 @@ vi.mock("./api", async (importOriginal) => {
 });
 
 vi.mock("./collaboration", () => ({ createWorkspaceEvents: mocks.createWorkspaceEvents }));
+vi.mock("./mentions", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./mentions")>()),
+  invalidatePagePreview: mocks.invalidatePagePreview,
+}));
 
 vi.mock("./EditorPage", () => ({
   EditorPage: (props: EditorPageProps) => (
@@ -82,6 +87,7 @@ function mockWorkspaceApi(treeReloadFailure?: ApiClientError, archiveFailure?: A
     if (path === "/api/install") return { initialized: true };
     if (path === "/api/me") return member;
     if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+    if (path === "/api/pages/tree?archived=true") return { pages: [] };
     if (path === "/api/pages/tree") {
       treeLoads += 1;
       if (treeLoads === 1) return { pages: [page] };
@@ -90,7 +96,7 @@ function mockWorkspaceApi(treeReloadFailure?: ApiClientError, archiveFailure?: A
     }
     if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
       if (archiveFailure) throw archiveFailure;
-      return { ok: true };
+      return { ok: true, pageIds: [page.id] };
     }
     throw new Error(`Unexpected API request: ${path}`);
   });
@@ -113,6 +119,7 @@ describe("App error handling", () => {
     vi.mocked(api).mockReset();
     mocks.createWorkspaceEvents.mockClear();
     mocks.editorAction.mockReset();
+    mocks.invalidatePagePreview.mockReset();
     mocks.signInEmail.mockReset();
     mocks.signOut.mockReset();
   });
@@ -205,9 +212,9 @@ describe("App error handling", () => {
   });
 
   it("suppresses duplicate messages that differ only by trailing punctuation", async () => {
-    mockWorkspaceApi(new ApiClientError(503, "tree_unavailable", "Access revoked."));
+    mockWorkspaceApi(new ApiClientError(503, "tree_unavailable", "Access revoked ."));
     mocks.editorAction.mockImplementation((props: EditorPageProps) => {
-      props.onAccessDenied(page.id, new ApiClientError(403, "forbidden", "Access revoked"));
+      props.onAccessDenied(page.id, new ApiClientError(403, "forbidden", "Access revoked."));
     });
     render(<App />);
 
@@ -217,7 +224,28 @@ describe("App error handling", () => {
     expect(screen.queryByText("Access revoked. Access revoked.")).not.toBeInTheDocument();
   });
 
-  it("keeps a successful archive removed when it joins a pre-archive tree load", async () => {
+  it("keeps an unavailable page removed when its reconciliation starts after the callback", async () => {
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    mocks.editorAction.mockImplementation((props: EditorPageProps) => props.onPageUnavailable?.(page.id));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Simulate document access denial" }));
+
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+  });
+
+  it("keeps an unseen archived descendant removed when archive joins a stale tree load", async () => {
     const staleReload = deferred<{ pages: Page[] }>();
     const child = { ...page, id: "child-page", parentId: page.id, position: "a1", title: "Child" };
     let treeLoads = 0;
@@ -229,12 +257,15 @@ describe("App error handling", () => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree?archived=true") return { pages: [page, child] };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        if (treeLoads === 1) return { pages: [page, child] };
+        if (treeLoads === 1) return { pages: [page] };
         return staleReload.promise;
       }
-      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") return { ok: true };
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        return { ok: true, pageIds: [page.id, child.id] };
+      }
       throw new Error(`Unexpected API request: ${path}`);
     });
     render(<App />);
@@ -254,6 +285,68 @@ describe("App error handling", () => {
     await waitFor(() => expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "Archive Child" })).not.toBeInTheDocument();
     expect(treeLoads).toBe(2);
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(child.id);
+    expect(api).toHaveBeenCalledWith("/api/pages/tree?archived=true");
+  });
+
+  it("clears a recovered page-tree error without clearing an access error", async () => {
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        if (treeLoads === 2) throw new ApiClientError(503, "tree_unavailable", "Tree refresh unavailable.");
+        return { pages: [] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    mocks.editorAction.mockImplementation((props: EditorPageProps) => {
+      props.onAccessDenied(page.id, new ApiClientError(403, "forbidden", "Access revoked."));
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Simulate document access denial" }));
+    expect(await screen.findByText("Access revoked. Tree refresh unavailable.")).toBeInTheDocument();
+
+    reconnectWorkspace();
+
+    expect(await screen.findByText("Access revoked.")).toBeInTheDocument();
+    expect(screen.queryByText(/Tree refresh unavailable/)).not.toBeInTheDocument();
+  });
+
+  it("keeps an unrelated mentions error when an archive starts", async () => {
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") {
+        throw new ApiClientError(503, "mentions_unavailable", "Mention count unavailable.");
+      }
+      if (path === "/api/pages/tree?archived=true") return { pages: [page] };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page] : [] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        return { ok: true, pageIds: [page.id] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByText("Mention count unavailable.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Archive Roadmap" }));
+
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(screen.getByText("Mention count unavailable.")).toBeInTheDocument();
   });
 
   it("reports both an archive failure and a failed reconciliation refresh", async () => {

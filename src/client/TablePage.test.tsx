@@ -295,6 +295,27 @@ describe("TablePage", () => {
     expect(await screen.findByText("Table could not be loaded.")).toBeInTheDocument();
   });
 
+  it("renders matching lease and load failures only once despite punctuation differences", async () => {
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") {
+        throw new ApiClientError(503, "service_unavailable", "Service unavailable");
+      }
+      throw new ApiClientError(503, "service_unavailable", "Service unavailable.");
+    });
+
+    render(
+      <TablePage
+        page={page}
+        member={member("editor")}
+        onPageChanged={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    await waitFor(() => expect(screen.queryAllByText(/Service unavailable/)).toHaveLength(1));
+  });
+
   it("acquires an editor lease and exposes table mutations", async () => {
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();

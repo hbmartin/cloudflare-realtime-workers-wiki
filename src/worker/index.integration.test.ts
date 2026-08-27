@@ -1944,7 +1944,12 @@ describe("Worker integration", () => {
       }),
     );
     expect(archived.status).toBe(200);
-    expect(await archived.json()).toEqual({ ok: true, cleanupPending: false, pendingPageIds: [] });
+    expect(await archived.json()).toEqual({
+      ok: true,
+      pageIds: [installed.pageId],
+      cleanupPending: false,
+      pendingPageIds: [],
+    });
     expect(
       (
         await env.DB.prepare(`SELECT COUNT(*) count FROM page_search WHERE page_id = ?`)
@@ -2008,6 +2013,7 @@ describe("Worker integration", () => {
       expect(archived.status).toBe(202);
       expect(await archived.json()).toEqual({
         ok: true,
+        pageIds: [installed.pageId],
         cleanupPending: true,
         pendingPageIds: [installed.pageId],
       });
