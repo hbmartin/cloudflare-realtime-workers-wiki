@@ -888,7 +888,12 @@ app.delete("/api/pages/:id", async (c) => {
     })),
   );
   return c.json(
-    { ok: true, cleanupPending: pendingPageIds.length > 0, pendingPageIds },
+    {
+      ok: true,
+      pageIds: archived.results.map((item) => item.id),
+      cleanupPending: pendingPageIds.length > 0,
+      pendingPageIds,
+    },
     pendingPageIds.length ? 202 : 200,
   );
 });

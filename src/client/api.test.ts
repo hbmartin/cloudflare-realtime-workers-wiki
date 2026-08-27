@@ -94,7 +94,8 @@ describe("api", () => {
     );
     const error = await api("/api/upstream").catch((cause: unknown) => cause);
 
-    expect(error).toBeInstanceOf(ApiClientError);
+    if (!(error instanceof ApiClientError)) throw new TypeError("Expected ApiClientError.");
+    expect(error.stack).toEqual(expect.any(String));
     expect(error).toMatchObject({
       name: "ApiClientError",
       status: 502,
@@ -110,7 +111,7 @@ describe("api", () => {
       "API response could not be processed",
       expect.objectContaining({
         name: "ApiClientError",
-        stack: error instanceof Error ? (error.stack ?? null) : null,
+        stack: error.stack ?? null,
         status: 502,
         requestPath: "/api/upstream",
         responseBodyFailure: "parse",
@@ -254,7 +255,8 @@ describe("api", () => {
 
     const error = await api("/api/example").catch((cause: unknown) => cause);
 
-    expect(error).toBeInstanceOf(EmptyApiResponseError);
+    if (!(error instanceof EmptyApiResponseError)) throw new TypeError("Expected EmptyApiResponseError.");
+    expect(error.stack).toEqual(expect.any(String));
     expect(error).toMatchObject({
       status: 200,
       hasJsonContentType: true,
@@ -270,7 +272,7 @@ describe("api", () => {
         responseBodyFailure: "empty",
         causeName: null,
         causeType: null,
-        stack: expect.any(String),
+        stack: error.stack ?? null,
       }),
     );
     expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
