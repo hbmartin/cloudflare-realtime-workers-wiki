@@ -5,7 +5,7 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { Page, TableData, TableLeaseResponse, TableLeaseTiming } from "../shared/types";
-import { ApiClientError, api, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
+import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
 import { TablePage } from "./TablePage";
 
 vi.mock("./api", async (importOriginal) => {
@@ -965,10 +965,15 @@ describe("TablePage", () => {
 
   it("preserves a server message while retrying lease renewal", async () => {
     vi.useFakeTimers();
+    let renewals = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.endsWith("/lease") && init?.method === "PATCH") {
-        throw new ApiClientError(503, "lease_unavailable", "Lease service temporarily unavailable.");
+        renewals += 1;
+        if (renewals === 1) {
+          throw new ApiClientError(503, "lease_unavailable", "Lease service temporarily unavailable");
+        }
+        return { leaseDurationMs: LEASE_DURATION_MS };
       }
       return { table };
     });
@@ -977,7 +982,28 @@ describe("TablePage", () => {
     await act(() => vi.advanceTimersByTimeAsync(20_000));
 
     expect(screen.getByText("Lease service temporarily unavailable. Retrying.")).toBeInTheDocument();
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
     expect(api).not.toHaveBeenCalledWith("/api/tables/table-page/lease", expect.objectContaining({ method: "DELETE" }));
+
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+
+    expect(screen.getByText("Editing lease active")).toBeInTheDocument();
+    expect(screen.queryByText("Lease service temporarily unavailable. Retrying.")).not.toBeInTheDocument();
+  });
+
+  it("uses the lease-renewal fallback for transport diagnostics", async () => {
+    vi.useFakeTimers();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.endsWith("/lease") && init?.method === "PATCH") throw new TypeError("Failed to fetch");
+      return { table };
+    });
+    await renderActiveEditor();
+
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+
+    expect(screen.getByText("The editing lease could not be renewed. Retrying.")).toBeInTheDocument();
+    expect(screen.queryByText("Failed to fetch. Retrying.")).not.toBeInTheDocument();
   });
 
   it("does not overlap lease renewals when a request stalls", async () => {
@@ -1315,6 +1341,15 @@ describe("TablePage", () => {
           responseUrl: null,
           contentType: "application/json",
           cause: new TypeError("The response stream terminated."),
+        }),
+    ],
+    [
+      "an empty JSON response",
+      () =>
+        new EmptyApiResponseError(200, {
+          requestPath: "/api/tables/table-page/cells/row/status",
+          responseUrl: null,
+          contentType: "application/json",
         }),
     ],
   ])("does not assume %s committed the mutation", async (_case, responseError) => {

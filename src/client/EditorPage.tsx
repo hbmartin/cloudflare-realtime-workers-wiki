@@ -9,7 +9,7 @@ import type { ClientMemberContext } from "../shared/types";
 import type { MentionSuggestion, Page } from "../shared/types";
 import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { diffBlockIds } from "../shared/block-diff";
-import { ApiClientError, api, json } from "./api";
+import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
 import { createDocumentCloseReconciler } from "./document-connection";
@@ -171,7 +171,7 @@ export function EditorPage({
         setTitleError("Page metadata changed. Your title was kept; review it and try again.");
         return;
       }
-      setTitleError(error instanceof Error ? error.message : "The title could not be saved.");
+      setTitleError(apiErrorMessage(error, "The title could not be saved."));
     }
   }
 
