@@ -2,16 +2,6 @@ import { createAuthClient } from "better-auth/react";
 
 export const authClient = createAuthClient({ baseURL: window.location.origin });
 
-export type ApiResponseBodyFailure = "read" | "parse";
-
-export interface ApiClientErrorDiagnostics {
-  requestPath?: string;
-  responseUrl?: string | null;
-  contentType?: string | null;
-  responseBodyFailure?: ApiResponseBodyFailure;
-  cause?: unknown;
-}
-
 type ApiErrorPayload = {
   code?: unknown;
   message?: unknown;
@@ -19,68 +9,43 @@ type ApiErrorPayload = {
 };
 
 export class ApiClientError extends Error {
-  readonly requestPath: string | null;
-  readonly responseUrl: string | null;
-  readonly contentType: string | null;
-  readonly responseBodyFailure: ApiResponseBodyFailure | null;
-
   constructor(
     readonly status: number,
     readonly code: string,
     message: string,
     readonly messageFromFallback = false,
-    diagnostics: ApiClientErrorDiagnostics = {},
   ) {
-    super(message, diagnostics.cause === undefined ? undefined : { cause: diagnostics.cause });
-    this.requestPath = diagnostics.requestPath ?? null;
-    this.responseUrl = diagnostics.responseUrl ?? null;
-    this.contentType = diagnostics.contentType ?? null;
-    this.responseBodyFailure = diagnostics.responseBodyFailure ?? null;
+    super(message);
   }
 }
 
-export abstract class SuccessfulApiResponseError extends Error {
+function isJsonContentType(contentType: string | null) {
+  const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  return mediaType === "application/json" || mediaType?.endsWith("+json") === true;
+}
+
+export class InvalidApiResponseError extends Error {
+  readonly hasJsonContentType: boolean;
+
   constructor(
-    message: string,
     readonly status: number,
-    readonly requestPath: string,
-    readonly responseUrl: string | null,
-    readonly contentType: string | null,
-    cause: unknown,
+    diagnostics: { contentType: string | null; cause: unknown },
   ) {
-    super(message, { cause });
-  }
-}
-
-export class InvalidApiResponseError extends SuccessfulApiResponseError {
-  constructor(
-    status: number,
-    requestPath: string,
-    responseUrl: string | null,
-    contentType: string | null,
-    cause: unknown,
-  ) {
-    super(
-      "The server returned malformed JSON in a successful response.",
-      status,
-      requestPath,
-      responseUrl,
-      contentType,
-      cause,
-    );
+    super("The server returned malformed JSON in a successful response.", { cause: diagnostics.cause });
+    this.hasJsonContentType = isJsonContentType(diagnostics.contentType);
     this.name = "InvalidApiResponseError";
   }
 }
 
-export class UnreadableApiResponseError extends SuccessfulApiResponseError {
+export class UnreadableApiResponseError extends Error {
+  readonly hasJsonContentType: boolean;
+
   constructor(
-    status: number,
-    requestPath: string,
-    responseUrl: string | null,
-    contentType: string | null,
-    cause: unknown,
+    readonly status: number,
+    diagnostics: { contentType: string | null; cause: unknown },
   ) {
-    super("The successful response body could not be read.", status, requestPath, responseUrl, contentType, cause);
+    super("The successful response body could not be read.", { cause: diagnostics.cause });
+    this.hasJsonContentType = isJsonContentType(diagnostics.contentType);
     this.name = "UnreadableApiResponseError";
   }
 }
@@ -88,10 +53,6 @@ export class UnreadableApiResponseError extends SuccessfulApiResponseError {
 export type UnauthorizedHandler = (error: ApiClientError) => void;
 
 const unauthorizedHandlers = new Set<UnauthorizedHandler>();
-
-function reportApiResponseFailure(error: Error) {
-  console.error("API response could not be processed", error);
-}
 
 export function onApiUnauthorized(handler: UnauthorizedHandler) {
   unauthorizedHandlers.add(handler);
@@ -104,38 +65,15 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !(init.body instanceof FormData)) headers.set("content-type", "application/json");
   const response = await fetch(path, { ...init, headers });
-  const responseUrl = response.url || null;
-  const contentType = response.headers.get("content-type");
   if (!response.ok) {
     const fallback = { code: "request_failed", message: `Request failed (${response.status}).` };
-    let payload: ApiErrorPayload | null = null;
-    let responseBodyFailure: ApiResponseBodyFailure | undefined;
-    let responseBodyCause: unknown;
-    try {
-      const body = await response.text();
-      try {
-        payload = JSON.parse(body) as ApiErrorPayload | null;
-      } catch (cause) {
-        responseBodyFailure = "parse";
-        responseBodyCause = cause;
-      }
-    } catch (cause) {
-      responseBodyFailure = "read";
-      responseBodyCause = cause;
-    }
+    const payload = (await response.json().catch(() => null)) as ApiErrorPayload | null;
     const error = payload?.error ?? payload;
     const normalizedCode = typeof error?.code === "string" ? error.code.trim() : "";
     const normalizedMessage = typeof error?.message === "string" ? error.message.trim() : "";
     const code = normalizedCode || fallback.code;
     const message = normalizedMessage || fallback.message;
-    const clientError = new ApiClientError(response.status, code, message, !normalizedMessage, {
-      requestPath: path,
-      responseUrl,
-      contentType,
-      responseBodyFailure,
-      cause: responseBodyCause,
-    });
-    if (responseBodyFailure) reportApiResponseFailure(clientError);
+    const clientError = new ApiClientError(response.status, code, message, !normalizedMessage);
     if (response.status === 401) {
       for (const handler of unauthorizedHandlers) {
         try {
@@ -147,20 +85,17 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw clientError;
   }
+  const contentType = response.headers.get("content-type");
   let payload: string;
   try {
     payload = await response.text();
   } catch (cause) {
-    const error = new UnreadableApiResponseError(response.status, path, responseUrl, contentType, cause);
-    reportApiResponseFailure(error);
-    throw error;
+    throw new UnreadableApiResponseError(response.status, { contentType, cause });
   }
   try {
     return JSON.parse(payload) as T;
   } catch (cause) {
-    const error = new InvalidApiResponseError(response.status, path, responseUrl, contentType, cause);
-    reportApiResponseFailure(error);
-    throw error;
+    throw new InvalidApiResponseError(response.status, { contentType, cause });
   }
 }
 
