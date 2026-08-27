@@ -3333,15 +3333,15 @@ describe("Worker integration", () => {
       ),
     );
 
-    expect(
-      (
-        await SELF.fetch(
-          authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
-            method: "DELETE",
-          }),
-        )
-      ).status,
-    ).toBe(200);
+    const archived = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+        method: "DELETE",
+      }),
+    );
+    expect(archived.status).toBe(200);
+    const archiveResult = await archived.json<{ pageIds: string[] }>();
+    expect(archiveResult.pageIds).toHaveLength(2);
+    expect(archiveResult.pageIds).toEqual(expect.arrayContaining([installed.pageId, child.id]));
     const context = createExecutionContext();
     const deleted = await worker.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/permanent-delete`, { method: "POST" }),

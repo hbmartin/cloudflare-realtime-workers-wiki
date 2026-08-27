@@ -166,6 +166,21 @@ describe("App error handling", () => {
     expect(await screen.findByText("Access revoked.")).toBeInTheDocument();
   });
 
+  it("clears an access-denied message on the next explicit navigation", async () => {
+    mockWorkspaceApi();
+    mocks.editorAction.mockImplementation((props: EditorPageProps) => {
+      props.onAccessDenied(page.id, new ApiClientError(403, "forbidden", "Access revoked."));
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Simulate document access denial" }));
+    expect(await screen.findByText("Access revoked.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Search/ }));
+
+    expect(screen.queryByText("Access revoked.")).not.toBeInTheDocument();
+  });
+
   it("does not let a reconnect refresh overwrite an access-denied message", async () => {
     const reload = deferred<{ pages: Page[] }>();
     let treeLoads = 0;
@@ -212,7 +227,7 @@ describe("App error handling", () => {
   });
 
   it("suppresses duplicate messages that differ only by trailing punctuation", async () => {
-    mockWorkspaceApi(new ApiClientError(503, "tree_unavailable", "Access revoked ."));
+    mockWorkspaceApi(new ApiClientError(503, "tree_unavailable", "Access revoked . !"));
     mocks.editorAction.mockImplementation((props: EditorPageProps) => {
       props.onAccessDenied(page.id, new ApiClientError(403, "forbidden", "Access revoked."));
     });
@@ -224,7 +239,7 @@ describe("App error handling", () => {
     expect(screen.queryByText("Access revoked. Access revoked.")).not.toBeInTheDocument();
   });
 
-  it("keeps an unavailable page removed when its reconciliation starts after the callback", async () => {
+  it("records an unavailable-page removal after starting reconciliation", async () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
@@ -243,6 +258,7 @@ describe("App error handling", () => {
 
     await waitFor(() => expect(treeLoads).toBe(2));
     expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
   });
 
   it("keeps an unseen archived descendant removed when archive joins a stale tree load", async () => {
@@ -287,7 +303,55 @@ describe("App error handling", () => {
     expect(treeLoads).toBe(2);
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(child.id);
-    expect(api).toHaveBeenCalledWith("/api/pages/tree?archived=true");
+    expect(api).not.toHaveBeenCalledWith("/api/pages/tree?archived=true");
+  });
+
+  it("reconciles an archive whose successful response has invalid page ids", async () => {
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page] : [] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") return { ok: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    expect(
+      await screen.findByText("The server returned an invalid archive response. Refreshing the page tree."),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+  });
+
+  it("does not describe failed trash data as empty", async () => {
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === "/api/pages/tree?archived=true") {
+        throw new ApiClientError(503, "trash_unavailable", "Trash service unavailable.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+
+    expect(await screen.findByRole("heading", { name: "Trash" })).toBeInTheDocument();
+    expect(screen.getByText("Trash service unavailable.")).toBeInTheDocument();
+    expect(screen.queryByText("Trash is empty.")).not.toBeInTheDocument();
   });
 
   it("clears a recovered page-tree error without clearing an access error", async () => {
