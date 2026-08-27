@@ -1,5 +1,7 @@
+import type { PAGE_KINDS } from "./validation";
+
 export type Role = "owner" | "editor" | "viewer";
-export type PageKind = "document" | "table";
+export type PageKind = (typeof PAGE_KINDS)[number];
 export type ColumnType = "text" | "number" | "checkbox" | "date" | "select";
 
 export type SessionUser = {

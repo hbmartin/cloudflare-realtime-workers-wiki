@@ -1,4 +1,6 @@
-import type { ColumnType, PageKind, Role } from "./types";
+import type { ColumnType, Page, PageKind, Role } from "./types";
+
+export const PAGE_KINDS = ["document", "table"] as const;
 
 export class ValidationError extends Error {}
 
@@ -56,6 +58,26 @@ function oneOf<T extends string>(value: unknown, name: string, values: readonly 
 }
 
 export const role = (value: unknown) => oneOf<Role>(value, "role", ["owner", "editor", "viewer"]);
-export const pageKind = (value: unknown) => oneOf<PageKind>(value, "kind", ["document", "table"]);
+export const pageKind = (value: unknown) => oneOf<PageKind>(value, "kind", PAGE_KINDS);
 export const columnType = (value: unknown) =>
   oneOf<ColumnType>(value, "type", ["text", "number", "checkbox", "date", "select"]);
+
+export function isPage(value: unknown): value is Page {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const page = value as Record<string, unknown>;
+  return (
+    typeof page.id === "string" &&
+    typeof page.workspaceId === "string" &&
+    (page.parentId === null || typeof page.parentId === "string") &&
+    typeof page.kind === "string" &&
+    PAGE_KINDS.includes(page.kind as PageKind) &&
+    typeof page.position === "string" &&
+    typeof page.title === "string" &&
+    (page.icon === null || typeof page.icon === "string") &&
+    typeof page.revision === "number" &&
+    typeof page.contentEpoch === "number" &&
+    (page.archivedAt === null || typeof page.archivedAt === "number") &&
+    typeof page.createdAt === "number" &&
+    typeof page.updatedAt === "number"
+  );
+}

@@ -903,42 +903,45 @@ app.post("/api/pages/:id/restore", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
-  await c.env.DB.prepare(
-    `WITH RECURSIVE subtree(id) AS (
-       SELECT id FROM pages WHERE id = ? AND workspace_id = ?
-       UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-     ) UPDATE pages SET archived_at = NULL, archived_by = NULL, updated_at = ? WHERE id IN subtree`,
-  )
-    .bind(page.id, member.workspace.id, now())
-    .run();
-  await c.env.DB.prepare(
-    `DELETE FROM archive_disconnect_targets WHERE page_id IN (
-       WITH RECURSIVE subtree(id) AS (
-         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       ) SELECT id FROM subtree
-     )`,
-  )
-    .bind(page.id)
-    .run();
-  const restored = await c.env.DB.prepare(
-    `SELECT * FROM pages WHERE id IN (
-      WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
-      SELECT id FROM subtree
-    )`,
-  )
-    .bind(page.id)
-    .all<PageRow>();
-  await c.env.DB.batch(
-    restored.results.flatMap((item) => [
-      c.env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(item.id),
-      c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, ?)`).bind(
-        item.id,
-        item.workspace_id,
-        item.title,
-        item.plain_text ?? "",
-      ),
-    ]),
-  );
+  const restoreResults = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT id FROM pages WHERE id = ? AND workspace_id = ?
+         UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       ) UPDATE pages SET archived_at = NULL, archived_by = NULL, updated_at = ? WHERE id IN subtree`,
+    ).bind(page.id, member.workspace.id, now()),
+    c.env.DB.prepare(
+      `DELETE FROM archive_disconnect_targets WHERE page_id IN (
+         WITH RECURSIVE subtree(id) AS (
+           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+         ) SELECT id FROM subtree
+       )`,
+    ).bind(page.id),
+    c.env.DB.prepare(
+      `DELETE FROM page_search WHERE page_id IN (
+         WITH RECURSIVE subtree(id) AS (
+           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+         ) SELECT id FROM subtree
+       )`,
+    ).bind(page.id),
+    c.env.DB.prepare(
+      `INSERT INTO page_search (page_id, workspace_id, title, body)
+       SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages WHERE id IN (
+         WITH RECURSIVE subtree(id) AS (
+           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+         ) SELECT id FROM subtree
+       )`,
+    ).bind(page.id),
+    // Read the restored snapshot in the same transaction as the update so a
+    // concurrent archive cannot turn a successful response back into Trash data.
+    c.env.DB.prepare(
+      `SELECT * FROM pages WHERE id IN (
+        WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
+        SELECT id FROM subtree
+      )`,
+    ).bind(page.id),
+  ]);
+  const restored = restoreResults[4] as D1Result<PageRow>;
   const restoredPages = restored.results.map(pageJson);
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-upserted",
