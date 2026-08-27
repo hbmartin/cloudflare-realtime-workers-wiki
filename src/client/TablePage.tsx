@@ -11,7 +11,7 @@ import type {
   TableLeaseTiming,
   TableRow,
 } from "../shared/types";
-import { ApiClientError, api, json, SuccessfulApiResponseError } from "./api";
+import { ApiClientError, api, InvalidApiResponseError, json, SuccessfulApiResponseError } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 
 type IsCurrent = () => boolean;
@@ -261,7 +261,7 @@ function errorChainIncludesTimeout(cause: unknown) {
 }
 
 function errorMessage(cause: unknown, fallback: string) {
-  if (!(cause instanceof Error)) return fallback;
+  if (!(cause instanceof Error) || cause instanceof SuccessfulApiResponseError) return fallback;
   return errorChainIncludesTimeout(cause) || (cause instanceof ApiClientError && cause.messageFromFallback)
     ? fallback
     : cause.message || fallback;
@@ -269,7 +269,7 @@ function errorMessage(cause: unknown, fallback: string) {
 
 function isCommittedMutationResponseError(cause: unknown) {
   if (cause instanceof InvalidMutationResponseError) return true;
-  return cause instanceof SuccessfulApiResponseError && cause.hasJsonContentType;
+  return cause instanceof InvalidApiResponseError && cause.hasJsonContentType;
 }
 
 // The table's page was archived or deleted underneath this view. Terminal for
@@ -1665,7 +1665,7 @@ export function TablePage({
             );
             return;
           }
-          setLeaseError(`${LEASE_RENEWAL_MESSAGE} Retrying.`);
+          setLeaseError(`${errorMessage(cause, LEASE_RENEWAL_MESSAGE)} Retrying.`);
           return;
         }
         stopRenewal();
@@ -1793,16 +1793,6 @@ export function TablePage({
             setSaveError(INVALID_MUTATION_RESPONSE_MESSAGE);
             resetCellInputAfterLoad(resetKey);
             await recoverRevision({ minimumRevision: committedRevisionFloor });
-            return null;
-          }
-          // A non-JSON 2xx response may have come from an intermediary that
-          // never applied the mutation. Reload without inventing a committed
-          // revision floor, and keep API-layer diagnostics out of the editor.
-          if (cause instanceof SuccessfulApiResponseError) {
-            invalidateRevision();
-            setSaveError(SAVE_FAILED_MESSAGE);
-            resetCellInputAfterLoad(resetKey);
-            await recoverRevision({ minimumRevision: currentRevision });
             return null;
           }
           if (cause instanceof ApiClientError && cause.code === "table_revision_conflict") {
