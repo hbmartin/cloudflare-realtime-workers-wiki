@@ -11,7 +11,7 @@ import type {
   TableLeaseTiming,
   TableRow,
 } from "../shared/types";
-import { ApiClientError, api, InvalidApiResponseError, json } from "./api";
+import { ApiClientError, api, json, SuccessfulApiResponseError } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 
 type IsCurrent = () => boolean;
@@ -1769,7 +1769,7 @@ export function TablePage({
           if (leaseTokenRef.current !== currentLease) {
             return failForLostLease();
           }
-          if (cause instanceof InvalidMutationResponseError || cause instanceof InvalidApiResponseError) {
+          if (cause instanceof InvalidMutationResponseError || cause instanceof SuccessfulApiResponseError) {
             const committedRevisionFloor = currentRevision + 1;
             preserveRevisionFloor(committedRevisionFloor);
             invalidateRevision();

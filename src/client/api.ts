@@ -13,10 +13,29 @@ export class ApiClientError extends Error {
   }
 }
 
-export class InvalidApiResponseError extends Error {
-  constructor(readonly status: number) {
-    super("The server returned an invalid successful response.");
+export class SuccessfulApiResponseError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly requestPath: string,
+    readonly contentType: string | null,
+    cause: unknown,
+  ) {
+    super(message, { cause });
+  }
+}
+
+export class InvalidApiResponseError extends SuccessfulApiResponseError {
+  constructor(status: number, requestPath: string, contentType: string | null, cause: unknown) {
+    super("The server returned malformed JSON in a successful response.", status, requestPath, contentType, cause);
     this.name = "InvalidApiResponseError";
+  }
+}
+
+export class UnreadableApiResponseError extends SuccessfulApiResponseError {
+  constructor(status: number, requestPath: string, contentType: string | null, cause: unknown) {
+    super("The successful response body could not be read.", status, requestPath, contentType, cause);
+    this.name = "UnreadableApiResponseError";
   }
 }
 
@@ -59,10 +78,17 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw clientError;
   }
+  const contentType = response.headers.get("content-type");
+  let payload: string;
   try {
-    return (await response.json()) as T;
-  } catch {
-    throw new InvalidApiResponseError(response.status);
+    payload = await response.text();
+  } catch (cause) {
+    throw new UnreadableApiResponseError(response.status, path, contentType, cause);
+  }
+  try {
+    return JSON.parse(payload) as T;
+  } catch (cause) {
+    throw new InvalidApiResponseError(response.status, path, contentType, cause);
   }
 }
 
