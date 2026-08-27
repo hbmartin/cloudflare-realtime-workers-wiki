@@ -1256,9 +1256,11 @@ export function TablePage({
         if (leaseTokenRef.current === token) {
           await endLease(
             token,
-            cause instanceof ApiClientError && cause.status === 409
-              ? apiErrorMessage(cause, LEASE_LOST_MESSAGE)
-              : LEASE_VERIFICATION_MESSAGE,
+            cause instanceof LeaseResponseError
+              ? cause.message
+              : cause instanceof ApiClientError && cause.status === 409
+                ? apiErrorMessage(cause, LEASE_LOST_MESSAGE)
+                : LEASE_VERIFICATION_MESSAGE,
             !(cause instanceof ApiClientError && cause.status === 409),
           );
         }
@@ -1659,7 +1661,7 @@ export function TablePage({
         // never extend it.
         if (cause instanceof LeaseResponseError) {
           stopRenewal();
-          await endLease(leaseToken, leaseErrorMessage(cause, LEASE_RENEWAL_MESSAGE));
+          await endLease(leaseToken, cause.message);
           return;
         }
         const retryable = !(cause instanceof ApiClientError) || cause.status === 429 || cause.status >= 500;
@@ -2021,6 +2023,7 @@ export function TablePage({
     });
 
   const editingReady = Boolean(leaseToken && revisionKnown);
+  const visibleRevisionRecoveryError = revisionRecoveryError === loadError?.message ? null : revisionRecoveryError;
 
   return (
     <main className="page-canvas table-canvas">
@@ -2061,7 +2064,7 @@ export function TablePage({
       {leaseError && <div className="notice">{leaseError}</div>}
       {saveError && <div className="notice notice-danger">{saveError}</div>}
       {revisionRecoveryPending && <div className="notice">{STALE_REFRESH_MESSAGE}</div>}
-      {revisionRecoveryError && <div className="notice notice-danger">{revisionRecoveryError}</div>}
+      {visibleRevisionRecoveryError && <div className="notice notice-danger">{visibleRevisionRecoveryError}</div>}
       {loadError && <div className="notice notice-danger">{loadError.message}</div>}
       <article className="table-paper">
         <input

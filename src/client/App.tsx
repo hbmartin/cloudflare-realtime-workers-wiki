@@ -16,12 +16,30 @@ type AppState =
   | { screen: "invite"; token: string }
   | { screen: "workspace"; member: ClientMemberContext };
 
-function appendErrorMessage(primary: string, secondary: string) {
-  const first = primary.trim();
-  const second = secondary.trim();
-  if (!first || first === second) return second;
-  if (!second) return first;
-  return `${/[.!?…]$/.test(first) ? first : `${first}.`} ${second}`;
+function errorMessageKey(message: string) {
+  return message.trim().replace(/[.!?…]+$/, "");
+}
+
+function appendErrorMessage(current: string[], message: string) {
+  const next = message.trim();
+  if (!next) return current;
+  const key = errorMessageKey(next);
+  return current.some((existing) => errorMessageKey(existing) === key) ? current : [...current, next];
+}
+
+function formatErrorMessages(messages: string[]) {
+  return messages.map((message) => (/[.!?…]$/.test(message) ? message : `${message}.`)).join(" ");
+}
+
+function pageSubtreeIds(pages: Page[], rootId: string) {
+  const ids = new Set([rootId]);
+  for (let previousSize = 0; previousSize !== ids.size;) {
+    previousSize = ids.size;
+    for (const page of pages) {
+      if (page.parentId && ids.has(page.parentId)) ids.add(page.id);
+    }
+  }
+  return [...ids];
 }
 
 async function resolveAppState(): Promise<AppState> {
@@ -270,9 +288,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
-  const [workspaceError, setWorkspaceError] = useState("");
+  const [workspaceErrors, setWorkspaceErrors] = useState<string[]>([]);
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const pageLoadPromise = useRef<Promise<void> | null>(null);
+
+  const reportWorkspaceError = useCallback((message: string) => {
+    setWorkspaceErrors((current) => appendErrorMessage(current, message));
+  }, []);
 
   const recordPageUpserts = useCallback((incoming: Page[]) => {
     pendingPageEvents.current.recordUpserts(incoming);
@@ -318,9 +340,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const handleMentionsRead = useCallback((unreadCount: number) => setUnreadMentions(unreadCount), []);
   useEffect(() => {
     void loadPages().catch((error) => {
-      setWorkspaceError(apiErrorMessage(error, "The page tree could not be loaded."));
+      reportWorkspaceError(apiErrorMessage(error, "The page tree could not be loaded."));
     });
-  }, [loadPages]);
+  }, [loadPages, reportWorkspaceError]);
   useEffect(() => {
     void loadUnreadMentions();
   }, [loadUnreadMentions]);
@@ -354,12 +376,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   useEffect(() => {
     const bundle = createWorkspaceEvents(member.workspace.id, handleWorkspaceEvent, () => {
       void loadPages().catch((error) => {
-        setWorkspaceError(apiErrorMessage(error, "The page tree could not be refreshed."));
+        reportWorkspaceError(apiErrorMessage(error, "The page tree could not be refreshed."));
       });
       void loadUnreadMentions();
     });
     return () => bundle.destroy();
-  }, [handleWorkspaceEvent, loadPages, loadUnreadMentions, member.workspace.id]);
+  }, [handleWorkspaceEvent, loadPages, loadUnreadMentions, member.workspace.id, reportWorkspaceError]);
 
   useEffect(() => {
     const navigate = (event: Event) => {
@@ -406,22 +428,26 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }
   async function archive(page: Page) {
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
-    setWorkspaceError("");
+    setWorkspaceErrors([]);
+    const archivedPageIds = pageSubtreeIds(pages, page.id);
     let archiveError: string | null = null;
     try {
       await api(`/api/pages/${page.id}`, { method: "DELETE" });
     } catch (error) {
       archiveError = apiErrorMessage(error, "The page could not be archived.");
-      setWorkspaceError(archiveError);
+      reportWorkspaceError(archiveError);
     }
-    await loadPages().catch((error) => {
+    const reconciliation = loadPages();
+    if (!archiveError) {
+      recordPageRemovals(archivedPageIds);
+      setPages((current) => current.filter((candidate) => !archivedPageIds.includes(candidate.id)));
+    }
+    await reconciliation.catch((error) => {
       const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
       if (archiveError) {
         console.error("Page tree could not be refreshed after an archive failure", error);
-        setWorkspaceError(appendErrorMessage(archiveError, refreshError));
-      } else {
-        setWorkspaceError(refreshError);
       }
+      reportWorkspaceError(refreshError);
     });
   }
   async function move(
@@ -468,24 +494,26 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     [recordPageUpserts],
   );
   const pageUnavailable = useCallback(
-    (pageId: string, primaryError?: string) => {
+    (pageId: string) => {
       recordPageRemovals([pageId]);
       setPages((current) => current.filter((page) => page.id !== pageId));
       void loadPages().catch((error) => {
         const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
-        setWorkspaceError(primaryError ? appendErrorMessage(primaryError, refreshError) : refreshError);
+        reportWorkspaceError(refreshError);
       });
     },
-    [loadPages, recordPageRemovals],
+    [loadPages, recordPageRemovals, reportWorkspaceError],
   );
   const documentAccessDenied = useCallback(
     (pageId: string, error: ApiClientError) => {
       const accessError = apiErrorMessage(error, "You no longer have access to this page.");
-      setWorkspaceError(accessError);
-      pageUnavailable(pageId, accessError);
+      reportWorkspaceError(accessError);
+      pageUnavailable(pageId);
     },
-    [pageUnavailable],
+    [pageUnavailable, reportWorkspaceError],
   );
+
+  const workspaceError = formatErrorMessages(workspaceErrors);
 
   return (
     <div className="workspace-shell">
