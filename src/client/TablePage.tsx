@@ -11,7 +11,14 @@ import type {
   TableLeaseTiming,
   TableRow,
 } from "../shared/types";
-import { ApiClientError, api, json, SuccessfulApiResponseError } from "./api";
+import {
+  ApiClientError,
+  api,
+  InvalidApiResponseError,
+  json,
+  SuccessfulApiResponseError,
+  UnreadableApiResponseError,
+} from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 
 type IsCurrent = () => boolean;
@@ -249,11 +256,35 @@ function releaseTableLease(pageId: string, leaseToken: string) {
   }).catch((cause) => console.error("Failed to release table lease", cause));
 }
 
+function errorChainIncludesName(cause: unknown, name: string) {
+  const seen = new Set<object>();
+  let current = cause;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    if ("name" in current && current.name === name) return true;
+    seen.add(current);
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return false;
+}
+
 function errorMessage(cause: unknown, fallback: string) {
   if (!(cause instanceof Error)) return fallback;
-  return cause.name === "TimeoutError" || (cause instanceof ApiClientError && cause.messageFromFallback)
+  return errorChainIncludesName(cause, "TimeoutError") || (cause instanceof ApiClientError && cause.messageFromFallback)
     ? fallback
     : cause.message || fallback;
+}
+
+function isJsonContentType(contentType: string | null) {
+  const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  return mediaType === "application/json" || mediaType?.endsWith("+json") === true;
+}
+
+function isCommittedMutationResponseError(cause: unknown) {
+  if (cause instanceof InvalidMutationResponseError) return true;
+  return (
+    (cause instanceof InvalidApiResponseError || cause instanceof UnreadableApiResponseError) &&
+    isJsonContentType(cause.contentType)
+  );
 }
 
 // The table's page was archived or deleted underneath this view. Terminal for
@@ -1769,13 +1800,23 @@ export function TablePage({
           if (leaseTokenRef.current !== currentLease) {
             return failForLostLease();
           }
-          if (cause instanceof InvalidMutationResponseError || cause instanceof SuccessfulApiResponseError) {
+          if (isCommittedMutationResponseError(cause)) {
             const committedRevisionFloor = currentRevision + 1;
             preserveRevisionFloor(committedRevisionFloor);
             invalidateRevision();
             setSaveError(INVALID_MUTATION_RESPONSE_MESSAGE);
             resetCellInputAfterLoad(resetKey);
             await recoverRevision({ minimumRevision: committedRevisionFloor });
+            return null;
+          }
+          // A non-JSON 2xx response may have come from an intermediary that
+          // never applied the mutation. Reload without inventing a committed
+          // revision floor, which would reject the unchanged table forever.
+          if (cause instanceof SuccessfulApiResponseError) {
+            invalidateRevision();
+            setSaveError(SAVE_FAILED_MESSAGE);
+            resetCellInputAfterLoad(resetKey);
+            await recoverRevision({ minimumRevision: currentRevision });
             return null;
           }
           if (cause instanceof ApiClientError && cause.code === "table_revision_conflict") {
