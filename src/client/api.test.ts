@@ -12,13 +12,25 @@ import {
 
 afterEach(() => vi.unstubAllGlobals());
 
-function unreadableResponse(cause: unknown, init?: ResponseInit) {
+function responseAt(url: string, body: BodyInit | null, init?: ResponseInit) {
+  const response = new Response(body, init);
+  Object.defineProperty(response, "url", { value: url });
+  return response;
+}
+
+function unreadableResponseAt(url: string, cause: unknown, init?: ResponseInit) {
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       controller.error(cause);
     },
   });
-  return new Response(body, init);
+  return responseAt(url, body, init);
+}
+
+function silenceApiResponseReport() {
+  const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  onTestFinished(() => reported.mockRestore());
+  return reported;
 }
 
 describe("api", () => {
@@ -61,12 +73,18 @@ describe("api", () => {
   });
 
   it("normalizes nested and malformed error responses", async () => {
+    const reported = silenceApiResponseReport();
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ error: { code: "forbidden", message: "No access." } }), { status: 403 }),
       )
-      .mockResolvedValueOnce(new Response("not-json", { status: 502 }));
+      .mockResolvedValueOnce(
+        responseAt("https://example.test/proxy-error", "not-json", {
+          status: 502,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+      );
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(api("/api/private")).rejects.toEqual(
@@ -79,15 +97,22 @@ describe("api", () => {
       status: 502,
       code: "request_failed",
       message: "Request failed (502).",
+      requestPath: "/api/upstream",
+      responseUrl: "https://example.test/proxy-error",
+      contentType: "text/html; charset=utf-8",
+      responseBodyFailure: "parse",
+      cause: expect.any(SyntaxError),
     });
+    expect(reported).toHaveBeenCalledWith("API response could not be processed", error);
   });
 
   it("uses the fallback when an error-response body cannot be read", async () => {
+    const reported = silenceApiResponseReport();
     const bodyError = new TypeError("The response stream terminated.");
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
-        unreadableResponse(bodyError, {
+        unreadableResponseAt("https://example.test/upstream", bodyError, {
           status: 502,
           headers: { "content-type": "application/problem+json" },
         }),
@@ -101,7 +126,13 @@ describe("api", () => {
       status: 502,
       code: "request_failed",
       message: "Request failed (502).",
+      requestPath: "/api/upstream",
+      responseUrl: "https://example.test/upstream",
+      contentType: "application/problem+json",
+      responseBodyFailure: "read",
+      cause: bodyError,
     });
+    expect(reported).toHaveBeenCalledWith("API response could not be processed", error);
   });
 
   it("treats an empty error-response body as an absent payload", async () => {
@@ -115,22 +146,23 @@ describe("api", () => {
   });
 
   it("classifies malformed successful responses by media type", async () => {
+    const reported = silenceApiResponseReport();
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
-        new Response("not-json", {
+        responseAt("https://example.test/api/json", "not-json", {
           status: 201,
           headers: { "content-type": "application/json; charset=utf-8" },
         }),
       )
       .mockResolvedValueOnce(
-        new Response("not-json", {
+        responseAt("https://example.test/login", "not-json", {
           status: 200,
           headers: { "content-type": "text/html; charset=utf-8" },
         }),
       )
       .mockResolvedValueOnce(
-        new Response("not-json", {
+        responseAt("https://example.test/api/problem", "not-json", {
           status: 200,
           headers: { "content-type": "APPLICATION/PROBLEM+JSON; charset=utf-8" },
         }),
@@ -145,15 +177,33 @@ describe("api", () => {
     expect(jsonError).toMatchObject({
       status: 201,
       hasJsonContentType: true,
+      requestPath: "/api/json",
+      responseUrl: "https://example.test/api/json",
+      contentType: "application/json; charset=utf-8",
       cause: expect.any(SyntaxError),
     });
-    expect(htmlError).toMatchObject({ status: 200, hasJsonContentType: false });
-    expect(problemJsonError).toMatchObject({ status: 200, hasJsonContentType: true });
+    expect(htmlError).toMatchObject({
+      status: 200,
+      hasJsonContentType: false,
+      requestPath: "/api/html",
+      responseUrl: "https://example.test/login",
+      contentType: "text/html; charset=utf-8",
+      message: "The server returned an unexpected non-JSON response.",
+    });
+    expect(problemJsonError).toMatchObject({
+      status: 200,
+      hasJsonContentType: true,
+      requestPath: "/api/problem",
+      responseUrl: "https://example.test/api/problem",
+      contentType: "APPLICATION/PROBLEM+JSON; charset=utf-8",
+    });
+    expect(reported).toHaveBeenCalledTimes(3);
   });
 
   it("preserves successful response body read failures", async () => {
+    const reported = silenceApiResponseReport();
     const bodyError = new DOMException("The operation timed out.", "TimeoutError");
-    const response = unreadableResponse(bodyError, {
+    const response = unreadableResponseAt("https://example.test/api/example?view=summary", bodyError, {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -165,8 +215,12 @@ describe("api", () => {
     expect(error).toMatchObject({
       status: 200,
       hasJsonContentType: true,
+      requestPath: "/api/example?view=summary",
+      responseUrl: "https://example.test/api/example?view=summary",
+      contentType: "application/json",
       cause: bodyError,
     });
+    expect(reported).toHaveBeenCalledWith("API response could not be processed", error);
   });
 
   it("normalizes API error codes and messages and replaces blank values", async () => {
