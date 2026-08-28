@@ -1975,7 +1975,7 @@ describe("Worker integration", () => {
     ).toBe(0);
   });
 
-  it("treats archiving an already archived subtree as an idempotent success", async () => {
+  it("returns the complete success envelope when archiving an already archived subtree", async () => {
     const installed = await bootstrap();
     const child = await createPage(installed.cookie, "document", installed.pageId);
     const archive = () =>
@@ -1987,16 +1987,32 @@ describe("Worker integration", () => {
 
     const first = await archive();
     expect(first.status).toBe(200);
-    expect(await first.json()).toMatchObject({
+    const firstBody = await first.json<{
+      ok: boolean;
+      pageIds: string[];
+      cleanupPending: boolean;
+      pendingPageIds: string[];
+    }>();
+    expect({ ...firstBody, pageIds: [...firstBody.pageIds].sort() }).toEqual({
       ok: true,
-      pageIds: expect.arrayContaining([installed.pageId, child.id]),
+      pageIds: [installed.pageId, child.id].sort(),
+      cleanupPending: false,
+      pendingPageIds: [],
     });
 
     const repeated = await archive();
     expect(repeated.status).toBe(200);
-    expect(await repeated.json()).toMatchObject({
+    const repeatedBody = await repeated.json<{
+      ok: boolean;
+      pageIds: string[];
+      cleanupPending: boolean;
+      pendingPageIds: string[];
+    }>();
+    expect({ ...repeatedBody, pageIds: [...repeatedBody.pageIds].sort() }).toEqual({
       ok: true,
-      pageIds: expect.arrayContaining([installed.pageId, child.id]),
+      pageIds: [installed.pageId, child.id].sort(),
+      cleanupPending: false,
+      pendingPageIds: [],
     });
   });
 

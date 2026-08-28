@@ -11,7 +11,14 @@ import type {
   TableLeaseTiming,
   TableRow,
 } from "../shared/types";
-import { ApiClientError, api, apiErrorMessage, isSuccessfulJsonResponseBodyError, json } from "./api";
+import {
+  ApiClientError,
+  api,
+  apiErrorMessage,
+  isPageNotFoundError,
+  isSuccessfulJsonResponseBodyError,
+  json,
+} from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { errorMessageKey } from "./error-messages";
 
@@ -297,12 +304,6 @@ function isNonRetryableLeaseRenewalError(cause: unknown): cause is ApiClientErro
 
 function shouldReleaseLeaseAfterRenewalFailure(cause: unknown) {
   return !(cause instanceof ApiClientError) || (cause.status !== 401 && cause.status !== 409);
-}
-
-// The table's page was archived or deleted underneath this view. Terminal for
-// the component: nothing it could request would succeed afterwards.
-function isPageUnavailableError(cause: unknown): cause is ApiClientError {
-  return cause instanceof ApiClientError && cause.code === "page_not_found";
 }
 
 function isDefinitiveMutationRejection(cause: unknown): cause is ApiClientError {
@@ -758,7 +759,7 @@ export function TablePage({
             retryStaleRevision,
           });
         }
-        if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
+        if (mountedRef.current && generation === loadGenerationRef.current && isPageNotFoundError(cause)) {
           // Terminal even when the effect that issued this load is gone, but only
           // while no newer load superseded it: a stale page_not_found can belong
           // to a page that was archived and has since been restored, and whatever
@@ -927,7 +928,7 @@ export function TablePage({
             retryStaleRevision,
           });
         }
-        if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
+        if (mountedRef.current && generation === loadGenerationRef.current && isPageNotFoundError(cause)) {
           markPageUnavailable(cause);
         } else if (!isCurrent()) {
           return tableLoadResult("superseded", { failure: { cause } });
@@ -1106,7 +1107,7 @@ export function TablePage({
       // Pagination can be the request that discovers the page is gone, and its
       // rejection is swallowed by the click handler; latch the terminal state here
       // under the same currency rule as load.
-      if (mountedRef.current && generation === loadGenerationRef.current && isPageUnavailableError(cause)) {
+      if (mountedRef.current && generation === loadGenerationRef.current && isPageNotFoundError(cause)) {
         markPageUnavailable(cause);
       }
       throw cause;
@@ -1237,7 +1238,7 @@ export function TablePage({
           // Renewal is the only request an idle editor keeps making, so it is
           // usually where an archived table is first noticed. Clearing the
           // lease here turns every caller's lease-ending fallback into a no-op.
-          if (isPageUnavailableError(cause)) markPageUnavailable(cause);
+          if (isPageNotFoundError(cause)) markPageUnavailable(cause);
           throw cause;
         },
       );
@@ -1326,7 +1327,7 @@ export function TablePage({
         }
       } catch (cause) {
         if (!isCurrent()) return;
-        if (isPageUnavailableError(cause)) {
+        if (isPageNotFoundError(cause)) {
           markPageUnavailable(cause);
           return;
         }
@@ -1808,7 +1809,7 @@ export function TablePage({
           // Terminal whichever lease the request carried, so it outranks the
           // lease-identity check: a 404 that lands after the local lease
           // expired must still stop polling instead of reading as lease loss.
-          if (isPageUnavailableError(cause)) {
+          if (isPageNotFoundError(cause)) {
             markPageUnavailable(cause);
             return null;
           }
