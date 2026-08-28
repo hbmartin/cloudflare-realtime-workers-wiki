@@ -1975,6 +1975,31 @@ describe("Worker integration", () => {
     ).toBe(0);
   });
 
+  it("treats archiving an already archived subtree as an idempotent success", async () => {
+    const installed = await bootstrap();
+    const child = await createPage(installed.cookie, "document", installed.pageId);
+    const archive = () =>
+      SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+          method: "DELETE",
+        }),
+      );
+
+    const first = await archive();
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({
+      ok: true,
+      pageIds: expect.arrayContaining([installed.pageId, child.id]),
+    });
+
+    const repeated = await archive();
+    expect(repeated.status).toBe(200);
+    expect(await repeated.json()).toMatchObject({
+      ok: true,
+      pageIds: expect.arrayContaining([installed.pageId, child.id]),
+    });
+  });
+
   it("returns authoritative pages when restoring an archived subtree", async () => {
     const installed = await bootstrap();
     const child = await createPage(installed.cookie, "document", installed.pageId);

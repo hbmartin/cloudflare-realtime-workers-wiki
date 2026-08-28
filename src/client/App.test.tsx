@@ -485,11 +485,18 @@ describe("App error handling", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
-    expect(reported).toHaveBeenCalledWith("Successful mutation response could not be validated", validationFailure);
+    expect(reported).toHaveBeenCalledWith("Successful mutation response could not be validated", {
+      requestPath: `/api/pages/${page.id}`,
+      method: "DELETE",
+      error: validationFailure,
+    });
     await act(async () => {
       reconciliation.resolve({ pages: [] });
       await reconciliation.promise;
     });
+    expect(
+      screen.queryByText("The server returned an invalid archive response. Refreshing the page tree."),
+    ).not.toBeInTheDocument();
   });
 
   it("does not clear a newer archive failure for another page", async () => {
@@ -646,8 +653,10 @@ describe("App error handling", () => {
     expect(treeLoads).toBe(1);
   });
 
-  it("reconciles a page_not_found archive rejection and removes the stale page", async () => {
+  it("reconciles a page_not_found after permanent deletion without resurfacing stale data", async () => {
+    const reconciliation = deferred<{ pages: Page[] }>();
     let treeLoads = 0;
+    let trashLoads = 0;
     vi.stubGlobal(
       "confirm",
       vi.fn(() => true),
@@ -658,7 +667,11 @@ describe("App error handling", () => {
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return { pages: treeLoads === 1 ? [page] : [] };
+        return treeLoads === 1 ? { pages: [page] } : reconciliation.promise;
+      }
+      if (path === "/api/pages/tree?archived=true") {
+        trashLoads += 1;
+        return { pages: [] };
       }
       if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
         throw new ApiClientError(404, "page_not_found", "Page not found.");
@@ -667,12 +680,21 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    const archive = await screen.findByRole("button", { name: "Archive Roadmap" });
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    await waitFor(() => expect(trashLoads).toBe(1));
+    fireEvent.click(archive);
 
     await waitFor(() => expect(treeLoads).toBe(2));
+    await waitFor(() => expect(trashLoads).toBe(2));
     expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
     expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+    await act(async () => {
+      reconciliation.resolve({ pages: [page] });
+      await reconciliation.promise;
+    });
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
   });
 
   it("lets the user dismiss a scoped archive error", async () => {

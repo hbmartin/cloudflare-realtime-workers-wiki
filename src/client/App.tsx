@@ -128,7 +128,11 @@ async function requestMutation<T>(
   try {
     return { kind: "committed", value: parse(value) };
   } catch (error) {
-    console.error("Successful mutation response could not be validated", error);
+    console.error("Successful mutation response could not be validated", {
+      requestPath: path,
+      method: init.method ?? "GET",
+      error,
+    });
     return { kind: "committed", value: null };
   }
 }
@@ -676,36 +680,37 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const attempt = startScopedWorkspaceErrorAttempt("archive", errorScope);
     try {
       const knownPageIds = pageSubtreeIds(pages, page.id);
-      let archiveFailed = false;
-      let removedIds: ReadonlySet<string> | null = null;
       const result = await requestMutation(`/api/pages/${page.id}`, { method: "DELETE" }, (value) =>
         archivePageIds(value, page.id),
       );
+      const pageAlreadyGone =
+        result.kind === "rejected" && result.error.status === 404 && result.error.code === "page_not_found";
+      const removedIds =
+        result.kind === "committed"
+          ? new Set(result.value ?? knownPageIds)
+          : pageAlreadyGone
+            ? new Set(knownPageIds)
+            : null;
       if (result.kind === "committed") {
         if (!result.value) {
           reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
         }
-        const committedRemovedIds = new Set(result.value ?? knownPageIds);
-        removedIds = committedRemovedIds;
-        recordPageRemovals([...committedRemovedIds]);
-        for (const pageId of committedRemovedIds) invalidatePagePreview(pageId);
-        setPages((current) => current.filter((candidate) => !committedRemovedIds.has(candidate.id)));
-        refreshTrash();
-      } else {
-        archiveFailed = true;
-        const pageAlreadyGone =
-          result.kind === "rejected" && result.error.status === 404 && result.error.code === "page_not_found";
+      } else if (!pageAlreadyGone) {
         const archiveError =
-          result.kind === "uncertain" && result.error instanceof SuccessfulApiResponseError
+          result.error instanceof SuccessfulApiResponseError
             ? "The archive response could not be verified. Refreshing the page tree."
             : apiErrorMessage(result.error, "The page could not be archived.");
         reportWorkspaceError(attempt, archiveError);
-        if (result.kind === "uncertain" || pageAlreadyGone) {
-          for (const pageId of knownPageIds) invalidatePagePreview(pageId);
-        }
       }
-      const needsReconciliation =
-        result.kind !== "rejected" || (result.error.status === 404 && result.error.code === "page_not_found");
+      if (removedIds) {
+        recordPageRemovals([...removedIds]);
+        for (const pageId of removedIds) invalidatePagePreview(pageId);
+        setPages((current) => current.filter((candidate) => !removedIds.has(candidate.id)));
+        refreshTrash();
+      } else if (result.kind === "uncertain") {
+        for (const pageId of knownPageIds) invalidatePagePreview(pageId);
+      }
+      const needsReconciliation = result.kind !== "rejected" || pageAlreadyGone;
       if (!needsReconciliation) return;
       const pendingPageLoad = pageLoadPromise.current;
       if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
@@ -715,7 +720,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         await reconciliation;
       } catch (error) {
         const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
-        if (archiveFailed) console.error("Page tree could not be refreshed after an archive failure", error);
+        if (result.kind !== "committed")
+          console.error("Page tree could not be refreshed after an archive failure", error);
         reportWorkspaceError({ source: "page-tree" }, refreshError);
       }
     } finally {

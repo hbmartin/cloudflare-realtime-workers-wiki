@@ -16,6 +16,8 @@
     "forceConsistentCasingInFileNames": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    // The Node-based Notion importer loads shared TypeScript modules directly,
+    // so their runtime imports need explicit .ts extensions for ESM resolution.
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
