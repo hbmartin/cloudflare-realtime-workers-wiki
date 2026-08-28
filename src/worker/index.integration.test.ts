@@ -2002,6 +2002,10 @@ describe("Worker integration", () => {
         expect.objectContaining({ id: child.id, archivedAt: null }),
       ]),
     );
+    const indexed = await env.DB.prepare(`SELECT page_id FROM page_search WHERE page_id IN (?, ?) ORDER BY page_id`)
+      .bind(installed.pageId, child.id)
+      .all<{ page_id: string }>();
+    expect(indexed.results.map((item) => item.page_id)).toEqual([installed.pageId, child.id].sort());
     await waitOnExecutionContext(restoreContext);
   });
 

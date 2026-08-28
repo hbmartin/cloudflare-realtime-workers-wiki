@@ -8,9 +8,9 @@ import {
   api,
   apiErrorMessage,
   authClient,
+  isSuccessfulJsonResponseBodyError,
   json,
   onApiUnauthorized,
-  SuccessfulApiResponseError,
 } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
@@ -27,7 +27,7 @@ type AppState =
   | { screen: "workspace"; member: ClientMemberContext };
 
 type WorkspaceErrorSource = "archive" | "mentions" | "page-access" | "page-tree" | "trash-load" | "trash-mutation";
-type WorkspaceError = { source: WorkspaceErrorSource; message: string; scope?: string };
+type WorkspaceError = { source: WorkspaceErrorSource; message: string; scope: string | undefined };
 
 function updateWorkspaceErrors(
   current: WorkspaceError[],
@@ -51,7 +51,7 @@ function updateWorkspaceErrors(
         ? current
         : current.filter((error) => error.source !== source)
       : current.filter((error) => error.source !== source || error.scope !== scope);
-  return [...retained, { source, message: next, ...(scope === undefined ? {} : { scope }) }];
+  return [...retained, { source, message: next, scope }];
 }
 
 function formatErrorMessages(errors: WorkspaceError[]) {
@@ -88,15 +88,24 @@ function restoreResponsePages(value: unknown, rootPageId: string, workspaceId: s
   return pages;
 }
 
-async function requestPageRestore(rootPageId: string, workspaceId: string) {
+type MutationRequestResult<T> = { kind: "committed"; value: T | null } | { kind: "failed"; error: unknown };
+
+async function requestMutation<T>(
+  path: string,
+  init: RequestInit,
+  parse: (value: unknown) => T | null,
+): Promise<MutationRequestResult<T>> {
   try {
-    const result = await api<unknown>(`/api/pages/${rootPageId}/restore`, { method: "POST" });
-    return { kind: "committed" as const, pages: restoreResponsePages(result, rootPageId, workspaceId) };
+    return { kind: "committed", value: parse(await api<unknown>(path, init)) };
   } catch (error) {
-    return error instanceof SuccessfulApiResponseError
-      ? { kind: "committed" as const, pages: null }
-      : { kind: "failed" as const, error };
+    return isSuccessfulJsonResponseBodyError(error) ? { kind: "committed", value: null } : { kind: "failed", error };
   }
+}
+
+function requestPageRestore(rootPageId: string, workspaceId: string) {
+  return requestMutation(`/api/pages/${rootPageId}/restore`, { method: "POST" }, (value) =>
+    restoreResponsePages(value, rootPageId, workspaceId),
+  );
 }
 
 function pageSubtreeIds(pages: Page[], rootPageId: string) {
@@ -378,6 +387,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     promise: Promise<void>;
   } | null>(null);
   const trashMutationIdsRef = useRef(new Set<string>());
+  const trashMutationAttemptRef = useRef(0);
+  const latestTrashMutationAttemptRef = useRef(new Map<string, number>());
 
   const reportWorkspaceError = useCallback((source: WorkspaceErrorSource, message: string, scope?: string) => {
     setWorkspaceErrors((current) => updateWorkspaceErrors(current, source, message, scope));
@@ -440,16 +451,23 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }, [clearWorkspaceErrors]);
   const loadTrash = useCallback(
     (version: number) => {
-      const current = trashLoadRequest.current;
-      if (current?.version === version) return current.promise;
-      current?.controller.abort();
+      const activeRequest = trashLoadRequest.current;
+      if (activeRequest?.version === version) return activeRequest.promise;
+      activeRequest?.controller.abort();
       const controller = new AbortController();
       const request = { version, controller, promise: Promise.resolve() };
       setTrashLoading(true);
       const loading = api<{ pages: Page[] }>("/api/pages/tree?archived=true", { signal: controller.signal })
         .then((data) => {
           if (controller.signal.aborted) return;
+          const pageIds = new Set(data.pages.map((page) => page.id));
           setTrash(data.pages);
+          setWorkspaceErrors((current) => {
+            const next = current.filter(
+              (error) => error.source !== "trash-mutation" || error.scope === undefined || pageIds.has(error.scope),
+            );
+            return next.length === current.length ? current : next;
+          });
           clearWorkspaceErrors("trash-load");
         })
         .catch((error) => {
@@ -574,28 +592,21 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
     clearWorkspaceErrors("archive");
     const knownPageIds = pageSubtreeIds(pages, page.id);
-    let archivedPageIds: string[] | null = null;
     let archiveError: string | null = null;
-    let archiveCommitted = false;
-    try {
-      const result = await api<unknown>(`/api/pages/${page.id}`, { method: "DELETE" });
-      archiveCommitted = true;
-      archivedPageIds = archivePageIds(result, page.id);
-      if (!archivedPageIds) {
+    const result = await requestMutation(`/api/pages/${page.id}`, { method: "DELETE" }, (value) =>
+      archivePageIds(value, page.id),
+    );
+    if (result.kind === "committed") {
+      if (!result.value) {
         reportWorkspaceError("archive", "The server returned an invalid archive response. Refreshing the page tree.");
       }
-    } catch (error) {
-      if (error instanceof SuccessfulApiResponseError) {
-        archiveCommitted = true;
-        reportWorkspaceError("archive", "The server returned an invalid archive response. Refreshing the page tree.");
-      } else {
-        archiveError = apiErrorMessage(error, "The page could not be archived.");
-        reportWorkspaceError("archive", archiveError);
-      }
+    } else {
+      archiveError = apiErrorMessage(result.error, "The page could not be archived.");
+      reportWorkspaceError("archive", archiveError);
     }
     const reconciliation = loadPages();
-    if (archiveCommitted) {
-      const removedIds = new Set(archivedPageIds ?? knownPageIds);
+    if (result.kind === "committed") {
+      const removedIds = new Set(result.value ?? knownPageIds);
       recordPageRemovals([...removedIds]);
       for (const pageId of removedIds) invalidatePagePreview(pageId);
       setPages((current) => current.filter((candidate) => !removedIds.has(candidate.id)));
@@ -603,7 +614,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     }
     try {
       await reconciliation;
-      if (archiveCommitted && !archivedPageIds) clearWorkspaceErrors("archive");
+      if (result.kind === "committed" && !result.value) clearWorkspaceErrors("archive");
     } catch (error) {
       const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
       if (archiveError) console.error("Page tree could not be refreshed after an archive failure", error);
@@ -686,11 +697,22 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     for (const pageId of pageIds) trashMutationIdsRef.current.delete(pageId);
     setPendingTrashMutationIds(new Set(trashMutationIdsRef.current));
   }
+  function startTrashMutationAttempt(errorScope: string) {
+    const attempt = ++trashMutationAttemptRef.current;
+    latestTrashMutationAttemptRef.current.set(errorScope, attempt);
+    clearWorkspaceErrors("trash-mutation", errorScope);
+    return attempt;
+  }
+  function finishTrashMutationAttempt(errorScope: string, attempt: number) {
+    if (latestTrashMutationAttemptRef.current.get(errorScope) === attempt) {
+      latestTrashMutationAttemptRef.current.delete(errorScope);
+    }
+  }
   async function restorePage(page: Page) {
     const knownPageIds = pageSubtreeIds(trash, page.id);
     if (!beginTrashMutation(knownPageIds)) return;
     const errorScope = page.id;
-    clearWorkspaceErrors("trash-mutation", errorScope);
+    const attempt = startTrashMutationAttempt(errorScope);
     let result: Awaited<ReturnType<typeof requestPageRestore>>;
     try {
       result = await requestPageRestore(page.id, member.workspace.id);
@@ -702,37 +724,44 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         );
         for (const pageId of knownPageIds) invalidatePagePreview(pageId);
       } else {
-        if (!result.pages) {
+        if (!result.value) {
           reportWorkspaceError(
             "trash-mutation",
             "The server returned an invalid restore response. Refreshing pages.",
             errorScope,
           );
         }
-        const restoredIds = new Set(result.pages?.map((restored) => restored.id) ?? knownPageIds);
-        if (result.pages) {
-          const restoredPages = result.pages;
+        const restoredIds = new Set(result.value?.map((restored) => restored.id) ?? knownPageIds);
+        if (result.value) {
+          const restoredPages = result.value;
           recordPageUpserts(restoredPages);
           setPages((current) => mergePages(current, restoredPages));
         }
-        for (const pageId of result.pages ? restoredIds : knownPageIds) invalidatePagePreview(pageId);
+        for (const pageId of result.value ? restoredIds : knownPageIds) invalidatePagePreview(pageId);
         setTrash((current) => current.filter((candidate) => !restoredIds.has(candidate.id)));
       }
       refreshTrash();
     } finally {
       endTrashMutation(knownPageIds);
     }
-    const needsFreshPageLoad = result.kind === "failed" || result.pages === null;
+    const needsFreshPageLoad = result.kind === "failed" || result.value === null;
     if (needsFreshPageLoad) {
       const pendingPageLoad = pageLoadPromise.current;
       if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
     }
     try {
       await loadPages();
-      if (result.kind === "committed" && !result.pages) clearWorkspaceErrors("trash-mutation", errorScope);
+      if (
+        result.kind === "committed" &&
+        !result.value &&
+        latestTrashMutationAttemptRef.current.get(errorScope) === attempt
+      ) {
+        clearWorkspaceErrors("trash-mutation", errorScope);
+      }
     } catch (error) {
       reportWorkspaceError("page-tree", apiErrorMessage(error, "The page tree could not be refreshed."));
     }
+    finishTrashMutationAttempt(errorScope, attempt);
   }
   async function permanentlyDeletePage(page: Page) {
     const knownPageIds = pageSubtreeIds(trash, page.id);
@@ -740,32 +769,33 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!confirm(`Permanently delete “${page.title}”? This cannot be undone.`)) return;
     if (!beginTrashMutation(knownPageIds)) return;
     const errorScope = page.id;
-    clearWorkspaceErrors("trash-mutation", errorScope);
+    const attempt = startTrashMutationAttempt(errorScope);
     try {
-      const result = await api<unknown>(`/api/pages/${page.id}/permanent-delete`, { method: "POST" });
-      const deletedIds = new Set(archivePageIds(result, page.id) ?? knownPageIds);
-      for (const pageId of deletedIds) invalidatePagePreview(pageId);
-      setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
-      refreshTrash();
-    } catch (error) {
-      if (error instanceof SuccessfulApiResponseError) {
-        for (const pageId of knownPageIds) invalidatePagePreview(pageId);
-        setTrash((current) => current.filter((candidate) => !knownPageIds.includes(candidate.id)));
-        reportWorkspaceError(
-          "trash-mutation",
-          "The server returned an invalid permanent-delete response. Refreshing trash.",
-          errorScope,
-        );
+      const result = await requestMutation(`/api/pages/${page.id}/permanent-delete`, { method: "POST" }, (value) =>
+        archivePageIds(value, page.id),
+      );
+      if (result.kind === "committed") {
+        const deletedIds = new Set(result.value ?? knownPageIds);
+        for (const pageId of deletedIds) invalidatePagePreview(pageId);
+        setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
+        if (!result.value) {
+          reportWorkspaceError(
+            "trash-mutation",
+            "The server returned an invalid permanent-delete response. Refreshing trash.",
+            errorScope,
+          );
+        }
       } else {
         reportWorkspaceError(
           "trash-mutation",
-          apiErrorMessage(error, "The page could not be permanently deleted."),
+          apiErrorMessage(result.error, "The page could not be permanently deleted."),
           errorScope,
         );
       }
       refreshTrash();
     } finally {
       endTrashMutation(knownPageIds);
+      finishTrashMutationAttempt(errorScope, attempt);
     }
   }
 

@@ -11,7 +11,7 @@ import type {
   TableLeaseTiming,
   TableRow,
 } from "../shared/types";
-import { ApiClientError, api, apiErrorMessage, json, SuccessfulApiResponseError } from "./api";
+import { ApiClientError, api, apiErrorMessage, isSuccessfulJsonResponseBodyError, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { errorMessageKey } from "./error-messages";
 
@@ -288,7 +288,7 @@ function uniqueTableNotices(notices: Array<TableNotice | null>) {
 
 function isCommittedMutationResponseError(cause: unknown) {
   if (cause instanceof InvalidMutationResponseError) return true;
-  return cause instanceof SuccessfulApiResponseError;
+  return isSuccessfulJsonResponseBodyError(cause);
 }
 
 function isNonRetryableLeaseRenewalError(cause: unknown): cause is ApiClientError {

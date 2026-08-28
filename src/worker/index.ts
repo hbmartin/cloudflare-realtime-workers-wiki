@@ -51,7 +51,14 @@ import {
   role,
   text,
 } from "../shared/validation";
-import type { ClientMemberContext, Page, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
+import type {
+  ClientMemberContext,
+  Page,
+  PageKind,
+  TableLeaseResponse,
+  TableLeaseTiming,
+  WorkspaceEvent,
+} from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
@@ -68,7 +75,7 @@ type PageRow = {
   id: string;
   workspace_id: string;
   parent_id: string | null;
-  kind: "document" | "table";
+  kind: PageKind;
   position: string;
   title: string;
   icon: string | null;
@@ -873,7 +880,7 @@ app.delete("/api/pages/:id", async (c) => {
      ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
   )
     .bind(page.id)
-    .all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
+    .all<{ id: string; kind: PageKind; content_epoch: number }>();
   const pageIds = archived.results.map((item) => item.id);
   const documents = archived.results.filter((item) => item.kind === "document");
   sendWorkspaceEvent(c, member.workspace.id, {
@@ -903,7 +910,13 @@ app.post("/api/pages/:id/restore", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
-  const restoreResults = await c.env.DB.batch([
+  const restoredSnapshotStatement = c.env.DB.prepare(
+    `SELECT * FROM pages WHERE id IN (
+      WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
+      SELECT id FROM subtree
+    )`,
+  ).bind(page.id);
+  const restoreResults = await c.env.DB.batch<PageRow>([
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
@@ -934,14 +947,16 @@ app.post("/api/pages/:id/restore", async (c) => {
     ).bind(page.id),
     // Read the restored snapshot in the same transaction as the update so a
     // concurrent archive cannot turn a successful response back into Trash data.
-    c.env.DB.prepare(
-      `SELECT * FROM pages WHERE id IN (
-        WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
-        SELECT id FROM subtree
-      )`,
-    ).bind(page.id),
+    restoredSnapshotStatement,
   ]);
-  const restored = restoreResults[4] as D1Result<PageRow>;
+  const restored = restoreResults.at(-1);
+  if (
+    !restored ||
+    !restored.results.some((item) => item.id === page.id) ||
+    restored.results.some((item) => item.archived_at !== null)
+  ) {
+    throw new Error("The restore batch did not return its authoritative page snapshot.");
+  }
   const restoredPages = restored.results.map(pageJson);
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-upserted",

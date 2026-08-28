@@ -7,6 +7,7 @@ import {
   apiErrorMessage,
   EmptyApiResponseError,
   InvalidApiResponseError,
+  isSuccessfulJsonResponseBodyError,
   json,
   onApiUnauthorized,
   UnreadableApiResponseError,
@@ -331,6 +332,30 @@ describe("api", () => {
       contentType: "APPLICATION/PROBLEM+JSON; charset=utf-8",
     });
     expect(reported).toHaveBeenCalledTimes(3);
+  });
+
+  it("uses the JSON response contract as evidence that a successful mutation reached the API", () => {
+    const jsonError = new UnreadableApiResponseError(200, {
+      requestPath: "/api/example",
+      responseUrl: null,
+      contentType: "application/json",
+      cause: new TypeError("The response stream terminated."),
+    });
+    const htmlError = new InvalidApiResponseError(200, {
+      requestPath: "/api/example",
+      responseUrl: null,
+      contentType: "text/html",
+      cause: new SyntaxError("Unexpected token '<'"),
+    });
+    const untypedEmptyError = new EmptyApiResponseError(204, {
+      requestPath: "/api/example",
+      responseUrl: null,
+      contentType: null,
+    });
+
+    expect(isSuccessfulJsonResponseBodyError(jsonError)).toBe(true);
+    expect(isSuccessfulJsonResponseBodyError(htmlError)).toBe(false);
+    expect(isSuccessfulJsonResponseBodyError(untypedEmptyError)).toBe(false);
   });
 
   it("preserves successful response body read failures", async () => {
