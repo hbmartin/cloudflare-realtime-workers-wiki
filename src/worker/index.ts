@@ -105,6 +105,16 @@ function pageJson(row: PageRow): Page {
   };
 }
 
+async function batchWithFinalResult<T>(
+  database: D1Database,
+  statements: D1PreparedStatement[],
+  finalStatement: D1PreparedStatement,
+) {
+  const finalResultIndex = statements.length;
+  const results = await database.batch<T>([...statements, finalStatement]);
+  return results[finalResultIndex];
+}
+
 function sendWorkspaceEvent(
   c: { env: Env; executionCtx: { waitUntil(promise: Promise<unknown>): void } },
   workspaceId: string,
@@ -916,40 +926,42 @@ app.post("/api/pages/:id/restore", async (c) => {
       SELECT id FROM subtree
     )`,
   ).bind(page.id);
-  const restoreResults = await c.env.DB.batch([
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
+  const restored = await batchWithFinalResult<PageRow>(
+    c.env.DB,
+    [
+      c.env.DB.prepare(
+        `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) UPDATE pages SET archived_at = NULL, archived_by = NULL, updated_at = ? WHERE id IN subtree`,
-    ).bind(page.id, member.workspace.id, now()),
-    c.env.DB.prepare(
-      `DELETE FROM archive_disconnect_targets WHERE page_id IN (
+      ).bind(page.id, member.workspace.id, now()),
+      c.env.DB.prepare(
+        `DELETE FROM archive_disconnect_targets WHERE page_id IN (
          WITH RECURSIVE subtree(id) AS (
            SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
          ) SELECT id FROM subtree
        )`,
-    ).bind(page.id),
-    c.env.DB.prepare(
-      `DELETE FROM page_search WHERE page_id IN (
+      ).bind(page.id),
+      c.env.DB.prepare(
+        `DELETE FROM page_search WHERE page_id IN (
          WITH RECURSIVE subtree(id) AS (
            SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
          ) SELECT id FROM subtree
        )`,
-    ).bind(page.id),
-    c.env.DB.prepare(
-      `INSERT INTO page_search (page_id, workspace_id, title, body)
+      ).bind(page.id),
+      c.env.DB.prepare(
+        `INSERT INTO page_search (page_id, workspace_id, title, body)
        SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages WHERE id IN (
          WITH RECURSIVE subtree(id) AS (
            SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
          ) SELECT id FROM subtree
        )`,
-    ).bind(page.id),
-    // Read the restored snapshot in the same transaction as the update so a
-    // concurrent archive cannot turn a successful response back into Trash data.
+      ).bind(page.id),
+    ],
+    // Read the restored snapshot in the same transaction as the update. Keeping
+    // this as the helper's final statement also pins the typed result to this query.
     restoredSnapshotStatement,
-  ]);
-  const restored = restoreResults.at(-1) as D1Result<PageRow> | undefined;
+  );
   if (
     !restored ||
     !restored.results.some((item) => item.id === page.id) ||

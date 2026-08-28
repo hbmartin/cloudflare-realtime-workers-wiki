@@ -285,7 +285,7 @@ describe("App error handling", () => {
       if (path === "/api/pages/tree") {
         treeLoads += 1;
         if (treeLoads === 1) return { pages: [page] };
-        return treeLoads === 2 ? staleReload.promise : { pages: [] };
+        return treeLoads === 2 ? staleReload.promise : { pages: [page, child] };
       }
       if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
         return { ok: true, pageIds: [page.id, child.id] };
@@ -359,7 +359,7 @@ describe("App error handling", () => {
       if (path === "/api/pages/tree") {
         treeLoads += 1;
         if (treeLoads === 1) return { pages: [page, child] };
-        return treeLoads === 2 ? staleReload.promise : { pages: [] };
+        return treeLoads === 2 ? staleReload.promise : { pages: [page, child] };
       }
       if (path === `/api/pages/${page.id}` && init?.method === "DELETE") return { ok: true };
       throw new Error(`Unexpected API request: ${path}`);
@@ -446,52 +446,6 @@ describe("App error handling", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("treats an archive response-validator exception as a committed mutation", async () => {
-    const reconciliation = deferred<{ pages: Page[] }>();
-    const validationFailure = new TypeError("Archive response validation failed.");
-    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    onTestFinished(() => reported.mockRestore());
-    let treeLoads = 0;
-    vi.stubGlobal(
-      "confirm",
-      vi.fn(() => true),
-    );
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return treeLoads === 1 ? { pages: [page] } : reconciliation.promise;
-      }
-      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
-        return new Proxy(
-          {},
-          {
-            has() {
-              throw validationFailure;
-            },
-          },
-        );
-      }
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
-
-    expect(
-      await screen.findByText("The server returned an invalid archive response. Refreshing the page tree."),
-    ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
-    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
-    expect(reported).toHaveBeenCalledWith("Successful mutation response could not be validated", validationFailure);
-    await act(async () => {
-      reconciliation.resolve({ pages: [] });
-      await reconciliation.promise;
-    });
-  });
-
   it("does not clear a newer archive failure for another page", async () => {
     const secondPage = { ...page, id: "second-page", position: "a1", title: "Second" };
     const reconciliation = deferred<{ pages: Page[] }>();
@@ -557,7 +511,7 @@ describe("App error handling", () => {
         contentType: null,
       }),
     ],
-  ])("does not treat %s as a committed archive", async (_label, responseError) => {
+  ])("reports %s as an unverified archive response", async (_label, responseError) => {
     let treeLoads = 0;
     vi.stubGlobal(
       "confirm",
@@ -579,9 +533,87 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.getByText("The page could not be archived.")).toBeInTheDocument();
+    expect(
+      screen.getByText("The archive response could not be verified. Refreshing the page tree."),
+    ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+  });
+
+  it("clears an unverified archive response after reconciliation confirms removal", async () => {
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page] : [] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        throw new InvalidApiResponseError(200, {
+          requestPath: path,
+          responseUrl: null,
+          contentType: "text/html",
+          cause: new SyntaxError("Unexpected token '<'"),
+        });
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(screen.queryByText(/archive response could not be verified/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+  });
+
+  it("does not reload the tree after a definitive archive rejection", async () => {
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        throw new ApiClientError(422, "archive_rejected", "Archive rejected.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    expect(await screen.findByText("Archive rejected.")).toBeInTheDocument();
+    expect(treeLoads).toBe(1);
+  });
+
+  it("lets the user dismiss a scoped archive error", async () => {
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockWorkspaceApi(undefined, new ApiClientError(422, "archive_rejected", "Archive rejected."));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    expect(await screen.findByText("Archive rejected.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss workspace errors" }));
+
+    expect(screen.queryByText("Archive rejected.")).not.toBeInTheDocument();
   });
 
   it("starts a post-archive trash request instead of adopting an older load", async () => {
@@ -1338,6 +1370,39 @@ describe("App error handling", () => {
 
     expect(await screen.findByText("Access revoked.")).toBeInTheDocument();
     expect(screen.queryByText(/Tree refresh unavailable/)).not.toBeInTheDocument();
+  });
+
+  it("does not let an older mention-count response overwrite a newer count", async () => {
+    const olderCount = deferred<{ unreadCount: number }>();
+    const newerCount = deferred<{ unreadCount: number }>();
+    let mentionLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") {
+        mentionLoads += 1;
+        return mentionLoads === 1 ? olderCount.promise : newerCount.promise;
+      }
+      if (path === "/api/pages/tree") return { pages: [page] };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await waitFor(() => expect(mentionLoads).toBe(1));
+    reconnectWorkspace();
+    await waitFor(() => expect(mentionLoads).toBe(2));
+    await act(async () => {
+      newerCount.resolve({ unreadCount: 2 });
+      await newerCount.promise;
+    });
+    expect(screen.getByText("2")).toBeInTheDocument();
+
+    await act(async () => {
+      olderCount.resolve({ unreadCount: 9 });
+      await olderCount.promise;
+    });
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.queryByText("9")).not.toBeInTheDocument();
   });
 
   it("keeps an unrelated mentions error when an archive starts", async () => {
