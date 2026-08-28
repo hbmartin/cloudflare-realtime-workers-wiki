@@ -1,7 +1,5 @@
-import type { PageKind } from "./page-kind";
+import { PAGE_KINDS, type PageKind } from "./page-kind.ts";
 import type { ColumnType, Page, Role } from "./types";
-
-const PAGE_KINDS = ["document", "table"] as const satisfies readonly PageKind[];
 
 export class ValidationError extends Error {}
 
