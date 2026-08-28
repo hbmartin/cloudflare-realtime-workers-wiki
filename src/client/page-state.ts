@@ -44,6 +44,35 @@ export class PageLoadEventBuffer {
   }
 }
 
+/**
+ * Keeps archive removals applied across failed or stale tree loads. A tree load
+ * may confirm a removal only when it started after the removal was pinned.
+ */
+export class PageRemovalTombstones {
+  private readonly pinnedDuringLoad = new Map<string, number>();
+
+  pin(pageIds: Iterable<string>, currentLoadGeneration: number) {
+    for (const pageId of pageIds) {
+      const previousGeneration = this.pinnedDuringLoad.get(pageId) ?? -1;
+      this.pinnedDuringLoad.set(pageId, Math.max(previousGeneration, currentLoadGeneration));
+    }
+  }
+
+  release(pageIds: Iterable<string>) {
+    for (const pageId of pageIds) this.pinnedDuringLoad.delete(pageId);
+  }
+
+  reconcile(observedPageIds: ReadonlySet<string>, loadGeneration: number) {
+    const removals = new Set(this.pinnedDuringLoad.keys());
+    for (const [pageId, pinnedDuringLoad] of this.pinnedDuringLoad) {
+      if (loadGeneration > pinnedDuringLoad && !observedPageIds.has(pageId)) {
+        this.pinnedDuringLoad.delete(pageId);
+      }
+    }
+    return removals;
+  }
+}
+
 export function mergePages(current: Page[], incoming: Page[]) {
   const pages = new Map(current.map((page) => [page.id, page]));
   for (const page of incoming) {

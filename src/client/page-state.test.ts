@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { Page } from "../shared/types";
-import { authoritativePageSnapshot, mergePages, mergePageSnapshot, PageLoadEventBuffer } from "./page-state";
+import {
+  authoritativePageSnapshot,
+  mergePages,
+  mergePageSnapshot,
+  PageLoadEventBuffer,
+  PageRemovalTombstones,
+} from "./page-state";
 
 function page(id: string, revision: number, title = id): Page {
   return {
@@ -58,6 +64,25 @@ describe("page state reconciliation", () => {
       upserts: [page("retry-upsert", 2)],
       removals: new Set(),
     });
+  });
+
+  it("retains archive removals until a later load confirms they are absent", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["removed"], 2);
+
+    expect(tombstones.reconcile(new Set(), 2)).toEqual(new Set(["removed"]));
+    expect(tombstones.reconcile(new Set(["removed"]), 3)).toEqual(new Set(["removed"]));
+    expect(tombstones.reconcile(new Set(), 4)).toEqual(new Set(["removed"]));
+    expect(tombstones.reconcile(new Set(["removed"]), 5)).toEqual(new Set());
+  });
+
+  it("releases an archive removal when the page is explicitly restored", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["restored"], 1);
+
+    tombstones.release(["restored"]);
+
+    expect(tombstones.reconcile(new Set(["restored"]), 2)).toEqual(new Set());
   });
 
   it("computes the authoritative pages and ids once", () => {

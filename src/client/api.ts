@@ -50,6 +50,10 @@ export class ApiClientError extends Error {
   }
 }
 
+export function isPageNotFoundError(cause: unknown): cause is ApiClientError {
+  return cause instanceof ApiClientError && cause.status === 404 && cause.code === "page_not_found";
+}
+
 function isJsonContentType(contentType: string | null) {
   const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase();
   return mediaType === "application/json" || mediaType?.endsWith("+json") === true;

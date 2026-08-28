@@ -359,7 +359,7 @@ describe("App error handling", () => {
       if (path === "/api/pages/tree") {
         treeLoads += 1;
         if (treeLoads === 1) return { pages: [page, child] };
-        return treeLoads === 2 ? staleReload.promise : { pages: [page, child] };
+        return treeLoads === 2 ? staleReload.promise : { pages: [] };
       }
       if (path === `/api/pages/${page.id}` && init?.method === "DELETE") return { ok: true };
       throw new Error(`Unexpected API request: ${path}`);
@@ -387,6 +387,41 @@ describe("App error handling", () => {
     ).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(child.id);
+  });
+
+  it("keeps an invalid-response warning while the post-archive tree remains stale", async () => {
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads < 3 ? [page] : [] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") return { ok: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(
+      screen.getByText("The server returned an invalid archive response. Refreshing the page tree."),
+    ).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+
+    reconnectWorkspace();
+
+    await waitFor(() => expect(treeLoads).toBe(3));
+    expect(
+      screen.queryByText("The server returned an invalid archive response. Refreshing the page tree."),
+    ).not.toBeInTheDocument();
   });
 
   it.each([
@@ -626,6 +661,47 @@ describe("App error handling", () => {
     expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
   });
 
+  it("refreshes Trash when an uncertain archive is later confirmed", async () => {
+    const archivedPage = { ...page, archivedAt: 2 };
+    let treeLoads = 0;
+    let trashLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page] : [] };
+      }
+      if (path === "/api/pages/tree?archived=true") {
+        trashLoads += 1;
+        return { pages: trashLoads === 1 ? [] : [archivedPage] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        throw new InvalidApiResponseError(200, {
+          requestPath: path,
+          responseUrl: null,
+          contentType: "text/html",
+          cause: new SyntaxError("Unexpected token '<'"),
+        });
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const archive = await screen.findByRole("button", { name: "Archive Roadmap" });
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    await waitFor(() => expect(trashLoads).toBe(1));
+    fireEvent.click(archive);
+
+    await waitFor(() => expect(trashLoads).toBe(2));
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
+  });
+
   it("does not reload the tree after a definitive archive rejection", async () => {
     let treeLoads = 0;
     vi.stubGlobal(
@@ -653,7 +729,36 @@ describe("App error handling", () => {
     expect(treeLoads).toBe(1);
   });
 
-  it("reconciles a page_not_found after permanent deletion without resurfacing stale data", async () => {
+  it("reconciles a page_not_found when the server tree confirms the page is gone", async () => {
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page] : [] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        throw new ApiClientError(404, "page_not_found", "Page not found.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+  });
+
+  it("keeps a page_not_found removal pinned while reconciliation data is stale", async () => {
     const reconciliation = deferred<{ pages: Page[] }>();
     let treeLoads = 0;
     let trashLoads = 0;
@@ -695,6 +800,45 @@ describe("App error handling", () => {
       await reconciliation.promise;
     });
     expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
+  });
+
+  it("keeps a page_not_found removal through a failed reconciliation and stale retry", async () => {
+    const failedReconciliation = deferred<{ pages: Page[] }>();
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        return treeLoads === 2 ? failedReconciliation.promise : { pages: [page] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        throw new ApiClientError(404, "page_not_found", "Page not found.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    await act(async () => {
+      failedReconciliation.reject(new ApiClientError(503, "tree_unavailable", "Tree unavailable."));
+      await failedReconciliation.promise.catch(() => undefined);
+    });
+
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    reconnectWorkspace();
+
+    await waitFor(() => expect(treeLoads).toBe(3));
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
   });
 
   it("lets the user dismiss a scoped archive error", async () => {
@@ -1533,7 +1677,7 @@ describe("App error handling", () => {
     expect(screen.getByText("Mention count unavailable.")).toBeInTheDocument();
   });
 
-  it("reports both an archive failure and a failed reconciliation refresh", async () => {
+  it("reports both an unverified archive and a failed reconciliation refresh", async () => {
     const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => reported.mockRestore());
     vi.stubGlobal(
@@ -1550,7 +1694,7 @@ describe("App error handling", () => {
 
     expect(await screen.findByText("Archive service unavailable. Tree refresh unavailable.")).toBeInTheDocument();
     expect(reported).toHaveBeenCalledWith(
-      "Page tree could not be refreshed after an archive failure",
+      "Page tree could not be refreshed after an unverified archive",
       expect.any(ApiClientError),
     );
   });
