@@ -110,6 +110,8 @@ async function batchWithFinalResult<T>(
   statements: D1PreparedStatement[],
   finalStatement: D1PreparedStatement,
 ) {
+  // D1 applies the caller-supplied row type to the whole batch; this helper only
+  // selects the result at the position occupied by finalStatement.
   const finalResultIndex = statements.length;
   const results = await database.batch<T>([...statements, finalStatement]);
   return results[finalResultIndex];
@@ -958,8 +960,7 @@ app.post("/api/pages/:id/restore", async (c) => {
        )`,
       ).bind(page.id),
     ],
-    // Read the restored snapshot in the same transaction as the update. Keeping
-    // this as the helper's final statement also pins the typed result to this query.
+    // Read the restored snapshot in the same transaction as the update.
     restoredSnapshotStatement,
   );
   if (

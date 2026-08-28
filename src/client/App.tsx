@@ -106,7 +106,10 @@ function restoreResponsePages(value: unknown, rootPageId: string, workspaceId: s
   return pages;
 }
 
-type MutationRequestResult<T> = { kind: "committed"; value: T | null } | { kind: "failed"; error: unknown };
+type MutationRequestResult<T> =
+  | { kind: "committed"; value: T | null }
+  | { kind: "rejected"; error: ApiClientError }
+  | { kind: "uncertain"; error: unknown };
 
 async function requestMutation<T>(
   path: string,
@@ -117,9 +120,17 @@ async function requestMutation<T>(
   try {
     value = await api<unknown>(path, init);
   } catch (error) {
-    return isSuccessfulJsonResponseBodyError(error) ? { kind: "committed", value: null } : { kind: "failed", error };
+    if (isSuccessfulJsonResponseBodyError(error)) return { kind: "committed", value: null };
+    return error instanceof ApiClientError && error.status >= 400 && error.status < 500
+      ? { kind: "rejected", error }
+      : { kind: "uncertain", error };
   }
-  return { kind: "committed", value: parse(value) };
+  try {
+    return { kind: "committed", value: parse(value) };
+  } catch (error) {
+    console.error("Successful mutation response could not be validated", error);
+    return { kind: "committed", value: null };
+  }
 }
 
 function requestPageRestore(rootPageId: string, workspaceId: string) {
@@ -400,7 +411,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [trashLoading, setTrashLoading] = useState(false);
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
-  const pageLoadPromise = useRef<Promise<ReadonlySet<string>> | null>(null);
+  const pageLoadPromise = useRef<Promise<void> | null>(null);
   const trashLoadRequest = useRef<{
     version: number;
     controller: AbortController;
@@ -496,7 +507,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         setSelectedId((current) =>
           current && authoritative.ids.has(current) ? current : ([...authoritative.ids][0] ?? null),
         );
-        return authoritative.ids;
       })
       .catch((error) => {
         pendingPageEvents.current.cancel();
@@ -664,53 +674,53 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
     const errorScope = page.id;
     const attempt = startScopedWorkspaceErrorAttempt("archive", errorScope);
-    const knownPageIds = pageSubtreeIds(pages, page.id);
-    let archiveError: string | null = null;
-    let removedIds: ReadonlySet<string> | null = null;
-    const result = await requestMutation(`/api/pages/${page.id}`, { method: "DELETE" }, (value) =>
-      archivePageIds(value, page.id),
-    );
-    if (result.kind === "committed") {
-      if (!result.value) {
-        reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
-      }
-    } else {
-      const responseIsAmbiguous = result.error instanceof SuccessfulApiResponseError;
-      archiveError = responseIsAmbiguous
-        ? "The archive response could not be verified. Refreshing the page tree."
-        : apiErrorMessage(result.error, "The page could not be archived.");
-      reportWorkspaceError(attempt, archiveError);
-      if (responseIsAmbiguous) {
-        for (const pageId of knownPageIds) invalidatePagePreview(pageId);
-      }
-    }
-    if (result.kind === "committed") {
-      const committedRemovedIds = new Set(result.value ?? knownPageIds);
-      removedIds = committedRemovedIds;
-      recordPageRemovals([...committedRemovedIds]);
-      for (const pageId of committedRemovedIds) invalidatePagePreview(pageId);
-      setPages((current) => current.filter((candidate) => !committedRemovedIds.has(candidate.id)));
-      refreshTrash();
-    }
-    const needsReconciliation =
-      result.kind === "committed" ||
-      !(result.error instanceof ApiClientError && result.error.status >= 400 && result.error.status < 500);
-    if (!needsReconciliation) {
-      finishWorkspaceErrorAttempt(attempt);
-      return;
-    }
-    const pendingPageLoad = pageLoadPromise.current;
-    if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
-    const reconciliation = loadPages();
-    if (removedIds) recordPageRemovals([...removedIds]);
     try {
-      await reconciliation;
-    } catch (error) {
-      const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
-      if (archiveError) console.error("Page tree could not be refreshed after an archive failure", error);
-      reportWorkspaceError({ source: "page-tree" }, refreshError);
+      const knownPageIds = pageSubtreeIds(pages, page.id);
+      let archiveFailed = false;
+      let removedIds: ReadonlySet<string> | null = null;
+      const result = await requestMutation(`/api/pages/${page.id}`, { method: "DELETE" }, (value) =>
+        archivePageIds(value, page.id),
+      );
+      if (result.kind === "committed") {
+        if (!result.value) {
+          reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
+        }
+        const committedRemovedIds = new Set(result.value ?? knownPageIds);
+        removedIds = committedRemovedIds;
+        recordPageRemovals([...committedRemovedIds]);
+        for (const pageId of committedRemovedIds) invalidatePagePreview(pageId);
+        setPages((current) => current.filter((candidate) => !committedRemovedIds.has(candidate.id)));
+        refreshTrash();
+      } else {
+        archiveFailed = true;
+        const pageAlreadyGone =
+          result.kind === "rejected" && result.error.status === 404 && result.error.code === "page_not_found";
+        const archiveError =
+          result.kind === "uncertain" && result.error instanceof SuccessfulApiResponseError
+            ? "The archive response could not be verified. Refreshing the page tree."
+            : apiErrorMessage(result.error, "The page could not be archived.");
+        reportWorkspaceError(attempt, archiveError);
+        if (result.kind === "uncertain" || pageAlreadyGone) {
+          for (const pageId of knownPageIds) invalidatePagePreview(pageId);
+        }
+      }
+      const needsReconciliation =
+        result.kind !== "rejected" || (result.error.status === 404 && result.error.code === "page_not_found");
+      if (!needsReconciliation) return;
+      const pendingPageLoad = pageLoadPromise.current;
+      if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
+      const reconciliation = loadPages();
+      if (removedIds) recordPageRemovals([...removedIds]);
+      try {
+        await reconciliation;
+      } catch (error) {
+        const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
+        if (archiveFailed) console.error("Page tree could not be refreshed after an archive failure", error);
+        reportWorkspaceError({ source: "page-tree" }, refreshError);
+      }
+    } finally {
+      finishWorkspaceErrorAttempt(attempt);
     }
-    finishWorkspaceErrorAttempt(attempt);
   }
   async function move(
     pageId: string,
@@ -796,7 +806,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     let result: Awaited<ReturnType<typeof requestPageRestore>>;
     try {
       result = await requestPageRestore(page.id, member.workspace.id);
-      if (result.kind === "failed") {
+      if (result.kind !== "committed") {
         reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be restored."));
         for (const pageId of knownPageIds) invalidatePagePreview(pageId);
       } else {
@@ -816,7 +826,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     } finally {
       endTrashMutation(knownPageIds);
     }
-    const needsFreshPageLoad = result.kind === "failed" || result.value === null;
+    const needsFreshPageLoad = result.kind !== "committed" || result.value === null;
     if (needsFreshPageLoad) {
       const pendingPageLoad = pageLoadPromise.current;
       if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
