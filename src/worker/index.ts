@@ -916,7 +916,7 @@ app.post("/api/pages/:id/restore", async (c) => {
       SELECT id FROM subtree
     )`,
   ).bind(page.id);
-  const restoreResults = await c.env.DB.batch<PageRow>([
+  const restoreResults = await c.env.DB.batch([
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
@@ -949,7 +949,7 @@ app.post("/api/pages/:id/restore", async (c) => {
     // concurrent archive cannot turn a successful response back into Trash data.
     restoredSnapshotStatement,
   ]);
-  const restored = restoreResults.at(-1);
+  const restored = restoreResults.at(-1) as D1Result<PageRow> | undefined;
   if (
     !restored ||
     !restored.results.some((item) => item.id === page.id) ||
