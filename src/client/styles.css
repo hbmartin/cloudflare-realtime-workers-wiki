@@ -202,6 +202,12 @@ select:focus-visible {
 .workspace-error-dismiss {
   border: 0;
   padding: 0;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
   color: inherit;
   background: transparent;
   cursor: pointer;

@@ -446,6 +446,52 @@ describe("App error handling", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("treats an archive response-validator exception as a committed mutation", async () => {
+    const reconciliation = deferred<{ pages: Page[] }>();
+    const validationFailure = new TypeError("Archive response validation failed.");
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return treeLoads === 1 ? { pages: [page] } : reconciliation.promise;
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        return new Proxy(
+          {},
+          {
+            has() {
+              throw validationFailure;
+            },
+          },
+        );
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    expect(
+      await screen.findByText("The server returned an invalid archive response. Refreshing the page tree."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+    expect(reported).toHaveBeenCalledWith("Successful mutation response could not be validated", validationFailure);
+    await act(async () => {
+      reconciliation.resolve({ pages: [] });
+      await reconciliation.promise;
+    });
+  });
+
   it("does not clear a newer archive failure for another page", async () => {
     const secondPage = { ...page, id: "second-page", position: "a1", title: "Second" };
     const reconciliation = deferred<{ pages: Page[] }>();
@@ -598,6 +644,35 @@ describe("App error handling", () => {
 
     expect(await screen.findByText("Archive rejected.")).toBeInTheDocument();
     expect(treeLoads).toBe(1);
+  });
+
+  it("reconciles a page_not_found archive rejection and removes the stale page", async () => {
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page] : [] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        throw new ApiClientError(404, "page_not_found", "Page not found.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
   });
 
   it("lets the user dismiss a scoped archive error", async () => {
