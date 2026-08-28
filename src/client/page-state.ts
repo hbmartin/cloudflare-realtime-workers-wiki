@@ -49,27 +49,53 @@ export class PageLoadEventBuffer {
  * may confirm a removal only when it started after the removal was pinned.
  */
 export class PageRemovalTombstones {
-  private readonly pinnedDuringLoad = new Map<string, number>();
+  private readonly entries = new Map<
+    string,
+    { pinnedDuringLoad: number; firstFreshPresenceGeneration: number | null }
+  >();
 
   pin(pageIds: Iterable<string>, currentLoadGeneration: number) {
     for (const pageId of pageIds) {
-      const previousGeneration = this.pinnedDuringLoad.get(pageId) ?? -1;
-      this.pinnedDuringLoad.set(pageId, Math.max(previousGeneration, currentLoadGeneration));
+      const previous = this.entries.get(pageId);
+      this.entries.set(pageId, {
+        pinnedDuringLoad: Math.max(previous?.pinnedDuringLoad ?? -1, currentLoadGeneration),
+        firstFreshPresenceGeneration: null,
+      });
     }
   }
 
   release(pageIds: Iterable<string>) {
-    for (const pageId of pageIds) this.pinnedDuringLoad.delete(pageId);
+    for (const pageId of pageIds) this.entries.delete(pageId);
   }
 
-  reconcile(observedPageIds: ReadonlySet<string>, loadGeneration: number) {
-    const removals = new Set(this.pinnedDuringLoad.keys());
-    for (const [pageId, pinnedDuringLoad] of this.pinnedDuringLoad) {
-      if (loadGeneration > pinnedDuringLoad && !observedPageIds.has(pageId)) {
-        this.pinnedDuringLoad.delete(pageId);
+  has(pageId: string) {
+    return this.entries.has(pageId);
+  }
+
+  /**
+   * Applies one tree-load observation and returns the ids that load must hide.
+   * One fresh load may still contain stale pre-removal data; repeated presence
+   * is treated as authoritative so an incorrect tombstone cannot live forever.
+   */
+  applyLoad(observedPageIds: ReadonlySet<string>, loadGeneration: number) {
+    const hiddenPageIds = new Set<string>();
+    for (const [pageId, entry] of this.entries) {
+      if (loadGeneration <= entry.pinnedDuringLoad) {
+        hiddenPageIds.add(pageId);
+        continue;
+      }
+      if (!observedPageIds.has(pageId)) {
+        this.entries.delete(pageId);
+        continue;
+      }
+      if (entry.firstFreshPresenceGeneration === null || loadGeneration <= entry.firstFreshPresenceGeneration) {
+        entry.firstFreshPresenceGeneration ??= loadGeneration;
+        hiddenPageIds.add(pageId);
+      } else {
+        this.entries.delete(pageId);
       }
     }
-    return removals;
+    return hiddenPageIds;
   }
 }
 
