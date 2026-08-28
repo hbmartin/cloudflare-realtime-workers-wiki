@@ -441,15 +441,6 @@ describe("App error handling", () => {
       }),
     ],
     [
-      "an unreadable JSON response",
-      new UnreadableApiResponseError(200, {
-        requestPath: `/api/pages/${page.id}`,
-        responseUrl: null,
-        contentType: "application/json",
-        cause: new TypeError("Body stream failed"),
-      }),
-    ],
-    [
       "a headerless empty response",
       new EmptyApiResponseError(204, {
         requestPath: `/api/pages/${page.id}`,
@@ -457,7 +448,7 @@ describe("App error handling", () => {
         contentType: null,
       }),
     ],
-  ])("treats %s as a committed archive", async (_label, responseError) => {
+  ])("does not treat %s as a committed archive", async (_label, responseError) => {
     let treeLoads = 0;
     vi.stubGlobal(
       "confirm",
@@ -479,9 +470,9 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.queryByText("The page could not be archived.")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
-    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+    expect(screen.getByText("The page could not be archived.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(mocks.invalidatePagePreview).not.toHaveBeenCalled();
   });
 
   it("starts a post-archive trash request instead of adopting an older load", async () => {
@@ -825,7 +816,7 @@ describe("App error handling", () => {
       }
       if (path === "/api/pages/tree?archived=true") {
         trashLoads += 1;
-        return { pages: trashLoads === 1 ? [archivedPage] : [] };
+        return { pages: [archivedPage] };
       }
       if (path === `/api/pages/${page.id}/restore` && init?.method === "POST") return { ok: true };
       throw new Error(`Unexpected API request: ${path}`);
@@ -848,6 +839,7 @@ describe("App error handling", () => {
     });
 
     await waitFor(() => expect(treeLoads).toBe(3));
+    expect(trashLoads).toBe(2);
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
     expect(
       screen.queryByText("The server returned an invalid restore response. Refreshing pages."),
@@ -992,7 +984,6 @@ describe("App error handling", () => {
     const deletedPage = { ...restoredPage, id: "delete-page", title: "Delete me" };
     const treeReload = deferred<{ pages: Page[] }>();
     let treeLoads = 0;
-    let trashLoads = 0;
     vi.stubGlobal(
       "confirm",
       vi.fn(() => true),
@@ -1006,8 +997,7 @@ describe("App error handling", () => {
         return treeLoads === 1 ? { pages: [] } : treeReload.promise;
       }
       if (path === "/api/pages/tree?archived=true") {
-        trashLoads += 1;
-        return { pages: trashLoads === 1 ? [restoredPage, deletedPage] : [deletedPage] };
+        return { pages: [restoredPage, deletedPage] };
       }
       if (path === `/api/pages/${page.id}/restore` && init?.method === "POST") return { ok: true };
       if (path === `/api/pages/${deletedPage.id}/permanent-delete` && init?.method === "POST") {
@@ -1021,7 +1011,9 @@ describe("App error handling", () => {
     const restoreButton = (await screen.findAllByRole("button", { name: "Restore" }))[0]!;
     fireEvent.click(restoreButton);
     expect(await screen.findByText(/invalid restore response/i)).toBeInTheDocument();
-    const deleteButton = await screen.findByRole("button", { name: "Delete forever" });
+    const deletedRow = screen.getByText("Delete me").parentElement;
+    const deleteButton = deletedRow?.querySelector("button.text-danger");
+    if (!(deleteButton instanceof HTMLButtonElement)) throw new TypeError("Delete button was not rendered.");
     await waitFor(() => expect(deleteButton).toBeEnabled());
     fireEvent.click(deleteButton);
 
@@ -1031,6 +1023,92 @@ describe("App error handling", () => {
     });
     expect(await screen.findByText("Deletion service unavailable.")).toBeInTheDocument();
     expect(screen.queryByText(/invalid restore response/i)).not.toBeInTheDocument();
+  });
+
+  it("does not clear a newer same-page failure after restore reconciliation", async () => {
+    const archivedPage = { ...page, archivedAt: 2 };
+    const staleTree = deferred<{ pages: Page[] }>();
+    let treeLoads = 0;
+    let restoreCalls = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [] };
+        return treeLoads === 2 ? staleTree.promise : { pages: [] };
+      }
+      if (path === "/api/pages/tree?archived=true") return { pages: [archivedPage] };
+      if (path === `/api/pages/${page.id}/restore` && init?.method === "POST") {
+        restoreCalls += 1;
+        if (restoreCalls === 1) return { ok: true };
+        throw new ApiClientError(503, "restore_unavailable", "Newer restore failure.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await waitFor(() => expect(treeLoads).toBe(1));
+    reconnectWorkspace();
+    await waitFor(() => expect(treeLoads).toBe(2));
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
+    expect(await screen.findByText(/invalid restore response/i)).toBeInTheDocument();
+
+    const retry = await screen.findByRole("button", { name: "Restore" });
+    await waitFor(() => expect(retry).toBeEnabled());
+    fireEvent.click(retry);
+    expect(await screen.findByText("Newer restore failure.")).toBeInTheDocument();
+
+    await act(async () => {
+      staleTree.resolve({ pages: [] });
+      await staleTree.promise;
+    });
+    await waitFor(() => expect(treeLoads).toBe(3));
+    expect(screen.getByText("Newer restore failure.")).toBeInTheDocument();
+  });
+
+  it("clears an invalid permanent-delete response after trash confirms deletion", async () => {
+    const owner = { ...member, role: "owner" as const };
+    const archivedPage = { ...page, archivedAt: 2 };
+    const refreshedTrash = deferred<{ pages: Page[] }>();
+    let trashLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return owner;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [] };
+      if (path === "/api/pages/tree?archived=true") {
+        trashLoads += 1;
+        return trashLoads === 1 ? { pages: [archivedPage] } : refreshedTrash.promise;
+      }
+      if (path === `/api/pages/${page.id}/permanent-delete` && init?.method === "POST") {
+        throw new InvalidApiResponseError(200, {
+          requestPath: path,
+          responseUrl: null,
+          contentType: "application/json",
+          cause: new SyntaxError("Unexpected end of JSON input"),
+        });
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete forever" }));
+    expect(await screen.findByText(/invalid permanent-delete response/i)).toBeInTheDocument();
+
+    await act(async () => {
+      refreshedTrash.resolve({ pages: [] });
+      await refreshedTrash.promise;
+    });
+    expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
+    expect(screen.queryByText(/invalid permanent-delete response/i)).not.toBeInTheDocument();
   });
 
   it("guards permanent deletion and invalidates every deleted preview", async () => {
@@ -1073,8 +1151,9 @@ describe("App error handling", () => {
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(child.id);
   });
 
-  it("keeps a mutation error separate from a successful trash reload", async () => {
+  it("clears a scoped mutation error when refreshed trash no longer contains its row", async () => {
     const archivedPage = { ...page, archivedAt: 2 };
+    const refreshedTrash = deferred<{ pages: Page[] }>();
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
@@ -1083,7 +1162,7 @@ describe("App error handling", () => {
       if (path === "/api/pages/tree") return { pages: [] };
       if (path === "/api/pages/tree?archived=true") {
         trashLoads += 1;
-        return { pages: trashLoads === 1 ? [archivedPage] : [] };
+        return trashLoads === 1 ? { pages: [archivedPage] } : refreshedTrash.promise;
       }
       if (path === `/api/pages/${page.id}/restore` && init?.method === "POST") {
         throw new ApiClientError(503, "restore_unavailable", "Restore service unavailable.");
@@ -1095,10 +1174,13 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
     expect(await screen.findByText("Restore service unavailable.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
 
+    await act(async () => {
+      refreshedTrash.resolve({ pages: [] });
+      await refreshedTrash.promise;
+    });
     expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
-    expect(screen.getByText("Restore service unavailable.")).toBeInTheDocument();
+    expect(screen.queryByText("Restore service unavailable.")).not.toBeInTheDocument();
   });
 
   it("does not describe failed trash data as empty", async () => {

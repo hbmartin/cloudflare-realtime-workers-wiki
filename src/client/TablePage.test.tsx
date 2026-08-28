@@ -1316,28 +1316,6 @@ describe("TablePage", () => {
       },
     ],
     [
-      "contains malformed non-JSON",
-      () => {
-        throw new InvalidApiResponseError(200, {
-          requestPath: "/api/tables/table-page/cells/row/status",
-          responseUrl: null,
-          contentType: "text/html; charset=utf-8",
-          cause: new SyntaxError("Unexpected token '<'"),
-        });
-      },
-    ],
-    [
-      "has an unreadable non-JSON body",
-      () => {
-        throw new UnreadableApiResponseError(200, {
-          requestPath: "/api/tables/table-page/cells/row/status",
-          responseUrl: null,
-          contentType: "text/html; charset=utf-8",
-          cause: new TypeError("The response stream terminated."),
-        });
-      },
-    ],
-    [
       "has an unreadable JSON body",
       () => {
         throw new UnreadableApiResponseError(200, {
@@ -1345,16 +1323,6 @@ describe("TablePage", () => {
           responseUrl: null,
           contentType: "application/json",
           cause: new TypeError("The response stream terminated."),
-        });
-      },
-    ],
-    [
-      "is empty without a content-type header",
-      () => {
-        throw new EmptyApiResponseError(204, {
-          requestPath: "/api/tables/table-page/cells/row/status",
-          responseUrl: null,
-          contentType: null,
         });
       },
     ],
@@ -1397,6 +1365,66 @@ describe("TablePage", () => {
 
     const lastSave = vi.mocked(api).mock.calls.findLast(([, init]) => init?.method === "PUT");
     expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 2 });
+  });
+
+  it.each([
+    [
+      "a malformed non-JSON response",
+      () =>
+        new InvalidApiResponseError(200, {
+          requestPath: "/api/tables/table-page/cells/row/status",
+          responseUrl: null,
+          contentType: "text/html; charset=utf-8",
+          cause: new SyntaxError("Unexpected token '<'"),
+        }),
+    ],
+    [
+      "an unreadable non-JSON response",
+      () =>
+        new UnreadableApiResponseError(200, {
+          requestPath: "/api/tables/table-page/cells/row/status",
+          responseUrl: null,
+          contentType: "text/html; charset=utf-8",
+          cause: new TypeError("The response stream terminated."),
+        }),
+    ],
+    [
+      "an empty response without a content type",
+      () =>
+        new EmptyApiResponseError(204, {
+          requestPath: "/api/tables/table-page/cells/row/status",
+          responseUrl: null,
+          contentType: null,
+        }),
+    ],
+  ])("does not latch an unreachable revision after %s", async (_case, responseError) => {
+    let loads = 0;
+    let mutations = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      if (path.includes("/cells/")) {
+        mutations += 1;
+        if (mutations === 1) throw responseError();
+        return { revision: 2 };
+      }
+      loads += 1;
+      return { table: tableWithTwoTextCells(1) };
+    });
+    await renderActiveEditor();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Unconfirmed" } });
+    fireEvent.blur(input);
+
+    expect(await screen.findByText("The table update could not be saved.")).toBeInTheDocument();
+    await waitFor(() => expect(loads).toBe(3));
+
+    const recoveredInput = screen.getByDisplayValue("Ready");
+    fireEvent.change(recoveredInput, { target: { value: "Retried" } });
+    fireEvent.blur(recoveredInput);
+    await waitFor(() => expect(mutations).toBe(2));
+
+    const lastSave = vi.mocked(api).mock.calls.findLast(([, init]) => init?.method === "PUT");
+    expect(JSON.parse(String(lastSave?.[1]?.body))).toMatchObject({ expectedRevision: 1 });
   });
 
   it("reloads the table when a mutation target no longer exists", async () => {

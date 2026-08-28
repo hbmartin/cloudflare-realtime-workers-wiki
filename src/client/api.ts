@@ -56,6 +56,7 @@ function isJsonContentType(contentType: string | null) {
 }
 
 /** A 2xx response whose body could not be decoded into the API contract. */
+// fallow-ignore-next-line unused-export -- public base of exported response errors and classifier
 export abstract class SuccessfulApiResponseError extends Error {
   readonly hasJsonContentType: boolean;
   readonly requestPath: string;
@@ -103,6 +104,10 @@ export class EmptyApiResponseError extends SuccessfulApiResponseError {
     super(status, diagnostics, "empty");
     this.name = "EmptyApiResponseError";
   }
+}
+
+export function isSuccessfulJsonResponseBodyError(cause: unknown): cause is SuccessfulApiResponseError {
+  return cause instanceof SuccessfulApiResponseError && cause.hasJsonContentType;
 }
 
 export type UnauthorizedHandler = (error: ApiClientError) => void;
