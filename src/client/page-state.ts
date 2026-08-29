@@ -59,6 +59,8 @@ export class PageRemovalTombstones {
   pin(pageIds: Iterable<string>, currentLoadGeneration: number) {
     let pinGeneration: number | null = null;
     for (const pageId of pageIds) {
+      const previous = this.entries.get(pageId);
+      if (previous && currentLoadGeneration < previous.pinnedDuringLoad) continue;
       pinGeneration ??= ++this.latestPinGeneration;
       this.entries.set(pageId, {
         pinnedDuringLoad: currentLoadGeneration,

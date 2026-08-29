@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   invalidatePagePreview: vi.fn(),
   signInEmail: vi.fn(),
   signOut: vi.fn(),
+  waitForReconciliationRetry: vi.fn(),
 }));
 
 vi.mock("./api", async (importOriginal) => {
@@ -34,6 +35,10 @@ vi.mock("./collaboration", () => ({ createWorkspaceEvents: mocks.createWorkspace
 vi.mock("./mentions", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./mentions")>()),
   invalidatePagePreview: mocks.invalidatePagePreview,
+}));
+vi.mock("./retry", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./retry")>()),
+  waitForReconciliationRetry: mocks.waitForReconciliationRetry,
 }));
 
 vi.mock("./EditorPage", () => ({
@@ -130,6 +135,8 @@ describe("App error handling", () => {
     mocks.invalidatePagePreview.mockReset();
     mocks.signInEmail.mockReset();
     mocks.signOut.mockReset();
+    mocks.waitForReconciliationRetry.mockReset();
+    mocks.waitForReconciliationRetry.mockResolvedValue(undefined);
   });
 
   afterEach(() => vi.unstubAllGlobals());
@@ -1134,7 +1141,6 @@ describe("App error handling", () => {
   });
 
   it("does not let a late upsert bypass a permanent-removal tombstone", async () => {
-    const cleanup = deferred<{ pages: Page[] }>();
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
@@ -1142,7 +1148,7 @@ describe("App error handling", () => {
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return treeLoads === 1 ? { pages: [page] } : cleanup.promise;
+        return { pages: [page] };
       }
       throw new Error(`Unexpected API request: ${path}`);
     });
@@ -1154,19 +1160,11 @@ describe("App error handling", () => {
 
     expect(screen.queryByRole("button", { name: "Archive Late rename" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
-    await waitFor(() => expect(treeLoads).toBe(2));
-    await act(async () => {
-      cleanup.resolve({ pages: [] });
-      await cleanup.promise;
-    });
-    expect(treeLoads).toBe(2);
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(treeLoads).toBe(1);
+    expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
   });
 
   it("does not let an out-of-order restored event release a newer removal", async () => {
-    const finalConfirmation = deferred<{ page: Page }>();
-    const archivedPage = { ...page, archivedAt: 2 };
-    let confirmationLoads = 0;
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
@@ -1174,11 +1172,7 @@ describe("App error handling", () => {
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return { pages: [page] };
-      }
-      if (path === `/api/pages/${page.id}`) {
-        confirmationLoads += 1;
-        return confirmationLoads === 1 ? { page: archivedPage } : finalConfirmation.promise;
+        return { pages: treeLoads === 1 ? [page] : [] };
       }
       if (path === "/api/pages/tree?archived=true") return { pages: [] };
       throw new Error(`Unexpected API request: ${path}`);
@@ -1189,32 +1183,24 @@ describe("App error handling", () => {
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
 
-    await waitFor(() => expect(confirmationLoads).toBe(2));
-    await act(async () => {
-      finalConfirmation.resolve({ page: archivedPage });
-      await finalConfirmation.promise;
-    });
-    expect(treeLoads).toBe(1);
-    expect(confirmationLoads).toBe(2);
+    await waitFor(() => expect(treeLoads).toBe(3));
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
     expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
   });
 
-  it("restores a remote page when the first confirmation still reports it archived", async () => {
-    const finalConfirmation = deferred<{ page: Page }>();
-    const archivedPage = { ...page, archivedAt: 2 };
-    let confirmationLoads = 0;
+  it("restores a remote page when the first confirming tree still omits it", async () => {
+    const finalConfirmation = deferred<{ pages: Page[] }>();
+    const retryDelay = deferred<void>();
     let treeLoads = 0;
+    mocks.waitForReconciliationRetry.mockReturnValueOnce(retryDelay.promise);
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return { pages: [page] };
-      }
-      if (path === `/api/pages/${page.id}`) {
-        confirmationLoads += 1;
-        return confirmationLoads === 1 ? { page: archivedPage } : finalConfirmation.promise;
+        if (treeLoads === 1) return { pages: [page] };
+        return treeLoads === 2 ? { pages: [] } : finalConfirmation.promise;
       }
       if (path === "/api/pages/tree?archived=true") return { pages: [] };
       throw new Error(`Unexpected API request: ${path}`);
@@ -1225,18 +1211,23 @@ describe("App error handling", () => {
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
 
-    await waitFor(() => expect(confirmationLoads).toBe(2));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(treeLoads).toBe(2);
     await act(async () => {
-      finalConfirmation.resolve({ page });
+      retryDelay.resolve();
+      await retryDelay.promise;
+    });
+    await waitFor(() => expect(treeLoads).toBe(3));
+    await act(async () => {
+      finalConfirmation.resolve({ pages: [page] });
       await finalConfirmation.promise;
     });
-    expect(treeLoads).toBe(1);
-    expect(confirmationLoads).toBe(2);
+    expect(treeLoads).toBe(3);
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
   });
 
-  it("confirms a remote restore without reloading the full page tree", async () => {
-    let confirmationLoads = 0;
+  it("confirms every restored page from the full page tree", async () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
@@ -1245,10 +1236,6 @@ describe("App error handling", () => {
       if (path === "/api/pages/tree") {
         treeLoads += 1;
         return { pages: [page] };
-      }
-      if (path === `/api/pages/${page.id}`) {
-        confirmationLoads += 1;
-        return { page };
       }
       if (path === "/api/pages/tree?archived=true") return { pages: [] };
       throw new Error(`Unexpected API request: ${path}`);
@@ -1260,8 +1247,33 @@ describe("App error handling", () => {
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
 
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-    expect(treeLoads).toBe(1);
-    expect(confirmationLoads).toBe(1);
+    expect(treeLoads).toBe(2);
+    expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
+  });
+
+  it("does not release a restored descendant omitted from the confirming tree", async () => {
+    const child = { ...page, id: "child-page", parentId: page.id, position: "a1", title: "Child" };
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page, child] : [page] };
+      }
+      if (path === "/api/pages/tree?archived=true") return { pages: [] };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Archive Child" })).toBeInTheDocument();
+    act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id, child.id], permanently: false }));
+    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page, child], restored: true }));
+
+    await waitFor(() => expect(treeLoads).toBe(3));
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Archive Child" })).not.toBeInTheDocument();
   });
 
   it.each<[string, WorkspaceEvent]>([
@@ -1747,7 +1759,7 @@ describe("App error handling", () => {
     expect(treeLoads).toBe(3);
   });
 
-  it("does not release restored descendants when the fresh tree omits the root", async () => {
+  it("does not pin an observed descendant when the confirming tree omits the root", async () => {
     const child = { ...page, id: "child-page", parentId: page.id, position: "a1", title: "Child" };
     const archivedPage = { ...page, archivedAt: 2 };
     let treeLoads = 0;
@@ -1781,7 +1793,7 @@ describe("App error handling", () => {
 
     await waitFor(() => expect(treeLoads).toBe(4));
     expect(treeLoads).toBe(4);
-    expect(screen.queryByRole("button", { name: "Archive Child" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Archive Child" })).toBeInTheDocument();
   });
 
   it("starts a fresh page load after a legacy restore response and an older load", async () => {

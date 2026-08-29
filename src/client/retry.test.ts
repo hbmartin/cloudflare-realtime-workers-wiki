@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { connectionRetryDelay } from "./retry";
+import { connectionRetryDelay, reconciliationRetryDelay } from "./retry";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -17,5 +17,16 @@ describe("connectionRetryDelay", () => {
 
     expect(connectionRetryDelay(attempt)).toBe(ceiling / 2);
     expect(connectionRetryDelay(attempt)).toBe(ceiling);
+  });
+});
+
+describe("reconciliationRetryDelay", () => {
+  it("uses equal jitter before retrying a stale read", () => {
+    vi.spyOn(Math, "random")
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(1 - Number.EPSILON);
+
+    expect(reconciliationRetryDelay()).toBe(500);
+    expect(reconciliationRetryDelay()).toBe(1_000);
   });
 });
