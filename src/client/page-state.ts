@@ -59,8 +59,6 @@ export class PageRemovalTombstones {
   pin(pageIds: Iterable<string>, currentLoadGeneration: number) {
     let pinGeneration: number | null = null;
     for (const pageId of pageIds) {
-      const previous = this.entries.get(pageId);
-      if (previous && currentLoadGeneration < previous.pinnedDuringLoad) continue;
       pinGeneration ??= ++this.latestPinGeneration;
       this.entries.set(pageId, {
         pinnedDuringLoad: currentLoadGeneration,
@@ -73,6 +71,10 @@ export class PageRemovalTombstones {
   /** Captures which removals existed before an operation started. */
   checkpoint() {
     return this.latestPinGeneration;
+  }
+
+  pageIdsPinnedAfter(checkpoint: number) {
+    return new Set([...this.entries].filter(([, entry]) => entry.pinGeneration > checkpoint).map(([pageId]) => pageId));
   }
 
   /** Releases only removals that are no newer than the supplied checkpoint. */
@@ -122,11 +124,15 @@ export class PageRemovalTombstones {
 
 export function mergePages(current: Page[], incoming: Page[]) {
   const pages = new Map(current.map((page) => [page.id, page]));
+  let changed = false;
   for (const page of incoming) {
     const previous = pages.get(page.id);
-    if (!previous || page.revision >= previous.revision) pages.set(page.id, page);
+    if (!previous || (page.revision >= previous.revision && previous !== page)) {
+      pages.set(page.id, page);
+      changed = true;
+    }
   }
-  return [...pages.values()];
+  return changed ? [...pages.values()] : current;
 }
 
 export function mergePageSnapshot(current: Page[], snapshot: Page[]) {

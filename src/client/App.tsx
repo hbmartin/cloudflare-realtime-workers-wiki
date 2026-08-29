@@ -172,10 +172,15 @@ function pageSubtreeIds(pages: Page[], rootPageId: string) {
   return pageIds;
 }
 
-async function reconcileWithOneRetry<T>(attempt: () => Promise<T>, needsRetry: (result: T) => boolean) {
+async function reconcileWithOneRetry<T>(
+  attempt: () => Promise<T>,
+  needsRetry: (result: T) => boolean,
+  signal?: AbortSignal,
+) {
   const first = await attempt();
-  if (!needsRetry(first)) return first;
-  await waitForReconciliationRetry();
+  if (signal?.aborted || !needsRetry(first)) return first;
+  await waitForReconciliationRetry(signal);
+  if (signal?.aborted) return first;
   return attempt();
 }
 
@@ -437,6 +442,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const [archiveRemovalTombstones] = useState(() => new PageRemovalTombstones());
+  const reconciliationAbortController = useRef<AbortController | null>(null);
   const pageLoadGeneration = useRef(0);
   const pageLoadPromise = useRef<Promise<{ serverPages: Page[]; removedDuringLoad: ReadonlySet<string> }> | null>(null);
   const trashLoadRequest = useRef<{
@@ -447,6 +453,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const trashMutationIdsRef = useRef(new Set<string>());
   const workspaceErrorAttemptRef = useRef(0);
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
+
+  useEffect(() => {
+    const controller = new AbortController();
+    reconciliationAbortController.current = controller;
+    return () => controller.abort();
+  }, []);
 
   const isCurrentWorkspaceErrorAttempt = useCallback((attempt: WorkspaceErrorAttempt) => {
     return latestWorkspaceErrorAttemptRef.current.get(workspaceErrorAttemptKey(attempt)) === attempt.generation;
@@ -562,10 +574,29 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       expectedPageIds: Iterable<string>,
       tombstoneCheckpoint: number,
       mutationWasCommitted: boolean,
+      releaseScope: "expected-pages" | "observed-subtree",
     ) => {
       const expectedIds = new Set(expectedPageIds);
+      const protectedPageIds = new Set<string>();
+      const signal = reconciliationAbortController.current?.signal;
       const observe = async () => {
+        for (const pageId of archiveRemovalTombstones.pageIdsPinnedAfter(tombstoneCheckpoint)) {
+          protectedPageIds.add(pageId);
+        }
         const { serverPages, removedDuringLoad } = await loadFreshPages();
+        for (const pageId of archiveRemovalTombstones.pageIdsPinnedAfter(tombstoneCheckpoint)) {
+          protectedPageIds.add(pageId);
+        }
+        for (const pageId of removedDuringLoad) protectedPageIds.add(pageId);
+        if (signal?.aborted) {
+          return {
+            rootWasObserved: false,
+            rootWasRestored: false,
+            expectedPagesWereRestored: false,
+            expectedPagesNeedRetry: false,
+            rootNeedsRetry: false,
+          };
+        }
         const serverPageIds = new Set(serverPages.map((candidate) => candidate.id));
         const rootWasObserved = !removedDuringLoad.has(rootPageId) && serverPageIds.has(rootPageId);
         const serverSubtreeIds = new Set(
@@ -574,37 +605,57 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             : [],
         );
         if (rootWasObserved) {
-          archiveRemovalTombstones.release(serverSubtreeIds, tombstoneCheckpoint);
-          const serverRestoredPages = serverPages.filter(
-            (candidate) => serverSubtreeIds.has(candidate.id) && !archiveRemovalTombstones.has(candidate.id),
+          const confirmedIds = new Set(
+            [...serverSubtreeIds].filter(
+              (pageId) =>
+                !protectedPageIds.has(pageId) && (releaseScope === "observed-subtree" || expectedIds.has(pageId)),
+            ),
           );
-          setPages((current) => mergePages(current, serverRestoredPages));
+          archiveRemovalTombstones.release(confirmedIds, tombstoneCheckpoint);
+          const serverRestoredPages = serverPages.filter(
+            (candidate) => confirmedIds.has(candidate.id) && !archiveRemovalTombstones.has(candidate.id),
+          );
+          if (serverRestoredPages.length) {
+            recordPageUpserts(serverRestoredPages);
+            setPages((current) => mergePages(current, serverRestoredPages));
+            const restoredIds = new Set(serverRestoredPages.map((page) => page.id));
+            setTrash((current) => {
+              const next = current.filter((page) => !restoredIds.has(page.id));
+              return next.length === current.length ? current : next;
+            });
+          }
         }
+        const expectedPageWasRestored = (pageId: string) =>
+          serverPageIds.has(pageId) &&
+          !removedDuringLoad.has(pageId) &&
+          !protectedPageIds.has(pageId) &&
+          !archiveRemovalTombstones.has(pageId);
+        const rootWasRestored = rootWasObserved && expectedPageWasRestored(rootPageId);
+        const expectedPagesWereRestored = [...expectedIds].every(expectedPageWasRestored);
         return {
           rootWasObserved,
-          rootWasRestored: rootWasObserved && !archiveRemovalTombstones.has(rootPageId),
-          expectedPagesWereRestored: [...expectedIds].every(
-            (pageId) =>
-              serverPageIds.has(pageId) && !removedDuringLoad.has(pageId) && !archiveRemovalTombstones.has(pageId),
-          ),
+          rootWasRestored,
+          expectedPagesWereRestored,
+          expectedPagesNeedRetry:
+            !expectedPagesWereRestored &&
+            [...expectedIds].some((pageId) => !protectedPageIds.has(pageId) && !expectedPageWasRestored(pageId)),
+          rootNeedsRetry: rootWasObserved && !rootWasRestored && !protectedPageIds.has(rootPageId),
         };
       };
 
-      return reconcileWithOneRetry(observe, (observation) =>
-        mutationWasCommitted
-          ? !observation.expectedPagesWereRestored
-          : observation.rootWasObserved && !observation.rootWasRestored,
+      return reconcileWithOneRetry(
+        observe,
+        (observation) => (mutationWasCommitted ? observation.expectedPagesNeedRetry : observation.rootNeedsRetry),
+        signal,
       );
     },
-    [archiveRemovalTombstones, loadFreshPages],
+    [archiveRemovalTombstones, loadFreshPages, recordPageUpserts],
   );
   const reconcileRestoredEvent = useCallback(
     async (restoredPages: Page[], tombstoneCheckpoint: number) => {
       const root = restoredEventRoot(restoredPages);
       if (!root) {
-        await loadFreshPages();
-        await waitForReconciliationRetry();
-        await loadFreshPages();
+        await reconcileWithOneRetry(loadFreshPages, () => true, reconciliationAbortController.current?.signal);
         return;
       }
       await reconcileRestoredRoot(
@@ -612,6 +663,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         restoredPages.map((page) => page.id),
         tombstoneCheckpoint,
         true,
+        "expected-pages",
       );
     },
     [loadFreshPages, reconcileRestoredRoot],
@@ -969,6 +1021,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           confirmedRestoredPages?.map((restored) => restored.id) ?? knownPageIds,
           restoreTombstoneCheckpoint,
           result.kind === "committed",
+          result.kind === "committed" && result.value === null ? "observed-subtree" : "expected-pages",
         );
         if (result.kind === "committed" && !result.value && rootWasRestored) {
           clearWorkspaceErrors(attempt);
