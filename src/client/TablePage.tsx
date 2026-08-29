@@ -1807,7 +1807,7 @@ export function TablePage({
         } catch (cause) {
           if (!isMounted()) return null;
           // Terminal whichever lease the request carried, so it outranks the
-          // lease-identity check: a 404 that lands after the local lease
+          // lease-identity check: a page_not_found that lands after the local lease
           // expired must still stop polling instead of reading as lease loss.
           if (isPageNotFoundError(cause)) {
             markPageUnavailable(cause);

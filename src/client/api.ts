@@ -51,7 +51,9 @@ export class ApiClientError extends Error {
 }
 
 export function isPageNotFoundError(cause: unknown): cause is ApiClientError {
-  return cause instanceof ApiClientError && cause.code === "page_not_found";
+  return (
+    cause instanceof ApiClientError && cause.code === "page_not_found" && (cause.status === 404 || cause.status === 410)
+  );
 }
 
 export function isPageNotFoundResponse(cause: unknown): cause is ApiClientError {
