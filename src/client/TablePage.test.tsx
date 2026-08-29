@@ -1498,7 +1498,7 @@ describe("TablePage", () => {
     expect(screen.getByText("The table update was not saved because editing access was lost.")).toBeInTheDocument();
   });
 
-  it("uses the page-not-found code to stop polling even with a nonstandard status", async () => {
+  it.each([404, 410])("stops polling when a mutation reports page-not-found with status %i", async (status) => {
     vi.useFakeTimers();
     const onPageUnavailable = vi.fn();
     let loads = 0;
@@ -1506,7 +1506,7 @@ describe("TablePage", () => {
       if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
       if (path.endsWith("/lease") && init?.method === "DELETE") return { ok: true };
       if (path.includes("/cells/")) {
-        throw new ApiClientError(410, "page_not_found", "Request failed (410).", true);
+        throw new ApiClientError(status, "page_not_found", `Request failed (${status}).`, true);
       }
       loads += 1;
       return { table };
@@ -1529,7 +1529,7 @@ describe("TablePage", () => {
 
     expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
     expect(screen.getByText("This table is no longer available.")).toBeInTheDocument();
-    expect(screen.queryByText("Request failed (410).")).not.toBeInTheDocument();
+    expect(screen.queryByText(`Request failed (${status}).`)).not.toBeInTheDocument();
     expect(api).toHaveBeenCalledWith("/api/tables/table-page/lease", {
       method: "DELETE",
       body: JSON.stringify({ leaseToken: "lease-token" }),

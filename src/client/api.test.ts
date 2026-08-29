@@ -39,11 +39,12 @@ function silenceApiResponseReport() {
 }
 
 describe("api", () => {
-  it("distinguishes the page-not-found code from a canonical 404 response", () => {
+  it("accepts only supported page-not-found statuses and distinguishes the canonical 404 response", () => {
     const nonstandardStatus = new ApiClientError(410, "page_not_found", "Page not found.");
 
     expect(isPageNotFoundError(nonstandardStatus)).toBe(true);
     expect(isPageNotFoundResponse(nonstandardStatus)).toBe(false);
+    expect(isPageNotFoundError(new ApiClientError(500, "page_not_found", "Page not found."))).toBe(false);
     expect(isPageNotFoundResponse(new ApiClientError(404, "page_not_found", "Page not found."))).toBe(true);
   });
 

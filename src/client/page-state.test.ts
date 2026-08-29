@@ -72,7 +72,6 @@ describe("page state reconciliation", () => {
 
     expect(tombstones.applyLoad(new Set(["removed"]), 2)).toEqual(new Set(["removed"]));
     expect(tombstones.applyLoad(new Set(["removed"]), 3)).toEqual(new Set(["removed"]));
-    expect(tombstones.applyLoad(new Set(["removed"]), 3)).toEqual(new Set(["removed"]));
     expect(tombstones.applyLoad(new Set(["removed"]), 4)).toEqual(new Set());
     expect(tombstones.applyLoad(new Set(["removed"]), 4)).toEqual(new Set());
   });
@@ -81,8 +80,19 @@ describe("page state reconciliation", () => {
     const tombstones = new PageRemovalTombstones();
     tombstones.pin(["removed"], 1);
 
-    expect(tombstones.applyLoad(new Set(), 2)).toEqual(new Set());
+    expect(tombstones.applyLoad(new Set(), 2)).toEqual(new Set(["removed"]));
     expect(tombstones.has("removed")).toBe(false);
+    expect(tombstones.applyLoad(new Set(), 3)).toEqual(new Set());
+  });
+
+  it("does not restart recovery grace for an older re-pin", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["removed"], 5);
+    expect(tombstones.applyLoad(new Set(["removed"]), 6)).toEqual(new Set(["removed"]));
+
+    tombstones.pin(["removed"], 4);
+
+    expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set());
   });
 
   it("releases an archive removal when the page is explicitly restored", () => {

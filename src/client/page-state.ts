@@ -57,8 +57,9 @@ export class PageRemovalTombstones {
   pin(pageIds: Iterable<string>, currentLoadGeneration: number) {
     for (const pageId of pageIds) {
       const previous = this.entries.get(pageId);
+      if (previous && currentLoadGeneration < previous.pinnedDuringLoad) continue;
       this.entries.set(pageId, {
-        pinnedDuringLoad: Math.max(previous?.pinnedDuringLoad ?? -1, currentLoadGeneration),
+        pinnedDuringLoad: currentLoadGeneration,
         firstFreshPresenceGeneration: null,
       });
     }
@@ -76,6 +77,7 @@ export class PageRemovalTombstones {
    * Applies one tree-load observation and returns the ids that load must hide.
    * One fresh load may still contain stale pre-removal data; repeated presence
    * is treated as authoritative so an incorrect tombstone cannot live forever.
+   * Each strictly increasing load generation must be applied exactly once.
    */
   applyLoad(observedPageIds: ReadonlySet<string>, loadGeneration: number) {
     const hiddenPageIds = new Set<string>();
@@ -85,11 +87,12 @@ export class PageRemovalTombstones {
         continue;
       }
       if (!observedPageIds.has(pageId)) {
+        hiddenPageIds.add(pageId);
         this.entries.delete(pageId);
         continue;
       }
-      if (entry.firstFreshPresenceGeneration === null || loadGeneration <= entry.firstFreshPresenceGeneration) {
-        entry.firstFreshPresenceGeneration ??= loadGeneration;
+      if (entry.firstFreshPresenceGeneration === null) {
+        entry.firstFreshPresenceGeneration = loadGeneration;
         hiddenPageIds.add(pageId);
       } else {
         this.entries.delete(pageId);
