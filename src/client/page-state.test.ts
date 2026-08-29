@@ -66,14 +66,23 @@ describe("page state reconciliation", () => {
     });
   });
 
-  it("retains archive removals until a later load confirms they are absent", () => {
+  it("retains archive removals through an in-flight load and one fresh stale observation", () => {
     const tombstones = new PageRemovalTombstones();
     tombstones.pin(["removed"], 2);
 
-    expect(tombstones.reconcile(new Set(), 2)).toEqual(new Set(["removed"]));
-    expect(tombstones.reconcile(new Set(["removed"]), 3)).toEqual(new Set(["removed"]));
-    expect(tombstones.reconcile(new Set(), 4)).toEqual(new Set(["removed"]));
-    expect(tombstones.reconcile(new Set(["removed"]), 5)).toEqual(new Set());
+    expect(tombstones.applyLoad(new Set(["removed"]), 2)).toEqual(new Set(["removed"]));
+    expect(tombstones.applyLoad(new Set(["removed"]), 3)).toEqual(new Set(["removed"]));
+    expect(tombstones.applyLoad(new Set(["removed"]), 3)).toEqual(new Set(["removed"]));
+    expect(tombstones.applyLoad(new Set(["removed"]), 4)).toEqual(new Set());
+    expect(tombstones.applyLoad(new Set(["removed"]), 4)).toEqual(new Set());
+  });
+
+  it("releases an archive removal when a fresh load confirms it is absent", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["removed"], 1);
+
+    expect(tombstones.applyLoad(new Set(), 2)).toEqual(new Set());
+    expect(tombstones.has("removed")).toBe(false);
   });
 
   it("releases an archive removal when the page is explicitly restored", () => {
@@ -82,7 +91,7 @@ describe("page state reconciliation", () => {
 
     tombstones.release(["restored"]);
 
-    expect(tombstones.reconcile(new Set(["restored"]), 2)).toEqual(new Set());
+    expect(tombstones.applyLoad(new Set(["restored"]), 2)).toEqual(new Set());
   });
 
   it("computes the authoritative pages and ids once", () => {
