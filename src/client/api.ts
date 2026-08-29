@@ -56,10 +56,6 @@ export function isPageNotFoundError(cause: unknown): cause is ApiClientError {
   );
 }
 
-export function isPageNotFoundResponse(cause: unknown): cause is ApiClientError {
-  return isPageNotFoundError(cause) && cause.status === 404;
-}
-
 function isJsonContentType(contentType: string | null) {
   const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase();
   return mediaType === "application/json" || mediaType?.endsWith("+json") === true;

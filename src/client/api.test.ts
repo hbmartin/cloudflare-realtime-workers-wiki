@@ -8,7 +8,6 @@ import {
   EmptyApiResponseError,
   InvalidApiResponseError,
   isPageNotFoundError,
-  isPageNotFoundResponse,
   isSuccessfulJsonResponseBodyError,
   json,
   onApiUnauthorized,
@@ -39,13 +38,10 @@ function silenceApiResponseReport() {
 }
 
 describe("api", () => {
-  it("accepts only supported page-not-found statuses and distinguishes the canonical 404 response", () => {
-    const nonstandardStatus = new ApiClientError(410, "page_not_found", "Page not found.");
-
-    expect(isPageNotFoundError(nonstandardStatus)).toBe(true);
-    expect(isPageNotFoundResponse(nonstandardStatus)).toBe(false);
+  it("accepts only supported page-not-found statuses", () => {
+    expect(isPageNotFoundError(new ApiClientError(410, "page_not_found", "Page not found."))).toBe(true);
     expect(isPageNotFoundError(new ApiClientError(500, "page_not_found", "Page not found."))).toBe(false);
-    expect(isPageNotFoundResponse(new ApiClientError(404, "page_not_found", "Page not found."))).toBe(true);
+    expect(isPageNotFoundError(new ApiClientError(404, "page_not_found", "Page not found."))).toBe(true);
   });
 
   it("adds JSON content type while preserving caller headers", async () => {

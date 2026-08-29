@@ -8,7 +8,7 @@ import {
   api,
   apiErrorMessage,
   authClient,
-  isPageNotFoundResponse,
+  isPageNotFoundError,
   isSuccessfulJsonResponseBodyError,
   json,
   onApiUnauthorized,
@@ -424,7 +424,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const [archiveRemovalTombstones] = useState(() => new PageRemovalTombstones());
   const pageLoadGeneration = useRef(0);
-  const pageLoadPromise = useRef<Promise<Page[]> | null>(null);
+  const pageLoadPromise = useRef<Promise<{ serverPages: Page[]; removedDuringLoad: ReadonlySet<string> }> | null>(null);
   const trashLoadRequest = useRef<{
     version: number;
     controller: AbortController;
@@ -525,7 +525,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         setSelectedId((current) =>
           current && authoritativeIds.has(current) ? current : ([...authoritativeIds][0] ?? null),
         );
-        return data.pages;
+        return { serverPages: data.pages, removedDuringLoad: removals };
       })
       .catch((error) => {
         pendingPageEvents.current.cancel();
@@ -626,7 +626,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         return;
       }
       if (event.type === "pages-removed") {
-        archiveRemovalTombstones.pin(event.pageIds, pageLoadGeneration.current);
+        if (event.permanently) {
+          archiveRemovalTombstones.release(event.pageIds);
+        } else {
+          archiveRemovalTombstones.pin(event.pageIds, pageLoadGeneration.current);
+        }
         recordPageRemovals(event.pageIds);
         for (const pageId of event.pageIds) invalidatePagePreview(pageId);
         const removedIds = new Set(event.pageIds);
@@ -702,7 +706,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const result = await requestMutation(`/api/pages/${page.id}`, { method: "DELETE" }, (value) =>
         archivePageIds(value, page.id),
       );
-      const pageAlreadyGone = result.kind === "rejected" && isPageNotFoundResponse(result.error);
+      const pageAlreadyGone = result.kind === "rejected" && isPageNotFoundError(result.error);
       const archiveWasUnverified =
         result.kind === "uncertain" || (result.kind === "committed" && result.value === null);
       const removedIds =
@@ -711,11 +715,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           : pageAlreadyGone
             ? new Set(knownPageIds)
             : null;
-      if (result.kind === "committed") {
-        if (archiveWasUnverified) {
-          reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
-        }
-      } else if (!pageAlreadyGone) {
+      if (result.kind === "committed" && result.value === null) {
+        reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
+      } else if (result.kind !== "committed" && !pageAlreadyGone) {
         const archiveError =
           result.error instanceof SuccessfulApiResponseError
             ? "The archive response could not be verified. Refreshing the page tree."
@@ -796,7 +798,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const pageUnavailable = useCallback(
     (pageId: string) => {
       archiveRemovalTombstones.pin([pageId], pageLoadGeneration.current);
-      const reconciliation = loadPages();
+      const pendingPageLoad = pageLoadPromise.current;
+      const reconciliation = pendingPageLoad
+        ? pendingPageLoad.catch(() => undefined).then(() => loadPages())
+        : loadPages();
       invalidatePagePreview(pageId);
       setPages((current) => current.filter((page) => page.id !== pageId));
       void reconciliation.catch((error) => {
@@ -829,56 +834,60 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!beginTrashMutation(knownPageIds)) return;
     const errorScope = page.id;
     const attempt = startScopedWorkspaceErrorAttempt("trash-mutation", errorScope);
-    let result: Awaited<ReturnType<typeof requestPageRestore>>;
     try {
-      result = await requestPageRestore(page.id, member.workspace.id);
-      if (result.kind !== "rejected") {
-        archiveRemovalTombstones.release(
-          result.kind === "committed" && result.value
-            ? [...knownPageIds, ...result.value.map((restored) => restored.id)]
-            : knownPageIds,
-        );
-      }
-      if (result.kind !== "committed") {
-        reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be restored."));
-        for (const pageId of knownPageIds) invalidatePagePreview(pageId);
-      } else {
-        if (!result.value) {
-          reportWorkspaceError(attempt, "The server returned an invalid restore response. Refreshing pages.");
+      let result: Awaited<ReturnType<typeof requestPageRestore>>;
+      try {
+        result = await requestPageRestore(page.id, member.workspace.id);
+        if (result.kind === "committed" && result.value) {
+          archiveRemovalTombstones.release(result.value.map((restored) => restored.id));
         }
-        const restoredIds = new Set(result.value?.map((restored) => restored.id) ?? knownPageIds);
-        if (result.value) {
-          const restoredPages = result.value;
-          recordPageUpserts(restoredPages);
-          setPages((current) => mergePages(current, restoredPages));
+        if (result.kind !== "committed") {
+          reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be restored."));
+          for (const pageId of knownPageIds) invalidatePagePreview(pageId);
+        } else {
+          if (!result.value) {
+            reportWorkspaceError(attempt, "The server returned an invalid restore response. Refreshing pages.");
+          }
+          const restoredIds = new Set(result.value?.map((restored) => restored.id) ?? knownPageIds);
+          if (result.value) {
+            const restoredPages = result.value;
+            recordPageUpserts(restoredPages);
+            setPages((current) => mergePages(current, restoredPages));
+          }
+          for (const pageId of result.value ? restoredIds : knownPageIds) invalidatePagePreview(pageId);
+          setTrash((current) => current.filter((candidate) => !restoredIds.has(candidate.id)));
         }
-        for (const pageId of result.value ? restoredIds : knownPageIds) invalidatePagePreview(pageId);
-        setTrash((current) => current.filter((candidate) => !restoredIds.has(candidate.id)));
+        refreshTrash();
+      } finally {
+        endTrashMutation(knownPageIds);
       }
-      refreshTrash();
-    } finally {
-      endTrashMutation(knownPageIds);
-    }
-    const pendingPageLoad = pageLoadPromise.current;
-    if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
-    try {
-      const serverPages = await loadPages();
-      if (result.kind !== "rejected") {
-        const rootWasRestored = serverPages.some((candidate) => candidate.id === page.id);
+
+      const responseConfirmedRestore = result.kind === "committed" && result.value !== null;
+      if (result.kind === "rejected" || responseConfirmedRestore) return;
+
+      const pendingPageLoad = pageLoadPromise.current;
+      if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
+      try {
+        const { serverPages, removedDuringLoad } = await loadPages();
+        const rootWasRestored =
+          !removedDuringLoad.has(page.id) && serverPages.some((candidate) => candidate.id === page.id);
         if (rootWasRestored) {
-          const serverRestoredIds = new Set(pageSubtreeIds(serverPages, page.id));
+          const serverRestoredIds = new Set(
+            pageSubtreeIds(serverPages, page.id).filter((pageId) => !removedDuringLoad.has(pageId)),
+          );
           archiveRemovalTombstones.release(serverRestoredIds);
           const serverRestoredPages = serverPages.filter((candidate) => serverRestoredIds.has(candidate.id));
           setPages((current) => mergePages(current, serverRestoredPages));
         }
+        if (result.kind === "committed" && !result.value) {
+          clearWorkspaceErrors(attempt);
+        }
+      } catch (error) {
+        reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be refreshed."));
       }
-      if (result.kind === "committed" && !result.value) {
-        clearWorkspaceErrors(attempt);
-      }
-    } catch (error) {
-      reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be refreshed."));
+    } finally {
+      finishWorkspaceErrorAttempt(attempt);
     }
-    finishWorkspaceErrorAttempt(attempt);
   }
   async function permanentlyDeletePage(page: Page) {
     const knownPageIds = pageSubtreeIds(trash, page.id);
