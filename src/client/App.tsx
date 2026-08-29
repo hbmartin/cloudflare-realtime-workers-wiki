@@ -537,6 +537,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     pageLoadPromise.current = loading;
     return loading;
   }, [archiveRemovalTombstones, clearWorkspaceErrors]);
+  const loadFreshPages = useCallback(async () => {
+    const pendingPageLoad = pageLoadPromise.current;
+    if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
+    return loadPages();
+  }, [loadPages]);
   const loadTrash = useCallback(
     (version: number) => {
       const activeRequest = trashLoadRequest.current;
@@ -613,7 +618,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
       if (event.type === "pages-upserted") {
-        if (event.restored) archiveRemovalTombstones.release(event.pages.map((page) => page.id));
+        const restoredPageIds = event.restored ? event.pages.map((page) => page.id) : [];
+        const restoredPagesNeedConfirmation = restoredPageIds.some((pageId) => archiveRemovalTombstones.has(pageId));
         recordPageUpserts(event.pages);
         for (const page of event.pages) invalidatePagePreview(page.id);
         const visiblePages = event.pages.filter((page) => !archiveRemovalTombstones.has(page.id));
@@ -622,15 +628,25 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           setPages((current) => mergePages(current, visiblePages));
           setTrash((current) => current.filter((page) => !visiblePageIds.has(page.id)));
         }
-        if (event.restored) refreshTrash();
+        if (event.restored) {
+          refreshTrash();
+          if (restoredPagesNeedConfirmation) {
+            void loadFreshPages()
+              .then(() =>
+                restoredPageIds.some((pageId) => archiveRemovalTombstones.has(pageId)) ? loadFreshPages() : undefined,
+              )
+              .catch((error) => {
+                reportWorkspaceError(
+                  { source: "page-tree" },
+                  apiErrorMessage(error, "The page tree could not be refreshed."),
+                );
+              });
+          }
+        }
         return;
       }
       if (event.type === "pages-removed") {
-        if (event.permanently) {
-          archiveRemovalTombstones.release(event.pageIds);
-        } else {
-          archiveRemovalTombstones.pin(event.pageIds, pageLoadGeneration.current);
-        }
+        archiveRemovalTombstones.pin(event.pageIds, pageLoadGeneration.current);
         recordPageRemovals(event.pageIds);
         for (const pageId of event.pageIds) invalidatePagePreview(pageId);
         const removedIds = new Set(event.pageIds);
@@ -645,7 +661,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setBacklinksRevision((current) => current + 1);
       if (event.mentionTargetUserIds.includes(member.user.id)) void loadUnreadMentions();
     },
-    [archiveRemovalTombstones, loadUnreadMentions, member.user.id, recordPageRemovals, recordPageUpserts, refreshTrash],
+    [
+      archiveRemovalTombstones,
+      loadFreshPages,
+      loadUnreadMentions,
+      member.user.id,
+      recordPageRemovals,
+      recordPageUpserts,
+      refreshTrash,
+      reportWorkspaceError,
+    ],
   );
 
   useEffect(() => {
@@ -734,11 +759,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (removedIds || result.kind === "uncertain") refreshTrash();
       const needsReconciliation = result.kind !== "rejected" || pageAlreadyGone;
       if (!needsReconciliation) return;
-      const pendingPageLoad = pageLoadPromise.current;
-      if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
-      const reconciliation = loadPages();
       try {
-        await reconciliation;
+        await loadFreshPages();
       } catch (error) {
         const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
         if (archiveWasUnverified) {
@@ -798,10 +820,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const pageUnavailable = useCallback(
     (pageId: string) => {
       archiveRemovalTombstones.pin([pageId], pageLoadGeneration.current);
-      const pendingPageLoad = pageLoadPromise.current;
-      const reconciliation = pendingPageLoad
-        ? pendingPageLoad.catch(() => undefined).then(() => loadPages())
-        : loadPages();
+      const reconciliation = loadFreshPages();
       invalidatePagePreview(pageId);
       setPages((current) => current.filter((page) => page.id !== pageId));
       void reconciliation.catch((error) => {
@@ -809,7 +828,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         reportWorkspaceError({ source: "page-tree" }, refreshError);
       });
     },
-    [archiveRemovalTombstones, loadPages, reportWorkspaceError],
+    [archiveRemovalTombstones, loadFreshPages, reportWorkspaceError],
   );
   const documentAccessDenied = useCallback(
     (pageId: string, error: ApiClientError) => {
@@ -832,6 +851,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   async function restorePage(page: Page) {
     const knownPageIds = pageSubtreeIds(trash, page.id);
     if (!beginTrashMutation(knownPageIds)) return;
+    const restoreTombstoneCheckpoint = archiveRemovalTombstones.checkpoint();
     const errorScope = page.id;
     const attempt = startScopedWorkspaceErrorAttempt("trash-mutation", errorScope);
     try {
@@ -839,7 +859,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       try {
         result = await requestPageRestore(page.id, member.workspace.id);
         if (result.kind === "committed" && result.value) {
-          archiveRemovalTombstones.release(result.value.map((restored) => restored.id));
+          archiveRemovalTombstones.release(
+            result.value.map((restored) => restored.id),
+            restoreTombstoneCheckpoint,
+          );
         }
         if (result.kind !== "committed") {
           reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be restored."));
@@ -850,36 +873,48 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           }
           const restoredIds = new Set(result.value?.map((restored) => restored.id) ?? knownPageIds);
           if (result.value) {
-            const restoredPages = result.value;
+            const restoredPages = result.value.filter((restored) => !archiveRemovalTombstones.has(restored.id));
             recordPageUpserts(restoredPages);
             setPages((current) => mergePages(current, restoredPages));
+            const visibleRestoredIds = new Set(restoredPages.map((restored) => restored.id));
+            setTrash((current) => current.filter((candidate) => !visibleRestoredIds.has(candidate.id)));
+          } else {
+            setTrash((current) => current.filter((candidate) => !restoredIds.has(candidate.id)));
           }
           for (const pageId of result.value ? restoredIds : knownPageIds) invalidatePagePreview(pageId);
-          setTrash((current) => current.filter((candidate) => !restoredIds.has(candidate.id)));
         }
         refreshTrash();
       } finally {
         endTrashMutation(knownPageIds);
       }
-
-      const responseConfirmedRestore = result.kind === "committed" && result.value !== null;
-      if (result.kind === "rejected" || responseConfirmedRestore) return;
-
-      const pendingPageLoad = pageLoadPromise.current;
-      if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
       try {
-        const { serverPages, removedDuringLoad } = await loadPages();
-        const rootWasRestored =
-          !removedDuringLoad.has(page.id) && serverPages.some((candidate) => candidate.id === page.id);
-        if (rootWasRestored) {
-          const serverRestoredIds = new Set(
-            pageSubtreeIds(serverPages, page.id).filter((pageId) => !removedDuringLoad.has(pageId)),
-          );
-          archiveRemovalTombstones.release(serverRestoredIds);
-          const serverRestoredPages = serverPages.filter((candidate) => serverRestoredIds.has(candidate.id));
-          setPages((current) => mergePages(current, serverRestoredPages));
+        const reconcileRestore = ({ serverPages, removedDuringLoad }: Awaited<ReturnType<typeof loadFreshPages>>) => {
+          const rootWasObserved =
+            !removedDuringLoad.has(page.id) && serverPages.some((candidate) => candidate.id === page.id);
+          if (rootWasObserved && result.kind !== "rejected") {
+            const serverRestoredIds = new Set(
+              pageSubtreeIds(serverPages, page.id).filter((pageId) => !removedDuringLoad.has(pageId)),
+            );
+            archiveRemovalTombstones.release(serverRestoredIds, restoreTombstoneCheckpoint);
+            const serverRestoredPages = serverPages.filter(
+              (candidate) => serverRestoredIds.has(candidate.id) && !archiveRemovalTombstones.has(candidate.id),
+            );
+            setPages((current) => mergePages(current, serverRestoredPages));
+          }
+          return rootWasObserved && !archiveRemovalTombstones.has(page.id);
+        };
+
+        let reconciliation = await loadFreshPages();
+        let rootWasRestored = reconcileRestore(reconciliation);
+        const responseConfirmedRestore = result.kind === "committed" && result.value !== null;
+        const rootWasObserved =
+          !reconciliation.removedDuringLoad.has(page.id) &&
+          reconciliation.serverPages.some((candidate) => candidate.id === page.id);
+        if ((!rootWasRestored && rootWasObserved) || (responseConfirmedRestore && !rootWasObserved)) {
+          reconciliation = await loadFreshPages();
+          rootWasRestored = reconcileRestore(reconciliation);
         }
-        if (result.kind === "committed" && !result.value) {
+        if (result.kind === "committed" && !result.value && rootWasRestored) {
           clearWorkspaceErrors(attempt);
         }
       } catch (error) {

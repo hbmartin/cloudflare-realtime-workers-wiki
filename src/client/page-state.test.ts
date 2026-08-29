@@ -72,9 +72,15 @@ describe("page state reconciliation", () => {
 
     expect(tombstones.applyLoad(new Set(["removed"]), 2)).toEqual(new Set(["removed"]));
     expect(tombstones.applyLoad(new Set(["removed"]), 3)).toEqual(new Set(["removed"]));
-    expect(tombstones.applyLoad(new Set(["removed"]), 3)).toEqual(new Set(["removed"]));
     expect(tombstones.applyLoad(new Set(["removed"]), 4)).toEqual(new Set());
-    expect(tombstones.applyLoad(new Set(["removed"]), 4)).toEqual(new Set());
+  });
+
+  it("rejects a repeated or older tree-load generation", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["removed"], 2);
+    tombstones.applyLoad(new Set(["removed"]), 3);
+
+    expect(() => tombstones.applyLoad(new Set(["removed"]), 3)).toThrow(/strictly increasing/);
   });
 
   it("releases an archive removal when a fresh load confirms it is absent", () => {
@@ -86,12 +92,23 @@ describe("page state reconciliation", () => {
     expect(tombstones.applyLoad(new Set(), 3)).toEqual(new Set());
   });
 
-  it("does not restart recovery grace for a repeated re-pin", () => {
+  it("restarts recovery grace for a new removal", () => {
     const tombstones = new PageRemovalTombstones();
     tombstones.pin(["removed"], 5);
     expect(tombstones.applyLoad(new Set(["removed"]), 6)).toEqual(new Set(["removed"]));
 
     tombstones.pin(["removed"], 6);
+
+    expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set(["removed"]));
+    expect(tombstones.applyLoad(new Set(["removed"]), 8)).toEqual(new Set());
+  });
+
+  it("does not restart recovery grace for an older removal", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["removed"], 5);
+    expect(tombstones.applyLoad(new Set(["removed"]), 6)).toEqual(new Set(["removed"]));
+
+    tombstones.pin(["removed"], 4);
 
     expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set());
   });
@@ -99,10 +116,22 @@ describe("page state reconciliation", () => {
   it("releases an archive removal when the page is explicitly restored", () => {
     const tombstones = new PageRemovalTombstones();
     tombstones.pin(["restored"], 1);
+    const checkpoint = tombstones.checkpoint();
 
-    tombstones.release(["restored"]);
+    tombstones.release(["restored"], checkpoint);
 
     expect(tombstones.applyLoad(new Set(["restored"]), 2)).toEqual(new Set());
+  });
+
+  it("does not release a removal pinned after the restoring operation began", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["restored"], 1);
+    const checkpoint = tombstones.checkpoint();
+    tombstones.pin(["restored"], 1);
+
+    tombstones.release(["restored"], checkpoint);
+
+    expect(tombstones.has("restored")).toBe(true);
   });
 
   it("computes the authoritative pages and ids once", () => {

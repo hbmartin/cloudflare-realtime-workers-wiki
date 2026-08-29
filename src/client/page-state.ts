@@ -45,27 +45,41 @@ export class PageLoadEventBuffer {
 }
 
 /**
- * Keeps archive removals applied across failed or stale tree loads. A tree load
+ * Keeps page removals applied across failed or stale tree loads. A tree load
  * may confirm a removal only when it started after the removal was pinned.
  */
 export class PageRemovalTombstones {
+  private latestPinGeneration = 0;
+  private lastAppliedLoadGeneration = 0;
   private readonly entries = new Map<
     string,
-    { pinnedDuringLoad: number; firstFreshPresenceGeneration: number | null }
+    { pinnedDuringLoad: number; pinGeneration: number; firstFreshPresenceGeneration: number | null }
   >();
 
   pin(pageIds: Iterable<string>, currentLoadGeneration: number) {
+    const pinGeneration = ++this.latestPinGeneration;
     for (const pageId of pageIds) {
-      if (this.entries.has(pageId)) continue;
+      const previous = this.entries.get(pageId);
+      if (previous && currentLoadGeneration < previous.pinnedDuringLoad) continue;
       this.entries.set(pageId, {
         pinnedDuringLoad: currentLoadGeneration,
+        pinGeneration,
         firstFreshPresenceGeneration: null,
       });
     }
   }
 
-  release(pageIds: Iterable<string>) {
-    for (const pageId of pageIds) this.entries.delete(pageId);
+  /** Captures which removals existed before an operation started. */
+  checkpoint() {
+    return this.latestPinGeneration;
+  }
+
+  /** Releases only removals that are no newer than the supplied checkpoint. */
+  release(pageIds: Iterable<string>, checkpoint: number) {
+    for (const pageId of pageIds) {
+      const entry = this.entries.get(pageId);
+      if (entry && entry.pinGeneration <= checkpoint) this.entries.delete(pageId);
+    }
   }
 
   has(pageId: string) {
@@ -76,9 +90,13 @@ export class PageRemovalTombstones {
    * Applies one tree-load observation and returns the ids that load must hide.
    * One fresh load may still contain stale pre-removal data; repeated presence
    * is treated as authoritative so an incorrect tombstone cannot live forever.
-   * Reapplying the same or an older generation does not advance recovery grace.
+   * Each strictly increasing load generation must be applied exactly once.
    */
   applyLoad(observedPageIds: ReadonlySet<string>, loadGeneration: number) {
+    if (loadGeneration <= this.lastAppliedLoadGeneration) {
+      throw new Error("Page removal tombstones require strictly increasing load generations.");
+    }
+    this.lastAppliedLoadGeneration = loadGeneration;
     const hiddenPageIds = new Set<string>();
     for (const [pageId, entry] of this.entries) {
       if (loadGeneration <= entry.pinnedDuringLoad) {
@@ -90,8 +108,8 @@ export class PageRemovalTombstones {
         this.entries.delete(pageId);
         continue;
       }
-      if (entry.firstFreshPresenceGeneration === null || loadGeneration <= entry.firstFreshPresenceGeneration) {
-        entry.firstFreshPresenceGeneration ??= loadGeneration;
+      if (entry.firstFreshPresenceGeneration === null) {
+        entry.firstFreshPresenceGeneration = loadGeneration;
         hiddenPageIds.add(pageId);
       } else {
         this.entries.delete(pageId);
