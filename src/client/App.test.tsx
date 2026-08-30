@@ -1247,6 +1247,7 @@ describe("App error handling", () => {
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
 
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Simulate document access denial" })).toBeInTheDocument();
     expect(treeLoads).toBe(2);
     expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
   });
@@ -1308,6 +1309,7 @@ describe("App error handling", () => {
   it("removes a remotely confirmed restore from a stale trash snapshot", async () => {
     const archivedPage = { ...page, archivedAt: 2 };
     const confirmation = deferred<{ pages: Page[] }>();
+    const staleTrash = deferred<{ pages: Page[] }>();
     let treeLoads = 0;
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
@@ -1320,7 +1322,7 @@ describe("App error handling", () => {
       }
       if (path === "/api/pages/tree?archived=true") {
         trashLoads += 1;
-        return { pages: [archivedPage] };
+        return trashLoads === 1 ? { pages: [archivedPage] } : staleTrash.promise;
       }
       throw new Error(`Unexpected API request: ${path}`);
     });
@@ -1338,8 +1340,41 @@ describe("App error handling", () => {
       confirmation.resolve({ pages: [page] });
       await confirmation.promise;
     });
+    expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
+    await act(async () => {
+      staleTrash.resolve({ pages: [archivedPage] });
+      await staleTrash.promise;
+    });
 
     expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
+  });
+
+  it("shows a confirmed restore in trash after it is archived again", async () => {
+    const archivedPage = { ...page, archivedAt: 2 };
+    let trashLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === "/api/pages/tree?archived=true") {
+        trashLoads += 1;
+        return { pages: [archivedPage] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
+    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
+    await waitFor(() => expect(trashLoads).toBe(2));
+    expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
+
+    act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
+
+    await waitFor(() => expect(trashLoads).toBe(3));
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
   });
 
   it("cancels a delayed reconciliation when the workspace unmounts", async () => {
