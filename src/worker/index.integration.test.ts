@@ -15,11 +15,12 @@ import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { TABLE_BULK_MAX_ROWS } from "../shared/table-limits";
-import type { TableData, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
+import type { Page, TableData, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { processDueUploadReaps } from "./attachments";
 import { processDeletionJob } from "./cleanup";
 import type { Env } from "./env";
 import worker from "./index";
+import { WorkspaceEvents } from "./workspace-events";
 
 type InstalledWorkspace = {
   cookie: string;
@@ -574,22 +575,101 @@ describe("Worker integration", () => {
     );
     expect(validOperation.status).toBe(200);
 
-    const invalidOperation = await stub.fetch(
-      new Request("https://workspace-events.internal/broadcast", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-notes-internal": env.BETTER_AUTH_SECRET,
-        },
-        body: JSON.stringify({
-          type: "pages-removed",
-          pageIds: [installed.pageId],
-          permanently: false,
-          operationId: "invalid/operation",
+    await runInDurableObject(stub, async (instance) => {
+      const delivered: string[] = [];
+      const workspaceEvents = instance as WorkspaceEvents;
+      const broadcast = vi
+        .spyOn(workspaceEvents, "broadcastCustomMessage")
+        .mockImplementation((message) => void delivered.push(message));
+      const invalidOperation = await workspaceEvents.onRequest(
+        new Request("https://workspace-events.internal/broadcast", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-notes-internal": env.BETTER_AUTH_SECRET,
+          },
+          body: JSON.stringify({
+            type: "pages-removed",
+            pageIds: [installed.pageId],
+            permanently: false,
+            operationId: "invalid/operation",
+          }),
         }),
-      }),
-    );
-    expect(invalidOperation.status).toBe(200);
+      );
+      broadcast.mockRestore();
+
+      expect(invalidOperation.status).toBe(200);
+      expect(delivered.map((message) => JSON.parse(message))).toEqual([
+        { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
+      ]);
+    });
+  });
+
+  it("strips undeclared properties before broadcasting workspace events", async () => {
+    const installed = await bootstrap();
+    const stub = env.WORKSPACE_EVENTS.getByName(installed.workspaceId);
+    const eventPage = {
+      ...(await (await SELF.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree"))).json<{ pages: Page[] }>())
+        .pages[0]!,
+      privateDiagnostic: "do not broadcast",
+    };
+    const { privateDiagnostic: _privateDiagnostic, ...expectedPage } = eventPage;
+
+    await runInDurableObject(stub, async (instance) => {
+      const delivered: string[] = [];
+      const workspaceEvents = instance as WorkspaceEvents;
+      const broadcast = vi
+        .spyOn(workspaceEvents, "broadcastCustomMessage")
+        .mockImplementation((message) => void delivered.push(message));
+      const request = (body: unknown) =>
+        workspaceEvents.onRequest(
+          new Request("https://workspace-events.internal/broadcast", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-notes-internal": env.BETTER_AUTH_SECRET,
+            },
+            body: JSON.stringify(body),
+          }),
+        );
+
+      expect(
+        (
+          await request({
+            type: "pages-upserted",
+            pages: [eventPage],
+            restored: true,
+            internalTrace: "trace",
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await request({
+            type: "projection-updated",
+            pageId: installed.pageId,
+            backlinkTargetIds: ["backlink"],
+            mentionTargetUserIds: [installed.userId],
+            internalTrace: "trace",
+          })
+        ).status,
+      ).toBe(200);
+      broadcast.mockRestore();
+
+      expect(delivered.map((message) => JSON.parse(message))).toEqual([
+        {
+          type: "pages-upserted",
+          pages: [expectedPage],
+          restored: true,
+        },
+        {
+          type: "projection-updated",
+          pageId: installed.pageId,
+          backlinkTargetIds: ["backlink"],
+          mentionTargetUserIds: [installed.userId],
+        },
+      ]);
+    });
   });
 
   it("allows JSON uploads, rejects executable extensions, and ignores punctuation-only search terms", async () => {

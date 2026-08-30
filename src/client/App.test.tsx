@@ -142,6 +142,29 @@ describe("App error handling", () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
+  it("recovers a failed initial page-tree load from the pending workspace", async () => {
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) throw new ApiClientError(503, "tree_unavailable", "Tree unavailable.");
+        return { pages: [page] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByText("Tree unavailable.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
+
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(treeLoads).toBe(2);
+    expect(screen.queryByText("Tree unavailable.")).not.toBeInTheDocument();
+  });
+
   it("uses the sign-in fallback for an empty Better Auth message", async () => {
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
@@ -398,6 +421,29 @@ describe("App error handling", () => {
     expect(
       await screen.findByText(
         "The page was archived, but the workspace could not be updated. Tree refresh unavailable.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("reconciles an uncertain archive when local handling throws", async () => {
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mocks.invalidatePagePreview.mockImplementationOnce(() => {
+      throw new Error("Preview cache unavailable.");
+    });
+    mockWorkspaceApi(
+      new ApiClientError(503, "tree_unavailable", "Tree refresh unavailable."),
+      new ApiClientError(503, "archive_unavailable", "Archive service unavailable."),
+    );
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    expect(
+      await screen.findByText(
+        "The page may have been archived, but the workspace could not be updated. Tree refresh unavailable.",
       ),
     ).toBeInTheDocument();
   });
@@ -1475,7 +1521,7 @@ describe("App error handling", () => {
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeEnabled();
     await waitFor(() => expect(screen.queryByRole("button", { name: "□Roadmap" })).not.toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: /Search/ }));
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
@@ -1524,7 +1570,7 @@ describe("App error handling", () => {
     fireEvent.click(screen.getByRole("button", { name: /Search/ }));
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeEnabled();
 
     fireEvent.click(screen.getByRole("button", { name: /Search/ }));
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
@@ -1573,7 +1619,8 @@ describe("App error handling", () => {
 
     expect(await screen.findByText("Tree refresh unavailable.")).toBeInTheDocument();
     expect(treeLoads).toBe(3);
-    expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restore" })).toBeEnabled();
+    expect(screen.queryByText("Trash is empty.")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "□Roadmap" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Search/ }));
@@ -2013,6 +2060,64 @@ describe("App error handling", () => {
 
     await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(missingPage.id));
     expect(screen.getByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
+  });
+
+  it("makes pending-navigation retries single-flight and falls back when the target remains absent", async () => {
+    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
+    const retry = deferred<{ pages: Page[] }>();
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return treeLoads === 1 ? { pages: [page] } : retry.promise;
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+    });
+    expect(screen.getByRole("button", { name: "+ Page" })).toBeDisabled();
+
+    const refresh = screen.getByRole("button", { name: "Refresh the page tree" });
+    fireEvent.click(refresh);
+    fireEvent.click(refresh);
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(screen.getByRole("button", { name: "Refreshing…" })).toBeDisabled();
+
+    await act(async () => {
+      retry.resolve({ pages: [page] });
+      await retry.promise;
+    });
+
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(treeLoads).toBe(2);
+  });
+
+  it("lets the user abandon a pending navigation target", async () => {
+    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
+
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Opening page…" })).not.toBeInTheDocument();
   });
 
   it("keeps a pending navigation target through a stale tree response", async () => {

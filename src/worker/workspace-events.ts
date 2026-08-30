@@ -1,6 +1,6 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { YServer } from "y-partyserver";
-import type { WorkspaceEvent } from "../shared/types";
+import type { Page, WorkspaceEvent } from "../shared/types";
 import { ID_PATTERN, isPage } from "../shared/validation";
 import type { Env } from "./env";
 
@@ -20,6 +20,23 @@ function stringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
+function normalizedPage(value: Page): Page {
+  return {
+    id: value.id,
+    workspaceId: value.workspaceId,
+    parentId: value.parentId,
+    kind: value.kind,
+    position: value.position,
+    title: value.title,
+    icon: value.icon,
+    revision: value.revision,
+    contentEpoch: value.contentEpoch,
+    archivedAt: value.archivedAt,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
 function workspaceEvent(value: unknown): WorkspaceEvent | null {
   const event = record(value);
   if (!event) return null;
@@ -29,14 +46,18 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
     event.pages.every(isPage) &&
     (event.restored === undefined || typeof event.restored === "boolean")
   ) {
-    return event as WorkspaceEvent;
+    return {
+      type: "pages-upserted",
+      pages: event.pages.map(normalizedPage),
+      ...(event.restored === undefined ? {} : { restored: event.restored }),
+    };
   }
   if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
     const operationId =
       typeof event.operationId === "string" && ID_PATTERN.test(event.operationId) ? event.operationId : undefined;
     return {
       type: "pages-removed",
-      pageIds: event.pageIds,
+      pageIds: [...event.pageIds],
       permanently: event.permanently,
       ...(operationId ? { operationId } : {}),
     };
@@ -47,7 +68,12 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
     stringList(event.backlinkTargetIds) &&
     stringList(event.mentionTargetUserIds)
   ) {
-    return event as WorkspaceEvent;
+    return {
+      type: "projection-updated",
+      pageId: event.pageId,
+      backlinkTargetIds: [...event.backlinkTargetIds],
+      mentionTargetUserIds: [...event.mentionTargetUserIds],
+    };
   }
   return null;
 }
