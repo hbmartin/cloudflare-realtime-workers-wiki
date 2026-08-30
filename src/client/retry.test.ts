@@ -1,7 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { connectionRetryDelay, reconciliationRetryDelay } from "./retry";
+// @vitest-environment jsdom
 
-afterEach(() => vi.restoreAllMocks());
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { connectionRetryDelay, reconciliationRetryDelay, waitForReconciliationRetry } from "./retry";
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe("connectionRetryDelay", () => {
   it.each([
@@ -28,5 +33,31 @@ describe("reconciliationRetryDelay", () => {
 
     expect(reconciliationRetryDelay()).toBe(500);
     expect(reconciliationRetryDelay()).toBe(1_000);
+  });
+});
+
+describe("waitForReconciliationRetry", () => {
+  it("resolves after the jittered delay", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const waiting = waitForReconciliationRetry();
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(waiting).resolves.toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("clears the pending timer when cancelled", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const waiting = waitForReconciliationRetry(controller.signal);
+
+    controller.abort();
+
+    await expect(waiting).resolves.toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
