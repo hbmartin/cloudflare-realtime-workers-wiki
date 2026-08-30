@@ -1,5 +1,4 @@
 import type { Page } from "../shared/types";
-import { PAGE_FIELDS } from "../shared/validation";
 
 export class PageLoadEventBuffer {
   private recording = false;
@@ -156,8 +155,26 @@ export class PageRemovalTombstones {
   }
 }
 
+const COMPARABLE_PAGE_FIELDS = [
+  "id",
+  "workspaceId",
+  "parentId",
+  "kind",
+  "position",
+  "title",
+  "icon",
+  "revision",
+  "contentEpoch",
+  "archivedAt",
+  "createdAt",
+  "updatedAt",
+] as const satisfies readonly (keyof Page)[];
+
+type UncomparedPageField = Exclude<keyof Page, (typeof COMPARABLE_PAGE_FIELDS)[number]>;
+
 function samePage(left: Page, right: Page) {
-  return PAGE_FIELDS.every((field) => left[field] === right[field]);
+  const allPageFieldsAreCompared: UncomparedPageField extends never ? true : never = true;
+  return allPageFieldsAreCompared && COMPARABLE_PAGE_FIELDS.every((field) => left[field] === right[field]);
 }
 
 export function mergePages(current: Page[], incoming: Page[]) {
