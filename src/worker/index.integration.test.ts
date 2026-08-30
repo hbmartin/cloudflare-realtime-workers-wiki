@@ -15,9 +15,10 @@ import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { TABLE_BULK_MAX_ROWS } from "../shared/table-limits";
-import type { TableData, TableLeaseResponse, TableLeaseTiming } from "../shared/types";
+import type { TableData, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { processDueUploadReaps } from "./attachments";
 import { processDeletionJob } from "./cleanup";
+import type { Env } from "./env";
 import worker from "./index";
 
 type InstalledWorkspace = {
@@ -555,6 +556,40 @@ describe("Worker integration", () => {
       }),
     );
     expect(malformed.status).toBe(400);
+
+    const validOperation = await stub.fetch(
+      new Request("https://workspace-events.internal/broadcast", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-notes-internal": env.BETTER_AUTH_SECRET,
+        },
+        body: JSON.stringify({
+          type: "pages-removed",
+          pageIds: [installed.pageId],
+          permanently: false,
+          operationId: "archive-operation",
+        }),
+      }),
+    );
+    expect(validOperation.status).toBe(200);
+
+    const invalidOperation = await stub.fetch(
+      new Request("https://workspace-events.internal/broadcast", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-notes-internal": env.BETTER_AUTH_SECRET,
+        },
+        body: JSON.stringify({
+          type: "pages-removed",
+          pageIds: [installed.pageId],
+          permanently: false,
+          operationId: "invalid/operation",
+        }),
+      }),
+    );
+    expect(invalidOperation.status).toBe(400);
   });
 
   it("allows JSON uploads, rejects executable extensions, and ignores punctuation-only search terms", async () => {
@@ -2014,6 +2049,51 @@ describe("Worker integration", () => {
       cleanupPending: false,
       pendingPageIds: [],
     });
+  });
+
+  it("copies the archive operation id into the workspace event", async () => {
+    const installed = await bootstrap();
+    const operationId = "archive-operation";
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property !== "WORKSPACE_EVENTS") return Reflect.get(target, property, receiver);
+        return {
+          getByName(workspaceId: string) {
+            return {
+              async fetch(request: Request) {
+                delivered.push({ workspaceId, event: (await request.json()) as WorkspaceEvent });
+                return Response.json({ delivered: true });
+              },
+            };
+          },
+        } as unknown as Env["WORKSPACE_EVENTS"];
+      },
+    });
+    const context = createExecutionContext();
+
+    const archived = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+        method: "DELETE",
+        headers: { "x-notes-operation-id": operationId },
+      }),
+      bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+
+    expect(archived.status).toBe(200);
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: {
+          type: "pages-removed",
+          pageIds: [installed.pageId],
+          permanently: false,
+          operationId,
+        },
+      },
+    ]);
   });
 
   it("returns authoritative pages when restoring an archived subtree", async () => {

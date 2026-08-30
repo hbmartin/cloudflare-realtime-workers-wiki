@@ -61,22 +61,25 @@ export const pageKind = (value: unknown) => oneOf<PageKind>(value, "kind", PAGE_
 export const columnType = (value: unknown) =>
   oneOf<ColumnType>(value, "type", ["text", "number", "checkbox", "date", "select"]);
 
+const PAGE_FIELD_VALIDATORS = {
+  id: (value: unknown) => typeof value === "string",
+  workspaceId: (value: unknown) => typeof value === "string",
+  parentId: (value: unknown) => value === null || typeof value === "string",
+  kind: (value: unknown) => typeof value === "string" && PAGE_KINDS.includes(value as PageKind),
+  position: (value: unknown) => typeof value === "string",
+  title: (value: unknown) => typeof value === "string",
+  icon: (value: unknown) => value === null || typeof value === "string",
+  revision: (value: unknown) => typeof value === "number",
+  contentEpoch: (value: unknown) => typeof value === "number",
+  archivedAt: (value: unknown) => value === null || typeof value === "number",
+  createdAt: (value: unknown) => typeof value === "number",
+  updatedAt: (value: unknown) => typeof value === "number",
+} satisfies { [Field in keyof Page]: (value: unknown) => boolean };
+
+export const PAGE_FIELDS: readonly (keyof Page)[] = Object.keys(PAGE_FIELD_VALIDATORS) as (keyof Page)[];
+
 export function isPage(value: unknown): value is Page {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const page = value as Record<string, unknown>;
-  return (
-    typeof page.id === "string" &&
-    typeof page.workspaceId === "string" &&
-    (page.parentId === null || typeof page.parentId === "string") &&
-    typeof page.kind === "string" &&
-    PAGE_KINDS.includes(page.kind as PageKind) &&
-    typeof page.position === "string" &&
-    typeof page.title === "string" &&
-    (page.icon === null || typeof page.icon === "string") &&
-    typeof page.revision === "number" &&
-    typeof page.contentEpoch === "number" &&
-    (page.archivedAt === null || typeof page.archivedAt === "number") &&
-    typeof page.createdAt === "number" &&
-    typeof page.updatedAt === "number"
-  );
+  return PAGE_FIELDS.every((field) => PAGE_FIELD_VALIDATORS[field](page[field]));
 }

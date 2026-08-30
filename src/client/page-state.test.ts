@@ -140,6 +140,32 @@ describe("page state reconciliation", () => {
     expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set());
   });
 
+  it("adds authoritative page ids reported by a duplicate removal operation", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["root"], 5, "same-removal");
+    const checkpoint = tombstones.checkpoint();
+
+    tombstones.pin(["root", "child"], 6, "same-removal");
+
+    expect(tombstones.has("root")).toBe(true);
+    expect(tombstones.has("child")).toBe(true);
+    expect(tombstones.checkpoint()).toBe(checkpoint);
+    expect(tombstones.pageIdsPinnedAfter(checkpoint)).toEqual(new Set());
+  });
+
+  it("does not let an older operation overwrite a newer removal for the same page", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["root"], 5, "older-removal");
+    const checkpoint = tombstones.checkpoint();
+    tombstones.pin(["child"], 6, "newer-removal");
+
+    tombstones.pin(["root", "child"], 7, "older-removal");
+    tombstones.release(["child"], checkpoint);
+
+    expect(tombstones.has("child")).toBe(true);
+    expect(tombstones.pageIdsPinnedAfter(checkpoint)).toEqual(new Set(["child"]));
+  });
+
   it("does not re-pin a released tombstone for a delayed duplicate operation", () => {
     const tombstones = new PageRemovalTombstones();
     tombstones.pin(["removed"], 5, "same-removal");
@@ -149,6 +175,16 @@ describe("page state reconciliation", () => {
     tombstones.pin(["removed"], 6, "same-removal");
 
     expect(tombstones.has("removed")).toBe(false);
+  });
+
+  it("does not restart recovery grace for an older removal", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["removed"], 5);
+    expect(tombstones.applyLoad(new Set(["removed"]), 6)).toEqual(new Set(["removed"]));
+
+    tombstones.pin(["removed"], 4);
+
+    expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set());
   });
 
   it("does not advance the removal checkpoint for an empty pin", () => {
