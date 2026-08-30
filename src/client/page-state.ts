@@ -1,4 +1,5 @@
 import type { Page } from "../shared/types";
+import { PAGE_FIELDS } from "../shared/validation";
 
 export class PageLoadEventBuffer {
   private recording = false;
@@ -54,7 +55,7 @@ export class PageRemovalTombstones {
   private static readonly MAX_SEEN_OPERATIONS = 256;
   private latestPinGeneration = 0;
   private lastAppliedLoadGeneration = 0;
-  private readonly seenOperations = new Set<string>();
+  private readonly seenOperations = new Map<string, { pageIds: Set<string>; pinGeneration: number | null }>();
   private readonly seenOperationOrder: string[] = [];
   private readonly entries = new Map<
     string,
@@ -62,19 +63,33 @@ export class PageRemovalTombstones {
   >();
 
   pin(pageIds: Iterable<string>, currentLoadGeneration: number, operationId?: string) {
-    const ids = [...pageIds];
+    const ids = [...new Set(pageIds)];
     if (!ids.length) return;
-    if (operationId && this.seenOperations.has(operationId)) return;
+    let operation = operationId ? this.seenOperations.get(operationId) : undefined;
     if (operationId) {
-      this.seenOperations.add(operationId);
-      this.seenOperationOrder.push(operationId);
-      if (this.seenOperationOrder.length > PageRemovalTombstones.MAX_SEEN_OPERATIONS) {
-        this.seenOperations.delete(this.seenOperationOrder.shift()!);
+      if (!operation) {
+        operation = { pageIds: new Set(), pinGeneration: null };
+        this.seenOperations.set(operationId, operation);
+        this.seenOperationOrder.push(operationId);
+        if (this.seenOperationOrder.length > PageRemovalTombstones.MAX_SEEN_OPERATIONS) {
+          this.seenOperations.delete(this.seenOperationOrder.shift()!);
+        }
       }
     }
-    let pinGeneration: number | null = null;
+    let pinGeneration = operation?.pinGeneration ?? null;
     for (const pageId of ids) {
+      if (operation?.pageIds.has(pageId)) continue;
+      operation?.pageIds.add(pageId);
+      const previous = this.entries.get(pageId);
+      if (
+        previous &&
+        (currentLoadGeneration < previous.pinnedDuringLoad ||
+          (pinGeneration !== null && pinGeneration < previous.pinGeneration))
+      ) {
+        continue;
+      }
       pinGeneration ??= ++this.latestPinGeneration;
+      if (operation) operation.pinGeneration = pinGeneration;
       this.entries.set(pageId, {
         pinnedDuringLoad: currentLoadGeneration,
         pinGeneration,
@@ -141,26 +156,8 @@ export class PageRemovalTombstones {
   }
 }
 
-const PAGE_FIELDS = [
-  "id",
-  "workspaceId",
-  "parentId",
-  "kind",
-  "position",
-  "title",
-  "icon",
-  "revision",
-  "contentEpoch",
-  "archivedAt",
-  "createdAt",
-  "updatedAt",
-] as const satisfies readonly (keyof Page)[];
-
-type UncomparedPageField = Exclude<keyof Page, (typeof PAGE_FIELDS)[number]>;
-
 function samePage(left: Page, right: Page) {
-  const allPageFieldsAreCompared: UncomparedPageField extends never ? true : never = true;
-  return allPageFieldsAreCompared && PAGE_FIELDS.every((field) => left[field] === right[field]);
+  return PAGE_FIELDS.every((field) => left[field] === right[field]);
 }
 
 export function mergePages(current: Page[], incoming: Page[]) {

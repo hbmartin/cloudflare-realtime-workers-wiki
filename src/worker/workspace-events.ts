@@ -1,7 +1,7 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { YServer } from "y-partyserver";
 import type { WorkspaceEvent } from "../shared/types";
-import { isPage } from "../shared/validation";
+import { ID_PATTERN, isPage } from "../shared/validation";
 import type { Env } from "./env";
 
 export interface EventConnectionAuth {
@@ -35,7 +35,7 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
     event.type === "pages-removed" &&
     stringList(event.pageIds) &&
     typeof event.permanently === "boolean" &&
-    (event.operationId === undefined || typeof event.operationId === "string")
+    (event.operationId === undefined || (typeof event.operationId === "string" && ID_PATTERN.test(event.operationId)))
   ) {
     return event as WorkspaceEvent;
   }

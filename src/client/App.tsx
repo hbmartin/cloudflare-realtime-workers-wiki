@@ -207,12 +207,13 @@ type WorkspacePageAction =
   | { type: "confirm-restored-root"; rootPageId: string; token: number }
   | { type: "clear-restored-root"; token: number };
 
+function assertNeverWorkspacePageAction(action: never): never {
+  throw new Error(`Unhandled workspace page action: ${JSON.stringify(action)}`);
+}
+
 function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAction): WorkspacePageState {
   if (action.type === "select") {
-    const selectedId =
-      action.pageId !== null && state.pagesLoaded && !state.pages.some((page) => page.id === action.pageId)
-        ? (state.pages[0]?.id ?? null)
-        : action.pageId;
+    const selectedId = action.pageId;
     if (state.selectedId === selectedId && state.pendingRestoredRoot === null) return state;
     return { ...state, selectedId, pendingRestoredRoot: null };
   }
@@ -289,8 +290,7 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
       pendingRestoredRoot: null,
     };
   }
-  const unhandledAction: never = action;
-  return unhandledAction;
+  return assertNeverWorkspacePageAction(action);
 }
 
 async function resolveAppState(): Promise<AppState> {
@@ -560,6 +560,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     controller: AbortController;
     promise: Promise<void>;
   } | null>(null);
+  const latestTrashLoadVersion = useRef(-1);
+  const trashTreeRefreshRequiredGeneration = useRef(0);
+  const trashTreeRefreshCompletedGeneration = useRef(0);
   const trashMutationIdsRef = useRef(new Set<string>());
   const workspaceErrorAttemptRef = useRef(0);
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
@@ -802,11 +805,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const activeRequest = trashLoadRequest.current;
       if (activeRequest?.version === version) return activeRequest.promise;
       activeRequest?.controller.abort();
+      latestTrashLoadVersion.current = version;
       const controller = new AbortController();
       const request = { version, controller, promise: Promise.resolve() };
       setTrashLoading(true);
       const loading = api<{ pages: Page[] }>("/api/pages/tree?archived=true", { signal: controller.signal })
-        .then(async (data) => {
+        .then((data) => {
           if (controller.signal.aborted) return;
           const archivedPagesById = new Map(data.pages.map((page) => [page.id, page]));
           let activeTreeNeedsRefresh = false;
@@ -817,16 +821,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               if (archivedPage) activeTreeNeedsRefresh = true;
             }
           }
-          if (activeTreeNeedsRefresh) {
-            try {
-              await loadFreshPages();
-            } catch (error) {
-              reportWorkspaceError(
-                { source: "page-tree" },
-                apiErrorMessage(error, "The page tree could not be refreshed."),
-              );
-            }
-          }
+          if (activeTreeNeedsRefresh) trashTreeRefreshRequiredGeneration.current += 1;
           if (controller.signal.aborted) return;
           const visiblePages = data.pages.filter((page) => !confirmedRestoredPageRevisions.has(page.id));
           const pageIds = new Set(visiblePages.map((page) => page.id));
@@ -836,6 +831,30 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             return next.length === current.length ? current : next;
           });
           clearWorkspaceErrors({ source: "trash-load" });
+          const requiredTreeRefreshGeneration = trashTreeRefreshRequiredGeneration.current;
+          if (requiredTreeRefreshGeneration > trashTreeRefreshCompletedGeneration.current) {
+            void loadFreshPages().then(
+              () => {
+                trashTreeRefreshCompletedGeneration.current = Math.max(
+                  trashTreeRefreshCompletedGeneration.current,
+                  requiredTreeRefreshGeneration,
+                );
+              },
+              (error) => {
+                if (
+                  controller.signal.aborted ||
+                  latestTrashLoadVersion.current !== version ||
+                  trashTreeRefreshCompletedGeneration.current >= requiredTreeRefreshGeneration
+                ) {
+                  return;
+                }
+                reportWorkspaceError(
+                  { source: "page-tree" },
+                  apiErrorMessage(error, "The page tree could not be refreshed."),
+                );
+              },
+            );
+          }
         })
         .catch((error) => {
           if (controller.signal.aborted) return;
@@ -999,10 +1018,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }
   async function archive(page: Page) {
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
-    const removalOperationId = crypto.randomUUID();
     const errorScope = page.id;
     const attempt = startScopedWorkspaceErrorAttempt("archive", errorScope);
     try {
+      const removalOperationId = crypto.randomUUID();
       const knownPageIds = pageSubtreeIds(pages, page.id);
       const result = await requestMutation(
         `/api/pages/${page.id}`,
@@ -1047,6 +1066,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         }
         reportWorkspaceError({ source: "page-tree" }, refreshError);
       }
+    } catch (error) {
+      reportWorkspaceError(attempt, apiErrorMessage(error, "The page could not be archived."));
     } finally {
       finishWorkspaceErrorAttempt(attempt);
     }

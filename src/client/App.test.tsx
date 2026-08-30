@@ -343,6 +343,45 @@ describe("App error handling", () => {
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
   });
 
+  it("sends the archive operation id to the server", async () => {
+    const operationId = "00000000-0000-4000-8000-000000000001";
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(operationId);
+    onTestFinished(() => randomUUID.mockRestore());
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockWorkspaceApi();
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(`/api/pages/${page.id}`, {
+        method: "DELETE",
+        headers: { "x-notes-operation-id": operationId },
+      }),
+    );
+  });
+
+  it("reports an archive error when operation id generation fails", async () => {
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockImplementation(() => {
+      throw new Error("Random UUID unavailable.");
+    });
+    onTestFinished(() => randomUUID.mockRestore());
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockWorkspaceApi();
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+
+    expect(await screen.findByText("The page could not be archived.")).toBeInTheDocument();
+    expect(api).not.toHaveBeenCalledWith(`/api/pages/${page.id}`, expect.objectContaining({ method: "DELETE" }));
+  });
+
   it("keeps an unseen archived descendant removed and starts a fresh post-archive tree load", async () => {
     const staleReload = deferred<{ pages: Page[] }>();
     const child = { ...page, id: "child-page", parentId: page.id, position: "a1", title: "Child" };
@@ -1382,6 +1421,7 @@ describe("App error handling", () => {
   it("refreshes the active tree when Trash reveals a newer archive", async () => {
     const archivedPage = { ...page, archivedAt: 2 };
     const rearchivedPage = { ...archivedPage, revision: page.revision + 1, updatedAt: page.updatedAt + 1 };
+    const activeTreeRefresh = deferred<{ pages: Page[] }>();
     let archivedAgain = false;
     let trashLoads = 0;
     let treeLoads = 0;
@@ -1391,7 +1431,8 @@ describe("App error handling", () => {
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return { pages: archivedAgain ? [] : [page] };
+        if (treeLoads === 1) return { pages: [page] };
+        return treeLoads === 2 ? activeTreeRefresh.promise : { pages: [] };
       }
       if (path === "/api/pages/tree?archived=true") {
         trashLoads += 1;
@@ -1415,7 +1456,60 @@ describe("App error handling", () => {
 
     expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
     expect(treeLoads).toBe(2);
-    expect(screen.queryByRole("button", { name: "Roadmap" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "□Roadmap" })).toBeInTheDocument();
+    await act(async () => {
+      activeTreeRefresh.resolve({ pages: [] });
+      await activeTreeRefresh.promise;
+    });
+    expect(screen.queryByRole("button", { name: "□Roadmap" })).not.toBeInTheDocument();
+  });
+
+  it("does not report a failed active-tree refresh from an older Trash request", async () => {
+    const archivedPage = { ...page, archivedAt: 2 };
+    const rearchivedPage = { ...archivedPage, revision: page.revision + 1, updatedAt: page.updatedAt + 1 };
+    const activeTreeRefresh = deferred<{ pages: Page[] }>();
+    let archivedAgain = false;
+    let trashLoads = 0;
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        return treeLoads === 2 ? activeTreeRefresh.promise : { pages: [] };
+      }
+      if (path === "/api/pages/tree?archived=true") {
+        trashLoads += 1;
+        return { pages: [archivedAgain ? rearchivedPage : archivedPage] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
+    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
+    await waitFor(() => expect(trashLoads).toBe(2));
+    expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
+
+    archivedAgain = true;
+    fireEvent.click(screen.getByRole("button", { name: /Search/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
+    expect(treeLoads).toBe(2);
+
+    fireEvent.click(screen.getByRole("button", { name: /Search/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    await waitFor(() => expect(trashLoads).toBe(4));
+    await act(async () => {
+      activeTreeRefresh.reject(new ApiClientError(503, "tree_unavailable", "Tree refresh unavailable."));
+      await activeTreeRefresh.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(treeLoads).toBe(3));
+    expect(screen.queryByText("Tree refresh unavailable.")).not.toBeInTheDocument();
   });
 
   it("does not expose a just-restored page when the next active tree is stale", async () => {
@@ -1820,8 +1914,9 @@ describe("App error handling", () => {
     expect(localStorage.getItem("notes:last-page")).toBe(otherPage.id);
   });
 
-  it("repairs navigation to a page that is absent from the loaded tree", async () => {
+  it("preserves navigation to a page until its workspace event reaches the loaded tree", async () => {
     const otherPage = { ...page, id: "other-page", position: "b0", title: "Other" };
+    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
@@ -1834,11 +1929,14 @@ describe("App error handling", () => {
 
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
     act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: "missing-page" }));
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
     });
 
-    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
     expect(localStorage.getItem("notes:last-page")).toBe(page.id);
+    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [missingPage] }));
+
+    await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(missingPage.id));
+    expect(screen.getByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
   });
 
   it("does not let an older restore preference overwrite a newer restored selection", async () => {
