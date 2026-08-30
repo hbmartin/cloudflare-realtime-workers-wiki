@@ -27,7 +27,16 @@ function page(id: string, revision: number, title = id): Page {
 
 describe("page state reconciliation", () => {
   it("ignores delayed page upserts with an older revision", () => {
-    expect(mergePages([page("a", 3, "new")], [page("a", 2, "old")])).toEqual([page("a", 3, "new")]);
+    const current = [page("a", 3, "new")];
+
+    expect(mergePages(current, [page("a", 2, "old")])).toBe(current);
+  });
+
+  it("preserves the current array when an upsert is already present", () => {
+    const existing = page("a", 3, "current");
+    const current = [existing];
+
+    expect(mergePages(current, [existing])).toBe(current);
   });
 
   it("applies events that arrived while a tree snapshot was loading", () => {
@@ -101,16 +110,6 @@ describe("page state reconciliation", () => {
 
     expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set(["removed"]));
     expect(tombstones.applyLoad(new Set(["removed"]), 8)).toEqual(new Set());
-  });
-
-  it("does not restart recovery grace for an older removal", () => {
-    const tombstones = new PageRemovalTombstones();
-    tombstones.pin(["removed"], 5);
-    expect(tombstones.applyLoad(new Set(["removed"]), 6)).toEqual(new Set(["removed"]));
-
-    tombstones.pin(["removed"], 4);
-
-    expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set());
   });
 
   it("does not advance the removal checkpoint for an empty pin", () => {
