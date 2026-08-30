@@ -59,6 +59,8 @@ export class PageRemovalTombstones {
   pin(pageIds: Iterable<string>, currentLoadGeneration: number) {
     let pinGeneration: number | null = null;
     for (const pageId of pageIds) {
+      const previous = this.entries.get(pageId);
+      if (previous && currentLoadGeneration < previous.pinnedDuringLoad) continue;
       pinGeneration ??= ++this.latestPinGeneration;
       this.entries.set(pageId, {
         pinnedDuringLoad: currentLoadGeneration,
@@ -126,12 +128,29 @@ export class PageRemovalTombstones {
   }
 }
 
+function samePage(left: Page, right: Page) {
+  return (
+    left.id === right.id &&
+    left.workspaceId === right.workspaceId &&
+    left.parentId === right.parentId &&
+    left.kind === right.kind &&
+    left.position === right.position &&
+    left.title === right.title &&
+    left.icon === right.icon &&
+    left.revision === right.revision &&
+    left.contentEpoch === right.contentEpoch &&
+    left.archivedAt === right.archivedAt &&
+    left.createdAt === right.createdAt &&
+    left.updatedAt === right.updatedAt
+  );
+}
+
 export function mergePages(current: Page[], incoming: Page[]) {
   const pages = new Map(current.map((page) => [page.id, page]));
   let changed = false;
   for (const page of incoming) {
     const previous = pages.get(page.id);
-    if (!previous || (page.revision >= previous.revision && previous !== page)) {
+    if (!previous || (page.revision >= previous.revision && !samePage(previous, page))) {
       pages.set(page.id, page);
       changed = true;
     }
@@ -141,10 +160,14 @@ export function mergePages(current: Page[], incoming: Page[]) {
 
 export function mergePageSnapshot(current: Page[], snapshot: Page[]) {
   const existing = new Map(current.map((page) => [page.id, page]));
-  return snapshot.map((page) => {
+  let changed = current.length !== snapshot.length;
+  const next = snapshot.map((page, index) => {
     const previous = existing.get(page.id);
-    return previous && previous.revision > page.revision ? previous : page;
+    const merged = previous && (previous.revision > page.revision || samePage(previous, page)) ? previous : page;
+    if (current[index] !== merged) changed = true;
+    return merged;
   });
+  return changed ? next : current;
 }
 
 export function authoritativePageSnapshot(
