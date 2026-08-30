@@ -26,7 +26,7 @@ describe("connectionRetryDelay", () => {
 });
 
 describe("reconciliationRetryDelay", () => {
-  it("uses equal jitter before retrying a stale read", () => {
+  it("jitters a 750 ms retry interval by 250 ms", () => {
     vi.spyOn(Math, "random")
       .mockReturnValueOnce(0)
       .mockReturnValueOnce(1 - Number.EPSILON);
