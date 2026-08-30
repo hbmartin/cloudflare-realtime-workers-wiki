@@ -121,23 +121,34 @@ describe("page state reconciliation", () => {
 
   it("restarts recovery grace for a new removal", () => {
     const tombstones = new PageRemovalTombstones();
-    tombstones.pin(["removed"], 5);
+    tombstones.pin(["removed"], 5, "first-removal");
     expect(tombstones.applyLoad(new Set(["removed"]), 6)).toEqual(new Set(["removed"]));
 
-    tombstones.pin(["removed"], 6);
+    tombstones.pin(["removed"], 6, "second-removal");
 
     expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set(["removed"]));
     expect(tombstones.applyLoad(new Set(["removed"]), 8)).toEqual(new Set());
   });
 
-  it("does not restart recovery grace for an older removal", () => {
+  it("does not restart recovery grace for a duplicate removal operation", () => {
     const tombstones = new PageRemovalTombstones();
-    tombstones.pin(["removed"], 5);
+    tombstones.pin(["removed"], 5, "same-removal");
     expect(tombstones.applyLoad(new Set(["removed"]), 6)).toEqual(new Set(["removed"]));
 
-    tombstones.pin(["removed"], 4);
+    tombstones.pin(["removed"], 6, "same-removal");
 
     expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set());
+  });
+
+  it("does not re-pin a released tombstone for a delayed duplicate operation", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["removed"], 5, "same-removal");
+    const checkpoint = tombstones.checkpoint();
+    tombstones.release(["removed"], checkpoint);
+
+    tombstones.pin(["removed"], 6, "same-removal");
+
+    expect(tombstones.has("removed")).toBe(false);
   });
 
   it("does not advance the removal checkpoint for an empty pin", () => {
@@ -148,6 +159,15 @@ describe("page state reconciliation", () => {
     tombstones.pin([], 6);
 
     expect(tombstones.checkpoint()).toBe(checkpoint);
+  });
+
+  it("does not consume an operation id for an empty pin", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin([], 5, "removal");
+
+    tombstones.pin(["removed"], 5, "removal");
+
+    expect(tombstones.has("removed")).toBe(true);
   });
 
   it("releases an archive removal when the page is explicitly restored", () => {

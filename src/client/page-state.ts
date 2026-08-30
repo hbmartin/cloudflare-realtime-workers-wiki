@@ -49,18 +49,31 @@ export class PageLoadEventBuffer {
  * may confirm a removal only when it started after the removal was pinned.
  */
 export class PageRemovalTombstones {
+  // The HTTP response and workspace event can report the same archive. Keep a
+  // bounded history so delayed duplicates cannot restart or resurrect its grace period.
+  private static readonly MAX_SEEN_OPERATIONS = 256;
   private latestPinGeneration = 0;
   private lastAppliedLoadGeneration = 0;
+  private readonly seenOperations = new Set<string>();
+  private readonly seenOperationOrder: string[] = [];
   private readonly entries = new Map<
     string,
     { pinnedDuringLoad: number; pinGeneration: number; firstFreshPresenceGeneration: number | null }
   >();
 
-  pin(pageIds: Iterable<string>, currentLoadGeneration: number) {
+  pin(pageIds: Iterable<string>, currentLoadGeneration: number, operationId?: string) {
+    const ids = [...pageIds];
+    if (!ids.length) return;
+    if (operationId && this.seenOperations.has(operationId)) return;
+    if (operationId) {
+      this.seenOperations.add(operationId);
+      this.seenOperationOrder.push(operationId);
+      if (this.seenOperationOrder.length > PageRemovalTombstones.MAX_SEEN_OPERATIONS) {
+        this.seenOperations.delete(this.seenOperationOrder.shift()!);
+      }
+    }
     let pinGeneration: number | null = null;
-    for (const pageId of pageIds) {
-      const previous = this.entries.get(pageId);
-      if (previous && currentLoadGeneration < previous.pinnedDuringLoad) continue;
+    for (const pageId of ids) {
       pinGeneration ??= ++this.latestPinGeneration;
       this.entries.set(pageId, {
         pinnedDuringLoad: currentLoadGeneration,
@@ -128,21 +141,26 @@ export class PageRemovalTombstones {
   }
 }
 
+const PAGE_FIELDS = [
+  "id",
+  "workspaceId",
+  "parentId",
+  "kind",
+  "position",
+  "title",
+  "icon",
+  "revision",
+  "contentEpoch",
+  "archivedAt",
+  "createdAt",
+  "updatedAt",
+] as const satisfies readonly (keyof Page)[];
+
+type UncomparedPageField = Exclude<keyof Page, (typeof PAGE_FIELDS)[number]>;
+
 function samePage(left: Page, right: Page) {
-  return (
-    left.id === right.id &&
-    left.workspaceId === right.workspaceId &&
-    left.parentId === right.parentId &&
-    left.kind === right.kind &&
-    left.position === right.position &&
-    left.title === right.title &&
-    left.icon === right.icon &&
-    left.revision === right.revision &&
-    left.contentEpoch === right.contentEpoch &&
-    left.archivedAt === right.archivedAt &&
-    left.createdAt === right.createdAt &&
-    left.updatedAt === right.updatedAt
-  );
+  const allPageFieldsAreCompared: UncomparedPageField extends never ? true : never = true;
+  return allPageFieldsAreCompared && PAGE_FIELDS.every((field) => left[field] === right[field]);
 }
 
 export function mergePages(current: Page[], incoming: Page[]) {

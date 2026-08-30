@@ -6,6 +6,7 @@ import type { ClientMemberContext, Page, WorkspaceEvent } from "../shared/types"
 import type { EditorPageProps } from "./EditorPage";
 import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
 import { App } from "./App";
+import { PAGE_NAVIGATE_EVENT } from "./mentions";
 
 const mocks = vi.hoisted(() => ({
   createWorkspaceEvents: vi.fn((_workspaceId: string, _onEvent: unknown, _onReconnect: () => void) => ({
@@ -1340,7 +1341,6 @@ describe("App error handling", () => {
       confirmation.resolve({ pages: [page] });
       await confirmation.promise;
     });
-    expect(trashLoads).toBe(2);
     expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
     await act(async () => {
       staleTrash.resolve({ pages: [archivedPage] });
@@ -1348,6 +1348,7 @@ describe("App error handling", () => {
     });
 
     expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
+    expect(trashLoads).toBe(2);
   });
 
   it("shows a confirmed restore in trash after it is archived again", async () => {
@@ -1378,7 +1379,7 @@ describe("App error handling", () => {
     expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
   });
 
-  it("shows a confirmed restore after a later archive event is missed", async () => {
+  it("refreshes the active tree when Trash reveals a newer archive", async () => {
     const archivedPage = { ...page, archivedAt: 2 };
     const rearchivedPage = { ...archivedPage, revision: page.revision + 1, updatedAt: page.updatedAt + 1 };
     let archivedAgain = false;
@@ -1412,8 +1413,9 @@ describe("App error handling", () => {
     fireEvent.click(screen.getByRole("button", { name: /Search/ }));
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
 
-    expect(treeLoads).toBe(1);
     expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
+    expect(treeLoads).toBe(2);
+    expect(screen.queryByRole("button", { name: "Roadmap" })).not.toBeInTheDocument();
   });
 
   it("does not expose a just-restored page when the next active tree is stale", async () => {
@@ -1440,6 +1442,7 @@ describe("App error handling", () => {
 
     expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
+    expect(treeLoads).toBe(2);
   });
 
   it("shows a restored page after an uncertain archive is confirmed by the active tree", async () => {
@@ -1765,6 +1768,33 @@ describe("App error handling", () => {
     await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(page.id));
   });
 
+  it("keeps the restored-root preference when the first confirming tree only has another page", async () => {
+    const archivedPage = { ...page, archivedAt: 2 };
+    const otherPage = { ...page, id: "other-page", position: "b0", title: "Other" };
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [] };
+        return treeLoads === 2 ? { pages: [otherPage] } : { pages: [otherPage, page] };
+      }
+      if (path === "/api/pages/tree?archived=true") return { pages: [archivedPage] };
+      if (path === `/api/pages/${page.id}/restore` && init?.method === "POST") return { ok: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
+
+    await waitFor(() => expect(treeLoads).toBe(3));
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
+  });
+
   it("falls back to an available page when a pending restored root is absent", async () => {
     const archivedPage = { ...page, archivedAt: 2 };
     const otherPage = { ...page, id: "other-page", position: "b0", title: "Other" };
@@ -1788,6 +1818,27 @@ describe("App error handling", () => {
 
     expect(await screen.findByRole("button", { name: "Archive Other" })).toBeInTheDocument();
     expect(localStorage.getItem("notes:last-page")).toBe(otherPage.id);
+  });
+
+  it("repairs navigation to a page that is absent from the loaded tree", async () => {
+    const otherPage = { ...page, id: "other-page", position: "b0", title: "Other" };
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page, otherPage] };
+      if (path === "/api/pages/tree?archived=true") return { pages: [] };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: "missing-page" }));
+    });
+
+    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
   });
 
   it("does not let an older restore preference overwrite a newer restored selection", async () => {
@@ -2196,8 +2247,8 @@ describe("App error handling", () => {
     });
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(trashLoads).toBe(2);
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(trashLoads).toBe(2);
     expect(
       screen.queryByText("The server returned an invalid restore response. Refreshing pages."),
     ).not.toBeInTheDocument();
