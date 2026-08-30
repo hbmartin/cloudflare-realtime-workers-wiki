@@ -76,7 +76,11 @@ const PAGE_FIELD_VALIDATORS = {
   updatedAt: (value: unknown) => typeof value === "number",
 } satisfies { [Field in keyof Page]-?: (value: unknown) => boolean };
 
-const PAGE_FIELDS: readonly (keyof Page)[] = Object.keys(PAGE_FIELD_VALIDATORS) as (keyof Page)[];
+export const PAGE_FIELDS: readonly (keyof Page)[] = Object.keys(PAGE_FIELD_VALIDATORS) as (keyof Page)[];
+
+export function pageWithoutUnknownFields(value: Page): Page {
+  return Object.fromEntries(PAGE_FIELDS.map((field) => [field, value[field]])) as Page;
+}
 
 export function isPage(value: unknown): value is Page {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;

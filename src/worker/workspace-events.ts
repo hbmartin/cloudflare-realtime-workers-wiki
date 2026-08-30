@@ -1,7 +1,7 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { YServer } from "y-partyserver";
-import type { Page, WorkspaceEvent } from "../shared/types";
-import { ID_PATTERN, isPage } from "../shared/validation";
+import type { WorkspaceEvent } from "../shared/types";
+import { ID_PATTERN, isPage, pageWithoutUnknownFields } from "../shared/validation";
 import type { Env } from "./env";
 
 export interface EventConnectionAuth {
@@ -20,23 +20,6 @@ function stringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
-function normalizedPage(value: Page): Page {
-  return {
-    id: value.id,
-    workspaceId: value.workspaceId,
-    parentId: value.parentId,
-    kind: value.kind,
-    position: value.position,
-    title: value.title,
-    icon: value.icon,
-    revision: value.revision,
-    contentEpoch: value.contentEpoch,
-    archivedAt: value.archivedAt,
-    createdAt: value.createdAt,
-    updatedAt: value.updatedAt,
-  };
-}
-
 function workspaceEvent(value: unknown): WorkspaceEvent | null {
   const event = record(value);
   if (!event) return null;
@@ -48,7 +31,7 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
   ) {
     return {
       type: "pages-upserted",
-      pages: event.pages.map(normalizedPage),
+      pages: event.pages.map(pageWithoutUnknownFields),
       ...(event.restored === undefined ? {} : { restored: event.restored }),
     };
   }
