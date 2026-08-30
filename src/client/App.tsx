@@ -209,8 +209,12 @@ type WorkspacePageAction =
 
 function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAction): WorkspacePageState {
   if (action.type === "select") {
-    if (state.selectedId === action.pageId && state.pendingRestoredRoot === null) return state;
-    return { ...state, selectedId: action.pageId, pendingRestoredRoot: null };
+    const selectedId =
+      action.pageId !== null && state.pagesLoaded && !state.pages.some((page) => page.id === action.pageId)
+        ? (state.pages[0]?.id ?? null)
+        : action.pageId;
+    if (state.selectedId === selectedId && state.pendingRestoredRoot === null) return state;
+    return { ...state, selectedId, pendingRestoredRoot: null };
   }
   if (action.type === "load") {
     const pages = mergePageSnapshot(state.pages, action.pages);
@@ -220,7 +224,9 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
         ? state.selectedId
         : state.pendingRestoredRoot && pageIds.has(state.pendingRestoredRoot.id)
           ? state.pendingRestoredRoot.id
-          : (pages[0]?.id ?? null);
+          : state.pendingRestoredRoot
+            ? null
+            : (pages[0]?.id ?? null);
     const pendingRestoredRoot = selectedId === null ? state.pendingRestoredRoot : null;
     if (
       pages === state.pages &&
@@ -250,9 +256,7 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
     const selectedWasRemoved = state.selectedId !== null && action.pageIds.has(state.selectedId);
     const selectedId = selectedWasRemoved ? (pages[0]?.id ?? null) : state.selectedId;
     const pendingRestoredRoot =
-      (state.pendingRestoredRoot && action.pageIds.has(state.pendingRestoredRoot.id)) || selectedId !== state.selectedId
-        ? null
-        : state.pendingRestoredRoot;
+      state.pendingRestoredRoot && action.pageIds.has(state.pendingRestoredRoot.id) ? null : state.pendingRestoredRoot;
     if (
       pages.length === state.pages.length &&
       selectedId === state.selectedId &&
@@ -277,8 +281,16 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
     }
     return { ...state, selectedId: action.rootPageId, pendingRestoredRoot: null };
   }
-  if (state.pendingRestoredRoot?.token !== action.token) return state;
-  return { ...state, pendingRestoredRoot: null };
+  if (action.type === "clear-restored-root") {
+    if (state.pendingRestoredRoot?.token !== action.token) return state;
+    return {
+      ...state,
+      selectedId: state.selectedId ?? state.pages[0]?.id ?? null,
+      pendingRestoredRoot: null,
+    };
+  }
+  const unhandledAction: never = action;
+  return unhandledAction;
 }
 
 async function resolveAppState(): Promise<AppState> {
@@ -794,15 +806,28 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const request = { version, controller, promise: Promise.resolve() };
       setTrashLoading(true);
       const loading = api<{ pages: Page[] }>("/api/pages/tree?archived=true", { signal: controller.signal })
-        .then((data) => {
+        .then(async (data) => {
           if (controller.signal.aborted) return;
           const archivedPagesById = new Map(data.pages.map((page) => [page.id, page]));
+          let activeTreeNeedsRefresh = false;
           for (const [pageId, restoredRevision] of confirmedRestoredPageRevisions) {
             const archivedPage = archivedPagesById.get(pageId);
             if (!archivedPage || archivedPage.revision > restoredRevision) {
               confirmedRestoredPageRevisions.delete(pageId);
+              if (archivedPage) activeTreeNeedsRefresh = true;
             }
           }
+          if (activeTreeNeedsRefresh) {
+            try {
+              await loadFreshPages();
+            } catch (error) {
+              reportWorkspaceError(
+                { source: "page-tree" },
+                apiErrorMessage(error, "The page tree could not be refreshed."),
+              );
+            }
+          }
+          if (controller.signal.aborted) return;
           const visiblePages = data.pages.filter((page) => !confirmedRestoredPageRevisions.has(page.id));
           const pageIds = new Set(visiblePages.map((page) => page.id));
           setTrash(visiblePages);
@@ -825,7 +850,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       trashLoadRequest.current = request;
       return loading;
     },
-    [clearWorkspaceErrors, confirmedRestoredPageRevisions, reportWorkspaceError],
+    [clearWorkspaceErrors, confirmedRestoredPageRevisions, loadFreshPages, reportWorkspaceError],
   );
   useEffect(() => {
     if (view === "trash") void loadTrash(trashRefreshVersion);
@@ -901,7 +926,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       }
       if (event.type === "pages-removed") {
         clearConfirmedRestores(event.pageIds);
-        archiveRemovalTombstones.pin(event.pageIds, pageLoadGeneration.current);
+        archiveRemovalTombstones.pin(event.pageIds, pageLoadGeneration.current, event.operationId);
         recordPageRemovals(event.pageIds);
         for (const pageId of event.pageIds) invalidatePagePreview(pageId);
         const removedIds = new Set(event.pageIds);
@@ -974,12 +999,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }
   async function archive(page: Page) {
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
+    const removalOperationId = crypto.randomUUID();
     const errorScope = page.id;
     const attempt = startScopedWorkspaceErrorAttempt("archive", errorScope);
     try {
       const knownPageIds = pageSubtreeIds(pages, page.id);
-      const result = await requestMutation(`/api/pages/${page.id}`, { method: "DELETE" }, (value) =>
-        archivePageIds(value, page.id),
+      const result = await requestMutation(
+        `/api/pages/${page.id}`,
+        { method: "DELETE", headers: { "x-notes-operation-id": removalOperationId } },
+        (value) => archivePageIds(value, page.id),
       );
       const pageAlreadyGone = result.kind === "rejected" && isPageNotFoundError(result.error);
       const archiveWasUnverified =
@@ -1001,7 +1029,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       }
       if (removedIds) {
         clearConfirmedRestores(removedIds);
-        archiveRemovalTombstones.pin(removedIds, pageLoadGeneration.current);
+        archiveRemovalTombstones.pin(removedIds, pageLoadGeneration.current, removalOperationId);
         for (const pageId of removedIds) invalidatePagePreview(pageId);
         dispatchPageAction({ type: "remove", pageIds: removedIds });
       } else if (result.kind === "uncertain") {

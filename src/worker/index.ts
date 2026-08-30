@@ -856,6 +856,12 @@ app.delete("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
+  const requestedOperationId = c.req.header("x-notes-operation-id");
+  const operationId =
+    requestedOperationId &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedOperationId)
+      ? requestedOperationId
+      : undefined;
   const timestamp = now();
   await c.env.DB.batch([
     c.env.DB.prepare(
@@ -901,6 +907,7 @@ app.delete("/api/pages/:id", async (c) => {
     type: "pages-removed",
     pageIds,
     permanently: false,
+    ...(operationId ? { operationId } : {}),
   });
   const pendingPageIds = await processArchiveDisconnectTargets(
     c.env,

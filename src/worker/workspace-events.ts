@@ -31,7 +31,12 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
   ) {
     return event as WorkspaceEvent;
   }
-  if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
+  if (
+    event.type === "pages-removed" &&
+    stringList(event.pageIds) &&
+    typeof event.permanently === "boolean" &&
+    (event.operationId === undefined || typeof event.operationId === "string")
+  ) {
     return event as WorkspaceEvent;
   }
   if (
