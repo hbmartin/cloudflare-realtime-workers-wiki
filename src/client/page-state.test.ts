@@ -39,6 +39,18 @@ describe("page state reconciliation", () => {
     expect(mergePages(current, [existing])).toBe(current);
   });
 
+  it("preserves the current array for a structurally identical upsert", () => {
+    const current = [page("a", 3, "current")];
+
+    expect(mergePages(current, [page("a", 3, "current")])).toBe(current);
+  });
+
+  it("applies a structurally changed upsert with the same revision", () => {
+    const current = [page("a", 3, "old title")];
+
+    expect(mergePages(current, [page("a", 3, "new title")])).toEqual([page("a", 3, "new title")]);
+  });
+
   it("applies events that arrived while a tree snapshot was loading", () => {
     const authoritative = authoritativePageSnapshot(
       [page("a", 2, "old"), page("removed", 1)],
@@ -56,6 +68,12 @@ describe("page state reconciliation", () => {
 
     expect(pages).toEqual([page("a", 1)]);
     expect([...authoritative.ids]).toEqual(["a"]);
+  });
+
+  it("preserves the current array for a structurally identical snapshot", () => {
+    const current = [page("a", 1), page("b", 2)];
+
+    expect(mergePageSnapshot(current, [page("a", 1), page("b", 2)])).toBe(current);
   });
 
   it("discards a failed load's event window before a later retry", () => {
@@ -110,6 +128,16 @@ describe("page state reconciliation", () => {
 
     expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set(["removed"]));
     expect(tombstones.applyLoad(new Set(["removed"]), 8)).toEqual(new Set());
+  });
+
+  it("does not restart recovery grace for an older removal", () => {
+    const tombstones = new PageRemovalTombstones();
+    tombstones.pin(["removed"], 5);
+    expect(tombstones.applyLoad(new Set(["removed"]), 6)).toEqual(new Set(["removed"]));
+
+    tombstones.pin(["removed"], 4);
+
+    expect(tombstones.applyLoad(new Set(["removed"]), 7)).toEqual(new Set());
   });
 
   it("does not advance the removal checkpoint for an empty pin", () => {

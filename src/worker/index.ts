@@ -862,7 +862,9 @@ app.delete("/api/pages/:id", async (c) => {
       `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       ) UPDATE pages SET archived_at = ?, archived_by = ?, updated_at = ? WHERE id IN subtree`,
+       ) UPDATE pages
+           SET archived_at = ?, archived_by = ?, revision = revision + 1, updated_at = ?
+         WHERE id IN subtree`,
     ).bind(page.id, member.workspace.id, timestamp, member.user.id, timestamp),
     c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
@@ -935,7 +937,9 @@ app.post("/api/pages/:id/restore", async (c) => {
         `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       ) UPDATE pages SET archived_at = NULL, archived_by = NULL, updated_at = ? WHERE id IN subtree`,
+       ) UPDATE pages
+           SET archived_at = NULL, archived_by = NULL, revision = revision + 1, updated_at = ?
+         WHERE id IN subtree`,
       ).bind(page.id, member.workspace.id, now()),
       c.env.DB.prepare(
         `DELETE FROM archive_disconnect_targets WHERE page_id IN (

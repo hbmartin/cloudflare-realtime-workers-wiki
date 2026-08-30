@@ -2036,11 +2036,11 @@ describe("Worker integration", () => {
     );
 
     expect(restored.status).toBe(200);
-    const result = await restored.json<{ pages: Array<{ id: string; archivedAt: number | null }> }>();
+    const result = await restored.json<{ pages: Array<{ id: string; archivedAt: number | null; revision: number }> }>();
     expect(result.pages).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: installed.pageId, archivedAt: null }),
-        expect.objectContaining({ id: child.id, archivedAt: null }),
+        expect.objectContaining({ id: installed.pageId, archivedAt: null, revision: 3 }),
+        expect.objectContaining({ id: child.id, archivedAt: null, revision: 3 }),
       ]),
     );
     const indexed = await env.DB.prepare(`SELECT page_id FROM page_search WHERE page_id IN (?, ?) ORDER BY page_id`)
