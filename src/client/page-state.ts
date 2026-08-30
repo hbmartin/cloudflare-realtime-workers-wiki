@@ -172,9 +172,15 @@ const COMPARABLE_PAGE_FIELDS = [
 
 type UncomparedPageField = Exclude<keyof Page, (typeof COMPARABLE_PAGE_FIELDS)[number]>;
 
+function samePage(
+  left: Page,
+  right: Page,
+  ..._missingFields: [UncomparedPageField] extends [never]
+    ? []
+    : ["Add missing Page fields to COMPARABLE_PAGE_FIELDS", UncomparedPageField]
+): boolean;
 function samePage(left: Page, right: Page) {
-  const allPageFieldsAreCompared: UncomparedPageField extends never ? true : never = true;
-  return allPageFieldsAreCompared && COMPARABLE_PAGE_FIELDS.every((field) => left[field] === right[field]);
+  return COMPARABLE_PAGE_FIELDS.every((field) => left[field] === right[field]);
 }
 
 export function mergePages(current: Page[], incoming: Page[]) {

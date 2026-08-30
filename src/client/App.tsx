@@ -200,6 +200,7 @@ type WorkspacePageState = {
 
 type WorkspacePageAction =
   | { type: "select"; pageId: string }
+  | { type: "clear-pending-selection"; pageId: string }
   | { type: "load"; pages: Page[] }
   | { type: "merge"; pages: Page[] }
   | { type: "merge-restored"; pages: Page[]; rootPageId: string | null }
@@ -208,8 +209,8 @@ type WorkspacePageAction =
   | { type: "confirm-restored-root"; rootPageId: string; token: number }
   | { type: "clear-restored-root"; token: number };
 
-function assertNeverWorkspacePageAction(_action: never): never {
-  throw new Error("Unhandled workspace page action.");
+function assertNeverWorkspacePageAction(action: never): never {
+  throw new Error(`Unhandled workspace page action: ${JSON.stringify(action)}`);
 }
 
 function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAction): WorkspacePageState {
@@ -225,6 +226,14 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
       return state;
     }
     return { ...state, selectedId, pendingSelectionId, pendingRestoredRoot: null };
+  }
+  if (action.type === "clear-pending-selection") {
+    if (state.pendingSelectionId !== action.pageId) return state;
+    return {
+      ...state,
+      selectedId: state.selectedId ?? state.pages[0]?.id ?? null,
+      pendingSelectionId: null,
+    };
   }
   if (action.type === "load") {
     const pages = mergePageSnapshot(state.pages, action.pages);
@@ -578,6 +587,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
   const [trashRefreshVersion, setTrashRefreshVersion] = useState(0);
   const [trashLoading, setTrashLoading] = useState(false);
+  const [pageTreeRetrying, setPageTreeRetrying] = useState(false);
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const [archiveRemovalTombstones] = useState(() => new PageRemovalTombstones());
@@ -595,6 +605,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   } | null>(null);
   const trashTreeRefreshOwed = useRef(false);
   const trashTreeRefreshPromise = useRef<Promise<void> | null>(null);
+  const pageTreeRetryingRef = useRef(false);
   const trashMutationIdsRef = useRef(new Set<string>());
   const workspaceErrorAttemptRef = useRef(0);
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
@@ -869,7 +880,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const request = { version, controller, promise: Promise.resolve() };
       setTrashLoading(true);
       const loading = api<{ pages: Page[] }>("/api/pages/tree?archived=true", { signal: controller.signal })
-        .then(async (data) => {
+        .then((data) => {
           if (controller.signal.aborted) return;
           const archivedPagesById = new Map(data.pages.map((page) => [page.id, page]));
           const rearchivedPageIds: string[] = [];
@@ -887,13 +898,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             dispatchPageAction({ type: "remove", pageIds: new Set(rearchivedPageIds) });
             trashTreeRefreshOwed.current = true;
           }
-          if (trashTreeRefreshOwed.current || trashTreeRefreshPromise.current) {
-            try {
-              await ensureTrashTreeRefresh();
-            } catch {
-              return;
-            }
-          }
           if (controller.signal.aborted) return;
           const visiblePages = data.pages.filter((page) => !confirmedRestoredPageRevisions.has(page.id));
           const pageIds = new Set(visiblePages.map((page) => page.id));
@@ -903,6 +907,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             return next.length === current.length ? current : next;
           });
           clearWorkspaceErrors({ source: "trash-load" });
+          if (trashTreeRefreshOwed.current || trashTreeRefreshPromise.current) {
+            void ensureTrashTreeRefresh().catch(() => undefined);
+          }
         })
         .catch((error) => {
           if (controller.signal.aborted) return;
@@ -1066,8 +1073,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     return items;
   }, [pages, pendingSelectionId, selected]);
 
-  async function createPage(kind: PageKind, parentId: string | null = selected?.parentId ?? null) {
-    const result = await api<{ page: Page }>("/api/pages", { method: "POST", body: json({ kind, parentId }) });
+  async function createPage(kind: PageKind, parentId?: string | null) {
+    const resolvedParentId =
+      parentId === undefined ? (pendingSelectionId ? null : (selected?.parentId ?? null)) : parentId;
+    const result = await api<{ page: Page }>("/api/pages", {
+      method: "POST",
+      body: json({ kind, parentId: resolvedParentId }),
+    });
     recordPageUpserts([result.page]);
     dispatchPageAction({ type: "merge", pages: [result.page] });
     navigateToPage(result.page.id);
@@ -1076,7 +1088,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
     const errorScope = page.id;
     const attempt = startScopedWorkspaceErrorAttempt("archive", errorScope);
-    let archiveWasCommitted = false;
+    let archiveOutcome: "not-started" | "rejected" | "uncertain" | "committed" = "not-started";
     try {
       const removalOperationId = crypto.randomUUID();
       const knownPageIds = pageSubtreeIds(pages, page.id);
@@ -1086,7 +1098,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         (value) => archivePageIds(value, page.id),
       );
       const pageAlreadyGone = result.kind === "rejected" && isPageNotFoundError(result.error);
-      archiveWasCommitted = result.kind === "committed" || pageAlreadyGone;
+      archiveOutcome =
+        result.kind === "committed" || pageAlreadyGone
+          ? "committed"
+          : result.kind === "uncertain"
+            ? "uncertain"
+            : "rejected";
       const archiveWasUnverified =
         result.kind === "uncertain" || (result.kind === "committed" && result.value === null);
       const removedIds =
@@ -1097,12 +1114,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             : null;
       if (result.kind === "committed" && result.value === null) {
         reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
-      } else if (result.kind !== "committed" && !pageAlreadyGone) {
+      } else if (result.kind === "uncertain") {
         const archiveError =
           result.error instanceof SuccessfulApiResponseError
             ? "The archive response could not be verified. Refreshing the page tree."
-            : apiErrorMessage(result.error, "The page could not be archived.");
+            : apiErrorMessage(result.error, "The archive result could not be verified. Refreshing the page tree.");
         reportWorkspaceError(attempt, archiveError);
+      } else if (result.kind === "rejected" && !pageAlreadyGone) {
+        reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be archived."));
       }
       if (removedIds) {
         clearConfirmedRestores(removedIds);
@@ -1129,12 +1148,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         attempt,
         apiErrorMessage(
           error,
-          archiveWasCommitted
+          archiveOutcome === "committed"
             ? "The page was archived, but the workspace could not be updated."
-            : "The page could not be archived.",
+            : archiveOutcome === "uncertain"
+              ? "The page may have been archived, but the workspace could not be updated."
+              : "The page could not be archived.",
         ),
       );
-      if (archiveWasCommitted) {
+      if (archiveOutcome === "committed" || archiveOutcome === "uncertain") {
         refreshTrash();
         try {
           await loadFreshPages();
@@ -1187,11 +1208,35 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     setView(next);
     setSidebarOpen(false);
   }
+  async function retryPageTree(errorTarget: WorkspaceErrorTarget, fallbackMessage: string, afterSuccess?: () => void) {
+    if (pageTreeRetryingRef.current) return;
+    pageTreeRetryingRef.current = true;
+    setPageTreeRetrying(true);
+    clearWorkspaceErrors(errorTarget);
+    try {
+      await loadFreshPages();
+      afterSuccess?.();
+    } catch (error) {
+      reportWorkspaceError(errorTarget, apiErrorMessage(error, fallbackMessage));
+    } finally {
+      pageTreeRetryingRef.current = false;
+      setPageTreeRetrying(false);
+    }
+  }
+  function retryInitialPageLoad() {
+    void retryPageTree({ source: "page-tree" }, "The page tree could not be loaded.");
+  }
   function retryPendingSelection() {
-    clearWorkspaceErrors({ source: "page-access" });
-    void loadFreshPages().catch((error) => {
-      reportWorkspaceError({ source: "page-access" }, apiErrorMessage(error, "The page could not be loaded."));
+    if (!pendingSelectionId) return;
+    const pageId = pendingSelectionId;
+    void retryPageTree({ source: "page-access" }, "The page could not be loaded.", () => {
+      dispatchPageAction({ type: "clear-pending-selection", pageId });
     });
+  }
+  function cancelPendingSelection() {
+    if (!pendingSelectionId) return;
+    clearWorkspaceErrors({ source: "page-access" });
+    dispatchPageAction({ type: "clear-pending-selection", pageId: pendingSelectionId });
   }
   const updatePage = useCallback(
     (page: Page) => {
@@ -1323,6 +1368,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
   const workspaceError = formatErrorMessages(workspaceErrors);
   const trashLoadFailed = workspaceErrors.some((error) => error.source === "trash-load");
+  const initialPageLoadFailed = !pagesLoaded && workspaceErrors.some((error) => error.source === "page-tree");
 
   return (
     <div className="workspace-shell">
@@ -1417,10 +1463,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           </div>
           {member.role !== "viewer" && (
             <div className="new-menu">
-              <button className="primary-small" onClick={() => void createPage("document")}>
+              <button
+                className="primary-small"
+                disabled={!pagesLoaded || pendingSelectionId !== null}
+                onClick={() => void createPage("document")}
+              >
                 + Page
               </button>
-              <button className="quiet-button" onClick={() => void createPage("table")}>
+              <button
+                className="quiet-button"
+                disabled={!pagesLoaded || pendingSelectionId !== null}
+                onClick={() => void createPage("table")}
+              >
                 + Table
               </button>
             </div>
@@ -1444,11 +1498,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         ) : view === "settings" ? (
           <MembersView member={member} />
         ) : !pagesLoaded ? (
-          <PendingPage message="Loading the workspace…" />
+          <PendingPage
+            message="Loading the workspace…"
+            onRetry={initialPageLoadFailed || pageTreeRetrying ? retryInitialPageLoad : undefined}
+            retrying={pageTreeRetrying}
+          />
         ) : pendingSelectionId ? (
           <PendingPage
             message="This page has not reached the workspace tree yet. It may still be syncing."
+            onCancel={cancelPendingSelection}
             onRetry={retryPendingSelection}
+            retrying={pageTreeRetrying}
           />
         ) : selected ? (
           selected.kind === "document" ? (
@@ -1861,16 +1921,33 @@ function EmptyWorkspace({ canEdit, onCreate }: { canEdit: boolean; onCreate: () 
   );
 }
 
-function PendingPage({ message, onRetry }: { message: string; onRetry?: () => void }) {
+function PendingPage({
+  message,
+  onRetry,
+  onCancel,
+  retrying = false,
+}: {
+  message: string;
+  onRetry?: () => void;
+  onCancel?: () => void;
+  retrying?: boolean;
+}) {
   return (
     <main className="empty-workspace" aria-live="polite">
       <div className="empty-illustration">⋯</div>
       <h1>Opening page…</h1>
       <p>{message}</p>
       {onRetry && (
-        <button className="primary-button" onClick={onRetry}>
-          Refresh the page tree
-        </button>
+        <div className="pending-page-actions">
+          <button className="primary-button" disabled={retrying} onClick={onRetry}>
+            {retrying ? "Refreshing…" : "Refresh the page tree"}
+          </button>
+          {onCancel && (
+            <button className="quiet-button" disabled={retrying} onClick={onCancel}>
+              Return to current page
+            </button>
+          )}
+        </div>
       )}
     </main>
   );
