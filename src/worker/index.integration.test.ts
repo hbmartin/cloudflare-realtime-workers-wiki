@@ -542,7 +542,7 @@ describe("Worker integration", () => {
     expect(await failedPrecondition.text()).toBe("");
   });
 
-  it("rejects malformed internal workspace events", async () => {
+  it("rejects malformed core workspace events and drops malformed advisory ids", async () => {
     const installed = await bootstrap();
     const stub = env.WORKSPACE_EVENTS.getByName(installed.workspaceId);
     const malformed = await stub.fetch(
@@ -589,7 +589,7 @@ describe("Worker integration", () => {
         }),
       }),
     );
-    expect(invalidOperation.status).toBe(400);
+    expect(invalidOperation.status).toBe(200);
   });
 
   it("allows JSON uploads, rejects executable extensions, and ignores punctuation-only search terms", async () => {

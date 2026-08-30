@@ -31,13 +31,15 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
   ) {
     return event as WorkspaceEvent;
   }
-  if (
-    event.type === "pages-removed" &&
-    stringList(event.pageIds) &&
-    typeof event.permanently === "boolean" &&
-    (event.operationId === undefined || (typeof event.operationId === "string" && ID_PATTERN.test(event.operationId)))
-  ) {
-    return event as WorkspaceEvent;
+  if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
+    const operationId =
+      typeof event.operationId === "string" && ID_PATTERN.test(event.operationId) ? event.operationId : undefined;
+    return {
+      type: "pages-removed",
+      pageIds: event.pageIds,
+      permanently: event.permanently,
+      ...(operationId ? { operationId } : {}),
+    };
   }
   if (
     event.type === "projection-updated" &&
