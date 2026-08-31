@@ -158,6 +158,8 @@ describe("App error handling", () => {
     render(<App />);
 
     expect(await screen.findByText("Tree unavailable.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Workspace unavailable" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create a root page" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
 
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
@@ -784,7 +786,8 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
     expect(await screen.findByText(/invalid archive response/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Archive Second" }));
-    expect(await screen.findByText(/Second archive failure/)).toBeInTheDocument();
+    expect(await screen.findByText(/archive result could not be verified/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Second archive failure/)).not.toBeInTheDocument();
 
     await act(async () => {
       reconciliation.resolve({ pages: [page, secondPage] });
@@ -792,7 +795,7 @@ describe("App error handling", () => {
     });
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(screen.getByText("Second archive failure.")).toBeInTheDocument();
+    expect(screen.getByText("The archive result could not be verified. Refreshing the page tree.")).toBeInTheDocument();
     expect(screen.queryByText(/invalid archive response/i)).not.toBeInTheDocument();
   });
 
@@ -836,9 +839,7 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(
-      screen.getByText("The archive response could not be verified. Refreshing the page tree."),
-    ).toBeInTheDocument();
+    expect(screen.getByText("The archive result could not be verified. Refreshing the page tree.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
   });
@@ -872,7 +873,7 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.queryByText(/archive response could not be verified/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/archive result could not be verified/i)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
   });
 
@@ -2062,7 +2063,7 @@ describe("App error handling", () => {
     expect(screen.getByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
   });
 
-  it("makes pending-navigation retries single-flight and falls back when the target remains absent", async () => {
+  it("makes pending-navigation retries single-flight and keeps waiting when the target remains absent", async () => {
     const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
     const retry = deferred<{ pages: Page[] }>();
     let treeLoads = 0;
@@ -2083,6 +2084,8 @@ describe("App error handling", () => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
     });
     expect(screen.getByRole("button", { name: "+ Page" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Create a root page" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Add child to Roadmap" })).toBeDisabled();
 
     const refresh = screen.getByRole("button", { name: "Refresh the page tree" });
     fireEvent.click(refresh);
@@ -2095,8 +2098,47 @@ describe("App error handling", () => {
       await retry.promise;
     });
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Opening page…" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Return to current page" })).toBeEnabled();
     expect(treeLoads).toBe(2);
+
+    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [missingPage] }));
+    expect(await screen.findByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
+  });
+
+  it("keeps the pending-navigation escape available while a retry is in flight", async () => {
+    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
+    const retry = deferred<{ pages: Page[] }>();
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return treeLoads === 1 ? { pages: [page] } : retry.promise;
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+
+    const cancel = screen.getByRole("button", { name: "Return to current page" });
+    expect(cancel).toBeEnabled();
+    fireEvent.click(cancel);
+    expect(screen.queryByRole("heading", { name: "Opening page…" })).not.toBeInTheDocument();
+
+    await act(async () => {
+      retry.resolve({ pages: [page] });
+      await retry.promise;
+    });
+    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
   });
 
   it("lets the user abandon a pending navigation target", async () => {
@@ -2118,6 +2160,28 @@ describe("App error handling", () => {
 
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Opening page…" })).not.toBeInTheDocument();
+  });
+
+  it("abandons a pending navigation when the user leaves the pages view", async () => {
+    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Search/ }));
+
+    expect(screen.getByRole("heading", { name: "Find anything" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "+ Page" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Return to current page" })).not.toBeInTheDocument();
   });
 
   it("keeps a pending navigation target through a stale tree response", async () => {
@@ -3033,7 +3097,12 @@ describe("App error handling", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
 
-    expect(await screen.findByText("Archive service unavailable. Tree refresh unavailable.")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "The archive result could not be verified. Refreshing the page tree. Tree refresh unavailable.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Archive service unavailable/)).not.toBeInTheDocument();
     expect(reported).toHaveBeenCalledWith(
       "Page tree could not be refreshed after an unverified archive",
       expect.any(ApiClientError),

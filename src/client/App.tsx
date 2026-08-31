@@ -12,7 +12,6 @@ import {
   isSuccessfulJsonResponseBodyError,
   json,
   onApiUnauthorized,
-  SuccessfulApiResponseError,
 } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
@@ -209,8 +208,8 @@ type WorkspacePageAction =
   | { type: "confirm-restored-root"; rootPageId: string; token: number }
   | { type: "clear-restored-root"; token: number };
 
-function assertNeverWorkspacePageAction(action: never): never {
-  throw new Error(`Unhandled workspace page action: ${JSON.stringify(action)}`);
+function assertNeverWorkspacePageAction(_action: never): never {
+  throw new Error("Unhandled workspace page action.");
 }
 
 function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAction): WorkspacePageState {
@@ -898,7 +897,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             dispatchPageAction({ type: "remove", pageIds: new Set(rearchivedPageIds) });
             trashTreeRefreshOwed.current = true;
           }
-          if (controller.signal.aborted) return;
           const visiblePages = data.pages.filter((page) => !confirmedRestoredPageRevisions.has(page.id));
           const pageIds = new Set(visiblePages.map((page) => page.id));
           setTrash(visiblePages);
@@ -1058,6 +1056,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
   const selected = pages.find((page) => page.id === selectedId) ?? null;
   const resolvedSelectedId = pendingSelectionId ? null : pagesLoaded ? (selected?.id ?? null) : selectedId;
+  const canCreatePage = member.role !== "viewer" && pagesLoaded && pendingSelectionId === null;
   useEffect(() => {
     if (resolvedSelectedId) localStorage.setItem("notes:last-page", resolvedSelectedId);
   }, [resolvedSelectedId]);
@@ -1074,8 +1073,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }, [pages, pendingSelectionId, selected]);
 
   async function createPage(kind: PageKind, parentId?: string | null) {
-    const resolvedParentId =
-      parentId === undefined ? (pendingSelectionId ? null : (selected?.parentId ?? null)) : parentId;
+    if (!canCreatePage) return;
+    const resolvedParentId = parentId === undefined ? (selected?.parentId ?? null) : parentId;
     const result = await api<{ page: Page }>("/api/pages", {
       method: "POST",
       body: json({ kind, parentId: resolvedParentId }),
@@ -1115,11 +1114,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (result.kind === "committed" && result.value === null) {
         reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
       } else if (result.kind === "uncertain") {
-        const archiveError =
-          result.error instanceof SuccessfulApiResponseError
-            ? "The archive response could not be verified. Refreshing the page tree."
-            : apiErrorMessage(result.error, "The archive result could not be verified. Refreshing the page tree.");
-        reportWorkspaceError(attempt, archiveError);
+        reportWorkspaceError(attempt, "The archive result could not be verified. Refreshing the page tree.");
       } else if (result.kind === "rejected" && !pageAlreadyGone) {
         reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be archived."));
       }
@@ -1198,24 +1193,23 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   // so navigating without closing it strands the reader behind the thing they
   // just opened. Selecting a page already closes it; these do the same.
   function showTrash() {
+    cancelPendingSelection();
     setSidebarOpen(false);
-    clearWorkspaceErrors({ source: "page-access" });
     refreshTrash();
     setView("trash");
   }
   function showView(next: "search" | "mentions" | "settings") {
-    clearWorkspaceErrors({ source: "page-access" });
+    cancelPendingSelection();
     setView(next);
     setSidebarOpen(false);
   }
-  async function retryPageTree(errorTarget: WorkspaceErrorTarget, fallbackMessage: string, afterSuccess?: () => void) {
+  async function retryPageTree(errorTarget: WorkspaceErrorTarget, fallbackMessage: string) {
     if (pageTreeRetryingRef.current) return;
     pageTreeRetryingRef.current = true;
     setPageTreeRetrying(true);
     clearWorkspaceErrors(errorTarget);
     try {
       await loadFreshPages();
-      afterSuccess?.();
     } catch (error) {
       reportWorkspaceError(errorTarget, apiErrorMessage(error, fallbackMessage));
     } finally {
@@ -1228,14 +1222,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }
   function retryPendingSelection() {
     if (!pendingSelectionId) return;
-    const pageId = pendingSelectionId;
-    void retryPageTree({ source: "page-access" }, "The page could not be loaded.", () => {
-      dispatchPageAction({ type: "clear-pending-selection", pageId });
-    });
+    void retryPageTree({ source: "page-access" }, "The page could not be loaded.");
   }
   function cancelPendingSelection() {
-    if (!pendingSelectionId) return;
     clearWorkspaceErrors({ source: "page-access" });
+    if (!pendingSelectionId) return;
     dispatchPageAction({ type: "clear-pending-selection", pageId: pendingSelectionId });
   }
   const updatePage = useCallback(
@@ -1398,7 +1389,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         </nav>
         <div className="sidebar-section-title">
           <span>Pages</span>
-          {member.role !== "viewer" && <button onClick={() => void createPage("document", null)}>+</button>}
+          {member.role !== "viewer" && (
+            <button
+              aria-label="Create a root page"
+              disabled={!canCreatePage}
+              onClick={() => void createPage("document", null)}
+            >
+              +
+            </button>
+          )}
         </div>
         <div
           className="tree-root"
@@ -1412,6 +1411,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             nodes={tree}
             selectedId={resolvedSelectedId}
             editable={member.role !== "viewer"}
+            canCreate={canCreatePage}
             onSelect={navigateToPage}
             onCreate={(parentId) => void createPage("document", parentId)}
             onArchive={(page) => void archive(page)}
@@ -1463,18 +1463,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           </div>
           {member.role !== "viewer" && (
             <div className="new-menu">
-              <button
-                className="primary-small"
-                disabled={!pagesLoaded || pendingSelectionId !== null}
-                onClick={() => void createPage("document")}
-              >
+              <button className="primary-small" disabled={!canCreatePage} onClick={() => void createPage("document")}>
                 + Page
               </button>
-              <button
-                className="quiet-button"
-                disabled={!pagesLoaded || pendingSelectionId !== null}
-                onClick={() => void createPage("table")}
-              >
+              <button className="quiet-button" disabled={!canCreatePage} onClick={() => void createPage("table")}>
                 + Table
               </button>
             </div>
@@ -1499,12 +1491,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <MembersView member={member} />
         ) : !pagesLoaded ? (
           <PendingPage
-            message="Loading the workspace…"
+            title={initialPageLoadFailed ? "Workspace unavailable" : "Loading workspace…"}
+            message={
+              initialPageLoadFailed
+                ? "The page tree could not be loaded. Refresh it to try again."
+                : "Fetching the latest page tree."
+            }
             onRetry={initialPageLoadFailed || pageTreeRetrying ? retryInitialPageLoad : undefined}
             retrying={pageTreeRetrying}
           />
         ) : pendingSelectionId ? (
           <PendingPage
+            title="Opening page…"
             message="This page has not reached the workspace tree yet. It may still be syncing."
             onCancel={cancelPendingSelection}
             onRetry={retryPendingSelection}
@@ -1548,6 +1546,7 @@ function PageTree({
   nodes,
   selectedId,
   editable,
+  canCreate,
   onSelect,
   onCreate,
   onArchive,
@@ -1558,6 +1557,7 @@ function PageTree({
   nodes: PageNode[];
   selectedId: string | null;
   editable: boolean;
+  canCreate: boolean;
   onSelect: (id: string) => void;
   onCreate: (parentId: string) => void;
   onArchive: (page: Page) => void;
@@ -1609,7 +1609,7 @@ function PageTree({
         </button>
         {editable && (
           <div className="tree-actions">
-            <button onClick={() => onCreate(node.id)} aria-label={`Add child to ${node.title}`}>
+            <button disabled={!canCreate} onClick={() => onCreate(node.id)} aria-label={`Add child to ${node.title}`}>
               +
             </button>
             <button onClick={() => onArchive(node)} aria-label={`Archive ${node.title}`}>
@@ -1621,7 +1621,17 @@ function PageTree({
       {node.children.length > 0 && (
         <div className="tree-children">
           <PageTree
-            {...{ nodes: node.children, selectedId, editable, onSelect, onCreate, onArchive, onDropPage, onMove }}
+            {...{
+              nodes: node.children,
+              selectedId,
+              editable,
+              canCreate,
+              onSelect,
+              onCreate,
+              onArchive,
+              onDropPage,
+              onMove,
+            }}
             grandparentId={node.parentId}
           />
         </div>
@@ -1922,11 +1932,13 @@ function EmptyWorkspace({ canEdit, onCreate }: { canEdit: boolean; onCreate: () 
 }
 
 function PendingPage({
+  title,
   message,
   onRetry,
   onCancel,
   retrying = false,
 }: {
+  title: string;
   message: string;
   onRetry?: () => void;
   onCancel?: () => void;
@@ -1935,7 +1947,7 @@ function PendingPage({
   return (
     <main className="empty-workspace" aria-live="polite">
       <div className="empty-illustration">⋯</div>
-      <h1>Opening page…</h1>
+      <h1>{title}</h1>
       <p>{message}</p>
       {onRetry && (
         <div className="pending-page-actions">
@@ -1943,7 +1955,7 @@ function PendingPage({
             {retrying ? "Refreshing…" : "Refresh the page tree"}
           </button>
           {onCancel && (
-            <button className="quiet-button" disabled={retrying} onClick={onCancel}>
+            <button className="quiet-button" onClick={onCancel}>
               Return to current page
             </button>
           )}

@@ -581,27 +581,30 @@ describe("Worker integration", () => {
       const broadcast = vi
         .spyOn(workspaceEvents, "broadcastCustomMessage")
         .mockImplementation((message) => void delivered.push(message));
-      const invalidOperation = await workspaceEvents.onRequest(
-        new Request("https://workspace-events.internal/broadcast", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-notes-internal": env.BETTER_AUTH_SECRET,
-          },
-          body: JSON.stringify({
-            type: "pages-removed",
-            pageIds: [installed.pageId],
-            permanently: false,
-            operationId: "invalid/operation",
+      try {
+        const invalidOperation = await workspaceEvents.onRequest(
+          new Request("https://workspace-events.internal/broadcast", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-notes-internal": env.BETTER_AUTH_SECRET,
+            },
+            body: JSON.stringify({
+              type: "pages-removed",
+              pageIds: [installed.pageId],
+              permanently: false,
+              operationId: "invalid/operation",
+            }),
           }),
-        }),
-      );
-      broadcast.mockRestore();
+        );
 
-      expect(invalidOperation.status).toBe(200);
-      expect(delivered.map((message) => JSON.parse(message))).toEqual([
-        { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
-      ]);
+        expect(invalidOperation.status).toBe(200);
+        expect(delivered.map((message) => JSON.parse(message))).toEqual([
+          { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
+        ]);
+      } finally {
+        broadcast.mockRestore();
+      }
     });
   });
 
@@ -633,42 +636,45 @@ describe("Worker integration", () => {
           }),
         );
 
-      expect(
-        (
-          await request({
+      try {
+        expect(
+          (
+            await request({
+              type: "pages-upserted",
+              pages: [eventPage],
+              restored: true,
+              internalTrace: "trace",
+            })
+          ).status,
+        ).toBe(200);
+        expect(
+          (
+            await request({
+              type: "projection-updated",
+              pageId: installed.pageId,
+              backlinkTargetIds: ["backlink"],
+              mentionTargetUserIds: [installed.userId],
+              internalTrace: "trace",
+            })
+          ).status,
+        ).toBe(200);
+
+        expect(delivered.map((message) => JSON.parse(message))).toEqual([
+          {
             type: "pages-upserted",
-            pages: [eventPage],
+            pages: [expectedPage],
             restored: true,
-            internalTrace: "trace",
-          })
-        ).status,
-      ).toBe(200);
-      expect(
-        (
-          await request({
+          },
+          {
             type: "projection-updated",
             pageId: installed.pageId,
             backlinkTargetIds: ["backlink"],
             mentionTargetUserIds: [installed.userId],
-            internalTrace: "trace",
-          })
-        ).status,
-      ).toBe(200);
-      broadcast.mockRestore();
-
-      expect(delivered.map((message) => JSON.parse(message))).toEqual([
-        {
-          type: "pages-upserted",
-          pages: [expectedPage],
-          restored: true,
-        },
-        {
-          type: "projection-updated",
-          pageId: installed.pageId,
-          backlinkTargetIds: ["backlink"],
-          mentionTargetUserIds: [installed.userId],
-        },
-      ]);
+          },
+        ]);
+      } finally {
+        broadcast.mockRestore();
+      }
     });
   });
 

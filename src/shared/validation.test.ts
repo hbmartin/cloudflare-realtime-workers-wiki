@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { columnType, isPage, nullableId, pageKind, role, text, ValidationError } from "./validation";
+import type { Page } from "./types";
+import {
+  columnType,
+  isPage,
+  nullableId,
+  pageKind,
+  pageWithoutUnknownFields,
+  role,
+  text,
+  ValidationError,
+} from "./validation";
 
 describe("request validation", () => {
   it("accepts only defined roles and column kinds", () => {
@@ -25,11 +35,13 @@ describe("request validation", () => {
       archivedAt: null,
       createdAt: 1,
       updatedAt: 1,
-    };
+    } satisfies Page;
+    const pageWithDiagnostic = { ...page, privateDiagnostic: "hidden" };
 
     expect(isPage(page)).toBe(true);
     expect(isPage({ ...page, kind: "canvas" })).toBe(false);
     expect(isPage({ ...page, revision: "1" })).toBe(false);
+    expect(pageWithoutUnknownFields(pageWithDiagnostic)).toEqual(page);
   });
 
   it("normalizes bounded text and nullable ids", () => {
