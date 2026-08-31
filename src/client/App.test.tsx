@@ -2141,6 +2141,50 @@ describe("App error handling", () => {
     expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
   });
 
+  it("ignores a failed pending-navigation retry after cancellation and permits a new retry", async () => {
+    const firstMissingPage = { ...page, id: "first-missing-page", position: "c0", title: "First missing" };
+    const secondMissingPage = { ...page, id: "second-missing-page", position: "d0", title: "Second missing" };
+    const firstRetry = deferred<{ pages: Page[] }>();
+    const staleFailure = new ApiClientError(503, "tree_unavailable", "Stale tree failure.");
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        if (treeLoads === 2) return firstRetry.promise;
+        return { pages: [page, secondMissingPage] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: firstMissingPage.id }));
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: secondMissingPage.id }));
+    });
+    expect(screen.getByRole("button", { name: "Refresh the page tree" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
+
+    await act(async () => {
+      firstRetry.reject(staleFailure);
+      await firstRetry.promise.catch(() => undefined);
+    });
+
+    expect(await screen.findByRole("button", { name: "Archive Second missing" })).toBeInTheDocument();
+    expect(treeLoads).toBe(3);
+    expect(screen.queryByText("Stale tree failure.")).not.toBeInTheDocument();
+  });
+
   it("lets the user abandon a pending navigation target", async () => {
     const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
     vi.mocked(api).mockImplementation(async (path) => {
@@ -3089,10 +3133,8 @@ describe("App error handling", () => {
       "confirm",
       vi.fn(() => true),
     );
-    mockWorkspaceApi(
-      new ApiClientError(503, "tree_unavailable", "Tree refresh unavailable."),
-      new ApiClientError(503, "archive_unavailable", "Archive service unavailable."),
-    );
+    const archiveFailure = new ApiClientError(503, "archive_unavailable", "Archive service unavailable.");
+    mockWorkspaceApi(new ApiClientError(503, "tree_unavailable", "Tree refresh unavailable."), archiveFailure);
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
@@ -3103,6 +3145,11 @@ describe("App error handling", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Archive service unavailable/)).not.toBeInTheDocument();
+    expect(reported).toHaveBeenCalledWith("Archive result could not be verified", {
+      pageId: page.id,
+      operationId: expect.any(String),
+      error: archiveFailure,
+    });
     expect(reported).toHaveBeenCalledWith(
       "Page tree could not be refreshed after an unverified archive",
       expect.any(ApiClientError),
