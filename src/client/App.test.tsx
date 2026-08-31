@@ -737,11 +737,16 @@ describe("App error handling", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
-    expect(reported).toHaveBeenCalledWith("Successful mutation response could not be validated", {
-      requestPath: `/api/pages/${page.id}`,
-      method: "DELETE",
-      error: validationFailure,
-    });
+    expect(reported).toHaveBeenCalledWith(
+      "Successful mutation response could not be validated",
+      expect.objectContaining({
+        requestPath: `/api/pages/${page.id}`,
+        method: "DELETE",
+        errorName: "TypeError",
+        errorMessage: validationFailure.message,
+        errorStack: expect.any(String),
+      }),
+    );
     await act(async () => {
       reconciliation.resolve({ pages: [] });
       await reconciliation.promise;
@@ -818,6 +823,8 @@ describe("App error handling", () => {
       }),
     ],
   ])("reports %s as an unverified archive response", async (_label, responseError) => {
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => reported.mockRestore());
     let treeLoads = 0;
     vi.stubGlobal(
       "confirm",
@@ -842,6 +849,17 @@ describe("App error handling", () => {
     expect(screen.getByText("The archive result could not be verified. Refreshing the page tree.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+    expect(reported).toHaveBeenCalledWith(
+      "Archive result could not be verified",
+      expect.objectContaining({
+        pageId: page.id,
+        operationId: expect.any(String),
+        outcome: "uncertain",
+        errorName: responseError.name,
+        errorMessage: responseError.message,
+        errorStack: expect.any(String),
+      }),
+    );
   });
 
   it("clears an unverified archive response after reconciliation confirms removal", async () => {
@@ -2106,6 +2124,134 @@ describe("App error handling", () => {
     expect(await screen.findByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
   });
 
+  it("keeps the in-flight retry attached when the same pending page is selected again", async () => {
+    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
+    const retry = deferred<{ pages: Page[] }>();
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return treeLoads === 1 ? { pages: [page] } : retry.promise;
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+    });
+
+    expect(screen.getByRole("button", { name: "Refreshing…" })).toBeDisabled();
+    expect(treeLoads).toBe(2);
+
+    await act(async () => {
+      retry.resolve({ pages: [page] });
+      await retry.promise;
+    });
+    expect(screen.getByRole("button", { name: "Refresh the page tree" })).toBeEnabled();
+  });
+
+  it("invalidates a failed retry when a workspace event resolves its pending page", async () => {
+    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
+    const retry = deferred<{ pages: Page[] }>();
+    const staleFailure = new ApiClientError(503, "tree_unavailable", "Stale tree failure.");
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return treeLoads === 1 ? { pages: [page] } : retry.promise;
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+
+    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [missingPage] }));
+    expect(await screen.findByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
+
+    await act(async () => {
+      retry.reject(staleFailure);
+      await retry.promise.catch(() => undefined);
+    });
+    expect(screen.queryByText("Stale tree failure.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
+  });
+
+  it("aborts a retry when navigation changes target and completes the replacement retry", async () => {
+    const firstMissingPage = { ...page, id: "first-missing-page", position: "c0", title: "First missing" };
+    const secondMissingPage = { ...page, id: "second-missing-page", position: "d0", title: "Second missing" };
+    let firstRetryAborted = false;
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        if (treeLoads === 2) {
+          return new Promise<never>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (!signal) {
+              reject(new Error("The pending page retry did not receive an abort signal."));
+              return;
+            }
+            signal.addEventListener(
+              "abort",
+              () => {
+                firstRetryAborted = true;
+                reject(signal.reason);
+              },
+              { once: true },
+            );
+          });
+        }
+        return { pages: [page] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: firstMissingPage.id }));
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: secondMissingPage.id }));
+    });
+    await waitFor(() => expect(firstRetryAborted).toBe(true));
+    const replacementRetry = screen.getByRole("button", { name: "Refresh the page tree" });
+    expect(replacementRetry).toBeEnabled();
+    fireEvent.click(replacementRetry);
+
+    await waitFor(() => expect(treeLoads).toBe(3));
+    expect(screen.getByRole("heading", { name: "Opening page…" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh the page tree" })).toBeEnabled();
+    expect(screen.queryByText(/could not be loaded/i)).not.toBeInTheDocument();
+  });
+
   it("keeps the pending-navigation escape available while a retry is in flight", async () => {
     const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
     const retry = deferred<{ pages: Page[] }>();
@@ -3145,14 +3291,29 @@ describe("App error handling", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Archive service unavailable/)).not.toBeInTheDocument();
-    expect(reported).toHaveBeenCalledWith("Archive result could not be verified", {
-      pageId: page.id,
-      operationId: expect.any(String),
-      error: archiveFailure,
-    });
+    const archiveLog = reported.mock.calls.find(([message]) => message === "Archive result could not be verified");
+    expect(archiveLog?.[1]).toEqual(
+      expect.objectContaining({
+        pageId: page.id,
+        operationId: expect.any(String),
+        outcome: "uncertain",
+        errorName: "ApiClientError",
+        errorMessage: archiveFailure.message,
+        errorStack: expect.any(String),
+      }),
+    );
+    const operationId = (archiveLog?.[1] as { operationId?: unknown } | undefined)?.operationId;
+    expect(operationId).toEqual(expect.any(String));
     expect(reported).toHaveBeenCalledWith(
       "Page tree could not be refreshed after an unverified archive",
-      expect.any(ApiClientError),
+      expect.objectContaining({
+        pageId: page.id,
+        operationId,
+        archiveOutcome: "uncertain",
+        errorName: "ApiClientError",
+        errorMessage: "Tree refresh unavailable.",
+        errorStack: expect.any(String),
+      }),
     );
   });
 
@@ -3185,9 +3346,26 @@ describe("App error handling", () => {
         "The server returned an invalid archive response. Refreshing the page tree. Tree refresh unavailable.",
       ),
     ).toBeInTheDocument();
+    const archiveLog = reported.mock.calls.find(([message]) => message === "Archive result could not be verified");
+    expect(archiveLog?.[1]).toEqual(
+      expect.objectContaining({
+        pageId: page.id,
+        operationId: expect.any(String),
+        outcome: "committed-invalid-response",
+        errorName: null,
+      }),
+    );
+    const operationId = (archiveLog?.[1] as { operationId?: unknown } | undefined)?.operationId;
     expect(reported).toHaveBeenCalledWith(
       "Page tree could not be refreshed after an unverified archive",
-      expect.any(ApiClientError),
+      expect.objectContaining({
+        pageId: page.id,
+        operationId,
+        archiveOutcome: "committed",
+        errorName: "ApiClientError",
+        errorMessage: "Tree refresh unavailable.",
+        errorStack: expect.any(String),
+      }),
     );
   });
 });
