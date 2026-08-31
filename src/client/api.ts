@@ -61,7 +61,10 @@ function isJsonContentType(contentType: string | null) {
   return mediaType === "application/json" || mediaType?.endsWith("+json") === true;
 }
 
-/** A 2xx response whose body could not be decoded into the API contract. */
+/**
+ * A 2xx response whose body could not be decoded into the API contract.
+ * @expected-unused -- Exported as the base type of the public concrete response errors.
+ */
 export abstract class SuccessfulApiResponseError extends Error {
   readonly hasJsonContentType: boolean;
   readonly requestPath: string;
