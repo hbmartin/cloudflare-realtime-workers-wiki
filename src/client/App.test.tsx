@@ -2196,10 +2196,11 @@ describe("App error handling", () => {
     expect(screen.getByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
   });
 
-  it("aborts a retry when navigation changes target and completes the replacement retry", async () => {
+  it("cancels only the retry observer while reconnect shares its page load", async () => {
     const firstMissingPage = { ...page, id: "first-missing-page", position: "c0", title: "First missing" };
     const secondMissingPage = { ...page, id: "second-missing-page", position: "d0", title: "Second missing" };
-    let firstRetryAborted = false;
+    const sharedTree = deferred<{ pages: Page[] }>();
+    let sharedRequestInit: RequestInit | undefined;
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
@@ -2209,21 +2210,8 @@ describe("App error handling", () => {
         treeLoads += 1;
         if (treeLoads === 1) return { pages: [page] };
         if (treeLoads === 2) {
-          return new Promise<never>((_resolve, reject) => {
-            const signal = init?.signal;
-            if (!signal) {
-              reject(new Error("The pending page retry did not receive an abort signal."));
-              return;
-            }
-            signal.addEventListener(
-              "abort",
-              () => {
-                firstRetryAborted = true;
-                reject(signal.reason);
-              },
-              { once: true },
-            );
-          });
+          sharedRequestInit = init;
+          return sharedTree.promise;
         }
         return { pages: [page] };
       }
@@ -2238,17 +2226,27 @@ describe("App error handling", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
     await waitFor(() => expect(treeLoads).toBe(2));
 
+    reconnectWorkspace();
+    fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
+    expect(sharedRequestInit?.signal).toBeUndefined();
+    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: secondMissingPage.id }));
     });
-    await waitFor(() => expect(firstRetryAborted).toBe(true));
     const replacementRetry = screen.getByRole("button", { name: "Refresh the page tree" });
     expect(replacementRetry).toBeEnabled();
     fireEvent.click(replacementRetry);
+    expect(treeLoads).toBe(2);
 
+    await act(async () => {
+      sharedTree.resolve({ pages: [page] });
+      await sharedTree.promise;
+    });
     await waitFor(() => expect(treeLoads).toBe(3));
     expect(screen.getByRole("heading", { name: "Opening page…" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Refresh the page tree" })).toBeEnabled();
+    expect(screen.queryByText(/page tree could not be refreshed/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/could not be loaded/i)).not.toBeInTheDocument();
   });
 

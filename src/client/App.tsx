@@ -67,6 +67,28 @@ function errorLogFields(error: unknown) {
   };
 }
 
+function observeUntilAborted<T>(promise: Promise<T>, signal: AbortSignal) {
+  if (signal.aborted) return Promise.reject<T>(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    const abort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
 function workspaceErrorAttemptKey(target: WorkspaceErrorTarget) {
   return `${target.source}\u0000${target.scope ?? ""}`;
 }
@@ -773,47 +795,40 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     setTrashRefreshVersion((current) => current + 1);
   }, []);
 
-  const loadPages = useCallback(
-    (signal?: AbortSignal) => {
-      if (pageLoadPromise.current) return pageLoadPromise.current;
-      const loadGeneration = ++pageLoadGeneration.current;
-      pendingPageEvents.current.start();
-      const loading = api<{ pages: Page[] }>("/api/pages/tree", signal ? { signal } : undefined)
-        .then((data) => {
-          const { upserts, removals } = pendingPageEvents.current.consume();
-          const observed = authoritativePageSnapshot(data.pages, upserts, removals);
-          const serverPageIds = new Set(data.pages.map((page) => page.id));
-          const tombstones = archiveRemovalTombstones.applyLoad(serverPageIds, loadGeneration);
-          const authoritativePages = observed.pages.filter((page) => !tombstones.has(page.id));
-          dispatchPageAction({ type: "load", pages: authoritativePages });
-          setWorkspaceErrors((current) => {
-            const next = current.filter((error) => error.source !== "archive" || observed.ids.has(error.scope));
-            return next.length === current.length ? current : next;
-          });
-          clearWorkspaceErrors({ source: "page-tree" });
-          return { serverPages: data.pages, removedDuringLoad: removals };
-        })
-        .catch((error) => {
-          pendingPageEvents.current.cancel();
-          throw error;
-        })
-        .finally(() => {
-          if (pageLoadPromise.current === loading) pageLoadPromise.current = null;
+  const loadPages = useCallback(() => {
+    if (pageLoadPromise.current) return pageLoadPromise.current;
+    const loadGeneration = ++pageLoadGeneration.current;
+    pendingPageEvents.current.start();
+    const loading = api<{ pages: Page[] }>("/api/pages/tree")
+      .then((data) => {
+        const { upserts, removals } = pendingPageEvents.current.consume();
+        const observed = authoritativePageSnapshot(data.pages, upserts, removals);
+        const serverPageIds = new Set(data.pages.map((page) => page.id));
+        const tombstones = archiveRemovalTombstones.applyLoad(serverPageIds, loadGeneration);
+        const authoritativePages = observed.pages.filter((page) => !tombstones.has(page.id));
+        dispatchPageAction({ type: "load", pages: authoritativePages });
+        setWorkspaceErrors((current) => {
+          const next = current.filter((error) => error.source !== "archive" || observed.ids.has(error.scope));
+          return next.length === current.length ? current : next;
         });
-      pageLoadPromise.current = loading;
-      return loading;
-    },
-    [archiveRemovalTombstones, clearWorkspaceErrors],
-  );
-  const loadFreshPages = useCallback(
-    async (signal?: AbortSignal) => {
-      const pendingPageLoad = pageLoadPromise.current;
-      if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
-      signal?.throwIfAborted();
-      return loadPages(signal);
-    },
-    [loadPages],
-  );
+        clearWorkspaceErrors({ source: "page-tree" });
+        return { serverPages: data.pages, removedDuringLoad: removals };
+      })
+      .catch((error) => {
+        pendingPageEvents.current.cancel();
+        throw error;
+      })
+      .finally(() => {
+        if (pageLoadPromise.current === loading) pageLoadPromise.current = null;
+      });
+    pageLoadPromise.current = loading;
+    return loading;
+  }, [archiveRemovalTombstones, clearWorkspaceErrors]);
+  const loadFreshPages = useCallback(async () => {
+    const pendingPageLoad = pageLoadPromise.current;
+    if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
+    return loadPages();
+  }, [loadPages]);
   const ensureTrashTreeRefresh = useCallback(() => {
     const pending = trashTreeRefreshPromise.current;
     if (pending) return pending;
@@ -1305,7 +1320,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     setPageTreeRetrying(true);
     clearWorkspaceErrors(errorAttempt);
     try {
-      await loadFreshPages(activeRetry.controller.signal);
+      await observeUntilAborted(loadFreshPages(), activeRetry.controller.signal);
     } catch (error) {
       if (!activeRetry.controller.signal.aborted) {
         reportWorkspaceError(errorAttempt, apiErrorMessage(error, fallbackMessage));
