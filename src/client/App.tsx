@@ -12,6 +12,7 @@ import {
   isSuccessfulJsonResponseBodyError,
   json,
   onApiUnauthorized,
+  SuccessfulApiResponseError,
 } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
@@ -208,8 +209,16 @@ type WorkspacePageAction =
   | { type: "confirm-restored-root"; rootPageId: string; token: number }
   | { type: "clear-restored-root"; token: number };
 
-function assertNeverWorkspacePageAction(_action: never): never {
-  throw new Error("Unhandled workspace page action.");
+function assertNeverWorkspacePageAction(action: never): never {
+  const unknownAction: unknown = action;
+  const actionType =
+    typeof unknownAction === "object" &&
+    unknownAction !== null &&
+    "type" in unknownAction &&
+    typeof unknownAction.type === "string"
+      ? unknownAction.type
+      : "<missing type>";
+  throw new Error(`Unhandled workspace page action: ${actionType}`);
 }
 
 function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAction): WorkspacePageState {
@@ -604,7 +613,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   } | null>(null);
   const trashTreeRefreshOwed = useRef(false);
   const trashTreeRefreshPromise = useRef<Promise<void> | null>(null);
-  const pageTreeRetryingRef = useRef(false);
+  const pageTreeRetryAttemptIdRef = useRef(0);
+  const activePageTreeRetryRef = useRef<{ id: number; source: WorkspaceErrorSource } | null>(null);
   const trashMutationIdsRef = useRef(new Set<string>());
   const workspaceErrorAttemptRef = useRef(0);
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
@@ -649,6 +659,19 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [isCurrentWorkspaceErrorAttempt],
   );
+  const invalidateWorkspaceErrorAttempt = useCallback(
+    (target: WorkspaceErrorTarget) => {
+      const attempt = startWorkspaceErrorAttempt(target);
+      clearWorkspaceErrors(attempt);
+      finishWorkspaceErrorAttempt(attempt);
+    },
+    [clearWorkspaceErrors, finishWorkspaceErrorAttempt, startWorkspaceErrorAttempt],
+  );
+  const detachPageTreeRetry = useCallback((source: WorkspaceErrorSource) => {
+    if (activePageTreeRetryRef.current?.source !== source) return;
+    activePageTreeRetryRef.current = null;
+    setPageTreeRetrying(false);
+  }, []);
   const startScopedWorkspaceErrorAttempt = useCallback(
     (source: ScopedWorkspaceErrorSource, scope: string) => {
       const attempt = startWorkspaceErrorAttempt({ source, scope });
@@ -659,12 +682,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const navigateToPage = useCallback(
     (pageId: string) => {
-      clearWorkspaceErrors({ source: "page-access" });
+      invalidateWorkspaceErrorAttempt({ source: "page-access" });
+      detachPageTreeRetry("page-access");
       dispatchPageAction({ type: "select", pageId });
       setView("pages");
       setSidebarOpen(false);
     },
-    [clearWorkspaceErrors],
+    [detachPageTreeRetry, invalidateWorkspaceErrorAttempt],
   );
 
   const recordPageUpserts = useCallback((incoming: Page[]) => {
@@ -1114,6 +1138,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (result.kind === "committed" && result.value === null) {
         reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
       } else if (result.kind === "uncertain") {
+        if (!(result.error instanceof SuccessfulApiResponseError)) {
+          console.error("Archive result could not be verified", {
+            pageId: page.id,
+            operationId: removalOperationId,
+            error: result.error,
+          });
+        }
         reportWorkspaceError(attempt, "The archive result could not be verified. Refreshing the page tree.");
       } else if (result.kind === "rejected" && !pageAlreadyGone) {
         reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be archived."));
@@ -1204,17 +1235,22 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     setSidebarOpen(false);
   }
   async function retryPageTree(errorTarget: WorkspaceErrorTarget, fallbackMessage: string) {
-    if (pageTreeRetryingRef.current) return;
-    pageTreeRetryingRef.current = true;
+    if (activePageTreeRetryRef.current) return;
+    const retryId = ++pageTreeRetryAttemptIdRef.current;
+    const errorAttempt = startWorkspaceErrorAttempt(errorTarget);
+    activePageTreeRetryRef.current = { id: retryId, source: errorTarget.source };
     setPageTreeRetrying(true);
-    clearWorkspaceErrors(errorTarget);
+    clearWorkspaceErrors(errorAttempt);
     try {
       await loadFreshPages();
     } catch (error) {
-      reportWorkspaceError(errorTarget, apiErrorMessage(error, fallbackMessage));
+      reportWorkspaceError(errorAttempt, apiErrorMessage(error, fallbackMessage));
     } finally {
-      pageTreeRetryingRef.current = false;
-      setPageTreeRetrying(false);
+      finishWorkspaceErrorAttempt(errorAttempt);
+      if (activePageTreeRetryRef.current?.id === retryId) {
+        activePageTreeRetryRef.current = null;
+        setPageTreeRetrying(false);
+      }
     }
   }
   function retryInitialPageLoad() {
@@ -1225,7 +1261,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     void retryPageTree({ source: "page-access" }, "The page could not be loaded.");
   }
   function cancelPendingSelection() {
-    clearWorkspaceErrors({ source: "page-access" });
+    invalidateWorkspaceErrorAttempt({ source: "page-access" });
+    detachPageTreeRetry("page-access");
     if (!pendingSelectionId) return;
     dispatchPageAction({ type: "clear-pending-selection", pageId: pendingSelectionId });
   }
