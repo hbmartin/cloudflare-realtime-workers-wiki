@@ -12,6 +12,7 @@ import {
   isSuccessfulJsonResponseBodyError,
   json,
   onApiUnauthorized,
+  SuccessfulApiResponseError,
 } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
@@ -1137,11 +1138,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (result.kind === "committed" && result.value === null) {
         reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
       } else if (result.kind === "uncertain") {
-        console.error("Archive result could not be verified", {
-          pageId: page.id,
-          operationId: removalOperationId,
-          error: result.error,
-        });
+        if (!(result.error instanceof SuccessfulApiResponseError)) {
+          console.error("Archive result could not be verified", {
+            pageId: page.id,
+            operationId: removalOperationId,
+            error: result.error,
+          });
+        }
         reportWorkspaceError(attempt, "The archive result could not be verified. Refreshing the page tree.");
       } else if (result.kind === "rejected" && !pageAlreadyGone) {
         reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be archived."));
