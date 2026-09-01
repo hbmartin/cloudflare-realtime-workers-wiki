@@ -42,7 +42,7 @@ type WorkspaceErrorSource =
   | "page-tree"
   | "trash-load"
   | "trash-mutation";
-type ScopedWorkspaceErrorSource = "archive" | "trash-mutation";
+type ScopedWorkspaceErrorSource = "archive" | "page-mutation" | "trash-mutation";
 type UnscopedWorkspaceErrorSource = Exclude<WorkspaceErrorSource, ScopedWorkspaceErrorSource>;
 type WorkspaceErrorTarget =
   | { source: ScopedWorkspaceErrorSource; scope: string }
@@ -101,7 +101,7 @@ function updateWorkspaceErrors(current: WorkspaceError[], target: WorkspaceError
         ? current
         : current.filter((error) => error.source !== target.source)
       : current.filter((error) => error.source !== target.source || error.scope !== target.scope);
-  if (target.source === "archive" || target.source === "trash-mutation") {
+  if (target.scope !== undefined) {
     return [...retained, { source: target.source, message: next, scope: target.scope }];
   }
   return [...retained, { source: target.source, message: next, scope: undefined }];
@@ -139,6 +139,20 @@ function restoreResponsePages(value: unknown, rootPageId: string, workspaceId: s
     return null;
   }
   return pages;
+}
+
+function pageMutationResponse(value: unknown, workspaceId: string, expectedPageId?: string) {
+  const page =
+    value !== null && typeof value === "object" && "page" in value ? (value as { page?: unknown }).page : null;
+  if (
+    !isPage(page) ||
+    page.workspaceId !== workspaceId ||
+    page.archivedAt !== null ||
+    (expectedPageId !== undefined && page.id !== expectedPageId)
+  ) {
+    return null;
+  }
+  return page;
 }
 
 type MutationRequestResult<T> =
@@ -636,8 +650,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   // revision hidden from trash while allowing a later archived revision through.
   const [confirmedRestoredPageRevisions] = useState(() => new Map<string, number>());
   const restoredRootToken = useRef(0);
-  const workspaceAbortController = useRef<AbortController>(null!);
-  workspaceAbortController.current ??= new AbortController();
+  const workspaceAbortController = useRef(new AbortController());
   const pageLoadGeneration = useRef(0);
   const pageLoadRequest = useRef<{
     controller: AbortController;
@@ -721,6 +734,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [isCurrentWorkspaceErrorAttempt],
   );
+  const clearWorkspaceErrorSource = useCallback((source: WorkspaceErrorSource) => {
+    setWorkspaceErrors((current) => {
+      const next = current.filter((error) => error.source !== source);
+      return next.length === current.length ? current : next;
+    });
+  }, []);
   const invalidateWorkspaceErrorAttempt = useCallback(
     (target: WorkspaceErrorTarget) => {
       const attempt = startWorkspaceErrorAttempt(target);
@@ -744,9 +763,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [clearWorkspaceErrors, finishWorkspaceErrorAttempt, invalidateWorkspaceErrorAttempt],
   );
-  const startScopedWorkspaceErrorAttempt = useCallback(
-    (source: ScopedWorkspaceErrorSource, scope: string) => {
-      const attempt = startWorkspaceErrorAttempt({ source, scope });
+  const startClearedWorkspaceErrorAttempt = useCallback(
+    (target: WorkspaceErrorTarget) => {
+      const attempt = startWorkspaceErrorAttempt(target);
       clearWorkspaceErrors(attempt);
       return attempt;
     },
@@ -1224,23 +1243,66 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     return items;
   }, [pages, pendingSelectionId, selected]);
 
+  async function reconcilePageMutation(signal: AbortSignal) {
+    try {
+      await loadFreshPages(signal);
+    } catch (error) {
+      if (signal.aborted) return;
+      reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be refreshed."));
+    }
+  }
+
   async function createPage(kind: PageKind, parentId?: string | null) {
     if (!canCreatePage) return;
     const signal = workspaceAbortController.current.signal;
     const resolvedParentId = parentId === undefined ? (selected?.parentId ?? null) : parentId;
-    const attempt = startWorkspaceErrorAttempt({ source: "page-mutation" });
-    clearWorkspaceErrors(attempt);
+    const operationId = crypto.randomUUID();
+    clearWorkspaceErrorSource("page-mutation");
+    const attempt = startClearedWorkspaceErrorAttempt({ source: "page-mutation", scope: operationId });
     try {
-      const result = await api<{ page: Page }>("/api/pages", {
-        method: "POST",
-        body: json({ kind, parentId: resolvedParentId }),
-      });
+      const result = await requestMutation(
+        "/api/pages",
+        {
+          method: "POST",
+          body: json({ kind, parentId: resolvedParentId }),
+          signal,
+        },
+        (value) => pageMutationResponse(value, member.workspace.id),
+      );
       if (signal.aborted) return;
-      recordPageUpserts([result.page]);
-      dispatchPageAction({ type: "merge", pages: [result.page] });
-      navigateToPage(result.page.id);
+      if (result.kind === "committed" && result.value) {
+        recordPageUpserts([result.value]);
+        dispatchPageAction({ type: "merge", pages: [result.value] });
+        navigateToPage(result.value.id);
+        return;
+      }
+      setSidebarOpen(false);
+      if (result.kind === "rejected") {
+        reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be created."));
+        return;
+      }
+      if (result.kind === "committed") {
+        console.error("Page creation result could not be verified", {
+          operationId,
+          outcome: "committed-invalid-response",
+          ...errorLogFields(result.responseError ?? "Successful response did not contain a valid page."),
+        });
+        reportWorkspaceError(
+          attempt,
+          "The server returned an invalid page-creation response. Refreshing the page tree.",
+        );
+      } else {
+        console.error("Page creation result could not be verified", {
+          operationId,
+          outcome: "uncertain",
+          ...errorLogFields(result.error),
+        });
+        reportWorkspaceError(attempt, "The page-creation result could not be verified. Refreshing the page tree.");
+      }
+      await reconcilePageMutation(signal);
     } catch (error) {
       if (signal.aborted) return;
+      setSidebarOpen(false);
       reportWorkspaceError(attempt, apiErrorMessage(error, "The page could not be created."));
     } finally {
       finishWorkspaceErrorAttempt(attempt);
@@ -1250,7 +1312,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
     const signal = workspaceAbortController.current.signal;
     const errorScope = page.id;
-    const attempt = startScopedWorkspaceErrorAttempt("archive", errorScope);
+    const attempt = startClearedWorkspaceErrorAttempt({ source: "archive", scope: errorScope });
     let archiveOutcome: "not-started" | "rejected" | "uncertain" | "committed" = "not-started";
     let archiveWasUnverified = false;
     let removalOperationId = "";
@@ -1353,18 +1415,54 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     afterId: string | null = null,
   ) {
     const signal = workspaceAbortController.current.signal;
-    const attempt = startWorkspaceErrorAttempt({ source: "page-mutation" });
-    clearWorkspaceErrors(attempt);
+    const operationId = crypto.randomUUID();
+    clearWorkspaceErrorSource("page-mutation");
+    const attempt = startClearedWorkspaceErrorAttempt({ source: "page-mutation", scope: operationId });
     try {
-      const result = await api<{ page: Page }>(`/api/pages/${pageId}/move`, {
-        method: "POST",
-        body: json({ parentId, beforeId, afterId }),
-      });
+      const result = await requestMutation(
+        `/api/pages/${pageId}/move`,
+        {
+          method: "POST",
+          body: json({ parentId, beforeId, afterId }),
+          signal,
+        },
+        (value) => pageMutationResponse(value, member.workspace.id, pageId),
+      );
       if (signal.aborted) return;
-      recordPageUpserts([result.page]);
-      dispatchPageAction({ type: "merge", pages: [result.page] });
+      if (result.kind === "committed" && result.value) {
+        recordPageUpserts([result.value]);
+        dispatchPageAction({ type: "merge", pages: [result.value] });
+        return;
+      }
+      setSidebarOpen(false);
+      if (result.kind === "rejected") {
+        reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be moved."));
+        return;
+      }
+      if (result.kind === "committed") {
+        console.error("Page movement result could not be verified", {
+          operationId,
+          pageId,
+          outcome: "committed-invalid-response",
+          ...errorLogFields(result.responseError ?? "Successful response did not contain the moved page."),
+        });
+        reportWorkspaceError(
+          attempt,
+          "The server returned an invalid page-movement response. Refreshing the page tree.",
+        );
+      } else {
+        console.error("Page movement result could not be verified", {
+          operationId,
+          pageId,
+          outcome: "uncertain",
+          ...errorLogFields(result.error),
+        });
+        reportWorkspaceError(attempt, "The page-movement result could not be verified. Refreshing the page tree.");
+      }
+      await reconcilePageMutation(signal);
     } catch (error) {
       if (signal.aborted) return;
+      setSidebarOpen(false);
       reportWorkspaceError(attempt, apiErrorMessage(error, "The page could not be moved."));
     } finally {
       finishWorkspaceErrorAttempt(attempt);
@@ -1481,7 +1579,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const signal = workspaceAbortController.current.signal;
     const restoreTombstoneCheckpoint = archiveRemovalTombstones.checkpoint();
     const errorScope = page.id;
-    const attempt = startScopedWorkspaceErrorAttempt("trash-mutation", errorScope);
+    const attempt = startClearedWorkspaceErrorAttempt({ source: "trash-mutation", scope: errorScope });
     try {
       let result: Awaited<ReturnType<typeof requestPageRestore>>;
       try {
@@ -1548,24 +1646,33 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!beginTrashMutation(knownPageIds)) return;
     const signal = workspaceAbortController.current.signal;
     const errorScope = page.id;
-    const attempt = startScopedWorkspaceErrorAttempt("trash-mutation", errorScope);
+    const attempt = startClearedWorkspaceErrorAttempt({ source: "trash-mutation", scope: errorScope });
     try {
       const result = await requestMutation(`/api/pages/${page.id}/permanent-delete`, { method: "POST" }, (value) =>
         archivePageIds(value, page.id),
       );
       const deletedIds = result.kind === "committed" ? new Set(result.value ?? knownPageIds) : null;
-      const committedResponseWasInvalid = result.kind === "committed" && result.value === null;
       const previewIds = deletedIds ?? (result.kind === "uncertain" ? knownPageIds : null);
       if (previewIds) {
         for (const pageId of previewIds) invalidatePagePreview(pageId);
       }
       if (signal.aborted) return;
-      if (deletedIds) {
+      if (result.kind === "committed" && deletedIds) {
         setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
-        if (committedResponseWasInvalid) {
+        if (!result.value) {
+          console.error("Permanent-delete result could not be verified", {
+            pageId: page.id,
+            outcome: "committed-invalid-response",
+            ...errorLogFields(result.responseError ?? "Successful response did not contain deleted page IDs."),
+          });
           reportWorkspaceError(attempt, "The server returned an invalid permanent-delete response. Refreshing trash.");
         }
       } else if (result.kind === "uncertain") {
+        console.error("Permanent-delete result could not be verified", {
+          pageId: page.id,
+          outcome: "uncertain",
+          ...errorLogFields(result.error),
+        });
         reportWorkspaceError(attempt, "The permanent-delete result could not be verified. Refreshing trash.");
       } else if (result.kind === "rejected") {
         reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be permanently deleted."));
