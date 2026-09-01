@@ -1105,6 +1105,75 @@ describe("App error handling", () => {
     );
   });
 
+  it("accepts a reconciled append after its captured sibling anchor is removed", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const movedPage = { ...page, position: "c0", revision: 2 };
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page, secondPage] : [movedPage] };
+      }
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    const treeRoot = document.querySelector(".tree-root");
+    if (!treeRoot) throw new Error("The page tree root was not rendered.");
+    fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
+
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
+    expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument();
+    expect(reported).toHaveBeenCalledWith(
+      "Page movement result could not be verified",
+      expect.objectContaining({ outcome: "committed-invalid-response", pageId: page.id }),
+    );
+  });
+
+  it("does not treat a missing append anchor as proof when the page was already last", async () => {
+    const firstPage = { ...page, id: "first-page", position: "a0", title: "First" };
+    const lastPage = { ...page, position: "b0" };
+    const revisedWithoutMoving = { ...lastPage, revision: 2 };
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [firstPage, lastPage] : [revisedWithoutMoving] };
+      }
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    const treeRoot = document.querySelector(".tree-root");
+    if (!treeRoot) throw new Error("The page tree root was not rendered.");
+    fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
+
+    expect(
+      await screen.findByText("The page-movement result could not be verified after refreshing the page tree."),
+    ).toBeInTheDocument();
+    expect(treeLoads).toBe(3);
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
+    expect(reported).toHaveBeenCalledWith(
+      "Page movement result could not be verified",
+      expect.objectContaining({ outcome: "committed-invalid-response", pageId: page.id }),
+    );
+  });
+
   it("does not verify a same-parent append from an unrelated revision bump", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
     const revisedWithoutMoving = { ...page, revision: 2 };

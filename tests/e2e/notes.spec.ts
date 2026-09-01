@@ -41,7 +41,7 @@ async function openSidebar(page: Page) {
   // the length of its slide-out transition. Clicking the toggle while it is already
   // open would also be swallowed by the scrim, which outranks the topbar.
   const toggle = page.getByRole("button", { name: "Open navigation" });
-  const scrim = page.locator('button.sidebar-scrim[aria-label="Close navigation"]');
+  const scrim = page.locator(".sidebar-scrim");
   if ((await toggle.isVisible()) && !(await scrim.isVisible())) await toggle.click();
   await expect(page.getByRole("button", { name: /Members/ })).toBeVisible();
 }
@@ -79,6 +79,7 @@ test.describe.configure({ mode: "serial" });
 test("bootstraps or signs in and passes critical accessibility checks", async ({ page }) => {
   await signIn(page);
   await expect(page.getByLabel("Page title")).toHaveValue("Welcome");
+  await openSidebar(page);
 
   const results = await new AxeBuilder({ page }).exclude(".bn-editor").analyze();
   const critical = results.violations.filter(
@@ -96,6 +97,8 @@ test("creates, renames, archives, and restores a page through the UI", async ({ 
   await titleInput.fill(title);
   await titleInput.press("Enter");
   // Creating a page closes the mobile drawer, and the tree lives inside it.
+  await openSidebar(page);
+  // Calling the helper for an already-open drawer must not click through its scrim.
   await openSidebar(page);
   const pageLink = treeLink(page, title);
   await expect(pageLink).toBeVisible();

@@ -93,9 +93,10 @@ type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
   title: string;
 };
 
-type PageCreateStateRow = PageRow & { receipt_request_hash: string | null };
+type PageJsonRow = Omit<PageRow, "plain_text" | "indexed_seq">;
+type PageCreateStateRow = PageJsonRow & { receipt_request_hash: string | null };
 
-function pageJson(row: PageRow): Page {
+function pageJson(row: PageJsonRow): Page {
   return {
     id: row.id,
     workspaceId: row.workspace_id,
@@ -125,12 +126,14 @@ async function readPageCreateReplay(
 ) {
   const existing = await database
     .prepare(
-      `SELECT p.*, r.request_hash receipt_request_hash
+      `SELECT p.id, p.workspace_id, p.parent_id, p.kind, p.position, p.title, p.icon,
+              p.revision, p.content_epoch, p.archived_at, p.created_at, p.updated_at,
+              r.request_hash receipt_request_hash
          FROM pages p
          LEFT JOIN page_create_receipts r ON r.page_id = p.id AND r.workspace_id = ?
-        WHERE p.id IN (${requested.map(() => "?").join(", ")})`,
+        WHERE p.workspace_id = ? AND p.id IN (${requested.map(() => "?").join(", ")})`,
     )
-    .bind(workspaceId, ...requested.map((page) => page.id))
+    .bind(workspaceId, workspaceId, ...requested.map((page) => page.id))
     .all<PageCreateStateRow>();
   if (!existing.results.length) return null;
   if (existing.results.length !== requested.length) {
@@ -138,25 +141,23 @@ async function readPageCreateReplay(
   }
   const byId = new Map(existing.results.map((row) => [row.id, row]));
   const rows = requested.map((page) => byId.get(page.id)!);
-  const hasReceipt = rows.some((row) => row.receipt_request_hash !== null);
-  if (hasReceipt) {
-    if (rows.some((row) => row.receipt_request_hash !== requestHash)) {
-      throw new HttpError(409, "idempotency_key_reused", conflictMessage);
-    }
-    return rows.map(pageJson);
-  }
-  const legacyMatches = requested.every((page, index) => {
+  const replayMatches = requested.every((page, index) => {
     const row = rows[index]!;
+    if (row.receipt_request_hash !== null) return row.receipt_request_hash === requestHash;
     return (
-      row.workspace_id === workspaceId &&
-      row.archived_at === null &&
-      row.parent_id === page.parentId &&
-      row.kind === page.kind &&
-      row.title === page.title
+      row.archived_at === null && row.parent_id === page.parentId && row.kind === page.kind && row.title === page.title
     );
   });
-  if (!legacyMatches) throw new HttpError(409, "idempotency_key_reused", conflictMessage);
+  if (!replayMatches) throw new HttpError(409, "idempotency_key_reused", conflictMessage);
   return rows.map(pageJson);
+}
+
+async function requestedPageIdsExist(database: D1Database, requested: RequestedPageCreate[]) {
+  const existing = await database
+    .prepare(`SELECT 1 FROM pages WHERE id IN (${requested.map(() => "?").join(", ")}) LIMIT 1`)
+    .bind(...requested.map((page) => page.id))
+    .first();
+  return existing !== null;
 }
 
 async function batchWithFinalResult<T>(
@@ -640,24 +641,21 @@ app.post("/api/pages", async (c) => {
   requireEditor(member);
   const body = await jsonBody(c.req.raw);
   const parentId = nullableId(body.parentId, "parentId");
-  const id = body.id === undefined ? crypto.randomUUID() : text(body.id, "id", 100);
+  const clientProvidedId = body.id !== undefined;
+  const id = clientProvidedId ? text(body.id, "id", 100) : crypto.randomUUID();
   if (!ID_PATTERN.test(id)) throw new HttpError(422, "invalid_input", "id is not a valid resource id.");
   const kind = pageKind(body.kind ?? "document");
   const title = typeof body.title === "string" ? text(body.title, "title", PAGE_TITLE_MAX) : "Untitled";
   const requestHash = await pageCreateRequestHash({ parentId, kind, title });
   const requested = [{ id, parentId, kind, title }];
   const conflictMessage = "That page id already describes a different page.";
-  if (parentId) await pageForMember(c.env, member, parentId);
-  const initialReplay = await readPageCreateReplay(
-    c.env.DB,
-    member.workspace.id,
-    requested,
-    requestHash,
-    conflictMessage,
-  );
+  const initialReplay = clientProvidedId
+    ? await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage)
+    : null;
   if (initialReplay) return c.json({ page: initialReplay[0]! });
+  if (parentId) await pageForMember(c.env, member, parentId);
   const timestamp = now();
-  let created: Page;
+  let createdRow: PageRow | undefined;
   try {
     const last = await c.env.DB.prepare(
       `SELECT position FROM pages WHERE workspace_id = ? AND parent_id IS ? AND archived_at IS NULL
@@ -682,14 +680,19 @@ app.post("/api/pages", async (c) => {
          (workspace_id, page_id, request_hash) VALUES (?, ?, ?)`,
       ).bind(member.workspace.id, id, requestHash),
     ]);
-    const createdRow = results[0]?.results[0];
-    if (!createdRow) throw new Error("The created page was not returned by its insert.");
-    created = pageJson(createdRow);
+    createdRow = results[0]?.results[0];
   } catch (error) {
     const replay = await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage);
     if (replay) return c.json({ page: replay[0]! });
+    if (await requestedPageIdsExist(c.env.DB, requested)) {
+      throw new HttpError(409, "idempotency_key_reused", conflictMessage);
+    }
     throw error;
   }
+  const created = createdRow
+    ? pageJson(createdRow)
+    : (await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage))?.[0];
+  if (!created) throw new Error("The created page was not returned by its insert or its committed receipt.");
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [created] });
   return c.json({ page: created }, 201);
 });
@@ -714,8 +717,10 @@ app.post("/api/pages/batch", async (c) => {
     throw new HttpError(422, "batch_too_large", `A batch is limited to ${PAGE_BATCH_MAX} pages.`);
   }
 
+  let allIdsClientProvided = true;
   const parsed = requested.map((raw, index) => {
     const entry = object(raw);
+    if (entry.id === undefined) allIdsClientProvided = false;
     const requestedId = entry.id === undefined ? crypto.randomUUID() : text(entry.id, `pages[${index}].id`, 100);
     if (!ID_PATTERN.test(requestedId)) {
       throw new HttpError(422, "invalid_input", `pages[${index}].id is not a valid resource id.`);
@@ -732,7 +737,9 @@ app.post("/api/pages/batch", async (c) => {
   }
   const requestHash = await pageCreateRequestHash(parsed);
   const conflictMessage = "Those page ids already describe different pages.";
-  const initialReplay = await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage);
+  const initialReplay = allIdsClientProvided
+    ? await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage)
+    : null;
   if (initialReplay) return c.json({ pages: initialReplay, replayed: true });
 
   // Every distinct parent is checked once, which also rejects a parent in another
@@ -793,20 +800,25 @@ app.post("/api/pages/batch", async (c) => {
       ).bind(member.workspace.id, page.id, requestHash),
     );
   }
-  let createdPages: Page[];
+  let createdRows: Array<PageRow | undefined>;
   try {
     const results = await c.env.DB.batch<PageRow>(statements);
-    const createdRows = pageResultIndexes.map((index) => results[index]?.results[0]);
-    if (createdRows.some((row) => !row)) {
-      throw new Error("The created page batch was not returned completely by its inserts.");
-    }
-    createdPages = createdRows.map((row) => pageJson(row!));
+    createdRows = pageResultIndexes.map((index) => results[index]?.results[0]);
   } catch (error) {
     // A concurrent identical retry may have committed between the existence check
     // and this transaction. Re-read before classifying the unique conflict.
     const replay = await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage);
     if (replay) return c.json({ pages: replay, replayed: true });
+    if (await requestedPageIdsExist(c.env.DB, parsed)) {
+      throw new HttpError(409, "idempotency_key_reused", conflictMessage);
+    }
     throw error;
+  }
+  const createdPages = createdRows.every((row) => row !== undefined)
+    ? createdRows.map((row) => pageJson(row!))
+    : await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage);
+  if (!createdPages) {
+    throw new Error("The created page batch was not returned completely by its inserts or committed receipts.");
   }
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: createdPages });
   return c.json({ pages: createdPages, replayed: false }, 201);

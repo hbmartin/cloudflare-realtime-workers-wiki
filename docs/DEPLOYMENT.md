@@ -120,9 +120,9 @@ pnpm deploy
 ```
 
 Migrations must complete before the Worker is deployed. The Worker queries the projection, mention,
-deletion-job, archive-disconnect, table-state, and page-creation receipt tables on ordinary request paths; deploying
-code that expects a migration which has not been applied produces runtime failures rather than a clean
-startup error.
+deletion-job, archive-disconnect, table-state, and page-creation receipt tables on ordinary request
+paths; deploying code that expects a migration which has not been applied produces runtime failures
+rather than a clean startup error.
 
 `pnpm deploy` runs `pnpm build` again, which runs the full typecheck. To deploy from CI instead, see
 [Automated deployment](#automated-deployment).

@@ -30,6 +30,11 @@ describe("D1 migrations", () => {
     // Sorting a table joins table_cells on column_id, which the primary key cannot serve.
     const indexes = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all<{ name: string }>();
     expect(indexes.results.map((index) => index.name)).toContain("idx_table_cells_column");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_page_create_receipts_page");
+    const pageCreateReceiptIndex = await env.DB.prepare(`PRAGMA index_info(idx_page_create_receipts_page)`).all<{
+      name: string;
+    }>();
+    expect(pageCreateReceiptIndex.results.map((column) => column.name)).toEqual(["page_id"]);
 
     const uploadColumns = await env.DB.prepare(`PRAGMA table_info(attachment_uploads)`).all<{ name: string }>();
     expect(uploadColumns.results.map((column) => column.name)).toEqual(

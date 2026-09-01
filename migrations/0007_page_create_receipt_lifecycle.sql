@@ -17,5 +17,6 @@ INNER JOIN pages AS page
 
 DROP TABLE page_create_receipts;
 ALTER TABLE page_create_receipts_next RENAME TO page_create_receipts;
+CREATE INDEX idx_page_create_receipts_page ON page_create_receipts(page_id);
 
 PRAGMA optimize;
