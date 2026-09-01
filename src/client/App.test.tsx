@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext, Page, WorkspaceEvent } from "../shared/types";
@@ -8,6 +8,7 @@ import type { EditorPageProps } from "./EditorPage";
 import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
 import { App } from "./App";
 import { PAGE_NAVIGATE_EVENT } from "./mentions";
+import { PageLoadEventBuffer } from "./page-state";
 
 const mocks = vi.hoisted(() => ({
   createWorkspaceEvents: vi.fn((_workspaceId: string, _onEvent: unknown, _onReconnect: () => void) => ({
@@ -142,6 +143,7 @@ describe("App error handling", () => {
   });
 
   afterEach(() => {
+    cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });
@@ -464,6 +466,8 @@ describe("App error handling", () => {
   });
 
   it("reconciles an uncertain archive when local handling throws", async () => {
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => reported.mockRestore());
     vi.stubGlobal(
       "confirm",
       vi.fn(() => true),
@@ -484,6 +488,14 @@ describe("App error handling", () => {
         "The page may have been archived, but the workspace could not be updated. Tree refresh unavailable.",
       ),
     ).toBeInTheDocument();
+    expect(reported).toHaveBeenCalledWith(
+      "Page tree could not be refreshed after an unverified archive",
+      expect.objectContaining({
+        pageId: page.id,
+        archiveOutcome: "uncertain",
+        errorMessage: "Tree refresh unavailable.",
+      }),
+    );
   });
 
   it("keeps an unseen archived descendant removed and starts a fresh post-archive tree load", async () => {
@@ -677,7 +689,71 @@ describe("App error handling", () => {
     ).toBeVisible();
   });
 
-  it("stops archive processing when the workspace unmounts before the mutation settles", async () => {
+  it("stops create processing when the workspace unmounts before the mutation settles", async () => {
+    const createdPage = { ...page, id: "created-page", position: "b0", title: "Created" };
+    const creation = deferred<{ page: Page }>();
+    const recordUpserts = vi.spyOn(PageLoadEventBuffer.prototype, "recordUpserts");
+    onTestFinished(() => recordUpserts.mockRestore());
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === "/api/pages" && init?.method === "POST") return creation.promise;
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    const app = render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+    await waitFor(() => expect(api).toHaveBeenCalledWith("/api/pages", expect.objectContaining({ method: "POST" })));
+    recordUpserts.mockClear();
+
+    app.unmount();
+    await act(async () => {
+      creation.resolve({ page: createdPage });
+      await creation.promise;
+    });
+
+    expect(recordUpserts).not.toHaveBeenCalled();
+    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
+  });
+
+  it("stops move processing when the workspace unmounts before the mutation settles", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const movedPage = { ...secondPage, position: "A0" };
+    const movement = deferred<{ page: Page }>();
+    const recordUpserts = vi.spyOn(PageLoadEventBuffer.prototype, "recordUpserts");
+    onTestFinished(() => recordUpserts.mockRestore());
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page, secondPage] };
+      if (path === `/api/pages/${secondPage.id}/move` && init?.method === "POST") return movement.promise;
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    const app = render(<App />);
+
+    const secondLink = (await screen.findByText("Second")).closest("button");
+    if (!secondLink) throw new Error("The second page navigation button was not rendered.");
+    fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(`/api/pages/${secondPage.id}/move`, expect.objectContaining({ method: "POST" })),
+    );
+    recordUpserts.mockClear();
+
+    app.unmount();
+    await act(async () => {
+      movement.resolve({ page: movedPage });
+      await movement.promise;
+    });
+
+    expect(recordUpserts).not.toHaveBeenCalled();
+  });
+
+  it("invalidates committed archive previews but stops workspace processing after unmount", async () => {
     const archiveResponse = deferred<{ ok: true; pageIds: string[] }>();
     let treeLoads = 0;
     vi.stubGlobal(
@@ -709,7 +785,95 @@ describe("App error handling", () => {
     });
 
     expect(treeLoads).toBe(1);
-    expect(mocks.invalidatePagePreview).not.toHaveBeenCalled();
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+  });
+
+  it("invalidates restored previews but starts no workspace refresh after unmount", async () => {
+    const archivedPage = { ...page, archivedAt: 2 };
+    const restoreResponse = deferred<{ pages: Page[] }>();
+    let treeLoads = 0;
+    let trashLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [] };
+      }
+      if (path === "/api/pages/tree?archived=true") {
+        trashLoads += 1;
+        return { pages: [archivedPage] };
+      }
+      if (path === `/api/pages/${page.id}/restore` && init?.method === "POST") return restoreResponse.promise;
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    const app = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(`/api/pages/${page.id}/restore`, expect.objectContaining({ method: "POST" })),
+    );
+
+    app.unmount();
+    await act(async () => {
+      restoreResponse.resolve({ pages: [page] });
+      await restoreResponse.promise;
+    });
+
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+    expect(treeLoads).toBe(1);
+    expect(trashLoads).toBe(1);
+  });
+
+  it("invalidates permanently deleted previews but starts no workspace refresh after unmount", async () => {
+    const owner = { ...member, role: "owner" as const };
+    const archivedPage = { ...page, archivedAt: 2 };
+    const deleteResponse = deferred<{ ok: true; pageIds: string[] }>();
+    let treeLoads = 0;
+    let trashLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return owner;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [] };
+      }
+      if (path === "/api/pages/tree?archived=true") {
+        trashLoads += 1;
+        return { pages: [archivedPage] };
+      }
+      if (path === `/api/pages/${page.id}/permanent-delete` && init?.method === "POST") {
+        return deleteResponse.promise;
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    const app = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete forever" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        `/api/pages/${page.id}/permanent-delete`,
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+
+    app.unmount();
+    await act(async () => {
+      deleteResponse.resolve({ ok: true, pageIds: [page.id] });
+      await deleteResponse.promise;
+    });
+
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
+    expect(treeLoads).toBe(1);
+    expect(trashLoads).toBe(1);
   });
 
   it("does not report archive reconciliation cancellation after workspace teardown", async () => {
@@ -734,6 +898,47 @@ describe("App error handling", () => {
         });
       }
       if (path === `/api/pages/${page.id}` && init?.method === "DELETE") return { ok: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    const app = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    reported.mockClear();
+
+    app.unmount();
+    await act(async () => Promise.resolve());
+
+    expect(reported).not.toHaveBeenCalled();
+  });
+
+  it("does not report recovery reconciliation cancellation after workspace teardown", async () => {
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mocks.invalidatePagePreview.mockImplementationOnce(() => {
+      throw new Error("Preview cache unavailable.");
+    });
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        const signal = init?.signal;
+        if (!signal) throw new Error("The recovery request did not receive a signal.");
+        return new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        throw new ApiClientError(503, "archive_unavailable", "Archive service unavailable.");
+      }
       throw new Error(`Unexpected API request: ${path}`);
     });
     const app = render(<App />);
@@ -3215,6 +3420,7 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Delete forever" }));
 
     expect(await screen.findByText("Deletion service unavailable.")).toBeInTheDocument();
+    expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
   });
 
   it("keeps an invalid restore error and a concurrent delete failure when reconciliation omits the root", async () => {

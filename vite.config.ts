@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 const isE2E = process.env.NOTES_E2E === "1";
+const browserTargets = ["chrome116", "edge116", "firefox124", "safari17.4", "ios17.4"];
 
 export default defineConfig(({ command }) => {
   // Vite writes the redirected Wrangler configuration used by deployment. Select the
@@ -12,8 +13,10 @@ export default defineConfig(({ command }) => {
 
   return {
     build: {
-      // The client combines workspace cancellation with request timeouts via AbortSignal.any.
-      target: ["chrome116", "edge116", "firefox124", "safari17.4", "ios17.4"],
+      // These targets define the documented JavaScript and CSS output baseline.
+      // Runtime APIs are feature-checked before the client mounts; Vite does not polyfill them.
+      target: browserTargets,
+      cssTarget: browserTargets,
     },
     plugins: [
       react(),
