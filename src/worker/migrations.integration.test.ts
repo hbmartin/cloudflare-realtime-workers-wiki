@@ -18,6 +18,7 @@ describe("D1 migrations", () => {
         "deletion_jobs",
         "member_mentions",
         "page_references",
+        "page_create_receipts",
         "prevent_final_owner_demotion",
         "prevent_final_owner_removal",
         "attachment_upload_parts",
@@ -38,6 +39,14 @@ describe("D1 migrations", () => {
     expect(attachmentColumns.results.map((column) => column.name)).toContain("content_sha256");
     const receiptColumns = await env.DB.prepare(`PRAGMA table_info(table_bulk_writes)`).all<{ name: string }>();
     expect(receiptColumns.results.map((column) => column.name)).toContain("request_hash");
+    const pageCreateReceiptColumns = await env.DB.prepare(`PRAGMA table_info(page_create_receipts)`).all<{
+      name: string;
+    }>();
+    expect(pageCreateReceiptColumns.results.map((column) => column.name)).toEqual([
+      "workspace_id",
+      "page_id",
+      "request_hash",
+    ]);
 
     const applied = await env.DB.prepare(`SELECT name FROM d1_migrations ORDER BY id`).all<{ name: string }>();
     expect(applied.results.map((migration) => migration.name)).toEqual(
@@ -65,6 +74,19 @@ describe("D1 migrations", () => {
     await expect(env.DB.prepare(`DELETE FROM workspace_members WHERE user_id = 'owner'`).run()).rejects.toThrow(
       /final_owner/,
     );
+
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO pages (id, workspace_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('page', 'workspace', 'document', 'a0', 'Page', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO page_create_receipts (workspace_id, page_id, request_hash)
+         VALUES ('workspace', 'page', 'request')`,
+      ),
+    ]);
+    await env.DB.prepare(`DELETE FROM pages WHERE id = 'page'`).run();
+    expect(await env.DB.prepare(`SELECT 1 FROM page_create_receipts WHERE page_id = 'page'`).first()).toBeNull();
 
     // Deleting the workspace itself must still cascade through the final owner.
     await env.DB.prepare(`DELETE FROM workspaces WHERE id = 'workspace'`).run();
@@ -121,5 +143,57 @@ describe("D1 migrations", () => {
     expect(await env.DB.prepare(`SELECT issuer FROM account WHERE id = 'credential'`).first()).toEqual({
       issuer: "local:credential",
     });
+  });
+
+  it("adopts only page-create receipts that still match a live page", async () => {
+    const lifecycle = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0007_page_create_receipt_lifecycle.sql",
+    );
+    expect(lifecycle).toBeTruthy();
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration !== lifecycle),
+    );
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('other', 'Other', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+           (id, workspace_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('page', 'workspace', 'document', 'a', 'Page', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO page_create_receipts
+           (workspace_id, page_id, request_hash, response_json, created_at)
+         VALUES ('workspace', 'page', 'live-request', '{}', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO page_create_receipts
+           (workspace_id, page_id, request_hash, response_json, created_at)
+         VALUES ('workspace', 'deleted-page', 'orphan-request', '{}', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO page_create_receipts
+           (workspace_id, page_id, request_hash, response_json, created_at)
+         VALUES ('other', 'page', 'wrong-workspace-request', '{}', ?)`,
+      ).bind(timestamp),
+    ]);
+
+    await applyD1Migrations(env.DB, [lifecycle!]);
+
+    expect(
+      await env.DB.prepare(
+        `SELECT workspace_id, page_id, request_hash FROM page_create_receipts ORDER BY workspace_id, page_id`,
+      ).all(),
+    ).toMatchObject({
+      results: [{ workspace_id: "workspace", page_id: "page", request_hash: "live-request" }],
+    });
+    await env.DB.prepare(`DELETE FROM pages WHERE id = 'page'`).run();
+    expect(await env.DB.prepare(`SELECT 1 FROM page_create_receipts`).first()).toBeNull();
   });
 });

@@ -3147,17 +3147,6 @@ describe("Worker integration", () => {
   it("honors and safely replays a client-generated page id", async () => {
     const installed = await bootstrap();
     const id = crypto.randomUUID();
-    const foreignWorkspaceId = crypto.randomUUID();
-    await env.DB.batch([
-      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES (?, 'Foreign workspace', ?)`).bind(
-        foreignWorkspaceId,
-        Date.now(),
-      ),
-      env.DB.prepare(
-        `INSERT INTO page_create_receipts
-         (workspace_id, page_id, request_hash, response_json, created_at) VALUES (?, ?, 'foreign', '{}', ?)`,
-      ).bind(foreignWorkspaceId, id, Date.now()),
-    ]);
     const post = (body: unknown) =>
       SELF.fetch(
         authenticatedRequest(installed.cookie, "/api/pages", {
@@ -3182,7 +3171,14 @@ describe("Worker integration", () => {
       .run();
     const replayedAfterMutation = await post(requested);
     expect(replayedAfterMutation.status).toBe(200);
-    expect(await replayedAfterMutation.json()).toEqual(createdBody);
+    expect(await replayedAfterMutation.json()).toEqual({
+      page: expect.objectContaining({
+        id,
+        parentId: null,
+        title: "Renamed",
+        archivedAt: expect.any(Number),
+      }),
+    });
 
     const mismatched = await post({ ...requested, title: "Different" });
     expect(mismatched.status).toBe(409);
@@ -3190,6 +3186,128 @@ describe("Worker integration", () => {
 
     const invalid = await post({ ...requested, id: "not/a/page/id" });
     expect(invalid.status).toBe(422);
+  });
+
+  it("preserves legacy page-create replays when no receipt was backfilled", async () => {
+    const installed = await bootstrap();
+    const id = crypto.randomUUID();
+    const requested = { id, parentId: installed.pageId, kind: "document", title: "Legacy page" };
+    const post = () =>
+      SELF.fetch(
+        authenticatedRequest(installed.cookie, "/api/pages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(requested),
+        }),
+      );
+
+    const created = await post();
+    expect(created.status).toBe(201);
+    const createdBody = await created.json();
+    await env.DB.prepare(`DELETE FROM page_create_receipts WHERE workspace_id = ? AND page_id = ?`)
+      .bind(installed.workspaceId, id)
+      .run();
+
+    const replayed = await post();
+    expect(replayed.status).toBe(200);
+    expect(await replayed.json()).toEqual(createdBody);
+  });
+
+  it("classifies a page id owned by another workspace as idempotency reuse", async () => {
+    const installed = await bootstrap();
+    const id = crypto.randomUUID();
+    const foreignWorkspaceId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES (?, 'Foreign workspace', ?)`).bind(
+        foreignWorkspaceId,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO pages (id, workspace_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES (?, ?, 'document', 'a0', 'Foreign page', ?, ?, ?)`,
+      ).bind(id, foreignWorkspaceId, installed.userId, timestamp, timestamp),
+    ]);
+
+    const response = await SELF.fetch(
+      authenticatedRequest(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, parentId: null, kind: "document", title: "Local page" }),
+      }),
+    );
+
+    expect(response.status).toBe(409);
+    expect((await response.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
+  });
+
+  it("does not let receipt conflict handling replace an invalid-parent error", async () => {
+    const installed = await bootstrap();
+    const id = crypto.randomUUID();
+    const create = await SELF.fetch(
+      authenticatedRequest(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, parentId: installed.pageId, kind: "document", title: "Child" }),
+      }),
+    );
+    expect(create.status).toBe(201);
+
+    const invalidParent = await SELF.fetch(
+      authenticatedRequest(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, parentId: crypto.randomUUID(), kind: "document", title: "Child" }),
+      }),
+    );
+
+    expect(invalidParent.status).toBe(404);
+    expect((await invalidParent.json<{ error: { code: string } }>()).error.code).toBe("page_not_found");
+  });
+
+  it("cascades a page-create receipt on permanent deletion and permits a new create", async () => {
+    const installed = await bootstrap();
+    const id = crypto.randomUUID();
+    const requested = { id, parentId: null, kind: "document", title: "Reusable page" };
+    const post = () =>
+      SELF.fetch(
+        authenticatedRequest(installed.cookie, "/api/pages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(requested),
+        }),
+      );
+    expect((await post()).status).toBe(201);
+    expect(
+      await env.DB.prepare(`SELECT request_hash FROM page_create_receipts WHERE page_id = ?`).bind(id).first(),
+    ).not.toBeNull();
+    expect(
+      (await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${id}`, { method: "DELETE" }))).status,
+    ).toBe(200);
+    const context = createExecutionContext();
+    const deleted = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${id}/permanent-delete`, { method: "POST" }),
+      env,
+      context,
+    );
+    expect(deleted.status).toBe(202);
+    expect(
+      await env.DB.prepare(`SELECT request_hash FROM page_create_receipts WHERE page_id = ?`).bind(id).first(),
+    ).toBeNull();
+    await waitOnExecutionContext(context);
+
+    const recreateContext = createExecutionContext();
+    const recreated = await worker.fetch(
+      authenticatedRequest(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(requested),
+      }),
+      env,
+      recreateContext,
+    );
+    expect(recreated.status).toBe(201);
+    await waitOnExecutionContext(recreateContext);
   });
 
   it("creates a whole tree level in one request, in the order asked for", async () => {
@@ -3258,7 +3376,18 @@ describe("Worker integration", () => {
       .run();
     const replayed = await post(pages);
     expect(replayed.status).toBe(200);
-    expect(await replayed.json()).toEqual({ ...createdBody, replayed: true });
+    expect(await replayed.json()).toEqual({
+      replayed: true,
+      pages: [
+        expect.objectContaining({
+          id: firstId,
+          parentId: null,
+          title: "Renamed",
+          archivedAt: expect.any(Number),
+        }),
+        createdBody.pages[1],
+      ],
+    });
 
     const mismatch = await post([{ ...pages[0], title: "Different" }, pages[1]]);
     expect(mismatch.status).toBe(409);
