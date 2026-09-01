@@ -196,6 +196,9 @@ function observedExpectedMove(
 ) {
   const moved = observedExpectedPage(result, expectation);
   if (!moved) return false;
+  // An unanchored move appends at the instant the server commits it. A concurrent
+  // append may legitimately become the new last sibling before this observation.
+  if (beforeId === null && afterId === null) return true;
   const siblings = result.serverPages
     .filter(
       (candidate) =>
@@ -212,7 +215,7 @@ function observedExpectedMove(
   const afterIndex = afterId === null ? -1 : siblings.findIndex((candidate) => candidate.id === afterId);
   if (beforeId !== null && (beforeIndex < 0 || movedIndex >= beforeIndex)) return false;
   if (afterId !== null && (afterIndex < 0 || movedIndex <= afterIndex)) return false;
-  return beforeId !== null || afterId !== null || movedIndex === siblings.length - 1;
+  return true;
 }
 
 type MutationRequestResult<T> =
@@ -696,6 +699,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [pageTreeRetrying, setPageTreeRetrying] = useState(false);
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
   const sidebarOpenRef = useRef(false);
+  const sidebarRef = useRef<HTMLElement>(null);
   const sidebarTriggerRef = useRef<HTMLButtonElement>(null);
   const restoreSidebarTriggerFocus = useRef(false);
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
@@ -767,7 +771,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   useEffect(() => {
     if (sidebarOpen || !restoreSidebarTriggerFocus.current) return;
     restoreSidebarTriggerFocus.current = false;
-    sidebarTriggerRef.current?.focus();
+    const trigger = sidebarTriggerRef.current;
+    if (trigger) {
+      const style = getComputedStyle(trigger);
+      if (style.display !== "none" && style.visibility !== "hidden") {
+        trigger.focus();
+        return;
+      }
+    }
+    sidebarRef.current?.focus();
   }, [sidebarOpen]);
 
   const isCurrentWorkspaceErrorAttempt = useCallback((attempt: WorkspaceErrorAttempt) => {
@@ -806,6 +818,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [isCurrentWorkspaceErrorAttempt],
   );
+  const clearSettledCreateErrors = useCallback(() => {
+    setWorkspaceErrors((current) => {
+      const next = current.filter(
+        (error) =>
+          error.source !== "page-mutation" ||
+          !error.scope?.startsWith("create:") ||
+          latestWorkspaceErrorAttemptRef.current.has(workspaceErrorAttemptKey(error)),
+      );
+      return next.length === current.length ? current : next;
+    });
+  }, []);
   const invalidateWorkspaceErrorAttempt = useCallback(
     (target: WorkspaceErrorTarget) => {
       const attempt = startWorkspaceErrorAttempt(target);
@@ -1326,13 +1349,22 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     isVerified: (result: PageLoadResult) => boolean,
     unresolvedMessage: string,
   ) {
+    let verifiedObservation: PageLoadResult | null = null;
+    let observationVerified = false;
+    const verify = (result: PageLoadResult) => {
+      if (result !== verifiedObservation) {
+        verifiedObservation = result;
+        observationVerified = isVerified(result);
+      }
+      return observationVerified;
+    };
     const observation = await reconcileWithOneRetry(
       () => reconcilePages(signal),
-      (result) => result !== null && !isVerified(result),
+      (result) => result === null || !verify(result),
       signal,
     );
     if (signal.aborted) return null;
-    if (observation && isVerified(observation)) {
+    if (observation && verify(observation)) {
       clearWorkspaceErrors(attempt);
       return observation;
     }
@@ -1353,15 +1385,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     });
     let operationId = "";
     let outcome: MutationOutcome = "not-started";
-    let expectation: PageMutationExpectation | null = null;
+    let recoveryExpectation: PageMutationExpectation | null = null;
     try {
       operationId = crypto.randomUUID();
-      expectation = {
+      const expectation: PageMutationExpectation = {
         id: operationId,
         workspaceId: member.workspace.id,
         parentId: resolvedParentId,
         kind,
       };
+      recoveryExpectation = expectation;
       const result = await requestMutation(
         "/api/pages",
         {
@@ -1369,11 +1402,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           body: json({ id: operationId, kind, parentId: resolvedParentId }),
           signal,
         },
-        (value) => pageMutationResponse(value, expectation!),
+        (value) => pageMutationResponse(value, expectation),
       );
       if (signal.aborted) return;
       outcome = result.kind;
       if (result.kind === "committed" && result.value) {
+        clearSettledCreateErrors();
         recordPageUpserts([result.value]);
         dispatchPageAction({ type: "merge", pages: [result.value] });
         navigateToPage(result.value.id);
@@ -1401,11 +1435,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const observation = await reconcilePageMutation(
         attempt,
         signal,
-        (reconciledPages) => observedExpectedPage(reconciledPages, expectation!) !== null,
+        (reconciledPages) => observedExpectedPage(reconciledPages, expectation) !== null,
         "The page-creation result could not be verified",
       );
       const created = observation && observedExpectedPage(observation, expectation);
-      if (created) navigateToPage(created.id);
+      if (created) {
+        clearSettledCreateErrors();
+        navigateToPage(created.id);
+      }
     } catch (error) {
       if (signal.aborted) return;
       closeSidebar(true);
@@ -1420,9 +1457,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               : "The page could not be created.",
         ),
       );
-      if (expectation && (outcome === "committed" || outcome === "uncertain")) {
-        const expectedPage = expectation;
-        await reconcilePageMutation(
+      if (recoveryExpectation && (outcome === "committed" || outcome === "uncertain")) {
+        const expectedPage = recoveryExpectation;
+        const recovered = await reconcilePageMutation(
           attempt,
           signal,
           (observation) => observedExpectedPage(observation, expectedPage) !== null,
@@ -1430,6 +1467,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             ? "The page was created, but the workspace could not be updated"
             : "The page may have been created, but the workspace could not be updated",
         );
+        if (recovered) clearSettledCreateErrors();
       }
     } finally {
       finishWorkspaceErrorAttempt(attempt);
@@ -1538,7 +1576,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const signal = workspaceAbortController.current.signal;
     const attempt = startClearedWorkspaceErrorAttempt({ source: "page-mutation", scope: `move:${pageId}` });
     const movingPage = pages.find((candidate) => candidate.id === pageId);
-    let operationId = "";
     let outcome: MutationOutcome = "not-started";
     if (!movingPage) {
       closeSidebar(true);
@@ -1554,7 +1591,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       minimumRevision: movingPage.revision + 1,
     };
     try {
-      operationId = crypto.randomUUID();
       const result = await requestMutation(
         `/api/pages/${pageId}/move`,
         {
@@ -1581,12 +1617,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           "Page movement result could not be verified",
           "committed-invalid-response",
           result.responseError ?? "Successful response did not contain the requested moved page.",
-          { operationId, pageId },
+          { pageId },
         );
         reportWorkspaceError(attempt, "The server returned an invalid page-movement response. Checking the page tree.");
       } else {
         logUnverifiedMutation("Page movement result could not be verified", "uncertain", result.error, {
-          operationId,
           pageId,
         });
         reportWorkspaceError(attempt, "The page-movement result could not be verified. Checking the page tree.");
@@ -1846,7 +1881,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
   return (
     <div className="workspace-shell">
-      <aside id="workspace-navigation" className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}>
+      <aside
+        ref={sidebarRef}
+        id="workspace-navigation"
+        className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}
+        aria-label="Workspace navigation"
+        tabIndex={-1}
+      >
         <header className="workspace-header">
           <span className="workspace-avatar">{member.workspace.name.slice(0, 1).toUpperCase()}</span>
           <div>
@@ -1941,7 +1982,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <button
             ref={sidebarTriggerRef}
             className="icon-button mobile-only"
-            aria-label="Open sidebar"
+            aria-label="Open navigation"
             aria-controls="workspace-navigation"
             aria-expanded={sidebarOpen}
             onClick={openSidebar}
@@ -2031,7 +2072,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         )}
       </section>
       {sidebarOpen && (
-        <button className="sidebar-scrim" aria-label="Close sidebar" onClick={() => closeSidebar(true)} />
+        <button
+          className="sidebar-scrim"
+          aria-label="Close navigation"
+          aria-controls="workspace-navigation"
+          onClick={() => closeSidebar(true)}
+        />
       )}
     </div>
   );

@@ -3147,6 +3147,17 @@ describe("Worker integration", () => {
   it("honors and safely replays a client-generated page id", async () => {
     const installed = await bootstrap();
     const id = crypto.randomUUID();
+    const foreignWorkspaceId = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES (?, 'Foreign workspace', ?)`).bind(
+        foreignWorkspaceId,
+        Date.now(),
+      ),
+      env.DB.prepare(
+        `INSERT INTO page_create_receipts
+         (workspace_id, page_id, request_hash, response_json, created_at) VALUES (?, ?, 'foreign', '{}', ?)`,
+      ).bind(foreignWorkspaceId, id, Date.now()),
+    ]);
     const post = (body: unknown) =>
       SELF.fetch(
         authenticatedRequest(installed.cookie, "/api/pages", {
@@ -3159,11 +3170,19 @@ describe("Worker integration", () => {
 
     const created = await post(requested);
     expect(created.status).toBe(201);
-    expect(await created.json()).toMatchObject({ page: requested });
+    const createdBody = await created.json<{ page: Page }>();
+    expect(createdBody).toMatchObject({ page: requested });
 
     const replayed = await post(requested);
     expect(replayed.status).toBe(200);
     expect(await replayed.json()).toMatchObject({ page: requested });
+
+    await env.DB.prepare(`UPDATE pages SET title = 'Renamed', parent_id = NULL, archived_at = ? WHERE id = ?`)
+      .bind(Date.now(), id)
+      .run();
+    const replayedAfterMutation = await post(requested);
+    expect(replayedAfterMutation.status).toBe(200);
+    expect(await replayedAfterMutation.json()).toEqual(createdBody);
 
     const mismatched = await post({ ...requested, title: "Different" });
     expect(mismatched.status).toBe(409);
@@ -3232,10 +3251,14 @@ describe("Worker integration", () => {
       );
     const created = await post(pages);
     expect(created.status).toBe(201);
-    expect(await created.json()).toMatchObject({ replayed: false });
+    const createdBody = await created.json<{ pages: Page[]; replayed: boolean }>();
+    expect(createdBody).toMatchObject({ replayed: false });
+    await env.DB.prepare(`UPDATE pages SET title = 'Renamed', parent_id = NULL, archived_at = ? WHERE id = ?`)
+      .bind(Date.now(), firstId)
+      .run();
     const replayed = await post(pages);
     expect(replayed.status).toBe(200);
-    expect(await replayed.json()).toMatchObject({ replayed: true });
+    expect(await replayed.json()).toEqual({ ...createdBody, replayed: true });
 
     const mismatch = await post([{ ...pages[0], title: "Different" }, pages[1]]);
     expect(mismatch.status).toBe(409);
