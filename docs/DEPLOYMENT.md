@@ -120,7 +120,7 @@ pnpm deploy
 ```
 
 Migrations must complete before the Worker is deployed. The Worker queries the projection, mention,
-deletion-job, archive-disconnect, and table-state tables on ordinary request paths; deploying
+deletion-job, archive-disconnect, table-state, and page-creation receipt tables on ordinary request paths; deploying
 code that expects a migration which has not been applied produces runtime failures rather than a clean
 startup error.
 
@@ -138,6 +138,14 @@ request hash and cannot safely distinguish a retry from reuse of the same reques
 content. Newly hashed receipts are durable until their table is deleted; do not run an old importer
 between applying `0005` and deploying the matching Worker, because it can create another unhashed
 receipt in that window.
+
+`0006_page_create_receipts.sql` introduces request receipts for client-addressed page creation without
+backfilling existing pages, because a batch's original request grouping cannot be reconstructed.
+`0007_page_create_receipt_lifecycle.sql` retains only receipts whose live page still exists in the same
+workspace, reduces them to request hashes, and makes them cascade when that page is permanently
+deleted. Pages without receipts continue to use the legacy live-metadata replay check, while receipt
+replays return current authoritative page metadata instead of a creation-time snapshot. Apply both
+migrations before deploying the Worker that reads or writes these receipts.
 
 ## 6. Bootstrap the owner
 

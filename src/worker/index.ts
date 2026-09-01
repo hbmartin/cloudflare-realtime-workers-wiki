@@ -44,7 +44,6 @@ import {
   columnType,
   documentRoom,
   ID_PATTERN,
-  isPage,
   nullableId,
   object,
   PAGE_TITLE_MAX,
@@ -89,11 +88,12 @@ type PageRow = {
   updated_at: number;
 };
 
-type PageCreateReceiptRow = {
-  page_id: string;
-  request_hash: string;
-  response_json: string;
+type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
+  parentId: string | null;
+  title: string;
 };
+
+type PageCreateStateRow = PageRow & { receipt_request_hash: string | null };
 
 function pageJson(row: PageRow): Page {
   return {
@@ -119,39 +119,44 @@ async function pageCreateRequestHash(value: unknown) {
 async function readPageCreateReplay(
   database: D1Database,
   workspaceId: string,
-  pageIds: string[],
+  requested: RequestedPageCreate[],
   requestHash: string,
   conflictMessage: string,
 ) {
-  const receipts = await database
+  const existing = await database
     .prepare(
-      `SELECT page_id, request_hash, response_json FROM page_create_receipts
-        WHERE workspace_id = ? AND page_id IN (${pageIds.map(() => "?").join(", ")})`,
+      `SELECT p.*, r.request_hash receipt_request_hash
+         FROM pages p
+         LEFT JOIN page_create_receipts r ON r.page_id = p.id AND r.workspace_id = ?
+        WHERE p.id IN (${requested.map(() => "?").join(", ")})`,
     )
-    .bind(workspaceId, ...pageIds)
-    .all<PageCreateReceiptRow>();
-  if (!receipts.results.length) return null;
-  if (receipts.results.length !== pageIds.length || receipts.results.some((row) => row.request_hash !== requestHash)) {
+    .bind(workspaceId, ...requested.map((page) => page.id))
+    .all<PageCreateStateRow>();
+  if (!existing.results.length) return null;
+  if (existing.results.length !== requested.length) {
     throw new HttpError(409, "idempotency_key_reused", conflictMessage);
   }
-  const byId = new Map(receipts.results.map((row) => [row.page_id, row]));
-  return pageIds.map((pageId) => {
-    const row = byId.get(pageId);
-    if (!row) throw new HttpError(409, "idempotency_key_reused", conflictMessage);
-    const page: unknown = JSON.parse(row.response_json);
-    if (!isPage(page)) {
-      throw new HttpError(500, "page_create_receipt_invalid", "A stored page-creation receipt is invalid.");
+  const byId = new Map(existing.results.map((row) => [row.id, row]));
+  const rows = requested.map((page) => byId.get(page.id)!);
+  const hasReceipt = rows.some((row) => row.receipt_request_hash !== null);
+  if (hasReceipt) {
+    if (rows.some((row) => row.receipt_request_hash !== requestHash)) {
+      throw new HttpError(409, "idempotency_key_reused", conflictMessage);
     }
-    return page;
+    return rows.map(pageJson);
+  }
+  const legacyMatches = requested.every((page, index) => {
+    const row = rows[index]!;
+    return (
+      row.workspace_id === workspaceId &&
+      row.archived_at === null &&
+      row.parent_id === page.parentId &&
+      row.kind === page.kind &&
+      row.title === page.title
+    );
   });
-}
-
-async function requestedPagesExist(database: D1Database, workspaceId: string, pageIds: string[]) {
-  const existing = await database
-    .prepare(`SELECT 1 FROM pages WHERE workspace_id = ? AND id IN (${pageIds.map(() => "?").join(", ")}) LIMIT 1`)
-    .bind(workspaceId, ...pageIds)
-    .first();
-  return Boolean(existing);
+  if (!legacyMatches) throw new HttpError(409, "idempotency_key_reused", conflictMessage);
+  return rows.map(pageJson);
 }
 
 async function batchWithFinalResult<T>(
@@ -640,38 +645,32 @@ app.post("/api/pages", async (c) => {
   const kind = pageKind(body.kind ?? "document");
   const title = typeof body.title === "string" ? text(body.title, "title", PAGE_TITLE_MAX) : "Untitled";
   const requestHash = await pageCreateRequestHash({ parentId, kind, title });
+  const requested = [{ id, parentId, kind, title }];
+  const conflictMessage = "That page id already describes a different page.";
+  if (parentId) await pageForMember(c.env, member, parentId);
+  const initialReplay = await readPageCreateReplay(
+    c.env.DB,
+    member.workspace.id,
+    requested,
+    requestHash,
+    conflictMessage,
+  );
+  if (initialReplay) return c.json({ page: initialReplay[0]! });
   const timestamp = now();
   let created: Page;
   try {
-    if (parentId) await pageForMember(c.env, member, parentId);
     const last = await c.env.DB.prepare(
       `SELECT position FROM pages WHERE workspace_id = ? AND parent_id IS ? AND archived_at IS NULL
         ORDER BY position DESC, id DESC LIMIT 1`,
     )
       .bind(member.workspace.id, parentId)
       .first<{ position: string }>();
-    const createdRow: PageRow = {
-      id,
-      workspace_id: member.workspace.id,
-      parent_id: parentId,
-      kind,
-      position: generateJitteredKeyBetween(last?.position ?? null, null),
-      title,
-      icon: null,
-      revision: 1,
-      content_epoch: 1,
-      plain_text: "",
-      indexed_seq: 0,
-      archived_at: null,
-      created_at: timestamp,
-      updated_at: timestamp,
-    };
-    created = pageJson(createdRow);
-    await c.env.DB.batch([
+    const position = generateJitteredKeyBetween(last?.position ?? null, null);
+    const results = await c.env.DB.batch<PageRow>([
       c.env.DB.prepare(
         `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(id, member.workspace.id, parentId, kind, createdRow.position, title, member.user.id, timestamp, timestamp),
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      ).bind(id, member.workspace.id, parentId, kind, position, title, member.user.id, timestamp, timestamp),
       c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
         id,
         member.workspace.id,
@@ -680,21 +679,15 @@ app.post("/api/pages", async (c) => {
       ...(kind === "table" ? [c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(id)] : []),
       c.env.DB.prepare(
         `INSERT INTO page_create_receipts
-         (workspace_id, page_id, request_hash, response_json, created_at) VALUES (?, ?, ?, ?, ?)`,
-      ).bind(member.workspace.id, id, requestHash, JSON.stringify(created), timestamp),
+         (workspace_id, page_id, request_hash) VALUES (?, ?, ?)`,
+      ).bind(member.workspace.id, id, requestHash),
     ]);
+    const createdRow = results[0]?.results[0];
+    if (!createdRow) throw new Error("The created page was not returned by its insert.");
+    created = pageJson(createdRow);
   } catch (error) {
-    const replay = await readPageCreateReplay(
-      c.env.DB,
-      member.workspace.id,
-      [id],
-      requestHash,
-      "That page id already describes a different page.",
-    );
+    const replay = await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage);
     if (replay) return c.json({ page: replay[0]! });
-    if (await requestedPagesExist(c.env.DB, member.workspace.id, [id])) {
-      throw new HttpError(409, "idempotency_key_reused", "That page id already describes a different page.");
-    }
     throw error;
   }
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [created] });
@@ -737,15 +730,9 @@ app.post("/api/pages/batch", async (c) => {
   if (new Set(parsed.map(({ id }) => id)).size !== parsed.length) {
     throw new HttpError(422, "invalid_input", "A page id may appear only once in a batch.");
   }
-  const requestedIds = parsed.map(({ id }) => id);
   const requestHash = await pageCreateRequestHash(parsed);
-  const initialReplay = await readPageCreateReplay(
-    c.env.DB,
-    member.workspace.id,
-    requestedIds,
-    requestHash,
-    "Those page ids already describe different pages.",
-  );
+  const conflictMessage = "Those page ids already describe different pages.";
+  const initialReplay = await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage);
   if (initialReplay) return c.json({ pages: initialReplay, replayed: true });
 
   // Every distinct parent is checked once, which also rejects a parent in another
@@ -771,31 +758,14 @@ app.post("/api/pages/batch", async (c) => {
   }
 
   const timestamp = now();
-  const createdPages = parsed.map((page) =>
-    pageJson({
-      id: page.id,
-      workspace_id: member.workspace.id,
-      parent_id: page.parentId,
-      kind: page.kind,
-      position: positions.get(page.id)!,
-      title: page.title,
-      icon: null,
-      revision: 1,
-      content_epoch: 1,
-      plain_text: "",
-      indexed_seq: 0,
-      archived_at: null,
-      created_at: timestamp,
-      updated_at: timestamp,
-    }),
-  );
-  const createdById = new Map(createdPages.map((page) => [page.id, page]));
   const statements: D1PreparedStatement[] = [];
+  const pageResultIndexes: number[] = [];
   for (const page of parsed) {
+    pageResultIndexes.push(statements.length);
     statements.push(
       c.env.DB.prepare(
         `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       ).bind(
         page.id,
         member.workspace.id,
@@ -819,26 +789,23 @@ app.post("/api/pages/batch", async (c) => {
     statements.push(
       c.env.DB.prepare(
         `INSERT INTO page_create_receipts
-         (workspace_id, page_id, request_hash, response_json, created_at) VALUES (?, ?, ?, ?, ?)`,
-      ).bind(member.workspace.id, page.id, requestHash, JSON.stringify(createdById.get(page.id)), timestamp),
+         (workspace_id, page_id, request_hash) VALUES (?, ?, ?)`,
+      ).bind(member.workspace.id, page.id, requestHash),
     );
   }
+  let createdPages: Page[];
   try {
-    await c.env.DB.batch(statements);
+    const results = await c.env.DB.batch<PageRow>(statements);
+    const createdRows = pageResultIndexes.map((index) => results[index]?.results[0]);
+    if (createdRows.some((row) => !row)) {
+      throw new Error("The created page batch was not returned completely by its inserts.");
+    }
+    createdPages = createdRows.map((row) => pageJson(row!));
   } catch (error) {
     // A concurrent identical retry may have committed between the existence check
     // and this transaction. Re-read before classifying the unique conflict.
-    const replay = await readPageCreateReplay(
-      c.env.DB,
-      member.workspace.id,
-      requestedIds,
-      requestHash,
-      "Those page ids already describe different pages.",
-    );
+    const replay = await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage);
     if (replay) return c.json({ pages: replay, replayed: true });
-    if (await requestedPagesExist(c.env.DB, member.workspace.id, requestedIds)) {
-      throw new HttpError(409, "idempotency_key_reused", "Those page ids already describe different pages.");
-    }
     throw error;
   }
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: createdPages });

@@ -193,12 +193,15 @@ function observedExpectedMove(
   expectation: PageMutationExpectation,
   beforeId: string | null,
   afterId: string | null,
+  appendAfterId: string | null,
 ) {
   const moved = observedExpectedPage(result, expectation);
   if (!moved) return false;
-  // An unanchored move appends at the instant the server commits it. A concurrent
-  // append may legitimately become the new last sibling before this observation.
-  if (beforeId === null && afterId === null) return true;
+  const isUnanchoredAppend = beforeId === null && afterId === null;
+  // With no pre-existing destination sibling, the requested parent plus revision
+  // bump is all an append can change. Otherwise retain the old tail as an anchor:
+  // later concurrent appends may follow the moved page without invalidating it.
+  if (isUnanchoredAppend && appendAfterId === null) return true;
   const siblings = result.serverPages
     .filter(
       (candidate) =>
@@ -211,6 +214,10 @@ function observedExpectedMove(
     );
   const movedIndex = siblings.findIndex((candidate) => candidate.id === expectation.id);
   if (movedIndex < 0) return false;
+  if (isUnanchoredAppend) {
+    const appendAfterIndex = siblings.findIndex((candidate) => candidate.id === appendAfterId);
+    return appendAfterIndex >= 0 && movedIndex > appendAfterIndex;
+  }
   const beforeIndex = beforeId === null ? -1 : siblings.findIndex((candidate) => candidate.id === beforeId);
   const afterIndex = afterId === null ? -1 : siblings.findIndex((candidate) => candidate.id === afterId);
   if (beforeId !== null && (beforeIndex < 0 || movedIndex >= beforeIndex)) return false;
@@ -776,7 +783,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const style = getComputedStyle(trigger);
       if (style.display !== "none" && style.visibility !== "hidden") {
         trigger.focus();
-        return;
+        if (document.activeElement === trigger) return;
       }
     }
     sidebarRef.current?.focus();
@@ -1590,6 +1597,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       kind: movingPage.kind,
       minimumRevision: movingPage.revision + 1,
     };
+    const appendAfterId =
+      beforeId === null && afterId === null
+        ? (pages
+            .filter(
+              (candidate) =>
+                candidate.id !== pageId && candidate.parentId === parentId && candidate.archivedAt === null,
+            )
+            .toSorted(
+              (left, right) => compareBinaryText(left.position, right.position) || compareBinaryText(left.id, right.id),
+            )
+            .at(-1)?.id ?? null)
+        : null;
     try {
       const result = await requestMutation(
         `/api/pages/${pageId}/move`,
@@ -1629,7 +1648,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       await reconcilePageMutation(
         attempt,
         signal,
-        (observation) => observedExpectedMove(observation, expectation, beforeId, afterId),
+        (observation) => observedExpectedMove(observation, expectation, beforeId, afterId, appendAfterId),
         "The page-movement result could not be verified",
       );
     } catch (error) {
@@ -1650,7 +1669,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         await reconcilePageMutation(
           attempt,
           signal,
-          (observation) => observedExpectedMove(observation, expectation, beforeId, afterId),
+          (observation) => observedExpectedMove(observation, expectation, beforeId, afterId, appendAfterId),
           outcome === "committed"
             ? "The page was moved, but the workspace could not be updated"
             : "The page may have been moved, but the workspace could not be updated",
@@ -2072,12 +2091,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         )}
       </section>
       {sidebarOpen && (
-        <button
-          className="sidebar-scrim"
-          aria-label="Close navigation"
-          aria-controls="workspace-navigation"
-          onClick={() => closeSidebar(true)}
-        />
+        <button className="sidebar-scrim" aria-hidden="true" tabIndex={-1} onClick={() => closeSidebar(true)} />
       )}
     </div>
   );

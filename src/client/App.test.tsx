@@ -707,7 +707,7 @@ describe("App error handling", () => {
     const openSidebar = screen.getByRole("button", { name: "Open navigation" });
     fireEvent.click(openSidebar);
     expect(document.querySelector(".workspace-sidebar")).toHaveClass("open");
-    expect(screen.getAllByRole("button", { name: "Close navigation" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Close navigation" })).toHaveLength(1);
     fireEvent.click(createButton);
 
     expect(await screen.findByText("Page creation was rejected.")).toBeInTheDocument();
@@ -807,8 +807,12 @@ describe("App error handling", () => {
     const secondLink = screen.getByText("Second").closest("button");
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
+
+    await waitFor(() => {
+      expect(api).toHaveBeenCalledWith(`/api/pages/${secondPage.id}/move`, expect.objectContaining({ method: "POST" }));
+      expect(screen.getAllByTitle("Alt+arrow keys move this page")[0]).toHaveTextContent("Second");
+    });
     expect(api).not.toHaveBeenCalledWith("/api/pages", expect.objectContaining({ method: "POST" }));
-    expect(api).toHaveBeenCalledWith(`/api/pages/${secondPage.id}/move`, expect.objectContaining({ method: "POST" }));
     expect(screen.queryByText("The page could not be moved.")).not.toBeInTheDocument();
   });
 
@@ -853,6 +857,26 @@ describe("App error handling", () => {
         }) as CSSStyleDeclaration,
     );
     onTestFinished(() => computedStyle.mockRestore());
+    fireEvent.click(openSidebar);
+    fireEvent.click(closeNavigation);
+
+    await waitFor(() => expect(document.activeElement).toBe(navigation));
+  });
+
+  it("restores focus to navigation when the visible trigger cannot take focus", async () => {
+    mockWorkspaceApi();
+    render(<App />);
+
+    const openSidebar = await screen.findByRole("button", { name: "Open navigation" });
+    const navigation = screen.getByRole("complementary", { name: "Workspace navigation" });
+    const closeNavigation = within(navigation).getByRole("button", { name: "Close navigation" });
+    const computedStyle = vi.spyOn(window, "getComputedStyle").mockReturnValue({
+      display: "block",
+      visibility: "visible",
+    } as CSSStyleDeclaration);
+    const rejectedFocus = vi.spyOn(openSidebar, "focus").mockImplementation(() => undefined);
+    onTestFinished(() => computedStyle.mockRestore());
+    onTestFinished(() => rejectedFocus.mockRestore());
     fireEvent.click(openSidebar);
     fireEvent.click(closeNavigation);
 
@@ -1075,6 +1099,41 @@ describe("App error handling", () => {
     await waitFor(() => expect(treeLoads).toBe(2));
     expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
     expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument();
+    expect(reported).toHaveBeenCalledWith(
+      "Page movement result could not be verified",
+      expect.objectContaining({ outcome: "committed-invalid-response", pageId: page.id }),
+    );
+  });
+
+  it("does not verify a same-parent append from an unrelated revision bump", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const revisedWithoutMoving = { ...page, revision: 2 };
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page, secondPage] : [revisedWithoutMoving, secondPage] };
+      }
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    const treeRoot = document.querySelector(".tree-root");
+    if (!treeRoot) throw new Error("The page tree root was not rendered.");
+    fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
+
+    expect(
+      await screen.findByText("The page-movement result could not be verified after refreshing the page tree."),
+    ).toBeInTheDocument();
+    expect(treeLoads).toBe(3);
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
     expect(reported).toHaveBeenCalledWith(
       "Page movement result could not be verified",
       expect.objectContaining({ outcome: "committed-invalid-response", pageId: page.id }),
