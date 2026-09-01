@@ -40,8 +40,8 @@ async function openSidebar(page: Page) {
   // open, so both track React state exactly, while the drawer stays visible for
   // the length of its slide-out transition. Clicking the toggle while it is already
   // open would also be swallowed by the scrim, which outranks the topbar.
-  const toggle = page.getByRole("button", { name: "Open sidebar" });
-  const scrim = page.getByRole("button", { name: "Close sidebar" });
+  const toggle = page.getByRole("button", { name: "Open navigation" });
+  const scrim = page.locator('button.sidebar-scrim[aria-label="Close navigation"]');
   if ((await toggle.isVisible()) && !(await scrim.isVisible())) await toggle.click();
   await expect(page.getByRole("button", { name: /Members/ })).toBeVisible();
 }

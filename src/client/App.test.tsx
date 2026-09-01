@@ -704,16 +704,56 @@ describe("App error handling", () => {
 
     const createButton = await screen.findByRole("button", { name: "Create a root page" });
     await waitFor(() => expect(createButton).toBeEnabled());
-    const openSidebar = screen.getByRole("button", { name: "Open sidebar" });
+    const openSidebar = screen.getByRole("button", { name: "Open navigation" });
     fireEvent.click(openSidebar);
     expect(document.querySelector(".workspace-sidebar")).toHaveClass("open");
-    expect(screen.getByRole("button", { name: "Close sidebar" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Close navigation" })).toHaveLength(2);
     fireEvent.click(createButton);
 
     expect(await screen.findByText("Page creation was rejected.")).toBeInTheDocument();
     expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
-    expect(screen.queryByRole("button", { name: "Close sidebar" })).not.toBeInTheDocument();
+    expect(document.querySelector(".sidebar-scrim")).not.toBeInTheDocument();
     await waitFor(() => expect(document.activeElement).toBe(openSidebar));
+  });
+
+  it("clears a settled create failure after a later create succeeds", async () => {
+    const firstPageId = "00000000-0000-4000-8000-000000000006";
+    const createdPageId = "00000000-0000-4000-8000-000000000007";
+    const createdPage = {
+      ...page,
+      id: createdPageId,
+      position: "b0",
+      title: "Created",
+    };
+    const randomUUID = vi
+      .spyOn(crypto, "randomUUID")
+      .mockReturnValueOnce(firstPageId)
+      .mockReturnValueOnce(createdPageId);
+    onTestFinished(() => randomUUID.mockRestore());
+    let creates = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === "/api/pages" && init?.method === "POST") {
+        creates += 1;
+        if (creates === 1) throw new ApiClientError(409, "create_rejected", "First creation failed.");
+        return { page: createdPage };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+    expect(await screen.findByText("First creation failed.")).toBeInTheDocument();
+
+    fireEvent.click(createButton);
+
+    expect((await screen.findAllByText("Created")).length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.queryByText("First creation failed.")).not.toBeInTheDocument());
   });
 
   it("reports a move failure without an unhandled rejection", async () => {
@@ -732,7 +772,7 @@ describe("App error handling", () => {
 
     const secondLink = (await screen.findByText("Second")).closest("button");
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
-    const openSidebar = screen.getByRole("button", { name: "Open sidebar" });
+    const openSidebar = screen.getByRole("button", { name: "Open navigation" });
     fireEvent.click(openSidebar);
     secondLink.focus();
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
@@ -742,17 +782,19 @@ describe("App error handling", () => {
     await waitFor(() => expect(document.activeElement).toBe(openSidebar));
   });
 
-  it("reports create and move setup failures when operation id generation throws", async () => {
+  it("reports a create setup failure without requiring an operation id for a move", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const movedPage = { ...secondPage, position: "A0", revision: 2 };
     const randomUUID = vi.spyOn(crypto, "randomUUID").mockImplementation(() => {
       throw new Error("Random UUID unavailable.");
     });
     onTestFinished(() => randomUUID.mockRestore());
-    vi.mocked(api).mockImplementation(async (path) => {
+    vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page, secondPage] };
+      if (path === `/api/pages/${secondPage.id}/move` && init?.method === "POST") return { page: movedPage };
       throw new Error(`Unexpected API request: ${path}`);
     });
     render(<App />);
@@ -765,12 +807,9 @@ describe("App error handling", () => {
     const secondLink = screen.getByText("Second").closest("button");
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
-    expect(await screen.findByRole("alert")).toHaveTextContent("The page could not be moved.");
     expect(api).not.toHaveBeenCalledWith("/api/pages", expect.objectContaining({ method: "POST" }));
-    expect(api).not.toHaveBeenCalledWith(
-      `/api/pages/${secondPage.id}/move`,
-      expect.objectContaining({ method: "POST" }),
-    );
+    expect(api).toHaveBeenCalledWith(`/api/pages/${secondPage.id}/move`, expect.objectContaining({ method: "POST" }));
+    expect(screen.queryByText("The page could not be moved.")).not.toBeInTheDocument();
   });
 
   it("closes the mobile drawer and restores focus when archive fails", async () => {
@@ -790,13 +829,34 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const openSidebar = await screen.findByRole("button", { name: "Open sidebar" });
+    const openSidebar = await screen.findByRole("button", { name: "Open navigation" });
     fireEvent.click(openSidebar);
     fireEvent.click(screen.getByRole("button", { name: "Archive Roadmap" }));
 
     expect(await screen.findByText("Archive was rejected.")).toBeInTheDocument();
     expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
     await waitFor(() => expect(document.activeElement).toBe(openSidebar));
+  });
+
+  it("restores focus to the visible navigation landmark when the mobile trigger is hidden", async () => {
+    mockWorkspaceApi();
+    render(<App />);
+
+    const openSidebar = await screen.findByRole("button", { name: "Open navigation" });
+    const navigation = screen.getByRole("complementary", { name: "Workspace navigation" });
+    const closeNavigation = within(navigation).getByRole("button", { name: "Close navigation" });
+    const computedStyle = vi.spyOn(window, "getComputedStyle").mockImplementation(
+      (element) =>
+        ({
+          display: element === openSidebar ? "none" : "block",
+          visibility: "visible",
+        }) as CSSStyleDeclaration,
+    );
+    onTestFinished(() => computedStyle.mockRestore());
+    fireEvent.click(openSidebar);
+    fireEvent.click(closeNavigation);
+
+    await waitFor(() => expect(document.activeElement).toBe(navigation));
   });
 
   it("reconciles an uncertain page creation and clears its diagnostics after observing the requested page", async () => {
@@ -845,6 +905,39 @@ describe("App error handling", () => {
       "Page creation result could not be verified",
       expect.objectContaining({ outcome: "uncertain", errorMessage: "Failed to fetch" }),
     );
+  });
+
+  it("retries page creation reconciliation after the first page-tree read fails", async () => {
+    const createdPageId = "00000000-0000-4000-8000-000000000008";
+    const createdPage = { ...page, id: createdPageId, position: "b0", title: "Created after retry" };
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(createdPageId);
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        if (treeLoads === 2) throw new ApiClientError(503, "tree_unavailable", "Tree refresh unavailable.");
+        return { pages: [page, createdPage] };
+      }
+      if (path === "/api/pages" && init?.method === "POST") throw new TypeError("Failed to fetch");
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+
+    expect((await screen.findAllByText("Created after retry")).length).toBeGreaterThan(0);
+    expect(treeLoads).toBe(3);
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/could not be verified|Tree refresh unavailable/)).not.toBeInTheDocument();
   });
 
   it("does not accept an unrelated page as a create response or reconciliation result", async () => {
@@ -951,6 +1044,40 @@ describe("App error handling", () => {
     expect(reported).toHaveBeenCalledWith(
       "Page movement result could not be verified",
       expect.objectContaining({ outcome: "committed-invalid-response", pageId: secondPage.id }),
+    );
+  });
+
+  it("accepts a reconciled append when another sibling was appended afterward", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const movedPage = { ...page, position: "c0", revision: 2 };
+    const concurrentPage = { ...page, id: "concurrent-page", position: "d0", title: "Concurrent" };
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page, secondPage] : [secondPage, movedPage, concurrentPage] };
+      }
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    const treeRoot = document.querySelector(".tree-root");
+    if (!treeRoot) throw new Error("The page tree root was not rendered.");
+    fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
+
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
+    expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument();
+    expect(reported).toHaveBeenCalledWith(
+      "Page movement result could not be verified",
+      expect.objectContaining({ outcome: "committed-invalid-response", pageId: page.id }),
     );
   });
 
