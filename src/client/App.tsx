@@ -24,7 +24,7 @@ import {
   PageLoadEventBuffer,
   PageRemovalTombstones,
 } from "./page-state";
-import { waitForReconciliationRetry } from "./retry";
+import { observeUntilAborted, waitForReconciliationRetry } from "./retry";
 import { TablePage } from "./TablePage";
 
 type AppState =
@@ -49,6 +49,9 @@ type WorkspaceError =
     };
 type WorkspaceErrorAttempt = WorkspaceErrorTarget & { generation: number };
 type PageTreeRetryTarget = { source: "page-access" | "page-tree"; scope?: undefined };
+type PageLoadResult = { serverPages: Page[]; removedDuringLoad: ReadonlySet<string> };
+
+const PAGE_TREE_REQUEST_TIMEOUT_MS = 15_000;
 
 function errorLogFields(error: unknown) {
   if (error instanceof Error) {
@@ -65,28 +68,6 @@ function errorLogFields(error: unknown) {
     errorStack: null,
     errorType: error === null ? "null" : typeof error,
   };
-}
-
-function observeUntilAborted<T>(promise: Promise<T>, signal: AbortSignal) {
-  if (signal.aborted) return Promise.reject<T>(signal.reason);
-  return new Promise<T>((resolve, reject) => {
-    const cleanup = () => signal.removeEventListener("abort", abort);
-    const abort = () => {
-      cleanup();
-      reject(signal.reason);
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    promise.then(
-      (value) => {
-        cleanup();
-        resolve(value);
-      },
-      (error) => {
-        cleanup();
-        reject(error);
-      },
-    );
-  });
 }
 
 function workspaceErrorAttemptKey(target: WorkspaceErrorTarget) {
@@ -642,9 +623,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   // revision hidden from trash while allowing a later archived revision through.
   const [confirmedRestoredPageRevisions] = useState(() => new Map<string, number>());
   const restoredRootToken = useRef(0);
-  const reconciliationAbortController = useRef<AbortController | null>(null);
+  const workspaceAbortController = useRef<AbortController | null>(null);
   const pageLoadGeneration = useRef(0);
-  const pageLoadPromise = useRef<Promise<{ serverPages: Page[]; removedDuringLoad: ReadonlySet<string> }> | null>(null);
+  const pageLoadRequest = useRef<{
+    controller: AbortController;
+    promise: Promise<PageLoadResult>;
+  } | null>(null);
   const trashLoadRequest = useRef<{
     version: number;
     controller: AbortController;
@@ -661,14 +645,29 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const trashMutationIdsRef = useRef(new Set<string>());
   const workspaceErrorAttemptRef = useRef(0);
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
+  const pageTreeErrorRevisionRef = useRef(0);
+  const abortWorkspaceRequests = useCallback(() => {
+    const activePageLoad = pageLoadRequest.current;
+    if (activePageLoad) {
+      pageLoadRequest.current = null;
+      pendingPageEvents.current.cancel();
+      activePageLoad.controller.abort();
+    }
+    const activeTrashLoad = trashLoadRequest.current;
+    if (activeTrashLoad) {
+      trashLoadRequest.current = null;
+      activeTrashLoad.controller.abort();
+    }
+    activePageTreeRetryRef.current?.controller.abort();
+  }, []);
   useEffect(() => {
     const controller = new AbortController();
-    reconciliationAbortController.current = controller;
+    workspaceAbortController.current = controller;
     return () => {
       controller.abort();
-      activePageTreeRetryRef.current?.controller.abort();
+      abortWorkspaceRequests();
     };
-  }, []);
+  }, [abortWorkspaceRequests]);
 
   const isCurrentWorkspaceErrorAttempt = useCallback((attempt: WorkspaceErrorAttempt) => {
     return latestWorkspaceErrorAttemptRef.current.get(workspaceErrorAttemptKey(attempt)) === attempt.generation;
@@ -689,6 +688,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const reportWorkspaceError = useCallback(
     (target: WorkspaceErrorTarget | WorkspaceErrorAttempt, message: string) => {
       if ("generation" in target && !isCurrentWorkspaceErrorAttempt(target)) return;
+      if (target.source === "page-tree") pageTreeErrorRevisionRef.current += 1;
       setWorkspaceErrors((current) => updateWorkspaceErrors(current, target, message));
     },
     [isCurrentWorkspaceErrorAttempt],
@@ -796,11 +796,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }, []);
 
   const loadPages = useCallback(() => {
-    if (pageLoadPromise.current) return pageLoadPromise.current;
+    const activeRequest = pageLoadRequest.current;
+    if (activeRequest) return activeRequest.promise;
     const loadGeneration = ++pageLoadGeneration.current;
+    const pageTreeErrorRevision = pageTreeErrorRevisionRef.current;
+    const controller = new AbortController();
+    const requestSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(PAGE_TREE_REQUEST_TIMEOUT_MS)]);
     pendingPageEvents.current.start();
-    const loading = api<{ pages: Page[] }>("/api/pages/tree")
+    const loading = api<{ pages: Page[] }>("/api/pages/tree", { signal: requestSignal })
       .then((data) => {
+        requestSignal.throwIfAborted();
         const { upserts, removals } = pendingPageEvents.current.consume();
         const observed = authoritativePageSnapshot(data.pages, upserts, removals);
         const serverPageIds = new Set(data.pages.map((page) => page.id));
@@ -811,41 +816,59 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           const next = current.filter((error) => error.source !== "archive" || observed.ids.has(error.scope));
           return next.length === current.length ? current : next;
         });
-        clearWorkspaceErrors({ source: "page-tree" });
+        if (pageTreeErrorRevisionRef.current === pageTreeErrorRevision) {
+          clearWorkspaceErrors({ source: "page-tree" });
+        }
         return { serverPages: data.pages, removedDuringLoad: removals };
       })
       .catch((error) => {
-        pendingPageEvents.current.cancel();
+        if (pageLoadRequest.current?.promise === loading) pendingPageEvents.current.cancel();
         throw error;
       })
       .finally(() => {
-        if (pageLoadPromise.current === loading) pageLoadPromise.current = null;
+        if (pageLoadRequest.current?.promise === loading) pageLoadRequest.current = null;
       });
-    pageLoadPromise.current = loading;
+    pageLoadRequest.current = { controller, promise: loading };
     return loading;
   }, [archiveRemovalTombstones, clearWorkspaceErrors]);
-  const loadFreshPages = useCallback(async () => {
-    const pendingPageLoad = pageLoadPromise.current;
-    if (pendingPageLoad) await pendingPageLoad.catch(() => undefined);
-    return loadPages();
-  }, [loadPages]);
+  const loadFreshPages = useCallback(
+    async (signal?: AbortSignal) => {
+      const observerSignal = signal ?? workspaceAbortController.current?.signal;
+      observerSignal?.throwIfAborted();
+      const pendingPageLoad = pageLoadRequest.current?.promise;
+      if (pendingPageLoad) {
+        try {
+          if (observerSignal) await observeUntilAborted(pendingPageLoad, observerSignal);
+          else await pendingPageLoad;
+        } catch {
+          observerSignal?.throwIfAborted();
+        }
+      }
+      observerSignal?.throwIfAborted();
+      const loading = loadPages();
+      return observerSignal ? observeUntilAborted(loading, observerSignal) : loading;
+    },
+    [loadPages],
+  );
   const ensureTrashTreeRefresh = useCallback(() => {
     const pending = trashTreeRefreshPromise.current;
     if (pending) return pending;
     if (!trashTreeRefreshOwed.current) return Promise.resolve();
 
+    const signal = workspaceAbortController.current?.signal;
     let refresh!: Promise<void>;
     refresh = (async () => {
       while (trashTreeRefreshOwed.current) {
         trashTreeRefreshOwed.current = false;
         try {
-          await loadFreshPages();
+          await loadFreshPages(signal);
         } catch (firstError) {
-          if (reconciliationAbortController.current?.signal.aborted) throw firstError;
+          if (signal?.aborted) throw firstError;
           trashTreeRefreshOwed.current = false;
           try {
-            await loadFreshPages();
+            await loadFreshPages(signal);
           } catch (error) {
+            if (signal?.aborted) throw error;
             trashTreeRefreshOwed.current = true;
             reportWorkspaceError(
               { source: "page-tree" },
@@ -875,12 +898,24 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       // A retry belongs to the same restore operation and must not release any
       // removal observed during its first attempt. A newer restore gets a newer checkpoint.
       const protectedPageIds = new Set<string>();
-      const signal = reconciliationAbortController.current?.signal;
+      const signal = workspaceAbortController.current?.signal;
       const observe = async () => {
         for (const pageId of archiveRemovalTombstones.pageIdsPinnedAfter(tombstoneCheckpoint)) {
           protectedPageIds.add(pageId);
         }
-        const { serverPages, removedDuringLoad } = await loadFreshPages();
+        let loadResult: PageLoadResult;
+        try {
+          loadResult = await loadFreshPages(signal);
+        } catch (error) {
+          if (signal?.aborted) {
+            return {
+              rootWasRestored: false,
+              needsRetry: false,
+            };
+          }
+          throw error;
+        }
+        const { serverPages, removedDuringLoad } = loadResult;
         for (const pageId of archiveRemovalTombstones.pageIdsPinnedAfter(tombstoneCheckpoint)) {
           protectedPageIds.add(pageId);
         }
@@ -946,7 +981,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     async (restoredPages: Page[], tombstoneCheckpoint: number) => {
       const root = restoredEventRoot(restoredPages);
       if (!root) {
-        await reconcileWithOneRetry(loadFreshPages, () => true, reconciliationAbortController.current?.signal);
+        const signal = workspaceAbortController.current?.signal;
+        const observe = async () => {
+          try {
+            return await loadFreshPages(signal);
+          } catch (error) {
+            if (signal?.aborted) return null;
+            throw error;
+          }
+        };
+        await reconcileWithOneRetry(observe, (result) => result !== null, signal);
         return;
       }
       await reconcileRestoredRoot(
@@ -1050,7 +1094,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     [invalidateWorkspaceErrorAttempt],
   );
   useEffect(() => {
+    const signal = workspaceAbortController.current?.signal;
     void loadPages().catch((error) => {
+      if (signal?.aborted) return;
       reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be loaded."));
     });
   }, [loadPages, reportWorkspaceError]);
@@ -1122,8 +1168,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
 
   useEffect(() => {
+    const signal = workspaceAbortController.current?.signal;
     const bundle = createWorkspaceEvents(member.workspace.id, handleWorkspaceEvent, () => {
       void loadPages().catch((error) => {
+        if (signal?.aborted) return;
         reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be refreshed."));
       });
       void loadUnreadMentions();
@@ -1320,7 +1368,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     setPageTreeRetrying(true);
     clearWorkspaceErrors(errorAttempt);
     try {
-      await observeUntilAborted(loadFreshPages(), activeRetry.controller.signal);
+      await loadFreshPages(activeRetry.controller.signal);
     } catch (error) {
       if (!activeRetry.controller.signal.aborted) {
         reportWorkspaceError(errorAttempt, apiErrorMessage(error, fallbackMessage));
@@ -1356,10 +1404,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     (pageId: string) => {
       clearConfirmedRestores([pageId]);
       archiveRemovalTombstones.pin([pageId], pageLoadGeneration.current);
-      const reconciliation = loadFreshPages();
+      const signal = workspaceAbortController.current?.signal;
+      const reconciliation = loadFreshPages(signal);
       invalidatePagePreview(pageId);
       dispatchPageAction({ type: "remove", pageIds: new Set([pageId]) });
       void reconciliation.catch((error) => {
+        if (signal?.aborted) return;
         const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
         reportWorkspaceError({ source: "page-tree" }, refreshError);
       });

@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { connectionRetryDelay, reconciliationRetryDelay, waitForReconciliationRetry } from "./retry";
+import {
+  connectionRetryDelay,
+  observeUntilAborted,
+  reconciliationRetryDelay,
+  waitForReconciliationRetry,
+} from "./retry";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -33,6 +38,32 @@ describe("reconciliationRetryDelay", () => {
 
     expect(reconciliationRetryDelay()).toBe(500);
     expect(reconciliationRetryDelay()).toBe(1_000);
+  });
+});
+
+describe("observeUntilAborted", () => {
+  it("stops observing without cancelling the input promise", async () => {
+    const controller = new AbortController();
+    let resolveSource!: (value: string) => void;
+    const source = new Promise<string>((resolve) => {
+      resolveSource = resolve;
+    });
+    const observed = observeUntilAborted(source, controller.signal);
+
+    controller.abort();
+
+    await expect(observed).rejects.toBe(controller.signal.reason);
+    resolveSource("completed");
+    await expect(source).resolves.toBe("completed");
+  });
+
+  it("handles an input rejection when the signal was already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const source = Promise.reject(new Error("late source failure"));
+
+    await expect(observeUntilAborted(source, controller.signal)).rejects.toBe(controller.signal.reason);
+    await Promise.resolve();
   });
 });
 
