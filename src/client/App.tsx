@@ -1347,7 +1347,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!canCreatePage) return;
     const signal = workspaceAbortController.current.signal;
     const resolvedParentId = parentId === undefined ? (selected?.parentId ?? null) : parentId;
-    const attempt = startClearedWorkspaceErrorAttempt({
+    const attempt = startWorkspaceErrorAttempt({
       source: "page-mutation",
       scope: `create:${++pageMutationScopeRef.current}`,
     });
