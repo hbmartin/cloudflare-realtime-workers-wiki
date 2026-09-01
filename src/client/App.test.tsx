@@ -677,6 +677,77 @@ describe("App error handling", () => {
     ).toBeVisible();
   });
 
+  it("stops archive processing when the workspace unmounts before the mutation settles", async () => {
+    const archiveResponse = deferred<{ ok: true; pageIds: string[] }>();
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") return archiveResponse.promise;
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    const app = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(`/api/pages/${page.id}`, expect.objectContaining({ method: "DELETE" })),
+    );
+
+    app.unmount();
+    await act(async () => {
+      archiveResponse.resolve({ ok: true, pageIds: [page.id] });
+      await archiveResponse.promise;
+    });
+
+    expect(treeLoads).toBe(1);
+    expect(mocks.invalidatePagePreview).not.toHaveBeenCalled();
+  });
+
+  it("does not report archive reconciliation cancellation after workspace teardown", async () => {
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        const signal = init?.signal;
+        if (!signal) throw new Error("The reconciliation request did not receive a signal.");
+        return new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") return { ok: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    const app = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    reported.mockClear();
+
+    app.unmount();
+    await act(async () => Promise.resolve());
+
+    expect(reported).not.toHaveBeenCalled();
+  });
+
   it.each([
     [
       "malformed JSON",
