@@ -1,4 +1,5 @@
 import { useEffect, useState, type ComponentType } from "react";
+import { AlertSplash, LoadingSplash } from "./Splash";
 
 export type SupportedAppModule = { default: ComponentType };
 export type SupportedAppLoader = () => Promise<SupportedAppModule>;
@@ -9,14 +10,14 @@ const loadDefaultSupportedApp: SupportedAppLoader = () => import("./SupportedApp
 function StartupFallback({ kind }: { kind: "unsupported" | "unavailable" }) {
   const unavailable = kind === "unavailable";
   return (
-    <main className="startup-splash" role="alert">
-      <h1>{unavailable ? "Workspace unavailable" : "Browser update required"}</h1>
-      <p>
-        {unavailable
+    <AlertSplash
+      title={unavailable ? "Workspace unavailable" : "Browser update required"}
+      message={
+        unavailable
           ? "The application could not be loaded. Refresh the page to try again."
-          : "Use Chrome or Edge 116+, Firefox 124+, or Safari 17.4+ to open this workspace."}
-      </p>
-    </main>
+          : "Use Chrome or Edge 116+, Firefox 124+, or Safari 17.4+ to open this workspace."
+      }
+    />
   );
 }
 
@@ -50,10 +51,5 @@ export function Startup({
   if (!supported) return <StartupFallback kind="unsupported" />;
   if (state.kind === "ready") return <state.SupportedApp />;
   if (state.kind === "unavailable") return <StartupFallback kind="unavailable" />;
-  return (
-    <output className="startup-splash">
-      <div className="startup-brand-mark">N</div>
-      <p>Opening Notes…</p>
-    </output>
-  );
+  return <LoadingSplash />;
 }

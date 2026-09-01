@@ -2,7 +2,7 @@
 
 import { act, render, screen } from "@testing-library/react";
 import type { JSX } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Startup } from "./startup";
 
 function deferred<T>() {
@@ -16,14 +16,17 @@ function deferred<T>() {
 }
 
 describe("Startup", () => {
-  beforeEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.restoreAllMocks());
 
   it("announces the unsupported-browser fallback without loading the application", () => {
     const loadSupportedApp = vi.fn();
 
     render(<Startup supported={false} loadSupportedApp={loadSupportedApp} />);
 
-    expect(screen.getByRole("alert")).toHaveTextContent("Browser update required");
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Browser update required");
+    expect(screen.getByRole("main")).toContainElement(alert);
+    expect(screen.getByRole("main")).not.toBe(alert);
     expect(loadSupportedApp).not.toHaveBeenCalled();
   });
 
@@ -32,7 +35,10 @@ describe("Startup", () => {
 
     render(<Startup supported loadSupportedApp={() => application.promise} />);
 
-    expect(screen.getByRole("status")).toHaveTextContent("Opening Notes…");
+    const status = screen.getByText("Opening Notes…");
+    expect(status).toHaveTextContent("Opening Notes…");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(screen.getByRole("main")).toContainElement(status);
   });
 
   it("renders the supported application after its bundle loads", async () => {
@@ -45,7 +51,7 @@ describe("Startup", () => {
     });
 
     expect(screen.getByText("Application loaded")).toBeInTheDocument();
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByText("Opening Notes…")).not.toBeInTheDocument();
   });
 
   it("logs and announces an application bundle load failure", async () => {

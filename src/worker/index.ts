@@ -587,37 +587,63 @@ app.post("/api/pages", async (c) => {
   const body = await jsonBody(c.req.raw);
   const parentId = nullableId(body.parentId, "parentId");
   if (parentId) await pageForMember(c.env, member, parentId);
+  const id = body.id === undefined ? crypto.randomUUID() : text(body.id, "id", 100);
+  if (!ID_PATTERN.test(id)) throw new HttpError(422, "invalid_input", "id is not a valid resource id.");
+  const kind = pageKind(body.kind ?? "document");
+  const title = typeof body.title === "string" ? text(body.title, "title", PAGE_TITLE_MAX) : "Untitled";
+  const readRequested = () => c.env.DB.prepare(`SELECT * FROM pages WHERE id = ?`).bind(id).first<PageRow>();
+  const matchingReplay = (row: PageRow | null) =>
+    row?.workspace_id === member.workspace.id &&
+    row.archived_at === null &&
+    row.parent_id === parentId &&
+    row.kind === kind &&
+    row.title === title
+      ? row
+      : null;
+  const existing = await readRequested();
+  if (existing) {
+    const replay = matchingReplay(existing);
+    if (replay) return c.json({ page: pageJson(replay) });
+    throw new HttpError(409, "idempotency_key_reused", "That page id already describes a different page.");
+  }
   const last = await c.env.DB.prepare(
     `SELECT position FROM pages WHERE workspace_id = ? AND parent_id IS ? AND archived_at IS NULL ORDER BY position DESC, id DESC LIMIT 1`,
   )
     .bind(member.workspace.id, parentId)
     .first<{ position: string }>();
-  const id = crypto.randomUUID();
-  const kind = pageKind(body.kind ?? "document");
-  const title = typeof body.title === "string" ? text(body.title, "title", PAGE_TITLE_MAX) : "Untitled";
   const timestamp = now();
-  await c.env.DB.batch([
-    c.env.DB.prepare(
-      `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(
-      id,
-      member.workspace.id,
-      parentId,
-      kind,
-      generateJitteredKeyBetween(last?.position ?? null, null),
-      title,
-      member.user.id,
-      timestamp,
-      timestamp,
-    ),
-    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
-      id,
-      member.workspace.id,
-      title,
-    ),
-    ...(kind === "table" ? [c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(id)] : []),
-  ]);
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        id,
+        member.workspace.id,
+        parentId,
+        kind,
+        generateJitteredKeyBetween(last?.position ?? null, null),
+        title,
+        member.user.id,
+        timestamp,
+        timestamp,
+      ),
+      c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
+        id,
+        member.workspace.id,
+        title,
+      ),
+      ...(kind === "table" ? [c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(id)] : []),
+    ]);
+  } catch (error) {
+    const afterConflict = await readRequested();
+    const replay = matchingReplay(afterConflict);
+    if (replay) return c.json({ page: pageJson(replay) });
+    if (afterConflict) {
+      throw new HttpError(409, "idempotency_key_reused", "That page id already describes a different page.");
+    }
+    throw error;
+  }
   const created = pageJson(await pageForMember(c.env, member, id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [created] });
   return c.json({ page: created }, 201);
