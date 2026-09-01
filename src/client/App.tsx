@@ -34,7 +34,14 @@ type AppState =
   | { screen: "invite"; token: string }
   | { screen: "workspace"; member: ClientMemberContext };
 
-type WorkspaceErrorSource = "archive" | "mentions" | "page-access" | "page-tree" | "trash-load" | "trash-mutation";
+type WorkspaceErrorSource =
+  | "archive"
+  | "mentions"
+  | "page-access"
+  | "page-mutation"
+  | "page-tree"
+  | "trash-load"
+  | "trash-mutation";
 type ScopedWorkspaceErrorSource = "archive" | "trash-mutation";
 type UnscopedWorkspaceErrorSource = Exclude<WorkspaceErrorSource, ScopedWorkspaceErrorSource>;
 type WorkspaceErrorTarget =
@@ -629,7 +636,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   // revision hidden from trash while allowing a later archived revision through.
   const [confirmedRestoredPageRevisions] = useState(() => new Map<string, number>());
   const restoredRootToken = useRef(0);
-  const workspaceAbortController = useRef(new AbortController());
+  const workspaceAbortController = useRef<AbortController>(null!);
+  workspaceAbortController.current ??= new AbortController();
   const pageLoadGeneration = useRef(0);
   const pageLoadRequest = useRef<{
     controller: AbortController;
@@ -987,9 +995,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const reconcileRestoredEvent = useCallback(
     async (restoredPages: Page[], tombstoneCheckpoint: number) => {
+      const signal = workspaceAbortController.current.signal;
       const root = restoredEventRoot(restoredPages);
       if (!root) {
-        const signal = workspaceAbortController.current.signal;
         const observe = async () => {
           try {
             return await loadFreshPages(signal);
@@ -1007,7 +1015,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         tombstoneCheckpoint,
         true,
         "expected-pages",
-        workspaceAbortController.current.signal,
+        signal,
       );
     },
     [loadFreshPages, reconcileRestoredRoot],
@@ -1220,20 +1228,23 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!canCreatePage) return;
     const signal = workspaceAbortController.current.signal;
     const resolvedParentId = parentId === undefined ? (selected?.parentId ?? null) : parentId;
-    let result: { page: Page };
+    const attempt = startWorkspaceErrorAttempt({ source: "page-mutation" });
+    clearWorkspaceErrors(attempt);
     try {
-      result = await api<{ page: Page }>("/api/pages", {
+      const result = await api<{ page: Page }>("/api/pages", {
         method: "POST",
         body: json({ kind, parentId: resolvedParentId }),
       });
+      if (signal.aborted) return;
+      recordPageUpserts([result.page]);
+      dispatchPageAction({ type: "merge", pages: [result.page] });
+      navigateToPage(result.page.id);
     } catch (error) {
       if (signal.aborted) return;
-      throw error;
+      reportWorkspaceError(attempt, apiErrorMessage(error, "The page could not be created."));
+    } finally {
+      finishWorkspaceErrorAttempt(attempt);
     }
-    if (signal.aborted) return;
-    recordPageUpserts([result.page]);
-    dispatchPageAction({ type: "merge", pages: [result.page] });
-    navigateToPage(result.page.id);
   }
   async function archive(page: Page) {
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
@@ -1315,6 +1326,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (!needsReconciliation) return;
       await reconcileArchivePages();
     } catch (error) {
+      if (signal.aborted) return;
       reportWorkspaceError(
         attempt,
         apiErrorMessage(
@@ -1341,19 +1353,22 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     afterId: string | null = null,
   ) {
     const signal = workspaceAbortController.current.signal;
-    let result: { page: Page };
+    const attempt = startWorkspaceErrorAttempt({ source: "page-mutation" });
+    clearWorkspaceErrors(attempt);
     try {
-      result = await api<{ page: Page }>(`/api/pages/${pageId}/move`, {
+      const result = await api<{ page: Page }>(`/api/pages/${pageId}/move`, {
         method: "POST",
         body: json({ parentId, beforeId, afterId }),
       });
+      if (signal.aborted) return;
+      recordPageUpserts([result.page]);
+      dispatchPageAction({ type: "merge", pages: [result.page] });
     } catch (error) {
       if (signal.aborted) return;
-      throw error;
+      reportWorkspaceError(attempt, apiErrorMessage(error, "The page could not be moved."));
+    } finally {
+      finishWorkspaceErrorAttempt(attempt);
     }
-    if (signal.aborted) return;
-    recordPageUpserts([result.page]);
-    dispatchPageAction({ type: "merge", pages: [result.page] });
   }
   async function runSearch(value: string) {
     setSearch(value);
@@ -1539,17 +1554,20 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         archivePageIds(value, page.id),
       );
       const deletedIds = result.kind === "committed" ? new Set(result.value ?? knownPageIds) : null;
+      const committedResponseWasInvalid = result.kind === "committed" && result.value === null;
       const previewIds = deletedIds ?? (result.kind === "uncertain" ? knownPageIds : null);
       if (previewIds) {
         for (const pageId of previewIds) invalidatePagePreview(pageId);
       }
       if (signal.aborted) return;
-      if (result.kind === "committed" && deletedIds) {
+      if (deletedIds) {
         setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
-        if (!result.value) {
+        if (committedResponseWasInvalid) {
           reportWorkspaceError(attempt, "The server returned an invalid permanent-delete response. Refreshing trash.");
         }
-      } else if (result.kind !== "committed") {
+      } else if (result.kind === "uncertain") {
+        reportWorkspaceError(attempt, "The permanent-delete result could not be verified. Refreshing trash.");
+      } else if (result.kind === "rejected") {
         reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be permanently deleted."));
       }
       refreshTrash();

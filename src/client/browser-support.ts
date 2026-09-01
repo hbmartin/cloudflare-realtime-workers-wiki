@@ -10,6 +10,6 @@ export function browserSupportsRequiredFeatures(
   return (
     typeof capabilities?.any === "function" &&
     typeof capabilities?.timeout === "function" &&
-    typeof capabilities.prototype?.throwIfAborted === "function"
+    typeof capabilities?.prototype?.throwIfAborted === "function"
   );
 }
