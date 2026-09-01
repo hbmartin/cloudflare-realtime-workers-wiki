@@ -184,6 +184,20 @@ function sendWorkspaceEvent(
   );
 }
 
+function rebroadcastPageCreateReplay(
+  c: { env: Env; executionCtx: { waitUntil(promise: Promise<unknown>): void } },
+  workspaceId: string,
+  pages: Page[],
+) {
+  // Replays return current page metadata. Repair a possibly lost create event
+  // only for pages that still belong in the live tree; rebroadcasting an archived
+  // page as an upsert would incorrectly revive it for connected clients.
+  const activePages = pages.filter((page) => page.archivedAt === null);
+  if (activePages.length) {
+    sendWorkspaceEvent(c, workspaceId, { type: "pages-upserted", pages: activePages });
+  }
+}
+
 function defaultLocation(request: Request, override?: string) {
   if (locationHint(override)) return override!;
   const continent = String(request.cf?.continent ?? "");
@@ -652,7 +666,10 @@ app.post("/api/pages", async (c) => {
   const initialReplay = clientProvidedId
     ? await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage)
     : null;
-  if (initialReplay) return c.json({ page: initialReplay[0]! });
+  if (initialReplay) {
+    rebroadcastPageCreateReplay(c, member.workspace.id, initialReplay);
+    return c.json({ page: initialReplay[0]! });
+  }
   if (parentId) await pageForMember(c.env, member, parentId);
   const timestamp = now();
   let createdRow: PageRow | undefined;
@@ -683,7 +700,10 @@ app.post("/api/pages", async (c) => {
     createdRow = results[0]?.results[0];
   } catch (error) {
     const replay = await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage);
-    if (replay) return c.json({ page: replay[0]! });
+    if (replay) {
+      rebroadcastPageCreateReplay(c, member.workspace.id, replay);
+      return c.json({ page: replay[0]! });
+    }
     if (await requestedPageIdsExist(c.env.DB, requested)) {
       throw new HttpError(409, "idempotency_key_reused", conflictMessage);
     }
@@ -740,7 +760,10 @@ app.post("/api/pages/batch", async (c) => {
   const initialReplay = allIdsClientProvided
     ? await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage)
     : null;
-  if (initialReplay) return c.json({ pages: initialReplay, replayed: true });
+  if (initialReplay) {
+    rebroadcastPageCreateReplay(c, member.workspace.id, initialReplay);
+    return c.json({ pages: initialReplay, replayed: true });
+  }
 
   // Every distinct parent is checked once, which also rejects a parent in another
   // workspace or an archived one exactly as the single-page route does.
@@ -808,7 +831,10 @@ app.post("/api/pages/batch", async (c) => {
     // A concurrent identical retry may have committed between the existence check
     // and this transaction. Re-read before classifying the unique conflict.
     const replay = await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage);
-    if (replay) return c.json({ pages: replay, replayed: true });
+    if (replay) {
+      rebroadcastPageCreateReplay(c, member.workspace.id, replay);
+      return c.json({ pages: replay, replayed: true });
+    }
     if (await requestedPageIdsExist(c.env.DB, parsed)) {
       throw new HttpError(409, "idempotency_key_reused", conflictMessage);
     }

@@ -161,6 +161,29 @@ async function bulkWrite(cookie: string, pageId: string, body: Record<string, un
   };
 }
 
+function envWithCapturedWorkspaceEvents(
+  bindings: Env,
+  delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
+) {
+  const workspaceEvents = {
+    getByName(workspaceId: string) {
+      return {
+        async fetch(request: Request) {
+          delivered.push({ workspaceId, event: (await request.json()) as WorkspaceEvent });
+          return Response.json({ delivered: true });
+        },
+      };
+    },
+  } as unknown as Env["WORKSPACE_EVENTS"];
+
+  return new Proxy(bindings, {
+    get(target, property, receiver) {
+      if (property === "WORKSPACE_EVENTS") return workspaceEvents;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+}
+
 function envWithFirstBatchResultHidden(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
@@ -180,21 +203,11 @@ function envWithFirstBatchResultHidden(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
-  const workspaceEvents = {
-    getByName(workspaceId: string) {
-      return {
-        async fetch(request: Request) {
-          delivered.push({ workspaceId, event: (await request.json()) as WorkspaceEvent });
-          return Response.json({ delivered: true });
-        },
-      };
-    },
-  } as unknown as Env["WORKSPACE_EVENTS"];
+  const capturedBindings = envWithCapturedWorkspaceEvents(bindings, delivered);
   return {
-    bindings: new Proxy(bindings, {
+    bindings: new Proxy(capturedBindings, {
       get(target, property, receiver) {
         if (property === "DB") return database;
-        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
         return Reflect.get(target, property, receiver);
       },
     }),
@@ -3254,7 +3267,7 @@ describe("Worker integration", () => {
     expect(await replayed.json()).toEqual(createdBody);
   });
 
-  it("never exposes a page owned by another workspace as a create replay", async () => {
+  it("rejects a cross-workspace receipt and classifies a foreign page id as reuse", async () => {
     const installed = await bootstrap();
     const id = crypto.randomUUID();
     const foreignWorkspaceId = crypto.randomUUID();
@@ -3281,32 +3294,20 @@ describe("Worker integration", () => {
     expect(response.status).toBe(409);
     expect((await response.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
 
-    const foreignRequest = { id, parentId: null, kind: "document", title: "Foreign page" };
     const requestHash = await sha256Hex(canonicalJson({ parentId: null, kind: "document", title: "Foreign page" }));
-    await env.DB.prepare(`INSERT INTO page_create_receipts (workspace_id, page_id, request_hash) VALUES (?, ?, ?)`)
-      .bind(installed.workspaceId, id, requestHash)
-      .run();
-    const mismatchedReceipt = await SELF.fetch(
-      authenticatedRequest(installed.cookie, "/api/pages", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(foreignRequest),
-      }),
-    );
-    const mismatchedReceiptBody = await mismatchedReceipt.json<{ error?: { code: string }; page?: Page }>();
-    expect(mismatchedReceipt.status).toBe(409);
-    expect(mismatchedReceiptBody).toEqual({
-      error: expect.objectContaining({ code: "idempotency_key_reused" }),
-    });
+    await expect(
+      env.DB.prepare(`INSERT INTO page_create_receipts (workspace_id, page_id, request_hash) VALUES (?, ?, ?)`)
+        .bind(installed.workspaceId, id, requestHash)
+        .run(),
+    ).rejects.toThrow(/FOREIGN KEY constraint failed/);
   });
 
-  it("never exposes a foreign page through a batch replay receipt", async () => {
+  it("rejects a cross-workspace batch receipt and classifies the foreign page id as reuse", async () => {
     const installed = await bootstrap();
     const id = crypto.randomUUID();
     const foreignWorkspaceId = crypto.randomUUID();
     const timestamp = Date.now();
     const pages = [{ id, parentId: null, kind: "document", title: "Foreign batch page" }];
-    const requestHash = await sha256Hex(canonicalJson(pages));
     await env.DB.batch([
       env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES (?, 'Foreign workspace', ?)`).bind(
         foreignWorkspaceId,
@@ -3316,12 +3317,12 @@ describe("Worker integration", () => {
         `INSERT INTO pages (id, workspace_id, kind, position, title, created_by, created_at, updated_at)
          VALUES (?, ?, 'document', 'a0', 'Foreign batch page', ?, ?, ?)`,
       ).bind(id, foreignWorkspaceId, installed.userId, timestamp, timestamp),
-      env.DB.prepare(`INSERT INTO page_create_receipts (workspace_id, page_id, request_hash) VALUES (?, ?, ?)`).bind(
-        installed.workspaceId,
-        id,
-        requestHash,
-      ),
     ]);
+    await expect(
+      env.DB.prepare(`INSERT INTO page_create_receipts (workspace_id, page_id, request_hash) VALUES (?, ?, ?)`)
+        .bind(installed.workspaceId, id, await sha256Hex(canonicalJson(pages)))
+        .run(),
+    ).rejects.toThrow(/FOREIGN KEY constraint failed/);
 
     const response = await SELF.fetch(
       authenticatedRequest(installed.cookie, "/api/pages/batch", {
@@ -3369,6 +3370,82 @@ describe("Worker integration", () => {
 
     expect(invalidParent.status).toBe(409);
     expect((await invalidParent.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
+  });
+
+  it("rebroadcasts only active pages when a single-page create is replayed", async () => {
+    const installed = await bootstrap();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const bindings = envWithCapturedWorkspaceEvents(env, delivered);
+    const requested = { id: crypto.randomUUID(), parentId: null, kind: "document", title: "Replay page" };
+    const request = () =>
+      authenticatedRequest(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(requested),
+      });
+
+    const createContext = createExecutionContext();
+    expect((await worker.fetch(request(), bindings, createContext)).status).toBe(201);
+    await waitOnExecutionContext(createContext);
+    delivered.length = 0;
+
+    const replayContext = createExecutionContext();
+    const replay = await worker.fetch(request(), bindings, replayContext);
+    const replayBody = await replay.json<{ page: Page }>();
+    await waitOnExecutionContext(replayContext);
+    expect(replay.status).toBe(200);
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "pages-upserted", pages: [replayBody.page] },
+      },
+    ]);
+
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), requested.id).run();
+    delivered.length = 0;
+    const archivedReplayContext = createExecutionContext();
+    const archivedReplay = await worker.fetch(request(), bindings, archivedReplayContext);
+    const archivedReplayBody = await archivedReplay.json<{ page: Page }>();
+    await waitOnExecutionContext(archivedReplayContext);
+    expect(archivedReplay.status).toBe(200);
+    expect(archivedReplayBody.page.archivedAt).not.toBeNull();
+    expect(delivered).toEqual([]);
+  });
+
+  it("rebroadcasts only active pages when a page batch is replayed", async () => {
+    const installed = await bootstrap();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const bindings = envWithCapturedWorkspaceEvents(env, delivered);
+    const pages = [
+      { id: crypto.randomUUID(), parentId: null, kind: "document", title: "Replay A" },
+      { id: crypto.randomUUID(), parentId: null, kind: "document", title: "Replay B" },
+    ];
+    const request = () =>
+      authenticatedRequest(installed.cookie, "/api/pages/batch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pages }),
+      });
+
+    const createContext = createExecutionContext();
+    expect((await worker.fetch(request(), bindings, createContext)).status).toBe(201);
+    await waitOnExecutionContext(createContext);
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), pages[0]!.id).run();
+    delivered.length = 0;
+
+    const replayContext = createExecutionContext();
+    const replay = await worker.fetch(request(), bindings, replayContext);
+    const replayBody = await replay.json<{ pages: Page[]; replayed: boolean }>();
+    await waitOnExecutionContext(replayContext);
+    expect(replay.status).toBe(200);
+    expect(replayBody.replayed).toBe(true);
+    expect(replayBody.pages[0]!.archivedAt).not.toBeNull();
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "pages-upserted", pages: [replayBody.pages[1]!] },
+      },
+    ]);
   });
 
   it("broadcasts a committed page create when its insert result is unexpectedly empty", async () => {

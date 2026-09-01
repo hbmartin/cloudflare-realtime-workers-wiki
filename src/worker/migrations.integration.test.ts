@@ -31,6 +31,7 @@ describe("D1 migrations", () => {
     const indexes = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all<{ name: string }>();
     expect(indexes.results.map((index) => index.name)).toContain("idx_table_cells_column");
     expect(indexes.results.map((index) => index.name)).toContain("idx_page_create_receipts_page");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_pages_workspace_page");
     const pageCreateReceiptIndex = await env.DB.prepare(`PRAGMA index_info(idx_page_create_receipts_page)`).all<{
       name: string;
     }>();
@@ -51,6 +52,21 @@ describe("D1 migrations", () => {
       "workspace_id",
       "page_id",
       "request_hash",
+    ]);
+    const receiptPageForeignKey = await env.DB.prepare(`PRAGMA foreign_key_list(page_create_receipts)`).all<{
+      seq: number;
+      table: string;
+      from: string;
+      to: string;
+    }>();
+    expect(
+      receiptPageForeignKey.results
+        .filter((foreignKey) => foreignKey.table === "pages")
+        .toSorted((left, right) => left.seq - right.seq)
+        .map((foreignKey) => [foreignKey.from, foreignKey.to]),
+    ).toEqual([
+      ["workspace_id", "workspace_id"],
+      ["page_id", "id"],
     ]);
 
     const applied = await env.DB.prepare(`SELECT name FROM d1_migrations ORDER BY id`).all<{ name: string }>();
@@ -198,6 +214,15 @@ describe("D1 migrations", () => {
     ).toMatchObject({
       results: [{ workspace_id: "workspace", page_id: "page", request_hash: "live-request" }],
     });
+    await expect(
+      env.DB.prepare(
+        `INSERT INTO page_create_receipts (workspace_id, page_id, request_hash)
+         VALUES ('other', 'page', 'wrong-workspace-request')`,
+      ).run(),
+    ).rejects.toThrow(/FOREIGN KEY constraint failed/);
+    await expect(
+      env.DB.prepare(`UPDATE page_create_receipts SET workspace_id = 'other' WHERE page_id = 'page'`).run(),
+    ).rejects.toThrow(/FOREIGN KEY constraint failed/);
     await env.DB.prepare(`DELETE FROM pages WHERE id = 'page'`).run();
     expect(await env.DB.prepare(`SELECT 1 FROM page_create_receipts`).first()).toBeNull();
   });
