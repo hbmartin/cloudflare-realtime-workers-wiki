@@ -3144,6 +3144,35 @@ describe("Worker integration", () => {
     });
   });
 
+  it("honors and safely replays a client-generated page id", async () => {
+    const installed = await bootstrap();
+    const id = crypto.randomUUID();
+    const post = (body: unknown) =>
+      SELF.fetch(
+        authenticatedRequest(installed.cookie, "/api/pages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+    const requested = { id, parentId: installed.pageId, kind: "document", title: "Stable page" };
+
+    const created = await post(requested);
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ page: requested });
+
+    const replayed = await post(requested);
+    expect(replayed.status).toBe(200);
+    expect(await replayed.json()).toMatchObject({ page: requested });
+
+    const mismatched = await post({ ...requested, title: "Different" });
+    expect(mismatched.status).toBe(409);
+    expect((await mismatched.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
+
+    const invalid = await post({ ...requested, id: "not/a/page/id" });
+    expect(invalid.status).toBe(422);
+  });
+
   it("creates a whole tree level in one request, in the order asked for", async () => {
     const installed = await bootstrap();
 

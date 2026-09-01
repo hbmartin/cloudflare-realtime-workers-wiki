@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { ClientMemberContext } from "../shared/types";
-import { buildTree } from "../shared/tree-model";
+import { buildTree, compareBinaryText } from "../shared/tree-model";
 import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent } from "../shared/types";
 import { isPage } from "../shared/validation";
 import {
@@ -25,6 +25,7 @@ import {
   PageRemovalTombstones,
 } from "./page-state";
 import { observeUntilAborted, waitForReconciliationRetry } from "./retry";
+import { LoadingSplash } from "./Splash";
 import { TablePage } from "./TablePage";
 
 type AppState =
@@ -75,6 +76,21 @@ function errorLogFields(error: unknown) {
     errorStack: null,
     errorType: error === null ? "null" : typeof error,
   };
+}
+
+type MutationOutcome = "not-started" | "rejected" | "uncertain" | "committed";
+
+function logUnverifiedMutation(
+  message: string,
+  outcome: "uncertain" | "committed-invalid-response",
+  error: unknown,
+  context: Record<string, unknown>,
+) {
+  console.error(message, {
+    ...context,
+    outcome,
+    ...errorLogFields(error),
+  });
 }
 
 function workspaceErrorAttemptKey(target: WorkspaceErrorTarget) {
@@ -141,18 +157,62 @@ function restoreResponsePages(value: unknown, rootPageId: string, workspaceId: s
   return pages;
 }
 
-function pageMutationResponse(value: unknown, workspaceId: string, expectedPageId?: string) {
+type PageMutationExpectation = {
+  id: string;
+  workspaceId: string;
+  parentId: string | null;
+  kind: PageKind;
+  minimumRevision?: number;
+};
+
+function matchesPageMutationExpectation(page: Page, expectation: PageMutationExpectation) {
+  return (
+    page.id === expectation.id &&
+    page.workspaceId === expectation.workspaceId &&
+    page.parentId === expectation.parentId &&
+    page.kind === expectation.kind &&
+    page.archivedAt === null &&
+    (expectation.minimumRevision === undefined || page.revision >= expectation.minimumRevision)
+  );
+}
+
+function pageMutationResponse(value: unknown, expectation: PageMutationExpectation) {
   const page =
     value !== null && typeof value === "object" && "page" in value ? (value as { page?: unknown }).page : null;
-  if (
-    !isPage(page) ||
-    page.workspaceId !== workspaceId ||
-    page.archivedAt !== null ||
-    (expectedPageId !== undefined && page.id !== expectedPageId)
-  ) {
-    return null;
-  }
-  return page;
+  return isPage(page) && matchesPageMutationExpectation(page, expectation) ? page : null;
+}
+
+function observedExpectedPage(result: PageLoadResult, expectation: PageMutationExpectation) {
+  if (result.removedDuringLoad.has(expectation.id)) return null;
+  const page = result.serverPages.find((candidate) => candidate.id === expectation.id);
+  return page && matchesPageMutationExpectation(page, expectation) ? page : null;
+}
+
+function observedExpectedMove(
+  result: PageLoadResult,
+  expectation: PageMutationExpectation,
+  beforeId: string | null,
+  afterId: string | null,
+) {
+  const moved = observedExpectedPage(result, expectation);
+  if (!moved) return false;
+  const siblings = result.serverPages
+    .filter(
+      (candidate) =>
+        candidate.archivedAt === null &&
+        candidate.parentId === expectation.parentId &&
+        !result.removedDuringLoad.has(candidate.id),
+    )
+    .toSorted(
+      (left, right) => compareBinaryText(left.position, right.position) || compareBinaryText(left.id, right.id),
+    );
+  const movedIndex = siblings.findIndex((candidate) => candidate.id === expectation.id);
+  if (movedIndex < 0) return false;
+  const beforeIndex = beforeId === null ? -1 : siblings.findIndex((candidate) => candidate.id === beforeId);
+  const afterIndex = afterId === null ? -1 : siblings.findIndex((candidate) => candidate.id === afterId);
+  if (beforeId !== null && (beforeIndex < 0 || movedIndex >= beforeIndex)) return false;
+  if (afterId !== null && (afterIndex < 0 || movedIndex <= afterIndex)) return false;
+  return beforeId !== null || afterId !== null || movedIndex === siblings.length - 1;
 }
 
 type MutationRequestResult<T> =
@@ -418,7 +478,7 @@ export function App() {
     void load();
   }, [load]);
 
-  if (state.screen === "loading") return <Splash />;
+  if (state.screen === "loading") return <LoadingSplash />;
   if (state.screen === "bootstrap") return <BootstrapScreen onComplete={load} />;
   if (state.screen === "invite")
     return (
@@ -432,15 +492,6 @@ export function App() {
     );
   if (state.screen === "signin") return <SignInScreen onComplete={load} initialError={state.message} />;
   return <Workspace member={state.member} onSignOut={signOut} />;
-}
-
-function Splash() {
-  return (
-    <div className="splash">
-      <div className="brand-mark">N</div>
-      <p>Opening Notes…</p>
-    </div>
-  );
 }
 
 function AuthLayout({
@@ -644,13 +695,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [trashLoading, setTrashLoading] = useState(false);
   const [pageTreeRetrying, setPageTreeRetrying] = useState(false);
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
+  const sidebarOpenRef = useRef(false);
+  const sidebarTriggerRef = useRef<HTMLButtonElement>(null);
+  const restoreSidebarTriggerFocus = useRef(false);
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const [archiveRemovalTombstones] = useState(() => new PageRemovalTombstones());
   // Archived-tree reads may lag a confirmed restore. Keep the newest restored
   // revision hidden from trash while allowing a later archived revision through.
   const [confirmedRestoredPageRevisions] = useState(() => new Map<string, number>());
   const restoredRootToken = useRef(0);
-  const workspaceAbortController = useRef(new AbortController());
+  const pageMutationScopeRef = useRef(0);
+  const workspaceAbortController = useRef<AbortController>(null!);
+  workspaceAbortController.current ??= new AbortController();
   const pageLoadGeneration = useRef(0);
   const pageLoadRequest = useRef<{
     controller: AbortController;
@@ -698,6 +754,22 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     };
   }, [abortWorkspaceRequests]);
 
+  const closeSidebar = useCallback((restoreFocus = false) => {
+    if (!sidebarOpenRef.current) return;
+    sidebarOpenRef.current = false;
+    if (restoreFocus) restoreSidebarTriggerFocus.current = true;
+    setSidebarOpen(false);
+  }, []);
+  const openSidebar = useCallback(() => {
+    sidebarOpenRef.current = true;
+    setSidebarOpen(true);
+  }, []);
+  useEffect(() => {
+    if (sidebarOpen || !restoreSidebarTriggerFocus.current) return;
+    restoreSidebarTriggerFocus.current = false;
+    sidebarTriggerRef.current?.focus();
+  }, [sidebarOpen]);
+
   const isCurrentWorkspaceErrorAttempt = useCallback((attempt: WorkspaceErrorAttempt) => {
     return latestWorkspaceErrorAttemptRef.current.get(workspaceErrorAttemptKey(attempt)) === attempt.generation;
   }, []);
@@ -734,12 +806,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [isCurrentWorkspaceErrorAttempt],
   );
-  const clearWorkspaceErrorSource = useCallback((source: WorkspaceErrorSource) => {
-    setWorkspaceErrors((current) => {
-      const next = current.filter((error) => error.source !== source);
-      return next.length === current.length ? current : next;
-    });
-  }, []);
   const invalidateWorkspaceErrorAttempt = useCallback(
     (target: WorkspaceErrorTarget) => {
       const attempt = startWorkspaceErrorAttempt(target);
@@ -779,9 +845,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       }
       dispatchPageAction({ type: "select", pageId });
       setView("pages");
-      setSidebarOpen(false);
+      closeSidebar(true);
     },
-    [cancelPageTreeRetry],
+    [cancelPageTreeRetry, closeSidebar],
   );
 
   useEffect(() => {
@@ -1243,84 +1309,143 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     return items;
   }, [pages, pendingSelectionId, selected]);
 
-  async function reconcilePageMutation(signal: AbortSignal) {
+  async function reconcilePages(signal: AbortSignal, onFailure?: (error: unknown) => void) {
     try {
-      await loadFreshPages(signal);
+      return await loadFreshPages(signal);
     } catch (error) {
-      if (signal.aborted) return;
+      if (signal.aborted) return null;
+      onFailure?.(error);
       reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be refreshed."));
+      return null;
     }
+  }
+
+  async function reconcilePageMutation(
+    attempt: WorkspaceErrorAttempt,
+    signal: AbortSignal,
+    isVerified: (result: PageLoadResult) => boolean,
+    unresolvedMessage: string,
+  ) {
+    const observation = await reconcileWithOneRetry(
+      () => reconcilePages(signal),
+      (result) => result !== null && !isVerified(result),
+      signal,
+    );
+    if (signal.aborted) return null;
+    if (observation && isVerified(observation)) {
+      clearWorkspaceErrors(attempt);
+      return observation;
+    }
+    reportWorkspaceError(
+      attempt,
+      observation ? `${unresolvedMessage} after refreshing the page tree.` : `${unresolvedMessage}.`,
+    );
+    return null;
   }
 
   async function createPage(kind: PageKind, parentId?: string | null) {
     if (!canCreatePage) return;
     const signal = workspaceAbortController.current.signal;
     const resolvedParentId = parentId === undefined ? (selected?.parentId ?? null) : parentId;
-    const operationId = crypto.randomUUID();
-    clearWorkspaceErrorSource("page-mutation");
-    const attempt = startClearedWorkspaceErrorAttempt({ source: "page-mutation", scope: operationId });
+    const attempt = startWorkspaceErrorAttempt({
+      source: "page-mutation",
+      scope: `create:${++pageMutationScopeRef.current}`,
+    });
+    let operationId = "";
+    let outcome: MutationOutcome = "not-started";
+    let expectation: PageMutationExpectation | null = null;
     try {
+      operationId = crypto.randomUUID();
+      expectation = {
+        id: operationId,
+        workspaceId: member.workspace.id,
+        parentId: resolvedParentId,
+        kind,
+      };
       const result = await requestMutation(
         "/api/pages",
         {
           method: "POST",
-          body: json({ kind, parentId: resolvedParentId }),
+          body: json({ id: operationId, kind, parentId: resolvedParentId }),
           signal,
         },
-        (value) => pageMutationResponse(value, member.workspace.id),
+        (value) => pageMutationResponse(value, expectation!),
       );
       if (signal.aborted) return;
+      outcome = result.kind;
       if (result.kind === "committed" && result.value) {
         recordPageUpserts([result.value]);
         dispatchPageAction({ type: "merge", pages: [result.value] });
         navigateToPage(result.value.id);
         return;
       }
-      setSidebarOpen(false);
+      closeSidebar(true);
       if (result.kind === "rejected") {
         reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be created."));
         return;
       }
       if (result.kind === "committed") {
-        console.error("Page creation result could not be verified", {
-          operationId,
-          outcome: "committed-invalid-response",
-          ...errorLogFields(result.responseError ?? "Successful response did not contain a valid page."),
-        });
-        reportWorkspaceError(
-          attempt,
-          "The server returned an invalid page-creation response. Refreshing the page tree.",
+        logUnverifiedMutation(
+          "Page creation result could not be verified",
+          "committed-invalid-response",
+          result.responseError ?? "Successful response did not contain the requested page.",
+          { operationId },
         );
+        reportWorkspaceError(attempt, "The server returned an invalid page-creation response. Checking the page tree.");
       } else {
-        console.error("Page creation result could not be verified", {
+        logUnverifiedMutation("Page creation result could not be verified", "uncertain", result.error, {
           operationId,
-          outcome: "uncertain",
-          ...errorLogFields(result.error),
         });
-        reportWorkspaceError(attempt, "The page-creation result could not be verified. Refreshing the page tree.");
+        reportWorkspaceError(attempt, "The page-creation result could not be verified. Checking the page tree.");
       }
-      await reconcilePageMutation(signal);
+      const observation = await reconcilePageMutation(
+        attempt,
+        signal,
+        (reconciledPages) => observedExpectedPage(reconciledPages, expectation!) !== null,
+        "The page-creation result could not be verified",
+      );
+      const created = observation && observedExpectedPage(observation, expectation);
+      if (created) navigateToPage(created.id);
     } catch (error) {
       if (signal.aborted) return;
-      setSidebarOpen(false);
-      reportWorkspaceError(attempt, apiErrorMessage(error, "The page could not be created."));
+      closeSidebar(true);
+      reportWorkspaceError(
+        attempt,
+        apiErrorMessage(
+          error,
+          outcome === "committed"
+            ? "The page was created, but the workspace could not be updated."
+            : outcome === "uncertain"
+              ? "The page may have been created, but the workspace could not be updated."
+              : "The page could not be created.",
+        ),
+      );
+      if (expectation && (outcome === "committed" || outcome === "uncertain")) {
+        const expectedPage = expectation;
+        await reconcilePageMutation(
+          attempt,
+          signal,
+          (observation) => observedExpectedPage(observation, expectedPage) !== null,
+          outcome === "committed"
+            ? "The page was created, but the workspace could not be updated"
+            : "The page may have been created, but the workspace could not be updated",
+        );
+      }
     } finally {
       finishWorkspaceErrorAttempt(attempt);
     }
   }
   async function archive(page: Page) {
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
+    closeSidebar(true);
     const signal = workspaceAbortController.current.signal;
     const errorScope = page.id;
     const attempt = startClearedWorkspaceErrorAttempt({ source: "archive", scope: errorScope });
-    let archiveOutcome: "not-started" | "rejected" | "uncertain" | "committed" = "not-started";
+    let archiveOutcome: MutationOutcome = "not-started";
     let archiveWasUnverified = false;
     let removalOperationId = "";
-    const reconcileArchivePages = async () => {
-      try {
-        await loadFreshPages(signal);
-      } catch (error) {
-        if (signal.aborted) return;
+    const reconcileArchivePages = () =>
+      reconcilePages(signal, (error) => {
         if (archiveWasUnverified) {
           console.error("Page tree could not be refreshed after an unverified archive", {
             pageId: page.id,
@@ -1329,9 +1454,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             ...errorLogFields(error),
           });
         }
-        reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be refreshed."));
-      }
-    };
+      });
     try {
       removalOperationId = crypto.randomUUID();
       const knownPageIds = pageSubtreeIds(pages, page.id);
@@ -1360,19 +1483,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       }
       if (signal.aborted) return;
       if (result.kind === "committed" && result.value === null) {
-        console.error("Archive result could not be verified", {
-          pageId: page.id,
-          operationId: removalOperationId,
-          outcome: "committed-invalid-response",
-          ...errorLogFields(result.responseError),
-        });
+        logUnverifiedMutation(
+          "Archive result could not be verified",
+          "committed-invalid-response",
+          result.responseError,
+          { pageId: page.id, operationId: removalOperationId },
+        );
         reportWorkspaceError(attempt, "The server returned an invalid archive response. Refreshing the page tree.");
       } else if (result.kind === "uncertain") {
-        console.error("Archive result could not be verified", {
+        logUnverifiedMutation("Archive result could not be verified", "uncertain", result.error, {
           pageId: page.id,
           operationId: removalOperationId,
-          outcome: "uncertain",
-          ...errorLogFields(result.error),
         });
         reportWorkspaceError(attempt, "The archive result could not be verified. Refreshing the page tree.");
       } else if (result.kind === "rejected" && !pageAlreadyGone) {
@@ -1415,10 +1536,25 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     afterId: string | null = null,
   ) {
     const signal = workspaceAbortController.current.signal;
-    const operationId = crypto.randomUUID();
-    clearWorkspaceErrorSource("page-mutation");
-    const attempt = startClearedWorkspaceErrorAttempt({ source: "page-mutation", scope: operationId });
+    const attempt = startClearedWorkspaceErrorAttempt({ source: "page-mutation", scope: `move:${pageId}` });
+    const movingPage = pages.find((candidate) => candidate.id === pageId);
+    let operationId = "";
+    let outcome: MutationOutcome = "not-started";
+    if (!movingPage) {
+      closeSidebar(true);
+      reportWorkspaceError(attempt, "The page could not be moved.");
+      finishWorkspaceErrorAttempt(attempt);
+      return;
+    }
+    const expectation: PageMutationExpectation = {
+      id: pageId,
+      workspaceId: member.workspace.id,
+      parentId,
+      kind: movingPage.kind,
+      minimumRevision: movingPage.revision + 1,
+    };
     try {
+      operationId = crypto.randomUUID();
       const result = await requestMutation(
         `/api/pages/${pageId}/move`,
         {
@@ -1426,44 +1562,65 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           body: json({ parentId, beforeId, afterId }),
           signal,
         },
-        (value) => pageMutationResponse(value, member.workspace.id, pageId),
+        (value) => pageMutationResponse(value, expectation),
       );
       if (signal.aborted) return;
+      outcome = result.kind;
       if (result.kind === "committed" && result.value) {
         recordPageUpserts([result.value]);
         dispatchPageAction({ type: "merge", pages: [result.value] });
         return;
       }
-      setSidebarOpen(false);
+      closeSidebar(true);
       if (result.kind === "rejected") {
         reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be moved."));
         return;
       }
       if (result.kind === "committed") {
-        console.error("Page movement result could not be verified", {
-          operationId,
-          pageId,
-          outcome: "committed-invalid-response",
-          ...errorLogFields(result.responseError ?? "Successful response did not contain the moved page."),
-        });
-        reportWorkspaceError(
-          attempt,
-          "The server returned an invalid page-movement response. Refreshing the page tree.",
+        logUnverifiedMutation(
+          "Page movement result could not be verified",
+          "committed-invalid-response",
+          result.responseError ?? "Successful response did not contain the requested moved page.",
+          { operationId, pageId },
         );
+        reportWorkspaceError(attempt, "The server returned an invalid page-movement response. Checking the page tree.");
       } else {
-        console.error("Page movement result could not be verified", {
+        logUnverifiedMutation("Page movement result could not be verified", "uncertain", result.error, {
           operationId,
           pageId,
-          outcome: "uncertain",
-          ...errorLogFields(result.error),
         });
-        reportWorkspaceError(attempt, "The page-movement result could not be verified. Refreshing the page tree.");
+        reportWorkspaceError(attempt, "The page-movement result could not be verified. Checking the page tree.");
       }
-      await reconcilePageMutation(signal);
+      await reconcilePageMutation(
+        attempt,
+        signal,
+        (observation) => observedExpectedMove(observation, expectation, beforeId, afterId),
+        "The page-movement result could not be verified",
+      );
     } catch (error) {
       if (signal.aborted) return;
-      setSidebarOpen(false);
-      reportWorkspaceError(attempt, apiErrorMessage(error, "The page could not be moved."));
+      closeSidebar(true);
+      reportWorkspaceError(
+        attempt,
+        apiErrorMessage(
+          error,
+          outcome === "committed"
+            ? "The page was moved, but the workspace could not be updated."
+            : outcome === "uncertain"
+              ? "The page may have been moved, but the workspace could not be updated."
+              : "The page could not be moved.",
+        ),
+      );
+      if (outcome === "committed" || outcome === "uncertain") {
+        await reconcilePageMutation(
+          attempt,
+          signal,
+          (observation) => observedExpectedMove(observation, expectation, beforeId, afterId),
+          outcome === "committed"
+            ? "The page was moved, but the workspace could not be updated"
+            : "The page may have been moved, but the workspace could not be updated",
+        );
+      }
     } finally {
       finishWorkspaceErrorAttempt(attempt);
     }
@@ -1484,14 +1641,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   // just opened. Selecting a page already closes it; these do the same.
   function showTrash() {
     cancelPendingSelection();
-    setSidebarOpen(false);
+    closeSidebar(true);
     refreshTrash();
     setView("trash");
   }
   function showView(next: "search" | "mentions" | "settings") {
     cancelPendingSelection();
     setView(next);
-    setSidebarOpen(false);
+    closeSidebar(true);
   }
   async function retryPageTree(errorTarget: PageTreeRetryTarget, fallbackMessage: string) {
     if (activePageTreeRetryRef.current) return;
@@ -1660,18 +1817,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (result.kind === "committed" && deletedIds) {
         setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
         if (!result.value) {
-          console.error("Permanent-delete result could not be verified", {
-            pageId: page.id,
-            outcome: "committed-invalid-response",
-            ...errorLogFields(result.responseError ?? "Successful response did not contain deleted page IDs."),
-          });
+          logUnverifiedMutation(
+            "Permanent-delete result could not be verified",
+            "committed-invalid-response",
+            result.responseError ?? "Successful response did not contain deleted page IDs.",
+            { pageId: page.id },
+          );
           reportWorkspaceError(attempt, "The server returned an invalid permanent-delete response. Refreshing trash.");
         }
       } else if (result.kind === "uncertain") {
-        console.error("Permanent-delete result could not be verified", {
+        logUnverifiedMutation("Permanent-delete result could not be verified", "uncertain", result.error, {
           pageId: page.id,
-          outcome: "uncertain",
-          ...errorLogFields(result.error),
         });
         reportWorkspaceError(attempt, "The permanent-delete result could not be verified. Refreshing trash.");
       } else if (result.kind === "rejected") {
@@ -1690,7 +1846,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
   return (
     <div className="workspace-shell">
-      <aside className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}>
+      <aside id="workspace-navigation" className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}>
         <header className="workspace-header">
           <span className="workspace-avatar">{member.workspace.name.slice(0, 1).toUpperCase()}</span>
           <div>
@@ -1699,7 +1855,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               {member.user.name} · {member.role}
             </small>
           </div>
-          <button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)}>
+          <button
+            className="icon-button mobile-only"
+            aria-label="Close navigation"
+            aria-controls="workspace-navigation"
+            onClick={() => closeSidebar(true)}
+          >
             ×
           </button>
         </header>
@@ -1777,7 +1938,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           </div>
         )}
         <header className="topbar">
-          <button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}>
+          <button
+            ref={sidebarTriggerRef}
+            className="icon-button mobile-only"
+            aria-label="Open sidebar"
+            aria-controls="workspace-navigation"
+            aria-expanded={sidebarOpen}
+            onClick={openSidebar}
+          >
             ☰
           </button>
           <div className="breadcrumbs">
@@ -1863,7 +2031,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         )}
       </section>
       {sidebarOpen && (
-        <button className="sidebar-scrim" aria-label="Close sidebar" onClick={() => setSidebarOpen(false)} />
+        <button className="sidebar-scrim" aria-label="Close sidebar" onClick={() => closeSidebar(true)} />
       )}
     </div>
   );

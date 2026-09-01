@@ -704,7 +704,8 @@ describe("App error handling", () => {
 
     const createButton = await screen.findByRole("button", { name: "Create a root page" });
     await waitFor(() => expect(createButton).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "☰" }));
+    const openSidebar = screen.getByRole("button", { name: "Open sidebar" });
+    fireEvent.click(openSidebar);
     expect(document.querySelector(".workspace-sidebar")).toHaveClass("open");
     expect(screen.getByRole("button", { name: "Close sidebar" })).toBeInTheDocument();
     fireEvent.click(createButton);
@@ -712,6 +713,7 @@ describe("App error handling", () => {
     expect(await screen.findByText("Page creation was rejected.")).toBeInTheDocument();
     expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
     expect(screen.queryByRole("button", { name: "Close sidebar" })).not.toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toBe(openSidebar));
   });
 
   it("reports a move failure without an unhandled rejection", async () => {
@@ -730,16 +732,86 @@ describe("App error handling", () => {
 
     const secondLink = (await screen.findByText("Second")).closest("button");
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
+    const openSidebar = screen.getByRole("button", { name: "Open sidebar" });
+    fireEvent.click(openSidebar);
+    secondLink.focus();
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
 
     expect(await screen.findByText("Page movement was rejected.")).toBeInTheDocument();
+    expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
+    await waitFor(() => expect(document.activeElement).toBe(openSidebar));
   });
 
-  it("reconciles an uncertain page creation and preserves its diagnostics", async () => {
-    const createdPage = { ...page, id: "created-page", position: "b0", title: "Created" };
+  it("reports create and move setup failures when operation id generation throws", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockImplementation(() => {
+      throw new Error("Random UUID unavailable.");
+    });
+    onTestFinished(() => randomUUID.mockRestore());
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page, secondPage] };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+    expect(await screen.findByText("The page could not be created.")).toBeInTheDocument();
+
+    const secondLink = screen.getByText("Second").closest("button");
+    if (!secondLink) throw new Error("The second page navigation button was not rendered.");
+    fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
+    expect(await screen.findByRole("alert")).toHaveTextContent("The page could not be moved.");
+    expect(api).not.toHaveBeenCalledWith("/api/pages", expect.objectContaining({ method: "POST" }));
+    expect(api).not.toHaveBeenCalledWith(
+      `/api/pages/${secondPage.id}/move`,
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("closes the mobile drawer and restores focus when archive fails", async () => {
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE") {
+        throw new ApiClientError(409, "archive_rejected", "Archive was rejected.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const openSidebar = await screen.findByRole("button", { name: "Open sidebar" });
+    fireEvent.click(openSidebar);
+    fireEvent.click(screen.getByRole("button", { name: "Archive Roadmap" }));
+
+    expect(await screen.findByText("Archive was rejected.")).toBeInTheDocument();
+    expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
+    await waitFor(() => expect(document.activeElement).toBe(openSidebar));
+  });
+
+  it("reconciles an uncertain page creation and clears its diagnostics after observing the requested page", async () => {
+    const createdPageId = "00000000-0000-4000-8000-000000000002";
+    const createdPage = {
+      ...page,
+      id: createdPageId,
+      position: "b0",
+      title: "Created",
+    };
     const networkError = new TypeError("Failed to fetch");
     const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(createdPageId);
     onTestFinished(() => reported.mockRestore());
+    onTestFinished(() => randomUUID.mockRestore());
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
@@ -758,18 +830,100 @@ describe("App error handling", () => {
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
 
-    expect(
-      await screen.findByText("The page-creation result could not be verified. Refreshing the page tree."),
-    ).toBeInTheDocument();
-    expect(await screen.findByText("Created")).toBeInTheDocument();
+    expect((await screen.findAllByText("Created")).length).toBeGreaterThan(0);
     expect(treeLoads).toBe(2);
+    expect(screen.queryByText(/page-creation result could not be verified/i)).not.toBeInTheDocument();
+    expect(localStorage.getItem("notes:last-page")).toBe(createdPage.id);
+    expect(api).toHaveBeenCalledWith(
+      "/api/pages",
+      expect.objectContaining({
+        body: JSON.stringify({ id: createdPage.id, kind: "document", parentId: null }),
+        method: "POST",
+      }),
+    );
     expect(reported).toHaveBeenCalledWith(
       "Page creation result could not be verified",
       expect.objectContaining({ outcome: "uncertain", errorMessage: "Failed to fetch" }),
     );
   });
 
-  it("reconciles an invalid successful page-movement response", async () => {
+  it("does not accept an unrelated page as a create response or reconciliation result", async () => {
+    const requestedPageId = "00000000-0000-4000-8000-000000000003";
+    const unrelatedPage = { ...page, id: "unrelated-page", position: "b0", title: "Unrelated" };
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(requestedPageId);
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page] : [page, unrelatedPage] };
+      }
+      if (path === "/api/pages" && init?.method === "POST") return { page: unrelatedPage };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+
+    expect(
+      await screen.findByText("The page-creation result could not be verified after refreshing the page tree."),
+    ).toBeInTheDocument();
+    expect(treeLoads).toBe(3);
+    expect(reported).toHaveBeenCalledWith(
+      "Page creation result could not be verified",
+      expect.objectContaining({ operationId: requestedPageId, outcome: "committed-invalid-response" }),
+    );
+  });
+
+  it("does not claim a committed create failed when local processing and reconciliation fail", async () => {
+    const createdPageId = "00000000-0000-4000-8000-000000000004";
+    const createdPage = {
+      ...page,
+      id: createdPageId,
+      position: "b0",
+      title: "Created",
+    };
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(createdPageId);
+    const recordUpserts = vi.spyOn(PageLoadEventBuffer.prototype, "recordUpserts").mockImplementationOnce(() => {
+      throw new Error("Page buffer unavailable.");
+    });
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => recordUpserts.mockRestore());
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        throw new ApiClientError(503, "tree_unavailable", "Tree refresh unavailable.");
+      }
+      if (path === "/api/pages" && init?.method === "POST") return { page: createdPage };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+
+    expect(
+      await screen.findByText(
+        "The page was created, but the workspace could not be updated. Tree refresh unavailable.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/page could not be created/i)).not.toBeInTheDocument();
+  });
+
+  it("reconciles an invalid successful page-movement response and clears the verified warning", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
     const movedPage = { ...secondPage, position: "A0", revision: 2 };
     const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -792,10 +946,8 @@ describe("App error handling", () => {
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
 
-    expect(
-      await screen.findByText("The server returned an invalid page-movement response. Refreshing the page tree."),
-    ).toBeInTheDocument();
     await waitFor(() => expect(treeLoads).toBe(2));
+    expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument();
     expect(reported).toHaveBeenCalledWith(
       "Page movement result could not be verified",
       expect.objectContaining({ outcome: "committed-invalid-response", pageId: secondPage.id }),
@@ -836,6 +988,98 @@ describe("App error handling", () => {
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Concurrent move failed.");
     expect(alert).toHaveTextContent("Concurrent creation failed.");
+  });
+
+  it("does not clear a reported create warning when a different mutation starts", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const requestedPageId = "00000000-0000-4000-8000-000000000005";
+    const reconciliation = deferred<{ pages: Page[] }>();
+    const movement = deferred<{ page: Page }>();
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(requestedPageId);
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page, secondPage] };
+        if (treeLoads === 2) return reconciliation.promise;
+        return { pages: [page, secondPage] };
+      }
+      if (path === "/api/pages" && init?.method === "POST") throw new TypeError("Failed to fetch");
+      if (path === `/api/pages/${secondPage.id}/move` && init?.method === "POST") return movement.promise;
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+    expect(
+      await screen.findByText("The page-creation result could not be verified. Checking the page tree."),
+    ).toBeInTheDocument();
+
+    const secondLink = screen.getByText("Second").closest("button");
+    if (!secondLink) throw new Error("The second page navigation button was not rendered.");
+    fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
+    expect(
+      screen.getByText("The page-creation result could not be verified. Checking the page tree."),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      movement.reject(new ApiClientError(409, "move_rejected", "Concurrent move failed."));
+      await movement.promise.catch(() => undefined);
+    });
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Concurrent move failed.");
+    expect(alert).toHaveTextContent("page-creation result could not be verified");
+
+    await act(async () => {
+      reconciliation.resolve({ pages: [page, secondPage] });
+      await reconciliation.promise;
+    });
+    await waitFor(() => expect(treeLoads).toBe(3));
+  });
+
+  it("suppresses an older failure after a newer move of the same page succeeds", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const movedPage = { ...secondPage, position: "A0", revision: 2 };
+    const olderMove = deferred<{ page: Page }>();
+    const newerMove = deferred<{ page: Page }>();
+    let moves = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page, secondPage] };
+      if (path === `/api/pages/${secondPage.id}/move` && init?.method === "POST") {
+        moves += 1;
+        return moves === 1 ? olderMove.promise : newerMove.promise;
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const secondLink = (await screen.findByText("Second")).closest("button");
+    if (!secondLink) throw new Error("The second page navigation button was not rendered.");
+    fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
+    fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
+
+    await act(async () => {
+      newerMove.resolve({ page: movedPage });
+      await newerMove.promise;
+    });
+    await act(async () => {
+      olderMove.reject(new ApiClientError(409, "move_rejected", "Superseded move failed."));
+      await olderMove.promise.catch(() => undefined);
+    });
+
+    expect(screen.queryByText("Superseded move failed.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("stops create processing when the workspace unmounts before the mutation settles", async () => {
