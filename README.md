@@ -17,6 +17,12 @@ The editor is BlockNote backed by Yjs. Each document epoch has one hibernating `
 
 This is an early v1 implementation. Production billing-grade hibernation verification and high-concurrency load tests still require a deployed Workers Paid account.
 
+## Browser support
+
+The production client supports Chrome and Edge 116+, Firefox 124+, and Safari 17.4+ on macOS and iOS. JavaScript and
+CSS builds target that same matrix. Because build targets do not polyfill runtime APIs, the client checks its required
+`AbortSignal` cancellation features at startup and shows an upgrade message instead of mounting in an unsupported browser.
+
 ## Local development
 
 Requires Node.js 22+ and pnpm 11.
