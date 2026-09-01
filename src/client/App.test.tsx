@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext, Page, WorkspaceEvent } from "../shared/types";
 import type { EditorPageProps } from "./EditorPage";
@@ -168,6 +169,38 @@ describe("App error handling", () => {
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
     expect(treeLoads).toBe(2);
     expect(screen.queryByText("Tree unavailable.")).not.toBeInTheDocument();
+  });
+
+  it("replaces a page-tree request aborted by the StrictMode effect remount", async () => {
+    let firstRequestSignal: AbortSignal | undefined;
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads > 1) return { pages: [page] };
+        const signal = init?.signal;
+        if (!signal) throw new Error("The initial page load did not receive a signal.");
+        firstRequestSignal = signal;
+        return new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(treeLoads).toBe(2);
+    expect(firstRequestSignal?.aborted).toBe(true);
+    expect(screen.queryByText(/page tree could not be loaded/i)).not.toBeInTheDocument();
   });
 
   it("uses the sign-in fallback for an empty Better Auth message", async () => {
@@ -2300,9 +2333,10 @@ describe("App error handling", () => {
       if (path === "/api/pages/tree") {
         treeLoads += 1;
         if (treeLoads === 1) return { pages: [page] };
-        sharedRequestSignal = init?.signal ?? undefined;
+        const signal = init?.signal;
+        sharedRequestSignal = signal ?? undefined;
         return new Promise<never>((_resolve, reject) => {
-          sharedRequestSignal?.addEventListener("abort", () => reject(sharedRequestSignal?.reason), { once: true });
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
         });
       }
       throw new Error(`Unexpected API request: ${path}`);
@@ -2318,6 +2352,38 @@ describe("App error handling", () => {
     const signal = sharedRequestSignal;
     expect(signal).toBeInstanceOf(AbortSignal);
     if (!(signal instanceof AbortSignal)) throw new Error("The shared page load did not receive a signal.");
+    expect(signal.aborted).toBe(false);
+
+    app.unmount();
+
+    expect(signal.aborted).toBe(true);
+    await act(async () => Promise.resolve());
+  });
+
+  it("aborts the archived page-tree request when the workspace unmounts", async () => {
+    let trashRequestSignal: AbortSignal | undefined;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === "/api/pages/tree?archived=true") {
+        const signal = init?.signal;
+        if (!signal) throw new Error("The trash page load did not receive a signal.");
+        trashRequestSignal = signal;
+        return new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    const app = render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    await waitFor(() => expect(trashRequestSignal).toBeInstanceOf(AbortSignal));
+    const signal = trashRequestSignal;
+    if (!(signal instanceof AbortSignal)) throw new Error("The trash page load did not receive a signal.");
     expect(signal.aborted).toBe(false);
 
     app.unmount();
@@ -2351,6 +2417,15 @@ describe("App error handling", () => {
 
     await screen.findByRole("button", { name: "Archive Roadmap" });
     vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+      const controller = new AbortController();
+      window.setTimeout(
+        () => controller.abort(new DOMException("The page tree request timed out.", "TimeoutError")),
+        milliseconds,
+      );
+      return controller.signal;
+    });
+    onTestFinished(() => timeout.mockRestore());
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
     });
