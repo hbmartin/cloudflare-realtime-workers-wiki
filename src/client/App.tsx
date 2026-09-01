@@ -204,6 +204,12 @@ async function reconcileWithOneRetry<T>(
   return attempt();
 }
 
+// A rootless restored event requires a second page-tree observation.
+// Cancellation returns null and ends reconciliation.
+function shouldObserveRootlessRestoreAgain(result: PageLoadResult | null) {
+  return result !== null;
+}
+
 function restoredEventRoot(pages: Page[]) {
   const pageIds = new Set(pages.map((page) => page.id));
   const roots = pages.filter((page) => !page.parentId || !pageIds.has(page.parentId));
@@ -990,7 +996,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             throw error;
           }
         };
-        await reconcileWithOneRetry(observe, (result) => result !== null, signal);
+        await reconcileWithOneRetry(observe, shouldObserveRootlessRestoreAgain, signal);
         return;
       }
       await reconcileRestoredRoot(
