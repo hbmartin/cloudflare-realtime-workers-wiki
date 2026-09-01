@@ -16,7 +16,6 @@ export default defineConfig(({ command }) => {
       // These targets define the documented JavaScript and CSS output baseline.
       // Runtime APIs are feature-checked before the client mounts; Vite does not polyfill them.
       target: browserTargets,
-      cssTarget: browserTargets,
     },
     plugins: [
       react(),

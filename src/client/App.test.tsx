@@ -689,6 +689,47 @@ describe("App error handling", () => {
     ).toBeVisible();
   });
 
+  it("reports a create failure without an unhandled rejection", async () => {
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === "/api/pages" && init?.method === "POST") {
+        throw new ApiClientError(503, "create_unavailable", "Page creation is unavailable.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+
+    expect(await screen.findByText("Page creation is unavailable.")).toBeInTheDocument();
+  });
+
+  it("reports a move failure without an unhandled rejection", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page, secondPage] };
+      if (path === `/api/pages/${secondPage.id}/move` && init?.method === "POST") {
+        throw new ApiClientError(503, "move_unavailable", "Page movement is unavailable.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const secondLink = (await screen.findByText("Second")).closest("button");
+    if (!secondLink) throw new Error("The second page navigation button was not rendered.");
+    fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
+
+    expect(await screen.findByText("Page movement is unavailable.")).toBeInTheDocument();
+  });
+
   it("stops create processing when the workspace unmounts before the mutation settles", async () => {
     const createdPage = { ...page, id: "created-page", position: "b0", title: "Created" };
     const creation = deferred<{ page: Page }>();
@@ -3396,7 +3437,7 @@ describe("App error handling", () => {
     await waitFor(() => expect(trashLoads).toBe(2));
   });
 
-  it("reports a permanent-delete failure without an unhandled rejection", async () => {
+  it("reports a permanent-delete rejection without an unhandled rejection", async () => {
     const owner = { ...member, role: "owner" as const };
     const archivedPage = { ...page, archivedAt: 2 };
     vi.stubGlobal(
@@ -3410,7 +3451,7 @@ describe("App error handling", () => {
       if (path === "/api/pages/tree") return { pages: [] };
       if (path === "/api/pages/tree?archived=true") return { pages: [archivedPage] };
       if (path === `/api/pages/${page.id}/permanent-delete` && init?.method === "POST") {
-        throw new ApiClientError(503, "delete_unavailable", "Deletion service unavailable.");
+        throw new ApiClientError(409, "delete_rejected", "Deletion was rejected.");
       }
       throw new Error(`Unexpected API request: ${path}`);
     });
@@ -3419,7 +3460,37 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Delete forever" }));
 
-    expect(await screen.findByText("Deletion service unavailable.")).toBeInTheDocument();
+    expect(await screen.findByText("Deletion was rejected.")).toBeInTheDocument();
+    expect(mocks.invalidatePagePreview).not.toHaveBeenCalledWith(page.id);
+  });
+
+  it("reports an uncertain permanent-delete result without claiming the deletion failed", async () => {
+    const owner = { ...member, role: "owner" as const };
+    const archivedPage = { ...page, archivedAt: 2 };
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return owner;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [] };
+      if (path === "/api/pages/tree?archived=true") return { pages: [archivedPage] };
+      if (path === `/api/pages/${page.id}/permanent-delete` && init?.method === "POST") {
+        throw new TypeError("Failed to fetch");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete forever" }));
+
+    expect(
+      await screen.findByText("The permanent-delete result could not be verified. Refreshing trash."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/could not be permanently deleted/i)).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
   });
 
@@ -3466,7 +3537,7 @@ describe("App error handling", () => {
       treeReload.resolve({ pages: [] });
       await treeReload.promise;
     });
-    expect(await screen.findByText(/Deletion service unavailable/)).toBeInTheDocument();
+    expect(await screen.findByText(/permanent-delete result could not be verified/i)).toBeInTheDocument();
     expect(screen.getByText(/invalid restore response/i)).toBeInTheDocument();
   });
 

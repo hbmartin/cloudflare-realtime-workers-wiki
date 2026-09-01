@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { browserSupportsRequiredFeatures } from "./browser-support";
 
 const supportedCapabilities = {
@@ -8,8 +8,16 @@ const supportedCapabilities = {
 };
 
 describe("browserSupportsRequiredFeatures", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it("accepts a runtime with every required AbortSignal capability", () => {
     expect(browserSupportsRequiredFeatures(supportedCapabilities)).toBe(true);
+  });
+
+  it("checks the runtime AbortSignal capabilities by default", () => {
+    vi.stubGlobal("AbortSignal", supportedCapabilities);
+
+    expect(browserSupportsRequiredFeatures()).toBe(true);
   });
 
   it.each([
