@@ -61,9 +61,36 @@ describe("observeUntilAborted", () => {
     const controller = new AbortController();
     controller.abort();
     const source = Promise.reject(new Error("late source failure"));
+    const catchSourceRejection = vi.spyOn(source, "catch");
+    const observed = observeUntilAborted(source, controller.signal);
 
-    await expect(observeUntilAborted(source, controller.signal)).rejects.toBe(controller.signal.reason);
-    await Promise.resolve();
+    expect(catchSourceRejection).toHaveBeenCalledOnce();
+    await expect(observed).rejects.toBe(controller.signal.reason);
+  });
+
+  it("removes the abort listener after the input promise resolves", async () => {
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+
+    await expect(observeUntilAborted(Promise.resolve("done"), controller.signal)).resolves.toBe("done");
+
+    const abortListener = add.mock.calls.find(([type]) => type === "abort")?.[1];
+    expect(abortListener).toEqual(expect.any(Function));
+    expect(remove).toHaveBeenCalledWith("abort", abortListener);
+  });
+
+  it("removes the abort listener after the input promise rejects", async () => {
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const sourceError = new Error("source failure");
+
+    await expect(observeUntilAborted(Promise.reject(sourceError), controller.signal)).rejects.toBe(sourceError);
+
+    const abortListener = add.mock.calls.find(([type]) => type === "abort")?.[1];
+    expect(abortListener).toEqual(expect.any(Function));
+    expect(remove).toHaveBeenCalledWith("abort", abortListener);
   });
 });
 

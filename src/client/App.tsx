@@ -204,6 +204,12 @@ async function reconcileWithOneRetry<T>(
   return attempt();
 }
 
+// A rootless restored event requires a second page-tree observation.
+// Cancellation returns null and ends reconciliation.
+function shouldObserveRootlessRestoreAgain(result: PageLoadResult | null) {
+  return result !== null;
+}
+
 function restoredEventRoot(pages: Page[]) {
   const pageIds = new Set(pages.map((page) => page.id));
   const roots = pages.filter((page) => !page.parentId || !pageIds.has(page.parentId));
@@ -841,6 +847,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           if (observerSignal) await observeUntilAborted(pendingPageLoad, observerSignal);
           else await pendingPageLoad;
         } catch {
+          // The pending request predates this caller's operation. Its failure
+          // does not replace the required post-operation observation.
           observerSignal?.throwIfAborted();
         }
       }
@@ -990,7 +998,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             throw error;
           }
         };
-        await reconcileWithOneRetry(observe, (result) => result !== null, signal);
+        await reconcileWithOneRetry(observe, shouldObserveRootlessRestoreAgain, signal);
         return;
       }
       await reconcileRestoredRoot(
@@ -1220,6 +1228,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }
   async function archive(page: Page) {
     if (!confirm(`Move “${page.title}” and its children to trash?`)) return;
+    const signal = workspaceAbortController.current?.signal;
     const errorScope = page.id;
     const attempt = startScopedWorkspaceErrorAttempt("archive", errorScope);
     let archiveOutcome: "not-started" | "rejected" | "uncertain" | "committed" = "not-started";
@@ -1231,6 +1240,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         { method: "DELETE", headers: { "x-notes-operation-id": removalOperationId } },
         (value) => archivePageIds(value, page.id),
       );
+      if (signal?.aborted) return;
       const pageAlreadyGone = result.kind === "rejected" && isPageNotFoundError(result.error);
       archiveOutcome =
         result.kind === "committed" || pageAlreadyGone
@@ -1277,8 +1287,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const needsReconciliation = result.kind !== "rejected" || pageAlreadyGone;
       if (!needsReconciliation) return;
       try {
-        await loadFreshPages();
+        await loadFreshPages(signal);
       } catch (error) {
+        if (signal?.aborted) return;
         const refreshError = apiErrorMessage(error, "The page tree could not be refreshed.");
         if (archiveWasUnverified) {
           console.error("Page tree could not be refreshed after an unverified archive", {
@@ -1291,6 +1302,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         reportWorkspaceError({ source: "page-tree" }, refreshError);
       }
     } catch (error) {
+      if (signal?.aborted) return;
       reportWorkspaceError(
         attempt,
         apiErrorMessage(
@@ -1305,8 +1317,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (archiveOutcome === "committed" || archiveOutcome === "uncertain") {
         refreshTrash();
         try {
-          await loadFreshPages();
+          await loadFreshPages(signal);
         } catch (refreshError) {
+          if (signal?.aborted) return;
           reportWorkspaceError(
             { source: "page-tree" },
             apiErrorMessage(refreshError, "The page tree could not be refreshed."),

@@ -11,6 +11,10 @@ export default defineConfig(({ command }) => {
   if (command === "build") process.env.CLOUDFLARE_ENV ??= "production";
 
   return {
+    build: {
+      // The client combines workspace cancellation with request timeouts via AbortSignal.any.
+      target: ["chrome116", "edge116", "firefox124", "safari17.4", "ios17.4"],
+    },
     plugins: [
       react(),
       cloudflare({
