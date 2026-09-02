@@ -782,12 +782,16 @@ describe("App error handling", () => {
     await waitFor(() => expect(document.activeElement).toBe(openSidebar));
   });
 
-  it("reports a create setup failure without requiring an operation id for a move", async () => {
+  it("uses a separate operation id after a create setup failure", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
     const movedPage = { ...secondPage, position: "A0", revision: 2 };
-    const randomUUID = vi.spyOn(crypto, "randomUUID").mockImplementation(() => {
-      throw new Error("Random UUID unavailable.");
-    });
+    const moveOperationId = "00000000-0000-4000-8000-000000000009";
+    const randomUUID = vi
+      .spyOn(crypto, "randomUUID")
+      .mockImplementationOnce(() => {
+        throw new Error("Random UUID unavailable.");
+      })
+      .mockReturnValue(moveOperationId);
     onTestFinished(() => randomUUID.mockRestore());
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
@@ -809,7 +813,13 @@ describe("App error handling", () => {
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
 
     await waitFor(() => {
-      expect(api).toHaveBeenCalledWith(`/api/pages/${secondPage.id}/move`, expect.objectContaining({ method: "POST" }));
+      expect(api).toHaveBeenCalledWith(
+        `/api/pages/${secondPage.id}/move`,
+        expect.objectContaining({
+          method: "POST",
+          headers: { "x-notes-operation-id": moveOperationId },
+        }),
+      );
       expect(screen.getAllByTitle("Alt+arrow keys move this page")[0]).toHaveTextContent("Second");
     });
     expect(api).not.toHaveBeenCalledWith("/api/pages", expect.objectContaining({ method: "POST" }));
@@ -1040,10 +1050,13 @@ describe("App error handling", () => {
     expect(screen.queryByText(/page could not be created/i)).not.toBeInTheDocument();
   });
 
-  it("reconciles an invalid successful page-movement response and clears the verified warning", async () => {
+  it("uses the matching move receipt to clear an invalid-response warning", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
     const movedPage = { ...secondPage, position: "A0", revision: 2 };
+    const operationId = "00000000-0000-4000-8000-000000000010";
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(operationId);
     const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
     onTestFinished(() => reported.mockRestore());
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
@@ -1052,9 +1065,10 @@ describe("App error handling", () => {
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return { pages: treeLoads === 1 ? [page, secondPage] : [movedPage, page] };
+        return { pages: [page, secondPage] };
       }
       if (path === `/api/pages/${secondPage.id}/move` && init?.method === "POST") return { ok: true };
+      if (path === `/api/pages/${secondPage.id}/moves/${operationId}`) return { page: movedPage, operationId };
       throw new Error(`Unexpected API request: ${path}`);
     });
     render(<App />);
@@ -1063,30 +1077,38 @@ describe("App error handling", () => {
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
 
-    await waitFor(() => expect(treeLoads).toBe(2));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(`/api/pages/${secondPage.id}/moves/${operationId}`, expect.anything()),
+    );
+    expect(treeLoads).toBe(1);
+    expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
     expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument();
     expect(reported).toHaveBeenCalledWith(
       "Page movement result could not be verified",
-      expect.objectContaining({ outcome: "committed-invalid-response", pageId: secondPage.id }),
+      expect.objectContaining({ operationId, outcome: "committed-invalid-response", pageId: secondPage.id }),
     );
   });
 
-  it("accepts a reconciled append when another sibling was appended afterward", async () => {
+  it("retries a missing move receipt before confirming the operation", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
     const movedPage = { ...page, position: "c0", revision: 2 };
-    const concurrentPage = { ...page, id: "concurrent-page", position: "d0", title: "Concurrent" };
+    const operationId = "00000000-0000-4000-8000-000000000011";
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(operationId);
     const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
     onTestFinished(() => reported.mockRestore());
-    let treeLoads = 0;
+    let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return { pages: treeLoads === 1 ? [page, secondPage] : [secondPage, movedPage, concurrentPage] };
-      }
+      if (path === "/api/pages/tree") return { pages: [page, secondPage] };
       if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      if (path === `/api/pages/${page.id}/moves/${operationId}`) {
+        receiptLoads += 1;
+        if (receiptLoads === 1) throw new ApiClientError(404, "move_not_found", "Move receipt not found.");
+        return { page: movedPage, operationId };
+      }
       throw new Error(`Unexpected API request: ${path}`);
     });
     render(<App />);
@@ -1096,65 +1118,38 @@ describe("App error handling", () => {
     if (!treeRoot) throw new Error("The page tree root was not rendered.");
     fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
 
-    await waitFor(() => expect(treeLoads).toBe(2));
-    expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
+    await waitFor(() => expect(receiptLoads).toBe(2));
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
     expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument();
-    expect(reported).toHaveBeenCalledWith(
-      "Page movement result could not be verified",
-      expect.objectContaining({ outcome: "committed-invalid-response", pageId: page.id }),
-    );
   });
 
-  it("accepts a reconciled same-parent append after its stale tail anchor leaves the parent", async () => {
-    const secondPage = { ...page, id: "second-page", position: "z0", title: "Second" };
-    const movedPage = { ...page, position: "b0", revision: 2 };
-    const departedAnchor = { ...secondPage, parentId: "another-parent" };
+  it("keeps an uncertain append warning when unrelated moves change its page and stale tail anchor", async () => {
+    const remainingPage = { ...page, id: "remaining-page", position: "m0", title: "Remaining" };
+    const tailPage = { ...page, id: "tail-page", position: "z0", title: "Tail" };
+    const unrelatedMove = { ...page, position: "b0", revision: 2 };
+    const departedTail = { ...tailPage, parentId: "another-parent" };
+    const operationId = "00000000-0000-4000-8000-000000000012";
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(operationId);
     const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
     onTestFinished(() => reported.mockRestore());
     let treeLoads = 0;
+    let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return { pages: treeLoads === 1 ? [page, secondPage] : [movedPage, departedAnchor] };
+        return {
+          pages: treeLoads === 1 ? [page, remainingPage, tailPage] : [unrelatedMove, remainingPage, departedTail],
+        };
       }
-      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    await screen.findByRole("button", { name: "Archive Roadmap" });
-    const treeRoot = document.querySelector(".tree-root");
-    if (!treeRoot) throw new Error("The page tree root was not rendered.");
-    fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
-
-    await waitFor(() => expect(treeLoads).toBe(2));
-    expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
-    expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument();
-    expect(reported).toHaveBeenCalledWith(
-      "Page movement result could not be verified",
-      expect.objectContaining({ outcome: "committed-invalid-response", pageId: page.id }),
-    );
-  });
-
-  it("does not treat a missing append anchor as proof when the page was already last", async () => {
-    const firstPage = { ...page, id: "first-page", position: "a0", title: "First" };
-    const lastPage = { ...page, position: "b0" };
-    const revisedWithoutMoving = { ...lastPage, revision: 2 };
-    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    onTestFinished(() => reported.mockRestore());
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return { pages: treeLoads === 1 ? [firstPage, lastPage] : [revisedWithoutMoving] };
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") throw new TypeError("Failed to fetch");
+      if (path === `/api/pages/${page.id}/moves/${operationId}`) {
+        receiptLoads += 1;
+        throw new ApiClientError(404, "move_not_found", "Move receipt not found.");
       }
-      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
       throw new Error(`Unexpected API request: ${path}`);
     });
     render(<App />);
@@ -1165,48 +1160,14 @@ describe("App error handling", () => {
     fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
 
     expect(
-      await screen.findByText("The page-movement result could not be verified after refreshing the page tree."),
+      await screen.findByText("The page-movement result could not be verified after checking the server receipt."),
     ).toBeInTheDocument();
-    expect(treeLoads).toBe(3);
+    expect(treeLoads).toBe(2);
+    expect(receiptLoads).toBe(2);
     expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
     expect(reported).toHaveBeenCalledWith(
       "Page movement result could not be verified",
-      expect.objectContaining({ outcome: "committed-invalid-response", pageId: page.id }),
-    );
-  });
-
-  it("does not verify a same-parent append from an unrelated revision bump", async () => {
-    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
-    const revisedWithoutMoving = { ...page, revision: 2 };
-    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    onTestFinished(() => reported.mockRestore());
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return { pages: treeLoads === 1 ? [page, secondPage] : [revisedWithoutMoving, secondPage] };
-      }
-      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    await screen.findByRole("button", { name: "Archive Roadmap" });
-    const treeRoot = document.querySelector(".tree-root");
-    if (!treeRoot) throw new Error("The page tree root was not rendered.");
-    fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
-
-    expect(
-      await screen.findByText("The page-movement result could not be verified after refreshing the page tree."),
-    ).toBeInTheDocument();
-    expect(treeLoads).toBe(3);
-    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
-    expect(reported).toHaveBeenCalledWith(
-      "Page movement result could not be verified",
-      expect.objectContaining({ outcome: "committed-invalid-response", pageId: page.id }),
+      expect.objectContaining({ operationId, outcome: "uncertain", pageId: page.id }),
     );
   });
 
@@ -1366,6 +1327,42 @@ describe("App error handling", () => {
     });
 
     expect(recordUpserts).not.toHaveBeenCalled();
+    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
+  });
+
+  it("does not let a late create response bypass a removal tombstone", async () => {
+    const createdPageId = "00000000-0000-4000-8000-000000000013";
+    const createdPage = { ...page, id: createdPageId, position: "b0", title: "Created" };
+    const creation = deferred<{ page: Page }>();
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(createdPageId);
+    const recordUpserts = vi.spyOn(PageLoadEventBuffer.prototype, "recordUpserts");
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => recordUpserts.mockRestore());
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === "/api/pages" && init?.method === "POST") return creation.promise;
+      if (path === "/api/pages/tree?archived=true") return { pages: [] };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+    await waitFor(() => expect(api).toHaveBeenCalledWith("/api/pages", expect.objectContaining({ method: "POST" })));
+    recordUpserts.mockClear();
+    act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [createdPageId], permanently: false }));
+
+    await act(async () => {
+      creation.resolve({ page: createdPage });
+      await creation.promise;
+    });
+
+    expect(recordUpserts).not.toHaveBeenCalledWith([createdPage]);
+    expect(screen.queryByRole("button", { name: "Archive Created" })).not.toBeInTheDocument();
     expect(localStorage.getItem("notes:last-page")).toBe(page.id);
   });
 

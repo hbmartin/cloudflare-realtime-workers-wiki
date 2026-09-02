@@ -20,7 +20,7 @@ import { processDueUploadReaps } from "./attachments";
 import { processDeletionJob } from "./cleanup";
 import type { Env } from "./env";
 import worker from "./index";
-import { WorkspaceEvents } from "./workspace-events";
+import { eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
 
 type InstalledWorkspace = {
   cookie: string;
@@ -161,13 +161,19 @@ async function bulkWrite(cookie: string, pageId: string, body: Record<string, un
   };
 }
 
-function capturedWorkspaceEvents(delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>) {
+function capturedWorkspaceEvents(bindings: Env, delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>) {
   return {
     getByName(workspaceId: string) {
       return {
         async fetch(request: Request) {
-          delivered.push({ workspaceId, event: (await request.json()) as WorkspaceEvent });
-          return Response.json({ delivered: true });
+          expect(request.headers.get("x-notes-workspace-id")).toBe(workspaceId);
+          const event = await eventForCurrentWorkspaceState(
+            bindings,
+            workspaceId,
+            (await request.json()) as WorkspaceEvent,
+          );
+          if (event) delivered.push({ workspaceId, event });
+          return Response.json({ delivered: event !== null });
         },
       };
     },
@@ -178,7 +184,7 @@ function envWithCapturedWorkspaceEvents(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
 ) {
-  const workspaceEvents = capturedWorkspaceEvents(delivered);
+  const workspaceEvents = capturedWorkspaceEvents(bindings, delivered);
   return new Proxy(bindings, {
     get(target, property, receiver) {
       if (property === "WORKSPACE_EVENTS") return workspaceEvents;
@@ -223,11 +229,16 @@ function envWithPageCreateBatchIntercepted(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
-  const workspaceEvents = capturedWorkspaceEvents(delivered);
+  const eventBindings = new Proxy(bindings, {
+    get(target, property, receiver) {
+      if (property === "DB") return database;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const workspaceEvents = capturedWorkspaceEvents(eventBindings, delivered);
   return {
-    bindings: new Proxy(bindings, {
+    bindings: new Proxy(eventBindings, {
       get(target, property, receiver) {
-        if (property === "DB") return database;
         if (property === "WORKSPACE_EVENTS") return workspaceEvents;
         return Reflect.get(target, property, receiver);
       },
@@ -627,18 +638,21 @@ describe("Worker integration", () => {
         headers: {
           "content-type": "application/json",
           "x-notes-internal": env.BETTER_AUTH_SECRET,
+          "x-notes-workspace-id": installed.workspaceId,
         },
         body: JSON.stringify({ type: "pages-removed", permanently: false }),
       }),
     );
     expect(malformed.status).toBe(400);
 
+    await env.DB.prepare("UPDATE pages SET archived_at = ? WHERE id = ?").bind(Date.now(), installed.pageId).run();
     const validOperation = await stub.fetch(
       new Request("https://workspace-events.internal/broadcast", {
         method: "POST",
         headers: {
           "content-type": "application/json",
           "x-notes-internal": env.BETTER_AUTH_SECRET,
+          "x-notes-workspace-id": installed.workspaceId,
         },
         body: JSON.stringify({
           type: "pages-removed",
@@ -663,6 +677,7 @@ describe("Worker integration", () => {
             headers: {
               "content-type": "application/json",
               "x-notes-internal": env.BETTER_AUTH_SECRET,
+              "x-notes-workspace-id": installed.workspaceId,
             },
             body: JSON.stringify({
               type: "pages-removed",
@@ -706,6 +721,7 @@ describe("Worker integration", () => {
             headers: {
               "content-type": "application/json",
               "x-notes-internal": env.BETTER_AUTH_SECRET,
+              "x-notes-workspace-id": installed.workspaceId,
             },
             body: JSON.stringify(body),
           }),
@@ -746,6 +762,62 @@ describe("Worker integration", () => {
             backlinkTargetIds: ["backlink"],
             mentionTargetUserIds: [installed.userId],
           },
+        ]);
+      } finally {
+        broadcast.mockRestore();
+      }
+    });
+  });
+
+  it("filters serialized page lifecycle events against the current workspace state", async () => {
+    const installed = await bootstrap();
+    const stub = env.WORKSPACE_EVENTS.getByName(installed.workspaceId);
+    const activePage = (
+      await (await SELF.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree"))).json<{ pages: Page[] }>()
+    ).pages[0]!;
+
+    await runInDurableObject(stub, async (instance) => {
+      const delivered: WorkspaceEvent[] = [];
+      const workspaceEvents = instance as WorkspaceEvents;
+      const broadcast = vi
+        .spyOn(workspaceEvents, "broadcastCustomMessage")
+        .mockImplementation((message) => void delivered.push(JSON.parse(message) as WorkspaceEvent));
+      const request = (event: WorkspaceEvent) =>
+        workspaceEvents.onRequest(
+          new Request("https://workspace-events.internal/broadcast", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-notes-internal": env.BETTER_AUTH_SECRET,
+              "x-notes-workspace-id": installed.workspaceId,
+            },
+            body: JSON.stringify(event),
+          }),
+        );
+
+      try {
+        await env.DB.prepare("UPDATE pages SET archived_at = ? WHERE id = ?").bind(Date.now(), installed.pageId).run();
+        const archivedResponses = await Promise.all([
+          request({ type: "pages-upserted", pages: [activePage] }),
+          request({ type: "pages-removed", pageIds: [installed.pageId], permanently: false }),
+        ]);
+        expect(await Promise.all(archivedResponses.map((response) => response.json()))).toEqual([
+          { delivered: false },
+          { delivered: true },
+        ]);
+
+        await env.DB.prepare("UPDATE pages SET archived_at = NULL WHERE id = ?").bind(installed.pageId).run();
+        const activeResponses = await Promise.all([
+          request({ type: "pages-removed", pageIds: [installed.pageId], permanently: false }),
+          request({ type: "pages-upserted", pages: [activePage] }),
+        ]);
+        expect(await Promise.all(activeResponses.map((response) => response.json()))).toEqual([
+          { delivered: false },
+          { delivered: true },
+        ]);
+        expect(delivered).toEqual([
+          { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
+          { type: "pages-upserted", pages: [activePage] },
         ]);
       } finally {
         broadcast.mockRestore();
@@ -3240,6 +3312,86 @@ describe("Worker integration", () => {
 
     const invalid = await post({ ...requested, id: "not/a/page/id" });
     expect(invalid.status).toBe(422);
+  });
+
+  it("records, reads, and idempotently replays an exact page move", async () => {
+    const installed = await bootstrap();
+    const sibling = await createPage(installed.cookie);
+    const operationId = crypto.randomUUID();
+    const moveBody: { parentId: string | null; beforeId: string | null; afterId: string | null } = {
+      parentId: null,
+      beforeId: null,
+      afterId: null,
+    };
+    const move = (requestedOperationId: string | null, body = moveBody) =>
+      SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(requestedOperationId ? { "x-notes-operation-id": requestedOperationId } : {}),
+          },
+          body: JSON.stringify(body),
+        }),
+      );
+
+    const first = await move(operationId);
+    expect(first.status).toBe(200);
+    const firstBody = await first.json<{ page: Page; operationId: string; replayed: boolean }>();
+    expect(firstBody).toMatchObject({ operationId, replayed: false, page: { id: installed.pageId, revision: 2 } });
+
+    const receipt = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`),
+    );
+    expect(receipt.status).toBe(200);
+    expect(await receipt.json()).toEqual({ operationId, page: firstBody.page });
+
+    const laterMove = await move(crypto.randomUUID(), { parentId: null, beforeId: sibling.id, afterId: null });
+    expect(laterMove.status).toBe(200);
+    expect((await laterMove.json<{ page: Page }>()).page.revision).toBe(3);
+
+    const replay = await move(operationId);
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual({ ...firstBody, replayed: true });
+    expect(
+      await env.DB.prepare(`SELECT revision FROM pages WHERE id = ?`)
+        .bind(installed.pageId)
+        .first<{ revision: number }>(),
+    ).toEqual({ revision: 3 });
+
+    const reused = await move(operationId, { parentId: null, beforeId: sibling.id, afterId: null });
+    expect(reused.status).toBe(409);
+    expect((await reused.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
+
+    const missingOperationId = await move(null);
+    expect(missingOperationId.status).toBe(422);
+    expect((await missingOperationId.json<{ error: { code: string } }>()).error.code).toBe("invalid_input");
+  });
+
+  it("does not expose a move receipt under another page or operation id", async () => {
+    const installed = await bootstrap();
+    const sibling = await createPage(installed.cookie);
+    const operationId = crypto.randomUUID();
+    const moved = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+    );
+    expect(moved.status).toBe(200);
+
+    const wrongPage = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${sibling.id}/moves/${operationId}`),
+    );
+    expect(wrongPage.status).toBe(404);
+    expect((await wrongPage.json<{ error: { code: string } }>()).error.code).toBe("move_not_found");
+
+    const wrongOperation = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${crypto.randomUUID()}`),
+    );
+    expect(wrongOperation.status).toBe(404);
+    expect((await wrongOperation.json<{ error: { code: string } }>()).error.code).toBe("move_not_found");
   });
 
   it("preserves legacy page-create replays when no receipt was backfilled", async () => {

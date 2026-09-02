@@ -95,6 +95,7 @@ type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
 
 type PageJsonRow = Omit<PageRow, "plain_text" | "indexed_seq">;
 type PageCreateStateRow = PageJsonRow & { receipt_request_hash: string | null };
+type PageMoveReceiptRow = { page_id: string; request_hash: string; response_json: string };
 
 function pageJson(row: PageJsonRow): Page {
   return {
@@ -115,6 +116,31 @@ function pageJson(row: PageJsonRow): Page {
 
 async function pageCreateRequestHash(value: unknown) {
   return sha256Hex(canonicalJson(value));
+}
+
+async function readPageMoveReceipt(database: D1Database, workspaceId: string, operationId: string) {
+  return database
+    .prepare(
+      `SELECT page_id, request_hash, response_json FROM page_move_receipts
+        WHERE workspace_id = ? AND operation_id = ?`,
+    )
+    .bind(workspaceId, operationId)
+    .first<PageMoveReceiptRow>();
+}
+
+async function readPageMoveReplay(
+  database: D1Database,
+  workspaceId: string,
+  pageId: string,
+  operationId: string,
+  requestHash: string,
+) {
+  const receipt = await readPageMoveReceipt(database, workspaceId, operationId);
+  if (!receipt) return null;
+  if (receipt.page_id !== pageId || receipt.request_hash !== requestHash) {
+    throw new HttpError(409, "idempotency_key_reused", "That move operation id was already used for another move.");
+  }
+  return JSON.parse(receipt.response_json) as Page;
 }
 
 async function readPageCreateReplay(
@@ -208,25 +234,7 @@ function sendWorkspaceEvent(
   event: WorkspaceEvent,
 ) {
   c.executionCtx.waitUntil(
-    (async () => {
-      let deliveredEvent = event;
-      if (event.type === "pages-upserted") {
-        const candidatePages = event.pages.filter((page) => page.archivedAt === null);
-        if (!candidatePages.length) return;
-        const active = await c.env.DB.prepare(
-          `SELECT id FROM pages
-            WHERE workspace_id = ? AND archived_at IS NULL
-              AND id IN (SELECT value FROM json_each(?))`,
-        )
-          .bind(workspaceId, JSON.stringify(candidatePages.map((page) => page.id)))
-          .all<{ id: string }>();
-        const activeIds = new Set(active.results.map((page) => page.id));
-        const pages = candidatePages.filter((page) => activeIds.has(page.id));
-        if (!pages.length) return;
-        deliveredEvent = { ...event, pages };
-      }
-      await broadcastWorkspaceEvent(c.env, workspaceId, deliveredEvent);
-    })().catch((error) => {
+    broadcastWorkspaceEvent(c.env, workspaceId, event).catch((error) => {
       console.error("Failed to broadcast workspace event", error);
     }),
   );
@@ -910,9 +918,20 @@ app.patch("/api/pages/:id", async (c) => {
 app.post("/api/pages/:id/move", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = await pageForMember(c.env, member, c.req.param("id"));
   const body = await jsonBody(c.req.raw);
+  const operationId = text(c.req.header("x-notes-operation-id"), "operationId", 100);
+  if (!ID_PATTERN.test(operationId)) {
+    throw new HttpError(422, "invalid_input", "operationId is not a valid resource id.");
+  }
+  const pageId = c.req.param("id");
   const parentId = nullableId(body.parentId, "parentId");
+  const beforeId = nullableId(body.beforeId, "beforeId");
+  const afterId = nullableId(body.afterId, "afterId");
+  const requestHash = await sha256Hex(canonicalJson({ pageId, parentId, beforeId, afterId }));
+  const replay = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
+  if (replay) return c.json({ page: replay, operationId, replayed: true });
+
+  const page = await pageForMember(c.env, member, pageId);
   if (parentId) {
     await pageForMember(c.env, member, parentId);
     const cycle = await c.env.DB.prepare(
@@ -925,8 +944,6 @@ app.post("/api/pages/:id/move", async (c) => {
       .first();
     if (cycle) throw new HttpError(409, "page_cycle", "A page cannot be moved beneath itself or a descendant.");
   }
-  const beforeId = nullableId(body.beforeId, "beforeId");
-  const afterId = nullableId(body.afterId, "afterId");
   const neighbors = await c.env.DB.prepare(
     `SELECT id, position FROM pages WHERE workspace_id = ? AND parent_id IS ? AND archived_at IS NULL`,
   )
@@ -944,14 +961,46 @@ app.post("/api/pages/:id/move", async (c) => {
       : (neighbors.results.sort((a, b) => compareBinaryText(a.position, b.position)).at(-1)?.position ?? null));
   const upper = before;
   if (lower && upper && lower >= upper) throw new HttpError(422, "invalid_order", "afterId must come before beforeId.");
-  await c.env.DB.prepare(
-    `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ? WHERE id = ?`,
-  )
-    .bind(parentId, generateJitteredKeyBetween(lower, upper), now(), page.id)
-    .run();
-  const moved = pageJson(await pageForMember(c.env, member, page.id));
+  const position = generateJitteredKeyBetween(lower, upper);
+  const timestamp = now();
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ? WHERE id = ?`,
+      ).bind(parentId, position, timestamp, page.id),
+      c.env.DB.prepare(
+        `INSERT INTO page_move_receipts
+           (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
+         SELECT workspace_id, ?, id, ?,
+           json_object(
+             'id', id, 'workspaceId', workspace_id, 'parentId', parent_id, 'kind', kind,
+             'position', position, 'title', title, 'icon', icon, 'revision', revision,
+             'contentEpoch', content_epoch, 'archivedAt', archived_at,
+             'createdAt', created_at, 'updatedAt', updated_at
+           ), ?
+         FROM pages WHERE id = ? AND workspace_id = ? AND changes() > 0`,
+      ).bind(operationId, requestHash, timestamp, page.id, member.workspace.id),
+    ]);
+  } catch (error) {
+    const committed = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
+    if (committed) return c.json({ page: committed, operationId, replayed: true });
+    throw error;
+  }
+  const moved = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
+  if (!moved) throw new Error("The moved page was not recorded by its committed receipt.");
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
-  return c.json({ page: moved });
+  return c.json({ page: moved, operationId, replayed: false });
+});
+
+app.get("/api/pages/:id/moves/:operationId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const operationId = c.req.param("operationId");
+  if (!ID_PATTERN.test(operationId)) throw new HttpError(404, "move_not_found", "Move receipt not found.");
+  const receipt = await readPageMoveReceipt(c.env.DB, member.workspace.id, operationId);
+  if (!receipt || receipt.page_id !== c.req.param("id")) {
+    throw new HttpError(404, "move_not_found", "Move receipt not found.");
+  }
+  return c.json({ page: JSON.parse(receipt.response_json), operationId });
 });
 
 app.delete("/api/pages/:id", async (c) => {

@@ -19,6 +19,7 @@ describe("D1 migrations", () => {
         "member_mentions",
         "page_references",
         "page_create_receipts",
+        "page_move_receipts",
         "prevent_final_owner_demotion",
         "prevent_final_owner_removal",
         "attachment_upload_parts",
@@ -31,6 +32,7 @@ describe("D1 migrations", () => {
     const indexes = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all<{ name: string }>();
     expect(indexes.results.map((index) => index.name)).toContain("idx_table_cells_column");
     expect(indexes.results.map((index) => index.name)).not.toContain("idx_page_create_receipts_page");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_page_move_receipts_page");
     expect(indexes.results.map((index) => index.name)).toContain("idx_pages_workspace_page");
 
     const uploadColumns = await env.DB.prepare(`PRAGMA table_info(attachment_uploads)`).all<{ name: string }>();
@@ -48,6 +50,17 @@ describe("D1 migrations", () => {
       "workspace_id",
       "page_id",
       "request_hash",
+    ]);
+    const pageMoveReceiptColumns = await env.DB.prepare(`PRAGMA table_info(page_move_receipts)`).all<{
+      name: string;
+    }>();
+    expect(pageMoveReceiptColumns.results.map((column) => column.name)).toEqual([
+      "workspace_id",
+      "operation_id",
+      "page_id",
+      "request_hash",
+      "response_json",
+      "created_at",
     ]);
     const receiptPageForeignKey = await env.DB.prepare(`PRAGMA foreign_key_list(page_create_receipts)`).all<{
       seq: number;
@@ -101,9 +114,15 @@ describe("D1 migrations", () => {
         `INSERT INTO page_create_receipts (workspace_id, page_id, request_hash)
          VALUES ('workspace', 'page', 'request')`,
       ),
+      env.DB.prepare(
+        `INSERT INTO page_move_receipts
+           (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
+         VALUES ('workspace', 'move', 'page', 'request', '{}', ?)`,
+      ).bind(timestamp),
     ]);
     await env.DB.prepare(`DELETE FROM pages WHERE id = 'page'`).run();
     expect(await env.DB.prepare(`SELECT 1 FROM page_create_receipts WHERE page_id = 'page'`).first()).toBeNull();
+    expect(await env.DB.prepare(`SELECT 1 FROM page_move_receipts WHERE page_id = 'page'`).first()).toBeNull();
 
     // Deleting the workspace itself must still cascade through the final owner.
     await env.DB.prepare(`DELETE FROM workspaces WHERE id = 'workspace'`).run();

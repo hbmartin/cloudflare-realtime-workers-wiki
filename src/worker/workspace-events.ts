@@ -61,11 +61,49 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
   return null;
 }
 
+export async function eventForCurrentWorkspaceState(
+  env: Env,
+  workspaceId: string,
+  event: WorkspaceEvent,
+): Promise<WorkspaceEvent | null> {
+  if (event.type === "pages-upserted") {
+    const candidates = event.pages.filter((page) => page.archivedAt === null);
+    if (!candidates.length) return null;
+    const active = await env.DB.prepare(
+      `SELECT id FROM pages
+        WHERE workspace_id = ? AND archived_at IS NULL
+          AND id IN (SELECT value FROM json_each(?))`,
+    )
+      .bind(workspaceId, JSON.stringify(candidates.map((page) => page.id)))
+      .all<{ id: string }>();
+    const activeIds = new Set(active.results.map((page) => page.id));
+    const pages = candidates.filter((page) => activeIds.has(page.id));
+    return pages.length ? { ...event, pages } : null;
+  }
+  if (event.type === "pages-removed") {
+    const statePredicate = event.permanently ? "1 = 1" : "archived_at IS NOT NULL";
+    const matching = await env.DB.prepare(
+      `SELECT id FROM pages
+        WHERE workspace_id = ? AND ${statePredicate}
+          AND id IN (SELECT value FROM json_each(?))`,
+    )
+      .bind(workspaceId, JSON.stringify(event.pageIds))
+      .all<{ id: string }>();
+    const matchingIds = new Set(matching.results.map((page) => page.id));
+    const pageIds = event.permanently
+      ? event.pageIds.filter((pageId) => !matchingIds.has(pageId))
+      : event.pageIds.filter((pageId) => matchingIds.has(pageId));
+    return pageIds.length ? { ...event, pageIds } : null;
+  }
+  return event;
+}
+
 export class WorkspaceEvents extends YServer {
   static options = { hibernate: true };
 
   private readonly state: DurableObjectState;
   private readonly bindings: Env;
+  private deliveryQueue = Promise.resolve();
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -111,11 +149,24 @@ export class WorkspaceEvents extends YServer {
     if (nextExpiry) await this.scheduleAlarm(nextExpiry);
   }
 
-  async onRequest(request: Request) {
+  onRequest(request: Request) {
+    const delivery = this.deliveryQueue.then(() => this.deliver(request));
+    this.deliveryQueue = delivery.then(
+      () => undefined,
+      () => undefined,
+    );
+    return delivery;
+  }
+
+  private async deliver(request: Request) {
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method !== "POST") return new Response("Not found", { status: 404 });
+    const workspaceId = request.headers.get("x-notes-workspace-id");
+    if (!workspaceId || !ID_PATTERN.test(workspaceId)) {
+      return Response.json({ error: "Invalid workspace id." }, { status: 400 });
+    }
     let value: unknown;
     try {
       value = await request.json();
@@ -124,8 +175,9 @@ export class WorkspaceEvents extends YServer {
     }
     const event = workspaceEvent(value);
     if (!event) return Response.json({ error: "Invalid workspace event." }, { status: 400 });
-    this.broadcastCustomMessage(JSON.stringify(event));
-    return Response.json({ delivered: true });
+    const currentEvent = await eventForCurrentWorkspaceState(this.bindings, workspaceId, event);
+    if (currentEvent) this.broadcastCustomMessage(JSON.stringify(currentEvent));
+    return Response.json({ delivered: currentEvent !== null });
   }
 
   private async scheduleAlarm(when: number) {
@@ -139,7 +191,10 @@ export async function broadcastWorkspaceEvent(env: Env, workspaceId: string, eve
   const response = await stub.fetch(
     new Request("https://workspace-events.internal/broadcast", {
       method: "POST",
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      headers: {
+        "x-notes-internal": env.BETTER_AUTH_SECRET,
+        "x-notes-workspace-id": workspaceId,
+      },
       body: JSON.stringify(event),
     }),
   );

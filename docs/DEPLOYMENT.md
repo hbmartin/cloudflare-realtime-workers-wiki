@@ -120,9 +120,9 @@ pnpm deploy
 ```
 
 Migrations must complete before the Worker is deployed. The Worker queries the projection, mention,
-deletion-job, archive-disconnect, table-state, and page-creation receipt tables on ordinary request
-paths; deploying code that expects a migration which has not been applied produces runtime failures
-rather than a clean startup error.
+deletion-job, archive-disconnect, table-state, page-creation receipt, and page-move receipt tables on
+ordinary request paths; deploying code that expects a migration which has not been applied produces
+runtime failures rather than a clean startup error.
 
 `pnpm deploy` runs `pnpm build` again, which runs the full typecheck. To deploy from CI instead, see
 [Automated deployment](#automated-deployment).
@@ -147,6 +147,12 @@ workspace, reduces them to request hashes, and makes them cascade when that page
 Pages without receipts continue to use the legacy live-metadata replay check, while active receipt
 replays return current authoritative page metadata instead of a creation-time snapshot. Apply all three
 migrations before deploying the Worker that reads or writes these receipts.
+
+`0009_page_move_receipts.sql` adds operation-specific move receipts. Each receipt stores the committed
+page snapshot so an uncertain client request can distinguish its own move from a later reorder of the
+same page. Receipts cascade when their page or workspace is permanently deleted. Apply this migration
+before deploying the Worker that requires `x-notes-operation-id` on page moves or serves move-receipt
+lookups.
 
 ## 6. Bootstrap the owner
 
