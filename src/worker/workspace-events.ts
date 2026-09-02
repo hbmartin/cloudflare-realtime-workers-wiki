@@ -10,6 +10,8 @@ export interface EventConnectionAuth {
   __ypsAwarenessIds?: number[];
 }
 
+const WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT = 128;
+
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -67,17 +69,17 @@ export async function eventForCurrentWorkspaceState(
   event: WorkspaceEvent,
 ): Promise<WorkspaceEvent | null> {
   if (event.type === "pages-upserted") {
-    const candidates = event.pages.filter((page) => page.archivedAt === null);
+    const candidates = event.pages.filter((page) => page.workspaceId === workspaceId && page.archivedAt === null);
     if (!candidates.length) return null;
     const active = await env.DB.prepare(
-      `SELECT id FROM pages
+      `SELECT id, revision FROM pages
         WHERE workspace_id = ? AND archived_at IS NULL
           AND id IN (SELECT value FROM json_each(?))`,
     )
       .bind(workspaceId, JSON.stringify(candidates.map((page) => page.id)))
-      .all<{ id: string }>();
-    const activeIds = new Set(active.results.map((page) => page.id));
-    const pages = candidates.filter((page) => activeIds.has(page.id));
+      .all<{ id: string; revision: number }>();
+    const activeRevisions = new Map(active.results.map((page) => [page.id, page.revision]));
+    const pages = candidates.filter((page) => activeRevisions.get(page.id) === page.revision);
     return pages.length ? { ...event, pages } : null;
   }
   if (event.type === "pages-removed") {
@@ -104,6 +106,7 @@ export class WorkspaceEvents extends YServer {
   private readonly state: DurableObjectState;
   private readonly bindings: Env;
   private deliveryQueue = Promise.resolve();
+  private queuedDeliveries = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -149,23 +152,14 @@ export class WorkspaceEvents extends YServer {
     if (nextExpiry) await this.scheduleAlarm(nextExpiry);
   }
 
-  onRequest(request: Request) {
-    const delivery = this.deliveryQueue.then(() => this.deliver(request));
-    this.deliveryQueue = delivery.then(
-      () => undefined,
-      () => undefined,
-    );
-    return delivery;
-  }
-
-  private async deliver(request: Request) {
+  async onRequest(request: Request) {
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method !== "POST") return new Response("Not found", { status: 404 });
-    const workspaceId = request.headers.get("x-notes-workspace-id");
+    const workspaceId = this.state.id.name;
     if (!workspaceId || !ID_PATTERN.test(workspaceId)) {
-      return Response.json({ error: "Invalid workspace id." }, { status: 400 });
+      return Response.json({ error: "Invalid workspace object identity." }, { status: 500 });
     }
     let value: unknown;
     try {
@@ -175,6 +169,30 @@ export class WorkspaceEvents extends YServer {
     }
     const event = workspaceEvent(value);
     if (!event) return Response.json({ error: "Invalid workspace event." }, { status: 400 });
+
+    // Projection notifications do not depend on page lifecycle ordering and do
+    // not read D1, so a slow lifecycle check must not hold them behind it.
+    if (event.type === "projection-updated") {
+      this.broadcastCustomMessage(JSON.stringify(event));
+      return Response.json({ delivered: true });
+    }
+    if (this.queuedDeliveries >= WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT) {
+      return Response.json({ error: "Workspace event delivery is busy." }, { status: 503 });
+    }
+    this.queuedDeliveries += 1;
+    const delivery = this.deliveryQueue.then(() => this.deliver(workspaceId, event));
+    this.deliveryQueue = delivery.then(
+      () => undefined,
+      () => undefined,
+    );
+    try {
+      return await delivery;
+    } finally {
+      this.queuedDeliveries -= 1;
+    }
+  }
+
+  private async deliver(workspaceId: string, event: WorkspaceEvent) {
     const currentEvent = await eventForCurrentWorkspaceState(this.bindings, workspaceId, event);
     if (currentEvent) this.broadcastCustomMessage(JSON.stringify(currentEvent));
     return Response.json({ delivered: currentEvent !== null });
@@ -193,7 +211,6 @@ export async function broadcastWorkspaceEvent(env: Env, workspaceId: string, eve
       method: "POST",
       headers: {
         "x-notes-internal": env.BETTER_AUTH_SECRET,
-        "x-notes-workspace-id": workspaceId,
       },
       body: JSON.stringify(event),
     }),
