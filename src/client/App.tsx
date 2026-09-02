@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { ClientMemberContext } from "../shared/types";
-import { buildTree } from "../shared/tree-model";
+import { buildTree, compareBinaryText } from "../shared/tree-model";
 import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent } from "../shared/types";
 import { isPage } from "../shared/validation";
 import {
@@ -163,6 +163,7 @@ type PageMutationExpectation = {
   parentId: string | null;
   kind: PageKind;
   minimumRevision?: number;
+  movePlacement?: { beforeId: string | null; afterId: string | null };
 };
 
 function matchesPageMutationExpectation(page: Page, expectation: PageMutationExpectation) {
@@ -188,6 +189,25 @@ function observedExpectedPage(result: PageLoadResult, expectation: PageMutationE
   return page && matchesPageMutationExpectation(page, expectation) ? page : null;
 }
 
+function observedExpectedMove(result: PageLoadResult, expectation: PageMutationExpectation) {
+  const moved = observedExpectedPage(result, expectation);
+  if (!moved || !expectation.movePlacement) return moved;
+
+  const siblings = result.serverPages
+    .filter(
+      (page) =>
+        page.archivedAt === null && page.parentId === expectation.parentId && !result.removedDuringLoad.has(page.id),
+    )
+    .sort((left, right) => compareBinaryText(left.position, right.position) || compareBinaryText(left.id, right.id));
+  const movedIndex = siblings.findIndex((page) => page.id === moved.id);
+  const { beforeId, afterId } = expectation.movePlacement;
+  if (movedIndex < 0) return null;
+  if (beforeId !== null && siblings[movedIndex + 1]?.id !== beforeId) return null;
+  if (afterId !== null && siblings[movedIndex - 1]?.id !== afterId) return null;
+  if (beforeId === null && afterId === null && movedIndex !== siblings.length - 1) return null;
+  return moved;
+}
+
 function pageMoveReceiptResponse(value: unknown, expectation: PageMutationExpectation, operationId: string) {
   if (
     value === null ||
@@ -199,6 +219,12 @@ function pageMoveReceiptResponse(value: unknown, expectation: PageMutationExpect
   }
   return pageMutationResponse(value, expectation);
 }
+
+type PageMoveReceiptObservation =
+  | { kind: "confirmed"; page: Page }
+  | { kind: "missing" }
+  | { kind: "unavailable" }
+  | { kind: "timed-out" };
 
 type MutationRequestResult<T> =
   | { kind: "committed"; value: T | null; responseError?: unknown }
@@ -705,6 +731,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   } | null>(null);
   const trashTreeRefreshOwed = useRef(false);
   const trashTreeRefreshPromise = useRef<Promise<void> | null>(null);
+  const workspaceInvalidationRefreshOwed = useRef(false);
+  const workspaceInvalidationRefreshPromise = useRef<Promise<void> | null>(null);
   const activePageTreeRetryRef = useRef<{
     target: PageTreeRetryTarget;
     errorAttempt: WorkspaceErrorAttempt;
@@ -956,6 +984,41 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [loadPages],
   );
+  const refreshInvalidatedWorkspace = useCallback(() => {
+    workspaceInvalidationRefreshOwed.current = true;
+    const pending = workspaceInvalidationRefreshPromise.current;
+    if (pending) return pending;
+
+    const signal = workspaceAbortController.current.signal;
+    const observe = async () => {
+      try {
+        return await loadFreshPages(signal);
+      } catch (error) {
+        if (!signal.aborted) {
+          reportWorkspaceError(
+            { source: "page-tree" },
+            apiErrorMessage(error, "The invalidated workspace could not be refreshed."),
+          );
+        }
+        return null;
+      }
+    };
+    let refresh!: Promise<void>;
+    refresh = (async () => {
+      while (workspaceInvalidationRefreshOwed.current && !signal.aborted) {
+        workspaceInvalidationRefreshOwed.current = false;
+        // Two post-invalidation observations also release archive tombstones
+        // when the dropped lifecycle event was a restore.
+        await reconcileWithOneRetry(observe, () => true, signal);
+      }
+    })().finally(() => {
+      if (workspaceInvalidationRefreshPromise.current === refresh) {
+        workspaceInvalidationRefreshPromise.current = null;
+      }
+    });
+    workspaceInvalidationRefreshPromise.current = refresh;
+    return refresh;
+  }, [loadFreshPages, reportWorkspaceError]);
   const ensureTrashTreeRefresh = useCallback(() => {
     const pending = trashTreeRefreshPromise.current;
     if (pending) return pending;
@@ -1084,10 +1147,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     [archiveRemovalTombstones, excludeConfirmedRestoresFromTrash, loadFreshPages],
   );
   const reconcileRestoredEvent = useCallback(
-    async (restoredPages: Page[], tombstoneCheckpoint: number) => {
+    async (restoredPages: Page[], tombstoneCheckpoint: number, restoredRootId?: string) => {
       const signal = workspaceAbortController.current.signal;
-      const root = restoredEventRoot(restoredPages);
-      if (!root) {
+      const rootPageId = restoredRootId ?? restoredEventRoot(restoredPages)?.id ?? null;
+      if (!rootPageId) {
         const observe = async () => {
           try {
             return await loadFreshPages(signal);
@@ -1100,7 +1163,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         return;
       }
       await reconcileRestoredRoot(
-        root.id,
+        rootPageId,
         restoredPages.map((page) => page.id),
         tombstoneCheckpoint,
         true,
@@ -1212,8 +1275,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }, [loadUnreadMentions]);
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
+      if (event.type === "workspace-invalidated") {
+        void refreshInvalidatedWorkspace();
+        return;
+      }
       if (event.type === "pages-upserted") {
-        const restoredRoot = event.restored ? restoredEventRoot(event.pages) : null;
+        const restoredRootId = event.restored
+          ? (event.restoredRootId ?? restoredEventRoot(event.pages)?.id ?? null)
+          : null;
         const restoredPagesNeedConfirmation =
           event.restored === true && event.pages.some((page) => archiveRemovalTombstones.has(page.id));
         recordPageUpserts(event.pages);
@@ -1221,7 +1290,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         const visiblePages = event.pages.filter((page) => !archiveRemovalTombstones.has(page.id));
         if (visiblePages.length) {
           if (event.restored) {
-            dispatchPageAction({ type: "merge-restored", pages: visiblePages, rootPageId: restoredRoot?.id ?? null });
+            dispatchPageAction({ type: "merge-restored", pages: visiblePages, rootPageId: restoredRootId });
             excludeConfirmedRestoresFromTrash(visiblePages);
           } else {
             dispatchPageAction({ type: "merge", pages: visiblePages });
@@ -1233,12 +1302,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           refreshTrash();
           if (restoredPagesNeedConfirmation) {
             const restoreTombstoneCheckpoint = archiveRemovalTombstones.checkpoint();
-            void reconcileRestoredEvent(event.pages, restoreTombstoneCheckpoint).catch((error) => {
-              reportWorkspaceError(
-                { source: "page-tree" },
-                apiErrorMessage(error, "The restored page could not be confirmed."),
-              );
-            });
+            void reconcileRestoredEvent(event.pages, restoreTombstoneCheckpoint, event.restoredRootId).catch(
+              (error) => {
+                reportWorkspaceError(
+                  { source: "page-tree" },
+                  apiErrorMessage(error, "The restored page could not be confirmed."),
+                );
+              },
+            );
           }
         }
         return;
@@ -1270,6 +1341,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       recordPageRemovals,
       recordPageUpserts,
       refreshTrash,
+      refreshInvalidatedWorkspace,
       reportWorkspaceError,
     ],
   );
@@ -1373,29 +1445,44 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     unresolvedMessage: string,
   ) {
     const receipt = await reconcileWithOneRetry(
-      async () => {
+      async (): Promise<PageMoveReceiptObservation> => {
+        const timeoutSignal = AbortSignal.timeout(PAGE_TREE_REQUEST_TIMEOUT_MS);
+        const requestSignal = AbortSignal.any([signal, timeoutSignal]);
         try {
-          const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(PAGE_TREE_REQUEST_TIMEOUT_MS)]);
           const value = await api<unknown>(`/api/pages/${pageId}/moves/${operationId}`, { signal: requestSignal });
-          return pageMoveReceiptResponse(value, expectation, operationId);
+          const page = pageMoveReceiptResponse(value, expectation, operationId);
+          return page ? { kind: "confirmed", page } : { kind: "unavailable" };
         } catch (error) {
-          if (signal.aborted) return null;
-          if (!(error instanceof ApiClientError && error.status === 404 && error.code === "move_not_found")) {
-            console.error("Move receipt could not be checked", { pageId, operationId, ...errorLogFields(error) });
+          if (signal.aborted) return { kind: "unavailable" };
+          if (timeoutSignal.aborted) return { kind: "timed-out" };
+          if (error instanceof ApiClientError && error.status === 404 && error.code === "move_not_found") {
+            return { kind: "missing" };
           }
-          return null;
+          console.error("Move receipt could not be checked", { pageId, operationId, ...errorLogFields(error) });
+          return { kind: "unavailable" };
         }
       },
-      (confirmed) => confirmed === null,
+      (observation) => observation.kind === "missing" || observation.kind === "unavailable",
       signal,
     );
     if (signal.aborted) return null;
-    if (receipt) {
-      mergePageMutationResult(receipt);
+    if (receipt.kind === "confirmed") {
+      mergePageMutationResult(receipt.page);
       clearWorkspaceErrors(attempt);
-      return receipt;
+      return receipt.page;
     }
-    await reconcilePages(signal);
+    const observation = await reconcileWithOneRetry(
+      () => reconcilePages(signal),
+      (result) =>
+        result === null || archiveRemovalTombstones.has(pageId) || observedExpectedMove(result, expectation) === null,
+      signal,
+    );
+    const moved =
+      observation && !archiveRemovalTombstones.has(pageId) && observedExpectedMove(observation, expectation);
+    if (moved) {
+      clearWorkspaceErrors(attempt);
+      return moved;
+    }
     if (!signal.aborted) reportWorkspaceError(attempt, `${unresolvedMessage} after checking the server receipt.`);
     return null;
   }
@@ -1434,6 +1521,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (result.kind === "committed" && result.value) {
         clearSettledCreateErrors();
         if (!mergePageMutationResult(result.value)) {
+          closeSidebar(true);
           reportWorkspaceError(attempt, "The page was created, but it is no longer available.");
           return;
         }
@@ -1617,6 +1705,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       parentId,
       kind: movingPage.kind,
       minimumRevision: movingPage.revision + 1,
+      movePlacement: { beforeId, afterId },
     };
     try {
       operationId = crypto.randomUUID();

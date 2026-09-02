@@ -47,7 +47,6 @@ import {
   nullableId,
   object,
   PAGE_TITLE_MAX,
-  isPage,
   pageKind,
   role,
   text,
@@ -98,6 +97,7 @@ type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
 type PageJsonRow = Omit<PageRow, "plain_text" | "indexed_seq">;
 type PageCreateStateRow = PageJsonRow & { receipt_request_hash: string | null };
 type PageMoveReceiptRow = { page_id: string; request_hash: string; response_json: string };
+type PageMoveBatchRow = PageMoveReceiptRow & { archived_at: number | null };
 
 function pageJson(row: PageJsonRow): Page {
   return {
@@ -130,17 +130,71 @@ async function readPageMoveReceipt(database: D1Database, workspaceId: string, op
     .first<PageMoveReceiptRow>();
 }
 
-function pageFromMoveReceipt(receipt: PageMoveReceiptRow, pageId: string, requestHash?: string) {
+function pageMoveReceiptSnapshotV1(value: unknown): Page {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("A stored page move receipt does not contain a valid page.");
+  }
+  const page = value as Record<string, unknown>;
+  if (
+    typeof page.id !== "string" ||
+    typeof page.workspaceId !== "string" ||
+    (page.parentId !== null && typeof page.parentId !== "string") ||
+    (page.kind !== "document" && page.kind !== "table") ||
+    typeof page.position !== "string" ||
+    typeof page.title !== "string" ||
+    (page.icon !== null && typeof page.icon !== "string") ||
+    typeof page.revision !== "number" ||
+    typeof page.contentEpoch !== "number" ||
+    (page.archivedAt !== null && typeof page.archivedAt !== "number") ||
+    typeof page.createdAt !== "number" ||
+    typeof page.updatedAt !== "number"
+  ) {
+    throw new Error("A stored page move receipt does not contain a valid page.");
+  }
+  // Keep this decoder pinned to receipt schema v1. If Page gains a field,
+  // TypeScript forces an explicit backward-compatible default here instead of
+  // silently making seven days of retained receipts unreadable.
+  return {
+    id: page.id,
+    workspaceId: page.workspaceId,
+    parentId: page.parentId,
+    kind: page.kind,
+    position: page.position,
+    title: page.title,
+    icon: page.icon,
+    revision: page.revision,
+    contentEpoch: page.contentEpoch,
+    archivedAt: page.archivedAt,
+    createdAt: page.createdAt,
+    updatedAt: page.updatedAt,
+  };
+}
+
+function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, pageId: string, requestHash?: string) {
   if (receipt.page_id !== pageId || (requestHash !== undefined && receipt.request_hash !== requestHash)) {
     throw new HttpError(409, "idempotency_key_reused", "That move operation id was already used for another move.");
   }
-  let page: unknown;
+  let stored: unknown;
   try {
-    page = JSON.parse(receipt.response_json);
+    stored = JSON.parse(receipt.response_json);
   } catch (error) {
     throw new Error("A stored page move receipt contains malformed JSON.", { cause: error });
   }
-  if (!isPage(page)) throw new Error("A stored page move receipt does not contain a valid page.");
+  const envelope =
+    stored !== null && typeof stored === "object" && !Array.isArray(stored)
+      ? (stored as Record<string, unknown>)
+      : null;
+  let snapshot = stored;
+  if (envelope && "pageMoveReceiptVersion" in envelope) {
+    if (envelope.pageMoveReceiptVersion !== 1 || !("page" in envelope)) {
+      throw new Error("A stored page move receipt uses an unsupported snapshot version.");
+    }
+    snapshot = envelope.page;
+  }
+  const page = pageMoveReceiptSnapshotV1(snapshot);
+  if (page.id !== receipt.page_id || page.workspaceId !== workspaceId) {
+    throw new Error("A stored page move receipt does not match its page and workspace.");
+  }
   return page;
 }
 
@@ -153,7 +207,7 @@ async function readPageMoveReplay(
 ) {
   const receipt = await readPageMoveReceipt(database, workspaceId, operationId);
   if (!receipt) return null;
-  return pageFromMoveReceipt(receipt, pageId, requestHash);
+  return pageFromMoveReceipt(receipt, workspaceId, pageId, requestHash);
 }
 
 async function pruneExpiredPageMoveReceipts(database: D1Database, timestamp = now()) {
@@ -988,39 +1042,58 @@ app.post("/api/pages/:id/move", async (c) => {
   const position = generateJitteredKeyBetween(lower, upper);
   const timestamp = now();
   try {
-    const receiptResult = await batchWithFinalResult<PageMoveReceiptRow>(
-      c.env.DB,
-      [
-        c.env.DB.prepare(
-          `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ?
-            WHERE id = ? AND workspace_id = ?`,
-        ).bind(parentId, position, timestamp, page.id, member.workspace.id),
-        c.env.DB.prepare(
-          `INSERT INTO page_move_receipts
-             (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
-           SELECT workspace_id, ?, id, ?,
-             json_object(
+    const moveResultIndex = 0;
+    const receiptResultIndex = 2;
+    const pageStateResultIndex = 3;
+    const results = await c.env.DB.batch<PageMoveBatchRow>([
+      c.env.DB.prepare(
+        `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ?
+          WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
+      ).bind(parentId, position, timestamp, page.id, member.workspace.id),
+      c.env.DB.prepare(
+        `INSERT INTO page_move_receipts
+           (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
+         SELECT workspace_id, ?, id, ?,
+           json_object(
+             'pageMoveReceiptVersion', 1,
+             'page', json_object(
                'id', id, 'workspaceId', workspace_id, 'parentId', parent_id, 'kind', kind,
                'position', position, 'title', title, 'icon', icon, 'revision', revision,
                'contentEpoch', content_epoch, 'archivedAt', archived_at,
                'createdAt', created_at, 'updatedAt', updated_at
-             ), ?
-           FROM pages WHERE id = ? AND workspace_id = ?`,
-        ).bind(operationId, requestHash, timestamp, page.id, member.workspace.id),
-      ],
+             )
+           ), ?
+         FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
+      ).bind(operationId, requestHash, timestamp, page.id, member.workspace.id),
       c.env.DB.prepare(
         `SELECT page_id, request_hash, response_json FROM page_move_receipts
           WHERE workspace_id = ? AND operation_id = ?`,
       ).bind(member.workspace.id, operationId),
-    );
+      c.env.DB.prepare(`SELECT archived_at FROM pages WHERE id = ? AND workspace_id = ?`).bind(
+        page.id,
+        member.workspace.id,
+      ),
+    ]);
+    if (!results[moveResultIndex]?.meta.changes) {
+      const unavailable = results[pageStateResultIndex]?.results[0];
+      if (unavailable && unavailable.archived_at !== null) {
+        throw new HttpError(409, "page_archived", "The page was archived before it could be moved.");
+      }
+      if (unavailable) throw new Error("An active page move unexpectedly changed no rows.");
+      throw new HttpError(404, "page_not_found", "Page not found.");
+    }
+    const receiptResult = results[receiptResultIndex];
     const receipt = receiptResult?.results[0];
     if (!receipt) throw new Error("The moved page was not recorded by its committed receipt.");
-    const moved = pageFromMoveReceipt(receipt, pageId, requestHash);
+    const moved = pageFromMoveReceipt(receipt, member.workspace.id, pageId, requestHash);
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
     return c.json({ page: moved, operationId, replayed: false });
   } catch (error) {
     const committed = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
-    if (committed) return c.json({ page: committed, operationId, replayed: true });
+    if (committed) {
+      sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });
+      return c.json({ page: committed, operationId, replayed: true });
+    }
     throw error;
   }
 });
@@ -1033,7 +1106,7 @@ app.get("/api/pages/:id/moves/:operationId", async (c) => {
   if (!receipt || receipt.page_id !== c.req.param("id")) {
     throw new HttpError(404, "move_not_found", "Move receipt not found.");
   }
-  return c.json({ page: pageFromMoveReceipt(receipt, c.req.param("id")), operationId });
+  return c.json({ page: pageFromMoveReceipt(receipt, member.workspace.id, c.req.param("id")), operationId });
 });
 
 app.delete("/api/pages/:id", async (c) => {
@@ -1166,6 +1239,7 @@ app.post("/api/pages/:id/restore", async (c) => {
     type: "pages-upserted",
     pages: restoredPages,
     restored: true,
+    restoredRootId: page.id,
   });
   return c.json({ pages: restoredPages });
 });
