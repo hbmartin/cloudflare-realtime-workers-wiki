@@ -33,6 +33,7 @@ describe("D1 migrations", () => {
     expect(indexes.results.map((index) => index.name)).toContain("idx_table_cells_column");
     expect(indexes.results.map((index) => index.name)).not.toContain("idx_page_create_receipts_page");
     expect(indexes.results.map((index) => index.name)).toContain("idx_page_move_receipts_page");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_page_move_receipts_created");
     expect(indexes.results.map((index) => index.name)).toContain("idx_pages_workspace_page");
 
     const uploadColumns = await env.DB.prepare(`PRAGMA table_info(attachment_uploads)`).all<{ name: string }>();

@@ -1375,7 +1375,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const receipt = await reconcileWithOneRetry(
       async () => {
         try {
-          const value = await api<unknown>(`/api/pages/${pageId}/moves/${operationId}`, { signal });
+          const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(PAGE_TREE_REQUEST_TIMEOUT_MS)]);
+          const value = await api<unknown>(`/api/pages/${pageId}/moves/${operationId}`, { signal: requestSignal });
           return pageMoveReceiptResponse(value, expectation, operationId);
         } catch (error) {
           if (signal.aborted) return null;
@@ -1432,7 +1433,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       outcome = result.kind;
       if (result.kind === "committed" && result.value) {
         clearSettledCreateErrors();
-        if (mergePageMutationResult(result.value)) navigateToPage(result.value.id);
+        if (!mergePageMutationResult(result.value)) {
+          reportWorkspaceError(attempt, "The page was created, but it is no longer available.");
+          return;
+        }
+        navigateToPage(result.value.id);
         return;
       }
       closeSidebar(true);

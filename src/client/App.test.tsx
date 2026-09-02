@@ -1123,6 +1123,66 @@ describe("App error handling", () => {
     expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument();
   });
 
+  it("times out stalled move-receipt checks before falling back to the page tree", async () => {
+    const operationId = "00000000-0000-4000-8000-000000000014";
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(operationId);
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    let receiptLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      if (path === `/api/pages/${page.id}/moves/${operationId}`) {
+        receiptLoads += 1;
+        const signal = init?.signal;
+        if (!signal) throw new Error("The move receipt request did not receive a signal.");
+        return new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+      const controller = new AbortController();
+      window.setTimeout(
+        () => controller.abort(new DOMException("The move receipt request timed out.", "TimeoutError")),
+        milliseconds,
+      );
+      return controller.signal;
+    });
+    onTestFinished(() => timeout.mockRestore());
+    const treeRoot = document.querySelector(".tree-root");
+    if (!treeRoot) throw new Error("The page tree root was not rendered.");
+    fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
+    await act(async () => Promise.resolve());
+    expect(receiptLoads).toBe(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+    expect(receiptLoads).toBe(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+
+    expect(treeLoads).toBe(2);
+    expect(
+      screen.getByText("The page-movement result could not be verified after checking the server receipt."),
+    ).toBeInTheDocument();
+  });
+
   it("keeps an uncertain append warning when unrelated moves change its page and stale tail anchor", async () => {
     const remainingPage = { ...page, id: "remaining-page", position: "m0", title: "Remaining" };
     const tailPage = { ...page, id: "tail-page", position: "z0", title: "Tail" };
@@ -1364,6 +1424,7 @@ describe("App error handling", () => {
     expect(recordUpserts).not.toHaveBeenCalledWith([createdPage]);
     expect(screen.queryByRole("button", { name: "Archive Created" })).not.toBeInTheDocument();
     expect(localStorage.getItem("notes:last-page")).toBe(page.id);
+    expect(await screen.findByText("The page was created, but it is no longer available.")).toBeInTheDocument();
   });
 
   it("stops move processing when the workspace unmounts before the mutation settles", async () => {

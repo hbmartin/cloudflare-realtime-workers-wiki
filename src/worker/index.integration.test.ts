@@ -166,7 +166,6 @@ function capturedWorkspaceEvents(bindings: Env, delivered: Array<{ workspaceId: 
     getByName(workspaceId: string) {
       return {
         async fetch(request: Request) {
-          expect(request.headers.get("x-notes-workspace-id")).toBe(workspaceId);
           const event = await eventForCurrentWorkspaceState(
             bindings,
             workspaceId,
@@ -652,7 +651,8 @@ describe("Worker integration", () => {
         headers: {
           "content-type": "application/json",
           "x-notes-internal": env.BETTER_AUTH_SECRET,
-          "x-notes-workspace-id": installed.workspaceId,
+          // The Durable Object must use its own name, not this untrusted hint.
+          "x-notes-workspace-id": crypto.randomUUID(),
         },
         body: JSON.stringify({
           type: "pages-removed",
@@ -815,6 +815,9 @@ describe("Worker integration", () => {
           { delivered: false },
           { delivered: true },
         ]);
+        await env.DB.prepare("UPDATE pages SET revision = revision + 1 WHERE id = ?").bind(installed.pageId).run();
+        const superseded = await request({ type: "pages-upserted", pages: [activePage] });
+        expect(await superseded.json()).toEqual({ delivered: false });
         expect(delivered).toEqual([
           { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
           { type: "pages-upserted", pages: [activePage] },
@@ -3363,9 +3366,64 @@ describe("Worker integration", () => {
     expect(reused.status).toBe(409);
     expect((await reused.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
 
-    const missingOperationId = await move(null);
-    expect(missingOperationId.status).toBe(422);
-    expect((await missingOperationId.json<{ error: { code: string } }>()).error.code).toBe("invalid_input");
+    const legacyMove = await move(null);
+    expect(legacyMove.status).toBe(200);
+    expect(await legacyMove.json()).toMatchObject({
+      operationId: expect.any(String),
+      replayed: false,
+      page: { id: installed.pageId, revision: 4 },
+    });
+  });
+
+  it("rejects malformed stored page move snapshots", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const moved = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+    );
+    expect(moved.status).toBe(200);
+    await env.DB.prepare(`UPDATE page_move_receipts SET response_json = '{"id":123}' WHERE operation_id = ?`)
+      .bind(operationId)
+      .run();
+
+    const receipt = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`),
+    );
+    expect(receipt.status).toBe(500);
+  });
+
+  it("prunes expired page move receipts while retaining the active recovery window", async () => {
+    const installed = await bootstrap();
+    const move = async (operationId: string) => {
+      const response = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+          body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+        }),
+      );
+      expect(response.status).toBe(200);
+    };
+    const expiredOperationId = crypto.randomUUID();
+    const currentOperationId = crypto.randomUUID();
+    await move(expiredOperationId);
+    await move(currentOperationId);
+    await env.DB.prepare(`UPDATE page_move_receipts SET created_at = 0 WHERE operation_id = ?`)
+      .bind(expiredOperationId)
+      .run();
+
+    const scheduledContext = createExecutionContext();
+    await worker.scheduled(createScheduledController(), env, scheduledContext);
+    await waitOnExecutionContext(scheduledContext);
+
+    const retained = await env.DB.prepare(`SELECT operation_id FROM page_move_receipts ORDER BY operation_id`).all<{
+      operation_id: string;
+    }>();
+    expect(retained.results.map((receipt) => receipt.operation_id)).toEqual([currentOperationId]);
   });
 
   it("does not expose a move receipt under another page or operation id", async () => {
