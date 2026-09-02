@@ -88,7 +88,7 @@ test("bootstraps or signs in and passes critical accessibility checks", async ({
   expect(critical).toEqual([]);
 });
 
-test("creates, renames, archives, and restores a page through the UI", async ({ page }, testInfo) => {
+test("creates, renames, archives, and restores a page through the UI @mobile-sidebar", async ({ page }, testInfo) => {
   await signIn(page);
   const title = `Lifecycle ${testInfo.project.name} ${Date.now()}`;
   await page.getByRole("button", { name: "+ Page", exact: true }).click();
@@ -100,6 +100,7 @@ test("creates, renames, archives, and restores a page through the UI", async ({ 
   await openSidebar(page);
   // Calling the helper for an already-open drawer must not click through its scrim.
   await openSidebar(page);
+  if (testInfo.project.name === "mobile-chromium") await expect(page.locator(".sidebar-scrim")).toBeVisible();
   const pageLink = treeLink(page, title);
   await expect(pageLink).toBeVisible();
 

@@ -149,6 +149,9 @@ async function readPageCreateReplay(
     );
   });
   if (!replayMatches) throw new HttpError(409, "idempotency_key_reused", conflictMessage);
+  if (rows.some((row) => row.archived_at !== null)) {
+    throw new HttpError(409, "page_archived", "A page created by this request is now archived.");
+  }
   return rows.map(pageJson);
 }
 
@@ -158,6 +161,33 @@ async function requestedPageIdsExist(database: D1Database, requested: RequestedP
     .bind(...requested.map((page) => page.id))
     .first();
   return existing !== null;
+}
+
+async function validatePageCreateParents(env: Env, member: MemberContext, requested: RequestedPageCreate[]) {
+  const parentIds = [...new Set(requested.map((page) => page.parentId))];
+  for (const parentId of parentIds) {
+    if (parentId) await pageForMember(env, member, parentId);
+  }
+}
+
+async function readInitialPageCreateReplay(
+  env: Env,
+  member: MemberContext,
+  requested: RequestedPageCreate[],
+  requestHash: string,
+  conflictMessage: string,
+) {
+  try {
+    return await readPageCreateReplay(env.DB, member.workspace.id, requested, requestHash, conflictMessage);
+  } catch (error) {
+    // Exact replays remain valid if their original parent was archived later.
+    // For a mismatched reuse, however, preserve the create API's parent error
+    // precedence before returning the idempotency conflict.
+    if (error instanceof HttpError && error.code === "idempotency_key_reused") {
+      await validatePageCreateParents(env, member, requested);
+    }
+    throw error;
+  }
 }
 
 async function batchWithFinalResult<T>(
@@ -178,7 +208,25 @@ function sendWorkspaceEvent(
   event: WorkspaceEvent,
 ) {
   c.executionCtx.waitUntil(
-    broadcastWorkspaceEvent(c.env, workspaceId, event).catch((error) => {
+    (async () => {
+      let deliveredEvent = event;
+      if (event.type === "pages-upserted") {
+        const candidatePages = event.pages.filter((page) => page.archivedAt === null);
+        if (!candidatePages.length) return;
+        const active = await c.env.DB.prepare(
+          `SELECT id FROM pages
+            WHERE workspace_id = ? AND archived_at IS NULL
+              AND id IN (SELECT value FROM json_each(?))`,
+        )
+          .bind(workspaceId, JSON.stringify(candidatePages.map((page) => page.id)))
+          .all<{ id: string }>();
+        const activeIds = new Set(active.results.map((page) => page.id));
+        const pages = candidatePages.filter((page) => activeIds.has(page.id));
+        if (!pages.length) return;
+        deliveredEvent = { ...event, pages };
+      }
+      await broadcastWorkspaceEvent(c.env, workspaceId, deliveredEvent);
+    })().catch((error) => {
       console.error("Failed to broadcast workspace event", error);
     }),
   );
@@ -650,10 +698,10 @@ app.post("/api/pages", async (c) => {
   const requested = [{ id, parentId, kind, title }];
   const conflictMessage = "That page id already describes a different page.";
   const initialReplay = clientProvidedId
-    ? await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage)
+    ? await readInitialPageCreateReplay(c.env, member, requested, requestHash, conflictMessage)
     : null;
   if (initialReplay) return c.json({ page: initialReplay[0]! });
-  if (parentId) await pageForMember(c.env, member, parentId);
+  await validatePageCreateParents(c.env, member, requested);
   const timestamp = now();
   let createdRow: PageRow | undefined;
   try {
@@ -682,9 +730,11 @@ app.post("/api/pages", async (c) => {
     ]);
     createdRow = results[0]?.results[0];
   } catch (error) {
+    // A failed batch response may be ambiguous after commit. The generated id is
+    // known inside this invocation, so its receipt can still recover the result.
     const replay = await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage);
     if (replay) return c.json({ page: replay[0]! });
-    if (await requestedPageIdsExist(c.env.DB, requested)) {
+    if (clientProvidedId && (await requestedPageIdsExist(c.env.DB, requested))) {
       throw new HttpError(409, "idempotency_key_reused", conflictMessage);
     }
     throw error;
@@ -717,10 +767,9 @@ app.post("/api/pages/batch", async (c) => {
     throw new HttpError(422, "batch_too_large", `A batch is limited to ${PAGE_BATCH_MAX} pages.`);
   }
 
-  let allIdsClientProvided = true;
-  const parsed = requested.map((raw, index) => {
-    const entry = object(raw);
-    if (entry.id === undefined) allIdsClientProvided = false;
+  const entries = requested.map((raw) => object(raw));
+  const allIdsClientProvided = entries.every((entry) => entry.id !== undefined);
+  const parsed = entries.map((entry, index) => {
     const requestedId = entry.id === undefined ? crypto.randomUUID() : text(entry.id, `pages[${index}].id`, 100);
     if (!ID_PATTERN.test(requestedId)) {
       throw new HttpError(422, "invalid_input", `pages[${index}].id is not a valid resource id.`);
@@ -732,22 +781,21 @@ app.post("/api/pages/batch", async (c) => {
       title: typeof entry.title === "string" ? text(entry.title, `pages[${index}].title`, PAGE_TITLE_MAX) : "Untitled",
     };
   });
+  const clientProvidedPages = parsed.filter((_page, index) => entries[index]!.id !== undefined);
   if (new Set(parsed.map(({ id }) => id)).size !== parsed.length) {
     throw new HttpError(422, "invalid_input", "A page id may appear only once in a batch.");
   }
   const requestHash = await pageCreateRequestHash(parsed);
   const conflictMessage = "Those page ids already describe different pages.";
   const initialReplay = allIdsClientProvided
-    ? await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage)
+    ? await readInitialPageCreateReplay(c.env, member, parsed, requestHash, conflictMessage)
     : null;
   if (initialReplay) return c.json({ pages: initialReplay, replayed: true });
 
   // Every distinct parent is checked once, which also rejects a parent in another
   // workspace or an archived one exactly as the single-page route does.
+  await validatePageCreateParents(c.env, member, parsed);
   const parentIds = [...new Set(parsed.map((page) => page.parentId))];
-  for (const parentId of parentIds) {
-    if (parentId) await pageForMember(c.env, member, parentId);
-  }
 
   // Positions are generated per parent, continuing after that parent's last child, so
   // a batch appends in request order just like a sequence of single creates would.
@@ -805,11 +853,11 @@ app.post("/api/pages/batch", async (c) => {
     const results = await c.env.DB.batch<PageRow>(statements);
     createdRows = pageResultIndexes.map((index) => results[index]?.results[0]);
   } catch (error) {
-    // A concurrent identical retry may have committed between the existence check
-    // and this transaction. Re-read before classifying the unique conflict.
+    // A concurrent identical retry or an ambiguously committed batch can be
+    // recovered from receipts, including ids generated inside this invocation.
     const replay = await readPageCreateReplay(c.env.DB, member.workspace.id, parsed, requestHash, conflictMessage);
     if (replay) return c.json({ pages: replay, replayed: true });
-    if (await requestedPageIdsExist(c.env.DB, parsed)) {
+    if (clientProvidedPages.length && (await requestedPageIdsExist(c.env.DB, clientProvidedPages))) {
       throw new HttpError(409, "idempotency_key_reused", conflictMessage);
     }
     throw error;

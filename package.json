@@ -19,6 +19,7 @@
     "test:worker": "vitest run --config vitest.worker.config.ts",
     "test:worker:coverage": "vitest run --config vitest.worker.config.ts --coverage",
     "test:e2e": "playwright test --project=chromium",
+    "test:e2e:mobile-sidebar": "playwright test --project=mobile-chromium --grep @mobile-sidebar",
     "test:e2e:nightly": "playwright test",
     "test:watch": "vitest",
     "lint": "oxlint --deny-warnings --report-unused-disable-directives .",
