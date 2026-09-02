@@ -193,7 +193,8 @@ function observedExpectedMove(
   expectation: PageMutationExpectation,
   beforeId: string | null,
   afterId: string | null,
-  appendAfterId: string | null,
+  appendAfter: Pick<Page, "id" | "position"> | null,
+  previousLocation: Pick<Page, "parentId" | "position">,
 ) {
   const moved = observedExpectedPage(result, expectation);
   if (!moved) return false;
@@ -201,7 +202,7 @@ function observedExpectedMove(
   // With no pre-existing destination sibling, the requested parent plus revision
   // bump is all an append can change. Otherwise retain the old tail as an anchor:
   // later concurrent appends may follow the moved page without invalidating it.
-  if (isUnanchoredAppend && appendAfterId === null) return true;
+  if (isUnanchoredAppend && appendAfter === null) return true;
   const siblings = result.serverPages
     .filter(
       (candidate) =>
@@ -215,8 +216,12 @@ function observedExpectedMove(
   const movedIndex = siblings.findIndex((candidate) => candidate.id === expectation.id);
   if (movedIndex < 0) return false;
   if (isUnanchoredAppend) {
-    const appendAfterIndex = siblings.findIndex((candidate) => candidate.id === appendAfterId);
-    return appendAfterIndex >= 0 && movedIndex > appendAfterIndex;
+    if (!appendAfter) return true;
+    const appendAfterIndex = siblings.findIndex((candidate) => candidate.id === appendAfter.id);
+    return appendAfterIndex >= 0
+      ? movedIndex > appendAfterIndex
+      : previousLocation.parentId !== expectation.parentId ||
+          (moved.position !== previousLocation.position && compareBinaryText(moved.position, appendAfter.position) > 0);
   }
   const beforeIndex = beforeId === null ? -1 : siblings.findIndex((candidate) => candidate.id === beforeId);
   const afterIndex = afterId === null ? -1 : siblings.findIndex((candidate) => candidate.id === afterId);
@@ -1597,7 +1602,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       kind: movingPage.kind,
       minimumRevision: movingPage.revision + 1,
     };
-    const appendAfterId =
+    const appendAfter =
       beforeId === null && afterId === null
         ? (pages
             .filter(
@@ -1607,7 +1612,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             .toSorted(
               (left, right) => compareBinaryText(left.position, right.position) || compareBinaryText(left.id, right.id),
             )
-            .at(-1)?.id ?? null)
+            .at(-1) ?? null)
         : null;
     try {
       const result = await requestMutation(
@@ -1648,7 +1653,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       await reconcilePageMutation(
         attempt,
         signal,
-        (observation) => observedExpectedMove(observation, expectation, beforeId, afterId, appendAfterId),
+        (observation) => observedExpectedMove(observation, expectation, beforeId, afterId, appendAfter, movingPage),
         "The page-movement result could not be verified",
       );
     } catch (error) {
@@ -1669,7 +1674,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         await reconcilePageMutation(
           attempt,
           signal,
-          (observation) => observedExpectedMove(observation, expectation, beforeId, afterId, appendAfterId),
+          (observation) => observedExpectedMove(observation, expectation, beforeId, afterId, appendAfter, movingPage),
           outcome === "committed"
             ? "The page was moved, but the workspace could not be updated"
             : "The page may have been moved, but the workspace could not be updated",
@@ -2090,9 +2095,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <EmptyWorkspace canEdit={member.role !== "viewer"} onCreate={() => void createPage("document", null)} />
         )}
       </section>
-      {sidebarOpen && (
-        <button className="sidebar-scrim" aria-hidden="true" tabIndex={-1} onClick={() => closeSidebar(true)} />
-      )}
+      {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
     </div>
   );
 }
