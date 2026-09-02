@@ -1,6 +1,5 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { YServer } from "y-partyserver";
-import { jitteredBackoff } from "../shared/retry";
 import type { WorkspaceEvent } from "../shared/types";
 import { ID_PATTERN, isPage, pageWithoutUnknownFields } from "../shared/validation";
 import type { Env } from "./env";
@@ -12,18 +11,6 @@ export interface EventConnectionAuth {
 }
 
 const WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT = 128;
-const WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS = 5;
-const WORKSPACE_EVENT_DELIVERY_RETRY_BASE_MS = 250;
-const WORKSPACE_EVENT_DELIVERY_RETRY_MAX_MS = 2_000;
-
-function waitForWorkspaceEventDeliveryRetry(attempt: number) {
-  return new Promise<void>((resolve) => {
-    setTimeout(
-      resolve,
-      jitteredBackoff(attempt, WORKSPACE_EVENT_DELIVERY_RETRY_BASE_MS, WORKSPACE_EVENT_DELIVERY_RETRY_MAX_MS),
-    );
-  });
-}
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -46,12 +33,15 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
     (event.restoredRootId === undefined ||
       (event.restored === true && typeof event.restoredRootId === "string" && ID_PATTERN.test(event.restoredRootId)))
   ) {
-    return {
-      type: "pages-upserted",
-      pages: event.pages.map(pageWithoutUnknownFields),
-      ...(event.restored === undefined ? {} : { restored: event.restored }),
-      ...(event.restoredRootId === undefined ? {} : { restoredRootId: event.restoredRootId }),
-    };
+    const pages = event.pages.map(pageWithoutUnknownFields);
+    return event.restored === true
+      ? {
+          type: "pages-upserted",
+          pages,
+          restored: true,
+          ...(event.restoredRootId === undefined ? {} : { restoredRootId: event.restoredRootId }),
+        }
+      : { type: "pages-upserted", pages, ...(event.restored === false ? { restored: false } : {}) };
   }
   if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
     const operationId =
@@ -96,10 +86,12 @@ export async function eventForCurrentWorkspaceState(
       .bind(workspaceId, JSON.stringify(candidates.map((page) => page.id)))
       .all<{ id: string; revision: number }>();
     const activeRevisions = new Map(active.results.map((page) => [page.id, page.revision]));
-    const stateChanged = candidates.some((page) => activeRevisions.get(page.id) !== page.revision);
+    const stateChanged = candidates.some((page) => {
+      const activeRevision = activeRevisions.get(page.id);
+      return activeRevision === undefined || activeRevision < page.revision;
+    });
     if (stateChanged) return { type: "workspace-invalidated" };
-    const pages = candidates.filter((page) => activeRevisions.has(page.id));
-    return pages.length ? { ...event, pages } : null;
+    return { ...event, pages: candidates };
   }
   if (event.type === "pages-removed") {
     const statePredicate = event.permanently ? "1 = 1" : "archived_at IS NOT NULL";
@@ -233,32 +225,15 @@ export class WorkspaceEvents extends YServer {
 }
 
 export async function broadcastWorkspaceEvent(env: Env, workspaceId: string, event: WorkspaceEvent) {
-  const body = JSON.stringify(event);
-  for (let attempt = 0; attempt < WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS; attempt += 1) {
-    // A thrown call has an unknown delivery outcome and breaks its stub. These
-    // events are not universally idempotent, so only retry the DO's explicit
-    // pre-enqueue busy response, using a fresh stub for that attempt.
-    const stub = env.WORKSPACE_EVENTS.getByName(workspaceId);
-    const response = await stub.fetch(
-      new Request("https://workspace-events.internal/broadcast", {
-        method: "POST",
-        headers: {
-          "x-notes-internal": env.BETTER_AUTH_SECRET,
-        },
-        body,
-      }),
-    );
-    if (response.ok) return;
-    const retryable =
-      response.status === 503 &&
-      (await response
-        .clone()
-        .json<{ error?: unknown }>()
-        .then((value) => value.error === "Workspace event delivery is busy.")
-        .catch(() => false));
-    if (!retryable || attempt === WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS - 1) {
-      throw new Error(`Workspace event delivery failed with ${response.status}`);
-    }
-    await waitForWorkspaceEventDeliveryRetry(attempt);
-  }
+  const stub = env.WORKSPACE_EVENTS.getByName(workspaceId);
+  const response = await stub.fetch(
+    new Request("https://workspace-events.internal/broadcast", {
+      method: "POST",
+      headers: {
+        "x-notes-internal": env.BETTER_AUTH_SECRET,
+      },
+      body: JSON.stringify(event),
+    }),
+  );
+  if (!response.ok) throw new Error(`Workspace event delivery failed with ${response.status}`);
 }

@@ -845,46 +845,6 @@ describe("Worker integration", () => {
     });
   });
 
-  it("retries lifecycle broadcasts rejected by a busy delivery queue", async () => {
-    const workspaceId = crypto.randomUUID();
-    const event: WorkspaceEvent = { type: "pages-removed", pageIds: [crypto.randomUUID()], permanently: false };
-    const delivered: WorkspaceEvent[] = [];
-    let attempts = 0;
-    let stubs = 0;
-    const workspaceEvents = {
-      getByName(requestedWorkspaceId: string) {
-        expect(requestedWorkspaceId).toBe(workspaceId);
-        stubs += 1;
-        return {
-          async fetch(request: Request) {
-            attempts += 1;
-            expect(request.headers.get("x-notes-internal")).toBe(env.BETTER_AUTH_SECRET);
-            delivered.push((await request.json()) as WorkspaceEvent);
-            return attempts < 3
-              ? Response.json({ error: "Workspace event delivery is busy." }, { status: 503 })
-              : Response.json({ delivered: true });
-          },
-        };
-      },
-    } as unknown as Env["WORKSPACE_EVENTS"];
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
-        return Reflect.get(target, property, receiver);
-      },
-    });
-    const random = vi.spyOn(Math, "random").mockReturnValue(0);
-    try {
-      await broadcastWorkspaceEvent(bindings, workspaceId, event);
-    } finally {
-      random.mockRestore();
-    }
-
-    expect(attempts).toBe(3);
-    expect(stubs).toBe(3);
-    expect(delivered).toEqual([event, event, event]);
-  });
-
   it("does not retry an ambiguous thrown workspace-event delivery", async () => {
     const workspaceId = crypto.randomUUID();
     const overloaded = Object.assign(new Error("Durable Object is overloaded."), {
@@ -1002,6 +962,11 @@ describe("Worker integration", () => {
           { delivered: false },
           { delivered: true },
         ]);
+        const premature = await request({
+          type: "pages-upserted",
+          pages: [{ ...activePage, revision: activePage.revision + 1 }],
+        });
+        expect(await premature.json()).toEqual({ delivered: true });
         await env.DB.prepare("UPDATE pages SET revision = revision + 1 WHERE id = ?").bind(installed.pageId).run();
         const superseded = await request({
           type: "pages-upserted",
@@ -1015,6 +980,12 @@ describe("Worker integration", () => {
           { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
           { type: "pages-upserted", pages: [activePage] },
           { type: "workspace-invalidated" },
+          {
+            type: "pages-upserted",
+            pages: [activePage, activeChild],
+            restored: true,
+            restoredRootId: activePage.id,
+          },
         ]);
       } finally {
         broadcast.mockRestore();

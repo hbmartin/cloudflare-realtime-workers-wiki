@@ -71,7 +71,8 @@ export type MentionInboxItem = {
 };
 
 export type WorkspaceEvent =
-  | { type: "pages-upserted"; pages: Page[]; restored?: boolean; restoredRootId?: string }
+  | { type: "pages-upserted"; pages: Page[]; restored: true; restoredRootId?: string }
+  | { type: "pages-upserted"; pages: Page[]; restored?: false; restoredRootId?: never }
   | { type: "pages-removed"; pageIds: string[]; permanently: boolean; operationId?: string }
   | { type: "workspace-invalidated" }
   | {

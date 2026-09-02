@@ -24,7 +24,7 @@ import {
   PageLoadEventBuffer,
   PageRemovalTombstones,
 } from "./page-state";
-import { observeUntilAborted, waitForReconciliationRetry } from "./retry";
+import { observeUntilAborted, reconciliationRetryDelay, waitForReconciliationRetry } from "./retry";
 import { LoadingSplash } from "./Splash";
 import { TablePage } from "./TablePage";
 
@@ -201,9 +201,10 @@ function observedExpectedMove(result: PageLoadResult, expectation: PageMutationE
     .sort((left, right) => compareBinaryText(left.position, right.position) || compareBinaryText(left.id, right.id));
   const movedIndex = siblings.findIndex((page) => page.id === moved.id);
   const { beforeId, afterId } = expectation.movePlacement;
+  const siblingIds = new Set(siblings.map((page) => page.id));
   if (movedIndex < 0) return null;
-  if (beforeId !== null && siblings[movedIndex + 1]?.id !== beforeId) return null;
-  if (afterId !== null && siblings[movedIndex - 1]?.id !== afterId) return null;
+  if (beforeId !== null && siblingIds.has(beforeId) && siblings[movedIndex + 1]?.id !== beforeId) return null;
+  if (afterId !== null && siblingIds.has(afterId) && siblings[movedIndex - 1]?.id !== afterId) return null;
   if (beforeId === null && afterId === null && movedIndex !== siblings.length - 1) return null;
   return moved;
 }
@@ -697,6 +698,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [view, setView] = useState<"pages" | "search" | "mentions" | "trash" | "settings">("pages");
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
   const [unreadMentions, setUnreadMentions] = useState(0);
@@ -733,6 +736,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const trashTreeRefreshPromise = useRef<Promise<void> | null>(null);
   const workspaceInvalidationRefreshOwed = useRef(false);
   const workspaceInvalidationRefreshPromise = useRef<Promise<void> | null>(null);
+  const workspaceInvalidationRefreshRetryTimer = useRef<number | null>(null);
   const activePageTreeRetryRef = useRef<{
     target: PageTreeRetryTarget;
     errorAttempt: WorkspaceErrorAttempt;
@@ -756,6 +760,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       activeTrashLoad.controller.abort();
     }
     activePageTreeRetryRef.current?.controller.abort();
+    if (workspaceInvalidationRefreshRetryTimer.current !== null) {
+      window.clearTimeout(workspaceInvalidationRefreshRetryTimer.current);
+      workspaceInvalidationRefreshRetryTimer.current = null;
+    }
   }, []);
   useEffect(() => {
     if (workspaceAbortController.current.signal.aborted) {
@@ -984,41 +992,75 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [loadPages],
   );
-  const refreshInvalidatedWorkspace = useCallback(() => {
-    workspaceInvalidationRefreshOwed.current = true;
-    const pending = workspaceInvalidationRefreshPromise.current;
-    if (pending) return pending;
+  const refreshInvalidatedWorkspace = useCallback(
+    function refreshInvalidatedWorkspace() {
+      workspaceInvalidationRefreshOwed.current = true;
+      if (workspaceInvalidationRefreshRetryTimer.current !== null) {
+        window.clearTimeout(workspaceInvalidationRefreshRetryTimer.current);
+        workspaceInvalidationRefreshRetryTimer.current = null;
+      }
+      const pending = workspaceInvalidationRefreshPromise.current;
+      if (pending) return pending;
 
-    const signal = workspaceAbortController.current.signal;
-    const observe = async () => {
-      try {
-        return await loadFreshPages(signal);
-      } catch (error) {
-        if (!signal.aborted) {
-          reportWorkspaceError(
-            { source: "page-tree" },
-            apiErrorMessage(error, "The invalidated workspace could not be refreshed."),
-          );
+      const signal = workspaceAbortController.current.signal;
+      const observe = async () => {
+        try {
+          await loadFreshPages(signal);
+          return true;
+        } catch (error) {
+          if (!signal.aborted) {
+            reportWorkspaceError(
+              { source: "page-tree" },
+              apiErrorMessage(error, "The invalidated workspace could not be refreshed."),
+            );
+          }
+          return false;
         }
-        return null;
-      }
-    };
-    let refresh!: Promise<void>;
-    refresh = (async () => {
-      while (workspaceInvalidationRefreshOwed.current && !signal.aborted) {
-        workspaceInvalidationRefreshOwed.current = false;
-        // Two post-invalidation observations also release archive tombstones
-        // when the dropped lifecycle event was a restore.
-        await reconcileWithOneRetry(observe, () => true, signal);
-      }
-    })().finally(() => {
-      if (workspaceInvalidationRefreshPromise.current === refresh) {
-        workspaceInvalidationRefreshPromise.current = null;
-      }
-    });
-    workspaceInvalidationRefreshPromise.current = refresh;
-    return refresh;
-  }, [loadFreshPages, reportWorkspaceError]);
+      };
+      let retryNeeded = false;
+      let refresh!: Promise<void>;
+      refresh = (async () => {
+        while (workspaceInvalidationRefreshOwed.current && !signal.aborted) {
+          workspaceInvalidationRefreshOwed.current = false;
+          // Two post-invalidation observations also release archive tombstones
+          // when the dropped lifecycle event was a restore.
+          let successfulObservations = 0;
+          await reconcileWithOneRetry(
+            async () => {
+              const succeeded = await observe();
+              if (succeeded) successfulObservations += 1;
+              return succeeded;
+            },
+            () => true,
+            signal,
+          );
+          if (successfulObservations < 2 && !signal.aborted) {
+            workspaceInvalidationRefreshOwed.current = true;
+            retryNeeded = true;
+            break;
+          }
+        }
+      })().finally(() => {
+        if (workspaceInvalidationRefreshPromise.current === refresh) {
+          workspaceInvalidationRefreshPromise.current = null;
+        }
+        if (
+          retryNeeded &&
+          workspaceInvalidationRefreshOwed.current &&
+          !signal.aborted &&
+          workspaceInvalidationRefreshRetryTimer.current === null
+        ) {
+          workspaceInvalidationRefreshRetryTimer.current = window.setTimeout(() => {
+            workspaceInvalidationRefreshRetryTimer.current = null;
+            void refreshInvalidatedWorkspace();
+          }, reconciliationRetryDelay());
+        }
+      });
+      workspaceInvalidationRefreshPromise.current = refresh;
+      return refresh;
+    },
+    [loadFreshPages, reportWorkspaceError],
+  );
   const ensureTrashTreeRefresh = useCallback(() => {
     const pending = trashTreeRefreshPromise.current;
     if (pending) return pending;
@@ -1276,6 +1318,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
       if (event.type === "workspace-invalidated") {
+        if (viewRef.current === "trash") refreshTrash();
         void refreshInvalidatedWorkspace();
         return;
       }
