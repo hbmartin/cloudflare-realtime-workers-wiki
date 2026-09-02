@@ -215,13 +215,11 @@ function observedExpectedMove(
     );
   const movedIndex = siblings.findIndex((candidate) => candidate.id === expectation.id);
   if (movedIndex < 0) return false;
-  if (isUnanchoredAppend) {
-    if (!appendAfter) return true;
+  if (isUnanchoredAppend && appendAfter !== null) {
     const appendAfterIndex = siblings.findIndex((candidate) => candidate.id === appendAfter.id);
     return appendAfterIndex >= 0
       ? movedIndex > appendAfterIndex
-      : previousLocation.parentId !== expectation.parentId ||
-          (moved.position !== previousLocation.position && compareBinaryText(moved.position, appendAfter.position) > 0);
+      : previousLocation.parentId !== expectation.parentId || moved.position !== previousLocation.position;
   }
   const beforeIndex = beforeId === null ? -1 : siblings.findIndex((candidate) => candidate.id === beforeId);
   const afterIndex = afterId === null ? -1 : siblings.findIndex((candidate) => candidate.id === afterId);

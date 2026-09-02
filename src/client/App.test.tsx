@@ -1105,9 +1105,10 @@ describe("App error handling", () => {
     );
   });
 
-  it("accepts a reconciled append after its captured sibling anchor is removed", async () => {
-    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
-    const movedPage = { ...page, position: "c0", revision: 2 };
+  it("accepts a reconciled same-parent append after its stale tail anchor leaves the parent", async () => {
+    const secondPage = { ...page, id: "second-page", position: "z0", title: "Second" };
+    const movedPage = { ...page, position: "b0", revision: 2 };
+    const departedAnchor = { ...secondPage, parentId: "another-parent" };
     const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => reported.mockRestore());
     let treeLoads = 0;
@@ -1117,7 +1118,7 @@ describe("App error handling", () => {
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return { pages: treeLoads === 1 ? [page, secondPage] : [movedPage] };
+        return { pages: treeLoads === 1 ? [page, secondPage] : [movedPage, departedAnchor] };
       }
       if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
       throw new Error(`Unexpected API request: ${path}`);
