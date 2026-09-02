@@ -281,6 +281,45 @@ function envArchivingPageBeforeNextBatch(bindings: Env, pageId: string) {
   };
 }
 
+function envRejectingNextBatchAfterCommit(
+  bindings: Env,
+  delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
+) {
+  let intercepted = false;
+  const database = new Proxy(bindings.DB, {
+    get(target, property) {
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          const results = await target.batch(statements);
+          if (!intercepted) {
+            intercepted = true;
+            throw new Error("D1 response lost after commit");
+          }
+          return results;
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const eventBindings = new Proxy(bindings, {
+    get(target, property, receiver) {
+      if (property === "DB") return database;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const workspaceEvents = capturedWorkspaceEvents(eventBindings, delivered);
+  return {
+    bindings: new Proxy(eventBindings, {
+      get(target, property, receiver) {
+        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
+        return Reflect.get(target, property, receiver);
+      },
+    }),
+    moveBatchWasIntercepted: () => intercepted,
+  };
+}
+
 const MIB = 1024 * 1024;
 
 async function initUpload(cookie: string, pageId: string, body: Record<string, unknown>) {
@@ -769,6 +808,7 @@ describe("Worker integration", () => {
               type: "pages-upserted",
               pages: [eventPage],
               restored: true,
+              restoredRootId: installed.pageId,
               internalTrace: "trace",
             })
           ).status,
@@ -790,6 +830,7 @@ describe("Worker integration", () => {
             type: "pages-upserted",
             pages: [expectedPage],
             restored: true,
+            restoredRootId: installed.pageId,
           },
           {
             type: "projection-updated",
@@ -809,9 +850,11 @@ describe("Worker integration", () => {
     const event: WorkspaceEvent = { type: "pages-removed", pageIds: [crypto.randomUUID()], permanently: false };
     const delivered: WorkspaceEvent[] = [];
     let attempts = 0;
+    let stubs = 0;
     const workspaceEvents = {
       getByName(requestedWorkspaceId: string) {
         expect(requestedWorkspaceId).toBe(workspaceId);
+        stubs += 1;
         return {
           async fetch(request: Request) {
             attempts += 1;
@@ -838,15 +881,87 @@ describe("Worker integration", () => {
     }
 
     expect(attempts).toBe(3);
+    expect(stubs).toBe(3);
     expect(delivered).toEqual([event, event, event]);
   });
 
-  it("filters serialized page lifecycle events against the current workspace state", async () => {
+  it("does not retry an ambiguous thrown workspace-event delivery", async () => {
+    const workspaceId = crypto.randomUUID();
+    const overloaded = Object.assign(new Error("Durable Object is overloaded."), {
+      overloaded: true,
+      retryable: true,
+    });
+    let stubs = 0;
+    const workspaceEvents = {
+      getByName() {
+        stubs += 1;
+        return { fetch: async () => Promise.reject(overloaded) };
+      },
+    } as unknown as Env["WORKSPACE_EVENTS"];
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    await expect(
+      broadcastWorkspaceEvent(bindings, workspaceId, {
+        type: "pages-removed",
+        pageIds: [crypto.randomUUID()],
+        permanently: false,
+      }),
+    ).rejects.toBe(overloaded);
+    expect(stubs).toBe(1);
+  });
+
+  it("collapses an overflowing lifecycle queue into one workspace invalidation", async () => {
     const installed = await bootstrap();
     const stub = env.WORKSPACE_EVENTS.getByName(installed.workspaceId);
     const activePage = (
       await (await SELF.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree"))).json<{ pages: Page[] }>()
     ).pages[0]!;
+
+    await runInDurableObject(stub, async (instance) => {
+      const delivered: WorkspaceEvent[] = [];
+      const workspaceEvents = instance as WorkspaceEvents;
+      const broadcast = vi
+        .spyOn(workspaceEvents, "broadcastCustomMessage")
+        .mockImplementation((message) => void delivered.push(JSON.parse(message) as WorkspaceEvent));
+      const request = () =>
+        workspaceEvents.onRequest(
+          new Request("https://workspace-events.internal/broadcast", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+            body: JSON.stringify({ type: "pages-upserted", pages: [activePage] }),
+          }),
+        );
+
+      try {
+        const queue = workspaceEvents as unknown as { queuedDeliveries: number };
+        queue.queuedDeliveries = 128;
+        const overflow = await request();
+        expect(overflow.status).toBe(202);
+        expect(await overflow.json()).toEqual({ delivered: false, resyncScheduled: true });
+
+        queue.queuedDeliveries = 0;
+        expect((await request()).status).toBe(200);
+        expect(delivered).toEqual([{ type: "pages-upserted", pages: [activePage] }, { type: "workspace-invalidated" }]);
+      } finally {
+        broadcast.mockRestore();
+      }
+    });
+  });
+
+  it("filters serialized page lifecycle events against the current workspace state", async () => {
+    const installed = await bootstrap();
+    await createPage(installed.cookie, "document", installed.pageId);
+    const stub = env.WORKSPACE_EVENTS.getByName(installed.workspaceId);
+    const activePages = (
+      await (await SELF.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree"))).json<{ pages: Page[] }>()
+    ).pages;
+    const activePage = activePages.find((page) => page.id === installed.pageId)!;
+    const activeChild = activePages.find((page) => page.parentId === installed.pageId)!;
 
     await runInDurableObject(stub, async (instance) => {
       const delivered: WorkspaceEvent[] = [];
@@ -874,7 +989,7 @@ describe("Worker integration", () => {
           request({ type: "pages-removed", pageIds: [installed.pageId], permanently: false }),
         ]);
         expect(await Promise.all(archivedResponses.map((response) => response.json()))).toEqual([
-          { delivered: false },
+          { delivered: true },
           { delivered: true },
         ]);
 
@@ -888,11 +1003,18 @@ describe("Worker integration", () => {
           { delivered: true },
         ]);
         await env.DB.prepare("UPDATE pages SET revision = revision + 1 WHERE id = ?").bind(installed.pageId).run();
-        const superseded = await request({ type: "pages-upserted", pages: [activePage] });
-        expect(await superseded.json()).toEqual({ delivered: false });
+        const superseded = await request({
+          type: "pages-upserted",
+          pages: [activePage, activeChild],
+          restored: true,
+          restoredRootId: activePage.id,
+        });
+        expect(await superseded.json()).toEqual({ delivered: true });
         expect(delivered).toEqual([
+          { type: "workspace-invalidated" },
           { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
           { type: "pages-upserted", pages: [activePage] },
+          { type: "workspace-invalidated" },
         ]);
       } finally {
         broadcast.mockRestore();
@@ -3479,6 +3601,35 @@ describe("Worker integration", () => {
     ).toEqual({ count: 0 });
   });
 
+  it("broadcasts a move recovered after the batch commits but its response is lost", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const intercepted = envRejectingNextBatchAfterCommit(env, delivered);
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    const body = await response.json<{ page: Page; replayed: boolean }>();
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.moveBatchWasIntercepted()).toBe(true);
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "pages-upserted", pages: [body.page] },
+      },
+    ]);
+  });
+
   it("rejects malformed or mismatched stored page move snapshots", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
@@ -3498,6 +3649,7 @@ describe("Worker integration", () => {
       return SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`));
     };
 
+    expect((await receipt(movedPage)).status).toBe(200);
     expect((await receipt({ id: 123 })).status).toBe(500);
     expect((await receipt({ ...movedPage, id: crypto.randomUUID() })).status).toBe(500);
     expect((await receipt({ ...movedPage, workspaceId: crypto.randomUUID() })).status).toBe(500);
@@ -3873,7 +4025,12 @@ describe("Worker integration", () => {
     expect(intercepted.pageCreateBatchWasIntercepted()).toBe(true);
     expect(response.status).toBe(201);
     expect(body.page.archivedAt).toBeNull();
-    expect(delivered).toEqual([]);
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "workspace-invalidated" },
+      },
+    ]);
   });
 
   it("removes an archived page from a stale batch-create upsert", async () => {
@@ -3913,7 +4070,7 @@ describe("Worker integration", () => {
     expect(delivered).toEqual([
       {
         workspaceId: installed.workspaceId,
-        event: { type: "pages-upserted", pages: [body.pages[1]!] },
+        event: { type: "workspace-invalidated" },
       },
     ]);
   });

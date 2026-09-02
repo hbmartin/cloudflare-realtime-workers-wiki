@@ -12,7 +12,7 @@ export interface EventConnectionAuth {
 }
 
 const WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT = 128;
-const WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS = 4;
+const WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS = 5;
 const WORKSPACE_EVENT_DELIVERY_RETRY_BASE_MS = 250;
 const WORKSPACE_EVENT_DELIVERY_RETRY_MAX_MS = 2_000;
 
@@ -42,12 +42,15 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
     event.type === "pages-upserted" &&
     Array.isArray(event.pages) &&
     event.pages.every(isPage) &&
-    (event.restored === undefined || typeof event.restored === "boolean")
+    (event.restored === undefined || typeof event.restored === "boolean") &&
+    (event.restoredRootId === undefined ||
+      (event.restored === true && typeof event.restoredRootId === "string" && ID_PATTERN.test(event.restoredRootId)))
   ) {
     return {
       type: "pages-upserted",
       pages: event.pages.map(pageWithoutUnknownFields),
       ...(event.restored === undefined ? {} : { restored: event.restored }),
+      ...(event.restoredRootId === undefined ? {} : { restoredRootId: event.restoredRootId }),
     };
   }
   if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
@@ -73,6 +76,7 @@ function workspaceEvent(value: unknown): WorkspaceEvent | null {
       mentionTargetUserIds: [...event.mentionTargetUserIds],
     };
   }
+  if (event.type === "workspace-invalidated") return { type: "workspace-invalidated" };
   return null;
 }
 
@@ -92,7 +96,9 @@ export async function eventForCurrentWorkspaceState(
       .bind(workspaceId, JSON.stringify(candidates.map((page) => page.id)))
       .all<{ id: string; revision: number }>();
     const activeRevisions = new Map(active.results.map((page) => [page.id, page.revision]));
-    const pages = candidates.filter((page) => activeRevisions.get(page.id) === page.revision);
+    const stateChanged = candidates.some((page) => activeRevisions.get(page.id) !== page.revision);
+    if (stateChanged) return { type: "workspace-invalidated" };
+    const pages = candidates.filter((page) => activeRevisions.has(page.id));
     return pages.length ? { ...event, pages } : null;
   }
   if (event.type === "pages-removed") {
@@ -120,6 +126,7 @@ export class WorkspaceEvents extends YServer {
   private readonly bindings: Env;
   private deliveryQueue = Promise.resolve();
   private queuedDeliveries = 0;
+  private resyncRequired = false;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -185,12 +192,16 @@ export class WorkspaceEvents extends YServer {
 
     // Projection notifications do not depend on page lifecycle ordering and do
     // not read D1, so a slow lifecycle check must not hold them behind it.
-    if (event.type === "projection-updated") {
+    if (event.type === "projection-updated" || event.type === "workspace-invalidated") {
       this.broadcastCustomMessage(JSON.stringify(event));
       return Response.json({ delivered: true });
     }
     if (this.queuedDeliveries >= WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT) {
-      return Response.json({ error: "Workspace event delivery is busy." }, { status: 503 });
+      // The mutation is already committed, so rejecting this request would leave
+      // connected clients stale indefinitely. Collapse all overflow into one
+      // authoritative refresh after the accepted queue drains.
+      this.resyncRequired = true;
+      return Response.json({ delivered: false, resyncScheduled: true }, { status: 202 });
     }
     this.queuedDeliveries += 1;
     const delivery = this.deliveryQueue.then(() => this.deliver(workspaceId, event));
@@ -202,6 +213,10 @@ export class WorkspaceEvents extends YServer {
       return await delivery;
     } finally {
       this.queuedDeliveries -= 1;
+      if (this.queuedDeliveries === 0 && this.resyncRequired) {
+        this.resyncRequired = false;
+        this.broadcastCustomMessage(JSON.stringify({ type: "workspace-invalidated" } satisfies WorkspaceEvent));
+      }
     }
   }
 
@@ -218,27 +233,29 @@ export class WorkspaceEvents extends YServer {
 }
 
 export async function broadcastWorkspaceEvent(env: Env, workspaceId: string, event: WorkspaceEvent) {
-  const stub = env.WORKSPACE_EVENTS.getByName(workspaceId);
   const body = JSON.stringify(event);
   for (let attempt = 0; attempt < WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS; attempt += 1) {
-    let response: Response;
-    try {
-      response = await stub.fetch(
-        new Request("https://workspace-events.internal/broadcast", {
-          method: "POST",
-          headers: {
-            "x-notes-internal": env.BETTER_AUTH_SECRET,
-          },
-          body,
-        }),
-      );
-    } catch (error) {
-      if (attempt === WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS - 1) throw error;
-      await waitForWorkspaceEventDeliveryRetry(attempt);
-      continue;
-    }
+    // A thrown call has an unknown delivery outcome and breaks its stub. These
+    // events are not universally idempotent, so only retry the DO's explicit
+    // pre-enqueue busy response, using a fresh stub for that attempt.
+    const stub = env.WORKSPACE_EVENTS.getByName(workspaceId);
+    const response = await stub.fetch(
+      new Request("https://workspace-events.internal/broadcast", {
+        method: "POST",
+        headers: {
+          "x-notes-internal": env.BETTER_AUTH_SECRET,
+        },
+        body,
+      }),
+    );
     if (response.ok) return;
-    const retryable = response.status === 429 || response.status >= 500;
+    const retryable =
+      response.status === 503 &&
+      (await response
+        .clone()
+        .json<{ error?: unknown }>()
+        .then((value) => value.error === "Workspace event delivery is busy.")
+        .catch(() => false));
     if (!retryable || attempt === WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS - 1) {
       throw new Error(`Workspace event delivery failed with ${response.status}`);
     }
