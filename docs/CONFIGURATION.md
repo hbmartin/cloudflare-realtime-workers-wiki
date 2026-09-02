@@ -109,6 +109,8 @@ configurable at runtime.
 | Sorted table depth (`TABLE_SORT_MAX_OFFSET`)            | 5000 rows reachable by offset when sorting                               | `src/shared/table-limits.ts`                    |
 | Bulk write caps                                         | 50 columns, 200 rows, 2000 cells, 1 MiB body per request                 | `src/shared/table-limits.ts`                    |
 | Bulk receipt retention                                  | Durable until the table/page cascade removes it                          | `table_bulk_writes`                             |
+| Page-create receipt retention                           | Durable until the page/workspace cascade removes it                      | `page_create_receipts`                          |
+| Page-move receipt retention                             | Durable until the page/workspace cascade removes it                      | `page_move_receipts`                            |
 | `DELETION_TARGET_BATCH_SIZE`                            | 50                                                                       | `src/worker/index.ts`                           |
 | `CLEANUP_LEASE_MS`                                      | 15 min                                                                   | `src/worker/cleanup.ts`                         |
 | `DOCUMENT_PURGE_TIMEOUT_MS`                             | 30 s                                                                     | `src/worker/cleanup.ts`                         |

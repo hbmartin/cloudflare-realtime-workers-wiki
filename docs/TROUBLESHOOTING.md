@@ -60,6 +60,8 @@ as a bare `500 internal_error` with no detail, so an unfamiliar 500 means checki
 | --------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `stale_epoch`               | 409    | The client asked for a document epoch that is no longer current, typically mid-restore. The client refetches and follows the new epoch                    |
 | `page_cycle`                | 409    | A move would make a page its own ancestor                                                                                                                 |
+| `idempotency_key_reused`    | 409    | A page-create or page-move operation id was reused with different request content. Generate a new operation id                                            |
+| `move_not_found`            | 404    | No committed move receipt exists for that workspace, page, and operation id                                                                               |
 | `archive_first`             | 409    | Permanent deletion attempted on a page that is not archived                                                                                               |
 | `page_archived`             | 409    | An identical page-create request was replayed after one of its receipt-backed pages was archived; restore it, permanently delete it, or use a new page ID |
 | `upload_too_large`          | 413    | Over 10 MiB on the single-shot form route, or over 10 GiB on a multipart upload                                                                           |

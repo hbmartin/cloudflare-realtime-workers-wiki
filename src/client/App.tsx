@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { ClientMemberContext } from "../shared/types";
-import { buildTree, compareBinaryText } from "../shared/tree-model";
+import { buildTree } from "../shared/tree-model";
 import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent } from "../shared/types";
 import { isPage } from "../shared/validation";
 import {
@@ -188,44 +188,16 @@ function observedExpectedPage(result: PageLoadResult, expectation: PageMutationE
   return page && matchesPageMutationExpectation(page, expectation) ? page : null;
 }
 
-function observedExpectedMove(
-  result: PageLoadResult,
-  expectation: PageMutationExpectation,
-  beforeId: string | null,
-  afterId: string | null,
-  appendAfter: Pick<Page, "id" | "position"> | null,
-  previousLocation: Pick<Page, "parentId" | "position">,
-) {
-  const moved = observedExpectedPage(result, expectation);
-  if (!moved) return false;
-  const isUnanchoredAppend = beforeId === null && afterId === null;
-  // With no pre-existing destination sibling, the requested parent plus revision
-  // bump is all an append can change. Otherwise retain the old tail as an anchor:
-  // later concurrent appends may follow the moved page without invalidating it.
-  if (isUnanchoredAppend && appendAfter === null) return true;
-  const siblings = result.serverPages
-    .filter(
-      (candidate) =>
-        candidate.archivedAt === null &&
-        candidate.parentId === expectation.parentId &&
-        !result.removedDuringLoad.has(candidate.id),
-    )
-    .toSorted(
-      (left, right) => compareBinaryText(left.position, right.position) || compareBinaryText(left.id, right.id),
-    );
-  const movedIndex = siblings.findIndex((candidate) => candidate.id === expectation.id);
-  if (movedIndex < 0) return false;
-  if (isUnanchoredAppend && appendAfter !== null) {
-    const appendAfterIndex = siblings.findIndex((candidate) => candidate.id === appendAfter.id);
-    return appendAfterIndex >= 0
-      ? movedIndex > appendAfterIndex
-      : previousLocation.parentId !== expectation.parentId || moved.position !== previousLocation.position;
+function pageMoveReceiptResponse(value: unknown, expectation: PageMutationExpectation, operationId: string) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !("operationId" in value) ||
+    (value as { operationId?: unknown }).operationId !== operationId
+  ) {
+    return null;
   }
-  const beforeIndex = beforeId === null ? -1 : siblings.findIndex((candidate) => candidate.id === beforeId);
-  const afterIndex = afterId === null ? -1 : siblings.findIndex((candidate) => candidate.id === afterId);
-  if (beforeId !== null && (beforeIndex < 0 || movedIndex >= beforeIndex)) return false;
-  if (afterId !== null && (afterIndex < 0 || movedIndex <= afterIndex)) return false;
-  return true;
+  return pageMutationResponse(value, expectation);
 }
 
 type MutationRequestResult<T> =
@@ -1385,6 +1357,48 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     return null;
   }
 
+  function mergePageMutationResult(page: Page) {
+    if (archiveRemovalTombstones.has(page.id)) return false;
+    recordPageUpserts([page]);
+    dispatchPageAction({ type: "merge", pages: [page] });
+    return true;
+  }
+
+  async function reconcileMoveMutation(
+    attempt: WorkspaceErrorAttempt,
+    signal: AbortSignal,
+    pageId: string,
+    operationId: string,
+    expectation: PageMutationExpectation,
+    unresolvedMessage: string,
+  ) {
+    const receipt = await reconcileWithOneRetry(
+      async () => {
+        try {
+          const value = await api<unknown>(`/api/pages/${pageId}/moves/${operationId}`, { signal });
+          return pageMoveReceiptResponse(value, expectation, operationId);
+        } catch (error) {
+          if (signal.aborted) return null;
+          if (!(error instanceof ApiClientError && error.status === 404 && error.code === "move_not_found")) {
+            console.error("Move receipt could not be checked", { pageId, operationId, ...errorLogFields(error) });
+          }
+          return null;
+        }
+      },
+      (confirmed) => confirmed === null,
+      signal,
+    );
+    if (signal.aborted) return null;
+    if (receipt) {
+      mergePageMutationResult(receipt);
+      clearWorkspaceErrors(attempt);
+      return receipt;
+    }
+    await reconcilePages(signal);
+    if (!signal.aborted) reportWorkspaceError(attempt, `${unresolvedMessage} after checking the server receipt.`);
+    return null;
+  }
+
   async function createPage(kind: PageKind, parentId?: string | null) {
     if (!canCreatePage) return;
     const signal = workspaceAbortController.current.signal;
@@ -1418,9 +1432,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       outcome = result.kind;
       if (result.kind === "committed" && result.value) {
         clearSettledCreateErrors();
-        recordPageUpserts([result.value]);
-        dispatchPageAction({ type: "merge", pages: [result.value] });
-        navigateToPage(result.value.id);
+        if (mergePageMutationResult(result.value)) navigateToPage(result.value.id);
         return;
       }
       closeSidebar(true);
@@ -1587,6 +1599,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const attempt = startClearedWorkspaceErrorAttempt({ source: "page-mutation", scope: `move:${pageId}` });
     const movingPage = pages.find((candidate) => candidate.id === pageId);
     let outcome: MutationOutcome = "not-started";
+    let operationId = "";
     if (!movingPage) {
       closeSidebar(true);
       reportWorkspaceError(attempt, "The page could not be moved.");
@@ -1600,23 +1613,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       kind: movingPage.kind,
       minimumRevision: movingPage.revision + 1,
     };
-    const appendAfter =
-      beforeId === null && afterId === null
-        ? (pages
-            .filter(
-              (candidate) =>
-                candidate.id !== pageId && candidate.parentId === parentId && candidate.archivedAt === null,
-            )
-            .toSorted(
-              (left, right) => compareBinaryText(left.position, right.position) || compareBinaryText(left.id, right.id),
-            )
-            .at(-1) ?? null)
-        : null;
     try {
+      operationId = crypto.randomUUID();
       const result = await requestMutation(
         `/api/pages/${pageId}/move`,
         {
           method: "POST",
+          headers: { "x-notes-operation-id": operationId },
           body: json({ parentId, beforeId, afterId }),
           signal,
         },
@@ -1625,8 +1628,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (signal.aborted) return;
       outcome = result.kind;
       if (result.kind === "committed" && result.value) {
-        recordPageUpserts([result.value]);
-        dispatchPageAction({ type: "merge", pages: [result.value] });
+        mergePageMutationResult(result.value);
         return;
       }
       closeSidebar(true);
@@ -1639,19 +1641,25 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           "Page movement result could not be verified",
           "committed-invalid-response",
           result.responseError ?? "Successful response did not contain the requested moved page.",
-          { pageId },
+          { pageId, operationId },
         );
-        reportWorkspaceError(attempt, "The server returned an invalid page-movement response. Checking the page tree.");
+        reportWorkspaceError(
+          attempt,
+          "The server returned an invalid page-movement response. Checking the server receipt.",
+        );
       } else {
         logUnverifiedMutation("Page movement result could not be verified", "uncertain", result.error, {
           pageId,
+          operationId,
         });
-        reportWorkspaceError(attempt, "The page-movement result could not be verified. Checking the page tree.");
+        reportWorkspaceError(attempt, "The page-movement result could not be verified. Checking the server receipt.");
       }
-      await reconcilePageMutation(
+      await reconcileMoveMutation(
         attempt,
         signal,
-        (observation) => observedExpectedMove(observation, expectation, beforeId, afterId, appendAfter, movingPage),
+        pageId,
+        operationId,
+        expectation,
         "The page-movement result could not be verified",
       );
     } catch (error) {
@@ -1669,10 +1677,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         ),
       );
       if (outcome === "committed" || outcome === "uncertain") {
-        await reconcilePageMutation(
+        await reconcileMoveMutation(
           attempt,
           signal,
-          (observation) => observedExpectedMove(observation, expectation, beforeId, afterId, appendAfter, movingPage),
+          pageId,
+          operationId,
+          expectation,
           outcome === "committed"
             ? "The page was moved, but the workspace could not be updated"
             : "The page may have been moved, but the workspace could not be updated",
