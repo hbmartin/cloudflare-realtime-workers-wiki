@@ -30,12 +30,8 @@ describe("D1 migrations", () => {
     // Sorting a table joins table_cells on column_id, which the primary key cannot serve.
     const indexes = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all<{ name: string }>();
     expect(indexes.results.map((index) => index.name)).toContain("idx_table_cells_column");
-    expect(indexes.results.map((index) => index.name)).toContain("idx_page_create_receipts_page");
+    expect(indexes.results.map((index) => index.name)).not.toContain("idx_page_create_receipts_page");
     expect(indexes.results.map((index) => index.name)).toContain("idx_pages_workspace_page");
-    const pageCreateReceiptIndex = await env.DB.prepare(`PRAGMA index_info(idx_page_create_receipts_page)`).all<{
-      name: string;
-    }>();
-    expect(pageCreateReceiptIndex.results.map((column) => column.name)).toEqual(["page_id"]);
 
     const uploadColumns = await env.DB.prepare(`PRAGMA table_info(attachment_uploads)`).all<{ name: string }>();
     expect(uploadColumns.results.map((column) => column.name)).toEqual(
@@ -171,10 +167,8 @@ describe("D1 migrations", () => {
       (migration) => migration.name === "0007_page_create_receipt_lifecycle.sql",
     );
     expect(lifecycle).toBeTruthy();
-    await applyD1Migrations(
-      env.DB,
-      env.TEST_MIGRATIONS!.filter((migration) => migration !== lifecycle),
-    );
+    const lifecycleIndex = env.TEST_MIGRATIONS!.indexOf(lifecycle!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, lifecycleIndex));
     const timestamp = Date.now();
     await env.DB.batch([
       env.DB.prepare(
@@ -214,6 +208,52 @@ describe("D1 migrations", () => {
     ).toMatchObject({
       results: [{ workspace_id: "workspace", page_id: "page", request_hash: "live-request" }],
     });
+    await env.DB.prepare(`DELETE FROM pages WHERE id = 'page'`).run();
+    expect(await env.DB.prepare(`SELECT 1 FROM page_create_receipts`).first()).toBeNull();
+  });
+
+  it("strengthens an applied page-create receipt lifecycle without retaining the redundant page index", async () => {
+    const integrity = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0008_page_create_receipt_integrity.sql",
+    );
+    expect(integrity).toBeTruthy();
+    const integrityIndex = env.TEST_MIGRATIONS!.indexOf(integrity!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, integrityIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('other', 'Other', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+           (id, workspace_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('page', 'workspace', 'document', 'a', 'Page', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO page_create_receipts (workspace_id, page_id, request_hash)
+         VALUES ('workspace', 'page', 'live-request')`,
+      ),
+      env.DB.prepare(
+        `INSERT INTO page_create_receipts (workspace_id, page_id, request_hash)
+         VALUES ('other', 'page', 'wrong-workspace-request')`,
+      ),
+    ]);
+    // Some preview databases may have received the abandoned in-place 0007
+    // edit before this forward migration replaced it.
+    await env.DB.prepare(`CREATE UNIQUE INDEX idx_pages_workspace_page ON pages(workspace_id, id)`).run();
+
+    await applyD1Migrations(env.DB, [integrity!]);
+
+    expect(
+      await env.DB.prepare(
+        `SELECT workspace_id, page_id, request_hash FROM page_create_receipts ORDER BY workspace_id, page_id`,
+      ).all(),
+    ).toMatchObject({
+      results: [{ workspace_id: "workspace", page_id: "page", request_hash: "live-request" }],
+    });
     await expect(
       env.DB.prepare(
         `INSERT INTO page_create_receipts (workspace_id, page_id, request_hash)
@@ -223,6 +263,9 @@ describe("D1 migrations", () => {
     await expect(
       env.DB.prepare(`UPDATE page_create_receipts SET workspace_id = 'other' WHERE page_id = 'page'`).run(),
     ).rejects.toThrow(/FOREIGN KEY constraint failed/);
+    const indexes = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all<{ name: string }>();
+    expect(indexes.results.map((index) => index.name)).toContain("idx_pages_workspace_page");
+    expect(indexes.results.map((index) => index.name)).not.toContain("idx_page_create_receipts_page");
     await env.DB.prepare(`DELETE FROM pages WHERE id = 'page'`).run();
     expect(await env.DB.prepare(`SELECT 1 FROM page_create_receipts`).first()).toBeNull();
   });
