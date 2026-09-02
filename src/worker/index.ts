@@ -130,7 +130,7 @@ async function readPageMoveReceipt(database: D1Database, workspaceId: string, op
     .first<PageMoveReceiptRow>();
 }
 
-function pageFromMoveReceipt(receipt: PageMoveReceiptRow, pageId: string, requestHash?: string) {
+function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, pageId: string, requestHash?: string) {
   if (receipt.page_id !== pageId || (requestHash !== undefined && receipt.request_hash !== requestHash)) {
     throw new HttpError(409, "idempotency_key_reused", "That move operation id was already used for another move.");
   }
@@ -141,6 +141,9 @@ function pageFromMoveReceipt(receipt: PageMoveReceiptRow, pageId: string, reques
     throw new Error("A stored page move receipt contains malformed JSON.", { cause: error });
   }
   if (!isPage(page)) throw new Error("A stored page move receipt does not contain a valid page.");
+  if (page.id !== receipt.page_id || page.workspaceId !== workspaceId) {
+    throw new Error("A stored page move receipt does not match its page and workspace.");
+  }
   return page;
 }
 
@@ -153,7 +156,7 @@ async function readPageMoveReplay(
 ) {
   const receipt = await readPageMoveReceipt(database, workspaceId, operationId);
   if (!receipt) return null;
-  return pageFromMoveReceipt(receipt, pageId, requestHash);
+  return pageFromMoveReceipt(receipt, workspaceId, pageId, requestHash);
 }
 
 async function pruneExpiredPageMoveReceipts(database: D1Database, timestamp = now()) {
@@ -988,34 +991,43 @@ app.post("/api/pages/:id/move", async (c) => {
   const position = generateJitteredKeyBetween(lower, upper);
   const timestamp = now();
   try {
-    const receiptResult = await batchWithFinalResult<PageMoveReceiptRow>(
-      c.env.DB,
-      [
-        c.env.DB.prepare(
-          `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ?
-            WHERE id = ? AND workspace_id = ?`,
-        ).bind(parentId, position, timestamp, page.id, member.workspace.id),
-        c.env.DB.prepare(
-          `INSERT INTO page_move_receipts
-             (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
-           SELECT workspace_id, ?, id, ?,
-             json_object(
-               'id', id, 'workspaceId', workspace_id, 'parentId', parent_id, 'kind', kind,
-               'position', position, 'title', title, 'icon', icon, 'revision', revision,
-               'contentEpoch', content_epoch, 'archivedAt', archived_at,
-               'createdAt', created_at, 'updatedAt', updated_at
-             ), ?
-           FROM pages WHERE id = ? AND workspace_id = ?`,
-        ).bind(operationId, requestHash, timestamp, page.id, member.workspace.id),
-      ],
+    const moveResultIndex = 0;
+    const receiptResultIndex = 2;
+    const results = await c.env.DB.batch<PageMoveReceiptRow>([
+      c.env.DB.prepare(
+        `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ?
+          WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
+      ).bind(parentId, position, timestamp, page.id, member.workspace.id),
+      c.env.DB.prepare(
+        `INSERT INTO page_move_receipts
+           (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
+         SELECT workspace_id, ?, id, ?,
+           json_object(
+             'id', id, 'workspaceId', workspace_id, 'parentId', parent_id, 'kind', kind,
+             'position', position, 'title', title, 'icon', icon, 'revision', revision,
+             'contentEpoch', content_epoch, 'archivedAt', archived_at,
+             'createdAt', created_at, 'updatedAt', updated_at
+           ), ?
+         FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
+      ).bind(operationId, requestHash, timestamp, page.id, member.workspace.id),
       c.env.DB.prepare(
         `SELECT page_id, request_hash, response_json FROM page_move_receipts
           WHERE workspace_id = ? AND operation_id = ?`,
       ).bind(member.workspace.id, operationId),
-    );
+    ]);
+    if (!results[moveResultIndex]?.meta.changes) {
+      const unavailable = await c.env.DB.prepare(`SELECT archived_at FROM pages WHERE id = ? AND workspace_id = ?`)
+        .bind(page.id, member.workspace.id)
+        .first<{ archived_at: number | null }>();
+      if (unavailable && unavailable.archived_at !== null) {
+        throw new HttpError(409, "page_archived", "The page was archived before it could be moved.");
+      }
+      throw new HttpError(404, "page_not_found", "Page not found.");
+    }
+    const receiptResult = results[receiptResultIndex];
     const receipt = receiptResult?.results[0];
     if (!receipt) throw new Error("The moved page was not recorded by its committed receipt.");
-    const moved = pageFromMoveReceipt(receipt, pageId, requestHash);
+    const moved = pageFromMoveReceipt(receipt, member.workspace.id, pageId, requestHash);
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
     return c.json({ page: moved, operationId, replayed: false });
   } catch (error) {
@@ -1033,7 +1045,7 @@ app.get("/api/pages/:id/moves/:operationId", async (c) => {
   if (!receipt || receipt.page_id !== c.req.param("id")) {
     throw new HttpError(404, "move_not_found", "Move receipt not found.");
   }
-  return c.json({ page: pageFromMoveReceipt(receipt, c.req.param("id")), operationId });
+  return c.json({ page: pageFromMoveReceipt(receipt, member.workspace.id, c.req.param("id")), operationId });
 });
 
 app.delete("/api/pages/:id", async (c) => {

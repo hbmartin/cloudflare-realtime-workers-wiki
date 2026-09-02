@@ -200,6 +200,8 @@ function pageMoveReceiptResponse(value: unknown, expectation: PageMutationExpect
   return pageMutationResponse(value, expectation);
 }
 
+type PageMoveReceiptObservation = { kind: "confirmed"; page: Page } | { kind: "missing" } | { kind: "unavailable" };
+
 type MutationRequestResult<T> =
   | { kind: "committed"; value: T | null; responseError?: unknown }
   | { kind: "rejected"; error: ApiClientError }
@@ -1373,27 +1375,29 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     unresolvedMessage: string,
   ) {
     const receipt = await reconcileWithOneRetry(
-      async () => {
+      async (): Promise<PageMoveReceiptObservation> => {
         try {
           const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(PAGE_TREE_REQUEST_TIMEOUT_MS)]);
           const value = await api<unknown>(`/api/pages/${pageId}/moves/${operationId}`, { signal: requestSignal });
-          return pageMoveReceiptResponse(value, expectation, operationId);
+          const page = pageMoveReceiptResponse(value, expectation, operationId);
+          return page ? { kind: "confirmed", page } : { kind: "unavailable" };
         } catch (error) {
-          if (signal.aborted) return null;
-          if (!(error instanceof ApiClientError && error.status === 404 && error.code === "move_not_found")) {
-            console.error("Move receipt could not be checked", { pageId, operationId, ...errorLogFields(error) });
+          if (signal.aborted) return { kind: "unavailable" };
+          if (error instanceof ApiClientError && error.status === 404 && error.code === "move_not_found") {
+            return { kind: "missing" };
           }
-          return null;
+          console.error("Move receipt could not be checked", { pageId, operationId, ...errorLogFields(error) });
+          return { kind: "unavailable" };
         }
       },
-      (confirmed) => confirmed === null,
+      (observation) => observation.kind === "missing",
       signal,
     );
     if (signal.aborted) return null;
-    if (receipt) {
-      mergePageMutationResult(receipt);
+    if (receipt.kind === "confirmed") {
+      mergePageMutationResult(receipt.page);
       clearWorkspaceErrors(attempt);
-      return receipt;
+      return receipt.page;
     }
     await reconcilePages(signal);
     if (!signal.aborted) reportWorkspaceError(attempt, `${unresolvedMessage} after checking the server receipt.`);

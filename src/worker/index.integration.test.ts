@@ -20,7 +20,7 @@ import { processDueUploadReaps } from "./attachments";
 import { processDeletionJob } from "./cleanup";
 import type { Env } from "./env";
 import worker from "./index";
-import { eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
+import { broadcastWorkspaceEvent, eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
 
 type InstalledWorkspace = {
   cookie: string;
@@ -243,6 +243,41 @@ function envWithPageCreateBatchIntercepted(
       },
     }),
     pageCreateBatchWasIntercepted: () => intercepted,
+  };
+}
+
+function envArchivingPageBeforeNextBatch(bindings: Env, pageId: string) {
+  let intercepted = false;
+  const database = new Proxy(bindings.DB, {
+    get(target, property) {
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          if (!intercepted) {
+            intercepted = true;
+            await target
+              .prepare(
+                `UPDATE pages
+                    SET archived_at = ?, revision = revision + 1, updated_at = ?
+                  WHERE id = ?`,
+              )
+              .bind(Date.now(), Date.now(), pageId)
+              .run();
+          }
+          return target.batch(statements);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    bindings: new Proxy(bindings, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    }),
+    moveBatchWasIntercepted: () => intercepted,
   };
 }
 
@@ -767,6 +802,43 @@ describe("Worker integration", () => {
         broadcast.mockRestore();
       }
     });
+  });
+
+  it("retries lifecycle broadcasts rejected by a busy delivery queue", async () => {
+    const workspaceId = crypto.randomUUID();
+    const event: WorkspaceEvent = { type: "pages-removed", pageIds: [crypto.randomUUID()], permanently: false };
+    const delivered: WorkspaceEvent[] = [];
+    let attempts = 0;
+    const workspaceEvents = {
+      getByName(requestedWorkspaceId: string) {
+        expect(requestedWorkspaceId).toBe(workspaceId);
+        return {
+          async fetch(request: Request) {
+            attempts += 1;
+            expect(request.headers.get("x-notes-internal")).toBe(env.BETTER_AUTH_SECRET);
+            delivered.push((await request.json()) as WorkspaceEvent);
+            return attempts < 3
+              ? Response.json({ error: "Workspace event delivery is busy." }, { status: 503 })
+              : Response.json({ delivered: true });
+          },
+        };
+      },
+    } as unknown as Env["WORKSPACE_EVENTS"];
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      await broadcastWorkspaceEvent(bindings, workspaceId, event);
+    } finally {
+      random.mockRestore();
+    }
+
+    expect(attempts).toBe(3);
+    expect(delivered).toEqual([event, event, event]);
   });
 
   it("filters serialized page lifecycle events against the current workspace state", async () => {
@@ -3375,7 +3447,39 @@ describe("Worker integration", () => {
     });
   });
 
-  it("rejects malformed stored page move snapshots", async () => {
+  it("does not move or receipt a page archived immediately before the move batch", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const intercepted = envArchivingPageBeforeNextBatch(env, installed.pageId);
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    const body = await response.json<{ error: { code: string } }>();
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.moveBatchWasIntercepted()).toBe(true);
+    expect(response.status).toBe(409);
+    expect(body.error.code).toBe("page_archived");
+    expect(
+      await env.DB.prepare(`SELECT revision, archived_at FROM pages WHERE id = ?`)
+        .bind(installed.pageId)
+        .first<{ revision: number; archived_at: number | null }>(),
+    ).toMatchObject({ revision: 2, archived_at: expect.any(Number) });
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE operation_id = ?`)
+        .bind(operationId)
+        .first<{ count: number }>(),
+    ).toEqual({ count: 0 });
+  });
+
+  it("rejects malformed or mismatched stored page move snapshots", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
     const moved = await SELF.fetch(
@@ -3386,14 +3490,17 @@ describe("Worker integration", () => {
       }),
     );
     expect(moved.status).toBe(200);
-    await env.DB.prepare(`UPDATE page_move_receipts SET response_json = '{"id":123}' WHERE operation_id = ?`)
-      .bind(operationId)
-      .run();
+    const movedPage = (await moved.json<{ page: Page }>()).page;
+    const receipt = async (snapshot: unknown) => {
+      await env.DB.prepare(`UPDATE page_move_receipts SET response_json = ? WHERE operation_id = ?`)
+        .bind(JSON.stringify(snapshot), operationId)
+        .run();
+      return SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`));
+    };
 
-    const receipt = await SELF.fetch(
-      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`),
-    );
-    expect(receipt.status).toBe(500);
+    expect((await receipt({ id: 123 })).status).toBe(500);
+    expect((await receipt({ ...movedPage, id: crypto.randomUUID() })).status).toBe(500);
+    expect((await receipt({ ...movedPage, workspaceId: crypto.randomUUID() })).status).toBe(500);
   });
 
   it("prunes expired page move receipts while retaining the active recovery window", async () => {

@@ -1,5 +1,6 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { YServer } from "y-partyserver";
+import { jitteredBackoff } from "../shared/retry";
 import type { WorkspaceEvent } from "../shared/types";
 import { ID_PATTERN, isPage, pageWithoutUnknownFields } from "../shared/validation";
 import type { Env } from "./env";
@@ -11,6 +12,18 @@ export interface EventConnectionAuth {
 }
 
 const WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT = 128;
+const WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS = 4;
+const WORKSPACE_EVENT_DELIVERY_RETRY_BASE_MS = 250;
+const WORKSPACE_EVENT_DELIVERY_RETRY_MAX_MS = 2_000;
+
+function waitForWorkspaceEventDeliveryRetry(attempt: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(
+      resolve,
+      jitteredBackoff(attempt, WORKSPACE_EVENT_DELIVERY_RETRY_BASE_MS, WORKSPACE_EVENT_DELIVERY_RETRY_MAX_MS),
+    );
+  });
+}
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -206,14 +219,29 @@ export class WorkspaceEvents extends YServer {
 
 export async function broadcastWorkspaceEvent(env: Env, workspaceId: string, event: WorkspaceEvent) {
   const stub = env.WORKSPACE_EVENTS.getByName(workspaceId);
-  const response = await stub.fetch(
-    new Request("https://workspace-events.internal/broadcast", {
-      method: "POST",
-      headers: {
-        "x-notes-internal": env.BETTER_AUTH_SECRET,
-      },
-      body: JSON.stringify(event),
-    }),
-  );
-  if (!response.ok) throw new Error(`Workspace event delivery failed with ${response.status}`);
+  const body = JSON.stringify(event);
+  for (let attempt = 0; attempt < WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS; attempt += 1) {
+    let response: Response;
+    try {
+      response = await stub.fetch(
+        new Request("https://workspace-events.internal/broadcast", {
+          method: "POST",
+          headers: {
+            "x-notes-internal": env.BETTER_AUTH_SECRET,
+          },
+          body,
+        }),
+      );
+    } catch (error) {
+      if (attempt === WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS - 1) throw error;
+      await waitForWorkspaceEventDeliveryRetry(attempt);
+      continue;
+    }
+    if (response.ok) return;
+    const retryable = response.status === 429 || response.status >= 500;
+    if (!retryable || attempt === WORKSPACE_EVENT_DELIVERY_MAX_ATTEMPTS - 1) {
+      throw new Error(`Workspace event delivery failed with ${response.status}`);
+    }
+    await waitForWorkspaceEventDeliveryRetry(attempt);
+  }
 }

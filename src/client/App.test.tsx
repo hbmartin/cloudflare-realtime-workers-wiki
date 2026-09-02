@@ -1172,11 +1172,8 @@ describe("App error handling", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(15_000);
     });
-    expect(receiptLoads).toBe(2);
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(15_000);
-    });
 
+    expect(receiptLoads).toBe(1);
     expect(treeLoads).toBe(2);
     expect(
       screen.getByText("The page-movement result could not be verified after checking the server receipt."),
