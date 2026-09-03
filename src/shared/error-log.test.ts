@@ -28,6 +28,19 @@ describe("error log fields", () => {
     });
   });
 
+  it("does not throw while describing a revoked Proxy", () => {
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+
+    expect(errorLogFields(revocable.proxy)).toEqual({
+      errorName: null,
+      errorMessage: null,
+      errorStack: null,
+      errorType: "object",
+      errorValue: "[object omitted]",
+    });
+  });
+
   it("flattens an Error cause and its safe metadata one level deep", () => {
     const cause = Object.assign(new SyntaxError("invalid JSON"), { status: 503, code: "receipt_unavailable" });
     const error = new Error("receipt decode failed", { cause });
@@ -44,6 +57,26 @@ describe("error log fields", () => {
       receiptErrorCauseStatus: 503,
       receiptErrorCauseCode: "receipt_unavailable",
     });
+  });
+
+  it("does not read cause when cause fields are disabled", () => {
+    let causeReads = 0;
+    const error = {
+      name: "RemoteError",
+      message: "Remote failure",
+      get cause() {
+        causeReads += 1;
+        return new Error("nested failure");
+      },
+    };
+
+    expect(prefixedErrorLogFields("error", error, false)).toEqual({
+      errorName: "RemoteError",
+      errorMessage: "Remote failure",
+      errorStack: null,
+      errorType: "object",
+    });
+    expect(causeReads).toBe(0);
   });
 
   it("recognizes DOMException and cross-realm-shaped errors", () => {

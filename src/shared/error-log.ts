@@ -26,7 +26,11 @@ function stringProperty(value: object, name: string, limit: number) {
 
 function isErrorLike(value: unknown): value is object {
   if (typeof value !== "object" || value === null) return false;
-  if (value instanceof Error) return true;
+  try {
+    if (value instanceof Error) return true;
+  } catch {
+    // A revoked or hostile Proxy can throw while its prototype chain is inspected.
+  }
   return (
     typeof property(value, "message") === "string" &&
     (typeof property(value, "name") === "string" || typeof property(value, "stack") === "string")
@@ -69,9 +73,11 @@ export function prefixedErrorLogFields(prefix: string, error: unknown, includeCa
       ...(typeof status === "number" && Number.isFinite(status) ? { [`${prefix}Status`]: status } : {}),
       ...(typeof code === "string" ? { [`${prefix}Code`]: bounded(code, ERROR_CODE_LIMIT) } : {}),
     };
-    const cause = property(error, "cause");
-    if (includeCause && cause !== undefined && cause !== error) {
-      Object.assign(fields, prefixedErrorLogFields(`${prefix}Cause`, cause, false));
+    if (includeCause) {
+      const cause = property(error, "cause");
+      if (cause !== undefined && cause !== error) {
+        Object.assign(fields, prefixedErrorLogFields(`${prefix}Cause`, cause, false));
+      }
     }
     return fields;
   }
