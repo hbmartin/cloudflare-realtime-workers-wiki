@@ -93,7 +93,8 @@ type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
 type PageCreateStateRow = PageJsonRow & { receipt_request_hash: string | null };
 type PageMoveReceiptRow = { page_id: string; request_hash: string; response_json: string };
 type PageMoveStateRow = { page_json: string };
-type PageMoveBatchRow = PageMoveReceiptRow | PageMoveStateRow;
+type PageMoveAvailabilityRow = { archived_at: number | null };
+type PageMoveBatchRow = PageMoveReceiptRow | PageMoveStateRow | PageMoveAvailabilityRow;
 
 class InvalidPageMoveReceiptError extends Error {
   override name = "InvalidPageMoveReceiptError";
@@ -125,13 +126,17 @@ async function pageCreateRequestHash(value: unknown) {
 }
 
 async function readPageMoveReceipt(database: D1Database, workspaceId: string, operationId: string) {
-  return database
+  const value = await database
     .prepare(
       `SELECT page_id, request_hash, response_json FROM page_move_receipts
         WHERE workspace_id = ? AND operation_id = ?`,
     )
     .bind(workspaceId, operationId)
-    .first<PageMoveReceiptRow>();
+    .first();
+  if (value === null) return null;
+  const receipt = pageMoveReceiptRow(value);
+  if (!receipt) throw new InvalidPageMoveReceiptError("A stored page move receipt row is malformed.");
+  return receipt;
 }
 
 function pageMoveReceiptSnapshotV1(value: unknown): Page {
@@ -185,18 +190,26 @@ function pageFromMoveState(row: PageMoveStateRow) {
   return pageMoveReceiptSnapshotV1(stored);
 }
 
-function pageMoveReceiptRow(value: PageMoveBatchRow | undefined): PageMoveReceiptRow | null {
-  return value &&
-    "page_id" in value &&
-    typeof value.page_id === "string" &&
-    typeof value.request_hash === "string" &&
-    typeof value.response_json === "string"
-    ? value
+function pageMoveReceiptRow(value: unknown): PageMoveReceiptRow | null {
+  if (value === null || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  return typeof row.page_id === "string" &&
+    typeof row.request_hash === "string" &&
+    typeof row.response_json === "string"
+    ? { page_id: row.page_id, request_hash: row.request_hash, response_json: row.response_json }
     : null;
 }
 
-function pageMoveStateRow(value: PageMoveBatchRow | undefined): PageMoveStateRow | null {
-  return value && "page_json" in value && typeof value.page_json === "string" ? value : null;
+function pageMoveStateRow(value: unknown): PageMoveStateRow | null {
+  if (value === null || typeof value !== "object") return null;
+  const serializedPage = Reflect.get(value, "page_json") as unknown;
+  return typeof serializedPage === "string" ? { page_json: serializedPage } : null;
+}
+
+function pageMoveAvailabilityRow(value: unknown): PageMoveAvailabilityRow | null {
+  if (value === null || typeof value !== "object") return null;
+  const archivedAt = Reflect.get(value, "archived_at") as unknown;
+  return archivedAt === null || typeof archivedAt === "number" ? { archived_at: archivedAt } : null;
 }
 
 function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, pageId: string, requestHash?: string) {
@@ -257,7 +270,7 @@ function pageMoveReceiptLogFields(error: unknown, context: PageMoveReceiptReadCo
     operationId: context.operationId,
     receiptReadPhase: context.receiptReadPhase,
     ...(context.recoveredFromPageState ? { recoveredFromPageState: true } : {}),
-    ...(context.moveError !== undefined ? prefixedErrorLogFields("moveError", context.moveError) : {}),
+    ...("moveError" in context ? prefixedErrorLogFields("moveError", context.moveError) : {}),
     ...prefixedErrorLogFields("receiptError", error),
   };
 }
@@ -1174,31 +1187,73 @@ app.post("/api/pages/:id/move", async (c) => {
           WHERE workspace_id = ? AND operation_id = ?`,
       ).bind(member.workspace.id, operationId),
       c.env.DB.prepare(
-        `SELECT ${PAGE_MOVE_RECEIPT_PAGE_JSON_SQL} AS page_json FROM pages WHERE id = ? AND workspace_id = ?`,
+        `SELECT archived_at,
+                CASE WHEN archived_at IS NULL THEN ${PAGE_MOVE_RECEIPT_PAGE_JSON_SQL} ELSE NULL END AS page_json
+           FROM pages WHERE id = ? AND workspace_id = ?`,
       ).bind(page.id, member.workspace.id),
     ]);
     if (!results[moveResultIndex]?.meta.changes) {
-      const unavailableRow = pageMoveStateRow(results[pageStateResultIndex]?.results[0]);
-      const unavailable = unavailableRow ? pageFromMoveState(unavailableRow) : null;
-      if (unavailable && unavailable.archivedAt !== null) {
+      const unavailableValue = results[pageStateResultIndex]?.results[0];
+      const unavailable = pageMoveAvailabilityRow(unavailableValue);
+      if (unavailableValue !== undefined && !unavailable) {
+        throw new Error("The unavailable page state returned by the move batch was malformed.");
+      }
+      if (unavailable && unavailable.archived_at !== null) {
         throw new HttpError(409, "page_archived", "The page was archived before it could be moved.");
       }
       if (unavailable) throw new Error("An active page move unexpectedly changed no rows.");
       throw new HttpError(404, "page_not_found", "Page not found.");
     }
-    const receiptResult = results[receiptResultIndex];
-    const receipt = pageMoveReceiptRow(receiptResult?.results[0]);
-    if (!receipt) throw new Error("The moved page was not recorded by its committed receipt.");
     let moved: Page;
     try {
+      const receipt = pageMoveReceiptRow(results[receiptResultIndex]?.results[0]);
+      if (!receipt) throw new InvalidPageMoveReceiptError("The committed page move receipt row was malformed.");
       moved = pageFromMoveReceipt(receipt, member.workspace.id, pageId, requestHash);
     } catch (receiptError) {
-      if (!(receiptError instanceof InvalidPageMoveReceiptError)) throw receiptError;
+      if (!(receiptError instanceof InvalidPageMoveReceiptError)) {
+        console.error(
+          "Committed page move receipt result was inconsistent.",
+          pageMoveReceiptLogFields(receiptError, {
+            workspaceId: member.workspace.id,
+            pageId,
+            operationId,
+            receiptReadPhase: "commit",
+          }),
+        );
+        throw new Error("The committed page move receipt result was inconsistent.", { cause: receiptError });
+      }
       const committedPageRow = pageMoveStateRow(results[pageStateResultIndex]?.results[0]);
       if (!committedPageRow) {
-        throw new Error("The moved page state was not returned by its committed batch.", { cause: receiptError });
+        const pageStateError = new Error("The moved page state was not returned by its committed batch.");
+        console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
+          ...pageMoveReceiptLogFields(receiptError, {
+            workspaceId: member.workspace.id,
+            pageId,
+            operationId,
+            receiptReadPhase: "commit",
+          }),
+          ...prefixedErrorLogFields("pageStateError", pageStateError),
+        });
+        throw new Error("The committed page move receipt and fallback state were unusable.", {
+          cause: receiptError,
+        });
       }
-      moved = pageFromMoveState(committedPageRow);
+      try {
+        moved = pageFromMoveState(committedPageRow);
+      } catch (pageStateError) {
+        console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
+          ...pageMoveReceiptLogFields(receiptError, {
+            workspaceId: member.workspace.id,
+            pageId,
+            operationId,
+            receiptReadPhase: "commit",
+          }),
+          ...prefixedErrorLogFields("pageStateError", pageStateError),
+        });
+        throw new Error("The committed page move receipt and fallback state were unusable.", {
+          cause: pageStateError,
+        });
+      }
       console.error(
         PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE,
         pageMoveReceiptLogFields(receiptError, {

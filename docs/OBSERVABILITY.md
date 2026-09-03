@@ -64,20 +64,21 @@ accrue duration, hibernation is not working and cost scales with connections rat
 
 ## Suggested alerts
 
-| Alert                   | Condition                                                                                                 | Why it matters                                                                                                                       |
-| ----------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Cron failure            | Scheduled invocation errors, or no successful invocation in 2 hours                                       | Both cleanup queues stop draining; deleted content leaks and archived pages keep editors connected                                   |
-| Sustained 5xx           | Worker error rate above baseline for 5 minutes                                                            | General outage                                                                                                                       |
-| `table_revision_failed` | Any `Table revision could not be advanced` log line                                                       | A table mutation invariant was violated. Not transient; see [Troubleshooting](TROUBLESHOOTING.md#the-table-mutation-guard)           |
-| Unresolved page move    | Any `Page move receipt could not be read.` log line                                                       | D1 could not determine an idempotent move outcome. Retry with the same operation id; sustained occurrences indicate a D1 outage      |
-| Invalid move receipt    | Any `Page move receipt was invalid.` log line                                                             | A persisted receipt is corrupt or unsupported. A commit-phase occurrence recovers from the authoritative page row                    |
-| Conflicting move replay | Any `Page move recovery found a conflicting receipt.` log line                                            | A failed move raced with reuse of its operation id. Inspect the flattened move and receipt errors                                    |
-| Deletion backlog        | `deletion_jobs` count above 10                                                                            | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                                 |
-| Move-receipt backlog    | Any `Page move receipt pruning reached its hourly catch-up limit` log line                                | More than 10000 expired receipts reached one pass; retention cleanup may be falling behind                                           |
-| Stuck deletion          | Any `deletion_jobs` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5              | Overdue by more than a cron interval, so the runner is not clearing it; `attempts` past the clamp means it is at the 16-hour ceiling |
-| Stuck archive           | Any `archive_disconnect_targets` row with `next_attempt_at` more than 2 hours past, or `attempts` above 9 | Same, against the 42 min 40 s ceiling                                                                                                |
-| Stuck upload            | Any `attachment_uploads` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5         | The reaper is not clearing it, so R2 keeps holding the parts                                                                         |
-| D1 size                 | Above 8 GB                                                                                                | Approaching the 10 GB cap with no migration path                                                                                     |
+| Alert                    | Condition                                                                                                 | Why it matters                                                                                                                       |
+| ------------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Cron failure             | Scheduled invocation errors, or no successful invocation in 2 hours                                       | Both cleanup queues stop draining; deleted content leaks and archived pages keep editors connected                                   |
+| Sustained 5xx            | Worker error rate above baseline for 5 minutes                                                            | General outage                                                                                                                       |
+| `table_revision_failed`  | Any `Table revision could not be advanced` log line                                                       | A table mutation invariant was violated. Not transient; see [Troubleshooting](TROUBLESHOOTING.md#the-table-mutation-guard)           |
+| Unresolved page move     | Any `Page move receipt could not be read.` log line                                                       | D1 could not determine an idempotent move outcome. Retry with the same operation id; sustained occurrences indicate a D1 outage      |
+| Invalid move receipt     | Any `Page move receipt was invalid.` log line                                                             | A persisted receipt or committed batch result is corrupt or unsupported. Inspect the phase and recovery fields                       |
+| Inconsistent move result | Any `Committed page move receipt result was inconsistent.` log line                                       | A committed batch result contradicted the request. The Worker retries from the authoritative stored receipt                          |
+| Conflicting move replay  | Any `Page move recovery found a conflicting receipt.` log line                                            | A failed move raced with reuse of its operation id. Inspect the flattened move and receipt errors                                    |
+| Deletion backlog         | `deletion_jobs` count above 10                                                                            | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                                 |
+| Move-receipt backlog     | Any `Page move receipt pruning reached its hourly catch-up limit` log line                                | More than 10000 expired receipts reached one pass; retention cleanup may be falling behind                                           |
+| Stuck deletion           | Any `deletion_jobs` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5              | Overdue by more than a cron interval, so the runner is not clearing it; `attempts` past the clamp means it is at the 16-hour ceiling |
+| Stuck archive            | Any `archive_disconnect_targets` row with `next_attempt_at` more than 2 hours past, or `attempts` above 9 | Same, against the 42 min 40 s ceiling                                                                                                |
+| Stuck upload             | Any `attachment_uploads` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5         | The reaper is not clearing it, so R2 keeps holding the parts                                                                         |
+| D1 size                  | Above 8 GB                                                                                                | Approaching the 10 GB cap with no migration path                                                                                     |
 
 The queue-based alerts have no push mechanism in this repository. Run the queries from
 [Operations](OPERATIONS.md#inspecting-the-work-queues) from an external scheduler and alert on a
@@ -100,6 +101,7 @@ Document restore failed
 Failed to reconcile pending document restore
 Page move receipt could not be read.
 Page move receipt was invalid.
+Committed page move receipt result was inconsistent.
 Page move recovery found a conflicting receipt.
 Unhandled request error
 Failed to handle document party request for
@@ -111,7 +113,7 @@ bundled output.
 Two things to remember:
 
 - Unrecognised exceptions are collapsed into `500 internal_error` with the original logged separately.
-  The log carries `requestMethod`, `requestPath`, and `requestRayId`; use the Ray ID when the client or
+  The log carries `requestMethod` plus bounded `requestPath`, `requestRayId`, and error fields; use the Ray ID when the client or
   Cloudflare request record has it, and otherwise correlate by timestamp.
 - Expected errors are never logged, by design. A client reporting a `404 room_not_found` or a
   `409 stale_epoch` on `/parties/*` will leave no trace in Workers Logs. Malformed upgrade paths land

@@ -115,6 +115,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Gate page-move receipt migration
+        shell: bash
         env:
           PAGE_MOVE_RECEIPT_MIGRATION_SAFE: ${{ inputs.confirm_page_move_receipt_migration_safe }}
         run: |

@@ -28,6 +28,21 @@ describe("error log fields", () => {
     });
   });
 
+  it("retains stable fields from message-only and stack-only throw values", () => {
+    expect(errorLogFields({ message: "Remote failure" })).toEqual({
+      errorName: null,
+      errorMessage: "Remote failure",
+      errorStack: null,
+      errorType: "object",
+    });
+    expect(errorLogFields({ stack: "remote:1" })).toEqual({
+      errorName: null,
+      errorMessage: null,
+      errorStack: "remote:1",
+      errorType: "object",
+    });
+  });
+
   it("does not throw while describing a revoked Proxy", () => {
     const revocable = Proxy.revocable({}, {});
     revocable.revoke();
@@ -108,5 +123,16 @@ describe("error log fields", () => {
 
     expect(fields.errorMessage).toBe(`${"x".repeat(1_999)}…[truncated]`);
     expect(fields.errorValue).toBe(fields.errorMessage);
+  });
+
+  it("applies field-specific bounds and omits non-finite numbers consistently", () => {
+    const fields = errorLogFields({ name: "ordinary", code: "c".repeat(300), reason: "r".repeat(3_000), status: NaN });
+
+    expect(fields.errorValue).toEqual({
+      name: "ordinary",
+      code: `${"c".repeat(200)}…[truncated]`,
+      reason: `${"r".repeat(2_000)}…[truncated]`,
+    });
+    expect(errorLogFields(Infinity).errorValue).toBe("[number omitted]");
   });
 });
