@@ -289,4 +289,63 @@ describe("D1 migrations", () => {
     await env.DB.prepare(`DELETE FROM pages WHERE id = 'page'`).run();
     expect(await env.DB.prepare(`SELECT 1 FROM page_create_receipts`).first()).toBeNull();
   });
+
+  it("normalizes legacy page-move snapshots into versioned envelopes", async () => {
+    const envelopes = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0011_page_move_receipt_envelopes.sql",
+    );
+    expect(envelopes).toBeTruthy();
+    const envelopeIndex = env.TEST_MIGRATIONS!.indexOf(envelopes!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, envelopeIndex));
+    const timestamp = Date.now();
+    const page = {
+      id: "page",
+      workspaceId: "workspace",
+      parentId: null,
+      kind: "document",
+      position: "a",
+      title: "Page",
+      icon: null,
+      revision: 1,
+      contentEpoch: 1,
+      archivedAt: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const versioned = { pageMoveReceiptVersion: 1, page };
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+           (id, workspace_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('page', 'workspace', 'document', 'a', 'Page', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      ...[
+        ["bare", JSON.stringify(page)],
+        ["versioned", JSON.stringify(versioned)],
+        ["malformed", "{"],
+      ].map(([operationId, responseJson]) =>
+        env.DB.prepare(
+          `INSERT INTO page_move_receipts
+             (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
+           VALUES ('workspace', ?, 'page', 'request', ?, ?)`,
+        ).bind(operationId, responseJson, timestamp),
+      ),
+    ]);
+
+    await applyD1Migrations(env.DB, [envelopes!]);
+
+    const receipts = await env.DB.prepare(
+      `SELECT operation_id, response_json FROM page_move_receipts ORDER BY operation_id`,
+    ).all<{ operation_id: string; response_json: string }>();
+    expect(receipts.results.map(({ operation_id, response_json }) => [operation_id, response_json])).toEqual([
+      ["bare", JSON.stringify(versioned)],
+      ["malformed", "{"],
+      ["versioned", JSON.stringify(versioned)],
+    ]);
+  });
 });

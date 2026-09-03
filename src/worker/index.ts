@@ -73,6 +73,7 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
 const PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE = 1_000;
+const PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES = 10;
 
 type PageRow = {
   id: string;
@@ -206,14 +207,10 @@ function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, p
     stored !== null && typeof stored === "object" && !Array.isArray(stored)
       ? (stored as Record<string, unknown>)
       : null;
-  let snapshot = stored;
-  if (envelope && "pageMoveReceiptVersion" in envelope) {
-    if (envelope.pageMoveReceiptVersion !== PAGE_MOVE_RECEIPT_VERSION || !("page" in envelope)) {
-      throw new Error("A stored page move receipt uses an unsupported snapshot version.");
-    }
-    snapshot = envelope.page;
+  if (!envelope || envelope.pageMoveReceiptVersion !== PAGE_MOVE_RECEIPT_VERSION || !("page" in envelope)) {
+    throw new Error("A stored page move receipt uses an unsupported snapshot version.");
   }
-  const page = pageMoveReceiptSnapshotV1(snapshot);
+  const page = pageMoveReceiptSnapshotV1(envelope.page);
   if (page.id !== receipt.page_id || page.workspaceId !== workspaceId) {
     throw new Error("A stored page move receipt does not match its page and workspace.");
   }
@@ -233,18 +230,26 @@ async function readPageMoveReplay(
 }
 
 async function pruneExpiredPageMoveReceipts(database: D1Database, timestamp = now()) {
-  return database
-    .prepare(
-      `DELETE FROM page_move_receipts
-        WHERE rowid IN (
-          SELECT rowid FROM page_move_receipts
-           WHERE created_at < ?
-           ORDER BY created_at
-           LIMIT ?
-        )`,
-    )
-    .bind(timestamp - PAGE_MOVE_RECEIPT_RETENTION_MS, PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE)
-    .run();
+  const expiredBefore = timestamp - PAGE_MOVE_RECEIPT_RETENTION_MS;
+  for (let batch = 0; batch < PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES; batch += 1) {
+    const result = await database
+      .prepare(
+        `DELETE FROM page_move_receipts
+          WHERE rowid IN (
+            SELECT rowid FROM page_move_receipts
+             WHERE created_at < ?
+             ORDER BY created_at
+             LIMIT ?
+          )`,
+      )
+      .bind(expiredBefore, PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE)
+      .run();
+    if (result.meta.changes < PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE) return;
+  }
+  console.warn("Page move receipt pruning reached its hourly catch-up limit; expired receipts may remain.", {
+    batchSize: PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
+    maxBatches: PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
+  });
 }
 
 async function readPageCreateReplay(
@@ -1115,8 +1120,19 @@ app.post("/api/pages/:id/move", async (c) => {
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
     return c.json({ page: moved, operationId, replayed: false });
   } catch (error) {
-    if (error instanceof HttpError) throw error;
-    const committed = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
+    if (error instanceof HttpError && error.code !== "page_archived") throw error;
+    let committed: Page | null;
+    try {
+      committed = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
+    } catch (replayError) {
+      if (replayError instanceof HttpError) throw replayError;
+      if (error instanceof HttpError) throw error;
+      throw new AggregateError(
+        [error, replayError],
+        "The page move failed and its committed receipt could not be read.",
+        { cause: replayError },
+      );
+    }
     if (committed) {
       sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });
       return c.json({ page: committed, operationId, replayed: true });

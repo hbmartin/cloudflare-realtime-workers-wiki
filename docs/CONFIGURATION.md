@@ -111,7 +111,8 @@ configurable at runtime.
 | Bulk receipt retention                                  | Durable until the table/page cascade removes it                          | `table_bulk_writes`                             |
 | Page-create receipt retention                           | Durable until the page/workspace cascade removes it                      | `page_create_receipts`                          |
 | `PAGE_MOVE_RECEIPT_RETENTION_MS`                        | 7 days; expired receipts are pruned hourly                               | `src/shared/page-move.ts`                       |
-| `PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE`                    | 1000 expired receipts per hourly pass                                    | `src/worker/index.ts`                           |
+| `PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE`                    | 1000 expired receipts per delete                                         | `src/worker/index.ts`                           |
+| `PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES`                   | 10 deletes per hourly pass                                               | `src/worker/index.ts`                           |
 | `DELETION_TARGET_BATCH_SIZE`                            | 50                                                                       | `src/worker/index.ts`                           |
 | `CLEANUP_LEASE_MS`                                      | 15 min                                                                   | `src/worker/cleanup.ts`                         |
 | `DOCUMENT_PURGE_TIMEOUT_MS`                             | 30 s                                                                     | `src/worker/cleanup.ts`                         |
@@ -141,15 +142,15 @@ requires restoring an earlier version into a fresh epoch. See
 
 ## Cron drain rates and backoff
 
-The hourly handler processes the cleanup queues with per-tick caps. These determine how long a backlog
-takes to clear, and whether a stalled row is broken or merely waiting.
+The hourly handler processes retry queues and retention cleanup with per-tick caps. These determine how
+long a backlog takes to clear, and whether a stalled row is broken or merely waiting.
 
-| Queue                        | Per tick | Backoff                                 | Effective ceiling |
+| Work item                    | Per tick | Backoff                                 | Effective ceiling |
 | ---------------------------- | -------- | --------------------------------------- | ----------------- |
 | `deletion_jobs`              | 10       | `min(24 h, 1 h × 2^min(attempts-1, 4))` | 16 h              |
 | `archive_disconnect_targets` | 50       | `min(1 h, 10 s × 2^min(attempts-1, 8))` | 42 min 40 s       |
 | `attachment_uploads`         | 50       | `min(1 h, 10 s × 2^min(attempts-1, 8))` | 42 min 40 s       |
-| `page_move_receipts`         | 1000     | None; oldest expired receipts first     | n/a               |
+| Expired `page_move_receipts` | 10000    | n/a; oldest receipts first              | n/a               |
 
 The outer `min` in each expression is never reached: the attempt clamp caps the exponent first, at
 `1 h × 2^4` and `10 s × 2^8` respectively. Read the effective ceiling column, not the outer bound.
@@ -162,6 +163,10 @@ Two consequences worth internalising:
   attempt succeeds.
 
 Archive disconnects are far more forgiving: 50 per tick with a 10-second initial backoff.
+
+Expired move receipts are retention cleanup, not retry work. Each pass deletes up to ten batches of
+1000 rows. Reaching that catch-up limit emits a warning because expired rows may remain; a sustained
+expiration rate above 10000 receipts per hour will outgrow the configured cleanup capacity.
 
 ## Security headers
 
