@@ -326,6 +326,7 @@ describe("D1 migrations", () => {
       ).bind(timestamp, timestamp),
       ...[
         ["bare", JSON.stringify(page)],
+        ["non-object", "[]"],
         ["versioned", JSON.stringify(versioned)],
         ["malformed", "{"],
       ].map(([operationId, responseJson]) =>
@@ -345,6 +346,7 @@ describe("D1 migrations", () => {
     expect(receipts.results.map(({ operation_id, response_json }) => [operation_id, response_json])).toEqual([
       ["bare", JSON.stringify(versioned)],
       ["malformed", "{"],
+      ["non-object", "[]"],
       ["versioned", JSON.stringify(versioned)],
     ]);
   });

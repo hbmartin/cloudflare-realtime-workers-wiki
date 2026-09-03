@@ -156,11 +156,11 @@ receipt age so the hourly Worker cleanup can prune entries after seven days. App
 deploying any Worker that handles page moves or serves move-receipt lookups; every move writes a receipt,
 including moves from older browser bundles. Apply `0010` before deploying this Worker version: its
 already-configured scheduled handler prunes receipts on every run, and the index prevents a full-table scan.
-`0011_page_move_receipt_envelopes.sql` wraps receipts written in the temporary bare-page format before the
-migration runs. This Worker writes explicitly versioned receipt envelopes but continues to read bare-page
-receipts because an older Worker can still write one during a rolling deployment. Keep that fallback for at
-least the seven-day receipt-retention window after every deployed Worker writes envelopes, and verify hourly
-pruning is healthy before removing it.
+Apply `0011_page_move_receipt_envelopes.sql` before deploying this Worker version. It wraps receipts already
+written in the temporary bare-page format. This Worker writes explicitly versioned receipt envelopes but
+continues to read bare-page receipts because an older Worker can still write one during the rolling deploy.
+Keep that fallback for at least the seven-day receipt-retention window after every deployed Worker writes
+envelopes, and verify hourly pruning is healthy before removing it.
 
 Before removing the fallback, run this against every production database. A zero count makes the end of the
 compatibility window directly observable instead of relying on deployment time alone:
