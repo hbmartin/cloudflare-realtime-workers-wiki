@@ -39,7 +39,8 @@ not as an error. The fix is fewer concurrent editors on that page; there is no s
 ## HTTP error codes
 
 Responses are `{"error":{"code","message","details"}}`. Unrecognised exceptions are logged and returned
-as a bare `500 internal_error` with no detail, so an unfamiliar 500 means checking Workers Logs.
+as a bare `500 internal_error` with no detail. Expected 5xx errors that need operator attention are logged
+explicitly and listed under [Log triage](#log-triage).
 
 ### Authentication and installation
 
@@ -62,6 +63,7 @@ as a bare `500 internal_error` with no detail, so an unfamiliar 500 means checki
 | `page_cycle`                | 409    | A move would make a page its own ancestor                                                                                                                 |
 | `idempotency_key_reused`    | 409    | A page-create or page-move operation id was reused with different request content. Generate a new operation id                                            |
 | `move_not_found`            | 404    | No committed move receipt exists for that workspace, page, and operation id, including because its seven-day recovery window expired                      |
+| `page_move_unresolved`      | 503    | D1 could not determine whether an operation-id-keyed move committed. Retry with the same operation id; do not generate a replacement id                   |
 | `archive_first`             | 409    | Permanent deletion attempted on a page that is not archived                                                                                               |
 | `page_archived`             | 409    | A receipt-backed page-create replay or concurrent page move targeted an archived page; restore it, permanently delete it, or retry against an active page |
 | `upload_too_large`          | 413    | Over 10 MiB on the single-shot form route, or over 10 GiB on a multipart upload                                                                           |
@@ -154,11 +156,12 @@ than misreported as a conflict.
 `table_revision_failed` means the invariant did not hold. It is not a transient error and retrying will
 not help. Escalate it.
 
-It is the one client-facing error the Worker also logs. Expected errors are otherwise never logged, so
-without that line this branch would be invisible: there is no metric carrying the response code. Search
-Workers Logs for `Table revision could not be advanced`, which carries the page id, the revision the
-caller expected, the revision actually stored, and whether the lease was still valid. The lease token
-and session id are deliberately omitted; they authenticate the caller.
+The Worker logs this client-facing error explicitly. Expected errors are normally not logged, but 5xx
+responses that need operator attention, including `page_move_unresolved`, are explicit exceptions because
+there is no metric carrying the response code. Search Workers Logs for `Table revision could not be
+advanced`, which carries the page id, the revision the caller expected, the revision actually stored, and
+whether the lease was still valid. The lease token and session id are deliberately omitted; they
+authenticate the caller.
 
 Classification depends only on `meta.changes` from the batch results and the read-back row, not on any
 D1 error message, so a change to D1's error formatting cannot degrade a `404` into a generic `500`.
@@ -168,30 +171,31 @@ D1 error message, so a change to D1's error formatting cannot degrade a `404` in
 Logging is unstructured. There is no request-id correlation, so triage is by message string in the
 Workers Logs search box.
 
-| Message                                                       | Meaning                                                                                                                                                           |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Scheduled deletion cleanup failed`                           | The hourly deletion pass threw. Check `deletion_jobs`                                                                                                             |
-| `Scheduled archive disconnect failed`                         | The hourly archive pass threw. Check `archive_disconnect_targets`                                                                                                 |
-| `Failed to prune page move receipts`                          | The hourly seven-day move-receipt retention pass threw. Check D1 availability and the `page_move_receipts` index                                                  |
-| `Page move receipt pruning reached its hourly catch-up limit` | Ten batches deleted 10000 expired receipts, but more may remain. Check the expired-row count and whether move volume is staying above the hourly cleanup capacity |
-| `Immediate deletion cleanup failed`                           | The inline attempt during a delete request failed. The cron will retry                                                                                            |
-| `Failed to discard staged deletion job`                       | A permanent delete failed _and_ its rollback failed. Inspect `deletion_jobs` for an orphan                                                                        |
-| `Failed to reschedule archive disconnect`                     | Backoff could not be persisted. The row may retry sooner than intended                                                                                            |
-| `Document restore failed`                                     | A version restore threw. The room stays read-only until reconciled                                                                                                |
-| `Document restore validation failed`                          | The version row or its R2 object could not be read. Nothing was staged, so **nothing retries**; the user must restore again                                       |
-| `Table revision could not be advanced`                        | A table mutation applied but its revision update did not, which the batch cannot produce. Carries the page and both revisions. Not transient                      |
-| `Failed to confirm restore commit state`                      | Restore could not determine whether it committed. Left pending for the alarm                                                                                      |
-| `Failed to reconcile pending document restore`                | A pending restore retried and failed again. Repeats on the backoff below, not in a hot loop                                                                       |
-| `Failed to record restore reconciliation attempt`             | The backoff counter could not be persisted. The next retry may come sooner than intended                                                                          |
-| `Failed to schedule restore reconciliation`                   | The retry alarm could not be armed. The room stays read-only until a request wakes it                                                                             |
-| `Failed to prune document versions`                           | Version retention did not run. Storage grows; not urgent                                                                                                          |
-| `Failed to broadcast workspace event`                         | A page-tree or projection event was dropped. Clients recover on reconnect                                                                                         |
-| `Failed to broadcast projection update`                       | Same, from the document side                                                                                                                                      |
-| `Failed to schedule compaction retry`                         | The compaction alarm could not be re-armed. The room may stay dirty                                                                                               |
-| `Failed to resume document alarm after transition`            | Alarm re-arm failed after archive, restore, or purge                                                                                                              |
-| `Failed to persist retired document state`                    | An epoch could not be marked retired                                                                                                                              |
-| `Failed to handle document party request for <room>`          | An unexpected failure on a `/parties/document/*` upgrade. The room is a validated `<pageId>~<epoch>`, or `an undecoded room` when the failure preceded validation |
-| `Failed to handle workspace-events party request for <room>`  | The same for a `/parties/workspace-events/*` upgrade                                                                                                              |
+| Message                                                            | Meaning                                                                                                                                                                        |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Scheduled deletion cleanup failed`                                | The hourly deletion pass threw. Check `deletion_jobs`                                                                                                                          |
+| `Scheduled archive disconnect failed`                              | The hourly archive pass threw. Check `archive_disconnect_targets`                                                                                                              |
+| `Failed to prune page move receipts`                               | The hourly seven-day move-receipt retention pass threw. Check D1 availability and the `page_move_receipts` index                                                               |
+| `Page move receipt pruning reached its hourly catch-up limit`      | Ten batches deleted 10000 expired receipts, but more may remain. Check the expired-row count and whether move volume is staying above the hourly cleanup capacity              |
+| `The page move failed and its committed receipt could not be read` | A move returned `503 page_move_unresolved` because D1 could not resolve its receipt. The log carries flattened move and replay error details; retry with the same operation id |
+| `Immediate deletion cleanup failed`                                | The inline attempt during a delete request failed. The cron will retry                                                                                                         |
+| `Failed to discard staged deletion job`                            | A permanent delete failed _and_ its rollback failed. Inspect `deletion_jobs` for an orphan                                                                                     |
+| `Failed to reschedule archive disconnect`                          | Backoff could not be persisted. The row may retry sooner than intended                                                                                                         |
+| `Document restore failed`                                          | A version restore threw. The room stays read-only until reconciled                                                                                                             |
+| `Document restore validation failed`                               | The version row or its R2 object could not be read. Nothing was staged, so **nothing retries**; the user must restore again                                                    |
+| `Table revision could not be advanced`                             | A table mutation applied but its revision update did not, which the batch cannot produce. Carries the page and both revisions. Not transient                                   |
+| `Failed to confirm restore commit state`                           | Restore could not determine whether it committed. Left pending for the alarm                                                                                                   |
+| `Failed to reconcile pending document restore`                     | A pending restore retried and failed again. Repeats on the backoff below, not in a hot loop                                                                                    |
+| `Failed to record restore reconciliation attempt`                  | The backoff counter could not be persisted. The next retry may come sooner than intended                                                                                       |
+| `Failed to schedule restore reconciliation`                        | The retry alarm could not be armed. The room stays read-only until a request wakes it                                                                                          |
+| `Failed to prune document versions`                                | Version retention did not run. Storage grows; not urgent                                                                                                                       |
+| `Failed to broadcast workspace event`                              | A page-tree or projection event was dropped. Clients recover on reconnect                                                                                                      |
+| `Failed to broadcast projection update`                            | Same, from the document side                                                                                                                                                   |
+| `Failed to schedule compaction retry`                              | The compaction alarm could not be re-armed. The room may stay dirty                                                                                                            |
+| `Failed to resume document alarm after transition`                 | Alarm re-arm failed after archive, restore, or purge                                                                                                                           |
+| `Failed to persist retired document state`                         | An epoch could not be marked retired                                                                                                                                           |
+| `Failed to handle document party request for <room>`               | An unexpected failure on a `/parties/document/*` upgrade. The room is a validated `<pageId>~<epoch>`, or `an undecoded room` when the failure preceded validation              |
+| `Failed to handle workspace-events party request for <room>`       | The same for a `/parties/workspace-events/*` upgrade                                                                                                                           |
 
 ### A restore returned 503
 
