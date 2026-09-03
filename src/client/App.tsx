@@ -212,8 +212,9 @@ function observedExpectedMove(result: PageLoadResult, expectation: PageMutationE
   if (movedIndex < 0) return null;
   const siblingIndexes = new Map(siblings.map((page, index) => [page.id, index]));
   const beforeIndex = beforeId === null ? -1 : (siblingIndexes.get(beforeId) ?? -1);
-  if (beforeIndex >= 0 && movedIndex >= beforeIndex) return null;
   const afterIndex = afterId === null ? -1 : (siblingIndexes.get(afterId) ?? -1);
+  if ((beforeId !== null || afterId !== null) && beforeIndex < 0 && afterIndex < 0) return null;
+  if (beforeIndex >= 0 && movedIndex >= beforeIndex) return null;
   if (afterIndex >= 0 && movedIndex <= afterIndex) return null;
   if (
     beforeId === null &&
@@ -1531,14 +1532,21 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       }
       return null;
     }
+    let verifiedObservation: PageLoadResult | null = null;
+    let verifiedMove: Page | null = null;
+    const moveIn = (result: PageLoadResult) => {
+      if (result !== verifiedObservation) {
+        verifiedObservation = result;
+        verifiedMove = observedExpectedMove(result, expectation);
+      }
+      return verifiedMove;
+    };
     const observation = await reconcileWithOneRetry(
       () => reconcilePages(signal),
-      (result) =>
-        result === null || archiveRemovalTombstones.has(pageId) || observedExpectedMove(result, expectation) === null,
+      (result) => result === null || archiveRemovalTombstones.has(pageId) || moveIn(result) === null,
       signal,
     );
-    const moved =
-      observation && !archiveRemovalTombstones.has(pageId) && observedExpectedMove(observation, expectation);
+    const moved = observation && !archiveRemovalTombstones.has(pageId) && moveIn(observation);
     if (moved) {
       clearWorkspaceErrors(attempt);
       return moved;

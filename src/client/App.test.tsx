@@ -1172,8 +1172,9 @@ describe("App error handling", () => {
     );
   });
 
-  it("accepts a reconciled move after its referenced neighbor leaves the sibling list", async () => {
+  it("accepts a reconciled move when one of two referenced neighbors leaves the sibling list", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const thirdPage = { ...page, id: "third-page", position: "d0", title: "Third" };
     const movedPage = { ...page, position: "c0", revision: 2 };
     const departedNeighbor = { ...secondPage, parentId: "another-parent", revision: 2 };
     const operationId = "00000000-0000-4000-8000-000000000016";
@@ -1189,7 +1190,7 @@ describe("App error handling", () => {
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return { pages: treeLoads === 1 ? [page, secondPage] : [movedPage, departedNeighbor] };
+        return { pages: treeLoads === 1 ? [page, secondPage, thirdPage] : [movedPage, departedNeighbor, thirdPage] };
       }
       if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
       if (path === `/api/pages/${page.id}/moves/${operationId}`) {
@@ -1211,6 +1212,51 @@ describe("App error handling", () => {
       expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument(),
     );
     expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
+  });
+
+  it("does not verify a reconciled move after every referenced neighbor leaves the sibling list", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const thirdPage = { ...page, id: "third-page", position: "d0", title: "Third" };
+    const movedPage = { ...page, position: "c0", revision: 2 };
+    const departedSecondPage = { ...secondPage, parentId: "another-parent", revision: 2 };
+    const departedThirdPage = { ...thirdPage, parentId: "another-parent", revision: 2 };
+    const operationId = "00000000-0000-4000-8000-000000000019";
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(operationId);
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    let receiptLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return {
+          pages: treeLoads === 1 ? [page, secondPage, thirdPage] : [movedPage, departedSecondPage, departedThirdPage],
+        };
+      }
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      if (path === `/api/pages/${page.id}/moves/${operationId}`) {
+        receiptLoads += 1;
+        throw new ApiClientError(503, "receipt_unavailable", "Receipt lookup unavailable.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const navigation = await screen.findByRole("complementary", { name: "Workspace navigation" });
+    const pageLink = (await within(navigation).findByText("Roadmap")).closest("button");
+    if (!pageLink) throw new Error("The page navigation button was not rendered.");
+    fireEvent.keyDown(pageLink, { altKey: true, key: "ArrowDown" });
+
+    expect(
+      await screen.findByText("The page-movement result could not be verified after checking the server receipt."),
+    ).toBeInTheDocument();
+    expect(receiptLoads).toBe(2);
+    expect(treeLoads).toBe(3);
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledTimes(2);
   });
 
   it("accepts a reconciled move when a concurrent sibling is interposed beside it", async () => {
