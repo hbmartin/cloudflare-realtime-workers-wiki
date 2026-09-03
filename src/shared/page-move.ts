@@ -1,0 +1,2 @@
+export const PAGE_MOVE_RECEIPT_VERSION = 1;
+export const PAGE_MOVE_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60_000;

@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
+import { PAGE_MOVE_RECEIPT_VERSION } from "../shared/page-move";
 import { TABLE_BULK_MAX_ROWS } from "../shared/table-limits";
 import type { Page, TableData, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { processDueUploadReaps } from "./attachments";
@@ -845,46 +846,6 @@ describe("Worker integration", () => {
     });
   });
 
-  it("retries lifecycle broadcasts rejected by a busy delivery queue", async () => {
-    const workspaceId = crypto.randomUUID();
-    const event: WorkspaceEvent = { type: "pages-removed", pageIds: [crypto.randomUUID()], permanently: false };
-    const delivered: WorkspaceEvent[] = [];
-    let attempts = 0;
-    let stubs = 0;
-    const workspaceEvents = {
-      getByName(requestedWorkspaceId: string) {
-        expect(requestedWorkspaceId).toBe(workspaceId);
-        stubs += 1;
-        return {
-          async fetch(request: Request) {
-            attempts += 1;
-            expect(request.headers.get("x-notes-internal")).toBe(env.BETTER_AUTH_SECRET);
-            delivered.push((await request.json()) as WorkspaceEvent);
-            return attempts < 3
-              ? Response.json({ error: "Workspace event delivery is busy." }, { status: 503 })
-              : Response.json({ delivered: true });
-          },
-        };
-      },
-    } as unknown as Env["WORKSPACE_EVENTS"];
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
-        return Reflect.get(target, property, receiver);
-      },
-    });
-    const random = vi.spyOn(Math, "random").mockReturnValue(0);
-    try {
-      await broadcastWorkspaceEvent(bindings, workspaceId, event);
-    } finally {
-      random.mockRestore();
-    }
-
-    expect(attempts).toBe(3);
-    expect(stubs).toBe(3);
-    expect(delivered).toEqual([event, event, event]);
-  });
-
   it("does not retry an ambiguous thrown workspace-event delivery", async () => {
     const workspaceId = crypto.randomUUID();
     const overloaded = Object.assign(new Error("Durable Object is overloaded."), {
@@ -915,6 +876,38 @@ describe("Worker integration", () => {
     expect(stubs).toBe(1);
   });
 
+  it("reports an accepted workspace-event delivery that was deferred to resync", async () => {
+    const workspaceId = crypto.randomUUID();
+    const workspaceEvents = {
+      getByName() {
+        return {
+          fetch: async () => Response.json({ delivered: false, resyncScheduled: true }, { status: 202 }),
+        };
+      },
+    } as unknown as Env["WORKSPACE_EVENTS"];
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      await broadcastWorkspaceEvent(bindings, workspaceId, {
+        type: "pages-removed",
+        pageIds: [crypto.randomUUID()],
+        permanently: false,
+      });
+
+      expect(warn).toHaveBeenCalledWith("Workspace event delivery deferred to an authoritative resync.", {
+        workspaceId,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("collapses an overflowing lifecycle queue into one workspace invalidation", async () => {
     const installed = await bootstrap();
     const stub = env.WORKSPACE_EVENTS.getByName(installed.workspaceId);
@@ -928,6 +921,14 @@ describe("Worker integration", () => {
       const broadcast = vi
         .spyOn(workspaceEvents, "broadcastCustomMessage")
         .mockImplementation((message) => void delivered.push(JSON.parse(message) as WorkspaceEvent));
+      const close = vi.fn();
+      const testEvents = workspaceEvents as unknown as {
+        getConnections(): Array<{ close(code: number, reason: string): void }>;
+        queuedDeliveries: number;
+      };
+      const originalGetConnections = testEvents.getConnections;
+      testEvents.getConnections = () => [{ close }];
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
       const request = () =>
         workspaceEvents.onRequest(
           new Request("https://workspace-events.internal/broadcast", {
@@ -938,16 +939,86 @@ describe("Worker integration", () => {
         );
 
       try {
-        const queue = workspaceEvents as unknown as { queuedDeliveries: number };
-        queue.queuedDeliveries = 128;
+        testEvents.queuedDeliveries = 128;
         const overflow = await request();
         expect(overflow.status).toBe(202);
         expect(await overflow.json()).toEqual({ delivered: false, resyncScheduled: true });
 
-        queue.queuedDeliveries = 0;
+        testEvents.queuedDeliveries = 0;
         expect((await request()).status).toBe(200);
         expect(delivered).toEqual([{ type: "pages-upserted", pages: [activePage] }, { type: "workspace-invalidated" }]);
+        expect(warn).toHaveBeenCalledOnce();
+        expect(close).toHaveBeenCalledWith(1012, "Workspace refresh required.");
       } finally {
+        warn.mockRestore();
+        testEvents.getConnections = originalGetConnections;
+        broadcast.mockRestore();
+      }
+    });
+  });
+
+  it("falls back to workspace invalidation when a lifecycle state check fails", async () => {
+    const installed = await bootstrap();
+    const stub = env.WORKSPACE_EVENTS.getByName(installed.workspaceId);
+    const activePage = (
+      await (await SELF.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree"))).json<{ pages: Page[] }>()
+    ).pages[0]!;
+
+    await runInDurableObject(stub, async (instance) => {
+      const delivered: WorkspaceEvent[] = [];
+      const workspaceEvents = instance as WorkspaceEvents;
+      const broadcast = vi
+        .spyOn(workspaceEvents, "broadcastCustomMessage")
+        .mockImplementation((message) => void delivered.push(JSON.parse(message) as WorkspaceEvent));
+      const close = vi.fn();
+      const failure = new Error("D1 unavailable");
+      const testEvents = workspaceEvents as unknown as {
+        bindings: Env;
+        getConnections(): Array<{ close(code: number, reason: string): void }>;
+      };
+      const originalBindings = testEvents.bindings;
+      const originalGetConnections = testEvents.getConnections;
+      testEvents.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property === "DB") {
+            return new Proxy(target.DB, {
+              get(database, databaseProperty, databaseReceiver) {
+                if (databaseProperty === "prepare") {
+                  return () => {
+                    throw failure;
+                  };
+                }
+                return Reflect.get(database, databaseProperty, databaseReceiver);
+              },
+            });
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      testEvents.getConnections = () => [{ close }];
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      try {
+        const response = await workspaceEvents.onRequest(
+          new Request("https://workspace-events.internal/broadcast", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+            body: JSON.stringify({ type: "pages-upserted", pages: [activePage] }),
+          }),
+        );
+
+        expect(response.status).toBe(202);
+        expect(await response.json()).toEqual({ delivered: false, resyncScheduled: true });
+        expect(delivered).toEqual([{ type: "workspace-invalidated" }]);
+        expect(close).toHaveBeenCalledWith(1012, "Workspace refresh required.");
+        expect(error).toHaveBeenCalledWith("Workspace event state check failed; scheduling workspace invalidation.", {
+          workspaceId: installed.workspaceId,
+          error: failure,
+        });
+      } finally {
+        error.mockRestore();
+        testEvents.getConnections = originalGetConnections;
+        testEvents.bindings = originalBindings;
         broadcast.mockRestore();
       }
     });
@@ -1002,6 +1073,11 @@ describe("Worker integration", () => {
           { delivered: false },
           { delivered: true },
         ]);
+        const premature = await request({
+          type: "pages-upserted",
+          pages: [{ ...activePage, revision: activePage.revision + 1 }],
+        });
+        expect(await premature.json()).toEqual({ delivered: true });
         await env.DB.prepare("UPDATE pages SET revision = revision + 1 WHERE id = ?").bind(installed.pageId).run();
         const superseded = await request({
           type: "pages-upserted",
@@ -1015,6 +1091,12 @@ describe("Worker integration", () => {
           { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
           { type: "pages-upserted", pages: [activePage] },
           { type: "workspace-invalidated" },
+          {
+            type: "pages-upserted",
+            pages: [activePage, activeChild],
+            restored: true,
+            restoredRootId: activePage.id,
+          },
         ]);
       } finally {
         broadcast.mockRestore();
@@ -3526,7 +3608,7 @@ describe("Worker integration", () => {
           method: "POST",
           headers: {
             "content-type": "application/json",
-            ...(requestedOperationId ? { "x-notes-operation-id": requestedOperationId } : {}),
+            ...(requestedOperationId === null ? {} : { "x-notes-operation-id": requestedOperationId }),
           },
           body: JSON.stringify(body),
         }),
@@ -3566,6 +3648,22 @@ describe("Worker integration", () => {
       operationId: expect.any(String),
       replayed: false,
       page: { id: installed.pageId, revision: 4 },
+    });
+
+    const emptyOperationIdMove = await move("");
+    expect(emptyOperationIdMove.status).toBe(200);
+    expect(await emptyOperationIdMove.json()).toMatchObject({
+      operationId: expect.any(String),
+      replayed: false,
+      page: { id: installed.pageId, revision: 5 },
+    });
+
+    const whitespaceOperationIdMove = await move("   ");
+    expect(whitespaceOperationIdMove.status).toBe(200);
+    expect(await whitespaceOperationIdMove.json()).toMatchObject({
+      operationId: expect.any(String),
+      replayed: false,
+      page: { id: installed.pageId, revision: 6 },
     });
   });
 
@@ -3649,10 +3747,26 @@ describe("Worker integration", () => {
       return SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`));
     };
 
-    expect((await receipt(movedPage)).status).toBe(200);
-    expect((await receipt({ id: 123 })).status).toBe(500);
-    expect((await receipt({ ...movedPage, id: crypto.randomUUID() })).status).toBe(500);
-    expect((await receipt({ ...movedPage, workspaceId: crypto.randomUUID() })).status).toBe(500);
+    expect((await receipt(movedPage)).status).toBe(500);
+    expect((await receipt({ pageMoveReceiptVersion: 2, page: movedPage })).status).toBe(500);
+    expect((await receipt({ pageMoveReceiptVersion: PAGE_MOVE_RECEIPT_VERSION, page: movedPage })).status).toBe(200);
+    expect((await receipt({ pageMoveReceiptVersion: PAGE_MOVE_RECEIPT_VERSION, page: { id: 123 } })).status).toBe(500);
+    expect(
+      (
+        await receipt({
+          pageMoveReceiptVersion: PAGE_MOVE_RECEIPT_VERSION,
+          page: { ...movedPage, id: crypto.randomUUID() },
+        })
+      ).status,
+    ).toBe(500);
+    expect(
+      (
+        await receipt({
+          pageMoveReceiptVersion: PAGE_MOVE_RECEIPT_VERSION,
+          page: { ...movedPage, workspaceId: crypto.randomUUID() },
+        })
+      ).status,
+    ).toBe(500);
   });
 
   it("prunes expired page move receipts while retaining the active recovery window", async () => {

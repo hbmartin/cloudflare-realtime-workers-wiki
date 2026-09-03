@@ -114,8 +114,10 @@ describe("page state reconciliation", () => {
     const tombstones = new PageRemovalTombstones();
     tombstones.pin(["removed"], 1);
 
+    expect(tombstones.hasEntries()).toBe(true);
     expect(tombstones.applyLoad(new Set(), 2)).toEqual(new Set(["removed"]));
     expect(tombstones.has("removed")).toBe(false);
+    expect(tombstones.hasEntries()).toBe(false);
     expect(tombstones.applyLoad(new Set(), 3)).toEqual(new Set());
   });
 

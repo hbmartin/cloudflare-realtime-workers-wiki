@@ -8,6 +8,10 @@ export function reconciliationRetryDelay() {
   return jitteredInterval(750, 250);
 }
 
+export function workspaceInvalidationRetryDelay(attempt: number) {
+  return jitteredBackoff(attempt, 1_000, 30_000);
+}
+
 export function observeUntilAborted<T>(promise: Promise<T>, signal: AbortSignal) {
   if (signal.aborted) {
     void promise.catch(() => undefined);
@@ -30,7 +34,7 @@ export function observeUntilAborted<T>(promise: Promise<T>, signal: AbortSignal)
   });
 }
 
-export function waitForReconciliationRetry(signal?: AbortSignal) {
+function waitForDelay(delay: number, signal?: AbortSignal) {
   return new Promise<void>((resolve) => {
     if (signal?.aborted) {
       resolve();
@@ -40,11 +44,19 @@ export function waitForReconciliationRetry(signal?: AbortSignal) {
       signal?.removeEventListener("abort", cancel);
       resolve();
     };
-    const timeout = window.setTimeout(finish, reconciliationRetryDelay());
+    const timeout = window.setTimeout(finish, delay);
     const cancel = () => {
       window.clearTimeout(timeout);
       finish();
     };
     signal?.addEventListener("abort", cancel, { once: true });
   });
+}
+
+export function waitForReconciliationRetry(signal?: AbortSignal) {
+  return waitForDelay(reconciliationRetryDelay(), signal);
+}
+
+export function waitForWorkspaceInvalidationRetry(attempt: number, signal?: AbortSignal) {
+  return waitForDelay(workspaceInvalidationRetryDelay(attempt), signal);
 }

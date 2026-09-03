@@ -16,10 +16,13 @@ const mocks = vi.hoisted(() => ({
     provider: {},
   })),
   editorAction: vi.fn(),
+  editorRender: vi.fn(),
+  invalidateAllPagePreviews: vi.fn(),
   invalidatePagePreview: vi.fn(),
   signInEmail: vi.fn(),
   signOut: vi.fn(),
   waitForReconciliationRetry: vi.fn(),
+  waitForWorkspaceInvalidationRetry: vi.fn(),
 }));
 
 vi.mock("./api", async (importOriginal) => {
@@ -37,17 +40,20 @@ vi.mock("./api", async (importOriginal) => {
 vi.mock("./collaboration", () => ({ createWorkspaceEvents: mocks.createWorkspaceEvents }));
 vi.mock("./mentions", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./mentions")>()),
+  invalidateAllPagePreviews: mocks.invalidateAllPagePreviews,
   invalidatePagePreview: mocks.invalidatePagePreview,
 }));
 vi.mock("./retry", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./retry")>()),
   waitForReconciliationRetry: mocks.waitForReconciliationRetry,
+  waitForWorkspaceInvalidationRetry: mocks.waitForWorkspaceInvalidationRetry,
 }));
 
 vi.mock("./EditorPage", () => ({
-  EditorPage: (props: EditorPageProps) => (
-    <button onClick={() => mocks.editorAction(props)}>Simulate document access denial</button>
-  ),
+  EditorPage: (props: EditorPageProps) => {
+    mocks.editorRender(props);
+    return <button onClick={() => mocks.editorAction(props)}>Simulate document access denial</button>;
+  },
 }));
 
 vi.mock("./TablePage", () => ({ TablePage: () => null }));
@@ -135,11 +141,15 @@ describe("App error handling", () => {
     vi.mocked(api).mockReset();
     mocks.createWorkspaceEvents.mockClear();
     mocks.editorAction.mockReset();
+    mocks.editorRender.mockReset();
+    mocks.invalidateAllPagePreviews.mockReset();
     mocks.invalidatePagePreview.mockReset();
     mocks.signInEmail.mockReset();
     mocks.signOut.mockReset();
     mocks.waitForReconciliationRetry.mockReset();
     mocks.waitForReconciliationRetry.mockResolvedValue(undefined);
+    mocks.waitForWorkspaceInvalidationRetry.mockReset();
+    mocks.waitForWorkspaceInvalidationRetry.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -1157,7 +1167,94 @@ describe("App error handling", () => {
     await waitFor(() => expect(receiptLoads).toBe(2));
     await waitFor(() => expect(treeLoads).toBe(2));
     expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
-    expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument(),
+    );
+  });
+
+  it("accepts a reconciled move after its referenced neighbor leaves the sibling list", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const movedPage = { ...page, position: "c0", revision: 2 };
+    const departedNeighbor = { ...secondPage, parentId: "another-parent", revision: 2 };
+    const operationId = "00000000-0000-4000-8000-000000000016";
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(operationId);
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    let receiptLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page, secondPage] : [movedPage, departedNeighbor] };
+      }
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      if (path === `/api/pages/${page.id}/moves/${operationId}`) {
+        receiptLoads += 1;
+        throw new ApiClientError(503, "receipt_unavailable", "Receipt lookup unavailable.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const navigation = await screen.findByRole("complementary", { name: "Workspace navigation" });
+    const pageLink = (await within(navigation).findByText("Roadmap")).closest("button");
+    if (!pageLink) throw new Error("The page navigation button was not rendered.");
+    fireEvent.keyDown(pageLink, { altKey: true, key: "ArrowDown" });
+
+    await waitFor(() => expect(receiptLoads).toBe(2));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    await waitFor(() =>
+      expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument(),
+    );
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
+  });
+
+  it("accepts a reconciled move when a concurrent sibling is interposed beside it", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const thirdPage = { ...page, id: "third-page", position: "d0", title: "Third" };
+    const interposedPage = { ...page, id: "interposed-page", position: "b5", title: "Interposed" };
+    const movedPage = { ...page, position: "c0", revision: 2 };
+    const operationId = "00000000-0000-4000-8000-000000000017";
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(operationId);
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    let receiptLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return {
+          pages: treeLoads === 1 ? [page, secondPage, thirdPage] : [secondPage, interposedPage, movedPage, thirdPage],
+        };
+      }
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      if (path === `/api/pages/${page.id}/moves/${operationId}`) {
+        receiptLoads += 1;
+        throw new ApiClientError(503, "receipt_unavailable", "Receipt lookup unavailable.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const navigation = await screen.findByRole("complementary", { name: "Workspace navigation" });
+    const pageLink = (await within(navigation).findByText("Roadmap")).closest("button");
+    if (!pageLink) throw new Error("The page navigation button was not rendered.");
+    fireEvent.keyDown(pageLink, { altKey: true, key: "ArrowDown" });
+
+    await waitFor(() => expect(receiptLoads).toBe(2));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    await waitFor(() =>
+      expect(screen.queryByText(/page-movement response|page-movement result/i)).not.toBeInTheDocument(),
+    );
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
   });
 
   it("times out stalled move-receipt checks before falling back to the page tree", async () => {
@@ -1217,7 +1314,7 @@ describe("App error handling", () => {
     ).toBeInTheDocument();
   });
 
-  it("keeps an uncertain append warning when unrelated moves change its page and stale tail anchor", async () => {
+  it("reports an uncertain move as not committed after two fresh missing receipts", async () => {
     const remainingPage = { ...page, id: "remaining-page", position: "m0", title: "Remaining" };
     const tailPage = { ...page, id: "tail-page", position: "z0", title: "Tail" };
     const unrelatedMove = { ...page, position: "b0", revision: 2 };
@@ -1253,16 +1350,52 @@ describe("App error handling", () => {
     if (!treeRoot) throw new Error("The page tree root was not rendered.");
     fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
 
-    expect(
-      await screen.findByText("The page-movement result could not be verified after checking the server receipt."),
-    ).toBeInTheDocument();
-    expect(treeLoads).toBe(3);
+    expect(await screen.findByText("The page was not moved.")).toBeInTheDocument();
+    expect(treeLoads).toBe(2);
     expect(receiptLoads).toBe(2);
-    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledTimes(2);
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
     expect(reported).toHaveBeenCalledWith(
       "Page movement result could not be verified",
       expect.objectContaining({ operationId, outcome: "uncertain", pageId: page.id }),
     );
+  });
+
+  it("keeps a missing-receipt result uncertain when the page was concurrently deleted", async () => {
+    const operationId = "00000000-0000-4000-8000-000000000018";
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(operationId);
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => randomUUID.mockRestore());
+    onTestFinished(() => reported.mockRestore());
+    let treeLoads = 0;
+    let receiptLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page] : [] };
+      }
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") throw new TypeError("Failed to fetch");
+      if (path === `/api/pages/${page.id}/moves/${operationId}`) {
+        receiptLoads += 1;
+        throw new ApiClientError(404, "move_not_found", "Move receipt not found.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    const treeRoot = document.querySelector(".tree-root");
+    if (!treeRoot) throw new Error("The page tree root was not rendered.");
+    fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
+
+    expect(
+      await screen.findByText("The page-movement result could not be verified after checking the server receipt."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("The page was not moved.")).not.toBeInTheDocument();
+    expect(treeLoads).toBe(2);
+    expect(receiptLoads).toBe(2);
   });
 
   it("keeps failures from overlapping create and move attempts", async () => {
@@ -2344,6 +2477,93 @@ describe("App error handling", () => {
     await waitFor(() => expect(treeLoads).toBe(3));
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
     expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
+  });
+
+  it("invalidates derived page data when the workspace must be resynced", async () => {
+    let treeLoads = 0;
+    let unreadLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") {
+        unreadLoads += 1;
+        return { unreadCount: 0 };
+      }
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    await waitFor(() => expect(unreadLoads).toBe(1));
+    await waitFor(() => expect(mocks.editorRender).toHaveBeenCalled());
+    mocks.editorRender.mockClear();
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+
+    await waitFor(() => expect(treeLoads).toBe(2));
+    await waitFor(() => expect(unreadLoads).toBe(2));
+    expect(mocks.invalidateAllPagePreviews).toHaveBeenCalledOnce();
+    expect(mocks.editorRender.mock.calls.at(-1)?.[0]).toMatchObject({ backlinksRevision: 1 });
+    expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the archived tree when an invalidation arrives while trash is visible", async () => {
+    const archivedPage = { ...page, id: "archived-page", title: "Archived", archivedAt: 2 };
+    let treeLoads = 0;
+    let trashLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
+      if (path === "/api/pages/tree?archived=true") {
+        trashLoads += 1;
+        return { pages: trashLoads === 1 ? [archivedPage] : [] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    expect(await screen.findByText("Archived")).toBeInTheDocument();
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+
+    await waitFor(() => expect(trashLoads).toBe(2));
+    await waitFor(() => expect(screen.queryByText("Archived")).not.toBeInTheDocument());
+    await waitFor(() => expect(treeLoads).toBe(2));
+  });
+
+  it("keeps retrying an invalidated workspace until a tree observation succeeds", async () => {
+    const refreshedPage = { ...page, title: "Refreshed", revision: 2 };
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) return { pages: [page] };
+        if (treeLoads <= 3) throw new ApiClientError(503, "tree_unavailable", "Tree unavailable.");
+        return { pages: [refreshedPage] };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+
+    expect(await screen.findByRole("button", { name: "Archive Refreshed" })).toBeInTheDocument();
+    await waitFor(() => expect(treeLoads).toBe(4));
+    expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
+    expect(mocks.waitForWorkspaceInvalidationRetry).toHaveBeenCalledOnce();
+    await waitFor(() => expect(screen.queryByText("Tree unavailable.")).not.toBeInTheDocument());
   });
 
   it("does not let a late upsert bypass a permanent-removal tombstone", async () => {

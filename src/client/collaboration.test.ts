@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createCollaboration } from "./collaboration";
+import { createCollaboration, createWorkspaceEvents } from "./collaboration";
 
 const mocks = vi.hoisted(() => ({
   whenSynced: new Promise<void>(() => undefined),
@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     connect: ReturnType<typeof vi.fn>;
     disconnect: ReturnType<typeof vi.fn>;
     destroy: ReturnType<typeof vi.fn>;
+    emit(event: string, value: unknown): void;
   }>,
 }));
 
@@ -51,6 +52,10 @@ vi.mock("y-partyserver/provider", () => ({
 
     off(event: string, handler: (value: unknown) => void) {
       this.handlers.get(event)?.delete(handler);
+    }
+
+    emit(event: string, value: unknown) {
+      for (const handler of this.handlers.get(event) ?? []) handler(value);
     }
   },
 }));
@@ -161,5 +166,28 @@ describe("collaboration durability barriers", () => {
     await Promise.resolve();
 
     expect(provider.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("delivers recognized workspace invalidation events", () => {
+    const onEvent = vi.fn();
+    const bundle = createWorkspaceEvents("workspace", onEvent, vi.fn());
+
+    mocks.providers[0]!.emit("custom-message", JSON.stringify({ type: "workspace-invalidated" }));
+
+    expect(onEvent).toHaveBeenCalledWith({ type: "workspace-invalidated" });
+    bundle.destroy();
+  });
+
+  it("ignores malformed and unknown workspace events", () => {
+    const onEvent = vi.fn();
+    const bundle = createWorkspaceEvents("workspace", onEvent, vi.fn());
+    const provider = mocks.providers[0]!;
+
+    provider.emit("custom-message", "not JSON");
+    provider.emit("custom-message", JSON.stringify({ type: "future-event" }));
+    provider.emit("custom-message", JSON.stringify({ type: "projection-updated", pageId: "page" }));
+
+    expect(onEvent).not.toHaveBeenCalled();
+    bundle.destroy();
   });
 });

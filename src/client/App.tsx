@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type ReactNode } from "react";
-import type { ClientMemberContext } from "../shared/types";
+import { PAGE_MOVE_RECEIPT_RETENTION_MS } from "../shared/page-move";
 import { buildTree, compareBinaryText } from "../shared/tree-model";
-import type { MentionInboxItem, Page, PageKind, PageNode, Role, WorkspaceEvent } from "../shared/types";
+import type {
+  ClientMemberContext,
+  MentionInboxItem,
+  Page,
+  PageKind,
+  PageNode,
+  Role,
+  WorkspaceEvent,
+} from "../shared/types";
 import { isPage } from "../shared/validation";
 import {
   ApiClientError,
@@ -16,7 +24,7 @@ import {
 import { createWorkspaceEvents } from "./collaboration";
 import { EditorPage } from "./EditorPage";
 import { errorMessageKey } from "./error-messages";
-import { invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
+import { invalidateAllPagePreviews, invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
 import {
   authoritativePageSnapshot,
   mergePages,
@@ -24,7 +32,7 @@ import {
   PageLoadEventBuffer,
   PageRemovalTombstones,
 } from "./page-state";
-import { observeUntilAborted, waitForReconciliationRetry } from "./retry";
+import { observeUntilAborted, waitForReconciliationRetry, waitForWorkspaceInvalidationRetry } from "./retry";
 import { LoadingSplash } from "./Splash";
 import { TablePage } from "./TablePage";
 
@@ -163,7 +171,7 @@ type PageMutationExpectation = {
   parentId: string | null;
   kind: PageKind;
   minimumRevision?: number;
-  movePlacement?: { beforeId: string | null; afterId: string | null };
+  movePlacement?: { beforeId: string | null; afterId: string | null; existingSiblingIds: string[] };
 };
 
 function matchesPageMutationExpectation(page: Page, expectation: PageMutationExpectation) {
@@ -200,11 +208,23 @@ function observedExpectedMove(result: PageLoadResult, expectation: PageMutationE
     )
     .sort((left, right) => compareBinaryText(left.position, right.position) || compareBinaryText(left.id, right.id));
   const movedIndex = siblings.findIndex((page) => page.id === moved.id);
-  const { beforeId, afterId } = expectation.movePlacement;
+  const { beforeId, afterId, existingSiblingIds } = expectation.movePlacement;
   if (movedIndex < 0) return null;
-  if (beforeId !== null && siblings[movedIndex + 1]?.id !== beforeId) return null;
-  if (afterId !== null && siblings[movedIndex - 1]?.id !== afterId) return null;
-  if (beforeId === null && afterId === null && movedIndex !== siblings.length - 1) return null;
+  const siblingIndexes = new Map(siblings.map((page, index) => [page.id, index]));
+  const beforeIndex = beforeId === null ? -1 : (siblingIndexes.get(beforeId) ?? -1);
+  if (beforeIndex >= 0 && movedIndex >= beforeIndex) return null;
+  const afterIndex = afterId === null ? -1 : (siblingIndexes.get(afterId) ?? -1);
+  if (afterIndex >= 0 && movedIndex <= afterIndex) return null;
+  if (
+    beforeId === null &&
+    afterId === null &&
+    existingSiblingIds.some((pageId) => {
+      const siblingIndex = siblingIndexes.get(pageId) ?? -1;
+      return siblingIndex >= 0 && movedIndex <= siblingIndex;
+    })
+  ) {
+    return null;
+  }
   return moved;
 }
 
@@ -984,41 +1004,59 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [loadPages],
   );
-  const refreshInvalidatedWorkspace = useCallback(() => {
-    workspaceInvalidationRefreshOwed.current = true;
-    const pending = workspaceInvalidationRefreshPromise.current;
-    if (pending) return pending;
+  const refreshInvalidatedWorkspace = useCallback(
+    function refreshInvalidatedWorkspace() {
+      workspaceInvalidationRefreshOwed.current = true;
+      const pending = workspaceInvalidationRefreshPromise.current;
+      if (pending) return pending;
 
-    const signal = workspaceAbortController.current.signal;
-    const observe = async () => {
-      try {
-        return await loadFreshPages(signal);
-      } catch (error) {
-        if (!signal.aborted) {
-          reportWorkspaceError(
-            { source: "page-tree" },
-            apiErrorMessage(error, "The invalidated workspace could not be refreshed."),
-          );
+      const signal = workspaceAbortController.current.signal;
+      const observe = async () => {
+        try {
+          await loadFreshPages(signal);
+          return true;
+        } catch (error) {
+          if (!signal.aborted) {
+            reportWorkspaceError(
+              { source: "page-tree" },
+              apiErrorMessage(error, "The invalidated workspace could not be refreshed."),
+            );
+          }
+          return false;
         }
-        return null;
-      }
-    };
-    let refresh!: Promise<void>;
-    refresh = (async () => {
-      while (workspaceInvalidationRefreshOwed.current && !signal.aborted) {
-        workspaceInvalidationRefreshOwed.current = false;
-        // Two post-invalidation observations also release archive tombstones
-        // when the dropped lifecycle event was a restore.
-        await reconcileWithOneRetry(observe, () => true, signal);
-      }
-    })().finally(() => {
-      if (workspaceInvalidationRefreshPromise.current === refresh) {
-        workspaceInvalidationRefreshPromise.current = null;
-      }
-    });
-    workspaceInvalidationRefreshPromise.current = refresh;
-    return refresh;
-  }, [loadFreshPages, reportWorkspaceError]);
+      };
+      let retryAttempt = 0;
+      let refresh!: Promise<void>;
+      refresh = (async () => {
+        while (workspaceInvalidationRefreshOwed.current && !signal.aborted) {
+          workspaceInvalidationRefreshOwed.current = false;
+          let successfulObservations = 0;
+          await reconcileWithOneRetry(
+            async () => {
+              const succeeded = await observe();
+              if (succeeded) successfulObservations += 1;
+              return succeeded;
+            },
+            (succeeded) => !succeeded || archiveRemovalTombstones.hasEntries(),
+            signal,
+          );
+          if (!signal.aborted && (successfulObservations === 0 || archiveRemovalTombstones.hasEntries())) {
+            workspaceInvalidationRefreshOwed.current = true;
+            await waitForWorkspaceInvalidationRetry(retryAttempt++, signal);
+          } else {
+            retryAttempt = 0;
+          }
+        }
+      })().finally(() => {
+        if (workspaceInvalidationRefreshPromise.current === refresh) {
+          workspaceInvalidationRefreshPromise.current = null;
+        }
+      });
+      workspaceInvalidationRefreshPromise.current = refresh;
+      return refresh;
+    },
+    [archiveRemovalTombstones, loadFreshPages, reportWorkspaceError],
+  );
   const ensureTrashTreeRefresh = useCallback(() => {
     const pending = trashTreeRefreshPromise.current;
     if (pending) return pending;
@@ -1276,6 +1314,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
       if (event.type === "workspace-invalidated") {
+        invalidateAllPagePreviews();
+        setBacklinksRevision((current) => current + 1);
+        refreshTrash();
+        void loadUnreadMentions();
         void refreshInvalidatedWorkspace();
         return;
       }
@@ -1441,6 +1483,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     signal: AbortSignal,
     pageId: string,
     operationId: string,
+    operationStartedAt: number,
     expectation: PageMutationExpectation,
     unresolvedMessage: string,
   ) {
@@ -1470,6 +1513,23 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       mergePageMutationResult(receipt.page);
       clearWorkspaceErrors(attempt);
       return receipt.page;
+    }
+    if (receipt.kind === "missing") {
+      const observation = await reconcilePages(signal);
+      if (signal.aborted) return null;
+      const pageStillActive = observation?.serverPages.some(
+        (page) =>
+          page.id === pageId &&
+          page.archivedAt === null &&
+          !observation.removedDuringLoad.has(pageId) &&
+          !archiveRemovalTombstones.has(pageId),
+      );
+      if (pageStillActive && Date.now() - operationStartedAt < PAGE_MOVE_RECEIPT_RETENTION_MS) {
+        reportWorkspaceError(attempt, "The page was not moved.");
+      } else {
+        reportWorkspaceError(attempt, `${unresolvedMessage} after checking the server receipt.`);
+      }
+      return null;
     }
     const observation = await reconcileWithOneRetry(
       () => reconcilePages(signal),
@@ -1693,6 +1753,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const movingPage = pages.find((candidate) => candidate.id === pageId);
     let outcome: MutationOutcome = "not-started";
     let operationId = "";
+    let operationStartedAt = 0;
     if (!movingPage) {
       closeSidebar(true);
       reportWorkspaceError(attempt, "The page could not be moved.");
@@ -1705,10 +1766,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       parentId,
       kind: movingPage.kind,
       minimumRevision: movingPage.revision + 1,
-      movePlacement: { beforeId, afterId },
+      movePlacement: {
+        beforeId,
+        afterId,
+        existingSiblingIds: pages
+          .filter((page) => page.id !== pageId && page.parentId === parentId && page.archivedAt === null)
+          .map((page) => page.id),
+      },
     };
     try {
       operationId = crypto.randomUUID();
+      operationStartedAt = Date.now();
       const result = await requestMutation(
         `/api/pages/${pageId}/move`,
         {
@@ -1753,6 +1821,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         signal,
         pageId,
         operationId,
+        operationStartedAt,
         expectation,
         "The page-movement result could not be verified",
       );
@@ -1776,6 +1845,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           signal,
           pageId,
           operationId,
+          operationStartedAt,
           expectation,
           outcome === "committed"
             ? "The page was moved, but the workspace could not be updated"
