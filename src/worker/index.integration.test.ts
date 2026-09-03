@@ -401,6 +401,74 @@ function envRejectingNextBatchAfterCommit(
   };
 }
 
+function envCorruptingNextMoveReceiptResult(
+  bindings: Env,
+  delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
+) {
+  let intercepted = false;
+  const database = new Proxy(bindings.DB, {
+    get(target, property) {
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          const results = await target.batch(statements);
+          const receipt = results[2]?.results[0] as { response_json?: string } | undefined;
+          if (!intercepted && receipt?.response_json) {
+            intercepted = true;
+            receipt.response_json = "{";
+          }
+          return results;
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const eventBindings = new Proxy(bindings, {
+    get(target, property, receiver) {
+      if (property === "DB") return database;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const workspaceEvents = capturedWorkspaceEvents(eventBindings, delivered);
+  return {
+    bindings: new Proxy(eventBindings, {
+      get(target, property, receiver) {
+        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
+        return Reflect.get(target, property, receiver);
+      },
+    }),
+    receiptResultWasCorrupted: () => intercepted,
+  };
+}
+
+function envRunningBeforeNextBatch(bindings: Env, beforeBatch: () => Promise<void>) {
+  let intercepted = false;
+  const database = new Proxy(bindings.DB, {
+    get(target, property) {
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          if (!intercepted) {
+            intercepted = true;
+            await beforeBatch();
+          }
+          return target.batch(statements);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    bindings: new Proxy(bindings, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    }),
+    batchWasIntercepted: () => intercepted,
+  };
+}
+
 const MIB = 1024 * 1024;
 
 async function initUpload(cookie: string, pageId: string, body: Record<string, unknown>) {
@@ -698,6 +766,14 @@ describe("Worker integration", () => {
       });
       expect(error).toHaveBeenCalledTimes(1);
       expect(error.mock.calls[0]![0]).toBe(`Failed to handle document party request for ${installed.pageId}~1`);
+      expect(error.mock.calls[0]![1]).toMatchObject({
+        party: "document",
+        room: `${installed.pageId}~1`,
+        errorName: "Error",
+        errorMessage: expect.any(String),
+        errorStack: expect.any(String),
+        errorType: "object",
+      });
       // The same broken dependency cannot be reached by an unbounded room, so
       // no arbitrary path can ride into that log line.
       const oversized = await SELF.fetch(
@@ -708,6 +784,45 @@ describe("Worker integration", () => {
     } finally {
       error.mockRestore();
     }
+  });
+
+  it("logs unexpected Hono request failures as bounded structured fields", async () => {
+    const installed = await bootstrap();
+    const databaseError = new Error("D1 page lookup failed");
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare") {
+          return (query: string) => {
+            if (query.includes("FROM pages")) throw databaseError;
+            return target.prepare(query);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => error.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree"), bindings, context);
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: { code: "internal_error", message: "Something went wrong." } });
+    expect(error).toHaveBeenCalledOnce();
+    expect(error).toHaveBeenCalledWith("Unhandled request error", {
+      errorName: databaseError.name,
+      errorMessage: databaseError.message,
+      errorStack: expect.any(String),
+      errorType: "object",
+    });
   });
 
   it("serves all byte-range forms and conditionally revalidates private attachments", async () => {
@@ -3805,10 +3920,11 @@ describe("Worker integration", () => {
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
+      receiptReadPhase: "recovery",
       moveErrorName: "Error",
       moveErrorMessage: "The page was archived before it could be moved.",
       moveErrorStack: expect.any(String),
@@ -3880,10 +3996,11 @@ describe("Worker integration", () => {
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
+      receiptReadPhase: "recovery",
       moveErrorName: failed.batchError.name,
       moveErrorMessage: failed.batchError.message,
       moveErrorStack: expect.any(String),
@@ -3917,10 +4034,11 @@ describe("Worker integration", () => {
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
+      receiptReadPhase: "preflight",
       receiptErrorName: failed.receiptError.name,
       receiptErrorMessage: failed.receiptError.message,
       receiptErrorStack: expect.any(String),
@@ -3957,6 +4075,105 @@ describe("Worker integration", () => {
     ]);
   });
 
+  it("returns and broadcasts authoritative state when the committed receipt result cannot be decoded", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const intercepted = envCorruptingNextMoveReceiptResult(env, delivered);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+    const request = () =>
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      });
+
+    const response = await worker.fetch(request(), intercepted.bindings, context);
+    const body = await response.json<{ page: Page; replayed: boolean }>();
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.receiptResultWasCorrupted()).toBe(true);
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ replayed: false, page: { id: installed.pageId, revision: 2 } });
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "pages-upserted", pages: [body.page] },
+      },
+    ]);
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith("Page move receipt was invalid.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "commit",
+      recoveredFromPageState: true,
+      receiptErrorName: "InvalidPageMoveReceiptError",
+      receiptErrorMessage: "A stored page move receipt contains malformed JSON.",
+      receiptErrorStack: expect.any(String),
+      receiptErrorType: "object",
+      receiptErrorCauseName: "SyntaxError",
+      receiptErrorCauseMessage: expect.any(String),
+      receiptErrorCauseStack: expect.any(String),
+      receiptErrorCauseType: "object",
+    });
+    const replay = await SELF.fetch(request());
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual({ page: body.page, operationId, replayed: true });
+  });
+
+  it("logs a failed move when recovery finds a conflicting receipt", async () => {
+    const installed = await bootstrap();
+    const sibling = await createPage(installed.cookie);
+    const operationId = crypto.randomUUID();
+    const intercepted = envRunningBeforeNextBatch(env, async () => {
+      const competing = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+          body: JSON.stringify({ parentId: null, beforeId: sibling.id, afterId: null }),
+        }),
+      );
+      expect(competing.status).toBe(200);
+    });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.batchWasIntercepted()).toBe(true);
+    expect(response.status).toBe(409);
+    expect((await response.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith(
+      "Page move recovery found a conflicting receipt.",
+      expect.objectContaining({
+        workspaceId: installed.workspaceId,
+        pageId: installed.pageId,
+        operationId,
+        receiptReadPhase: "recovery",
+        moveErrorName: expect.any(String),
+        moveErrorMessage: expect.any(String),
+        receiptErrorName: "Error",
+        receiptErrorMessage: "That move operation id was already used for another move.",
+        receiptErrorStatus: 409,
+        receiptErrorCode: "idempotency_key_reused",
+      }),
+    );
+  });
+
   it("logs both failures when a committed move receipt is invalid", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
@@ -3982,10 +4199,11 @@ describe("Worker integration", () => {
     expect(response.status).toBe(500);
     expect((await response.json<{ error: { code: string } }>()).error.code).toBe("internal_error");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt was invalid.", {
+    expect(logged).toHaveBeenCalledWith("Page move receipt was invalid.", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
+      receiptReadPhase: "recovery",
       moveErrorName: "Error",
       moveErrorMessage: "D1 response lost after commit",
       moveErrorStack: expect.any(String),
@@ -4025,10 +4243,11 @@ describe("Worker integration", () => {
     expect(response.status).toBe(500);
     expect((await response.json<{ error: { code: string } }>()).error.code).toBe("internal_error");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt was invalid.", {
+    expect(logged).toHaveBeenCalledWith("Page move receipt was invalid.", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
+      receiptReadPhase: "reconciliation",
       receiptErrorName: "InvalidPageMoveReceiptError",
       receiptErrorMessage: "A stored page move receipt contains malformed JSON.",
       receiptErrorStack: expect.any(String),
@@ -4059,10 +4278,11 @@ describe("Worker integration", () => {
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
+      receiptReadPhase: "reconciliation",
       receiptErrorName: failed.receiptError.name,
       receiptErrorMessage: failed.receiptError.message,
       receiptErrorStack: expect.any(String),
