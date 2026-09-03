@@ -72,6 +72,7 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 // query ceiling while still collapsing a tree level into one request.
 const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
+const PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE = 1_000;
 
 type PageRow = {
   id: string;
@@ -205,10 +206,14 @@ function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, p
     stored !== null && typeof stored === "object" && !Array.isArray(stored)
       ? (stored as Record<string, unknown>)
       : null;
-  if (!envelope || envelope.pageMoveReceiptVersion !== PAGE_MOVE_RECEIPT_VERSION || !("page" in envelope)) {
-    throw new Error("A stored page move receipt uses an unsupported snapshot version.");
+  let snapshot = stored;
+  if (envelope && "pageMoveReceiptVersion" in envelope) {
+    if (envelope.pageMoveReceiptVersion !== PAGE_MOVE_RECEIPT_VERSION || !("page" in envelope)) {
+      throw new Error("A stored page move receipt uses an unsupported snapshot version.");
+    }
+    snapshot = envelope.page;
   }
-  const page = pageMoveReceiptSnapshotV1(envelope.page);
+  const page = pageMoveReceiptSnapshotV1(snapshot);
   if (page.id !== receipt.page_id || page.workspaceId !== workspaceId) {
     throw new Error("A stored page move receipt does not match its page and workspace.");
   }
@@ -229,8 +234,16 @@ async function readPageMoveReplay(
 
 async function pruneExpiredPageMoveReceipts(database: D1Database, timestamp = now()) {
   return database
-    .prepare(`DELETE FROM page_move_receipts WHERE created_at < ?`)
-    .bind(timestamp - PAGE_MOVE_RECEIPT_RETENTION_MS)
+    .prepare(
+      `DELETE FROM page_move_receipts
+        WHERE rowid IN (
+          SELECT rowid FROM page_move_receipts
+           WHERE created_at < ?
+           ORDER BY created_at
+           LIMIT ?
+        )`,
+    )
+    .bind(timestamp - PAGE_MOVE_RECEIPT_RETENTION_MS, PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE)
     .run();
 }
 
@@ -1102,6 +1115,7 @@ app.post("/api/pages/:id/move", async (c) => {
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
     return c.json({ page: moved, operationId, replayed: false });
   } catch (error) {
+    if (error instanceof HttpError) throw error;
     const committed = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
     if (committed) {
       sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });

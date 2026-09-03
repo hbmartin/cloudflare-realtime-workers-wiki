@@ -247,7 +247,11 @@ function envWithPageCreateBatchIntercepted(
   };
 }
 
-function envArchivingPageBeforeNextBatch(bindings: Env, pageId: string) {
+function envArchivingPageBeforeNextBatch(
+  bindings: Env,
+  pageId: string,
+  options: { failReceiptReadsAfterBatch?: boolean } = {},
+) {
   let intercepted = false;
   const database = new Proxy(bindings.DB, {
     get(target, property) {
@@ -265,6 +269,14 @@ function envArchivingPageBeforeNextBatch(bindings: Env, pageId: string) {
               .run();
           }
           return target.batch(statements);
+        };
+      }
+      if (property === "prepare") {
+        return (query: string) => {
+          if (intercepted && options.failReceiptReadsAfterBatch && query.includes("FROM page_move_receipts")) {
+            throw new Error("D1 unavailable after definitive move rejection");
+          }
+          return target.prepare(query);
         };
       }
       const value: unknown = Reflect.get(target, property, target);
@@ -1091,12 +1103,7 @@ describe("Worker integration", () => {
           { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
           { type: "pages-upserted", pages: [activePage] },
           { type: "workspace-invalidated" },
-          {
-            type: "pages-upserted",
-            pages: [activePage, activeChild],
-            restored: true,
-            restoredRootId: activePage.id,
-          },
+          { type: "workspace-invalidated" },
         ]);
       } finally {
         broadcast.mockRestore();
@@ -3670,7 +3677,9 @@ describe("Worker integration", () => {
   it("does not move or receipt a page archived immediately before the move batch", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
-    const intercepted = envArchivingPageBeforeNextBatch(env, installed.pageId);
+    const intercepted = envArchivingPageBeforeNextBatch(env, installed.pageId, {
+      failReceiptReadsAfterBatch: true,
+    });
     const context = createExecutionContext();
     const response = await worker.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
@@ -3728,7 +3737,7 @@ describe("Worker integration", () => {
     ]);
   });
 
-  it("rejects malformed or mismatched stored page move snapshots", async () => {
+  it("accepts legacy page move snapshots and rejects unsupported, malformed, or mismatched snapshots", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
     const moved = await SELF.fetch(
@@ -3747,8 +3756,10 @@ describe("Worker integration", () => {
       return SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`));
     };
 
-    expect((await receipt(movedPage)).status).toBe(500);
-    expect((await receipt({ pageMoveReceiptVersion: 2, page: movedPage })).status).toBe(500);
+    expect((await receipt(movedPage)).status).toBe(200);
+    expect((await receipt({ pageMoveReceiptVersion: PAGE_MOVE_RECEIPT_VERSION + 1, page: movedPage })).status).toBe(
+      500,
+    );
     expect((await receipt({ pageMoveReceiptVersion: PAGE_MOVE_RECEIPT_VERSION, page: movedPage })).status).toBe(200);
     expect((await receipt({ pageMoveReceiptVersion: PAGE_MOVE_RECEIPT_VERSION, page: { id: 123 } })).status).toBe(500);
     expect(
@@ -3769,7 +3780,7 @@ describe("Worker integration", () => {
     ).toBe(500);
   });
 
-  it("prunes expired page move receipts while retaining the active recovery window", async () => {
+  it("prunes expired page move receipts in bounded batches while retaining the active recovery window", async () => {
     const installed = await bootstrap();
     const move = async (operationId: string) => {
       const response = await SELF.fetch(
@@ -3781,22 +3792,40 @@ describe("Worker integration", () => {
       );
       expect(response.status).toBe(200);
     };
-    const expiredOperationId = crypto.randomUUID();
     const currentOperationId = crypto.randomUUID();
-    await move(expiredOperationId);
     await move(currentOperationId);
-    await env.DB.prepare(`UPDATE page_move_receipts SET created_at = 0 WHERE operation_id = ?`)
-      .bind(expiredOperationId)
+    const expiredOperationIds = Array.from({ length: 1_001 }, (_, index) => `expired-move-${index}`);
+    await env.DB.prepare(
+      `INSERT INTO page_move_receipts
+         (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
+       SELECT ?, value, ?, 'expired-request', '{}', 0 FROM json_each(?)`,
+    )
+      .bind(installed.workspaceId, installed.pageId, JSON.stringify(expiredOperationIds))
       .run();
 
     const scheduledContext = createExecutionContext();
     await worker.scheduled(createScheduledController(), env, scheduledContext);
     await waitOnExecutionContext(scheduledContext);
 
-    const retained = await env.DB.prepare(`SELECT operation_id FROM page_move_receipts ORDER BY operation_id`).all<{
-      operation_id: string;
-    }>();
-    expect(retained.results.map((receipt) => receipt.operation_id)).toEqual([currentOperationId]);
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE created_at = 0`).first<{
+        count: number;
+      }>(),
+    ).toEqual({ count: 1 });
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE operation_id = ?`)
+        .bind(currentOperationId)
+        .first<{ count: number }>(),
+    ).toEqual({ count: 1 });
+
+    const secondScheduledContext = createExecutionContext();
+    await worker.scheduled(createScheduledController(), env, secondScheduledContext);
+    await waitOnExecutionContext(secondScheduledContext);
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE created_at = 0`).first<{
+        count: number;
+      }>(),
+    ).toEqual({ count: 0 });
   });
 
   it("does not expose a move receipt under another page or operation id", async () => {
