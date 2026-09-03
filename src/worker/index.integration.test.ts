@@ -253,6 +253,7 @@ function envArchivingPageBeforeNextBatch(
   options: { beforeBatch?: () => Promise<void>; failReceiptReadsAfterBatch?: boolean } = {},
 ) {
   let intercepted = false;
+  const replayError = new Error("D1 unavailable during archive-race receipt lookup");
   const database = new Proxy(bindings.DB, {
     get(target, property) {
       if (property === "batch") {
@@ -275,7 +276,7 @@ function envArchivingPageBeforeNextBatch(
       if (property === "prepare") {
         return (query: string) => {
           if (intercepted && options.failReceiptReadsAfterBatch && query.includes("FROM page_move_receipts")) {
-            throw new Error("D1 unavailable after definitive move rejection");
+            throw replayError;
           }
           return target.prepare(query);
         };
@@ -285,6 +286,7 @@ function envArchivingPageBeforeNextBatch(
     },
   });
   return {
+    replayError,
     bindings: new Proxy(bindings, {
       get(target, property, receiver) {
         if (property === "DB") return database;
@@ -1138,12 +1140,7 @@ describe("Worker integration", () => {
           { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
           { type: "pages-upserted", pages: [activePage] },
           { type: "workspace-invalidated" },
-          {
-            type: "pages-upserted",
-            pages: [activePage, activeChild],
-            restored: true,
-            restoredRootId: activePage.id,
-          },
+          { type: "workspace-invalidated" },
         ]);
       } finally {
         broadcast.mockRestore();
@@ -3717,9 +3714,7 @@ describe("Worker integration", () => {
   it("does not move or receipt a page archived immediately before the move batch", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
-    const intercepted = envArchivingPageBeforeNextBatch(env, installed.pageId, {
-      failReceiptReadsAfterBatch: true,
-    });
+    const intercepted = envArchivingPageBeforeNextBatch(env, installed.pageId);
     const context = createExecutionContext();
     const response = await worker.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
@@ -3746,6 +3741,35 @@ describe("Worker integration", () => {
         .bind(operationId)
         .first<{ count: number }>(),
     ).toEqual({ count: 0 });
+  });
+
+  it("reports an ambiguous archive race when its move receipt cannot be read", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const intercepted = envArchivingPageBeforeNextBatch(env, installed.pageId, {
+      failReceiptReadsAfterBatch: true,
+    });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    const body = await response.json<{ error: { code: string } }>();
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(500);
+    expect(body.error.code).toBe("page_move_unresolved");
+    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+      moveError: expect.objectContaining({ code: "page_archived" }),
+      replayError: intercepted.replayError,
+    });
   });
 
   it("replays a concurrent committed move when the page is archived before the duplicate batch", async () => {
@@ -3789,6 +3813,7 @@ describe("Worker integration", () => {
     const failed = envFailingMoveBatchAndReplay(env);
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
     const response = await worker.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
         method: "POST",
@@ -3796,14 +3821,17 @@ describe("Worker integration", () => {
         body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
       }),
       failed.bindings,
-      createExecutionContext(),
+      context,
     );
+    const body = await response.json<{ error: { code: string } }>();
+    await waitOnExecutionContext(context);
 
     expect(response.status).toBe(500);
-    const aggregate = logged.mock.calls.find(([error]) => error instanceof AggregateError)?.[0] as
-      | AggregateError
-      | undefined;
-    expect(aggregate?.errors).toEqual([failed.batchError, failed.replayError]);
+    expect(body.error.code).toBe("page_move_unresolved");
+    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+      moveError: failed.batchError,
+      replayError: failed.replayError,
+    });
   });
 
   it("broadcasts a move recovered after the batch commits but its response is lost", async () => {
@@ -3835,7 +3863,7 @@ describe("Worker integration", () => {
     ]);
   });
 
-  it("rejects unversioned, unsupported, malformed, or mismatched page move snapshots", async () => {
+  it("accepts legacy page move snapshots and rejects unsupported, malformed, or mismatched snapshots", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
     const moved = await SELF.fetch(
@@ -3854,7 +3882,7 @@ describe("Worker integration", () => {
       return SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`));
     };
 
-    expect((await receipt(movedPage)).status).toBe(500);
+    expect((await receipt(movedPage)).status).toBe(200);
     expect((await receipt({ pageMoveReceiptVersion: PAGE_MOVE_RECEIPT_VERSION + 1, page: movedPage })).status).toBe(
       500,
     );
@@ -3878,7 +3906,7 @@ describe("Worker integration", () => {
     ).toBe(500);
   });
 
-  it("catches up expired page move receipt batches while retaining the active recovery window", async () => {
+  it("bounds receipt-pruning catch-up and warns only while expired receipts remain", async () => {
     const installed = await bootstrap();
     const move = async (operationId: string) => {
       const response = await SELF.fetch(
@@ -3892,38 +3920,45 @@ describe("Worker integration", () => {
     };
     const currentOperationId = crypto.randomUUID();
     await move(currentOperationId);
-    const expiredOperationIds = Array.from({ length: 1_001 }, (_, index) => `expired-move-${index}`);
-    await env.DB.prepare(
-      `INSERT INTO page_move_receipts
-         (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
-       SELECT ?, value, ?, 'expired-request', '{}', 0 FROM json_each(?)`,
-    )
-      .bind(installed.workspaceId, installed.pageId, JSON.stringify(expiredOperationIds))
-      .run();
+    const insertExpired = (prefix: string, count: number) =>
+      env.DB.prepare(
+        `INSERT INTO page_move_receipts
+           (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
+         SELECT ?, value, ?, 'expired-request', '{}', 0 FROM json_each(?)`,
+      )
+        .bind(
+          installed.workspaceId,
+          installed.pageId,
+          JSON.stringify(Array.from({ length: count }, (_, index) => `${prefix}-${index}`)),
+        )
+        .run();
+    const countExpired = () =>
+      env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE created_at = 0`).first<{ count: number }>();
+    const runPrune = async () => {
+      const context = createExecutionContext();
+      await worker.scheduled(createScheduledController(), env, context);
+      await waitOnExecutionContext(context);
+    };
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    onTestFinished(() => warned.mockRestore());
 
-    const scheduledContext = createExecutionContext();
-    await worker.scheduled(createScheduledController(), env, scheduledContext);
-    await waitOnExecutionContext(scheduledContext);
+    await insertExpired("exact-capacity", 10_000);
+    await runPrune();
+    expect(await countExpired()).toEqual({ count: 0 });
+    expect(warned).not.toHaveBeenCalled();
 
-    expect(
-      await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE created_at = 0`).first<{
-        count: number;
-      }>(),
-    ).toEqual({ count: 0 });
-    expect(
-      await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE operation_id = ?`)
-        .bind(currentOperationId)
-        .first<{ count: number }>(),
-    ).toEqual({ count: 1 });
+    await insertExpired("over-capacity", 10_001);
+    await runPrune();
+    expect(await countExpired()).toEqual({ count: 1 });
+    expect(warned).toHaveBeenCalledOnce();
+    expect(warned).toHaveBeenCalledWith(
+      "Page move receipt pruning reached its hourly catch-up limit; expired receipts may remain.",
+      { batchSize: 1_000, maxBatches: 10 },
+    );
 
-    const secondScheduledContext = createExecutionContext();
-    await worker.scheduled(createScheduledController(), env, secondScheduledContext);
-    await waitOnExecutionContext(secondScheduledContext);
-    expect(
-      await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE created_at = 0`).first<{
-        count: number;
-      }>(),
-    ).toEqual({ count: 0 });
+    await runPrune();
+    expect(await countExpired()).toEqual({ count: 0 });
+    expect(warned).toHaveBeenCalledOnce();
     expect(
       await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE operation_id = ?`)
         .bind(currentOperationId)
