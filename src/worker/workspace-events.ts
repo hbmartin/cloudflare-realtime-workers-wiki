@@ -30,7 +30,7 @@ export async function eventForCurrentWorkspaceState(
     const activeRevisions = new Map(active.results.map((page) => [page.id, page.revision]));
     const stateChanged = candidates.some((page) => {
       const activeRevision = activeRevisions.get(page.id);
-      return activeRevision === undefined || activeRevision !== page.revision;
+      return activeRevision === undefined || activeRevision < page.revision;
     });
     if (stateChanged) return { type: "workspace-invalidated" };
     return { ...event, pages: candidates };

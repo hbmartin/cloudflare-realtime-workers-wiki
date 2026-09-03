@@ -10,7 +10,7 @@ import {
   SELF,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
@@ -250,7 +250,7 @@ function envWithPageCreateBatchIntercepted(
 function envArchivingPageBeforeNextBatch(
   bindings: Env,
   pageId: string,
-  options: { failReceiptReadsAfterBatch?: boolean } = {},
+  options: { beforeBatch?: () => Promise<void>; failReceiptReadsAfterBatch?: boolean } = {},
 ) {
   let intercepted = false;
   const database = new Proxy(bindings.DB, {
@@ -259,6 +259,7 @@ function envArchivingPageBeforeNextBatch(
         return async (statements: D1PreparedStatement[]) => {
           if (!intercepted) {
             intercepted = true;
+            await options.beforeBatch?.();
             await target
               .prepare(
                 `UPDATE pages
@@ -291,6 +292,40 @@ function envArchivingPageBeforeNextBatch(
       },
     }),
     moveBatchWasIntercepted: () => intercepted,
+  };
+}
+
+function envFailingMoveBatchAndReplay(bindings: Env) {
+  const batchError = new Error("D1 move batch failed");
+  const replayError = new Error("D1 move receipt lookup failed");
+  let batchFailed = false;
+  const database = new Proxy(bindings.DB, {
+    get(target, property) {
+      if (property === "batch") {
+        return async () => {
+          batchFailed = true;
+          throw batchError;
+        };
+      }
+      if (property === "prepare") {
+        return (query: string) => {
+          if (batchFailed && query.includes("FROM page_move_receipts")) throw replayError;
+          return target.prepare(query);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    batchError,
+    replayError,
+    bindings: new Proxy(bindings, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    }),
   };
 }
 
@@ -1103,7 +1138,12 @@ describe("Worker integration", () => {
           { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
           { type: "pages-upserted", pages: [activePage] },
           { type: "workspace-invalidated" },
-          { type: "workspace-invalidated" },
+          {
+            type: "pages-upserted",
+            pages: [activePage, activeChild],
+            restored: true,
+            restoredRootId: activePage.id,
+          },
         ]);
       } finally {
         broadcast.mockRestore();
@@ -3708,6 +3748,64 @@ describe("Worker integration", () => {
     ).toEqual({ count: 0 });
   });
 
+  it("replays a concurrent committed move when the page is archived before the duplicate batch", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const body = { parentId: null, beforeId: null, afterId: null };
+    let committedPage: Page | null = null;
+    const intercepted = envArchivingPageBeforeNextBatch(env, installed.pageId, {
+      beforeBatch: async () => {
+        const committed = await SELF.fetch(
+          authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+            body: JSON.stringify(body),
+          }),
+        );
+        expect(committed.status).toBe(200);
+        committedPage = (await committed.json<{ page: Page }>()).page;
+      },
+    });
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify(body),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    const responseBody = await response.json<{ page: Page; replayed: boolean }>();
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.moveBatchWasIntercepted()).toBe(true);
+    expect(response.status).toBe(200);
+    expect(responseBody).toEqual({ page: committedPage, operationId, replayed: true });
+  });
+
+  it("preserves both failures when a move batch and its replay lookup fail", async () => {
+    const installed = await bootstrap();
+    const failed = envFailingMoveBatchAndReplay(env);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": crypto.randomUUID() },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      failed.bindings,
+      createExecutionContext(),
+    );
+
+    expect(response.status).toBe(500);
+    const aggregate = logged.mock.calls.find(([error]) => error instanceof AggregateError)?.[0] as
+      | AggregateError
+      | undefined;
+    expect(aggregate?.errors).toEqual([failed.batchError, failed.replayError]);
+  });
+
   it("broadcasts a move recovered after the batch commits but its response is lost", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
@@ -3737,7 +3835,7 @@ describe("Worker integration", () => {
     ]);
   });
 
-  it("accepts legacy page move snapshots and rejects unsupported, malformed, or mismatched snapshots", async () => {
+  it("rejects unversioned, unsupported, malformed, or mismatched page move snapshots", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
     const moved = await SELF.fetch(
@@ -3756,7 +3854,7 @@ describe("Worker integration", () => {
       return SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`));
     };
 
-    expect((await receipt(movedPage)).status).toBe(200);
+    expect((await receipt(movedPage)).status).toBe(500);
     expect((await receipt({ pageMoveReceiptVersion: PAGE_MOVE_RECEIPT_VERSION + 1, page: movedPage })).status).toBe(
       500,
     );
@@ -3780,7 +3878,7 @@ describe("Worker integration", () => {
     ).toBe(500);
   });
 
-  it("prunes expired page move receipts in bounded batches while retaining the active recovery window", async () => {
+  it("catches up expired page move receipt batches while retaining the active recovery window", async () => {
     const installed = await bootstrap();
     const move = async (operationId: string) => {
       const response = await SELF.fetch(
@@ -3811,7 +3909,7 @@ describe("Worker integration", () => {
       await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE created_at = 0`).first<{
         count: number;
       }>(),
-    ).toEqual({ count: 1 });
+    ).toEqual({ count: 0 });
     expect(
       await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE operation_id = ?`)
         .bind(currentOperationId)
@@ -3826,6 +3924,11 @@ describe("Worker integration", () => {
         count: number;
       }>(),
     ).toEqual({ count: 0 });
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM page_move_receipts WHERE operation_id = ?`)
+        .bind(currentOperationId)
+        .first<{ count: number }>(),
+    ).toEqual({ count: 1 });
   });
 
   it("does not expose a move receipt under another page or operation id", async () => {

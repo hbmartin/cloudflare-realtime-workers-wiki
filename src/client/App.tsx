@@ -197,7 +197,11 @@ function observedExpectedPage(result: PageLoadResult, expectation: PageMutationE
   return page && matchesPageMutationExpectation(page, expectation) ? page : null;
 }
 
-function observedExpectedMove(result: PageLoadResult, expectation: PageMutationExpectation) {
+function observedExpectedMove(
+  result: PageLoadResult,
+  expectation: PageMutationExpectation,
+  requireReferencedNeighbor = true,
+) {
   const moved = observedExpectedPage(result, expectation);
   if (!moved || !expectation.movePlacement) return moved;
 
@@ -213,7 +217,9 @@ function observedExpectedMove(result: PageLoadResult, expectation: PageMutationE
   const siblingIndexes = new Map(siblings.map((page, index) => [page.id, index]));
   const beforeIndex = beforeId === null ? -1 : (siblingIndexes.get(beforeId) ?? -1);
   const afterIndex = afterId === null ? -1 : (siblingIndexes.get(afterId) ?? -1);
-  if ((beforeId !== null || afterId !== null) && beforeIndex < 0 && afterIndex < 0) return null;
+  if (requireReferencedNeighbor && (beforeId !== null || afterId !== null) && beforeIndex < 0 && afterIndex < 0) {
+    return null;
+  }
   if (beforeIndex >= 0 && movedIndex >= beforeIndex) return null;
   if (afterIndex >= 0 && movedIndex <= afterIndex) return null;
   if (
@@ -315,6 +321,14 @@ async function reconcileWithOneRetry<T>(
   await waitForReconciliationRetry(signal);
   if (signal?.aborted) return first;
   return attempt();
+}
+
+function memoizeLastResult<T extends object, R>(evaluate: (value: T) => R) {
+  let cached: { value: T; result: R } | null = null;
+  return (value: T) => {
+    if (cached?.value !== value) cached = { value, result: evaluate(value) };
+    return cached.result;
+  };
 }
 
 // A rootless restored event requires a second page-tree observation.
@@ -1446,15 +1460,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     isVerified: (result: PageLoadResult) => boolean,
     unresolvedMessage: string,
   ) {
-    let verifiedObservation: PageLoadResult | null = null;
-    let observationVerified = false;
-    const verify = (result: PageLoadResult) => {
-      if (result !== verifiedObservation) {
-        verifiedObservation = result;
-        observationVerified = isVerified(result);
-      }
-      return observationVerified;
-    };
+    const verify = memoizeLastResult(isVerified);
     const observation = await reconcileWithOneRetry(
       () => reconcilePages(signal),
       (result) => result === null || !verify(result),
@@ -1485,6 +1491,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     pageId: string,
     operationId: string,
     operationStartedAt: number,
+    commitKnown: boolean,
     expectation: PageMutationExpectation,
     unresolvedMessage: string,
   ) {
@@ -1532,20 +1539,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       }
       return null;
     }
-    let verifiedObservation: PageLoadResult | null = null;
-    let verifiedMove: Page | null = null;
-    const moveIn = (result: PageLoadResult) => {
-      if (result !== verifiedObservation) {
-        verifiedObservation = result;
-        verifiedMove = observedExpectedMove(result, expectation);
-      }
-      return verifiedMove;
-    };
+    const moveIn = memoizeLastResult((result: PageLoadResult) =>
+      observedExpectedMove(result, expectation, !commitKnown),
+    );
     const observation = await reconcileWithOneRetry(
       () => reconcilePages(signal),
       (result) => result === null || archiveRemovalTombstones.has(pageId) || moveIn(result) === null,
       signal,
     );
+    if (signal.aborted) return null;
     const moved = observation && !archiveRemovalTombstones.has(pageId) && moveIn(observation);
     if (moved) {
       clearWorkspaceErrors(attempt);
@@ -1830,6 +1832,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         pageId,
         operationId,
         operationStartedAt,
+        result.kind === "committed",
         expectation,
         "The page-movement result could not be verified",
       );
@@ -1854,6 +1857,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           pageId,
           operationId,
           operationStartedAt,
+          outcome === "committed",
           expectation,
           outcome === "committed"
             ? "The page was moved, but the workspace could not be updated"

@@ -1172,9 +1172,8 @@ describe("App error handling", () => {
     );
   });
 
-  it("accepts a reconciled move when one of two referenced neighbors leaves the sibling list", async () => {
+  it("accepts a known-committed move after its only referenced neighbor leaves the sibling list", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
-    const thirdPage = { ...page, id: "third-page", position: "d0", title: "Third" };
     const movedPage = { ...page, position: "c0", revision: 2 };
     const departedNeighbor = { ...secondPage, parentId: "another-parent", revision: 2 };
     const operationId = "00000000-0000-4000-8000-000000000016";
@@ -1190,7 +1189,7 @@ describe("App error handling", () => {
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
         treeLoads += 1;
-        return { pages: treeLoads === 1 ? [page, secondPage, thirdPage] : [movedPage, departedNeighbor, thirdPage] };
+        return { pages: treeLoads === 1 ? [page, secondPage] : [movedPage, departedNeighbor] };
       }
       if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
       if (path === `/api/pages/${page.id}/moves/${operationId}`) {
@@ -1214,7 +1213,7 @@ describe("App error handling", () => {
     expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
   });
 
-  it("does not verify a reconciled move after every referenced neighbor leaves the sibling list", async () => {
+  it("does not verify an uncertain move after every referenced neighbor leaves the sibling list", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
     const thirdPage = { ...page, id: "third-page", position: "d0", title: "Third" };
     const movedPage = { ...page, position: "c0", revision: 2 };
@@ -1237,7 +1236,7 @@ describe("App error handling", () => {
           pages: treeLoads === 1 ? [page, secondPage, thirdPage] : [movedPage, departedSecondPage, departedThirdPage],
         };
       }
-      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") return { ok: true };
+      if (path === `/api/pages/${page.id}/move` && init?.method === "POST") throw new TypeError("Failed to fetch");
       if (path === `/api/pages/${page.id}/moves/${operationId}`) {
         receiptLoads += 1;
         throw new ApiClientError(503, "receipt_unavailable", "Receipt lookup unavailable.");
