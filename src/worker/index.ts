@@ -1159,6 +1159,10 @@ app.post("/api/pages/:id/move", async (c) => {
     } catch (replayError) {
       if (replayError instanceof HttpError) throw replayError;
       if (replayError instanceof InvalidPageMoveReceiptError) {
+        console.error("The page move failed and its committed receipt was invalid.", {
+          ...prefixedErrorLogFields("moveError", error),
+          ...prefixedErrorLogFields("replayError", replayError),
+        });
         throw new AggregateError([error, replayError], "The page move failed and its committed receipt was invalid.", {
           cause: replayError,
         });

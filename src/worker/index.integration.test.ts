@@ -338,6 +338,7 @@ function envFailingMoveBatchAndReplay(bindings: Env) {
 function envRejectingNextBatchAfterCommit(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
+  afterCommit?: () => Promise<void>,
 ) {
   let intercepted = false;
   const database = new Proxy(bindings.DB, {
@@ -347,6 +348,7 @@ function envRejectingNextBatchAfterCommit(
           const results = await target.batch(statements);
           if (!intercepted) {
             intercepted = true;
+            await afterCommit?.();
             throw new Error("D1 response lost after commit");
           }
           return results;
@@ -3886,6 +3888,41 @@ describe("Worker integration", () => {
         event: { type: "pages-upserted", pages: [body.page] },
       },
     ]);
+  });
+
+  it("logs both failures when a committed move receipt is invalid", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const intercepted = envRejectingNextBatchAfterCommit(env, [], async () => {
+      await env.DB.prepare(`UPDATE page_move_receipts SET response_json = ? WHERE operation_id = ?`)
+        .bind("{", operationId)
+        .run();
+    });
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(500);
+    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt was invalid.", {
+      moveErrorName: "Error",
+      moveErrorMessage: "D1 response lost after commit",
+      moveErrorStack: expect.any(String),
+      moveErrorType: "object",
+      replayErrorName: "Error",
+      replayErrorMessage: "A stored page move receipt contains malformed JSON.",
+      replayErrorStack: expect.any(String),
+      replayErrorType: "object",
+    });
   });
 
   it("accepts legacy page move snapshots and rejects unsupported, malformed, or mismatched snapshots", async () => {
