@@ -197,6 +197,32 @@ function envWithCapturedWorkspaceEvents(
   });
 }
 
+function envWithDatabase(bindings: Env, database: D1Database) {
+  return new Proxy(bindings, {
+    get(target, property, receiver) {
+      if (property === "DB") return database;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+}
+
+type D1BatchResults = Awaited<ReturnType<D1Database["batch"]>>;
+
+function databaseWithBatchInterceptor(
+  database: D1Database,
+  intercept: (statements: D1PreparedStatement[], run: () => Promise<D1BatchResults>) => Promise<D1BatchResults>,
+) {
+  return new Proxy(database, {
+    get(target, property) {
+      if (property === "batch") {
+        return (statements: D1PreparedStatement[]) => intercept(statements, () => target.batch(statements));
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 function envWithPageCreateBatchIntercepted(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
@@ -205,48 +231,29 @@ function envWithPageCreateBatchIntercepted(
 ) {
   const expectedIds = new Set(expectedPageIds);
   let intercepted = false;
-  const database = new Proxy(bindings.DB, {
-    get(target, property) {
-      if (property === "batch") {
-        return async (statements: D1PreparedStatement[]) => {
-          const results = await target.batch<Record<string, unknown>>(statements);
-          if (intercepted) return results;
-          const pageResultIndexes = results.flatMap((result, index) =>
-            result.results.some((row) => typeof row.id === "string" && expectedIds.has(row.id)) ? [index] : [],
-          );
-          const returnedPageIds = new Set(
-            pageResultIndexes.flatMap((index) =>
-              results[index]!.results.flatMap((row) =>
-                typeof row.id === "string" && expectedIds.has(row.id) ? [row.id] : [],
-              ),
-            ),
-          );
-          if (expectedPageIds.some((pageId) => !returnedPageIds.has(pageId))) return results;
-          intercepted = true;
-          await options.afterPageCreateBatch?.();
-          return options.hideFirstPageResult
-            ? results.map((result, index) => (index === pageResultIndexes[0] ? { ...result, results: [] } : result))
-            : results;
-        };
-      }
-      const value: unknown = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
+  const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
+    const results = (await run()) as D1Result<Record<string, unknown>>[];
+    if (intercepted) return results;
+    const pageResultIndexes = results.flatMap((result, index) =>
+      result.results.some((row) => typeof row.id === "string" && expectedIds.has(row.id)) ? [index] : [],
+    );
+    const returnedPageIds = new Set(
+      pageResultIndexes.flatMap((index) =>
+        results[index]!.results.flatMap((row) =>
+          typeof row.id === "string" && expectedIds.has(row.id) ? [row.id] : [],
+        ),
+      ),
+    );
+    if (expectedPageIds.some((pageId) => !returnedPageIds.has(pageId))) return results;
+    intercepted = true;
+    await options.afterPageCreateBatch?.();
+    return options.hideFirstPageResult
+      ? results.map((result, index) => (index === pageResultIndexes[0] ? { ...result, results: [] } : result))
+      : results;
   });
-  const eventBindings = new Proxy(bindings, {
-    get(target, property, receiver) {
-      if (property === "DB") return database;
-      return Reflect.get(target, property, receiver);
-    },
-  });
-  const workspaceEvents = capturedWorkspaceEvents(eventBindings, delivered);
+  const eventBindings = envWithDatabase(bindings, database);
   return {
-    bindings: new Proxy(eventBindings, {
-      get(target, property, receiver) {
-        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
-        return Reflect.get(target, property, receiver);
-      },
-    }),
+    bindings: envWithCapturedWorkspaceEvents(eventBindings, delivered),
     pageCreateBatchWasIntercepted: () => intercepted,
   };
 }
@@ -258,25 +265,22 @@ function envArchivingPageBeforeNextBatch(
 ) {
   let intercepted = false;
   const replayError = new Error("D1 unavailable during archive-race receipt lookup");
-  const database = new Proxy(bindings.DB, {
+  const batchDatabase = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
+    if (!intercepted) {
+      intercepted = true;
+      await options.beforeBatch?.();
+      await bindings.DB.prepare(
+        `UPDATE pages
+              SET archived_at = ?, revision = revision + 1, updated_at = ?
+            WHERE id = ?`,
+      )
+        .bind(Date.now(), Date.now(), pageId)
+        .run();
+    }
+    return run();
+  });
+  const database = new Proxy(batchDatabase, {
     get(target, property) {
-      if (property === "batch") {
-        return async (statements: D1PreparedStatement[]) => {
-          if (!intercepted) {
-            intercepted = true;
-            await options.beforeBatch?.();
-            await target
-              .prepare(
-                `UPDATE pages
-                    SET archived_at = ?, revision = revision + 1, updated_at = ?
-                  WHERE id = ?`,
-              )
-              .bind(Date.now(), Date.now(), pageId)
-              .run();
-          }
-          return target.batch(statements);
-        };
-      }
       if (property === "prepare") {
         return (query: string) => {
           if (intercepted && options.failReceiptReadsAfterBatch && query.includes("FROM page_move_receipts")) {
@@ -291,12 +295,7 @@ function envArchivingPageBeforeNextBatch(
   });
   return {
     replayError,
-    bindings: new Proxy(bindings, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    }),
+    bindings: envWithDatabase(bindings, database),
     moveBatchWasIntercepted: () => intercepted,
   };
 }
@@ -305,14 +304,12 @@ function envFailingMoveBatchAndReplay(bindings: Env) {
   const batchError = new Error("D1 move batch failed");
   const replayError = new Error("D1 move receipt lookup failed");
   let batchFailed = false;
-  const database = new Proxy(bindings.DB, {
+  const batchDatabase = databaseWithBatchInterceptor(bindings.DB, async () => {
+    batchFailed = true;
+    throw batchError;
+  });
+  const database = new Proxy(batchDatabase, {
     get(target, property) {
-      if (property === "batch") {
-        return async () => {
-          batchFailed = true;
-          throw batchError;
-        };
-      }
       if (property === "prepare") {
         return (query: string) => {
           if (batchFailed && query.includes("FROM page_move_receipts")) throw replayError;
@@ -326,12 +323,7 @@ function envFailingMoveBatchAndReplay(bindings: Env) {
   return {
     batchError,
     replayError,
-    bindings: new Proxy(bindings, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    }),
+    bindings: envWithDatabase(bindings, database),
   };
 }
 
@@ -351,12 +343,7 @@ function envFailingPageMoveReceiptReads(bindings: Env) {
   });
   return {
     receiptError,
-    bindings: new Proxy(bindings, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    }),
+    bindings: envWithDatabase(bindings, database),
   };
 }
 
@@ -366,105 +353,51 @@ function envRejectingNextBatchAfterCommit(
   afterCommit?: () => Promise<void>,
 ) {
   let intercepted = false;
-  const database = new Proxy(bindings.DB, {
-    get(target, property) {
-      if (property === "batch") {
-        return async (statements: D1PreparedStatement[]) => {
-          const results = await target.batch(statements);
-          if (!intercepted) {
-            intercepted = true;
-            await afterCommit?.();
-            throw new Error("D1 response lost after commit");
-          }
-          return results;
-        };
-      }
-      const value: unknown = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
+  const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
+    const results = await run();
+    if (!intercepted) {
+      intercepted = true;
+      await afterCommit?.();
+      throw new Error("D1 response lost after commit");
+    }
+    return results;
   });
-  const eventBindings = new Proxy(bindings, {
-    get(target, property, receiver) {
-      if (property === "DB") return database;
-      return Reflect.get(target, property, receiver);
-    },
-  });
-  const workspaceEvents = capturedWorkspaceEvents(eventBindings, delivered);
+  const eventBindings = envWithDatabase(bindings, database);
   return {
-    bindings: new Proxy(eventBindings, {
-      get(target, property, receiver) {
-        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
-        return Reflect.get(target, property, receiver);
-      },
-    }),
+    bindings: envWithCapturedWorkspaceEvents(eventBindings, delivered),
     moveBatchWasIntercepted: () => intercepted,
   };
 }
 
-function envCorruptingNextMoveReceiptResult(
+function envMutatingNextMoveBatchResult(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
+  mutate: (results: D1BatchResults) => boolean,
 ) {
   let intercepted = false;
-  const database = new Proxy(bindings.DB, {
-    get(target, property) {
-      if (property === "batch") {
-        return async (statements: D1PreparedStatement[]) => {
-          const results = await target.batch(statements);
-          const receipt = results[2]?.results[0] as { response_json?: string } | undefined;
-          if (!intercepted && receipt?.response_json) {
-            intercepted = true;
-            receipt.response_json = "{";
-          }
-          return results;
-        };
-      }
-      const value: unknown = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
+  const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
+    const results = await run();
+    if (!intercepted) intercepted = mutate(results);
+    return results;
   });
-  const eventBindings = new Proxy(bindings, {
-    get(target, property, receiver) {
-      if (property === "DB") return database;
-      return Reflect.get(target, property, receiver);
-    },
-  });
-  const workspaceEvents = capturedWorkspaceEvents(eventBindings, delivered);
+  const eventBindings = envWithDatabase(bindings, database);
   return {
-    bindings: new Proxy(eventBindings, {
-      get(target, property, receiver) {
-        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
-        return Reflect.get(target, property, receiver);
-      },
-    }),
-    receiptResultWasCorrupted: () => intercepted,
+    bindings: envWithCapturedWorkspaceEvents(eventBindings, delivered),
+    batchResultWasMutated: () => intercepted,
   };
 }
 
 function envRunningBeforeNextBatch(bindings: Env, beforeBatch: () => Promise<void>) {
   let intercepted = false;
-  const database = new Proxy(bindings.DB, {
-    get(target, property) {
-      if (property === "batch") {
-        return async (statements: D1PreparedStatement[]) => {
-          if (!intercepted) {
-            intercepted = true;
-            await beforeBatch();
-          }
-          return target.batch(statements);
-        };
-      }
-      const value: unknown = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
+  const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
+    if (!intercepted) {
+      intercepted = true;
+      await beforeBatch();
+    }
+    return run();
   });
   return {
-    bindings: new Proxy(bindings, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    }),
+    bindings: envWithDatabase(bindings, database),
     batchWasIntercepted: () => intercepted,
   };
 }
@@ -811,13 +744,22 @@ describe("Worker integration", () => {
     onTestFinished(() => error.mockRestore());
     const context = createExecutionContext();
 
-    const response = await worker.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree"), bindings, context);
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, "/api/pages/tree?private=omitted", {
+        headers: { "cf-ray": "test-ray-id" },
+      }),
+      bindings,
+      context,
+    );
     await waitOnExecutionContext(context);
 
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error: { code: "internal_error", message: "Something went wrong." } });
     expect(error).toHaveBeenCalledOnce();
     expect(error).toHaveBeenCalledWith("Unhandled request error", {
+      requestMethod: "GET",
+      requestPath: "/api/pages/tree",
+      requestRayId: "test-ray-id",
       errorName: databaseError.name,
       errorMessage: databaseError.message,
       errorStack: expect.any(String),
@@ -4079,7 +4021,12 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
-    const intercepted = envCorruptingNextMoveReceiptResult(env, delivered);
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
+      const receipt = results[2]?.results[0] as { response_json?: string } | undefined;
+      if (!receipt?.response_json) return false;
+      receipt.response_json = "{";
+      return true;
+    });
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => logged.mockRestore());
     const context = createExecutionContext();
@@ -4094,7 +4041,7 @@ describe("Worker integration", () => {
     const body = await response.json<{ page: Page; replayed: boolean }>();
     await waitOnExecutionContext(context);
 
-    expect(intercepted.receiptResultWasCorrupted()).toBe(true);
+    expect(intercepted.batchResultWasMutated()).toBe(true);
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ replayed: false, page: { id: installed.pageId, revision: 2 } });
     expect(delivered).toEqual([
@@ -4122,6 +4069,76 @@ describe("Worker integration", () => {
     const replay = await SELF.fetch(request());
     expect(replay.status).toBe(200);
     expect(await replay.json()).toEqual({ page: body.page, operationId, replayed: true });
+  });
+
+  it("does not require fallback page state when the committed receipt is valid", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
+      const receipt = results[2]?.results[0] as { response_json?: string } | undefined;
+      if (!receipt?.response_json || !results[3]) return false;
+      results[3] = { ...results[3], results: [] };
+      return true;
+    });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    const body = await response.json<{ page: Page; replayed: boolean }>();
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.batchResultWasMutated()).toBe(true);
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ replayed: false, page: { id: installed.pageId, revision: 2 } });
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "pages-upserted", pages: [body.page] },
+      },
+    ]);
+    expect(logged).not.toHaveBeenCalled();
+  });
+
+  it("does not recover a conflicting committed receipt as a successful move", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
+      const receipt = results[2]?.results[0] as { request_hash?: string } | undefined;
+      if (!receipt?.request_hash) return false;
+      receipt.request_hash = "conflicting-request-hash";
+      return true;
+    });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.batchResultWasMutated()).toBe(true);
+    expect(response.status).toBe(409);
+    expect((await response.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
+    expect(delivered).toEqual([]);
+    expect(logged).not.toHaveBeenCalled();
   });
 
   it("logs a failed move when recovery finds a conflicting receipt", async () => {

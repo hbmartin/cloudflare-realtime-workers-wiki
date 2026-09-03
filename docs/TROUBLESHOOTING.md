@@ -170,8 +170,9 @@ D1 error message, so a change to D1's error formatting cannot degrade a `404` in
 
 ## Log triage
 
-Logs use stable message strings with structured diagnostic fields. There is no request-id correlation, so
-triage starts with the message string in the Workers Logs search box and then uses the attached identifiers.
+Logs use stable message strings with structured diagnostic fields. Unhandled Hono errors carry a
+`requestRayId` when Cloudflare supplied one; other entries have no request-id correlation. Triage starts with
+the message string in the Workers Logs search box and then uses the attached identifiers.
 
 | Message                                                       | Meaning                                                                                                                                                                                                            |
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -182,7 +183,7 @@ triage starts with the message string in the Workers Logs search box and then us
 | `Page move receipt could not be read.`                        | D1 could not determine whether the operation has a receipt. The request returns `503 page_move_unresolved`; retry with the same operation id. `receiptReadPhase` identifies preflight, recovery, or reconciliation |
 | `Page move receipt was invalid.`                              | A receipt was malformed, unsupported, or did not match its page/workspace. A `commit`-phase entry was recovered from authoritative batch state; other phases return `500 internal_error`                           |
 | `Page move recovery found a conflicting receipt.`             | A move attempt failed and recovery found the operation id attached to different request content. The request returns `409 idempotency_key_reused`; inspect both `moveError*` and `receiptError*`                   |
-| `Unhandled request error`                                     | An unexpected Hono API failure was collapsed to `500 internal_error`. Inspect the bounded `error*` fields and correlate by timestamp                                                                               |
+| `Unhandled request error`                                     | An unexpected Hono API failure was collapsed to `500 internal_error`. Inspect `requestMethod`, `requestPath`, `requestRayId`, and the bounded `error*` fields                                                      |
 | `Immediate deletion cleanup failed`                           | The inline attempt during a delete request failed. The cron will retry                                                                                                                                             |
 | `Failed to discard staged deletion job`                       | A permanent delete failed _and_ its rollback failed. Inspect `deletion_jobs` for an orphan                                                                                                                         |
 | `Failed to reschedule archive disconnect`                     | Backoff could not be persisted. The row may retry sooner than intended                                                                                                                                             |

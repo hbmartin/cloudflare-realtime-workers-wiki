@@ -2,15 +2,29 @@ import { describe, expect, it } from "vitest";
 import { errorLogFields, prefixedErrorLogFields } from "./error-log";
 
 describe("error log fields", () => {
-  it("describes non-Error throw values without retaining their properties", () => {
-    const thrown = { reason: "database unavailable" };
+  it("retains bounded allowlisted fields from non-Error throw values", () => {
+    const thrown: { reason: string; secret: string; self?: unknown } = {
+      reason: "database unavailable",
+      secret: "do not log this",
+    };
+    thrown.self = thrown;
 
     expect(errorLogFields(thrown)).toEqual({
       errorName: null,
       errorMessage: null,
       errorStack: null,
       errorType: "object",
-      errorValue: "[object omitted]",
+      errorValue: { reason: "database unavailable" },
+    });
+  });
+
+  it("does not classify an ordinary object from its name alone", () => {
+    expect(errorLogFields({ name: "primary", reason: "not selected" })).toEqual({
+      errorName: null,
+      errorMessage: null,
+      errorStack: null,
+      errorType: "object",
+      errorValue: { name: "primary", reason: "not selected" },
     });
   });
 
@@ -53,6 +67,13 @@ describe("error log fields", () => {
     const fields = errorLogFields("x".repeat(3_000));
 
     expect(fields.errorMessage).toMatch(/^x{2000}…\[truncated\]$/);
+    expect(fields.errorValue).toBe(fields.errorMessage);
+  });
+
+  it("does not split a surrogate pair at the string limit", () => {
+    const fields = errorLogFields(`${"x".repeat(1_999)}😀tail`);
+
+    expect(fields.errorMessage).toBe(`${"x".repeat(1_999)}…[truncated]`);
     expect(fields.errorValue).toBe(fields.errorMessage);
   });
 });
