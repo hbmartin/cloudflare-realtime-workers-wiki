@@ -996,8 +996,9 @@ app.post("/api/pages/:id/move", async (c) => {
   const requestedOperationId = c.req.header("x-notes-operation-id");
   // Older browser bundles did not send an operation id. Preserve their move
   // behavior while new clients retain an id they can use for reconciliation.
-  const operationId =
-    requestedOperationId === undefined ? crypto.randomUUID() : text(requestedOperationId, "operationId", 100);
+  const operationId = requestedOperationId?.trim()
+    ? text(requestedOperationId, "operationId", 100)
+    : crypto.randomUUID();
   if (!ID_PATTERN.test(operationId)) {
     throw new HttpError(422, "invalid_input", "operationId is not a valid resource id.");
   }

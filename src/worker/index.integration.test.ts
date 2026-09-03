@@ -3497,7 +3497,7 @@ describe("Worker integration", () => {
           method: "POST",
           headers: {
             "content-type": "application/json",
-            ...(requestedOperationId ? { "x-notes-operation-id": requestedOperationId } : {}),
+            ...(requestedOperationId === null ? {} : { "x-notes-operation-id": requestedOperationId }),
           },
           body: JSON.stringify(body),
         }),
@@ -3537,6 +3537,22 @@ describe("Worker integration", () => {
       operationId: expect.any(String),
       replayed: false,
       page: { id: installed.pageId, revision: 4 },
+    });
+
+    const emptyOperationIdMove = await move("");
+    expect(emptyOperationIdMove.status).toBe(200);
+    expect(await emptyOperationIdMove.json()).toMatchObject({
+      operationId: expect.any(String),
+      replayed: false,
+      page: { id: installed.pageId, revision: 5 },
+    });
+
+    const whitespaceOperationIdMove = await move("   ");
+    expect(whitespaceOperationIdMove.status).toBe(200);
+    expect(await whitespaceOperationIdMove.json()).toMatchObject({
+      operationId: expect.any(String),
+      replayed: false,
+      page: { id: installed.pageId, revision: 6 },
     });
   });
 
