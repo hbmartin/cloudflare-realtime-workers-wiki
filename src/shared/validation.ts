@@ -1,5 +1,5 @@
 import { PAGE_KINDS, type PageKind } from "./page-kind.ts";
-import type { ColumnType, Page, Role } from "./types";
+import type { ColumnType, Page, Role, WorkspaceEvent } from "./types";
 
 export class ValidationError extends Error {}
 
@@ -86,4 +86,62 @@ export function isPage(value: unknown): value is Page {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const page = value as Record<string, unknown>;
   return PAGE_FIELDS.every((field) => PAGE_FIELD_VALIDATORS[field](page[field]));
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+export function parseWorkspaceEvent(value: unknown): WorkspaceEvent | null {
+  const event = record(value);
+  if (!event) return null;
+  if (
+    event.type === "pages-upserted" &&
+    Array.isArray(event.pages) &&
+    event.pages.every(isPage) &&
+    (event.restored === undefined || typeof event.restored === "boolean") &&
+    (event.restoredRootId === undefined ||
+      (event.restored === true && typeof event.restoredRootId === "string" && ID_PATTERN.test(event.restoredRootId)))
+  ) {
+    const pages = event.pages.map(pageWithoutUnknownFields);
+    return event.restored === true
+      ? {
+          type: "pages-upserted",
+          pages,
+          restored: true,
+          ...(event.restoredRootId === undefined ? {} : { restoredRootId: event.restoredRootId }),
+        }
+      : { type: "pages-upserted", pages, ...(event.restored === false ? { restored: false } : {}) };
+  }
+  if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
+    const operationId =
+      typeof event.operationId === "string" && ID_PATTERN.test(event.operationId) ? event.operationId : undefined;
+    return {
+      type: "pages-removed",
+      pageIds: [...event.pageIds],
+      permanently: event.permanently,
+      ...(operationId ? { operationId } : {}),
+    };
+  }
+  if (
+    event.type === "projection-updated" &&
+    typeof event.pageId === "string" &&
+    stringList(event.backlinkTargetIds) &&
+    stringList(event.mentionTargetUserIds)
+  ) {
+    return {
+      type: "projection-updated",
+      pageId: event.pageId,
+      backlinkTargetIds: [...event.backlinkTargetIds],
+      mentionTargetUserIds: [...event.mentionTargetUserIds],
+    };
+  }
+  if (event.type === "workspace-invalidated") return { type: "workspace-invalidated" };
+  return null;
 }

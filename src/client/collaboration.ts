@@ -2,6 +2,7 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
 import type { WorkspaceEvent } from "../shared/types";
+import { parseWorkspaceEvent } from "../shared/validation";
 import { CollaborationDurability } from "./collaboration-durability";
 import { connectionRetryDelay } from "./retry";
 
@@ -188,7 +189,8 @@ export function createWorkspaceEvents(
   });
   const customMessage = (message: string) => {
     try {
-      onEvent(JSON.parse(message) as WorkspaceEvent);
+      const event = parseWorkspaceEvent(JSON.parse(message));
+      if (event) onEvent(event);
     } catch {
       // Ignore messages from future server versions.
     }

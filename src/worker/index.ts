@@ -40,6 +40,8 @@ import {
   TABLE_SORT_MAX_OFFSET,
   TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
+import { PAGE_KINDS } from "../shared/page-kind";
+import { PAGE_MOVE_RECEIPT_RETENTION_MS, PAGE_MOVE_RECEIPT_VERSION } from "../shared/page-move";
 import {
   columnType,
   documentRoom,
@@ -70,7 +72,6 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 // query ceiling while still collapsing a tree level into one request.
 const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
-const PAGE_MOVE_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
 type PageRow = {
   id: string;
@@ -98,6 +99,25 @@ type PageJsonRow = Omit<PageRow, "plain_text" | "indexed_seq">;
 type PageCreateStateRow = PageJsonRow & { receipt_request_hash: string | null };
 type PageMoveReceiptRow = { page_id: string; request_hash: string; response_json: string };
 type PageMoveBatchRow = PageMoveReceiptRow & { archived_at: number | null };
+
+const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
+  id: "id",
+  workspaceId: "workspace_id",
+  parentId: "parent_id",
+  kind: "kind",
+  position: "position",
+  title: "title",
+  icon: "icon",
+  revision: "revision",
+  contentEpoch: "content_epoch",
+  archivedAt: "archived_at",
+  createdAt: "created_at",
+  updatedAt: "updated_at",
+} as const satisfies { [Field in keyof Page]-?: string };
+
+const PAGE_MOVE_RECEIPT_PAGE_JSON_SQL = `json_object(${Object.entries(PAGE_MOVE_RECEIPT_PAGE_COLUMNS)
+  .map(([field, column]) => `'${field}', ${column}`)
+  .join(", ")})`;
 
 function pageJson(row: PageJsonRow): Page {
   return {
@@ -139,7 +159,8 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
     typeof page.id !== "string" ||
     typeof page.workspaceId !== "string" ||
     (page.parentId !== null && typeof page.parentId !== "string") ||
-    (page.kind !== "document" && page.kind !== "table") ||
+    typeof page.kind !== "string" ||
+    !PAGE_KINDS.includes(page.kind as PageKind) ||
     typeof page.position !== "string" ||
     typeof page.title !== "string" ||
     (page.icon !== null && typeof page.icon !== "string") ||
@@ -158,7 +179,7 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
     id: page.id,
     workspaceId: page.workspaceId,
     parentId: page.parentId,
-    kind: page.kind,
+    kind: page.kind as PageKind,
     position: page.position,
     title: page.title,
     icon: page.icon,
@@ -184,14 +205,10 @@ function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, p
     stored !== null && typeof stored === "object" && !Array.isArray(stored)
       ? (stored as Record<string, unknown>)
       : null;
-  let snapshot = stored;
-  if (envelope && "pageMoveReceiptVersion" in envelope) {
-    if (envelope.pageMoveReceiptVersion !== 1 || !("page" in envelope)) {
-      throw new Error("A stored page move receipt uses an unsupported snapshot version.");
-    }
-    snapshot = envelope.page;
+  if (!envelope || envelope.pageMoveReceiptVersion !== PAGE_MOVE_RECEIPT_VERSION || !("page" in envelope)) {
+    throw new Error("A stored page move receipt uses an unsupported snapshot version.");
   }
-  const page = pageMoveReceiptSnapshotV1(snapshot);
+  const page = pageMoveReceiptSnapshotV1(envelope.page);
   if (page.id !== receipt.page_id || page.workspaceId !== workspaceId) {
     throw new Error("A stored page move receipt does not match its page and workspace.");
   }
@@ -1056,13 +1073,8 @@ app.post("/api/pages/:id/move", async (c) => {
            (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
          SELECT workspace_id, ?, id, ?,
            json_object(
-             'pageMoveReceiptVersion', 1,
-             'page', json_object(
-               'id', id, 'workspaceId', workspace_id, 'parentId', parent_id, 'kind', kind,
-               'position', position, 'title', title, 'icon', icon, 'revision', revision,
-               'contentEpoch', content_epoch, 'archivedAt', archived_at,
-               'createdAt', created_at, 'updatedAt', updated_at
-             )
+             'pageMoveReceiptVersion', ${PAGE_MOVE_RECEIPT_VERSION},
+             'page', ${PAGE_MOVE_RECEIPT_PAGE_JSON_SQL}
            ), ?
          FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
       ).bind(operationId, requestHash, timestamp, page.id, member.workspace.id),

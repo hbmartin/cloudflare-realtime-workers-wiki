@@ -1,7 +1,7 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { YServer } from "y-partyserver";
 import type { WorkspaceEvent } from "../shared/types";
-import { ID_PATTERN, isPage, pageWithoutUnknownFields } from "../shared/validation";
+import { ID_PATTERN, parseWorkspaceEvent } from "../shared/validation";
 import type { Env } from "./env";
 
 export interface EventConnectionAuth {
@@ -11,64 +11,6 @@ export interface EventConnectionAuth {
 }
 
 const WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT = 128;
-
-function record(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function stringList(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string");
-}
-
-function workspaceEvent(value: unknown): WorkspaceEvent | null {
-  const event = record(value);
-  if (!event) return null;
-  if (
-    event.type === "pages-upserted" &&
-    Array.isArray(event.pages) &&
-    event.pages.every(isPage) &&
-    (event.restored === undefined || typeof event.restored === "boolean") &&
-    (event.restoredRootId === undefined ||
-      (event.restored === true && typeof event.restoredRootId === "string" && ID_PATTERN.test(event.restoredRootId)))
-  ) {
-    const pages = event.pages.map(pageWithoutUnknownFields);
-    return event.restored === true
-      ? {
-          type: "pages-upserted",
-          pages,
-          restored: true,
-          ...(event.restoredRootId === undefined ? {} : { restoredRootId: event.restoredRootId }),
-        }
-      : { type: "pages-upserted", pages, ...(event.restored === false ? { restored: false } : {}) };
-  }
-  if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
-    const operationId =
-      typeof event.operationId === "string" && ID_PATTERN.test(event.operationId) ? event.operationId : undefined;
-    return {
-      type: "pages-removed",
-      pageIds: [...event.pageIds],
-      permanently: event.permanently,
-      ...(operationId ? { operationId } : {}),
-    };
-  }
-  if (
-    event.type === "projection-updated" &&
-    typeof event.pageId === "string" &&
-    stringList(event.backlinkTargetIds) &&
-    stringList(event.mentionTargetUserIds)
-  ) {
-    return {
-      type: "projection-updated",
-      pageId: event.pageId,
-      backlinkTargetIds: [...event.backlinkTargetIds],
-      mentionTargetUserIds: [...event.mentionTargetUserIds],
-    };
-  }
-  if (event.type === "workspace-invalidated") return { type: "workspace-invalidated" };
-  return null;
-}
 
 export async function eventForCurrentWorkspaceState(
   env: Env,
@@ -179,19 +121,25 @@ export class WorkspaceEvents extends YServer {
     } catch {
       return Response.json({ error: "Invalid workspace event." }, { status: 400 });
     }
-    const event = workspaceEvent(value);
+    const event = parseWorkspaceEvent(value);
     if (!event) return Response.json({ error: "Invalid workspace event." }, { status: 400 });
 
     // Projection notifications do not depend on page lifecycle ordering and do
     // not read D1, so a slow lifecycle check must not hold them behind it.
     if (event.type === "projection-updated" || event.type === "workspace-invalidated") {
-      this.broadcastCustomMessage(JSON.stringify(event));
+      this.broadcastEvent(event);
       return Response.json({ delivered: true });
     }
     if (this.queuedDeliveries >= WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT) {
       // The mutation is already committed, so rejecting this request would leave
       // connected clients stale indefinitely. Collapse all overflow into one
       // authoritative refresh after the accepted queue drains.
+      if (!this.resyncRequired) {
+        console.warn("Workspace event delivery queue overflow; scheduling workspace invalidation.", {
+          workspaceId,
+          queuedDeliveries: this.queuedDeliveries,
+        });
+      }
       this.resyncRequired = true;
       return Response.json({ delivered: false, resyncScheduled: true }, { status: 202 });
     }
@@ -207,15 +155,35 @@ export class WorkspaceEvents extends YServer {
       this.queuedDeliveries -= 1;
       if (this.queuedDeliveries === 0 && this.resyncRequired) {
         this.resyncRequired = false;
-        this.broadcastCustomMessage(JSON.stringify({ type: "workspace-invalidated" } satisfies WorkspaceEvent));
+        this.broadcastEvent({ type: "workspace-invalidated" });
       }
     }
   }
 
   private async deliver(workspaceId: string, event: WorkspaceEvent) {
-    const currentEvent = await eventForCurrentWorkspaceState(this.bindings, workspaceId, event);
-    if (currentEvent) this.broadcastCustomMessage(JSON.stringify(currentEvent));
-    return Response.json({ delivered: currentEvent !== null });
+    try {
+      const currentEvent = await eventForCurrentWorkspaceState(this.bindings, workspaceId, event);
+      if (currentEvent) this.broadcastEvent(currentEvent);
+      return Response.json({ delivered: currentEvent !== null });
+    } catch (error) {
+      console.error("Workspace event state check failed; scheduling workspace invalidation.", {
+        workspaceId,
+        error,
+      });
+      this.resyncRequired = true;
+      return Response.json({ delivered: false, resyncScheduled: true }, { status: 202 });
+    }
+  }
+
+  private broadcastEvent(event: WorkspaceEvent) {
+    this.broadcastCustomMessage(JSON.stringify(event));
+    if (event.type !== "workspace-invalidated") return;
+
+    // Older bundles do not recognize this event type. Closing after the
+    // broadcast makes every client reconnect and reload authoritative state.
+    for (const connection of this.getConnections<EventConnectionAuth>()) {
+      connection.close(1012, "Workspace refresh required.");
+    }
   }
 
   private async scheduleAlarm(when: number) {
@@ -236,4 +204,7 @@ export async function broadcastWorkspaceEvent(env: Env, workspaceId: string, eve
     }),
   );
   if (!response.ok) throw new Error(`Workspace event delivery failed with ${response.status}`);
+  if (response.status === 202) {
+    console.warn("Workspace event delivery deferred to an authoritative resync.", { workspaceId });
+  }
 }

@@ -13,6 +13,10 @@ export function invalidatePagePreview(pageId: string) {
   previewCache.delete(pageId);
 }
 
+export function invalidateAllPagePreviews() {
+  previewCache.clear();
+}
+
 function loadPreview(pageId: string) {
   let pending = previewCache.get(pageId);
   if (!pending) {

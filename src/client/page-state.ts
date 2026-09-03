@@ -123,6 +123,10 @@ export class PageRemovalTombstones {
     return this.entries.has(pageId);
   }
 
+  hasEntries() {
+    return this.entries.size > 0;
+  }
+
   /**
    * Applies one tree-load observation and returns the ids that load must hide.
    * One fresh load may still contain stale pre-removal data; repeated presence
