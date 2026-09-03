@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { PAGE_MOVE_RECEIPT_RETENTION_MS } from "../shared/page-move";
+import { errorLogFields } from "../shared/error-log";
 import { buildTree, compareBinaryText } from "../shared/tree-model";
 import type {
   ClientMemberContext,
@@ -68,23 +69,6 @@ type PageTreeRetryTarget = { source: "page-access" | "page-tree"; scope?: undefi
 type PageLoadResult = { serverPages: Page[]; removedDuringLoad: ReadonlySet<string> };
 
 const PAGE_TREE_REQUEST_TIMEOUT_MS = 15_000;
-
-function errorLogFields(error: unknown) {
-  if (error instanceof Error) {
-    return {
-      errorName: error.name,
-      errorMessage: error.message,
-      errorStack: error.stack ?? null,
-      errorType: "object",
-    };
-  }
-  return {
-    errorName: null,
-    errorMessage: typeof error === "string" ? error : null,
-    errorStack: null,
-    errorType: error === null ? "null" : typeof error,
-  };
-}
 
 type MutationOutcome = "not-started" | "rejected" | "uncertain" | "committed";
 

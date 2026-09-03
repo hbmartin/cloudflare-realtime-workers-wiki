@@ -335,6 +335,31 @@ function envFailingMoveBatchAndReplay(bindings: Env) {
   };
 }
 
+function envFailingPageMoveReceiptReads(bindings: Env) {
+  const receiptError = new Error("D1 move receipt lookup failed");
+  const database = new Proxy(bindings.DB, {
+    get(target, property) {
+      if (property === "prepare") {
+        return (query: string) => {
+          if (query.includes("FROM page_move_receipts")) throw receiptError;
+          return target.prepare(query);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    receiptError,
+    bindings: new Proxy(bindings, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    }),
+  };
+}
+
 function envRejectingNextBatchAfterCommit(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
@@ -3779,17 +3804,21 @@ describe("Worker integration", () => {
     expect(intercepted.moveBatchWasIntercepted()).toBe(true);
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
+    expect(logged).toHaveBeenCalledOnce();
     expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
       moveErrorName: "Error",
       moveErrorMessage: "The page was archived before it could be moved.",
       moveErrorStack: expect.any(String),
       moveErrorType: "object",
       moveErrorStatus: 409,
       moveErrorCode: "page_archived",
-      replayErrorName: intercepted.replayError.name,
-      replayErrorMessage: intercepted.replayError.message,
-      replayErrorStack: expect.any(String),
-      replayErrorType: "object",
+      receiptErrorName: intercepted.replayError.name,
+      receiptErrorMessage: intercepted.replayError.message,
+      receiptErrorStack: expect.any(String),
+      receiptErrorType: "object",
     });
   });
 
@@ -3832,13 +3861,14 @@ describe("Worker integration", () => {
   it("returns an unresolved result and logs both move failures", async () => {
     const installed = await bootstrap();
     const failed = envFailingMoveBatchAndReplay(env);
+    const operationId = crypto.randomUUID();
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => logged.mockRestore());
     const context = createExecutionContext();
     const response = await worker.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-notes-operation-id": crypto.randomUUID() },
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
         body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
       }),
       failed.bindings,
@@ -3849,15 +3879,52 @@ describe("Worker integration", () => {
 
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
+    expect(logged).toHaveBeenCalledOnce();
     expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
       moveErrorName: failed.batchError.name,
       moveErrorMessage: failed.batchError.message,
       moveErrorStack: expect.any(String),
       moveErrorType: "object",
-      replayErrorName: failed.replayError.name,
-      replayErrorMessage: failed.replayError.message,
-      replayErrorStack: expect.any(String),
-      replayErrorType: "object",
+      receiptErrorName: failed.replayError.name,
+      receiptErrorMessage: failed.replayError.message,
+      receiptErrorStack: expect.any(String),
+      receiptErrorType: "object",
+    });
+  });
+
+  it("returns the same unresolved result when an idempotent replay receipt cannot be read", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const request = () =>
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      });
+    expect((await SELF.fetch(request())).status).toBe(200);
+    const failed = envFailingPageMoveReceiptReads(env);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(request(), failed.bindings, context);
+    const body = await response.json<{ error: { code: string } }>();
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(503);
+    expect(body.error.code).toBe("page_move_unresolved");
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptErrorName: failed.receiptError.name,
+      receiptErrorMessage: failed.receiptError.message,
+      receiptErrorStack: expect.any(String),
+      receiptErrorType: "object",
     });
   });
 
@@ -3913,15 +3980,93 @@ describe("Worker integration", () => {
     await waitOnExecutionContext(context);
 
     expect(response.status).toBe(500);
+    expect((await response.json<{ error: { code: string } }>()).error.code).toBe("internal_error");
+    expect(logged).toHaveBeenCalledOnce();
     expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt was invalid.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
       moveErrorName: "Error",
       moveErrorMessage: "D1 response lost after commit",
       moveErrorStack: expect.any(String),
       moveErrorType: "object",
-      replayErrorName: "Error",
-      replayErrorMessage: "A stored page move receipt contains malformed JSON.",
-      replayErrorStack: expect.any(String),
-      replayErrorType: "object",
+      receiptErrorName: "InvalidPageMoveReceiptError",
+      receiptErrorMessage: "A stored page move receipt contains malformed JSON.",
+      receiptErrorStack: expect.any(String),
+      receiptErrorType: "object",
+      receiptErrorCauseName: "SyntaxError",
+      receiptErrorCauseMessage: expect.any(String),
+      receiptErrorCauseStack: expect.any(String),
+      receiptErrorCauseType: "object",
+    });
+  });
+
+  it("logs an invalid receipt lookup once with reconciliation identifiers", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const moved = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+    );
+    expect(moved.status).toBe(200);
+    await env.DB.prepare(`UPDATE page_move_receipts SET response_json = ? WHERE operation_id = ?`)
+      .bind("{", operationId)
+      .run();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+
+    const response = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`),
+    );
+
+    expect(response.status).toBe(500);
+    expect((await response.json<{ error: { code: string } }>()).error.code).toBe("internal_error");
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt was invalid.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptErrorName: "InvalidPageMoveReceiptError",
+      receiptErrorMessage: "A stored page move receipt contains malformed JSON.",
+      receiptErrorStack: expect.any(String),
+      receiptErrorType: "object",
+      receiptErrorCauseName: "SyntaxError",
+      receiptErrorCauseMessage: expect.any(String),
+      receiptErrorCauseStack: expect.any(String),
+      receiptErrorCauseType: "object",
+    });
+  });
+
+  it("returns an unresolved result when the reconciliation receipt cannot be read", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const failed = envFailingPageMoveReceiptReads(env);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/moves/${operationId}`),
+      failed.bindings,
+      context,
+    );
+    const body = await response.json<{ error: { code: string } }>();
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(503);
+    expect(body.error.code).toBe("page_move_unresolved");
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptErrorName: failed.receiptError.name,
+      receiptErrorMessage: failed.receiptError.message,
+      receiptErrorStack: expect.any(String),
+      receiptErrorType: "object",
     });
   });
 

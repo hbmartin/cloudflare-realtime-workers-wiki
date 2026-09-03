@@ -41,6 +41,7 @@ import {
   TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
 import { PAGE_KINDS } from "../shared/page-kind";
+import { prefixedErrorLogFields } from "../shared/error-log";
 import {
   PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
   PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
@@ -69,6 +70,7 @@ import type {
 import { compareBinaryText } from "../shared/tree-model";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
+import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -78,21 +80,9 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
 
-type PageRow = {
-  id: string;
-  workspace_id: string;
-  parent_id: string | null;
-  kind: PageKind;
-  position: string;
-  title: string;
-  icon: string | null;
-  revision: number;
-  content_epoch: number;
+type PageRow = PageJsonRow & {
   plain_text: string;
   indexed_seq: number;
-  archived_at: number | null;
-  created_at: number;
-  updated_at: number;
 };
 
 type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
@@ -100,29 +90,12 @@ type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
   title: string;
 };
 
-type PageJsonRow = Omit<PageRow, "plain_text" | "indexed_seq">;
 type PageCreateStateRow = PageJsonRow & { receipt_request_hash: string | null };
 type PageMoveReceiptRow = { page_id: string; request_hash: string; response_json: string };
 type PageMoveBatchRow = PageMoveReceiptRow & { archived_at: number | null };
 
-class InvalidPageMoveReceiptError extends Error {}
-
-function prefixedErrorLogFields(prefix: string, error: unknown): Record<string, unknown> {
-  if (error instanceof Error) {
-    return {
-      [`${prefix}Name`]: error.name,
-      [`${prefix}Message`]: error.message,
-      [`${prefix}Stack`]: error.stack ?? null,
-      [`${prefix}Type`]: "object",
-      ...(error instanceof HttpError ? { [`${prefix}Status`]: error.status, [`${prefix}Code`]: error.code } : {}),
-    };
-  }
-  return {
-    [`${prefix}Name`]: null,
-    [`${prefix}Message`]: typeof error === "string" ? error : null,
-    [`${prefix}Stack`]: null,
-    [`${prefix}Type`]: error === null ? "null" : typeof error,
-  };
+class InvalidPageMoveReceiptError extends Error {
+  override name = "InvalidPageMoveReceiptError";
 }
 
 const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
@@ -143,23 +116,6 @@ const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
 const PAGE_MOVE_RECEIPT_PAGE_JSON_SQL = `json_object(${Object.entries(PAGE_MOVE_RECEIPT_PAGE_COLUMNS)
   .map(([field, column]) => `'${field}', ${column}`)
   .join(", ")})`;
-
-function pageJson(row: PageJsonRow): Page {
-  return {
-    id: row.id,
-    workspaceId: row.workspace_id,
-    parentId: row.parent_id,
-    kind: row.kind,
-    position: row.position,
-    title: row.title,
-    icon: row.icon,
-    revision: row.revision,
-    contentEpoch: row.content_epoch,
-    archivedAt: row.archived_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
 
 async function pageCreateRequestHash(value: unknown) {
   return sha256Hex(canonicalJson(value));
@@ -254,6 +210,52 @@ async function readPageMoveReplay(
   const receipt = await readPageMoveReceipt(database, workspaceId, operationId);
   if (!receipt) return null;
   return pageFromMoveReceipt(receipt, workspaceId, pageId, requestHash);
+}
+
+type PageMoveReceiptReadContext = {
+  workspaceId: string;
+  pageId: string;
+  operationId: string;
+  moveError?: unknown;
+};
+
+function pageMoveErrorLogFields(prefix: string, error: unknown) {
+  return {
+    ...prefixedErrorLogFields(prefix, error),
+    ...(error instanceof HttpError ? { [`${prefix}Status`]: error.status, [`${prefix}Code`]: error.code } : {}),
+  };
+}
+
+function throwPageMoveReceiptReadFailure(error: unknown, context: PageMoveReceiptReadContext): never {
+  if (error instanceof HttpError) throw error;
+  const fields = {
+    workspaceId: context.workspaceId,
+    pageId: context.pageId,
+    operationId: context.operationId,
+    ...("moveError" in context ? pageMoveErrorLogFields("moveError", context.moveError) : {}),
+    ...pageMoveErrorLogFields("receiptError", error),
+  };
+  if (error instanceof InvalidPageMoveReceiptError) {
+    console.error("The page move failed and its committed receipt was invalid.", fields);
+    throw new HttpError(500, "internal_error", "Something went wrong.");
+  }
+  console.error("The page move failed and its committed receipt could not be read.", fields);
+  throw new HttpError(
+    503,
+    "page_move_unresolved",
+    "The page move result could not be determined. Retry with the same operation id.",
+  );
+}
+
+async function readPageMoveReceiptWithDiagnostics<T>(
+  read: () => Promise<T>,
+  context: PageMoveReceiptReadContext,
+): Promise<T> {
+  try {
+    return await read();
+  } catch (error) {
+    return throwPageMoveReceiptReadFailure(error, context);
+  }
 }
 
 async function pruneExpiredPageMoveReceipts(database: D1Database, timestamp = now()) {
@@ -1074,7 +1076,11 @@ app.post("/api/pages/:id/move", async (c) => {
   const beforeId = nullableId(body.beforeId, "beforeId");
   const afterId = nullableId(body.afterId, "afterId");
   const requestHash = await sha256Hex(canonicalJson({ pageId, parentId, beforeId, afterId }));
-  const replay = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
+  const receiptContext = { workspaceId: member.workspace.id, pageId, operationId };
+  const replay = await readPageMoveReceiptWithDiagnostics(
+    () => readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash),
+    receiptContext,
+  );
   if (replay) return c.json({ page: replay, operationId, replayed: true });
 
   const page = await pageForMember(c.env, member, pageId);
@@ -1153,30 +1159,10 @@ app.post("/api/pages/:id/move", async (c) => {
     return c.json({ page: moved, operationId, replayed: false });
   } catch (error) {
     if (error instanceof HttpError && error.code !== "page_archived") throw error;
-    let committed: Page | null;
-    try {
-      committed = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
-    } catch (replayError) {
-      if (replayError instanceof HttpError) throw replayError;
-      if (replayError instanceof InvalidPageMoveReceiptError) {
-        console.error("The page move failed and its committed receipt was invalid.", {
-          ...prefixedErrorLogFields("moveError", error),
-          ...prefixedErrorLogFields("replayError", replayError),
-        });
-        throw new AggregateError([error, replayError], "The page move failed and its committed receipt was invalid.", {
-          cause: replayError,
-        });
-      }
-      console.error("The page move failed and its committed receipt could not be read.", {
-        ...prefixedErrorLogFields("moveError", error),
-        ...prefixedErrorLogFields("replayError", replayError),
-      });
-      throw new HttpError(
-        503,
-        "page_move_unresolved",
-        "The page move result could not be determined. Retry with the same operation id.",
-      );
-    }
+    const committed = await readPageMoveReceiptWithDiagnostics(
+      () => readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash),
+      { ...receiptContext, moveError: error },
+    );
     if (committed) {
       sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });
       return c.json({ page: committed, operationId, replayed: true });
@@ -1187,13 +1173,20 @@ app.post("/api/pages/:id/move", async (c) => {
 
 app.get("/api/pages/:id/moves/:operationId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  const pageId = c.req.param("id");
   const operationId = c.req.param("operationId");
   if (!ID_PATTERN.test(operationId)) throw new HttpError(404, "move_not_found", "Move receipt not found.");
-  const receipt = await readPageMoveReceipt(c.env.DB, member.workspace.id, operationId);
-  if (!receipt || receipt.page_id !== c.req.param("id")) {
+  const page = await readPageMoveReceiptWithDiagnostics(
+    async () => {
+      const receipt = await readPageMoveReceipt(c.env.DB, member.workspace.id, operationId);
+      return !receipt || receipt.page_id !== pageId ? null : pageFromMoveReceipt(receipt, member.workspace.id, pageId);
+    },
+    { workspaceId: member.workspace.id, pageId, operationId },
+  );
+  if (!page) {
     throw new HttpError(404, "move_not_found", "Move receipt not found.");
   }
-  return c.json({ page: pageFromMoveReceipt(receipt, member.workspace.id, c.req.param("id")), operationId });
+  return c.json({ page, operationId });
 });
 
 app.delete("/api/pages/:id", async (c) => {

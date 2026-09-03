@@ -156,12 +156,13 @@ than misreported as a conflict.
 `table_revision_failed` means the invariant did not hold. It is not a transient error and retrying will
 not help. Escalate it.
 
-The Worker logs this client-facing error explicitly. Expected errors are normally not logged, but 5xx
-responses that need operator attention, including `page_move_unresolved`, are explicit exceptions because
-there is no metric carrying the response code. Search Workers Logs for `Table revision could not be
-advanced`, which carries the page id, the revision the caller expected, the revision actually stored, and
-whether the lease was still valid. The lease token and session id are deliberately omitted; they
-authenticate the caller.
+The Worker logs client-facing errors that need operator attention explicitly. Expected errors are normally
+not logged, but `page_move_unresolved`, invalid persisted move receipts, and `table_revision_failed` are
+exceptions because there is no metric carrying the response code. Search Workers Logs for the matching
+entry in [Log triage](#log-triage). Page-move entries carry the workspace, page, and operation ids plus
+flattened error details. `Table revision could not be advanced` carries the page id, the revision the caller
+expected, the revision actually stored, and whether the lease was still valid. Lease tokens and session ids
+are deliberately omitted because they authenticate the caller.
 
 Classification depends only on `meta.changes` from the batch results and the read-back row, not on any
 D1 error message, so a change to D1's error formatting cannot degrade a `404` into a generic `500`.
@@ -178,6 +179,7 @@ Workers Logs search box.
 | `Failed to prune page move receipts`                               | The hourly seven-day move-receipt retention pass threw. Check D1 availability and the `page_move_receipts` index                                                               |
 | `Page move receipt pruning reached its hourly catch-up limit`      | Ten batches deleted 10000 expired receipts, but more may remain. Check the expired-row count and whether move volume is staying above the hourly cleanup capacity              |
 | `The page move failed and its committed receipt could not be read` | A move returned `503 page_move_unresolved` because D1 could not resolve its receipt. The log carries flattened move and replay error details; retry with the same operation id |
+| `The page move failed and its committed receipt was invalid`       | A stored receipt was malformed, unsupported, or did not match its page/workspace. The log identifies the receipt and includes the decode cause. Retrying cannot repair it      |
 | `Immediate deletion cleanup failed`                                | The inline attempt during a delete request failed. The cron will retry                                                                                                         |
 | `Failed to discard staged deletion job`                            | A permanent delete failed _and_ its rollback failed. Inspect `deletion_jobs` for an orphan                                                                                     |
 | `Failed to reschedule archive disconnect`                          | Backoff could not be persisted. The row may retry sooner than intended                                                                                                         |

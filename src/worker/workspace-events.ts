@@ -1,8 +1,9 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { YServer } from "y-partyserver";
-import type { Page, PageKind, WorkspaceEvent } from "../shared/types";
+import type { Page, WorkspaceEvent } from "../shared/types";
 import { ID_PATTERN, parseWorkspaceEvent } from "../shared/validation";
 import type { Env } from "./env";
+import { pageJson, type PageJsonRow } from "./page-row";
 
 export interface EventConnectionAuth {
   userId: string;
@@ -11,38 +12,6 @@ export interface EventConnectionAuth {
 }
 
 const WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT = 128;
-
-type ActivePageRow = {
-  id: string;
-  workspace_id: string;
-  parent_id: string | null;
-  kind: PageKind;
-  position: string;
-  title: string;
-  icon: string | null;
-  revision: number;
-  content_epoch: number;
-  archived_at: number | null;
-  created_at: number;
-  updated_at: number;
-};
-
-function activePage(row: ActivePageRow): Page {
-  return {
-    id: row.id,
-    workspaceId: row.workspace_id,
-    parentId: row.parent_id,
-    kind: row.kind,
-    position: row.position,
-    title: row.title,
-    icon: row.icon,
-    revision: row.revision,
-    contentEpoch: row.content_epoch,
-    archivedAt: row.archived_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
 
 export async function eventForCurrentWorkspaceState(
   env: Env,
@@ -59,17 +28,18 @@ export async function eventForCurrentWorkspaceState(
           AND id IN (SELECT value FROM json_each(?))`,
     )
       .bind(workspaceId, JSON.stringify(candidates.map((page) => page.id)))
-      .all<ActivePageRow>();
-    const activePages = new Map(active.results.map((row) => [row.id, activePage(row)]));
-    const stateChanged = candidates.some((page) => {
+      .all<PageJsonRow>();
+    const activePages = new Map(active.results.map((row) => [row.id, pageJson(row)]));
+    const currentPages: Page[] = [];
+    for (const page of candidates) {
       const current = activePages.get(page.id);
-      return current === undefined || current.revision < page.revision;
-    });
-    if (stateChanged) return { type: "workspace-invalidated" };
+      if (current === undefined || current.revision < page.revision) return { type: "workspace-invalidated" };
+      currentPages.push(current);
+    }
     // A later mutation can commit before an older queued event is delivered.
     // Broadcast the current rows instead of forcing every client to reconnect;
     // clients still receive authoritative state even if the later event is lost.
-    return { ...event, pages: candidates.map((page) => activePages.get(page.id)!) };
+    return { ...event, pages: currentPages };
   }
   if (event.type === "pages-removed") {
     const statePredicate = event.permanently ? "1 = 1" : "archived_at IS NOT NULL";
