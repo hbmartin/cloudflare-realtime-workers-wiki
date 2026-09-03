@@ -68,6 +68,7 @@ accrue duration, hibernation is not working and cost scales with connections rat
 | Cron failure            | Scheduled invocation errors, or no successful invocation in 2 hours                                       | Both cleanup queues stop draining; deleted content leaks and archived pages keep editors connected                                   |
 | Sustained 5xx           | Worker error rate above baseline for 5 minutes                                                            | General outage                                                                                                                       |
 | `table_revision_failed` | Any `Table revision could not be advanced` log line                                                       | A table mutation invariant was violated. Not transient; see [Troubleshooting](TROUBLESHOOTING.md#the-table-mutation-guard)           |
+| Unresolved page move    | Any `The page move failed and its committed receipt could not be read` log line                           | D1 could not determine an idempotent move outcome. Retry with the same operation id; sustained occurrences indicate a D1 outage      |
 | Deletion backlog        | `deletion_jobs` count above 10                                                                            | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                                 |
 | Move-receipt backlog    | Any `Page move receipt pruning reached its hourly catch-up limit` log line                                | More than 10000 expired receipts reached one pass; retention cleanup may be falling behind                                           |
 | Stuck deletion          | Any `deletion_jobs` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5              | Overdue by more than a cron interval, so the runner is not clearing it; `attempts` past the clamp means it is at the 16-hour ceiling |
@@ -94,6 +95,7 @@ Scheduled deletion cleanup failed
 Scheduled archive disconnect failed
 Document restore failed
 Failed to reconcile pending document restore
+The page move failed and its committed receipt could not be read
 Failed to handle document party request for
 ```
 

@@ -14,7 +14,11 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
-import { PAGE_MOVE_RECEIPT_VERSION } from "../shared/page-move";
+import {
+  PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
+  PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
+  PAGE_MOVE_RECEIPT_VERSION,
+} from "../shared/page-move";
 import { TABLE_BULK_MAX_ROWS } from "../shared/table-limits";
 import type { Page, TableData, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
 import { processDueUploadReaps } from "./attachments";
@@ -1128,6 +1132,7 @@ describe("Worker integration", () => {
         });
         expect(await premature.json()).toEqual({ delivered: true });
         await env.DB.prepare("UPDATE pages SET revision = revision + 1 WHERE id = ?").bind(installed.pageId).run();
+        const supersededActivePage = { ...activePage, revision: activePage.revision + 1 };
         const superseded = await request({
           type: "pages-upserted",
           pages: [activePage, activeChild],
@@ -1140,7 +1145,12 @@ describe("Worker integration", () => {
           { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
           { type: "pages-upserted", pages: [activePage] },
           { type: "workspace-invalidated" },
-          { type: "workspace-invalidated" },
+          {
+            type: "pages-upserted",
+            pages: [supersededActivePage, activeChild],
+            restored: true,
+            restoredRootId: activePage.id,
+          },
         ]);
       } finally {
         broadcast.mockRestore();
@@ -3764,11 +3774,20 @@ describe("Worker integration", () => {
     const body = await response.json<{ error: { code: string } }>();
     await waitOnExecutionContext(context);
 
-    expect(response.status).toBe(500);
+    expect(intercepted.moveBatchWasIntercepted()).toBe(true);
+    expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
-      moveError: expect.objectContaining({ code: "page_archived" }),
-      replayError: intercepted.replayError,
+      moveErrorName: "Error",
+      moveErrorMessage: "The page was archived before it could be moved.",
+      moveErrorStack: expect.any(String),
+      moveErrorType: "object",
+      moveErrorStatus: 409,
+      moveErrorCode: "page_archived",
+      replayErrorName: intercepted.replayError.name,
+      replayErrorMessage: intercepted.replayError.message,
+      replayErrorStack: expect.any(String),
+      replayErrorType: "object",
     });
   });
 
@@ -3808,7 +3827,7 @@ describe("Worker integration", () => {
     expect(responseBody).toEqual({ page: committedPage, operationId, replayed: true });
   });
 
-  it("preserves both failures when a move batch and its replay lookup fail", async () => {
+  it("returns an unresolved result and logs both move failures", async () => {
     const installed = await bootstrap();
     const failed = envFailingMoveBatchAndReplay(env);
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -3826,11 +3845,17 @@ describe("Worker integration", () => {
     const body = await response.json<{ error: { code: string } }>();
     await waitOnExecutionContext(context);
 
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledWith("The page move failed and its committed receipt could not be read.", {
-      moveError: failed.batchError,
-      replayError: failed.replayError,
+      moveErrorName: failed.batchError.name,
+      moveErrorMessage: failed.batchError.message,
+      moveErrorStack: expect.any(String),
+      moveErrorType: "object",
+      replayErrorName: failed.replayError.name,
+      replayErrorMessage: failed.replayError.message,
+      replayErrorStack: expect.any(String),
+      replayErrorType: "object",
     });
   });
 
@@ -3942,18 +3967,23 @@ describe("Worker integration", () => {
     const warned = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     onTestFinished(() => warned.mockRestore());
 
-    await insertExpired("exact-capacity", 10_000);
+    const pruneCapacity = PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE * PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES;
+
+    await insertExpired("exact-capacity", pruneCapacity);
     await runPrune();
     expect(await countExpired()).toEqual({ count: 0 });
     expect(warned).not.toHaveBeenCalled();
 
-    await insertExpired("over-capacity", 10_001);
+    await insertExpired("over-capacity", pruneCapacity + 1);
     await runPrune();
     expect(await countExpired()).toEqual({ count: 1 });
     expect(warned).toHaveBeenCalledOnce();
     expect(warned).toHaveBeenCalledWith(
       "Page move receipt pruning reached its hourly catch-up limit; expired receipts may remain.",
-      { batchSize: 1_000, maxBatches: 10 },
+      {
+        batchSize: PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
+        maxBatches: PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
+      },
     );
 
     await runPrune();

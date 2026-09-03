@@ -111,8 +111,8 @@ configurable at runtime.
 | Bulk receipt retention                                  | Durable until the table/page cascade removes it                          | `table_bulk_writes`                             |
 | Page-create receipt retention                           | Durable until the page/workspace cascade removes it                      | `page_create_receipts`                          |
 | `PAGE_MOVE_RECEIPT_RETENTION_MS`                        | 7 days; expired receipts are pruned hourly                               | `src/shared/page-move.ts`                       |
-| `PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE`                    | 1000 expired receipts per delete                                         | `src/worker/index.ts`                           |
-| `PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES`                   | 10 deletes per hourly pass                                               | `src/worker/index.ts`                           |
+| `PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE`                    | 1000 expired receipts per delete                                         | `src/shared/page-move.ts`                       |
+| `PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES`                   | 10 deletes per hourly pass                                               | `src/shared/page-move.ts`                       |
 | `DELETION_TARGET_BATCH_SIZE`                            | 50                                                                       | `src/worker/index.ts`                           |
 | `CLEANUP_LEASE_MS`                                      | 15 min                                                                   | `src/worker/cleanup.ts`                         |
 | `DOCUMENT_PURGE_TIMEOUT_MS`                             | 30 s                                                                     | `src/worker/cleanup.ts`                         |

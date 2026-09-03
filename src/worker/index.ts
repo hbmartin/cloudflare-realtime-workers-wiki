@@ -41,7 +41,12 @@ import {
   TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
 import { PAGE_KINDS } from "../shared/page-kind";
-import { PAGE_MOVE_RECEIPT_RETENTION_MS, PAGE_MOVE_RECEIPT_VERSION } from "../shared/page-move";
+import {
+  PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
+  PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
+  PAGE_MOVE_RECEIPT_RETENTION_MS,
+  PAGE_MOVE_RECEIPT_VERSION,
+} from "../shared/page-move";
 import {
   columnType,
   documentRoom,
@@ -72,8 +77,6 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 // query ceiling while still collapsing a tree level into one request.
 const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
-const PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE = 1_000;
-const PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES = 10;
 
 type PageRow = {
   id: string;
@@ -101,6 +104,26 @@ type PageJsonRow = Omit<PageRow, "plain_text" | "indexed_seq">;
 type PageCreateStateRow = PageJsonRow & { receipt_request_hash: string | null };
 type PageMoveReceiptRow = { page_id: string; request_hash: string; response_json: string };
 type PageMoveBatchRow = PageMoveReceiptRow & { archived_at: number | null };
+
+class InvalidPageMoveReceiptError extends Error {}
+
+function prefixedErrorLogFields(prefix: string, error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      [`${prefix}Name`]: error.name,
+      [`${prefix}Message`]: error.message,
+      [`${prefix}Stack`]: error.stack ?? null,
+      [`${prefix}Type`]: "object",
+      ...(error instanceof HttpError ? { [`${prefix}Status`]: error.status, [`${prefix}Code`]: error.code } : {}),
+    };
+  }
+  return {
+    [`${prefix}Name`]: null,
+    [`${prefix}Message`]: typeof error === "string" ? error : null,
+    [`${prefix}Stack`]: null,
+    [`${prefix}Type`]: error === null ? "null" : typeof error,
+  };
+}
 
 const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
   id: "id",
@@ -154,7 +177,7 @@ async function readPageMoveReceipt(database: D1Database, workspaceId: string, op
 
 function pageMoveReceiptSnapshotV1(value: unknown): Page {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("A stored page move receipt does not contain a valid page.");
+    throw new InvalidPageMoveReceiptError("A stored page move receipt does not contain a valid page.");
   }
   const page = value as Record<string, unknown>;
   if (
@@ -172,7 +195,7 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
     typeof page.createdAt !== "number" ||
     typeof page.updatedAt !== "number"
   ) {
-    throw new Error("A stored page move receipt does not contain a valid page.");
+    throw new InvalidPageMoveReceiptError("A stored page move receipt does not contain a valid page.");
   }
   // Keep this decoder pinned to receipt schema v1. If Page gains a field,
   // TypeScript forces an explicit backward-compatible default here instead of
@@ -201,7 +224,7 @@ function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, p
   try {
     stored = JSON.parse(receipt.response_json);
   } catch (error) {
-    throw new Error("A stored page move receipt contains malformed JSON.", { cause: error });
+    throw new InvalidPageMoveReceiptError("A stored page move receipt contains malformed JSON.", { cause: error });
   }
   const envelope =
     stored !== null && typeof stored === "object" && !Array.isArray(stored)
@@ -210,13 +233,13 @@ function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, p
   let snapshot = stored;
   if (envelope && "pageMoveReceiptVersion" in envelope) {
     if (envelope.pageMoveReceiptVersion !== PAGE_MOVE_RECEIPT_VERSION || !("page" in envelope)) {
-      throw new Error("A stored page move receipt uses an unsupported snapshot version.");
+      throw new InvalidPageMoveReceiptError("A stored page move receipt uses an unsupported snapshot version.");
     }
     snapshot = envelope.page;
   }
   const page = pageMoveReceiptSnapshotV1(snapshot);
   if (page.id !== receipt.page_id || page.workspaceId !== workspaceId) {
-    throw new Error("A stored page move receipt does not match its page and workspace.");
+    throw new InvalidPageMoveReceiptError("A stored page move receipt does not match its page and workspace.");
   }
   return page;
 }
@@ -1135,11 +1158,20 @@ app.post("/api/pages/:id/move", async (c) => {
       committed = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
     } catch (replayError) {
       if (replayError instanceof HttpError) throw replayError;
+      if (replayError instanceof InvalidPageMoveReceiptError) {
+        throw new AggregateError([error, replayError], "The page move failed and its committed receipt was invalid.", {
+          cause: replayError,
+        });
+      }
       console.error("The page move failed and its committed receipt could not be read.", {
-        moveError: error,
-        replayError,
+        ...prefixedErrorLogFields("moveError", error),
+        ...prefixedErrorLogFields("replayError", replayError),
       });
-      throw new HttpError(500, "page_move_unresolved", "The page move result could not be determined.");
+      throw new HttpError(
+        503,
+        "page_move_unresolved",
+        "The page move result could not be determined. Retry with the same operation id.",
+      );
     }
     if (committed) {
       sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });
