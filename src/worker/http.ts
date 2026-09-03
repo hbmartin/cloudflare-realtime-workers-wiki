@@ -1,4 +1,5 @@
 import type { Context } from "hono";
+import { errorLogFields } from "../shared/error-log";
 import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
 
@@ -36,7 +37,7 @@ export function errorPayload(error: unknown) {
 }
 
 export function errorResponse(c: Context, error: unknown) {
-  if (!isExpectedError(error)) console.error(error);
+  if (!isExpectedError(error)) console.error("Unhandled request error", errorLogFields(error));
   const { status, body } = errorPayload(error);
   return c.json(body, status);
 }

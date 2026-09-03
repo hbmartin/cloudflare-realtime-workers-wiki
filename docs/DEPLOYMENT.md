@@ -156,14 +156,21 @@ receipt age so the hourly Worker cleanup can prune entries after seven days. App
 deploying any Worker that handles page moves or serves move-receipt lookups; every move writes a receipt,
 including moves from older browser bundles. Apply `0010` before deploying this Worker version: its
 already-configured scheduled handler prunes receipts on every run, and the index prevents a full-table scan.
-Apply `0011_page_move_receipt_envelopes.sql` before deploying this Worker version. It wraps receipts already
-written in the temporary bare-page format. This Worker writes explicitly versioned receipt envelopes but
-continues to read bare-page receipts because an older Worker can still write one during the rolling deploy.
-Keep that fallback for at least the seven-day receipt-retention window after every deployed Worker writes
-envelopes, and verify hourly pruning is healthy before removing it.
+`0011_page_move_receipt_envelopes.sql` wraps receipts already written in the temporary bare-page format. For a
+normal upgrade from a Worker that already reads both bare receipts and versioned envelopes, apply it with the
+other migrations before deploying this Worker version. If the live Worker only reads bare receipts, first
+quiesce page-move requests and keep them quiesced until both the migration and Worker deployment complete; the
+migration can otherwise rewrite a receipt that the live Worker still needs to replay. A bridge release that
+reads both formats while continuing to write bare receipts is an alternative when downtime is unacceptable.
 
-Before removing the fallback, run this against every production database. A zero count makes the end of the
-compatibility window directly observable instead of relying on deployment time alone:
+This Worker writes explicitly versioned receipt envelopes but continues to read bare-page receipts during the
+compatibility window. Record when the last deployed Worker capable of writing bare receipts is retired, keep
+the fallback for at least the seven-day receipt-retention window after that time, and verify hourly pruning is
+healthy before removing it.
+
+Before removing the fallback, run this against every production database. A non-zero count blocks removal. A
+zero count is necessary but not sufficient: `0011` rewrites historical bare receipts, so the query does not
+prove that every bare-writing Worker has retired or that the retention window has elapsed.
 
 ```sql
 SELECT COUNT(*) AS bare_receipts
@@ -282,7 +289,9 @@ If the release contained no migration, `pnpm wrangler rollback` alone is suffici
 `.github/workflows/deploy.yml` deploys after successful CI for the current tip of `main`, and on a
 manual `workflow_dispatch` after running `pnpm check`. There is no staging environment, so a bad
 commit on `main` reaches users if its CI passes; the workflow applies D1 migrations before deploying,
-matching the manual order above.
+matching the normal manual order above. An installation whose live Worker cannot read versioned page-move
+receipts must use the quiesced manual upgrade described for `0011`; do not let this workflow apply that
+migration while the older Worker is serving page-move requests.
 
 It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository or environment secrets and
 `PRODUCTION_BASE_URL` as a variable. Secrets set with `wrangler secret put --env production` are not
