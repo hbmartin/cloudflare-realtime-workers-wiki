@@ -207,10 +207,14 @@ function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, p
     stored !== null && typeof stored === "object" && !Array.isArray(stored)
       ? (stored as Record<string, unknown>)
       : null;
-  if (!envelope || envelope.pageMoveReceiptVersion !== PAGE_MOVE_RECEIPT_VERSION || !("page" in envelope)) {
-    throw new Error("A stored page move receipt uses an unsupported snapshot version.");
+  let snapshot = stored;
+  if (envelope && "pageMoveReceiptVersion" in envelope) {
+    if (envelope.pageMoveReceiptVersion !== PAGE_MOVE_RECEIPT_VERSION || !("page" in envelope)) {
+      throw new Error("A stored page move receipt uses an unsupported snapshot version.");
+    }
+    snapshot = envelope.page;
   }
-  const page = pageMoveReceiptSnapshotV1(envelope.page);
+  const page = pageMoveReceiptSnapshotV1(snapshot);
   if (page.id !== receipt.page_id || page.workspaceId !== workspaceId) {
     throw new Error("A stored page move receipt does not match its page and workspace.");
   }
@@ -246,6 +250,11 @@ async function pruneExpiredPageMoveReceipts(database: D1Database, timestamp = no
       .run();
     if (result.meta.changes < PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE) return;
   }
+  const remaining = await database
+    .prepare(`SELECT 1 FROM page_move_receipts WHERE created_at < ? LIMIT 1`)
+    .bind(expiredBefore)
+    .first();
+  if (!remaining) return;
   console.warn("Page move receipt pruning reached its hourly catch-up limit; expired receipts may remain.", {
     batchSize: PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
     maxBatches: PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
@@ -1126,12 +1135,11 @@ app.post("/api/pages/:id/move", async (c) => {
       committed = await readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash);
     } catch (replayError) {
       if (replayError instanceof HttpError) throw replayError;
-      if (error instanceof HttpError) throw error;
-      throw new AggregateError(
-        [error, replayError],
-        "The page move failed and its committed receipt could not be read.",
-        { cause: replayError },
-      );
+      console.error("The page move failed and its committed receipt could not be read.", {
+        moveError: error,
+        replayError,
+      });
+      throw new HttpError(500, "page_move_unresolved", "The page move result could not be determined.");
     }
     if (committed) {
       sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });

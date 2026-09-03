@@ -174,6 +174,9 @@ type PageMutationExpectation = {
   movePlacement?: { beforeId: string | null; afterId: string | null; existingSiblingIds: string[] };
 };
 
+type MoveReconciliationMode = "known-committed" | "uncertain";
+type ReferencedNeighborEvidence = "required" | "optional";
+
 function matchesPageMutationExpectation(page: Page, expectation: PageMutationExpectation) {
   return (
     page.id === expectation.id &&
@@ -200,7 +203,7 @@ function observedExpectedPage(result: PageLoadResult, expectation: PageMutationE
 function observedExpectedMove(
   result: PageLoadResult,
   expectation: PageMutationExpectation,
-  requireReferencedNeighbor = true,
+  referencedNeighborEvidence: ReferencedNeighborEvidence,
 ) {
   const moved = observedExpectedPage(result, expectation);
   if (!moved || !expectation.movePlacement) return moved;
@@ -217,7 +220,12 @@ function observedExpectedMove(
   const siblingIndexes = new Map(siblings.map((page, index) => [page.id, index]));
   const beforeIndex = beforeId === null ? -1 : (siblingIndexes.get(beforeId) ?? -1);
   const afterIndex = afterId === null ? -1 : (siblingIndexes.get(afterId) ?? -1);
-  if (requireReferencedNeighbor && (beforeId !== null || afterId !== null) && beforeIndex < 0 && afterIndex < 0) {
+  if (
+    referencedNeighborEvidence === "required" &&
+    (beforeId !== null || afterId !== null) &&
+    beforeIndex < 0 &&
+    afterIndex < 0
+  ) {
     return null;
   }
   if (beforeIndex >= 0 && movedIndex >= beforeIndex) return null;
@@ -1491,7 +1499,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     pageId: string,
     operationId: string,
     operationStartedAt: number,
-    commitKnown: boolean,
+    mode: MoveReconciliationMode,
     expectation: PageMutationExpectation,
     unresolvedMessage: string,
   ) {
@@ -1539,8 +1547,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       }
       return null;
     }
+    const referencedNeighborEvidence = mode === "known-committed" ? "optional" : "required";
     const moveIn = memoizeLastResult((result: PageLoadResult) =>
-      observedExpectedMove(result, expectation, !commitKnown),
+      observedExpectedMove(result, expectation, referencedNeighborEvidence),
     );
     const observation = await reconcileWithOneRetry(
       () => reconcilePages(signal),
@@ -1553,7 +1562,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       clearWorkspaceErrors(attempt);
       return moved;
     }
-    if (!signal.aborted) reportWorkspaceError(attempt, `${unresolvedMessage} after checking the server receipt.`);
+    reportWorkspaceError(attempt, `${unresolvedMessage} after checking the server receipt.`);
     return null;
   }
 
@@ -1832,7 +1841,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         pageId,
         operationId,
         operationStartedAt,
-        result.kind === "committed",
+        result.kind === "committed" ? "known-committed" : "uncertain",
         expectation,
         "The page-movement result could not be verified",
       );
@@ -1857,7 +1866,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           pageId,
           operationId,
           operationStartedAt,
-          outcome === "committed",
+          outcome === "committed" ? "known-committed" : "uncertain",
           expectation,
           outcome === "committed"
             ? "The page was moved, but the workspace could not be updated"
