@@ -92,7 +92,8 @@ type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
 
 type PageCreateStateRow = PageJsonRow & { receipt_request_hash: string | null };
 type PageMoveReceiptRow = { page_id: string; request_hash: string; response_json: string };
-type PageMoveBatchRow = PageMoveReceiptRow & PageJsonRow;
+type PageMoveStateRow = { page_json: string };
+type PageMoveBatchRow = PageMoveReceiptRow | PageMoveStateRow;
 
 class InvalidPageMoveReceiptError extends Error {
   override name = "InvalidPageMoveReceiptError";
@@ -111,12 +112,11 @@ const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
   archivedAt: "archived_at",
   createdAt: "created_at",
   updatedAt: "updated_at",
-} as const satisfies { [Field in keyof Page]-?: string };
+} as const satisfies { [Field in keyof Page]-?: keyof PageJsonRow };
 
 const PAGE_MOVE_RECEIPT_PAGE_JSON_SQL = `json_object(${Object.entries(PAGE_MOVE_RECEIPT_PAGE_COLUMNS)
   .map(([field, column]) => `'${field}', ${column}`)
   .join(", ")})`;
-const PAGE_MOVE_RECEIPT_PAGE_SELECT_SQL = Object.values(PAGE_MOVE_RECEIPT_PAGE_COLUMNS).join(", ");
 const PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE = "Page move receipt was invalid.";
 const PAGE_MOVE_RECEIPT_UNREADABLE_LOG_MESSAGE = "Page move receipt could not be read.";
 
@@ -175,6 +175,30 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
   };
 }
 
+function pageFromMoveState(row: PageMoveStateRow) {
+  let stored: unknown;
+  try {
+    stored = JSON.parse(row.page_json);
+  } catch (error) {
+    throw new InvalidPageMoveReceiptError("The committed page state contains malformed JSON.", { cause: error });
+  }
+  return pageMoveReceiptSnapshotV1(stored);
+}
+
+function pageMoveReceiptRow(value: PageMoveBatchRow | undefined): PageMoveReceiptRow | null {
+  return value &&
+    "page_id" in value &&
+    typeof value.page_id === "string" &&
+    typeof value.request_hash === "string" &&
+    typeof value.response_json === "string"
+    ? value
+    : null;
+}
+
+function pageMoveStateRow(value: PageMoveBatchRow | undefined): PageMoveStateRow | null {
+  return value && "page_json" in value && typeof value.page_json === "string" ? value : null;
+}
+
 function pageFromMoveReceipt(receipt: PageMoveReceiptRow, workspaceId: string, pageId: string, requestHash?: string) {
   if (receipt.page_id !== pageId || (requestHash !== undefined && receipt.request_hash !== requestHash)) {
     throw new HttpError(409, "idempotency_key_reused", "That move operation id was already used for another move.");
@@ -215,13 +239,28 @@ async function readPageMoveReplay(
   return pageFromMoveReceipt(receipt, workspaceId, pageId, requestHash);
 }
 
+type PageMoveReceiptReadPhase = "preflight" | "commit" | "recovery" | "reconciliation";
+
 type PageMoveReceiptReadContext = {
   workspaceId: string;
   pageId: string;
   operationId: string;
-  receiptReadPhase: "preflight" | "recovery" | "reconciliation";
+  receiptReadPhase: PageMoveReceiptReadPhase;
   moveError?: unknown;
+  recoveredFromPageState?: boolean;
 };
+
+function pageMoveReceiptLogFields(error: unknown, context: PageMoveReceiptReadContext) {
+  return {
+    workspaceId: context.workspaceId,
+    pageId: context.pageId,
+    operationId: context.operationId,
+    receiptReadPhase: context.receiptReadPhase,
+    ...(context.recoveredFromPageState ? { recoveredFromPageState: true } : {}),
+    ...(context.moveError !== undefined ? prefixedErrorLogFields("moveError", context.moveError) : {}),
+    ...prefixedErrorLogFields("receiptError", error),
+  };
+}
 
 async function readPageMoveReceiptWithDiagnostics<T>(
   read: () => Promise<T>,
@@ -230,18 +269,10 @@ async function readPageMoveReceiptWithDiagnostics<T>(
   try {
     return await read();
   } catch (error) {
-    const fields = {
-      workspaceId: context.workspaceId,
-      pageId: context.pageId,
-      operationId: context.operationId,
-      receiptReadPhase: context.receiptReadPhase,
-      ...("moveError" in context ? prefixedErrorLogFields("moveError", context.moveError) : {}),
-      ...prefixedErrorLogFields("receiptError", error),
-    };
+    if (error instanceof HttpError && context.receiptReadPhase !== "recovery") throw error;
+    const fields = pageMoveReceiptLogFields(error, context);
     if (error instanceof HttpError) {
-      if (context.receiptReadPhase === "recovery") {
-        console.error("Page move recovery found a conflicting receipt.", fields);
-      }
+      console.error("Page move recovery found a conflicting receipt.", fields);
       throw error;
     }
     if (error instanceof InvalidPageMoveReceiptError) {
@@ -1142,37 +1173,42 @@ app.post("/api/pages/:id/move", async (c) => {
         `SELECT page_id, request_hash, response_json FROM page_move_receipts
           WHERE workspace_id = ? AND operation_id = ?`,
       ).bind(member.workspace.id, operationId),
-      c.env.DB.prepare(`SELECT ${PAGE_MOVE_RECEIPT_PAGE_SELECT_SQL} FROM pages WHERE id = ? AND workspace_id = ?`).bind(
-        page.id,
-        member.workspace.id,
-      ),
+      c.env.DB.prepare(
+        `SELECT ${PAGE_MOVE_RECEIPT_PAGE_JSON_SQL} AS page_json FROM pages WHERE id = ? AND workspace_id = ?`,
+      ).bind(page.id, member.workspace.id),
     ]);
     if (!results[moveResultIndex]?.meta.changes) {
-      const unavailable = results[pageStateResultIndex]?.results[0];
-      if (unavailable && unavailable.archived_at !== null) {
+      const unavailableRow = pageMoveStateRow(results[pageStateResultIndex]?.results[0]);
+      const unavailable = unavailableRow ? pageFromMoveState(unavailableRow) : null;
+      if (unavailable && unavailable.archivedAt !== null) {
         throw new HttpError(409, "page_archived", "The page was archived before it could be moved.");
       }
       if (unavailable) throw new Error("An active page move unexpectedly changed no rows.");
       throw new HttpError(404, "page_not_found", "Page not found.");
     }
     const receiptResult = results[receiptResultIndex];
-    const receipt = receiptResult?.results[0];
+    const receipt = pageMoveReceiptRow(receiptResult?.results[0]);
     if (!receipt) throw new Error("The moved page was not recorded by its committed receipt.");
-    const committedPageRow = results[pageStateResultIndex]?.results[0];
-    if (!committedPageRow) throw new Error("The moved page state was not returned by its committed batch.");
     let moved: Page;
     try {
       moved = pageFromMoveReceipt(receipt, member.workspace.id, pageId, requestHash);
     } catch (receiptError) {
-      console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
-        workspaceId: member.workspace.id,
-        pageId,
-        operationId,
-        receiptReadPhase: "commit",
-        recoveredFromPageState: true,
-        ...prefixedErrorLogFields("receiptError", receiptError),
-      });
-      moved = pageJson(committedPageRow);
+      if (!(receiptError instanceof InvalidPageMoveReceiptError)) throw receiptError;
+      const committedPageRow = pageMoveStateRow(results[pageStateResultIndex]?.results[0]);
+      if (!committedPageRow) {
+        throw new Error("The moved page state was not returned by its committed batch.", { cause: receiptError });
+      }
+      moved = pageFromMoveState(committedPageRow);
+      console.error(
+        PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE,
+        pageMoveReceiptLogFields(receiptError, {
+          workspaceId: member.workspace.id,
+          pageId,
+          operationId,
+          receiptReadPhase: "commit",
+          recoveredFromPageState: true,
+        }),
+      );
     }
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
     return c.json({ page: moved, operationId, replayed: false });

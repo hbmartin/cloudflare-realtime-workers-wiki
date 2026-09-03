@@ -36,6 +36,9 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      confirm_page_move_receipt_migration_safe:
+        type: boolean
 ```
 
 CI still starts directly on every push. The deploy workflow starts from its `workflow_run`
@@ -45,15 +48,21 @@ deploy job explicitly checks out the triggering run's `head_sha`, not the event'
 SHA. `workflow_dispatch` also becomes available from the default-branch definition, but the person
 dispatching it may select another branch or tag as the run's ref.
 
+Before building or changing production, the deploy job asks D1 for its pending migration list. If
+`0011_page_move_receipt_envelopes.sql` is pending, automatic deployment fails closed. Apply that migration
+only from a manual dispatch after page moves are quiesced, or after verifying that the live Worker already
+reads versioned receipts, and check `confirm_page_move_receipt_migration_safe` on that run. The confirmation
+is ignored once `0011` is no longer pending, so later automatic deploys resume normally.
+
 ## The release gate
 
 The `gate` job must pass before the `deploy` job starts, rather than running alongside it, because
 migrations are forward-only. What it runs depends on how the workflow was triggered:
 
-| Event                      | `pnpm check` in the gate | Deployment condition                                  |
-| -------------------------- | ------------------------ | ----------------------------------------------------- |
-| Completed CI run on `main` | Skipped                  | CI passed and its SHA is still the current `main` tip |
-| `workflow_dispatch`        | Runs                     | The selected ref passes the full local check          |
+| Event                      | `pnpm check` in the gate | Deployment condition                                                                  |
+| -------------------------- | ------------------------ | ------------------------------------------------------------------------------------- |
+| Completed CI run on `main` | Skipped                  | CI passed, its SHA is the current `main` tip, and migration `0011` is not pending     |
+| `workflow_dispatch`        | Runs                     | The ref passes; pending `0011` also requires the explicit migration-safe confirmation |
 
 `.github/workflows/ci.yml` triggers on `on: push` with no branch filter, so every push to `main`
 starts CI on the same SHA. Its five jobs — static checks, unit, Worker integration, build, and the

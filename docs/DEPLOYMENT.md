@@ -289,9 +289,11 @@ If the release contained no migration, `pnpm wrangler rollback` alone is suffici
 `.github/workflows/deploy.yml` deploys after successful CI for the current tip of `main`, and on a
 manual `workflow_dispatch` after running `pnpm check`. There is no staging environment, so a bad
 commit on `main` reaches users if its CI passes; the workflow applies D1 migrations before deploying,
-matching the normal manual order above. An installation whose live Worker cannot read versioned page-move
-receipts must use the quiesced manual upgrade described for `0011`; do not let this workflow apply that
-migration while the older Worker is serving page-move requests.
+matching the normal manual order above. Before applying migrations, the workflow lists the production
+database's pending migrations. If `0011_page_move_receipt_envelopes.sql` is pending, an automatic run stops
+before making changes. Quiesce page moves or verify that the live Worker already reads versioned receipts,
+then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
+until that manually dispatched run has deployed the new Worker.
 
 It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository or environment secrets and
 `PRODUCTION_BASE_URL` as a variable. Secrets set with `wrangler secret put --env production` are not

@@ -37,7 +37,14 @@ export function errorPayload(error: unknown) {
 }
 
 export function errorResponse(c: Context, error: unknown) {
-  if (!isExpectedError(error)) console.error("Unhandled request error", errorLogFields(error));
+  if (!isExpectedError(error)) {
+    console.error("Unhandled request error", {
+      requestMethod: c.req.method,
+      requestPath: new URL(c.req.url).pathname,
+      requestRayId: c.req.header("cf-ray") ?? null,
+      ...errorLogFields(error),
+    });
+  }
   const { status, body } = errorPayload(error);
   return c.json(body, status);
 }

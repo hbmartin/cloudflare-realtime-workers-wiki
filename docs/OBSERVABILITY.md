@@ -11,8 +11,9 @@
 
 That is the entirety of the instrumentation. There is deliberately **no** Sentry, Analytics Engine
 binding, tail consumer, Logpush configuration, OpenTelemetry export, or metrics emitter. Application
-logging uses `console.error` in the Worker, with no request-id correlation. Most calls pass a bare error
-object; page-move reconciliation failures and `Table revision could not be advanced` carry structured
+logging uses `console.error` in the Worker. Unhandled Hono request errors carry the method, pathname, and
+Cloudflare Ray ID when available; most other logs have no request-id correlation. Most calls pass a bare
+error object; page-move reconciliation failures and `Table revision could not be advanced` carry structured
 fields because their client responses do not identify the affected operation.
 
 Plan monitoring around that constraint: Cloudflare's own dashboards carry the numeric signal, and the
@@ -110,8 +111,8 @@ bundled output.
 Two things to remember:
 
 - Unrecognised exceptions are collapsed into `500 internal_error` with the original logged separately.
-  A 500 in a client report and a log entry are two views of one event; correlate by timestamp, since
-  there is no request id.
+  The log carries `requestMethod`, `requestPath`, and `requestRayId`; use the Ray ID when the client or
+  Cloudflare request record has it, and otherwise correlate by timestamp.
 - Expected errors are never logged, by design. A client reporting a `404 room_not_found` or a
   `409 stale_epoch` on `/parties/*` will leave no trace in Workers Logs. Malformed upgrade paths land
   in that group, so a burst of them is visible in request metrics but not in the logs.
