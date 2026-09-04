@@ -167,6 +167,15 @@ describe("error log fields", () => {
     );
   });
 
+  it("truncates a trimmed persisted error without splitting a surrogate pair", () => {
+    const payloadLimit = PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length;
+    const message = `  ${"x".repeat(payloadLimit - 1)}😀${"tail".repeat(100)} \n`;
+
+    expect(safeErrorMessage({ message }, "Unknown failure")).toBe(
+      `${"x".repeat(payloadLimit - 1)}${TRUNCATION_MARKER}`,
+    );
+  });
+
   it("applies field-specific bounds and preserves non-finite numbers as strings", () => {
     const fields = errorLogFields({ name: "ordinary", code: "c".repeat(300), reason: "r".repeat(3_000), status: NaN });
 

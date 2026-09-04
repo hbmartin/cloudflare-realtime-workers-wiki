@@ -51,7 +51,7 @@ describe("HTTP error handling", () => {
     });
   });
 
-  it("reads an HttpError code without trusting hostile properties", () => {
+  it("handles an HttpError code without trusting hostile properties", () => {
     const error = new HttpError(409, "conflict", "Conflict");
     const hostileCode = new Proxy(error, {
       get(target, property, receiver) {
