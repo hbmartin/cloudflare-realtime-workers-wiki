@@ -150,6 +150,8 @@ describe("error log fields", () => {
   });
 
   it("uses a non-empty bounded fallback for persisted error messages", () => {
+    expect(safeErrorMessage("  Thrown string failure \n", "Unknown failure")).toBe("Thrown string failure");
+    expect(safeErrorMessage(" \n\t", "Unknown failure")).toBe("Unknown failure");
     expect(safeErrorMessage({ message: "" }, "Unknown failure")).toBe("Unknown failure");
     expect(safeErrorMessage({ message: " \n\t" }, "Unknown failure")).toBe("Unknown failure");
     expect(safeErrorMessage({ message: "  Remote failure \n" }, "Unknown failure")).toBe("Remote failure");

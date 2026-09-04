@@ -25,7 +25,7 @@ CSS builds target that same matrix. Because build targets do not polyfill runtim
 
 ## Local development
 
-Requires Node.js 22.18 or later in the Node 22 release line, or Node.js 24.2+, and pnpm 11.
+Requires Node.js 22.18 or later in the Node 22 release line, or Node.js 24.2+, and pnpm 11.18.0.
 
 ```sh
 pnpm install

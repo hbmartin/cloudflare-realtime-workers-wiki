@@ -399,15 +399,15 @@ function envRejectingNextBatchAfterCommit(
 function envMutatingNextMoveBatchResult(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
-  mutate: (results: D1BatchResults, uninterceptedDatabase: D1Database) => boolean | Promise<boolean>,
+  mutate: (results: D1BatchResults) => boolean | Promise<boolean>,
 ) {
   let intercepted = false;
   let mutateInOrder = Promise.resolve();
   const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
     const results = await run();
+    if (intercepted) return results;
     const attempt = mutateInOrder.then(async () => {
-      // Database work awaited by mutate must use the original binding so it cannot re-enter this serialized interceptor.
-      if (!intercepted) intercepted = await mutate(results, bindings.DB);
+      if (!intercepted) intercepted = await mutate(results);
     });
     mutateInOrder = attempt.catch(() => undefined);
     await attempt;
@@ -4215,11 +4215,10 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
-    const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results, database) => {
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results) => {
       const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
       if (receipt?.page_id !== installed.pageId) return false;
-      await database
-        .prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
+      await env.DB.prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
         .bind(installed.workspaceId, operationId)
         .run();
       results.length = 0;

@@ -7,21 +7,15 @@ const ERROR_CODE_LIMIT = LOG_IDENTIFIER_LIMIT;
 const ERROR_MESSAGE_LIMIT = LOG_TEXT_LIMIT;
 const ERROR_STACK_LIMIT = 16_000;
 const TRUNCATION_MARKER = "…[truncated]";
-const NON_WHITESPACE_PATTERN = /\S/u;
-const WHITESPACE_PATTERN = /\s/u;
-
-function boundedLogStringRange(value: string, start: number, end: number, limit: number) {
-  if (end - start <= limit) return value.slice(start, end);
-  if (limit <= 0) return "";
-  if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, limit);
-  let sliceEnd = start + limit - TRUNCATION_MARKER.length;
-  const lastCodeUnit = value.charCodeAt(sliceEnd - 1);
-  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) sliceEnd -= 1;
-  return `${value.slice(start, sliceEnd)}${TRUNCATION_MARKER}`;
-}
 
 export function boundedLogString(value: string, limit: number) {
-  return boundedLogStringRange(value, 0, value.length, limit);
+  if (value.length <= limit) return value;
+  if (limit <= 0) return "";
+  if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, limit);
+  let sliceEnd = limit - TRUNCATION_MARKER.length;
+  const lastCodeUnit = value.charCodeAt(sliceEnd - 1);
+  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) sliceEnd -= 1;
+  return `${value.slice(0, sliceEnd)}${TRUNCATION_MARKER}`;
 }
 
 function property(value: object, name: string): unknown {
@@ -63,16 +57,11 @@ function logPrimitive(value: unknown, stringLimit: number) {
 }
 
 export function safeErrorMessage(error: unknown, fallback: string) {
-  if (typeof error === "object" && error !== null) {
-    const message = property(error, "message");
-    if (typeof message === "string") {
-      const start = message.search(NON_WHITESPACE_PATTERN);
-      if (start !== -1) {
-        let end = message.length;
-        while (end > start && WHITESPACE_PATTERN.test(message.charAt(end - 1))) end -= 1;
-        return boundedLogStringRange(message, start, end, PERSISTED_ERROR_MESSAGE_LIMIT);
-      }
-    }
+  const message =
+    typeof error === "string" ? error : typeof error === "object" && error !== null ? property(error, "message") : null;
+  if (typeof message === "string") {
+    const trimmed = message.trim();
+    if (trimmed) return boundedLogString(trimmed, PERSISTED_ERROR_MESSAGE_LIMIT);
   }
   return boundedLogString(fallback, PERSISTED_ERROR_MESSAGE_LIMIT);
 }
