@@ -1,5 +1,6 @@
 import type { Env } from "./env";
 import { locationHint } from "./http";
+import { safeErrorMessage } from "../shared/error-log";
 
 type DeletionTargetKind = "document_do" | "r2_object" | "r2_prefix";
 
@@ -89,7 +90,7 @@ export async function processDeletionJob(env: Env, jobId: string) {
         .bind(Date.now(), job.id, target.kind, target.target, job.id, leaseUntil)
         .run();
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown cleanup failure";
+      const message = safeErrorMessage(error, "Unknown cleanup failure");
       await env.DB.prepare(
         `UPDATE deletion_targets
             SET attempts = attempts + 1, last_error = ?
@@ -98,7 +99,7 @@ export async function processDeletionJob(env: Env, jobId: string) {
               SELECT 1 FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?
             )`,
       )
-        .bind(message.slice(0, 1_000), job.id, target.kind, target.target, job.id, leaseUntil)
+        .bind(message, job.id, target.kind, target.target, job.id, leaseUntil)
         .run();
     }
   }

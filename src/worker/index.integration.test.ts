@@ -300,8 +300,8 @@ function envArchivingPageBeforeNextBatch(
   };
 }
 
-function envFailingMoveBatchAndReplay(bindings: Env) {
-  const batchError = new Error("D1 move batch failed");
+function envFailingMoveBatchAndReplay<BatchError = Error>(bindings: Env, options?: { batchError: BatchError }) {
+  const batchError = options ? options.batchError : (new Error("D1 move batch failed") as BatchError);
   const replayError = new Error("D1 move receipt lookup failed");
   let batchFailed = false;
   const batchDatabase = databaseWithBatchInterceptor(bindings.DB, async () => {
@@ -327,30 +327,7 @@ function envFailingMoveBatchAndReplay(bindings: Env) {
   };
 }
 
-function envFailingMoveBatchWithUndefined(bindings: Env) {
-  const receiptError = new Error("D1 move receipt lookup failed");
-  let batchFailed = false;
-  const batchDatabase = databaseWithBatchInterceptor(bindings.DB, () => {
-    batchFailed = true;
-    return Promise.reject();
-  });
-  const database = new Proxy(batchDatabase, {
-    get(target, property) {
-      if (property === "prepare") {
-        return (query: string) => {
-          if (batchFailed && query.includes("FROM page_move_receipts")) throw receiptError;
-          return target.prepare(query);
-        };
-      }
-      const value: unknown = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-  return { receiptError, bindings: envWithDatabase(bindings, database) };
-}
-
-function envFailingPageMoveReceiptReads(bindings: Env) {
-  const receiptError = new Error("D1 move receipt lookup failed");
+function envThrowingPageMoveReceiptReads(bindings: Env, receiptError: unknown) {
   const database = new Proxy(bindings.DB, {
     get(target, property) {
       if (property === "prepare") {
@@ -363,9 +340,14 @@ function envFailingPageMoveReceiptReads(bindings: Env) {
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+  return envWithDatabase(bindings, database);
+}
+
+function envFailingPageMoveReceiptReads(bindings: Env) {
+  const receiptError = new Error("D1 move receipt lookup failed");
   return {
     receiptError,
-    bindings: envWithDatabase(bindings, database),
+    bindings: envThrowingPageMoveReceiptReads(bindings, receiptError),
   };
 }
 
@@ -3983,7 +3965,7 @@ describe("Worker integration", () => {
 
   it("retains diagnostics when move execution rejects with undefined", async () => {
     const installed = await bootstrap();
-    const failed = envFailingMoveBatchWithUndefined(env);
+    const failed = envFailingMoveBatchAndReplay(env, { batchError: undefined });
     const operationId = crypto.randomUUID();
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => logged.mockRestore());
@@ -4010,7 +3992,7 @@ describe("Worker integration", () => {
         moveErrorStack: null,
         moveErrorType: "undefined",
         moveErrorValue: "undefined",
-        receiptErrorMessage: failed.receiptError.message,
+        receiptErrorMessage: failed.replayError.message,
       }),
     );
   });
@@ -4049,6 +4031,43 @@ describe("Worker integration", () => {
     });
   });
 
+  it("returns the same unresolved result when a receipt read throws a revoked Proxy", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const request = () =>
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      });
+    expect((await SELF.fetch(request())).status).toBe(200);
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+    const bindings = envThrowingPageMoveReceiptReads(env, revocable.proxy);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(request(), bindings, context);
+    const body = await response.json<{ error: { code: string } }>();
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(503);
+    expect(body.error.code).toBe("page_move_unresolved");
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "preflight",
+      receiptErrorName: null,
+      receiptErrorMessage: null,
+      receiptErrorStack: null,
+      receiptErrorType: "object",
+      receiptErrorValue: "[object omitted]",
+    });
+  });
+
   it("broadcasts a move recovered after the batch commits but its response is lost", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
@@ -4068,6 +4087,39 @@ describe("Worker integration", () => {
     await waitOnExecutionContext(context);
 
     expect(intercepted.moveBatchWasIntercepted()).toBe(true);
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "pages-upserted", pages: [body.page] },
+      },
+    ]);
+  });
+
+  it("recovers the stored receipt instead of reporting a truncated batch result as page missing", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
+      results.length = 0;
+      return true;
+    });
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    const body = await response.json<{ page: Page; replayed: boolean }>();
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.batchResultWasMutated()).toBe(true);
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
     expect(delivered).toEqual([

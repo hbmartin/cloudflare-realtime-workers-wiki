@@ -19,9 +19,8 @@ import {
   HttpError,
   assertSameOrigin,
   attachmentDisposition,
-  errorPayload,
+  classifyError,
   errorResponse,
-  isExpectedError,
   locationHint,
   normalizeFilename,
   now,
@@ -41,7 +40,7 @@ import {
   TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
 import { PAGE_KINDS } from "../shared/page-kind";
-import { errorLogFields, prefixedErrorLogFields } from "../shared/error-log";
+import { errorLogFields, prefixedErrorLogFields, safeInstanceOf } from "../shared/error-log";
 import {
   PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
   PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
@@ -202,13 +201,13 @@ function pageMoveReceiptRow(value: unknown): PageMoveReceiptRow | null {
 
 function pageMoveStateRow(value: unknown): PageMoveStateRow | null {
   if (value === null || typeof value !== "object") return null;
-  const serializedPage = Reflect.get(value, "page_json") as unknown;
+  const serializedPage = (value as Record<string, unknown>).page_json;
   return typeof serializedPage === "string" ? { page_json: serializedPage } : null;
 }
 
 function pageMoveAvailabilityRow(value: unknown): PageMoveAvailabilityRow | null {
   if (value === null || typeof value !== "object") return null;
-  const archivedAt = Reflect.get(value, "archived_at") as unknown;
+  const archivedAt = (value as Record<string, unknown>).archived_at;
   return archivedAt === null || typeof archivedAt === "number" ? { archived_at: archivedAt } : null;
 }
 
@@ -282,13 +281,13 @@ async function readPageMoveReceiptWithDiagnostics<T>(
   try {
     return await read();
   } catch (error) {
-    if (error instanceof HttpError && context.receiptReadPhase !== "recovery") throw error;
+    if (safeInstanceOf(error, HttpError) && context.receiptReadPhase !== "recovery") throw error;
     const fields = pageMoveReceiptLogFields(error, context);
-    if (error instanceof HttpError) {
+    if (safeInstanceOf(error, HttpError)) {
       console.error("Page move recovery found a conflicting receipt.", fields);
       throw error;
     }
-    if (error instanceof InvalidPageMoveReceiptError) {
+    if (safeInstanceOf(error, InvalidPageMoveReceiptError)) {
       console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, fields);
       throw new HttpError(500, "internal_error", "Something went wrong.");
     }
@@ -395,7 +394,7 @@ async function readInitialPageCreateReplay(
     // Exact replays remain valid if their original parent was archived later.
     // For a mismatched reuse, however, preserve the create API's parent error
     // precedence before returning the idempotency conflict.
-    if (error instanceof HttpError && error.code === "idempotency_key_reused") {
+    if (safeInstanceOf(error, HttpError) && error.code === "idempotency_key_reused") {
       await validatePageCreateParents(env, member, requested);
     }
     throw error;
@@ -445,7 +444,7 @@ async function jsonBody(request: Request) {
   try {
     return object(await request.json());
   } catch (error) {
-    if (error instanceof HttpError) throw error;
+    if (safeInstanceOf(error, HttpError)) throw error;
     throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
   }
 }
@@ -478,7 +477,7 @@ async function limitedJsonBody(request: Request, limit: number) {
     }
     return object(JSON.parse(new TextDecoder().decode(bytes)));
   } catch (error) {
-    if (error instanceof HttpError) throw error;
+    if (safeInstanceOf(error, HttpError)) throw error;
     throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
   }
 }
@@ -1192,8 +1191,19 @@ app.post("/api/pages/:id/move", async (c) => {
            FROM pages WHERE id = ? AND workspace_id = ?`,
       ).bind(page.id, member.workspace.id),
     ]);
-    if (!results[moveResultIndex]?.meta.changes) {
-      const unavailableValue = results[pageStateResultIndex]?.results[0];
+    if (results.length !== 4) {
+      throw new Error("The page move batch returned an unexpected number of results.");
+    }
+    const moveChanges = results[moveResultIndex]?.meta?.changes;
+    if (moveChanges !== 0 && moveChanges !== 1) {
+      throw new Error("The page move batch returned malformed move metadata.");
+    }
+    if (moveChanges === 0) {
+      const pageStateResult = results[pageStateResultIndex];
+      if (!pageStateResult || !Array.isArray(pageStateResult.results)) {
+        throw new Error("The page move batch did not return its page-state result.");
+      }
+      const unavailableValue = pageStateResult.results[0];
       const unavailable = pageMoveAvailabilityRow(unavailableValue);
       if (unavailableValue !== undefined && !unavailable) {
         throw new Error("The unavailable page state returned by the move batch was malformed.");
@@ -1204,63 +1214,41 @@ app.post("/api/pages/:id/move", async (c) => {
       if (unavailable) throw new Error("An active page move unexpectedly changed no rows.");
       throw new HttpError(404, "page_not_found", "Page not found.");
     }
+    const commitReceiptContext = { ...receiptContext, receiptReadPhase: "commit" as const };
     let moved: Page;
     try {
       const receipt = pageMoveReceiptRow(results[receiptResultIndex]?.results[0]);
       if (!receipt) throw new InvalidPageMoveReceiptError("The committed page move receipt row was malformed.");
       moved = pageFromMoveReceipt(receipt, member.workspace.id, pageId, requestHash);
     } catch (receiptError) {
-      if (!(receiptError instanceof InvalidPageMoveReceiptError)) {
+      if (!safeInstanceOf(receiptError, InvalidPageMoveReceiptError)) {
         console.error(
           "Committed page move receipt result was inconsistent.",
-          pageMoveReceiptLogFields(receiptError, {
-            workspaceId: member.workspace.id,
-            pageId,
-            operationId,
-            receiptReadPhase: "commit",
-          }),
+          pageMoveReceiptLogFields(receiptError, commitReceiptContext),
         );
         throw new Error("The committed page move receipt result was inconsistent.", { cause: receiptError });
       }
+      const unusablePageState = (pageStateError: unknown, cause = pageStateError) => {
+        console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
+          ...pageMoveReceiptLogFields(receiptError, commitReceiptContext),
+          ...prefixedErrorLogFields("pageStateError", pageStateError),
+        });
+        return new Error("The committed page move receipt and fallback state were unusable.", { cause });
+      };
       const committedPageRow = pageMoveStateRow(results[pageStateResultIndex]?.results[0]);
       if (!committedPageRow) {
         const pageStateError = new Error("The moved page state was not returned by its committed batch.");
-        console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
-          ...pageMoveReceiptLogFields(receiptError, {
-            workspaceId: member.workspace.id,
-            pageId,
-            operationId,
-            receiptReadPhase: "commit",
-          }),
-          ...prefixedErrorLogFields("pageStateError", pageStateError),
-        });
-        throw new Error("The committed page move receipt and fallback state were unusable.", {
-          cause: receiptError,
-        });
+        throw unusablePageState(pageStateError, receiptError);
       }
       try {
         moved = pageFromMoveState(committedPageRow);
       } catch (pageStateError) {
-        console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
-          ...pageMoveReceiptLogFields(receiptError, {
-            workspaceId: member.workspace.id,
-            pageId,
-            operationId,
-            receiptReadPhase: "commit",
-          }),
-          ...prefixedErrorLogFields("pageStateError", pageStateError),
-        });
-        throw new Error("The committed page move receipt and fallback state were unusable.", {
-          cause: pageStateError,
-        });
+        throw unusablePageState(pageStateError);
       }
       console.error(
         PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE,
         pageMoveReceiptLogFields(receiptError, {
-          workspaceId: member.workspace.id,
-          pageId,
-          operationId,
-          receiptReadPhase: "commit",
+          ...commitReceiptContext,
           recoveredFromPageState: true,
         }),
       );
@@ -1268,7 +1256,7 @@ app.post("/api/pages/:id/move", async (c) => {
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
     return c.json({ page: moved, operationId, replayed: false });
   } catch (error) {
-    if (error instanceof HttpError && error.code !== "page_archived") throw error;
+    if (safeInstanceOf(error, HttpError) && error.code !== "page_archived") throw error;
     const committed = await readPageMoveReceiptWithDiagnostics(
       () => readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash),
       { ...receiptContext, receiptReadPhase: "recovery", moveError: error },
@@ -3380,7 +3368,8 @@ async function handlePartyRequest(request: Request, env: Env) {
     // Mirrors errorResponse: expected errors carry client-facing messages, and
     // anything else is logged here (there is no Hono context yet) and answered
     // generically. The room is an opaque id, safe to log where the cookie is not.
-    if (!isExpectedError(error)) {
+    const { expected, status, body } = classifyError(error);
+    if (!expected) {
       const party = isDocument ? "document" : "workspace-events";
       console.error(`Failed to handle ${party} party request for ${room ?? "an undecoded room"}`, {
         party,
@@ -3388,7 +3377,6 @@ async function handlePartyRequest(request: Request, env: Env) {
         ...errorLogFields(error),
       });
     }
-    const { status, body } = errorPayload(error);
     return Response.json(body, { status });
   }
 }

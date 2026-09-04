@@ -122,6 +122,14 @@ jobs:
           pending_migrations=$(mktemp)
           trap 'rm -f "${pending_migrations}"' EXIT
           pnpm wrangler d1 migrations list DB --env production --remote | tee "${pending_migrations}"
+          if grep -Fq "No migrations to apply!" "${pending_migrations}"; then
+            :
+          elif grep -Fq "Migrations to be applied:" "${pending_migrations}" && grep -Eq '[[:alnum:]_.-]+\.sql' "${pending_migrations}"; then
+            :
+          else
+            echo "Wrangler did not return a recognizable migration listing; refusing to deploy." >&2
+            exit 1
+          fi
           if grep -Fq "0011_page_move_receipt_envelopes.sql" "${pending_migrations}"; then
             if [ "${PAGE_MOVE_RECEIPT_MIGRATION_SAFE}" != "true" ]; then
               echo "0011 requires a manually confirmed safe upgrade." >&2

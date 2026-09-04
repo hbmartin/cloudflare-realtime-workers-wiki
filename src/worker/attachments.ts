@@ -1,4 +1,5 @@
 import type { Env } from "./env";
+import { safeErrorMessage } from "../shared/error-log.ts";
 
 /**
  * Attachment upload policy, shared by both upload paths, plus the reaper that
@@ -108,7 +109,7 @@ function uploadRetryDelay(attempts: number) {
 }
 
 function uploadErrorMessage(error: unknown, fallback: string) {
-  return (error instanceof Error ? error.message : fallback).slice(0, 1_000);
+  return safeErrorMessage(error, fallback);
 }
 
 async function rescheduleUpload(
