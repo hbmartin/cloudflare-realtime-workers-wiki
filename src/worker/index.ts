@@ -1279,26 +1279,19 @@ app.post("/api/pages/:id/move", async (c) => {
     if (httpErrorCode !== null && httpErrorCode !== "page_archived") throw error;
     const recoveryContext = { ...receiptContext, receiptReadPhase: "recovery" as const, moveError: error };
     const invalidBatchResult = safeInstanceOf(error, InvalidPageMoveBatchResultError);
-    let committed: Page | null;
+    let committed: Page | null = null;
     try {
       committed = await readPageMoveReceiptWithDiagnostics(
         () => readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash),
         recoveryContext,
       );
-    } catch (recoveryError) {
+    } finally {
       if (invalidBatchResult) {
         console.error(
           PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE,
-          pageMoveLogFields({ ...recoveryContext, recoveredFromReceipt: false }),
+          pageMoveLogFields({ ...recoveryContext, recoveredFromReceipt: committed !== null }),
         );
       }
-      throw recoveryError;
-    }
-    if (invalidBatchResult) {
-      console.error(
-        PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE,
-        pageMoveLogFields({ ...recoveryContext, recoveredFromReceipt: committed !== null }),
-      );
     }
     if (committed) {
       sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });

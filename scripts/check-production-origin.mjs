@@ -1,4 +1,3 @@
-import { pathToFileURL } from "node:url";
 import { unstable_readConfig } from "wrangler";
 
 export function configuredProductionOrigin({ configPath = "wrangler.jsonc", readConfig = unstable_readConfig } = {}) {
@@ -25,7 +24,11 @@ export function checkProductionOrigin({ productionBaseURL = process.env.PRODUCTI
   return configured;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (typeof import.meta.main !== "boolean") {
+  throw new Error("This script requires a Node.js runtime with import.meta.main support.");
+}
+
+if (import.meta.main) {
   try {
     console.log(`Production health origin validated: ${checkProductionOrigin()}`);
   } catch (error) {

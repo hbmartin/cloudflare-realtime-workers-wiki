@@ -30,6 +30,10 @@ export function checkPageMoveMigration(output, confirmed = false) {
   return pending;
 }
 
+if (typeof import.meta.main !== "boolean") {
+  throw new Error("This script requires a Node.js runtime with import.meta.main support.");
+}
+
 if (import.meta.main) {
   try {
     const listingPath = process.argv[2];
