@@ -1,6 +1,9 @@
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import { checkProductionOrigin, configuredProductionOrigin } from "./check-production-origin.mjs";
 
 const configWith = (betterAuthURL) => () => ({ vars: { BETTER_AUTH_URL: betterAuthURL } });
@@ -16,6 +19,23 @@ describe("production origin validation", () => {
   it("executes the same CLI entry point used by the deployment workflow", () => {
     const configured = configuredProductionOrigin();
     const result = spawnSync(process.execPath, [entrypoint], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: { ...process.env, PRODUCTION_BASE_URL: configured },
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Production health origin validated: ${configured}`);
+  });
+
+  it("executes the production-origin gate when invoked through a symlink", () => {
+    const directory = mkdtempSync(join(tmpdir(), "production-origin-"));
+    onTestFinished(() => rmSync(directory, { recursive: true }));
+    const symlink = join(directory, "check-production-origin.mjs");
+    symlinkSync(entrypoint, symlink);
+    const configured = configuredProductionOrigin();
+
+    const result = spawnSync(process.execPath, [symlink], {
       cwd: process.cwd(),
       encoding: "utf8",
       env: { ...process.env, PRODUCTION_BASE_URL: configured },

@@ -8,14 +8,18 @@ const ERROR_MESSAGE_LIMIT = LOG_TEXT_LIMIT;
 const ERROR_STACK_LIMIT = 16_000;
 const TRUNCATION_MARKER = "…[truncated]";
 
-export function boundedLogString(value: string, limit: number) {
-  if (value.length <= limit) return value;
+function boundedLogStringRange(value: string, start: number, end: number, limit: number) {
+  if (end - start <= limit) return value.slice(start, end);
   if (limit <= 0) return "";
   if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, limit);
-  let end = limit - TRUNCATION_MARKER.length;
-  const lastCodeUnit = value.charCodeAt(end - 1);
-  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) end -= 1;
-  return `${value.slice(0, end)}${TRUNCATION_MARKER}`;
+  let sliceEnd = start + limit - TRUNCATION_MARKER.length;
+  const lastCodeUnit = value.charCodeAt(sliceEnd - 1);
+  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) sliceEnd -= 1;
+  return `${value.slice(start, sliceEnd)}${TRUNCATION_MARKER}`;
+}
+
+export function boundedLogString(value: string, limit: number) {
+  return boundedLogStringRange(value, 0, value.length, limit);
 }
 
 function property(value: object, name: string): unknown {
@@ -59,8 +63,12 @@ function logPrimitive(value: unknown, stringLimit: number) {
 export function safeErrorMessage(error: unknown, fallback: string) {
   if (typeof error === "object" && error !== null) {
     const message = property(error, "message");
-    if (typeof message === "string" && message.trim().length > 0) {
-      return boundedLogString(message, PERSISTED_ERROR_MESSAGE_LIMIT);
+    if (typeof message === "string") {
+      const start = message.search(/\S/u);
+      if (start !== -1) {
+        const end = message.search(/\s*$/u);
+        return boundedLogStringRange(message, start, end, PERSISTED_ERROR_MESSAGE_LIMIT);
+      }
     }
   }
   return boundedLogString(fallback, PERSISTED_ERROR_MESSAGE_LIMIT);

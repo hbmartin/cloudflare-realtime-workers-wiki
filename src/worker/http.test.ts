@@ -62,6 +62,11 @@ describe("HTTP error handling", () => {
 
     expect(safeHttpErrorCode(error)).toBe("conflict");
     expect(safeHttpErrorCode(hostileCode)).toBeNull();
+    expect(classifyError(hostileCode)).toEqual({
+      expected: false,
+      status: 500,
+      body: { error: { code: "internal_error", message: "Something went wrong." } },
+    });
     expect(safeHttpErrorCode(new Error("ordinary failure"))).toBeNull();
   });
 });
