@@ -124,7 +124,7 @@ const PAGE_MOVE_RECEIPT_PAGE_JSON_SQL = `json_object(${Object.entries(PAGE_MOVE_
   .join(", ")})`;
 const PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE = "Page move receipt was invalid.";
 const PAGE_MOVE_RECEIPT_UNREADABLE_LOG_MESSAGE = "Page move receipt could not be read.";
-const PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE = "Page move batch result was invalid.";
+const PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE = "Page move batch result was invalid or inconsistent.";
 
 async function pageCreateRequestHash(value: unknown) {
   return sha256Hex(canonicalJson(value));
@@ -266,16 +266,26 @@ type PageMoveReceiptReadContext = {
   receiptReadPhase: PageMoveReceiptReadPhase;
   moveError?: unknown;
   recoveredFromPageState?: boolean;
+  recoveredFromReceipt?: boolean;
 };
 
-function pageMoveReceiptLogFields(error: unknown, context: PageMoveReceiptReadContext) {
+function pageMoveLogFields(context: PageMoveReceiptReadContext) {
   return {
     workspaceId: context.workspaceId,
     pageId: context.pageId,
     operationId: context.operationId,
     receiptReadPhase: context.receiptReadPhase,
     ...(context.recoveredFromPageState ? { recoveredFromPageState: true } : {}),
+    ...(typeof context.recoveredFromReceipt === "boolean"
+      ? { recoveredFromReceipt: context.recoveredFromReceipt }
+      : {}),
     ...("moveError" in context ? prefixedErrorLogFields("moveError", context.moveError) : {}),
+  };
+}
+
+function pageMoveReceiptLogFields(error: unknown, context: PageMoveReceiptReadContext) {
+  return {
+    ...pageMoveLogFields(context),
     ...prefixedErrorLogFields("receiptError", error),
   };
 }
@@ -1267,21 +1277,30 @@ app.post("/api/pages/:id/move", async (c) => {
   } catch (error) {
     const httpErrorCode = safeHttpErrorCode(error);
     if (httpErrorCode !== null && httpErrorCode !== "page_archived") throw error;
-    const committed = await readPageMoveReceiptWithDiagnostics(
-      () => readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash),
-      { ...receiptContext, receiptReadPhase: "recovery", moveError: error },
-    );
-    if (committed) {
-      if (safeInstanceOf(error, InvalidPageMoveBatchResultError)) {
-        console.error(PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE, {
-          workspaceId: member.workspace.id,
-          pageId,
-          operationId,
-          receiptReadPhase: "recovery",
-          recoveredFromReceipt: true,
-          ...prefixedErrorLogFields("moveError", error),
-        });
+    const recoveryContext = { ...receiptContext, receiptReadPhase: "recovery" as const, moveError: error };
+    const invalidBatchResult = safeInstanceOf(error, InvalidPageMoveBatchResultError);
+    let committed: Page | null;
+    try {
+      committed = await readPageMoveReceiptWithDiagnostics(
+        () => readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash),
+        recoveryContext,
+      );
+    } catch (recoveryError) {
+      if (invalidBatchResult) {
+        console.error(
+          PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE,
+          pageMoveLogFields({ ...recoveryContext, recoveredFromReceipt: false }),
+        );
       }
+      throw recoveryError;
+    }
+    if (invalidBatchResult) {
+      console.error(
+        PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE,
+        pageMoveLogFields({ ...recoveryContext, recoveredFromReceipt: committed !== null }),
+      );
+    }
+    if (committed) {
       sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });
       return c.json({ page: committed, operationId, replayed: true });
     }

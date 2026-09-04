@@ -151,6 +151,7 @@ describe("error log fields", () => {
 
   it("uses a non-empty bounded fallback for persisted error messages", () => {
     expect(safeErrorMessage({ message: "" }, "Unknown failure")).toBe("Unknown failure");
+    expect(safeErrorMessage({ message: " \n\t" }, "Unknown failure")).toBe("Unknown failure");
     expect(safeErrorMessage(new Error("x".repeat(2_000)), "Unknown failure")).toBe(
       `${"x".repeat(PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
     );
