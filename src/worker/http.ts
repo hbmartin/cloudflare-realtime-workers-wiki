@@ -1,5 +1,11 @@
 import type { Context } from "hono";
-import { boundedLogString, errorLogFields, safeInstanceOf } from "../shared/error-log";
+import {
+  LOG_IDENTIFIER_LIMIT,
+  LOG_TEXT_LIMIT,
+  boundedLogString,
+  errorLogFields,
+  safeInstanceOf,
+} from "../shared/error-log";
 import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
 
@@ -16,6 +22,8 @@ export class HttpError extends Error {
 
 // An error whose message was written for the client. Anything else is an
 // internal failure: callers log it and answer with a generic message.
+// Classification owns the status and JSON envelope for both Hono and raw party
+// requests so those response paths cannot drift apart.
 export function classifyError(error: unknown) {
   try {
     if (safeInstanceOf(error, ValidationError)) {
@@ -48,8 +56,8 @@ export function errorResponse(c: Context, error: unknown) {
     const rayId = c.req.header("cf-ray");
     console.error("Unhandled request error", {
       requestMethod: c.req.method,
-      requestPath: boundedLogString(new URL(c.req.url).pathname, 2_000),
-      requestRayId: rayId ? boundedLogString(rayId, 200) : null,
+      requestPath: boundedLogString(new URL(c.req.url).pathname, LOG_TEXT_LIMIT),
+      requestRayId: rayId ? boundedLogString(rayId, LOG_IDENTIFIER_LIMIT) : null,
       ...errorLogFields(error),
     });
   }

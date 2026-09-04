@@ -1,6 +1,9 @@
-const ERROR_NAME_LIMIT = 200;
-const ERROR_CODE_LIMIT = 200;
-const ERROR_MESSAGE_LIMIT = 2_000;
+export const LOG_IDENTIFIER_LIMIT = 200;
+export const LOG_TEXT_LIMIT = 2_000;
+
+const ERROR_NAME_LIMIT = LOG_IDENTIFIER_LIMIT;
+const ERROR_CODE_LIMIT = LOG_IDENTIFIER_LIMIT;
+const ERROR_MESSAGE_LIMIT = LOG_TEXT_LIMIT;
 const ERROR_STACK_LIMIT = 16_000;
 
 export function boundedLogString(value: string, limit: number) {
@@ -43,10 +46,18 @@ function isErrorLike(value: unknown): value is object {
 
 function logPrimitive(value: unknown, stringLimit: number) {
   if (typeof value === "string") return boundedLogString(value, stringLimit);
-  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
   if (typeof value === "boolean" || value === null) return value;
   if (typeof value === "bigint") return boundedLogString(String(value), stringLimit);
   return undefined;
+}
+
+export function safeErrorMessage(error: unknown, fallback: string, limit = 1_000) {
+  if (typeof error === "object" && error !== null) {
+    const message = property(error, "message");
+    if (typeof message === "string") return boundedLogString(message, limit);
+  }
+  return boundedLogString(fallback, limit);
 }
 
 function logValue(value: unknown) {
@@ -79,13 +90,21 @@ export function prefixedErrorLogFields(prefix: string, error: unknown, includeCa
   if (isErrorLike(error)) {
     const status = property(error, "status");
     const code = property(error, "code");
+    const loggedStatus = logPrimitive(status, ERROR_MESSAGE_LIMIT);
+    const loggedCode = logPrimitive(code, ERROR_CODE_LIMIT);
+    const reason = logPrimitive(property(error, "reason"), ERROR_MESSAGE_LIMIT);
+    const errno = logPrimitive(property(error, "errno"), ERROR_MESSAGE_LIMIT);
+    const syscall = logPrimitive(property(error, "syscall"), ERROR_MESSAGE_LIMIT);
     const fields: Record<string, unknown> = {
       [`${prefix}Name`]: stringProperty(error, "name", ERROR_NAME_LIMIT),
       [`${prefix}Message`]: stringProperty(error, "message", ERROR_MESSAGE_LIMIT),
       [`${prefix}Stack`]: stringProperty(error, "stack", ERROR_STACK_LIMIT),
       [`${prefix}Type`]: "object",
-      ...(typeof status === "number" && Number.isFinite(status) ? { [`${prefix}Status`]: status } : {}),
-      ...(typeof code === "string" ? { [`${prefix}Code`]: boundedLogString(code, ERROR_CODE_LIMIT) } : {}),
+      ...(loggedStatus !== undefined ? { [`${prefix}Status`]: loggedStatus } : {}),
+      ...(loggedCode !== undefined ? { [`${prefix}Code`]: loggedCode } : {}),
+      ...(reason !== undefined ? { [`${prefix}Reason`]: reason } : {}),
+      ...(errno !== undefined ? { [`${prefix}Errno`]: errno } : {}),
+      ...(syscall !== undefined ? { [`${prefix}Syscall`]: syscall } : {}),
     };
     if (includeCause) {
       const cause = property(error, "cause");

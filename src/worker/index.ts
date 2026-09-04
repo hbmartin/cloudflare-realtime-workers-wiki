@@ -201,13 +201,13 @@ function pageMoveReceiptRow(value: unknown): PageMoveReceiptRow | null {
 
 function pageMoveStateRow(value: unknown): PageMoveStateRow | null {
   if (value === null || typeof value !== "object") return null;
-  const serializedPage = Reflect.get(value, "page_json") as unknown;
+  const serializedPage = (value as Record<string, unknown>).page_json;
   return typeof serializedPage === "string" ? { page_json: serializedPage } : null;
 }
 
 function pageMoveAvailabilityRow(value: unknown): PageMoveAvailabilityRow | null {
   if (value === null || typeof value !== "object") return null;
-  const archivedAt = Reflect.get(value, "archived_at") as unknown;
+  const archivedAt = (value as Record<string, unknown>).archived_at;
   return archivedAt === null || typeof archivedAt === "number" ? { archived_at: archivedAt } : null;
 }
 
@@ -1191,8 +1191,19 @@ app.post("/api/pages/:id/move", async (c) => {
            FROM pages WHERE id = ? AND workspace_id = ?`,
       ).bind(page.id, member.workspace.id),
     ]);
-    if (!results[moveResultIndex]?.meta.changes) {
-      const unavailableValue = results[pageStateResultIndex]?.results[0];
+    if (results.length !== 4) {
+      throw new Error("The page move batch returned an unexpected number of results.");
+    }
+    const moveChanges = results[moveResultIndex]?.meta?.changes;
+    if (moveChanges !== 0 && moveChanges !== 1) {
+      throw new Error("The page move batch returned malformed move metadata.");
+    }
+    if (moveChanges === 0) {
+      const pageStateResult = results[pageStateResultIndex];
+      if (!pageStateResult || !Array.isArray(pageStateResult.results)) {
+        throw new Error("The page move batch did not return its page-state result.");
+      }
+      const unavailableValue = pageStateResult.results[0];
       const unavailable = pageMoveAvailabilityRow(unavailableValue);
       if (unavailableValue !== undefined && !unavailable) {
         throw new Error("The unavailable page state returned by the move batch was malformed.");
@@ -1203,6 +1214,7 @@ app.post("/api/pages/:id/move", async (c) => {
       if (unavailable) throw new Error("An active page move unexpectedly changed no rows.");
       throw new HttpError(404, "page_not_found", "Page not found.");
     }
+    const commitReceiptContext = { ...receiptContext, receiptReadPhase: "commit" as const };
     let moved: Page;
     try {
       const receipt = pageMoveReceiptRow(results[receiptResultIndex]?.results[0]);
@@ -1212,54 +1224,31 @@ app.post("/api/pages/:id/move", async (c) => {
       if (!safeInstanceOf(receiptError, InvalidPageMoveReceiptError)) {
         console.error(
           "Committed page move receipt result was inconsistent.",
-          pageMoveReceiptLogFields(receiptError, {
-            workspaceId: member.workspace.id,
-            pageId,
-            operationId,
-            receiptReadPhase: "commit",
-          }),
+          pageMoveReceiptLogFields(receiptError, commitReceiptContext),
         );
         throw new Error("The committed page move receipt result was inconsistent.", { cause: receiptError });
       }
+      const unusablePageState = (pageStateError: unknown, cause = pageStateError) => {
+        console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
+          ...pageMoveReceiptLogFields(receiptError, commitReceiptContext),
+          ...prefixedErrorLogFields("pageStateError", pageStateError),
+        });
+        return new Error("The committed page move receipt and fallback state were unusable.", { cause });
+      };
       const committedPageRow = pageMoveStateRow(results[pageStateResultIndex]?.results[0]);
       if (!committedPageRow) {
         const pageStateError = new Error("The moved page state was not returned by its committed batch.");
-        console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
-          ...pageMoveReceiptLogFields(receiptError, {
-            workspaceId: member.workspace.id,
-            pageId,
-            operationId,
-            receiptReadPhase: "commit",
-          }),
-          ...prefixedErrorLogFields("pageStateError", pageStateError),
-        });
-        throw new Error("The committed page move receipt and fallback state were unusable.", {
-          cause: receiptError,
-        });
+        throw unusablePageState(pageStateError, receiptError);
       }
       try {
         moved = pageFromMoveState(committedPageRow);
       } catch (pageStateError) {
-        console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
-          ...pageMoveReceiptLogFields(receiptError, {
-            workspaceId: member.workspace.id,
-            pageId,
-            operationId,
-            receiptReadPhase: "commit",
-          }),
-          ...prefixedErrorLogFields("pageStateError", pageStateError),
-        });
-        throw new Error("The committed page move receipt and fallback state were unusable.", {
-          cause: pageStateError,
-        });
+        throw unusablePageState(pageStateError);
       }
       console.error(
         PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE,
         pageMoveReceiptLogFields(receiptError, {
-          workspaceId: member.workspace.id,
-          pageId,
-          operationId,
-          receiptReadPhase: "commit",
+          ...commitReceiptContext,
           recoveredFromPageState: true,
         }),
       );

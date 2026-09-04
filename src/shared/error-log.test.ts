@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { errorLogFields, prefixedErrorLogFields } from "./error-log";
+import { errorLogFields, prefixedErrorLogFields, safeErrorMessage } from "./error-log";
 
 describe("error log fields", () => {
   it("retains bounded allowlisted fields from non-Error throw values", () => {
@@ -29,11 +29,17 @@ describe("error log fields", () => {
   });
 
   it("retains stable fields from message-only and stack-only throw values", () => {
-    expect(errorLogFields({ message: "Remote failure" })).toEqual({
+    expect(
+      errorLogFields({ message: "Remote failure", reason: "socket closed", errno: -5, syscall: "read", code: 12 }),
+    ).toEqual({
       errorName: null,
       errorMessage: "Remote failure",
       errorStack: null,
       errorType: "object",
+      errorCode: 12,
+      errorReason: "socket closed",
+      errorErrno: -5,
+      errorSyscall: "read",
     });
     expect(errorLogFields({ stack: "remote:1" })).toEqual({
       errorName: null,
@@ -54,6 +60,7 @@ describe("error log fields", () => {
       errorType: "object",
       errorValue: "[object omitted]",
     });
+    expect(safeErrorMessage(revocable.proxy, "Unknown failure")).toBe("Unknown failure");
   });
 
   it("flattens an Error cause and its safe metadata one level deep", () => {
@@ -125,14 +132,17 @@ describe("error log fields", () => {
     expect(fields.errorValue).toBe(fields.errorMessage);
   });
 
-  it("applies field-specific bounds and omits non-finite numbers consistently", () => {
+  it("applies field-specific bounds and preserves non-finite numbers as strings", () => {
     const fields = errorLogFields({ name: "ordinary", code: "c".repeat(300), reason: "r".repeat(3_000), status: NaN });
 
     expect(fields.errorValue).toEqual({
       name: "ordinary",
       code: `${"c".repeat(200)}…[truncated]`,
       reason: `${"r".repeat(2_000)}…[truncated]`,
+      status: "NaN",
     });
-    expect(errorLogFields(Infinity).errorValue).toBe("[number omitted]");
+    expect(errorLogFields(NaN).errorValue).toBe("NaN");
+    expect(errorLogFields(Infinity).errorValue).toBe("Infinity");
+    expect(errorLogFields(-Infinity).errorValue).toBe("-Infinity");
   });
 });
