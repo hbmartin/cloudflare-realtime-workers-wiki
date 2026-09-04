@@ -399,7 +399,7 @@ function envRejectingNextBatchAfterCommit(
 function envMutatingNextMoveBatchResult(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
-  mutate: (results: D1BatchResults, uninterceptedDatabase: D1Database) => boolean | Promise<boolean>,
+  mutate: (results: D1BatchResults) => boolean | Promise<boolean>,
 ) {
   let intercepted = false;
   let mutateFailure: { error: unknown } | undefined;
@@ -407,11 +407,15 @@ function envMutatingNextMoveBatchResult(
   const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
     const results = await run();
     if (intercepted || mutateFailure) return results;
+    let returnedResults = results;
     const attempt = mutateInOrder.then(async () => {
-      // Database work awaited by mutate must use the original binding so it cannot re-enter this serialized interceptor.
       if (!intercepted && !mutateFailure) {
         try {
-          intercepted = await mutate(results, bindings.DB);
+          const candidateResults = structuredClone(results);
+          if (await mutate(candidateResults)) {
+            intercepted = true;
+            returnedResults = candidateResults;
+          }
         } catch (error) {
           // Keep test-fixture failures out of the Worker's production error handling and surface the original value below.
           mutateFailure = { error };
@@ -420,7 +424,7 @@ function envMutatingNextMoveBatchResult(
     });
     mutateInOrder = attempt;
     await attempt;
-    return results;
+    return returnedResults;
   });
   const eventBindings = envWithDatabase(bindings, database);
   return {
@@ -429,6 +433,7 @@ function envMutatingNextMoveBatchResult(
       if (mutateFailure) throw mutateFailure.error;
       return intercepted;
     },
+    batchResultMutationWasApplied: () => intercepted,
   };
 }
 
@@ -4231,8 +4236,11 @@ describe("Worker integration", () => {
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
       const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
       if (receipt?.page_id !== installed.pageId) return false;
+      results.length = 0;
       throw mutateError;
     });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
     const context = createExecutionContext();
 
     const response = await worker.fetch(
@@ -4244,6 +4252,7 @@ describe("Worker integration", () => {
       intercepted.bindings,
       context,
     );
+    const body = await response.json<{ page: Page; replayed: boolean }>();
     await waitOnExecutionContext(context);
 
     let surfacedError: unknown;
@@ -4254,18 +4263,19 @@ describe("Worker integration", () => {
     }
     expect(surfacedError).toBe(mutateError);
     expect(response.status).toBe(200);
+    expect(body).toMatchObject({ replayed: false, page: { id: installed.pageId, revision: 2 } });
     expect(delivered).toHaveLength(1);
+    expect(logged).not.toHaveBeenCalled();
   });
 
   it("logs an invalid batch result when receipt recovery cannot recover it", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
-    const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results, database) => {
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results) => {
       const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
       if (receipt?.page_id !== installed.pageId) return false;
-      await database
-        .prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
+      await env.DB.prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
         .bind(installed.workspaceId, operationId)
         .run();
       results.length = 0;
@@ -4320,7 +4330,7 @@ describe("Worker integration", () => {
     const bindings = envThrowingPageMoveReceiptReads(
       intercepted.bindings,
       recoveryError,
-      intercepted.batchResultWasMutated,
+      intercepted.batchResultMutationWasApplied,
     );
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => logged.mockRestore());
