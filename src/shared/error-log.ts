@@ -24,13 +24,20 @@ function stringProperty(value: object, name: string, limit: number) {
   return typeof candidate === "string" ? boundedLogString(candidate, limit) : null;
 }
 
+export function safeInstanceOf<Instance>(
+  value: unknown,
+  constructor: abstract new (...arguments_: never[]) => Instance,
+): value is Instance {
+  try {
+    return value instanceof constructor;
+  } catch {
+    return false;
+  }
+}
+
 function isErrorLike(value: unknown): value is object {
   if (typeof value !== "object" || value === null) return false;
-  try {
-    if (value instanceof Error) return true;
-  } catch {
-    // A revoked or hostile Proxy can throw while its prototype chain is inspected.
-  }
+  if (safeInstanceOf(value, Error)) return true;
   return typeof property(value, "message") === "string" || typeof property(value, "stack") === "string";
 }
 

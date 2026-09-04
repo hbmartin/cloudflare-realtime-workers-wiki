@@ -19,9 +19,8 @@ import {
   HttpError,
   assertSameOrigin,
   attachmentDisposition,
-  errorPayload,
+  classifyError,
   errorResponse,
-  isExpectedError,
   locationHint,
   normalizeFilename,
   now,
@@ -41,7 +40,7 @@ import {
   TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
 import { PAGE_KINDS } from "../shared/page-kind";
-import { errorLogFields, prefixedErrorLogFields } from "../shared/error-log";
+import { errorLogFields, prefixedErrorLogFields, safeInstanceOf } from "../shared/error-log";
 import {
   PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
   PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
@@ -282,13 +281,13 @@ async function readPageMoveReceiptWithDiagnostics<T>(
   try {
     return await read();
   } catch (error) {
-    if (error instanceof HttpError && context.receiptReadPhase !== "recovery") throw error;
+    if (safeInstanceOf(error, HttpError) && context.receiptReadPhase !== "recovery") throw error;
     const fields = pageMoveReceiptLogFields(error, context);
-    if (error instanceof HttpError) {
+    if (safeInstanceOf(error, HttpError)) {
       console.error("Page move recovery found a conflicting receipt.", fields);
       throw error;
     }
-    if (error instanceof InvalidPageMoveReceiptError) {
+    if (safeInstanceOf(error, InvalidPageMoveReceiptError)) {
       console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, fields);
       throw new HttpError(500, "internal_error", "Something went wrong.");
     }
@@ -395,7 +394,7 @@ async function readInitialPageCreateReplay(
     // Exact replays remain valid if their original parent was archived later.
     // For a mismatched reuse, however, preserve the create API's parent error
     // precedence before returning the idempotency conflict.
-    if (error instanceof HttpError && error.code === "idempotency_key_reused") {
+    if (safeInstanceOf(error, HttpError) && error.code === "idempotency_key_reused") {
       await validatePageCreateParents(env, member, requested);
     }
     throw error;
@@ -445,7 +444,7 @@ async function jsonBody(request: Request) {
   try {
     return object(await request.json());
   } catch (error) {
-    if (error instanceof HttpError) throw error;
+    if (safeInstanceOf(error, HttpError)) throw error;
     throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
   }
 }
@@ -478,7 +477,7 @@ async function limitedJsonBody(request: Request, limit: number) {
     }
     return object(JSON.parse(new TextDecoder().decode(bytes)));
   } catch (error) {
-    if (error instanceof HttpError) throw error;
+    if (safeInstanceOf(error, HttpError)) throw error;
     throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
   }
 }
@@ -1210,7 +1209,7 @@ app.post("/api/pages/:id/move", async (c) => {
       if (!receipt) throw new InvalidPageMoveReceiptError("The committed page move receipt row was malformed.");
       moved = pageFromMoveReceipt(receipt, member.workspace.id, pageId, requestHash);
     } catch (receiptError) {
-      if (!(receiptError instanceof InvalidPageMoveReceiptError)) {
+      if (!safeInstanceOf(receiptError, InvalidPageMoveReceiptError)) {
         console.error(
           "Committed page move receipt result was inconsistent.",
           pageMoveReceiptLogFields(receiptError, {
@@ -1268,7 +1267,7 @@ app.post("/api/pages/:id/move", async (c) => {
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
     return c.json({ page: moved, operationId, replayed: false });
   } catch (error) {
-    if (error instanceof HttpError && error.code !== "page_archived") throw error;
+    if (safeInstanceOf(error, HttpError) && error.code !== "page_archived") throw error;
     const committed = await readPageMoveReceiptWithDiagnostics(
       () => readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash),
       { ...receiptContext, receiptReadPhase: "recovery", moveError: error },
@@ -3380,7 +3379,8 @@ async function handlePartyRequest(request: Request, env: Env) {
     // Mirrors errorResponse: expected errors carry client-facing messages, and
     // anything else is logged here (there is no Hono context yet) and answered
     // generically. The room is an opaque id, safe to log where the cookie is not.
-    if (!isExpectedError(error)) {
+    const { expected, status, body } = classifyError(error);
+    if (!expected) {
       const party = isDocument ? "document" : "workspace-events";
       console.error(`Failed to handle ${party} party request for ${room ?? "an undecoded room"}`, {
         party,
@@ -3388,7 +3388,6 @@ async function handlePartyRequest(request: Request, env: Env) {
         ...errorLogFields(error),
       });
     }
-    const { status, body } = errorPayload(error);
     return Response.json(body, { status });
   }
 }

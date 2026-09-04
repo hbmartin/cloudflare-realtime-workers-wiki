@@ -349,8 +349,7 @@ function envFailingMoveBatchWithUndefined(bindings: Env) {
   return { receiptError, bindings: envWithDatabase(bindings, database) };
 }
 
-function envFailingPageMoveReceiptReads(bindings: Env) {
-  const receiptError = new Error("D1 move receipt lookup failed");
+function envThrowingPageMoveReceiptReads(bindings: Env, receiptError: unknown) {
   const database = new Proxy(bindings.DB, {
     get(target, property) {
       if (property === "prepare") {
@@ -363,9 +362,14 @@ function envFailingPageMoveReceiptReads(bindings: Env) {
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+  return envWithDatabase(bindings, database);
+}
+
+function envFailingPageMoveReceiptReads(bindings: Env) {
+  const receiptError = new Error("D1 move receipt lookup failed");
   return {
     receiptError,
-    bindings: envWithDatabase(bindings, database),
+    bindings: envThrowingPageMoveReceiptReads(bindings, receiptError),
   };
 }
 
@@ -4046,6 +4050,43 @@ describe("Worker integration", () => {
       receiptErrorMessage: failed.receiptError.message,
       receiptErrorStack: expect.any(String),
       receiptErrorType: "object",
+    });
+  });
+
+  it("returns the same unresolved result when a receipt read throws a revoked Proxy", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const request = () =>
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      });
+    expect((await SELF.fetch(request())).status).toBe(200);
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+    const bindings = envThrowingPageMoveReceiptReads(env, revocable.proxy);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(request(), bindings, context);
+    const body = await response.json<{ error: { code: string } }>();
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(503);
+    expect(body.error.code).toBe("page_move_unresolved");
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "preflight",
+      receiptErrorName: null,
+      receiptErrorMessage: null,
+      receiptErrorStack: null,
+      receiptErrorType: "object",
+      receiptErrorValue: "[object omitted]",
     });
   });
 

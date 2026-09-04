@@ -1,5 +1,5 @@
 import type { Context } from "hono";
-import { boundedLogString, errorLogFields } from "../shared/error-log";
+import { boundedLogString, errorLogFields, safeInstanceOf } from "../shared/error-log";
 import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
 
@@ -16,28 +16,35 @@ export class HttpError extends Error {
 
 // An error whose message was written for the client. Anything else is an
 // internal failure: callers log it and answer with a generic message.
-export function isExpectedError(error: unknown): error is HttpError | ValidationError {
-  return error instanceof HttpError || error instanceof ValidationError;
-}
-
-// The status and JSON envelope for any error, independent of the framework
-// that produces the response, so the Hono error handler and the raw party
-// request path cannot drift apart.
-export function errorPayload(error: unknown) {
-  if (error instanceof ValidationError) {
-    return { status: 422 as const, body: { error: { code: "invalid_input", message: error.message } } };
+export function classifyError(error: unknown) {
+  try {
+    if (safeInstanceOf(error, ValidationError)) {
+      return {
+        expected: true as const,
+        status: 422 as const,
+        body: { error: { code: "invalid_input", message: error.message } },
+      };
+    }
+    if (safeInstanceOf(error, HttpError)) {
+      return {
+        expected: true as const,
+        status: error.status,
+        body: { error: { code: error.code, message: error.message, details: error.details } },
+      };
+    }
+  } catch {
+    // Treat hostile error objects as unexpected and return the generic response.
   }
-  if (error instanceof HttpError) {
-    return {
-      status: error.status,
-      body: { error: { code: error.code, message: error.message, details: error.details } },
-    };
-  }
-  return { status: 500 as const, body: { error: { code: "internal_error", message: "Something went wrong." } } };
+  return {
+    expected: false as const,
+    status: 500 as const,
+    body: { error: { code: "internal_error", message: "Something went wrong." } },
+  };
 }
 
 export function errorResponse(c: Context, error: unknown) {
-  if (!isExpectedError(error)) {
+  const { expected, status, body } = classifyError(error);
+  if (!expected) {
     const rayId = c.req.header("cf-ray");
     console.error("Unhandled request error", {
       requestMethod: c.req.method,
@@ -46,7 +53,6 @@ export function errorResponse(c: Context, error: unknown) {
       ...errorLogFields(error),
     });
   }
-  const { status, body } = errorPayload(error);
   return c.json(body, status);
 }
 
