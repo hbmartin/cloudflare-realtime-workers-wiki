@@ -36,10 +36,10 @@ describe("HTTP error handling", () => {
     });
   });
 
-  it("returns a generic classification when an error Proxy has a hostile property trap", () => {
+  it("returns a generic classification when an error Proxy has a hostile status", () => {
     const error = new Proxy(new HttpError(409, "conflict", "Conflict"), {
       get(target, property, receiver) {
-        if (property === "status" || property === "code") throw new Error(`${String(property)} is unavailable`);
+        if (property === "status") throw new Error("status is unavailable");
         return Reflect.get(target, property, receiver);
       },
     });
@@ -49,6 +49,19 @@ describe("HTTP error handling", () => {
       status: 500,
       body: { error: { code: "internal_error", message: "Something went wrong." } },
     });
-    expect(safeHttpErrorCode(error)).toBeNull();
+  });
+
+  it("reads an HttpError code without trusting hostile properties", () => {
+    const error = new HttpError(409, "conflict", "Conflict");
+    const hostileCode = new Proxy(error, {
+      get(target, property, receiver) {
+        if (property === "code") throw new Error("code is unavailable");
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    expect(safeHttpErrorCode(error)).toBe("conflict");
+    expect(safeHttpErrorCode(hostileCode)).toBeNull();
+    expect(safeHttpErrorCode(new Error("ordinary failure"))).toBeNull();
   });
 });

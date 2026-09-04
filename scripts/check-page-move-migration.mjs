@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
 
 const NO_PENDING_MIGRATIONS = "No migrations to apply!";
 const PENDING_MIGRATIONS = "Migrations to be applied:";
@@ -31,7 +30,7 @@ export function checkPageMoveMigration(output, confirmed = false) {
   return pending;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (import.meta.main) {
   try {
     const listingPath = process.argv[2];
     if (!listingPath) throw new Error("Pass the captured Wrangler migration listing path.");

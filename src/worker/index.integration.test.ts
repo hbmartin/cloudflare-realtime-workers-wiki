@@ -395,12 +395,12 @@ function envRejectingNextBatchAfterCommit(
 function envMutatingNextMoveBatchResult(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
-  mutate: (results: D1BatchResults) => boolean,
+  mutate: (results: D1BatchResults) => boolean | Promise<boolean>,
 ) {
   let intercepted = false;
   const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
     const results = await run();
-    if (!intercepted) intercepted = mutate(results);
+    if (!intercepted) intercepted = await mutate(results);
     return results;
   });
   const eventBindings = envWithDatabase(bindings, database);
@@ -4186,7 +4186,7 @@ describe("Worker integration", () => {
       },
     ]);
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move batch result was invalid.", {
+    expect(logged).toHaveBeenCalledWith("Page move batch result was invalid or inconsistent.", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -4197,6 +4197,102 @@ describe("Worker integration", () => {
       moveErrorStack: expect.any(String),
       moveErrorType: "object",
     });
+  });
+
+  it("logs an invalid batch result when receipt recovery cannot recover it", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results) => {
+      await env.DB.prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
+        .bind(installed.workspaceId, operationId)
+        .run();
+      results.length = 0;
+      return true;
+    });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    const body = await response.json<{ error: { code: string } }>();
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.batchResultWasMutated()).toBe(true);
+    expect(response.status).toBe(500);
+    expect(body.error.code).toBe("internal_error");
+    expect(delivered).toEqual([]);
+    expect(logged).toHaveBeenCalledTimes(2);
+    expect(logged).toHaveBeenNthCalledWith(1, "Page move batch result was invalid or inconsistent.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "recovery",
+      recoveredFromReceipt: false,
+      moveErrorName: "InvalidPageMoveBatchResultError",
+      moveErrorMessage: "The page move batch returned an unexpected number of results.",
+      moveErrorStack: expect.any(String),
+      moveErrorType: "object",
+    });
+    expect(logged).toHaveBeenNthCalledWith(2, "Unhandled request error", expect.any(Object));
+  });
+
+  it("reports a zero-change result for an active page as an inconsistent batch result", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
+      const moveResult = results[0];
+      if (!moveResult) return false;
+      moveResult.meta.changes = 0;
+      return true;
+    });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    const body = await response.json<{ page: Page; replayed: boolean }>();
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.batchResultWasMutated()).toBe(true);
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "pages-upserted", pages: [body.page] },
+      },
+    ]);
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith(
+      "Page move batch result was invalid or inconsistent.",
+      expect.objectContaining({
+        workspaceId: installed.workspaceId,
+        pageId: installed.pageId,
+        operationId,
+        receiptReadPhase: "recovery",
+        recoveredFromReceipt: true,
+        moveErrorName: "InvalidPageMoveBatchResultError",
+        moveErrorMessage: "An active page move unexpectedly changed no rows.",
+      }),
+    );
   });
 
   it("returns and broadcasts authoritative state when the committed receipt result cannot be decoded", async () => {

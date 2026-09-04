@@ -59,7 +59,7 @@ function logPrimitive(value: unknown, stringLimit: number) {
 export function safeErrorMessage(error: unknown, fallback: string) {
   if (typeof error === "object" && error !== null) {
     const message = property(error, "message");
-    if (typeof message === "string" && message.length > 0) {
+    if (typeof message === "string" && message.trim().length > 0) {
       return boundedLogString(message, PERSISTED_ERROR_MESSAGE_LIMIT);
     }
   }

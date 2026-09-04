@@ -1,6 +1,9 @@
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import { checkPageMoveMigration, parsePendingMigrations } from "./check-page-move-migration.mjs";
 
 const entrypoint = fileURLToPath(new URL("./check-page-move-migration.mjs", import.meta.url));
@@ -13,6 +16,12 @@ const pending = `Migrations to be applied:
 │ 0011_page_move_receipt_envelopes.sql   │
 └────────────────────────────────────────┘
 `;
+
+function unconfirmedEnvironment() {
+  const environment = { ...process.env };
+  delete environment.PAGE_MOVE_RECEIPT_MIGRATION_SAFE;
+  return environment;
+}
 
 describe("page-move migration deployment gate", () => {
   it("parses empty and populated Wrangler migration listings", () => {
@@ -35,7 +44,11 @@ describe("page-move migration deployment gate", () => {
   });
 
   it("executes the same entry point used by the deployment workflow", () => {
-    const rejected = spawnSync(process.execPath, [entrypoint, "-"], { encoding: "utf8", input: pending });
+    const rejected = spawnSync(process.execPath, [entrypoint, "-"], {
+      encoding: "utf8",
+      env: unconfirmedEnvironment(),
+      input: pending,
+    });
     expect(rejected.status).toBe(1);
     expect(rejected.stderr).toContain("0011 requires a manually confirmed safe upgrade.");
 
@@ -46,5 +59,21 @@ describe("page-move migration deployment gate", () => {
     });
     expect(accepted.status).toBe(0);
     expect(accepted.stdout).toContain("Recognized Wrangler migration listing (2 pending).");
+  });
+
+  it("executes the migration gate when invoked through a symlink", () => {
+    const directory = mkdtempSync(join(tmpdir(), "page-move-migration-"));
+    onTestFinished(() => rmSync(directory, { recursive: true }));
+    const symlink = join(directory, "check-page-move-migration.mjs");
+    symlinkSync(entrypoint, symlink);
+
+    const rejected = spawnSync(process.execPath, [symlink, "-"], {
+      encoding: "utf8",
+      env: unconfirmedEnvironment(),
+      input: pending,
+    });
+
+    expect(rejected.status).toBe(1);
+    expect(rejected.stderr).toContain("0011 requires a manually confirmed safe upgrade.");
   });
 });
