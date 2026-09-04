@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { errorLogFields, prefixedErrorLogFields, safeErrorMessage } from "./error-log";
+import {
+  LOG_TEXT_LIMIT,
+  PERSISTED_ERROR_MESSAGE_LIMIT,
+  errorLogFields,
+  prefixedErrorLogFields,
+  safeErrorMessage,
+} from "./error-log";
+
+const TRUNCATION_MARKER = "…[truncated]";
 
 describe("error log fields", () => {
   it("retains bounded allowlisted fields from non-Error throw values", () => {
@@ -30,13 +38,20 @@ describe("error log fields", () => {
 
   it("retains stable fields from message-only and stack-only throw values", () => {
     expect(
-      errorLogFields({ message: "Remote failure", reason: "socket closed", errno: -5, syscall: "read", code: 12 }),
+      errorLogFields({
+        message: "Remote failure",
+        reason: "socket closed",
+        errno: -5,
+        syscall: "read",
+        status: "503",
+        code: 12,
+      }),
     ).toEqual({
       errorName: null,
       errorMessage: "Remote failure",
       errorStack: null,
       errorType: "object",
-      errorCode: 12,
+      errorCode: "12",
       errorReason: "socket closed",
       errorErrno: -5,
       errorSyscall: "read",
@@ -121,15 +136,27 @@ describe("error log fields", () => {
   it("bounds logged strings", () => {
     const fields = errorLogFields("x".repeat(3_000));
 
-    expect(fields.errorMessage).toMatch(/^x{2000}…\[truncated\]$/);
+    expect(fields.errorMessage).toBe(`${"x".repeat(LOG_TEXT_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`);
+    expect(fields.errorMessage).toHaveLength(LOG_TEXT_LIMIT);
     expect(fields.errorValue).toBe(fields.errorMessage);
   });
 
   it("does not split a surrogate pair at the string limit", () => {
-    const fields = errorLogFields(`${"x".repeat(1_999)}😀tail`);
+    const payloadLimit = LOG_TEXT_LIMIT - TRUNCATION_MARKER.length;
+    const fields = errorLogFields(`${"x".repeat(payloadLimit - 1)}😀${"tail".repeat(100)}`);
 
-    expect(fields.errorMessage).toBe(`${"x".repeat(1_999)}…[truncated]`);
+    expect(fields.errorMessage).toBe(`${"x".repeat(payloadLimit - 1)}${TRUNCATION_MARKER}`);
     expect(fields.errorValue).toBe(fields.errorMessage);
+  });
+
+  it("uses a non-empty bounded fallback for persisted error messages", () => {
+    expect(safeErrorMessage({ message: "" }, "Unknown failure")).toBe("Unknown failure");
+    expect(safeErrorMessage(new Error("x".repeat(2_000)), "Unknown failure")).toBe(
+      `${"x".repeat(PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
+    );
+    expect(safeErrorMessage(new Error("x".repeat(2_000)), "Unknown failure")).toHaveLength(
+      PERSISTED_ERROR_MESSAGE_LIMIT,
+    );
   });
 
   it("applies field-specific bounds and preserves non-finite numbers as strings", () => {
@@ -137,8 +164,8 @@ describe("error log fields", () => {
 
     expect(fields.errorValue).toEqual({
       name: "ordinary",
-      code: `${"c".repeat(200)}…[truncated]`,
-      reason: `${"r".repeat(2_000)}…[truncated]`,
+      code: `${"c".repeat(200 - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
+      reason: `${"r".repeat(LOG_TEXT_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
       status: "NaN",
     });
     expect(errorLogFields(NaN).errorValue).toBe("NaN");

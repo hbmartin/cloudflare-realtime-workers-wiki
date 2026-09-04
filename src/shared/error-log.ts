@@ -1,17 +1,21 @@
 export const LOG_IDENTIFIER_LIMIT = 200;
 export const LOG_TEXT_LIMIT = 2_000;
+export const PERSISTED_ERROR_MESSAGE_LIMIT = 1_000;
 
 const ERROR_NAME_LIMIT = LOG_IDENTIFIER_LIMIT;
 const ERROR_CODE_LIMIT = LOG_IDENTIFIER_LIMIT;
 const ERROR_MESSAGE_LIMIT = LOG_TEXT_LIMIT;
 const ERROR_STACK_LIMIT = 16_000;
+const TRUNCATION_MARKER = "…[truncated]";
 
 export function boundedLogString(value: string, limit: number) {
   if (value.length <= limit) return value;
-  let end = limit;
+  if (limit <= 0) return "";
+  if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, limit);
+  let end = limit - TRUNCATION_MARKER.length;
   const lastCodeUnit = value.charCodeAt(end - 1);
   if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) end -= 1;
-  return `${value.slice(0, end)}…[truncated]`;
+  return `${value.slice(0, end)}${TRUNCATION_MARKER}`;
 }
 
 function property(value: object, name: string): unknown {
@@ -52,12 +56,14 @@ function logPrimitive(value: unknown, stringLimit: number) {
   return undefined;
 }
 
-export function safeErrorMessage(error: unknown, fallback: string, limit = 1_000) {
+export function safeErrorMessage(error: unknown, fallback: string) {
   if (typeof error === "object" && error !== null) {
     const message = property(error, "message");
-    if (typeof message === "string") return boundedLogString(message, limit);
+    if (typeof message === "string" && message.length > 0) {
+      return boundedLogString(message, PERSISTED_ERROR_MESSAGE_LIMIT);
+    }
   }
-  return boundedLogString(fallback, limit);
+  return boundedLogString(fallback, PERSISTED_ERROR_MESSAGE_LIMIT);
 }
 
 function logValue(value: unknown) {
@@ -90,8 +96,15 @@ export function prefixedErrorLogFields(prefix: string, error: unknown, includeCa
   if (isErrorLike(error)) {
     const status = property(error, "status");
     const code = property(error, "code");
-    const loggedStatus = logPrimitive(status, ERROR_MESSAGE_LIMIT);
-    const loggedCode = logPrimitive(code, ERROR_CODE_LIMIT);
+    const loggedStatus = typeof status === "number" && Number.isFinite(status) ? status : undefined;
+    const loggedCode =
+      typeof code === "string"
+        ? boundedLogString(code, ERROR_CODE_LIMIT)
+        : typeof code === "number" && Number.isFinite(code)
+          ? String(code)
+          : typeof code === "bigint"
+            ? boundedLogString(String(code), ERROR_CODE_LIMIT)
+            : undefined;
     const reason = logPrimitive(property(error, "reason"), ERROR_MESSAGE_LIMIT);
     const errno = logPrimitive(property(error, "errno"), ERROR_MESSAGE_LIMIT);
     const syscall = logPrimitive(property(error, "syscall"), ERROR_MESSAGE_LIMIT);

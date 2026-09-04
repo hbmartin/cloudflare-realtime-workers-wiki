@@ -72,6 +72,7 @@ accrue duration, hibernation is not working and cost scales with connections rat
 | Unresolved page move     | Any `Page move receipt could not be read.` log line                                                       | D1 could not determine an idempotent move outcome. Retry with the same operation id; sustained occurrences indicate a D1 outage      |
 | Invalid move receipt     | Any `Page move receipt was invalid.` log line                                                             | A persisted receipt or committed batch result is corrupt or unsupported. Inspect the phase and recovery fields                       |
 | Inconsistent move result | Any `Committed page move receipt result was inconsistent.` log line                                       | A committed batch result contradicted the request. The Worker retries from the authoritative stored receipt                          |
+| Invalid move batch       | Any `Page move batch result was invalid.` log line                                                        | D1 committed a move but returned malformed metadata. The Worker recovered from the authoritative stored receipt                      |
 | Conflicting move replay  | Any `Page move recovery found a conflicting receipt.` log line                                            | A failed move raced with reuse of its operation id. Inspect the flattened move and receipt errors                                    |
 | Deletion backlog         | `deletion_jobs` count above 10                                                                            | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                                 |
 | Move-receipt backlog     | Any `Page move receipt pruning reached its hourly catch-up limit` log line                                | More than 10000 expired receipts reached one pass; retention cleanup may be falling behind                                           |
@@ -102,6 +103,7 @@ Failed to reconcile pending document restore
 Page move receipt could not be read.
 Page move receipt was invalid.
 Committed page move receipt result was inconsistent.
+Page move batch result was invalid.
 Page move recovery found a conflicting receipt.
 Unhandled request error
 Failed to handle document party request for

@@ -13,6 +13,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
+import { LOG_IDENTIFIER_LIMIT, LOG_TEXT_LIMIT } from "../shared/error-log";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import {
   PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
@@ -24,8 +25,11 @@ import type { Page, TableData, TableLeaseResponse, TableLeaseTiming, WorkspaceEv
 import { processDueUploadReaps } from "./attachments";
 import { processDeletionJob } from "./cleanup";
 import type { Env } from "./env";
+import { HttpError } from "./http";
 import worker from "./index";
 import { broadcastWorkspaceEvent, eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
+
+const TRUNCATION_MARKER = "…[truncated]";
 
 type InstalledWorkspace = {
   cookie: string;
@@ -300,8 +304,22 @@ function envArchivingPageBeforeNextBatch(
   };
 }
 
-function envFailingMoveBatchAndReplay<BatchError = Error>(bindings: Env, options?: { batchError: BatchError }) {
-  const batchError = options ? options.batchError : (new Error("D1 move batch failed") as BatchError);
+type FailingMoveBatchAndReplay<BatchError> = {
+  batchError: BatchError;
+  replayError: Error;
+  bindings: Env;
+};
+
+function envFailingMoveBatchAndReplay(bindings: Env): FailingMoveBatchAndReplay<Error>;
+function envFailingMoveBatchAndReplay<BatchError>(
+  bindings: Env,
+  options: { batchError: BatchError },
+): FailingMoveBatchAndReplay<BatchError>;
+function envFailingMoveBatchAndReplay(
+  bindings: Env,
+  options?: { batchError: unknown },
+): FailingMoveBatchAndReplay<unknown> {
+  const batchError = options ? options.batchError : new Error("D1 move batch failed");
   const replayError = new Error("D1 move receipt lookup failed");
   let batchFailed = false;
   const batchDatabase = databaseWithBatchInterceptor(bindings.DB, async () => {
@@ -355,6 +373,7 @@ function envRejectingNextBatchAfterCommit(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
   afterCommit?: () => Promise<void>,
+  batchError: unknown = new Error("D1 response lost after commit"),
 ) {
   let intercepted = false;
   const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
@@ -362,7 +381,7 @@ function envRejectingNextBatchAfterCommit(
     if (!intercepted) {
       intercepted = true;
       await afterCommit?.();
-      throw new Error("D1 response lost after commit");
+      throw batchError;
     }
     return results;
   });
@@ -763,8 +782,8 @@ describe("Worker integration", () => {
     expect(error).toHaveBeenCalledOnce();
     expect(error).toHaveBeenCalledWith("Unhandled request error", {
       requestMethod: "GET",
-      requestPath: `${requestedPath.slice(0, 2_000)}…[truncated]`,
-      requestRayId: `${"r".repeat(200)}…[truncated]`,
+      requestPath: `${requestedPath.slice(0, LOG_TEXT_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
+      requestRayId: `${"r".repeat(LOG_IDENTIFIER_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
       errorName: databaseError.name,
       errorMessage: databaseError.message,
       errorStack: expect.any(String),
@@ -4097,6 +4116,42 @@ describe("Worker integration", () => {
     ]);
   });
 
+  it("recovers a committed move when reading the thrown HttpError code is unsafe", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const hostileError = new Proxy(new HttpError(409, "page_archived", "Page archived"), {
+      get(target, property, receiver) {
+        if (property === "code") throw new Error("code is unavailable");
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const intercepted = envRejectingNextBatchAfterCommit(env, delivered, undefined, hostileError);
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    const body = await response.json<{ page: Page; replayed: boolean }>();
+    await waitOnExecutionContext(context);
+
+    expect(intercepted.moveBatchWasIntercepted()).toBe(true);
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "pages-upserted", pages: [body.page] },
+      },
+    ]);
+  });
+
   it("recovers the stored receipt instead of reporting a truncated batch result as page missing", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
@@ -4105,6 +4160,8 @@ describe("Worker integration", () => {
       results.length = 0;
       return true;
     });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
     const context = createExecutionContext();
 
     const response = await worker.fetch(
@@ -4128,6 +4185,18 @@ describe("Worker integration", () => {
         event: { type: "pages-upserted", pages: [body.page] },
       },
     ]);
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith("Page move batch result was invalid.", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "recovery",
+      recoveredFromReceipt: true,
+      moveErrorName: "InvalidPageMoveBatchResultError",
+      moveErrorMessage: "The page move batch returned an unexpected number of results.",
+      moveErrorStack: expect.any(String),
+      moveErrorType: "object",
+    });
   });
 
   it("returns and broadcasts authoritative state when the committed receipt result cannot be decoded", async () => {
