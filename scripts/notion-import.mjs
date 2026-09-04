@@ -20,9 +20,9 @@
  */
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { assertSupportedNode } from "./notion-import/node-version.mjs";
+import { assertNodeSupportsTypeStripping } from "./notion-import/node-version.mjs";
 
-assertSupportedNode();
+assertNodeSupportsTypeStripping();
 
 // These modules import shared .ts files. Keep them dynamic so the plain-JavaScript
 // version guard above can explain an unsupported Node version before module loading fails.
