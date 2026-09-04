@@ -7,6 +7,8 @@ const ERROR_CODE_LIMIT = LOG_IDENTIFIER_LIMIT;
 const ERROR_MESSAGE_LIMIT = LOG_TEXT_LIMIT;
 const ERROR_STACK_LIMIT = 16_000;
 const TRUNCATION_MARKER = "…[truncated]";
+const NON_WHITESPACE_PATTERN = /\S/u;
+const WHITESPACE_PATTERN = /\s/u;
 
 function boundedLogStringRange(value: string, start: number, end: number, limit: number) {
   if (end - start <= limit) return value.slice(start, end);
@@ -64,9 +66,10 @@ export function safeErrorMessage(error: unknown, fallback: string) {
   if (typeof error === "object" && error !== null) {
     const message = property(error, "message");
     if (typeof message === "string") {
-      const start = message.search(/\S/u);
+      const start = message.search(NON_WHITESPACE_PATTERN);
       if (start !== -1) {
-        const end = message.search(/\s*$/u);
+        let end = message.length;
+        while (end > start && WHITESPACE_PATTERN.test(message.charAt(end - 1))) end -= 1;
         return boundedLogStringRange(message, start, end, PERSISTED_ERROR_MESSAGE_LIMIT);
       }
     }
