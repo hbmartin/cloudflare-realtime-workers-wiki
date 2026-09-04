@@ -108,10 +108,6 @@ function uploadRetryDelay(attempts: number) {
   return Math.min(60 * 60_000, 10_000 * 2 ** Math.min(Math.max(1, attempts) - 1, 8));
 }
 
-function uploadErrorMessage(error: unknown, fallback: string) {
-  return safeErrorMessage(error, fallback);
-}
-
 async function rescheduleUpload(
   env: Env,
   row: Pick<UploadReapRow, "id" | "attempts">,
@@ -129,7 +125,7 @@ async function rescheduleUpload(
       state,
       Math.max(1, row.attempts),
       timestamp + uploadRetryDelay(row.attempts),
-      uploadErrorMessage(error, "Unknown upload cleanup failure"),
+      safeErrorMessage(error, "Unknown upload cleanup failure"),
       timestamp,
       row.id,
       leaseUntil,

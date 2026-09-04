@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { HttpError, classifyError, errorResponse } from "./http";
+import { HttpError, classifyError, errorResponse, safeHttpErrorCode } from "./http";
 
 describe("HTTP error handling", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -39,7 +39,7 @@ describe("HTTP error handling", () => {
   it("returns a generic classification when an error Proxy has a hostile property trap", () => {
     const error = new Proxy(new HttpError(409, "conflict", "Conflict"), {
       get(target, property, receiver) {
-        if (property === "status") throw new Error("status is unavailable");
+        if (property === "status" || property === "code") throw new Error(`${String(property)} is unavailable`);
         return Reflect.get(target, property, receiver);
       },
     });
@@ -49,5 +49,6 @@ describe("HTTP error handling", () => {
       status: 500,
       body: { error: { code: "internal_error", message: "Something went wrong." } },
     });
+    expect(safeHttpErrorCode(error)).toBeNull();
   });
 });

@@ -20,6 +20,16 @@ export class HttpError extends Error {
   }
 }
 
+export function safeHttpErrorCode(error: unknown) {
+  if (!safeInstanceOf(error, HttpError)) return null;
+  try {
+    const code = error.code;
+    return typeof code === "string" ? code : null;
+  } catch {
+    return null;
+  }
+}
+
 // An error whose message was written for the client. Anything else is an
 // internal failure: callers log it and answer with a generic message.
 // Classification owns the status and JSON envelope for both Hono and raw party

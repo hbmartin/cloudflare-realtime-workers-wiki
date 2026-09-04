@@ -52,7 +52,10 @@ Before building or changing production, the deploy job asks D1 for its pending m
 `0011_page_move_receipt_envelopes.sql` is pending, automatic deployment fails closed. Apply that migration
 only from a manual dispatch after page moves are quiesced, or after verifying that the live Worker already
 reads versioned receipts, and check `confirm_page_move_receipt_migration_safe` on that run. The confirmation
-is ignored once `0011` is no longer pending, so later automatic deploys resume normally.
+is ignored once `0011` is no longer pending, so later automatic deploys resume normally. The gate also
+refuses to deploy when Wrangler's migration listing is not in a recognized empty or populated form. Update
+the fixtures in `scripts/check-page-move-migration.test.mjs` alongside any intentional Wrangler-output parser
+change.
 
 ## The release gate
 

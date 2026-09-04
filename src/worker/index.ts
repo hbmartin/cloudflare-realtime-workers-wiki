@@ -24,6 +24,7 @@ import {
   locationHint,
   normalizeFilename,
   now,
+  safeHttpErrorCode,
   sha256,
 } from "./http";
 import {
@@ -99,6 +100,10 @@ class InvalidPageMoveReceiptError extends Error {
   override name = "InvalidPageMoveReceiptError";
 }
 
+class InvalidPageMoveBatchResultError extends Error {
+  override name = "InvalidPageMoveBatchResultError";
+}
+
 const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
   id: "id",
   workspaceId: "workspace_id",
@@ -119,6 +124,7 @@ const PAGE_MOVE_RECEIPT_PAGE_JSON_SQL = `json_object(${Object.entries(PAGE_MOVE_
   .join(", ")})`;
 const PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE = "Page move receipt was invalid.";
 const PAGE_MOVE_RECEIPT_UNREADABLE_LOG_MESSAGE = "Page move receipt could not be read.";
+const PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE = "Page move batch result was invalid.";
 
 async function pageCreateRequestHash(value: unknown) {
   return sha256Hex(canonicalJson(value));
@@ -394,7 +400,7 @@ async function readInitialPageCreateReplay(
     // Exact replays remain valid if their original parent was archived later.
     // For a mismatched reuse, however, preserve the create API's parent error
     // precedence before returning the idempotency conflict.
-    if (safeInstanceOf(error, HttpError) && error.code === "idempotency_key_reused") {
+    if (safeHttpErrorCode(error) === "idempotency_key_reused") {
       await validatePageCreateParents(env, member, requested);
     }
     throw error;
@@ -1166,7 +1172,7 @@ app.post("/api/pages/:id/move", async (c) => {
     const moveResultIndex = 0;
     const receiptResultIndex = 2;
     const pageStateResultIndex = 3;
-    const results = await c.env.DB.batch<PageMoveBatchRow>([
+    const statements = [
       c.env.DB.prepare(
         `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ?
           WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
@@ -1190,28 +1196,31 @@ app.post("/api/pages/:id/move", async (c) => {
                 CASE WHEN archived_at IS NULL THEN ${PAGE_MOVE_RECEIPT_PAGE_JSON_SQL} ELSE NULL END AS page_json
            FROM pages WHERE id = ? AND workspace_id = ?`,
       ).bind(page.id, member.workspace.id),
-    ]);
-    if (results.length !== 4) {
-      throw new Error("The page move batch returned an unexpected number of results.");
+    ];
+    const results = await c.env.DB.batch<PageMoveBatchRow>(statements);
+    if (results.length !== statements.length) {
+      throw new InvalidPageMoveBatchResultError("The page move batch returned an unexpected number of results.");
     }
     const moveChanges = results[moveResultIndex]?.meta?.changes;
     if (moveChanges !== 0 && moveChanges !== 1) {
-      throw new Error("The page move batch returned malformed move metadata.");
+      throw new InvalidPageMoveBatchResultError("The page move batch returned malformed move metadata.");
     }
     if (moveChanges === 0) {
       const pageStateResult = results[pageStateResultIndex];
       if (!pageStateResult || !Array.isArray(pageStateResult.results)) {
-        throw new Error("The page move batch did not return its page-state result.");
+        throw new InvalidPageMoveBatchResultError("The page move batch did not return its page-state result.");
       }
       const unavailableValue = pageStateResult.results[0];
       const unavailable = pageMoveAvailabilityRow(unavailableValue);
       if (unavailableValue !== undefined && !unavailable) {
-        throw new Error("The unavailable page state returned by the move batch was malformed.");
+        throw new InvalidPageMoveBatchResultError(
+          "The unavailable page state returned by the move batch was malformed.",
+        );
       }
       if (unavailable && unavailable.archived_at !== null) {
         throw new HttpError(409, "page_archived", "The page was archived before it could be moved.");
       }
-      if (unavailable) throw new Error("An active page move unexpectedly changed no rows.");
+      if (unavailable) throw new InvalidPageMoveBatchResultError("An active page move unexpectedly changed no rows.");
       throw new HttpError(404, "page_not_found", "Page not found.");
     }
     const commitReceiptContext = { ...receiptContext, receiptReadPhase: "commit" as const };
@@ -1256,12 +1265,23 @@ app.post("/api/pages/:id/move", async (c) => {
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
     return c.json({ page: moved, operationId, replayed: false });
   } catch (error) {
-    if (safeInstanceOf(error, HttpError) && error.code !== "page_archived") throw error;
+    const httpErrorCode = safeHttpErrorCode(error);
+    if (httpErrorCode !== null && httpErrorCode !== "page_archived") throw error;
     const committed = await readPageMoveReceiptWithDiagnostics(
       () => readPageMoveReplay(c.env.DB, member.workspace.id, pageId, operationId, requestHash),
       { ...receiptContext, receiptReadPhase: "recovery", moveError: error },
     );
     if (committed) {
+      if (safeInstanceOf(error, InvalidPageMoveBatchResultError)) {
+        console.error(PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE, {
+          workspaceId: member.workspace.id,
+          pageId,
+          operationId,
+          receiptReadPhase: "recovery",
+          recoveredFromReceipt: true,
+          ...prefixedErrorLogFields("moveError", error),
+        });
+      }
       sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });
       return c.json({ page: committed, operationId, replayed: true });
     }
