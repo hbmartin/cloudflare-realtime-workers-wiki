@@ -1,5 +1,5 @@
 import type { Context } from "hono";
-import { errorLogFields } from "../shared/error-log";
+import { boundedLogString, errorLogFields } from "../shared/error-log";
 import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
 
@@ -38,10 +38,11 @@ export function errorPayload(error: unknown) {
 
 export function errorResponse(c: Context, error: unknown) {
   if (!isExpectedError(error)) {
+    const rayId = c.req.header("cf-ray");
     console.error("Unhandled request error", {
       requestMethod: c.req.method,
-      requestPath: new URL(c.req.url).pathname,
-      requestRayId: c.req.header("cf-ray") ?? null,
+      requestPath: boundedLogString(new URL(c.req.url).pathname, 2_000),
+      requestRayId: rayId ? boundedLogString(rayId, 200) : null,
       ...errorLogFields(error),
     });
   }
