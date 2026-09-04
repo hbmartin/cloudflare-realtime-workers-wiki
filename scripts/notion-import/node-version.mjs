@@ -1,15 +1,25 @@
 // Plain JavaScript with no project imports, so this check runs before Node is asked to
 // load the shared TypeScript modules used by the importer.
-const NODE_22_MINIMUM_MINOR = 18;
-const NODE_24_MINIMUM_MINOR = 2;
+const TYPE_STRIPPING_MINOR_BOUNDARIES = [
+  { major: 22, minimumMinor: 18 },
+  { major: 23, minimumMinor: 6 },
+];
+const FIRST_FULLY_SUPPORTED_MAJOR = 24;
+const TYPE_STRIPPING_REQUIREMENT = [
+  ...TYPE_STRIPPING_MINOR_BOUNDARIES.map(({ major, minimumMinor }) => `Node ${major}.${minimumMinor}+`),
+  `Node ${FIRST_FULLY_SUPPORTED_MAJOR}+`,
+].join(", ");
 
-export function assertSupportedNode(version = process.versions.node) {
+export function assertNodeSupportsTypeStripping(version = process.versions.node) {
   const [major, minor] = version.split(".").map((part) => Number.parseInt(part, 10));
   const supported =
-    (major === 22 && minor >= NODE_22_MINIMUM_MINOR) || (major === 24 && minor >= NODE_24_MINIMUM_MINOR) || major > 24;
+    major >= FIRST_FULLY_SUPPORTED_MAJOR ||
+    TYPE_STRIPPING_MINOR_BOUNDARIES.some(
+      ({ major: supportedMajor, minimumMinor }) => major === supportedMajor && minor >= minimumMinor,
+    );
   if (!supported) {
     throw new Error(
-      `The Notion importer needs Node 22.${NODE_22_MINIMUM_MINOR}+ in the Node 22 release line, or Node 24.${NODE_24_MINIMUM_MINOR}+; this is Node ${version}.`,
+      `The Notion importer needs native TypeScript type stripping enabled by default (${TYPE_STRIPPING_REQUIREMENT}); this is Node ${version}.`,
     );
   }
 }

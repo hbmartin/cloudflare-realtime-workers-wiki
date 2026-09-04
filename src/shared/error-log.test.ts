@@ -149,9 +149,15 @@ describe("error log fields", () => {
     expect(fields.errorValue).toBe(fields.errorMessage);
   });
 
-  it("uses a non-empty bounded fallback for persisted error messages", () => {
+  it("normalizes and bounds messages from directly thrown strings", () => {
     expect(safeErrorMessage("  Thrown string failure \n", "Unknown failure")).toBe("Thrown string failure");
     expect(safeErrorMessage(" \n\t", "Unknown failure")).toBe("Unknown failure");
+    expect(safeErrorMessage(`  ${"x".repeat(2_000)} \n`, "Unknown failure")).toBe(
+      `${"x".repeat(PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
+    );
+  });
+
+  it("uses a non-empty bounded fallback for persisted error messages", () => {
     expect(safeErrorMessage({ message: "" }, "Unknown failure")).toBe("Unknown failure");
     expect(safeErrorMessage({ message: " \n\t" }, "Unknown failure")).toBe("Unknown failure");
     expect(safeErrorMessage({ message: "  Remote failure \n" }, "Unknown failure")).toBe("Remote failure");

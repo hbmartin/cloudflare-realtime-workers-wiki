@@ -399,24 +399,36 @@ function envRejectingNextBatchAfterCommit(
 function envMutatingNextMoveBatchResult(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
-  mutate: (results: D1BatchResults) => boolean | Promise<boolean>,
+  mutate: (results: D1BatchResults, uninterceptedDatabase: D1Database) => boolean | Promise<boolean>,
 ) {
   let intercepted = false;
+  let mutateFailure: { error: unknown } | undefined;
   let mutateInOrder = Promise.resolve();
   const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
     const results = await run();
-    if (intercepted) return results;
+    if (intercepted || mutateFailure) return results;
     const attempt = mutateInOrder.then(async () => {
-      if (!intercepted) intercepted = await mutate(results);
+      // Database work awaited by mutate must use the original binding so it cannot re-enter this serialized interceptor.
+      if (!intercepted && !mutateFailure) {
+        try {
+          intercepted = await mutate(results, bindings.DB);
+        } catch (error) {
+          // Keep test-fixture failures out of the Worker's production error handling and surface the original value below.
+          mutateFailure = { error };
+        }
+      }
     });
-    mutateInOrder = attempt.catch(() => undefined);
+    mutateInOrder = attempt;
     await attempt;
     return results;
   });
   const eventBindings = envWithDatabase(bindings, database);
   return {
     bindings: envWithCapturedWorkspaceEvents(eventBindings, delivered),
-    batchResultWasMutated: () => intercepted,
+    batchResultWasMutated: () => {
+      if (mutateFailure) throw mutateFailure.error;
+      return intercepted;
+    },
   };
 }
 
@@ -4211,14 +4223,49 @@ describe("Worker integration", () => {
     });
   });
 
+  it("surfaces a move batch mutator failure directly to the test", async () => {
+    const installed = await bootstrap();
+    const operationId = crypto.randomUUID();
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const mutateError = new Error("Move batch mutator failed");
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
+      const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
+      if (receipt?.page_id !== installed.pageId) return false;
+      throw mutateError;
+    });
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+      }),
+      intercepted.bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+
+    let surfacedError: unknown;
+    try {
+      intercepted.batchResultWasMutated();
+    } catch (error) {
+      surfacedError = error;
+    }
+    expect(surfacedError).toBe(mutateError);
+    expect(response.status).toBe(200);
+    expect(delivered).toHaveLength(1);
+  });
+
   it("logs an invalid batch result when receipt recovery cannot recover it", async () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
-    const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results) => {
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results, database) => {
       const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
       if (receipt?.page_id !== installed.pageId) return false;
-      await env.DB.prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
+      await database
+        .prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
         .bind(installed.workspaceId, operationId)
         .run();
       results.length = 0;
