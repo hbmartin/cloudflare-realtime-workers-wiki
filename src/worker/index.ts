@@ -118,6 +118,7 @@ import {
   spaceWatchState,
 } from "./notifications";
 import { parseSearchRequest, searchPages, searchTitles } from "./search";
+import { cleanupImport } from "./importer";
 
 const app = new Hono<{ Bindings: Env }>();
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -126,6 +127,7 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
 const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple", "pink"] as const;
+const MAX_IMPORT_UPLOAD_BYTES = 24 * 1024 * 1024;
 
 type PageRow = PageJsonRow & {
   created_by: string;
@@ -1592,6 +1594,102 @@ app.post("/api/templates/:id/instantiate", async (c) => {
   return c.json({ job: jobJson(job) }, 202);
 });
 
+app.post("/api/import-uploads", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const contentLength = Number(c.req.header("content-length") ?? 0);
+  if (contentLength > MAX_IMPORT_UPLOAD_BYTES + 100_000) {
+    throw new HttpError(413, "import_too_large", "Import uploads are limited to 24 MiB.");
+  }
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) throw new HttpError(422, "file_required", "Attach one import file in the file field.");
+  if (!file.size) throw new HttpError(422, "empty_import", "The import file is empty.");
+  if (file.size > MAX_IMPORT_UPLOAD_BYTES) {
+    throw new HttpError(413, "import_too_large", "Import uploads are limited to 24 MiB.");
+  }
+  const spaceId = text(form.get("spaceId"), "spaceId", 100);
+  const space = await spaceForMember(c.env, member, spaceId);
+  if (effectiveSpaceRole(member.role, space.visibility, space.space_role) === "viewer") {
+    throw new HttpError(403, "read_only", "Your role in this space is read-only.");
+  }
+  const filename = normalizeFilename(file.name);
+  const lower = filename.toLowerCase();
+  const format =
+    lower.endsWith(".md") || lower.endsWith(".markdown")
+      ? "markdown"
+      : lower.endsWith(".html") || lower.endsWith(".htm")
+        ? "html"
+        : lower.endsWith(".zip")
+          ? "notion_zip"
+          : null;
+  if (!format) {
+    throw new HttpError(415, "unsupported_import", "Choose a Markdown, HTML, or Notion ZIP file.");
+  }
+  const job = await createJob(c.env, {
+    member,
+    type: "import",
+    spaceId,
+    options: { filename, format, confirmed: false },
+  });
+  const inputKey = `jobs/${job.id}/input/${encodeURIComponent(filename)}`;
+  try {
+    await c.env.BUCKET.put(inputKey, file.stream(), {
+      httpMetadata: { contentType: file.type || "application/octet-stream" },
+      customMetadata: { filename, jobId: job.id },
+    });
+    await c.env.DB.prepare(`UPDATE jobs SET input_key = ?, expires_at = ?, updated_at = ? WHERE id = ?`)
+      .bind(inputKey, now() + 7 * 24 * 60 * 60_000, now(), job.id)
+      .run();
+  } catch (error) {
+    await c.env.BUCKET.delete(inputKey).catch(() => undefined);
+    await c.env.DB.prepare(`DELETE FROM jobs WHERE id = ?`)
+      .bind(job.id)
+      .run()
+      .catch(() => undefined);
+    throw error;
+  }
+  const uploaded = (await c.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(job.id).first<JobRow>())!;
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, uploaded).catch((error) => {
+      console.error("Failed to start import inspection workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(uploaded) }, 202);
+});
+
+async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string) {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const body = routeJobId ? {} : await jsonBody(c.req.raw);
+  const jobId = routeJobId ?? text(body.jobId, "jobId", 100);
+  const job = await jobForMember(c.env, member, jobId);
+  if (job.type !== "import") throw new HttpError(404, "import_not_found", "Import job not found.");
+  if (job.status !== "awaiting_confirmation") {
+    throw new HttpError(409, "import_not_confirmable", "This import is not awaiting confirmation.");
+  }
+  const options = JSON.parse(job.options_json) as Record<string, unknown>;
+  const instanceId = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, options_json = ?, progress_label = 'Queued',
+      error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ? AND status = 'awaiting_confirmation'`,
+  )
+    .bind(instanceId, JSON.stringify({ ...options, confirmed: true }), now(), job.id)
+    .run();
+  const confirmed = await jobForMember(c.env, member, job.id);
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, confirmed).catch((error) => {
+      console.error("Failed to start confirmed import workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(confirmed) }, 202);
+}
+
+app.post("/api/imports", (c) => confirmImport(c));
+app.post("/api/imports/:id/confirm", (c) => confirmImport(c, c.req.param("id")));
+
 app.get("/api/jobs", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const requestedLimit = Number(c.req.query("limit") ?? 50);
@@ -1671,6 +1769,13 @@ app.post("/api/jobs/:id/cancel", async (c) => {
       c.env.NOTES_WORKFLOW.get(job.workflow_instance_id)
         .then((instance) => instance.terminate())
         .catch((error) => console.error("Failed to terminate canceled workflow", { jobId: job.id, error })),
+    );
+  }
+  if (job.type === "import") {
+    c.executionCtx.waitUntil(
+      cleanupImport(c.env, job).catch((error) =>
+        console.error("Failed to clean up canceled import", { jobId: job.id, error }),
+      ),
     );
   }
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });

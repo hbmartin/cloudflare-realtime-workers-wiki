@@ -10,6 +10,7 @@ import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { runExport } from "./exporter";
+import { cleanupImport, runImport } from "./importer";
 
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
@@ -72,7 +73,9 @@ export function jobJson(row: JobRow): Job {
       typeof result.pageId === "string" || (result.preview && typeof result.preview === "object")
         ? {
             ...(typeof result.pageId === "string" ? { pageId: result.pageId } : {}),
-            ...(result.preview && typeof result.preview === "object" ? { preview: result.preview as ImportPreview } : {}),
+            ...(result.preview && typeof result.preview === "object"
+              ? { preview: result.preview as ImportPreview }
+              : {}),
           }
         : null,
     error: row.error_code && row.error_message ? { code: row.error_code, message: row.error_message } : null,
@@ -538,7 +541,8 @@ async function startJobWorkflow(env: Env, job: Pick<JobRow, "id" | "workflow_ins
 export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "workflow_instance_id">) {
   if (env.WORKFLOW_INLINE !== "true") return startJobWorkflow(env, job);
   const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(job.id).first<JobRow>();
-  if (!row || (row.type !== "template_clone" && row.type !== "export")) return startJobWorkflow(env, job);
+  if (!row || (row.type !== "template_clone" && row.type !== "export" && row.type !== "import"))
+    return startJobWorkflow(env, job);
   await updateJob(env, row.id, { status: "running", current: 0, label: "Preparing" });
   await notifyJobs(env, row.workspace_id);
   const inlineStep = {
@@ -547,12 +551,20 @@ export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "work
     },
   };
   try {
-    if (row.type === "template_clone") await runTemplateClone(env, row, inlineStep as Parameters<typeof runTemplateClone>[2]);
-    else await runExport(env, row, inlineStep as Parameters<typeof runExport>[2]);
+    if (row.type === "template_clone")
+      await runTemplateClone(env, row, inlineStep as Parameters<typeof runTemplateClone>[2]);
+    else if (row.type === "export") await runExport(env, row, inlineStep as Parameters<typeof runExport>[2]);
+    else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
-    await cleanupTemplateClone(env, row, templateCloneOptions(row)).catch((cleanupError) => {
-      console.error("Failed to clean up inline template clone", { jobId: row.id, cleanupError });
-    });
+    if (row.type === "template_clone") {
+      await cleanupTemplateClone(env, row, templateCloneOptions(row)).catch((cleanupError) => {
+        console.error("Failed to clean up inline template clone", { jobId: row.id, cleanupError });
+      });
+    } else if (row.type === "import") {
+      await cleanupImport(env, row).catch((cleanupError) => {
+        console.error("Failed to clean up inline import", { jobId: row.id, cleanupError });
+      });
+    }
     await updateJob(env, row.id, {
       status: "failed",
       label: "Failed",
@@ -725,8 +737,9 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         await runExport(this.env, job, step);
         return;
       }
-      if (job.type !== "search_reindex") {
-        throw new Error(`The ${job.type} executor is not registered yet.`);
+      if (job.type === "import") {
+        await runImport(this.env, job, step);
+        return;
       }
       const total = await step.do("count pages", async () => {
         await assertJobActive(this.env, jobId);
@@ -778,6 +791,11 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
             console.error("Failed to clean up canceled template clone", { jobId, cleanupError });
           });
         }
+        if (canceledJob?.type === "import") {
+          await cleanupImport(this.env, canceledJob).catch((cleanupError) => {
+            console.error("Failed to clean up canceled import", { jobId, cleanupError });
+          });
+        }
         await updateJob(this.env, jobId, { status: "canceled", label: "Canceled" });
         return;
       }
@@ -785,6 +803,11 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       if (failedJob?.type === "template_clone") {
         await cleanupTemplateClone(this.env, failedJob, templateCloneOptions(failedJob)).catch((cleanupError) => {
           console.error("Failed to clean up failed template clone", { jobId, cleanupError });
+        });
+      }
+      if (failedJob?.type === "import") {
+        await cleanupImport(this.env, failedJob).catch((cleanupError) => {
+          console.error("Failed to clean up failed import", { jobId, cleanupError });
         });
       }
       await updateJob(this.env, jobId, {
@@ -876,14 +899,15 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
 
 export async function expireJobArtifacts(env: Env) {
   const rows = await env.DB.prepare(
-    `SELECT id, input_key, output_key FROM jobs WHERE expires_at IS NOT NULL AND expires_at <= ?
+    `SELECT id, type, input_key, output_key FROM jobs WHERE expires_at IS NOT NULL AND expires_at <= ?
       AND (input_key IS NOT NULL OR output_key IS NOT NULL) LIMIT 50`,
   )
     .bind(Date.now())
-    .all<Pick<JobRow, "id" | "input_key" | "output_key">>();
+    .all<Pick<JobRow, "id" | "type" | "input_key" | "output_key">>();
   for (const row of rows.results) {
     const keys = [...new Set([row.input_key, row.output_key].filter((key): key is string => Boolean(key)))];
     if (keys.length) await env.BUCKET.delete(keys);
+    if (row.type === "import") await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/documents/`);
     await env.DB.prepare(`UPDATE jobs SET input_key = NULL, output_key = NULL, updated_at = ? WHERE id = ?`)
       .bind(Date.now(), row.id)
       .run();

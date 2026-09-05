@@ -2,7 +2,7 @@ import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionC
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import type { Job } from "../shared/types";
-import { readZip } from "../shared/zip";
+import { createZip, readZip } from "../shared/zip";
 import type { Env } from "./env";
 import {
   consumeDeliveryMessage,
@@ -53,6 +53,15 @@ async function bootstrap(): Promise<InstalledWorkspace> {
     pages: Array<{ id: string }>;
   }>();
   return { cookie, pageId: tree.pages[0]!.id, userId: me.user.id, workspaceId: me.workspace.id };
+}
+
+function inlineBindings() {
+  return new Proxy(env as Env, {
+    get(target, property, receiver) {
+      if (property === "WORKFLOW_INLINE") return "true";
+      return Reflect.get(target, property, receiver);
+    },
+  });
 }
 
 beforeEach(async () => {
@@ -268,7 +277,11 @@ describe("job execution", () => {
     const job = (await response.json<{ job: Job }>()).job;
     await waitOnExecutionContext(context);
 
-    const completed = await worker.fetch(request(installed.cookie, `/api/jobs/${job.id}`), env, createExecutionContext());
+    const completed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}`),
+      env,
+      createExecutionContext(),
+    );
     expect((await completed.json<{ job: Job }>()).job).toMatchObject({ status: "succeeded", hasDownload: true });
     const download = await worker.fetch(
       request(installed.cookie, `/api/jobs/${job.id}/download`),
@@ -498,6 +511,131 @@ describe("job execution", () => {
       .first<{ is_template: number; name: string; label: string; select_value: string }>();
     expect(cloned).toMatchObject({ is_template: 1, name: "Status", label: "Ready" });
     expect(cloned?.select_value).toContain(":option:");
+  });
+
+  it("previews and confirms a Markdown import without exposing staged pages", async () => {
+    const installed = await bootstrap();
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set(
+      "file",
+      new File(["# Imported heading\n\nHello **team**.\n\n- [x] Verified\n"], "brief.md", {
+        type: "text/markdown",
+      }),
+    );
+    const uploadContext = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    expect(response.status).toBe(202);
+    const queued = (await response.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(uploadContext);
+
+    const preview = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${queued.id}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job;
+    expect(preview).toMatchObject({
+      status: "awaiting_confirmation",
+      result: { preview: { format: "markdown", filename: "brief.md", pages: 1, tables: 0, assets: 0 } },
+    });
+    const hiddenTree = await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext());
+    expect(
+      (await hiddenTree.json<{ pages: Array<{ title: string }> }>()).pages.map((page) => page.title),
+    ).not.toContain("brief");
+
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${queued.id}/confirm`, { method: "POST" }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+
+    const completed = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${queued.id}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job;
+    expect(completed).toMatchObject({ status: "succeeded", result: { pageId: expect.any(String) } });
+    const content = await worker.fetch(
+      request(installed.cookie, `/api/pages/${completed.result!.pageId}/content`),
+      env,
+      createExecutionContext(),
+    );
+    expect(content.status).toBe(200);
+    expect(JSON.stringify((await content.json<{ document: unknown }>()).document)).toContain("Imported heading");
+  });
+
+  it("imports a Notion ZIP hierarchy, database CSV, and bundled image", async () => {
+    const installed = await bootstrap();
+    const encoder = new TextEncoder();
+    const zip = createZip([
+      {
+        path: "Project 0123456789abcdef0123456789abcdef.html",
+        bytes: encoder.encode(
+          '<article><div class="page-body"><p>Overview</p><img src="Project 0123456789abcdef0123456789abcdef/photo.png"></div></article>',
+        ),
+      },
+      {
+        path: "Project 0123456789abcdef0123456789abcdef/Tasks aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.html",
+        bytes: encoder.encode('<article><div class="page-body"><p>Database</p></div></article>'),
+      },
+      {
+        path: "Project 0123456789abcdef0123456789abcdef/Tasks aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.csv",
+        bytes: encoder.encode("Task,Done,Estimate\nShip,yes,2\nTest,no,3\n"),
+      },
+      {
+        path: "Project 0123456789abcdef0123456789abcdef/photo.png",
+        bytes: new Uint8Array([137, 80, 78, 71]),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "notion.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const preview = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job;
+    expect(preview.result?.preview).toMatchObject({ format: "notion_zip", pages: 2, tables: 1, assets: 1 });
+
+    const confirmContext = createExecutionContext();
+    await worker.fetch(
+      request(installed.cookie, "/api/imports", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jobId }),
+      }),
+      inlineBindings(),
+      confirmContext,
+    );
+    await waitOnExecutionContext(confirmContext);
+    const tree = await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext());
+    const imported = (
+      await tree.json<{ pages: Array<{ id: string; parentId: string | null; kind: string; title: string }> }>()
+    ).pages;
+    const project = imported.find((page) => page.title === "Project")!;
+    const tasks = imported.find((page) => page.title === "Tasks")!;
+    expect(tasks).toMatchObject({ parentId: project.id, kind: "table" });
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM table_rows WHERE page_id = ?`).bind(tasks.id).first(),
+    ).toMatchObject({ count: 2 });
+    expect(
+      await env.DB.prepare(`SELECT name FROM attachments WHERE page_id = ?`).bind(project.id).first(),
+    ).toMatchObject({ name: "photo.png" });
   });
 });
 

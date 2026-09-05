@@ -140,9 +140,9 @@ describe("search v2", () => {
     const privateSpace = (await privateSpaceResponse.json<{ space: Space }>()).space;
     const secret = await createPage(installed.cookie, "Orchid launch", privateSpace.id);
     const archived = await createPage(installed.cookie, "Orchid archive", installed.generalId);
-    expect((await SELF.fetch(request(installed.cookie, `/api/pages/${archived.id}`, { method: "DELETE" }))).status).toBe(
-      200,
-    );
+    expect(
+      (await SELF.fetch(request(installed.cookie, `/api/pages/${archived.id}`, { method: "DELETE" }))).status,
+    ).toBe(200);
 
     const viewerSearch = await (
       await SELF.fetch(request(viewerCookie, "/api/search?q=Orchid&archive=all"))
@@ -151,9 +151,7 @@ describe("search v2", () => {
     expect(JSON.stringify(viewerSearch)).not.toContain(privateSpace.name);
     expect(JSON.stringify(viewerSearch)).not.toContain(secret.title);
 
-    const active = await (
-      await SELF.fetch(request(installed.cookie, "/api/search?q=Orchid"))
-    ).json<SearchResponse>();
+    const active = await (await SELF.fetch(request(installed.cookie, "/api/search?q=Orchid"))).json<SearchResponse>();
     expect(active.results.map((result) => result.page.id)).toEqual([secret.id]);
     const archivedOnly = await (
       await SELF.fetch(request(installed.cookie, "/api/search?q=Orchid&archive=archived"))

@@ -42,11 +42,7 @@ function exportOptions(job: JobRow): ExportOptions {
 }
 
 function escapeHtml(value: string) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 
 function escapeMarkdownCell(value: string) {
@@ -54,7 +50,9 @@ function escapeMarkdownCell(value: string) {
 }
 
 function fileStem(title: string) {
-  const normalized = normalizeFilename(title).replace(/\.(md|html|pdf|zip)$/i, "").trim();
+  const normalized = normalizeFilename(title)
+    .replace(/\.(md|html|pdf|zip)$/i, "")
+    .trim();
   return normalized || "Untitled";
 }
 
@@ -77,10 +75,9 @@ async function documentExport(env: Env, page: ExportPage) {
   const serialized = serializeDocument(envelope.document);
   return {
     markdown: `# ${page.title.replaceAll("\n", " ")}\n\n${serialized.markdown}`,
-    html: serialized.html.replace(
-      "<head>",
-      `<head><title>${escapeHtml(page.title)}</title>`,
-    ).replace("<body>", `<body><h1>${escapeHtml(page.title)}</h1>`),
+    html: serialized.html
+      .replace("<head>", `<head><title>${escapeHtml(page.title)}</title>`)
+      .replace("<body>", `<body><h1>${escapeHtml(page.title)}</h1>`),
   };
 }
 
@@ -166,10 +163,16 @@ async function portableExport(
     if (!object) throw new Error(`Attachment ${attachment.name} is missing.`);
     const name = uniqueAssetName(attachment.name, used);
     const relative = `assets/${name}`;
-    rewritten = rewritten.replaceAll(`/api/attachments/${attachment.id}`, relative.split("/").map(encodeURIComponent).join("/"));
+    rewritten = rewritten.replaceAll(
+      `/api/attachments/${attachment.id}`,
+      relative.split("/").map(encodeURIComponent).join("/"),
+    );
     entries.push({ path: relative, bytes: new Uint8Array(await object.arrayBuffer()) });
   }
-  entries.unshift({ path: `${fileStem(page.title)}.${format === "markdown" ? "md" : "html"}`, bytes: new TextEncoder().encode(rewritten) });
+  entries.unshift({
+    path: `${fileStem(page.title)}.${format === "markdown" ? "md" : "html"}`,
+    bytes: new TextEncoder().encode(rewritten),
+  });
   return createZip(entries);
 }
 
@@ -193,7 +196,11 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
       if (!env.BROWSER) throw new Error("PDF export is not configured.");
       const response = await env.BROWSER.quickAction("pdf", {
         html: serialized.html,
-        pdfOptions: { format: "a4", printBackground: true, margin: { top: "24mm", right: "18mm", bottom: "24mm", left: "18mm" } },
+        pdfOptions: {
+          format: "a4",
+          printBackground: true,
+          margin: { top: "24mm", right: "18mm", bottom: "24mm", left: "18mm" },
+        },
       });
       if (!response.ok) throw new Error(`PDF rendering failed (${response.status}).`);
       bytes = new Uint8Array(await response.arrayBuffer());
@@ -211,7 +218,8 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
         filename = `${fileStem(page.title)}.${options.format === "markdown" ? "md" : "html"}`;
       }
     }
-    if (!bytes.byteLength || bytes.byteLength > EXPORT_MAX_BYTES) throw new Error("The export exceeds the 64 MiB limit.");
+    if (!bytes.byteLength || bytes.byteLength > EXPORT_MAX_BYTES)
+      throw new Error("The export exceeds the 64 MiB limit.");
     const outputKey = `jobs/${job.id}/output/${encodeURIComponent(filename)}`;
     await env.BUCKET.put(outputKey, bytes, {
       httpMetadata: { contentType },

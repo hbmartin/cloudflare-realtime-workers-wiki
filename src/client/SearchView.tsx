@@ -1,12 +1,5 @@
 import { useEffect, useState } from "react";
-import type {
-  PageKind,
-  SearchArchiveState,
-  SearchResponse,
-  SearchResult,
-  Space,
-  Tag,
-} from "../shared/types";
+import type { PageKind, SearchArchiveState, SearchResponse, SearchResult, Space, Tag } from "../shared/types";
 import { api, apiErrorMessage } from "./api";
 
 type SearchMember = { id: string; name: string; email: string };
@@ -161,8 +154,7 @@ export function SearchView({
     ...selectedTags.map((tag) => ({
       key: `tag:${tag.id}`,
       label: `Tag: ${tag.name}`,
-      remove: () =>
-        updateFilters((current) => ({ ...current, tagIds: current.tagIds.filter((id) => id !== tag.id) })),
+      remove: () => updateFilters((current) => ({ ...current, tagIds: current.tagIds.filter((id) => id !== tag.id) })),
     })),
     ...(filters.creatorId
       ? [

@@ -27,6 +27,7 @@ export function ActivitiesTray({
   onRefresh,
   onCancel,
   onRetry,
+  onConfirm,
   onOpenResult,
 }: {
   jobs: Job[];
@@ -37,6 +38,7 @@ export function ActivitiesTray({
   onRefresh: () => void;
   onCancel: (job: Job) => void;
   onRetry: (job: Job) => void;
+  onConfirm: (job: Job) => void;
   onOpenResult: (job: Job) => void;
 }) {
   const closeButton = useRef<HTMLButtonElement>(null);
@@ -129,6 +131,22 @@ export function ActivitiesTray({
                     />
                   )}
                   {job.error && <p className="activity-job-error">{job.error.message}</p>}
+                  {job.status === "awaiting_confirmation" && job.result?.preview && (
+                    <dl className="import-preview">
+                      <div>
+                        <dt>Pages</dt>
+                        <dd>{job.result.preview.pages}</dd>
+                      </div>
+                      <div>
+                        <dt>Tables</dt>
+                        <dd>{job.result.preview.tables}</dd>
+                      </div>
+                      <div>
+                        <dt>Assets</dt>
+                        <dd>{job.result.preview.assets}</dd>
+                      </div>
+                    </dl>
+                  )}
                   {job.warnings.map((warning) => (
                     <p className="activity-warning" key={warning}>
                       {warning}
@@ -137,6 +155,11 @@ export function ActivitiesTray({
                   <div className="activity-meta">
                     <time dateTime={new Date(job.createdAt).toISOString()}>{timestamp(job.createdAt)}</time>
                     <span className="activity-actions">
+                      {job.status === "awaiting_confirmation" && (
+                        <button className="primary-small" disabled={pending} onClick={() => onConfirm(job)}>
+                          {pending ? "Starting…" : "Confirm import"}
+                        </button>
+                      )}
                       {job.status === "succeeded" && job.result?.pageId && (
                         <button className="quiet-button" disabled={pending} onClick={() => onOpenResult(job)}>
                           Open page

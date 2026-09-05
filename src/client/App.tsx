@@ -47,6 +47,7 @@ import { NotificationsPanel } from "./NotificationsPanel";
 import { WatchControl } from "./WatchControl";
 import { SearchView } from "./SearchView";
 import { ExportDialog } from "./ExportDialog";
+import { ImportDialog } from "./ImportDialog";
 
 type AppState =
   | { screen: "loading" }
@@ -730,7 +731,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     () => ({
       pages: [],
       pagesLoaded: false,
-      selectedId: localStorage.getItem("notes:last-page"),
+      selectedId: new URLSearchParams(window.location.search).get("page") ?? localStorage.getItem("notes:last-page"),
       pendingSelectionId: null,
       pendingRestoredRoot: null,
     }),
@@ -751,6 +752,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [activitiesOpen, setActivitiesOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [notificationsRevision, setNotificationsRevision] = useState(0);
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -951,6 +953,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         localStorage.setItem(`notes:active-space:${member.workspace.id}`, page.spaceId);
       }
       dispatchPageAction({ type: "select", pageId });
+      history.replaceState(null, "", `/?page=${encodeURIComponent(pageId)}`);
       setView("pages");
       closeSidebar(true);
     },
@@ -1751,14 +1754,23 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const timer = window.setTimeout(() => void loadJobs(), 1_000);
     return () => window.clearTimeout(timer);
   }, [activeJobCount, activitiesOpen, jobs, loadJobs]);
-  const mutateJob = useCallback(async (job: Job, action: "cancel" | "retry") => {
+  const mutateJob = useCallback(async (job: Job, action: "cancel" | "retry" | "confirm") => {
     setPendingJobId(job.id);
     try {
-      const data = await api<{ job: Job }>(`/api/jobs/${encodeURIComponent(job.id)}/${action}`, { method: "POST" });
+      const path =
+        action === "confirm"
+          ? `/api/imports/${encodeURIComponent(job.id)}/confirm`
+          : `/api/jobs/${encodeURIComponent(job.id)}/${action}`;
+      const data = await api<{ job: Job }>(path, { method: "POST" });
       setJobs((current) => current.map((candidate) => (candidate.id === data.job.id ? data.job : candidate)));
       setJobsError("");
     } catch (error) {
-      setJobsError(apiErrorMessage(error, `The job could not be ${action === "cancel" ? "canceled" : "retried"}.`));
+      setJobsError(
+        apiErrorMessage(
+          error,
+          `The job could not be ${action === "cancel" ? "canceled" : action === "confirm" ? "confirmed" : "retried"}.`,
+        ),
+      );
     } finally {
       setPendingJobId(null);
     }
@@ -2444,8 +2456,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}
         aria-label="Workspace navigation"
         tabIndex={-1}
-        inert={activitiesOpen || notificationsOpen || exportOpen ? true : undefined}
-        aria-hidden={activitiesOpen || notificationsOpen || exportOpen || undefined}
+        inert={activitiesOpen || notificationsOpen || exportOpen || importOpen ? true : undefined}
+        aria-hidden={activitiesOpen || notificationsOpen || exportOpen || importOpen || undefined}
       >
         <header className="workspace-header">
           <span className="workspace-avatar">{member.workspace.name.slice(0, 1).toUpperCase()}</span>
@@ -2592,8 +2604,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
       <section
         className="workspace-content"
-        inert={activitiesOpen || notificationsOpen || exportOpen ? true : undefined}
-        aria-hidden={activitiesOpen || notificationsOpen || exportOpen || undefined}
+        inert={activitiesOpen || notificationsOpen || exportOpen || importOpen ? true : undefined}
+        aria-hidden={activitiesOpen || notificationsOpen || exportOpen || importOpen || undefined}
       >
         {workspaceError && (
           <div className="form-error workspace-error" role="alert">
@@ -2697,6 +2709,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             </button>
             {member.role !== "viewer" && (
               <div className="new-menu">
+                <button className="quiet-button" disabled={!canCreatePage} onClick={() => setImportOpen(true)}>
+                  ⇧ Import
+                </button>
                 <button className="primary-small" disabled={!canCreatePage} onClick={() => void createPage("document")}>
                   + Page
                 </button>
@@ -2808,6 +2823,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onRefresh={() => void loadJobs()}
           onCancel={(job) => void mutateJob(job, "cancel")}
           onRetry={(job) => void mutateJob(job, "retry")}
+          onConfirm={(job) => void mutateJob(job, "confirm")}
           onOpenResult={(job) => void openJobResult(job)}
         />
       )}
@@ -2826,6 +2842,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onQueued={(job) => {
             setJobs((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)]);
             setExportOpen(false);
+            setActivitiesOpen(true);
+          }}
+        />
+      )}
+      {importOpen && (
+        <ImportDialog
+          spaces={spaces.filter((space) => space.effectiveRole !== "viewer")}
+          initialSpaceId={currentSpaceId}
+          onClose={() => setImportOpen(false)}
+          onQueued={(job) => {
+            setJobs((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)]);
+            setImportOpen(false);
             setActivitiesOpen(true);
           }}
         />

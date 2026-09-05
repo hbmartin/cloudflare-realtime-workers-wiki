@@ -196,14 +196,7 @@ export async function searchPages(
         ORDER BY rank_tier, score, p.updated_at DESC, p.id
         LIMIT ? OFFSET ?`,
     )
-    .bind(
-      normalized,
-      prefix,
-      member.user.id,
-      ...whereBindings,
-      request.limit + 1,
-      request.offset,
-    )
+    .bind(normalized, prefix, member.user.id, ...whereBindings, request.limit + 1, request.offset)
     .all<SearchRow>();
   const hasMore = rows.results.length > request.limit;
   return {

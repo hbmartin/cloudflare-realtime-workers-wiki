@@ -50,7 +50,11 @@ function header(size: number) {
 export function createZip(entries: ZipEntry[]) {
   if (entries.length > MAX_ZIP_ENTRIES) throw new Error("The archive contains too many files.");
   const encoder = new TextEncoder();
-  const files = entries.map((entry) => ({ ...entry, path: safeArchivePath(entry.path), name: encoder.encode(entry.path) }));
+  const files = entries.map((entry) => ({
+    ...entry,
+    path: safeArchivePath(entry.path),
+    name: encoder.encode(entry.path),
+  }));
   if (files.reduce((total, entry) => total + entry.bytes.byteLength, 0) > MAX_EXPANDED_BYTES) {
     throw new Error("The archive expands beyond the supported size.");
   }

@@ -1664,6 +1664,51 @@ button.mention-chip:focus-visible {
   font-size: 44px;
   color: #7c7ad2;
 }
+.import-field {
+  display: grid;
+  gap: 7px;
+}
+.import-field input[type="file"],
+.import-field select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: white;
+  padding: 9px;
+  color: var(--ink);
+}
+.import-field small,
+.import-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.import-note {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f0eee7;
+}
+.import-preview {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin: 10px 0;
+}
+.import-preview div {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+}
+.import-preview dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+.import-preview dd {
+  margin: 2px 0 0;
+  font-weight: 700;
+}
 .sidebar-scrim {
   display: none;
 }

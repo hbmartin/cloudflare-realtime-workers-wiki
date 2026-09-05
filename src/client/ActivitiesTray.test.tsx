@@ -36,6 +36,7 @@ describe("ActivitiesTray", () => {
         onRefresh={vi.fn()}
         onCancel={cancel}
         onRetry={vi.fn()}
+        onConfirm={vi.fn()}
         onOpenResult={vi.fn()}
       />,
     );
@@ -62,6 +63,7 @@ describe("ActivitiesTray", () => {
         onRefresh={vi.fn()}
         onCancel={vi.fn()}
         onRetry={vi.fn()}
+        onConfirm={vi.fn()}
         onOpenResult={vi.fn()}
       />,
     );
@@ -71,5 +73,45 @@ describe("ActivitiesTray", () => {
     view.unmount();
     await waitFor(() => expect(trigger).toHaveFocus());
     trigger.remove();
+  });
+
+  it("shows an import preview and requires explicit confirmation", () => {
+    const confirm = vi.fn();
+    const importJob: Job = {
+      ...runningJob,
+      id: "import-1",
+      type: "import",
+      status: "awaiting_confirmation",
+      progress: { current: 2, total: 7, label: "Ready to import" },
+      result: {
+        preview: {
+          format: "notion_zip",
+          filename: "workspace.zip",
+          pages: 8,
+          tables: 2,
+          assets: 5,
+          warnings: [],
+        },
+      },
+    };
+    render(
+      <ActivitiesTray
+        jobs={[importJob]}
+        loading={false}
+        error=""
+        pendingJobId={null}
+        onClose={vi.fn()}
+        onRefresh={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+        onConfirm={confirm}
+        onOpenResult={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("8")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.getByText("5")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm import" }));
+    expect(confirm).toHaveBeenCalledWith(importJob);
   });
 });

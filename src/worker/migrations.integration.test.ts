@@ -142,9 +142,7 @@ describe("D1 migrations", () => {
       env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = 'page'`).bind(timestamp),
       env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id = 'page'`),
     ]);
-    const searchMigration = env.TEST_MIGRATIONS!.find(
-      (migration) => migration.name === "0015_search_v2_rollout.sql",
-    );
+    const searchMigration = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0015_search_v2_rollout.sql");
     expect(searchMigration).toBeTruthy();
     await applyD1Migrations(env.DB, [searchMigration!]);
     expect(await env.DB.prepare(`SELECT page_id, title FROM page_search_v2 WHERE page_id = 'page'`).first()).toEqual({
