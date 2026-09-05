@@ -72,6 +72,9 @@ import {
 } from "../shared/validation";
 import type {
   ClientMemberContext,
+  NotificationChannelMode,
+  NotificationEventType,
+  NotificationPreference,
   Page,
   PageKind,
   Role,
@@ -100,6 +103,19 @@ import {
   type DeliveryQueueMessage,
   type JobRow,
 } from "./jobs";
+import {
+  listNotifications,
+  listSubscriptions,
+  markNotifications,
+  NOTIFICATION_EVENT_TYPES,
+  notificationPreferences,
+  notificationPreferencesConfigured,
+  pageWatchState,
+  sendDueNotificationDigests,
+  setNotificationPreference,
+  setSubscription,
+  spaceWatchState,
+} from "./notifications";
 
 const app = new Hono<{ Bindings: Env }>();
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -501,6 +517,18 @@ function sendWorkspaceEvent(
     broadcastWorkspaceEvent(c.env, workspaceId, event).catch((error) => {
       console.error("Failed to broadcast workspace event", error);
     }),
+  );
+}
+
+function sendCommentMutationEvents(
+  c: { env: Env; executionCtx: { waitUntil(promise: Promise<unknown>): void } },
+  workspaceId: string,
+  pageId: string,
+) {
+  sendWorkspaceEvent(c, workspaceId, { type: "comments-invalidated", pageId });
+  sendWorkspaceEvent(c, workspaceId, { type: "notifications-invalidated" });
+  c.executionCtx.waitUntil(
+    sweepOutbox(c.env).catch((error) => console.error("Comment notification enqueue failed", error)),
   );
 }
 
@@ -1928,7 +1956,7 @@ app.post("/api/pages/:id/comments", async (c) => {
   const body = await jsonBody(c.req.raw);
   const initialComment = object(body.initialComment);
   const thread = await createCommentThread(c.env, member, scopedPage, initialComment.body);
-  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
   return c.json({ thread }, 201);
 });
 
@@ -1965,7 +1993,7 @@ app.post("/api/comment-threads/:id/anchor", async (c) => {
   await c.env.DB.prepare(`UPDATE comment_threads SET anchor_json = ?, updated_at = ? WHERE id = ? AND page_id = ?`)
     .bind(anchored ? anchorJson : null, Date.now(), c.req.param("id"), page.id)
     .run();
-  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
   return c.json({ thread: await commentThread(c.env, member, scopedPage, c.req.param("id")), anchored });
 });
 
@@ -1974,7 +2002,7 @@ async function createReplyResponse(c: Context<{ Bindings: Env }>, threadId: stri
   const page = await pageForCommentThread(c.env, member, threadId);
   const comment = object(body.comment);
   const thread = await addCommentReply(c.env, member, commentPage(page), threadId, comment.body, body.parentId);
-  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
   return c.json({ thread }, 201);
 }
 
@@ -1999,7 +2027,7 @@ app.put("/api/comment-threads/:id/comments/:commentId", async (c) => {
     c.req.param("commentId"),
     comment.body,
   );
-  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
   return c.json({ thread });
 });
 
@@ -2015,7 +2043,7 @@ app.patch("/api/comments/:id", async (c) => {
     c.req.param("id"),
     body.body,
   );
-  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: located.page.id });
+  sendCommentMutationEvents(c, member.workspace.id, located.page.id);
   return c.json({ thread });
 });
 
@@ -2023,7 +2051,7 @@ async function deleteCommentResponse(c: Context<{ Bindings: Env }>, threadId: st
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForCommentThread(c.env, member, threadId);
   const thread = await softDeleteComment(c.env, member, commentPage(page), threadId, commentId);
-  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
   return c.json({ thread });
 }
 
@@ -2035,7 +2063,7 @@ app.delete("/api/comments/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const located = await pageForComment(c.env, member, c.req.param("id"));
   const thread = await softDeleteComment(c.env, member, commentPage(located.page), located.threadId, c.req.param("id"));
-  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: located.page.id });
+  sendCommentMutationEvents(c, member.workspace.id, located.page.id);
   return c.json({ thread });
 });
 
@@ -2043,13 +2071,123 @@ async function resolutionResponse(c: Context<{ Bindings: Env }>, threadId: strin
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForCommentThread(c.env, member, threadId);
   const thread = await setThreadResolved(c.env, member, commentPage(page), threadId, resolved);
-  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
   return c.json({ thread });
 }
 
 app.post("/api/comment-threads/:id/resolve", async (c) => resolutionResponse(c, c.req.param("id"), true));
 app.post("/api/comment-threads/:id/reopen", async (c) => resolutionResponse(c, c.req.param("id"), false));
 app.post("/api/comment-threads/:id/unresolve", async (c) => resolutionResponse(c, c.req.param("id"), false));
+
+app.get("/api/notifications", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const requestedLimit = Number(c.req.query("limit") ?? 30);
+  const requestedOffset = Number(c.req.query("offset") ?? 0);
+  const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 30;
+  const offset = Number.isInteger(requestedOffset) ? Math.min(Math.max(requestedOffset, 0), 10_000) : 0;
+  return c.json(
+    await listNotifications(c.env, member, {
+      unreadOnly: c.req.query("unread") === "true",
+      limit,
+      offset,
+    }),
+  );
+});
+
+async function markNotificationResponse(c: Context<{ Bindings: Env }>, action: "read" | "archive") {
+  const member = await requireMember(c.req.raw, c.env);
+  const body = await jsonBody(c.req.raw);
+  let ids: string[] | null = null;
+  if (body.ids !== undefined) {
+    if (!Array.isArray(body.ids) || body.ids.length > 500 || body.ids.some((id) => typeof id !== "string")) {
+      throw new HttpError(422, "invalid_notification_ids", "Choose up to 500 notifications.");
+    }
+    ids = body.ids;
+  }
+  await markNotifications(c.env, member, action, ids);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "notifications-invalidated" });
+  return c.json({ ok: true });
+}
+
+app.post("/api/notifications/read", async (c) => markNotificationResponse(c, "read"));
+app.post("/api/notifications/archive", async (c) => markNotificationResponse(c, "archive"));
+
+app.get("/api/notification-preferences", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json({
+    preferences: await notificationPreferences(c.env, member),
+    configured: await notificationPreferencesConfigured(c.env, member),
+    channels: {
+      email: { available: Boolean(c.env.SEND_EMAIL && c.env.EMAIL_FROM) },
+      slack: { available: false },
+    },
+  });
+});
+
+app.put("/api/notification-preferences", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const body = await jsonBody(c.req.raw);
+  const requested = Array.isArray(body.preferences) ? body.preferences : [body.preference ?? body];
+  if (!requested.length || requested.length > NOTIFICATION_EVENT_TYPES.length) {
+    throw new HttpError(422, "invalid_notification_preferences", "Choose one preference for each event.");
+  }
+  const preferences = requested.map((value): NotificationPreference => {
+    const preference = object(value);
+    const eventType = text(preference.eventType, "eventType", 40) as NotificationEventType;
+    const email = text(preference.email, "email", 20) as NotificationChannelMode;
+    const slack = text(preference.slack, "slack", 20) as NotificationChannelMode;
+    if (typeof preference.inApp !== "boolean") {
+      throw new HttpError(422, "invalid_notification_preference", "inApp must be true or false.");
+    }
+    return {
+      eventType,
+      inApp: preference.inApp,
+      email,
+      slack,
+      timezone: text(preference.timezone, "timezone", 100),
+    };
+  });
+  if (new Set(preferences.map((preference) => preference.eventType)).size !== preferences.length) {
+    throw new HttpError(422, "duplicate_notification_preference", "Each event may only be configured once.");
+  }
+  for (const preference of preferences) await setNotificationPreference(c.env, member, preference);
+  return c.json({ preferences: await notificationPreferences(c.env, member) });
+});
+
+app.get("/api/subscriptions", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json({ subscriptions: await listSubscriptions(c.env, member) });
+});
+
+app.get("/api/pages/:id/watch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  return c.json({ watch: await pageWatchState(c.env, member, page.id, page.space_id!) });
+});
+
+app.put("/api/pages/:id/watch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const state = text(body.state, "state", 20) as "watching" | "muted" | "none";
+  await setSubscription(c.env, member, "page", page.id, state);
+  return c.json({ watch: await pageWatchState(c.env, member, page.id, page.space_id!) });
+});
+
+app.get("/api/spaces/:id/watch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  return c.json({ watch: await spaceWatchState(c.env, member, space.id) });
+});
+
+app.put("/api/spaces/:id/watch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const state = text(body.state, "state", 20) as "watching" | "muted" | "none";
+  await setSubscription(c.env, member, "space", space.id, state);
+  return c.json({ watch: await spaceWatchState(c.env, member, space.id) });
+});
 
 app.get("/api/pages/:id/content", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
@@ -4596,6 +4734,11 @@ export default {
     context.waitUntil(
       expireJobArtifacts(env).catch((error) => {
         console.error("Job artifact expiry failed", error);
+      }),
+    );
+    context.waitUntil(
+      sendDueNotificationDigests(env).catch((error) => {
+        console.error("Notification digest delivery failed", error);
       }),
     );
   },

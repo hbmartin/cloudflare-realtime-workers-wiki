@@ -5,6 +5,7 @@ import { sha256Hex } from "../shared/import-integrity";
 import type { Job, JobStatus, JobType } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
+import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
@@ -795,15 +796,7 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
   const payload = jsonRecord(row.payload_json);
   const notificationId = payload.notificationId;
   if (typeof notificationId !== "string") throw new Error("Notification outbox payload is invalid.");
-  const ledgerKey = `${outboxId}:in_app`;
-  const timestamp = Date.now();
-  await env.DB.prepare(
-    `INSERT INTO deliveries (idempotency_key, outbox_id, channel, status, delivered_at, updated_at)
-     VALUES (?, ?, 'in_app', 'sent', ?, ?)
-     ON CONFLICT(idempotency_key) DO UPDATE SET status = 'sent', delivered_at = COALESCE(deliveries.delivered_at, excluded.updated_at), updated_at = excluded.updated_at`,
-  )
-    .bind(ledgerKey, outboxId, timestamp, timestamp)
-    .run();
+  await deliverNotification(env, notificationId, outboxId);
   message.ack();
 }
 

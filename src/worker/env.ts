@@ -11,6 +11,8 @@ export interface AppBindings {
   WORKSPACE_EVENTS: DurableObjectNamespace<WorkspaceEvents>;
   NOTES_WORKFLOW: Workflow<Readonly<JobWorkflowParams>>;
   DELIVERY_QUEUE: Queue;
+  SEND_EMAIL?: SendEmail;
+  EMAIL_FROM?: string;
   ASSETS: Fetcher;
   BETTER_AUTH_SECRET: string;
   BETTER_AUTH_URL: string;

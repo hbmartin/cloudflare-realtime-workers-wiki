@@ -546,6 +546,61 @@ select:focus-visible {
   gap: 6px;
   font-size: 12px;
 }
+.notification-trigger,
+.watch-control {
+  position: relative;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 7px;
+  padding: 6px 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+}
+.notification-trigger:hover,
+.watch-control:hover,
+.watch-control.state-watching {
+  background: #f0eee7;
+  color: var(--ink);
+}
+.notification-trigger > b {
+  position: absolute;
+  top: -3px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border: 2px solid var(--canvas);
+  border-radius: 999px;
+  background: var(--accent);
+  color: white;
+  font-size: 9px;
+  line-height: 12px;
+  text-align: center;
+}
+.watch-control.state-muted {
+  color: #8a6a3a;
+}
+.watch-control:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+.watch-control.compact {
+  padding: 2px 4px;
+  font-size: 14px;
+}
+.watch-error {
+  color: var(--danger);
+}
+.sidebar-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
 .organization-action {
   border: 0;
   background: transparent;
@@ -1706,6 +1761,165 @@ button.mention-chip:focus-visible {
   margin-top: 12px;
 }
 
+.notification-toolbar > div {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.notification-filter {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.notification-filter button {
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+.notification-filter button.active {
+  background: #e8e7fb;
+  color: #454386;
+  font-weight: 700;
+}
+.notification-list li {
+  position: relative;
+  padding: 0;
+}
+.notification-list li.unread {
+  background: #f7f6ff;
+}
+.notification-open {
+  width: 100%;
+  padding: 16px 42px 16px 2px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  display: grid;
+  grid-template-columns: 10px 1fr;
+  gap: 9px;
+  text-align: left;
+}
+.notification-open > span:last-child {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+.notification-open strong {
+  font-size: 13px;
+  line-height: 1.4;
+}
+.notification-open span span,
+.notification-open time {
+  color: var(--muted);
+  font-size: 11px;
+}
+.notification-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: transparent;
+}
+.notification-list li.unread .notification-dot {
+  background: var(--accent);
+}
+.notification-archive {
+  position: absolute;
+  top: 12px;
+  right: 3px;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.notification-archive:hover {
+  background: #ebe9e2;
+}
+.notification-list .notification-more {
+  padding: 16px 0;
+  text-align: center;
+}
+.notification-settings {
+  padding: 20px;
+  overflow-y: auto;
+}
+.notification-settings h3 {
+  margin-top: 22px;
+  font-family: Georgia, serif;
+  font-size: 20px;
+}
+.notification-settings > .muted {
+  margin-top: 7px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.channel-status {
+  display: block;
+  margin-top: 14px !important;
+  padding: 10px 12px;
+  border: 1px solid #e5cfae;
+  border-radius: 8px;
+  background: #fff7e8;
+  color: #72511d;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.notification-preference {
+  margin: 16px 0 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.notification-preference legend {
+  padding: 0 5px;
+  font-size: 12px;
+  font-weight: 800;
+}
+.notification-preference label,
+.timezone-field {
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+}
+.notification-preference select,
+.timezone-field input {
+  min-width: 0;
+  border: 1px solid #d9d6cd;
+  border-radius: 6px;
+  background: white;
+  padding: 5px 7px;
+  color: var(--ink);
+  font: inherit;
+}
+.slack-disabled {
+  grid-column: 1 / -1;
+  color: #8b8880;
+  font-size: 10px;
+}
+.timezone-field {
+  margin: 18px 0;
+  display: grid;
+  gap: 6px;
+}
+.notification-settings .activity-job-error {
+  color: var(--danger);
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+
 @media (max-width: 1050px) {
   .document-layout.with-panel .document-paper {
     margin-right: 0;
@@ -1796,6 +2010,12 @@ button.mention-chip:focus-visible {
     font-size: 0;
   }
   .organization-action > span {
+    font-size: 17px;
+  }
+  .watch-control:not(.compact) {
+    font-size: 0;
+  }
+  .watch-control:not(.compact) > span:first-child {
     font-size: 17px;
   }
   .page-tags {

@@ -116,6 +116,43 @@ export type CommentThread = {
   updatedAt: number;
 };
 
+export type NotificationEventType = "mention" | "reply" | "thread_resolved" | "thread_reopened" | "page_edit";
+export type NotificationChannelMode = "off" | "immediate" | "digest";
+
+export type Notification = {
+  id: string;
+  eventType: NotificationEventType;
+  actor: SessionUser | null;
+  space: { id: string; name: string };
+  page: { id: string; title: string; icon: string | null };
+  threadId: string | null;
+  data: Record<string, unknown>;
+  readAt: number | null;
+  archivedAt: number | null;
+  createdAt: number;
+};
+
+export type NotificationPreference = {
+  eventType: NotificationEventType;
+  inApp: boolean;
+  email: NotificationChannelMode;
+  slack: NotificationChannelMode;
+  timezone: string;
+};
+
+export type Subscription = {
+  id: string;
+  resourceType: "page" | "space";
+  resourceId: string;
+  state: "watching" | "muted";
+  createdAt: number;
+};
+
+export type WatchState = {
+  state: "watching" | "muted" | "none";
+  source: "page" | "space" | null;
+};
+
 export type JobType = "import" | "export" | "template_clone" | "comment_migration" | "search_reindex";
 export type JobStatus =
   | "queued"

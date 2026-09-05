@@ -8,6 +8,8 @@ import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import { joinBytes, splitBytes } from "../shared/bytes";
 import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
+import { sweepOutbox } from "./jobs";
+import { notificationFanoutStatements } from "./notifications";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
 const COMPACTION_DELAY_MS = 30_000;
@@ -39,6 +41,7 @@ interface MetaRow extends Record<string, SqlStorageValue> {
   read_only: number;
   last_version_at: number;
   last_editor_id: string | null;
+  notify_edit: number;
 }
 
 interface PageProjectionRow {
@@ -193,6 +196,7 @@ export class Document extends YServer {
   private metadata!: MetaRow;
   private pendingUpdates: Uint8Array[] = [];
   private pendingAuthorId: string | null = null;
+  private pendingNotifyEdit = false;
   private purged = false;
   private transition: "archive" | "restore" | null = null;
   private transitionAlarmDeferred = false;
@@ -233,7 +237,8 @@ export class Document extends YServer {
       restore_retry_at INTEGER NOT NULL DEFAULT 0,
       read_only INTEGER NOT NULL DEFAULT 0,
       last_version_at INTEGER NOT NULL DEFAULT 0,
-      last_editor_id TEXT
+      last_editor_id TEXT,
+      notify_edit INTEGER NOT NULL DEFAULT 0
     )`);
     const metaColumns = sql.exec<{ name: string }>(`PRAGMA table_info(document_meta)`).toArray();
     if (!metaColumns.some((column) => column.name === "snapshot_bytes")) {
@@ -247,6 +252,9 @@ export class Document extends YServer {
     }
     if (!metaColumns.some((column) => column.name === "restore_retry_at")) {
       sql.exec(`ALTER TABLE document_meta ADD COLUMN restore_retry_at INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!metaColumns.some((column) => column.name === "notify_edit")) {
+      sql.exec(`ALTER TABLE document_meta ADD COLUMN notify_edit INTEGER NOT NULL DEFAULT 0`);
     }
     const hadMetadata = Boolean(
       sql.exec<{ present: number }>(`SELECT EXISTS(SELECT 1 FROM document_meta WHERE id = 1) present`).one().present,
@@ -681,6 +689,7 @@ export class Document extends YServer {
       this.metadata.retired = 1;
       this.pendingUpdates = [];
       this.pendingAuthorId = null;
+      this.pendingNotifyEdit = false;
       for (const connection of this.getConnections()) {
         connection.close(4411, "This page was permanently deleted.");
       }
@@ -695,12 +704,14 @@ export class Document extends YServer {
     if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) return;
     this.pendingUpdates.push(update);
     this.pendingAuthorId = origin?.state?.userId ?? this.pendingAuthorId;
+    this.pendingNotifyEdit ||= Boolean(origin?.state?.userId);
   }
 
   private flushPendingUpdates() {
     if (!this.pendingUpdates.length || this.purged) return;
     const updates = this.pendingUpdates;
     const authorId = this.pendingAuthorId;
+    const notifyEdit = this.pendingNotifyEdit;
     const merged = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
     this.state.storage.transactionSync(() => {
       const row = this.state.storage.sql
@@ -719,14 +730,18 @@ export class Document extends YServer {
         );
       }
       this.state.storage.sql.exec(
-        `UPDATE document_meta SET dirty = 1, last_editor_id = COALESCE(?, last_editor_id) WHERE id = 1`,
+        `UPDATE document_meta SET dirty = 1, last_editor_id = COALESCE(?, last_editor_id),
+          notify_edit = CASE WHEN ? THEN 1 ELSE notify_edit END WHERE id = 1`,
         authorId,
+        notifyEdit ? 1 : 0,
       );
     });
     this.pendingUpdates = [];
     this.pendingAuthorId = null;
+    this.pendingNotifyEdit = false;
     this.metadata.dirty = 1;
     if (authorId) this.metadata.last_editor_id = authorId;
+    if (notifyEdit) this.metadata.notify_edit = 1;
   }
 
   private compact(forceVersion = false): Promise<void> {
@@ -780,13 +795,14 @@ export class Document extends YServer {
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(
         `UPDATE document_meta
-            SET dirty = 0, snapshot_bytes = ?, read_only = CASE WHEN ? THEN 1 ELSE read_only END
+            SET dirty = 0, notify_edit = 0, snapshot_bytes = ?, read_only = CASE WHEN ? THEN 1 ELSE read_only END
           WHERE id = 1`,
         snapshot.byteLength,
         readOnly ? 1 : 0,
       );
     });
     this.metadata.dirty = 0;
+    this.metadata.notify_edit = 0;
     this.metadata.snapshot_bytes = snapshot.byteLength;
     if (readOnly) this.metadata.read_only = 1;
 
@@ -820,15 +836,37 @@ export class Document extends YServer {
       let pageProjected = false;
 
       if (page) {
-        const [oldPageTargets, oldUserTargets] = await Promise.all([
+        const [oldPageTargets, oldUserTargets, watcherRows] = await Promise.all([
           this.bindings.DB.prepare(`SELECT target_page_id id FROM page_references WHERE source_page_id = ?`)
             .bind(pageId)
             .all<{ id: string }>(),
           this.bindings.DB.prepare(`SELECT target_user_id id FROM member_mentions WHERE source_page_id = ?`)
             .bind(pageId)
             .all<{ id: string }>(),
+          metadataAtStart.notify_edit && metadataAtStart.last_editor_id
+            ? this.bindings.DB.prepare(
+                `SELECT user_id id FROM subscriptions
+                  WHERE resource_type = 'page' AND resource_id = ? AND muted_at IS NULL
+                 UNION
+                SELECT space_watch.user_id id FROM subscriptions space_watch
+                  WHERE space_watch.resource_type = 'space' AND space_watch.resource_id = ?
+                    AND space_watch.muted_at IS NULL
+                    AND NOT EXISTS (
+                      SELECT 1 FROM subscriptions page_override
+                       WHERE page_override.user_id = space_watch.user_id
+                         AND page_override.resource_type = 'page' AND page_override.resource_id = ?
+                    )`,
+              )
+                .bind(pageId, page.space_id, pageId)
+                .all<{ id: string }>()
+            : Promise.resolve({ results: [] as Array<{ id: string }> }),
         ]);
         const timestamp = Date.now();
+        const oldMentionIds = new Set(oldUserTargets.results.map((row) => row.id));
+        const newMentionIds = projection.memberMentions
+          .map((mention) => mention.targetId)
+          .filter((id) => !oldMentionIds.has(id));
+        const watcherIds = watcherRows.results.map((row) => row.id).filter((id) => !newMentionIds.includes(id));
         const makeVersion = Boolean(
           forceVersion ||
           !metadataAtStart.last_version_at ||
@@ -923,6 +961,30 @@ export class Document extends YServer {
             `DELETE FROM member_mentions WHERE source_page_id = ? AND projection_seq <> ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, maximum, pageId, epoch),
+          ...notificationFanoutStatements(this.bindings.DB, {
+            workspaceId: page.workspace_id,
+            spaceId: page.space_id,
+            pageId,
+            threadId: null,
+            actorId: metadataAtStart.last_editor_id ?? "",
+            eventType: "mention",
+            sourceId: `${pageId}:${epoch}:${maximum}`,
+            recipientIds: metadataAtStart.notify_edit && metadataAtStart.last_editor_id ? newMentionIds : [],
+            data: { sequence: maximum },
+            createdAt: timestamp,
+          }),
+          ...notificationFanoutStatements(this.bindings.DB, {
+            workspaceId: page.workspace_id,
+            spaceId: page.space_id,
+            pageId,
+            threadId: null,
+            actorId: metadataAtStart.last_editor_id ?? "",
+            eventType: "page_edit",
+            sourceId: `${pageId}:${epoch}:${maximum}`,
+            recipientIds: metadataAtStart.notify_edit ? watcherIds : [],
+            data: { sequence: maximum },
+            createdAt: timestamp,
+          }),
         ];
         const currentPageTargetsIndex = statements.length;
         statements.push(
@@ -993,6 +1055,18 @@ export class Document extends YServer {
               mentionTargetUserIds,
             }).catch((error) => console.error("Failed to broadcast projection update", error)),
           );
+          if (
+            metadataAtStart.notify_edit &&
+            metadataAtStart.last_editor_id &&
+            (newMentionIds.length || watcherIds.length)
+          ) {
+            this.state.waitUntil(
+              Promise.all([
+                broadcastWorkspaceEvent(this.bindings, page.workspace_id, { type: "notifications-invalidated" }),
+                sweepOutbox(this.bindings),
+              ]).catch((error) => console.error("Failed to enqueue document notifications", error)),
+            );
+          }
         }
       }
 
@@ -1019,7 +1093,11 @@ export class Document extends YServer {
       }
     } catch (error) {
       this.metadata.dirty = 1;
-      this.state.storage.sql.exec(`UPDATE document_meta SET dirty = 1 WHERE id = 1`);
+      if (metadataAtStart.notify_edit) this.metadata.notify_edit = 1;
+      this.state.storage.sql.exec(
+        `UPDATE document_meta SET dirty = 1, notify_edit = CASE WHEN ? THEN 1 ELSE notify_edit END WHERE id = 1`,
+        metadataAtStart.notify_edit ? 1 : 0,
+      );
       try {
         await this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS);
       } catch (alarmError) {

@@ -1,6 +1,7 @@
 import type { Comment, CommentBody, CommentThread, Role } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
+import { notificationFanoutStatements } from "./notifications";
 
 const COMMENT_BODY_MAX_BYTES = 32 * 1024;
 const COMMENT_BODY_MAX_NODES = 2_000;
@@ -115,6 +116,30 @@ function commentPlainText(value: unknown) {
   };
   visit(value);
   return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function commentMentionUserIds(value: unknown) {
+  const ids = new Set<string>();
+  const visit = (node: unknown) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child);
+      return;
+    }
+    const record = node as Record<string, unknown>;
+    const attributes =
+      record.props && typeof record.props === "object"
+        ? (record.props as Record<string, unknown>)
+        : record.attrs && typeof record.attrs === "object"
+          ? (record.attrs as Record<string, unknown>)
+          : record;
+    if (record.type === "mention" && attributes.entityType === "user" && typeof attributes.entityId === "string") {
+      ids.add(attributes.entityId);
+    }
+    for (const child of Object.values(record)) visit(child);
+  };
+  visit(value);
+  return [...ids];
 }
 
 function parseBody(value: string): CommentBody | null {
@@ -235,6 +260,16 @@ function watchPageStatement(database: D1Database, page: CommentPage, userId: str
     .bind(`page:${page.id}:${userId}`, page.workspace_id, userId, page.id, userId, timestamp);
 }
 
+async function threadParticipantIds(env: Env, threadId: string) {
+  const rows = await env.DB.prepare(
+    `SELECT created_by user_id FROM comment_threads WHERE id = ?
+     UNION SELECT user_id FROM comments WHERE thread_id = ?`,
+  )
+    .bind(threadId, threadId)
+    .all<{ user_id: string }>();
+  return rows.results.map((row) => row.user_id);
+}
+
 export async function createCommentThread(env: Env, member: MemberContext, page: CommentPage, bodyValue: unknown) {
   const body = validatedCommentBody(bodyValue);
   const threadId = crypto.randomUUID();
@@ -252,6 +287,18 @@ export async function createCommentThread(env: Env, member: MemberContext, page:
        VALUES (?, ?, NULL, ?, ?, ?, ?, ?)`,
     ).bind(commentId, threadId, member.user.id, body.json, body.plainText, timestamp, timestamp),
     watchPageStatement(env.DB, page, member.user.id, timestamp),
+    ...notificationFanoutStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      spaceId: page.space_id,
+      pageId: page.id,
+      threadId,
+      actorId: member.user.id,
+      eventType: "mention",
+      sourceId: commentId,
+      recipientIds: commentMentionUserIds(body.body),
+      data: { commentId },
+      createdAt: timestamp,
+    }),
     ...refreshCommentSearchStatements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
@@ -284,6 +331,8 @@ export async function addCommentReply(
   }
   const commentId = crypto.randomUUID();
   const timestamp = Date.now();
+  const mentionedUserIds = commentMentionUserIds(body.body);
+  const participantIds = (await threadParticipantIds(env, threadId)).filter((id) => !mentionedUserIds.includes(id));
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO comments
@@ -292,6 +341,30 @@ export async function addCommentReply(
     ).bind(commentId, threadId, parentId, member.user.id, body.json, body.plainText, timestamp, timestamp),
     env.DB.prepare(`UPDATE comment_threads SET updated_at = ? WHERE id = ?`).bind(timestamp, thread.id),
     watchPageStatement(env.DB, page, member.user.id, timestamp),
+    ...notificationFanoutStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      spaceId: page.space_id,
+      pageId: page.id,
+      threadId,
+      actorId: member.user.id,
+      eventType: "mention",
+      sourceId: commentId,
+      recipientIds: mentionedUserIds,
+      data: { commentId },
+      createdAt: timestamp,
+    }),
+    ...notificationFanoutStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      spaceId: page.space_id,
+      pageId: page.id,
+      threadId,
+      actorId: member.user.id,
+      eventType: "reply",
+      sourceId: commentId,
+      recipientIds: participantIds,
+      data: { commentId },
+      createdAt: timestamp,
+    }),
     ...refreshCommentSearchStatements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
@@ -306,9 +379,11 @@ export async function updateComment(
   bodyValue: unknown,
 ) {
   await threadRow(env, page, threadId);
-  const existing = await env.DB.prepare(`SELECT user_id, deleted_at FROM comments WHERE id = ? AND thread_id = ?`)
+  const existing = await env.DB.prepare(
+    `SELECT user_id, deleted_at, body_json FROM comments WHERE id = ? AND thread_id = ?`,
+  )
     .bind(commentId, threadId)
-    .first<{ user_id: string; deleted_at: number | null }>();
+    .first<{ user_id: string; deleted_at: number | null; body_json: string }>();
   if (!existing) throw new HttpError(404, "comment_not_found", "Comment not found.");
   if (existing.user_id !== member.user.id) {
     throw new HttpError(403, "comment_author_required", "Only the comment author may edit it.");
@@ -316,6 +391,8 @@ export async function updateComment(
   if (existing.deleted_at) throw new HttpError(409, "comment_deleted", "A deleted comment cannot be edited.");
   const body = validatedCommentBody(bodyValue);
   const timestamp = Date.now();
+  const previousMentionIds = new Set(commentMentionUserIds(parseBody(existing.body_json)));
+  const newMentionIds = commentMentionUserIds(body.body).filter((id) => !previousMentionIds.has(id));
   await env.DB.batch([
     env.DB.prepare(`UPDATE comments SET body_json = ?, plain_text = ?, updated_at = ? WHERE id = ?`).bind(
       body.json,
@@ -324,6 +401,18 @@ export async function updateComment(
       commentId,
     ),
     env.DB.prepare(`UPDATE comment_threads SET updated_at = ? WHERE id = ?`).bind(timestamp, threadId),
+    ...notificationFanoutStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      spaceId: page.space_id,
+      pageId: page.id,
+      threadId,
+      actorId: member.user.id,
+      eventType: "mention",
+      sourceId: commentId,
+      recipientIds: newMentionIds,
+      data: { commentId },
+      createdAt: timestamp,
+    }),
     ...refreshCommentSearchStatements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
@@ -367,10 +456,28 @@ export async function setThreadResolved(
   if (!canResolve(member, page, thread)) {
     throw new HttpError(403, "comment_resolve_forbidden", "You cannot change this thread's resolution state.");
   }
+  if (Boolean(thread.resolved_at) === resolved) return commentThread(env, member, page, threadId);
   const timestamp = Date.now();
-  await env.DB.prepare(`UPDATE comment_threads SET resolved_at = ?, resolved_by = ?, updated_at = ? WHERE id = ?`)
-    .bind(resolved ? timestamp : null, resolved ? member.user.id : null, timestamp, threadId)
-    .run();
+  const participantIds = await threadParticipantIds(env, threadId);
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE comment_threads SET resolved_at = ?, resolved_by = ?, updated_at = ? WHERE id = ?`).bind(
+      resolved ? timestamp : null,
+      resolved ? member.user.id : null,
+      timestamp,
+      threadId,
+    ),
+    ...notificationFanoutStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      spaceId: page.space_id,
+      pageId: page.id,
+      threadId,
+      actorId: member.user.id,
+      eventType: resolved ? "thread_resolved" : "thread_reopened",
+      sourceId: `${threadId}:${timestamp}`,
+      recipientIds: participantIds,
+      createdAt: timestamp,
+    }),
+  ]);
   return commentThread(env, member, page, threadId);
 }
 

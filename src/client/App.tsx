@@ -43,6 +43,8 @@ import { TablePage } from "./TablePage";
 import { ActivitiesTray } from "./ActivitiesTray";
 import { PageTags } from "./PageTags";
 import { TemplateLibrary } from "./TemplateLibrary";
+import { NotificationsPanel } from "./NotificationsPanel";
+import { WatchControl } from "./WatchControl";
 
 type AppState =
   | { screen: "loading" }
@@ -745,6 +747,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [pageTreeRetrying, setPageTreeRetrying] = useState(false);
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
   const [activitiesOpen, setActivitiesOpen] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notificationsRevision, setNotificationsRevision] = useState(0);
+  const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [jobsLoading, setJobsLoading] = useState(false);
   const [jobsError, setJobsError] = useState("");
@@ -767,6 +772,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const sidebarRef = useRef<HTMLElement>(null);
   const sidebarTriggerRef = useRef<HTMLButtonElement>(null);
   const activityTriggerRef = useRef<HTMLButtonElement>(null);
+  const notificationTriggerRef = useRef<HTMLButtonElement>(null);
   const restoreSidebarTriggerFocus = useRef(false);
   const restoreActivityTriggerFocus = useRef(false);
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
@@ -1356,6 +1362,19 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   useEffect(() => {
     void loadUnreadMentions();
   }, [loadUnreadMentions]);
+  const loadUnreadNotifications = useCallback(async () => {
+    try {
+      const data = await api<{ unreadCount: number }>("/api/notifications?limit=1&unread=true");
+      setUnreadNotifications(data.unreadCount);
+    } catch {
+      // The panel presents actionable loading errors; the shell badge may stay stale.
+    }
+  }, []);
+  useEffect(() => {
+    void api<{ unreadCount: number }>("/api/notifications?limit=1&unread=true")
+      .then((data) => setUnreadNotifications(data.unreadCount))
+      .catch(() => undefined);
+  }, []);
   const loadJobs = useCallback(async () => {
     setJobsLoading(true);
     try {
@@ -1600,7 +1619,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         if (activitiesOpen) void loadJobs();
         return;
       }
-      if (event.type === "notifications-invalidated") return;
+      if (event.type === "notifications-invalidated") {
+        setNotificationsRevision((current) => current + 1);
+        void loadUnreadNotifications();
+        return;
+      }
       if (event.type === "comments-invalidated") {
         if (event.pageId === selectedId) setCommentsRevision((current) => current + 1);
         return;
@@ -1663,6 +1686,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       excludeConfirmedRestoresFromTrash,
       loadJobs,
       loadOrganization,
+      loadUnreadNotifications,
       loadUnreadMentions,
       activitiesOpen,
       member.user.id,
@@ -1684,9 +1708,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be refreshed."));
       });
       void loadUnreadMentions();
+      void loadUnreadNotifications();
     });
     return () => bundle.destroy();
-  }, [handleWorkspaceEvent, loadPages, loadUnreadMentions, member.workspace.id, reportWorkspaceError]);
+  }, [
+    handleWorkspaceEvent,
+    loadPages,
+    loadUnreadMentions,
+    loadUnreadNotifications,
+    member.workspace.id,
+    reportWorkspaceError,
+  ]);
 
   const closeActivities = useCallback(() => {
     restoreActivityTriggerFocus.current = true;
@@ -1699,9 +1731,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }, [activitiesOpen]);
   const openActivities = useCallback(() => {
     restoreActivityTriggerFocus.current = false;
+    setNotificationsOpen(false);
     setActivitiesOpen(true);
     void loadJobs();
   }, [loadJobs]);
+  const openNotifications = useCallback(() => {
+    setActivitiesOpen(false);
+    setNotificationsOpen(true);
+    setNotificationsRevision((current) => current + 1);
+  }, []);
   const activeJobCount = jobs.filter((job) =>
     ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status),
   ).length;
@@ -2414,8 +2452,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}
         aria-label="Workspace navigation"
         tabIndex={-1}
-        inert={activitiesOpen ? true : undefined}
-        aria-hidden={activitiesOpen || undefined}
+        inert={activitiesOpen || notificationsOpen ? true : undefined}
+        aria-hidden={activitiesOpen || notificationsOpen || undefined}
       >
         <header className="workspace-header">
           <span className="workspace-avatar">{member.workspace.name.slice(0, 1).toUpperCase()}</span>
@@ -2509,15 +2547,20 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         {pins.length > 0 && <SidebarPageLinks label="Pinned" pages={pins} icon="⌖" onSelect={navigateToPage} />}
         <div className="sidebar-section-title">
           <span>{activeSpace?.name ?? "Pages"}</span>
-          {canEditActiveSpace && (
-            <button
-              aria-label="Create a root page"
-              disabled={!canCreatePage}
-              onClick={() => void createPage("document", null)}
-            >
-              +
-            </button>
-          )}
+          <span className="sidebar-section-actions">
+            {activeSpace && (
+              <WatchControl key={activeSpace.id} resourceType="space" resourceId={activeSpace.id} compact />
+            )}
+            {canEditActiveSpace && (
+              <button
+                aria-label="Create a root page"
+                disabled={!canCreatePage}
+                onClick={() => void createPage("document", null)}
+              >
+                +
+              </button>
+            )}
+          </span>
         </div>
         <div
           className="tree-root"
@@ -2557,8 +2600,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
       <section
         className="workspace-content"
-        inert={activitiesOpen ? true : undefined}
-        aria-hidden={activitiesOpen || undefined}
+        inert={activitiesOpen || notificationsOpen ? true : undefined}
+        aria-hidden={activitiesOpen || notificationsOpen || undefined}
       >
         {workspaceError && (
           <div className="form-error workspace-error" role="alert">
@@ -2595,6 +2638,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <div className="topbar-actions">
             {view === "pages" && activeSelected && !activeSelected.isTemplate && (
               <>
+                <WatchControl key={activeSelected.id} resourceType="page" resourceId={activeSelected.id} />
                 <button
                   className={`organization-action ${favorites.some((page) => page.id === activeSelected.id) ? "active" : ""}`}
                   disabled={pendingOrganizationAction === `favorite:${activeSelected.id}`}
@@ -2633,6 +2677,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                 )}
               </>
             )}
+            <button
+              ref={notificationTriggerRef}
+              className="notification-trigger"
+              aria-label={unreadNotifications ? `Notifications, ${unreadNotifications} unread` : "Notifications"}
+              aria-haspopup="dialog"
+              onClick={openNotifications}
+            >
+              <span aria-hidden="true">🔔</span>
+              {unreadNotifications > 0 && <b>{unreadNotifications > 99 ? "99+" : unreadNotifications}</b>}
+            </button>
             <button
               ref={activityTriggerRef}
               className="activity-trigger"
@@ -2759,6 +2813,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onCancel={(job) => void mutateJob(job, "cancel")}
           onRetry={(job) => void mutateJob(job, "retry")}
           onOpenResult={(job) => void openJobResult(job)}
+        />
+      )}
+      {notificationsOpen && (
+        <NotificationsPanel
+          revision={notificationsRevision}
+          onClose={() => setNotificationsOpen(false)}
+          onSelectPage={navigateToPage}
+          onUnreadCountChange={setUnreadNotifications}
         />
       )}
       {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
