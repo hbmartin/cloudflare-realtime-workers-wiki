@@ -25,6 +25,19 @@ describe("D1 migrations", () => {
         "attachment_upload_parts",
         "attachment_uploads",
         "table_bulk_writes",
+        "spaces",
+        "space_members",
+        "document_projections",
+        "page_search_v2",
+        "jobs",
+        "outbox",
+        "notifications",
+        "comment_migrations",
+        "slack_installations",
+        "slack_user_links",
+        "slack_channel_subscriptions",
+        "slack_unfurls",
+        "slack_request_replays",
       ]),
     );
 
@@ -35,6 +48,12 @@ describe("D1 migrations", () => {
     expect(indexes.results.map((index) => index.name)).toContain("idx_page_move_receipts_page");
     expect(indexes.results.map((index) => index.name)).toContain("idx_page_move_receipts_created");
     expect(indexes.results.map((index) => index.name)).toContain("idx_pages_workspace_page");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_slack_channels_unique");
+
+    const slackColumns = await env.DB.prepare(`PRAGMA table_info(slack_installations)`).all<{ name: string }>();
+    expect(slackColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["bot_token_ciphertext", "bot_refresh_token_ciphertext", "token_expires_at"]),
+    );
 
     const uploadColumns = await env.DB.prepare(`PRAGMA table_info(attachment_uploads)`).all<{ name: string }>();
     expect(uploadColumns.results.map((column) => column.name)).toEqual(
@@ -83,6 +102,183 @@ describe("D1 migrations", () => {
     expect(applied.results.map((migration) => migration.name)).toEqual(
       env.TEST_MIGRATIONS!.map((migration) => migration.name),
     );
+  });
+
+  it("marks legacy comment migrations separately and enrolls existing page creators as watchers", async () => {
+    const commentsMigration = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0013_comments_notifications.sql",
+    );
+    expect(commentsMigration).toBeTruthy();
+    const migrationIndex = env.TEST_MIGRATIONS!.indexOf(commentsMigration!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, migrationIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES ('workspace', 'owner', 'owner', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('page', 'workspace', 'workspace-general', 'document', 'a0', 'Page', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+    ]);
+
+    await applyD1Migrations(env.DB, [commentsMigration!]);
+
+    expect(
+      await env.DB.prepare(
+        `SELECT user_id, resource_type, resource_id, muted_at FROM subscriptions WHERE resource_id = 'page'`,
+      ).first(),
+    ).toEqual({ user_id: "owner", resource_type: "page", resource_id: "page", muted_at: null });
+    expect(await env.DB.prepare(`SELECT page_id FROM comment_migrations`).first()).toBeNull();
+
+    const scanMigration = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0014_comment_migration_jobs.sql",
+    );
+    expect(scanMigration).toBeTruthy();
+    await applyD1Migrations(env.DB, [scanMigration!]);
+    expect(
+      await env.DB.prepare(
+        `SELECT workspace_id, requested_by, type, status FROM jobs WHERE workspace_id = 'workspace'`,
+      ).first(),
+    ).toEqual({ workspace_id: "workspace", requested_by: "owner", type: "comment_migration", status: "queued" });
+
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = 'page'`).bind(timestamp),
+      env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id = 'page'`),
+    ]);
+    const searchMigration = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0015_search_v2_rollout.sql");
+    expect(searchMigration).toBeTruthy();
+    await applyD1Migrations(env.DB, [searchMigration!]);
+    expect(await env.DB.prepare(`SELECT page_id, title FROM page_search_v2 WHERE page_id = 'page'`).first()).toEqual({
+      page_id: "page",
+      title: "Page",
+    });
+    expect(
+      await env.DB.prepare(
+        `SELECT workspace_id, requested_by, type, status FROM jobs
+          WHERE workspace_id = 'workspace' AND type = 'search_reindex'`,
+      ).first(),
+    ).toEqual({ workspace_id: "workspace", requested_by: "owner", type: "search_reindex", status: "queued" });
+  });
+
+  it("preserves reserved Slack integration records while upgrading their schema", async () => {
+    const slackMigration = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0016_slack_integration.sql");
+    expect(slackMigration).toBeTruthy();
+    const migrationIndex = env.TEST_MIGRATIONS!.indexOf(slackMigration!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, migrationIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES ('workspace', 'owner', 'owner', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('page', 'workspace', 'workspace-general', 'document', 'a0', 'Page', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
+          (workspace_id, team_id, team_name, bot_user_id, encrypted_bot_token, installed_by, created_at, updated_at)
+         VALUES ('workspace', 'T123', 'Legacy Slack', 'B123', 'encrypted-token', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_user_links (workspace_id, user_id, slack_user_id, created_at)
+         VALUES ('workspace', 'owner', 'U123', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_link_tokens (token_hash, workspace_id, slack_user_id, expires_at)
+         VALUES ('token', 'workspace', 'U123', ?)`,
+      ).bind(timestamp + 600_000),
+      env.DB.prepare(
+        `INSERT INTO slack_channel_subscriptions
+          (id, workspace_id, space_id, page_id, channel_id, channel_name, events_json, cadence, created_by, created_at)
+         VALUES ('channel', 'workspace', 'workspace-general', 'page', 'C123', 'notes', '["page_edit"]', 'digest', 'owner', ?)`,
+      ).bind(timestamp),
+    ]);
+
+    await applyD1Migrations(env.DB, [slackMigration!]);
+    expect(
+      await env.DB.prepare(`SELECT id, workspace_id, team_id, bot_token_ciphertext FROM slack_installations`).first(),
+    ).toEqual({ id: "workspace", workspace_id: "workspace", team_id: "T123", bot_token_ciphertext: "encrypted-token" });
+    expect(await env.DB.prepare(`SELECT installation_id, slack_user_id FROM slack_user_links`).first()).toEqual({
+      installation_id: "workspace",
+      slack_user_id: "U123",
+    });
+    expect(
+      await env.DB.prepare(
+        `SELECT installation_id, event_types_json, cadence FROM slack_channel_subscriptions`,
+      ).first(),
+    ).toEqual({ installation_id: "workspace", event_types_json: '["page_edit"]', cadence: "digest" });
+  });
+
+  it("backfills every legacy page into a General space and guards cross-space parents", async () => {
+    const foundation = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0012_parity_foundations.sql");
+    expect(foundation).toBeTruthy();
+    const foundationIndex = env.TEST_MIGRATIONS!.indexOf(foundation!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, foundationIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES ('workspace', 'owner', 'owner', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages (id, workspace_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('parent', 'workspace', 'document', 'a0', 'Parent', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('child', 'workspace', 'parent', 'document', 'a1', 'Child', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+    ]);
+
+    await applyD1Migrations(env.DB, [foundation!]);
+
+    expect(await env.DB.prepare(`SELECT id FROM spaces WHERE workspace_id = 'workspace'`).first()).toEqual({
+      id: "workspace-general",
+    });
+    expect(
+      await env.DB.prepare(`SELECT id, space_id FROM pages ORDER BY id`).all<{ id: string; space_id: string }>(),
+    ).toMatchObject({
+      results: [
+        { id: "child", space_id: "workspace-general" },
+        { id: "parent", space_id: "workspace-general" },
+      ],
+    });
+
+    await env.DB.prepare(
+      `INSERT INTO spaces (id, workspace_id, name, slug, position, created_at, updated_at)
+       VALUES ('private', 'workspace', 'Private', 'private', 'a1', ?, ?)`,
+    )
+      .bind(timestamp, timestamp)
+      .run();
+    await expect(
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('invalid', 'workspace', 'private', 'parent', 'document', 'a2', 'Invalid', 'owner', ?, ?)`,
+      )
+        .bind(timestamp, timestamp)
+        .run(),
+    ).rejects.toThrow(/cross_space_parent/);
   });
 
   it("enforces the owner guards and workspace cascade on a fresh database", async () => {

@@ -1,7 +1,13 @@
-import { CommentsExtension, DefaultThreadStoreAuth, ThreadStoreAuth } from "@blocknote/core/comments";
-import { withCollaboration, YjsThreadStore } from "@blocknote/core/yjs";
+import { CommentsExtension } from "@blocknote/core/comments";
+import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
+import { withCollaboration } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
-import { SuggestionMenuController, ThreadsSidebar, useCreateBlockNote } from "@blocknote/react";
+import {
+  getDefaultReactSlashMenuItems,
+  SuggestionMenuController,
+  ThreadsSidebar,
+  useCreateBlockNote,
+} from "@blocknote/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
@@ -13,7 +19,9 @@ import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
 import { createDocumentCloseReconciler } from "./document-connection";
+import { editorBlockFactories } from "./editor-blocks";
 import { notesSchema } from "./mentions";
+import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 
 export type EditorPageProps = {
@@ -24,6 +32,7 @@ export type EditorPageProps = {
   onAccessDenied: (pageId: string, error: ApiClientError) => void;
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
+  commentsRevision?: number;
 };
 
 export function EditorPage({
@@ -34,6 +43,7 @@ export function EditorPage({
   onAccessDenied,
   onSelectPage,
   backlinksRevision,
+  commentsRevision = 0,
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
@@ -330,6 +340,7 @@ export function EditorPage({
               editable={editable}
               commentsOpen={commentsVisible}
               pageId={page.id}
+              commentsRevision={commentsRevision}
             />
           ) : storageError ? (
             <div className="editor-loading">
@@ -427,42 +438,13 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
   );
 }
 
-class ReadOnlyThreadStoreAuth extends ThreadStoreAuth {
-  canCreateThread() {
-    return false;
-  }
-  canAddComment() {
-    return false;
-  }
-  canUpdateComment() {
-    return false;
-  }
-  canDeleteComment() {
-    return false;
-  }
-  canDeleteThread() {
-    return false;
-  }
-  canResolveThread() {
-    return false;
-  }
-  canUnresolveThread() {
-    return false;
-  }
-  canAddReaction() {
-    return false;
-  }
-  canDeleteReaction() {
-    return false;
-  }
-}
-
-function editorOptions(bundle: CollaborationBundle, member: ClientMemberContext, editable: boolean, pageId: string) {
-  const threadStore = new YjsThreadStore(
-    member.user.id,
-    bundle.doc.getMap("comments"),
-    editable ? new DefaultThreadStoreAuth(member.user.id, "editor") : new ReadOnlyThreadStoreAuth(),
-  );
+function editorOptions(
+  bundle: CollaborationBundle,
+  member: ClientMemberContext,
+  editable: boolean,
+  pageId: string,
+  threadStore: ServerThreadStore,
+) {
   return withCollaboration({
     schema: notesSchema,
     // Media dropped or pasted into the body becomes a real attachment on this page, so
@@ -483,12 +465,7 @@ function editorOptions(bundle: CollaborationBundle, member: ClientMemberContext,
       CommentsExtension({
         threadStore,
         resolveUsers: async (ids: string[]) =>
-          ids.map((id) => ({
-            id,
-            username: id === member.user.id ? member.user.name : "Collaborator",
-            avatarUrl: "",
-            color: userColor(id),
-          })),
+          threadStore.resolveUsers(ids).map((user) => ({ ...user, color: userColor(user.id) })),
       }),
     ],
   });
@@ -500,15 +477,71 @@ function CollaborativeEditor({
   editable,
   commentsOpen,
   pageId,
+  commentsRevision,
 }: {
   bundle: CollaborationBundle;
   member: ClientMemberContext;
   editable: boolean;
   commentsOpen: boolean;
   pageId: string;
+  commentsRevision: number;
 }) {
-  const options = useMemo(() => editorOptions(bundle, member, editable, pageId), [bundle, editable, member, pageId]);
+  const [commentError, setCommentError] = useState("");
+  const commentsPanel = useRef<HTMLElement>(null);
+  const threadStore = useMemo(
+    () => new ServerThreadStore(pageId, member.user.id, setCommentError),
+    [member.user.id, pageId],
+  );
+  useEffect(() => {
+    void threadStore.refresh(commentsRevision);
+  }, [commentsRevision, threadStore]);
+  useEffect(() => {
+    const panel = commentsPanel.current;
+    if (!commentsOpen || !panel) return undefined;
+    const labelGeneratedEditors = () => {
+      for (const textbox of panel.querySelectorAll<HTMLElement>('[role="textbox"]:not([aria-label])')) {
+        textbox.setAttribute(
+          "aria-label",
+          textbox.getAttribute("contenteditable") === "false" ? "Comment content" : "Write a reply",
+        );
+      }
+    };
+    labelGeneratedEditors();
+    const observer = new MutationObserver(labelGeneratedEditors);
+    observer.observe(panel, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [commentsOpen]);
+  const options = useMemo(
+    () => editorOptions(bundle, member, editable, pageId, threadStore),
+    [bundle, editable, member, pageId, threadStore],
+  );
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
+  const getSlashItems = async (query: string) =>
+    filterSuggestionItems(
+      [
+        ...getDefaultReactSlashMenuItems(editor),
+        ...editorBlockFactories.map((item) => ({
+          title: item.label,
+          subtext: item.description,
+          aliases: [item.type],
+          group: "Notes blocks",
+          icon: <span>{item.icon}</span>,
+          onItemClick: () => insertOrUpdateBlockForSlashMenu(editor, { type: item.type }),
+        })),
+        {
+          title: "Inline math",
+          subtext: "Insert a KaTeX formula in this line",
+          aliases: ["formula", "latex"],
+          group: "Notes blocks",
+          icon: <span>𝑥</span>,
+          onItemClick: () =>
+            editor.insertInlineContent([{ type: "inlineMath", props: { formula: "x" } }], {
+              updateSelection: true,
+            }),
+        },
+      ],
+      query,
+    );
   const getMentionItems = async (query: string) => {
     const data = await api<{ suggestions: MentionSuggestion[] }>(
       `/api/mentions/suggestions?q=${encodeURIComponent(query)}`,
@@ -536,16 +569,18 @@ function CollaborativeEditor({
     }));
   };
   return (
-    <BlockNoteView editor={editor} editable={editable} className="notes-editor" theme="light">
+    <BlockNoteView editor={editor} editable={editable} className="notes-editor" theme="light" slashMenu={false}>
+      {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
       {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
       {commentsOpen && (
-        <aside className="side-panel comments-panel">
+        <aside ref={commentsPanel} className="side-panel comments-panel">
           <h2>Comments</h2>
           <p className="muted">
             {editable
               ? "Select text and use the formatting toolbar to start a thread."
-              : "Comments are read-only while this document is not editable."}
+              : "You can comment and reply even while the document is read-only."}
           </p>
+          {commentError && <p className="form-error">{commentError}</p>}
           <ThreadsSidebar filter="all" sort="position" />
         </aside>
       )}

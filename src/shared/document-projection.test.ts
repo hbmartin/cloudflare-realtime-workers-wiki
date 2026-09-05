@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { projectDocument, type ProseMirrorJson } from "./document-projection";
+import { projectDocument, serializeDocument, type ProseMirrorJson } from "./document-projection";
 
 function document(...content: ProseMirrorJson[]): ProseMirrorJson {
   return { type: "doc", content };
@@ -102,5 +102,29 @@ describe("structured document projection", () => {
     expect(projection.plainText).toHaveLength(500_000);
     expect(projection.pageReferences.map((item) => item.targetId)).toEqual(["late-page"]);
     expect(projection.pageReferences[0]!.excerpt).toContain("Late");
+  });
+
+  it("serializes custom nodes and neutralizes unsafe links and unknown nodes", () => {
+    const serialized = serializeDocument(
+      document(
+        {
+          type: "callout",
+          attrs: { icon: "!", tone: "warning" },
+          content: [{ type: "paragraph", content: [{ type: "text", text: "Heads up" }] }],
+        },
+        { type: "math", attrs: { formula: "x < y" } },
+        { type: "mermaid", attrs: { source: "graph TD; A-->B" } },
+        { type: "bookmark", attrs: { title: "Unsafe", url: "javascript:alert(1)" } },
+        { type: "futureWidget", content: [{ type: "text", text: "<still readable>" }] },
+      ),
+    );
+
+    expect(serialized.markdown).toContain("> ! Heads up");
+    expect(serialized.markdown).toContain("```mermaid");
+    expect(serialized.html).toContain('class="callout callout-warning"');
+    expect(serialized.html).toContain("x &lt; y");
+    expect(serialized.html).not.toContain("javascript:");
+    expect(serialized.html).toContain('data-unsupported-node="futureWidget"');
+    expect(serialized.html).toContain("&lt;still readable&gt;");
   });
 });

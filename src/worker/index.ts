@@ -1,5 +1,5 @@
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
@@ -13,6 +13,17 @@ import {
   UPLOAD_SESSION_TTL_MS,
 } from "./attachments";
 import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
+import {
+  addCommentReply,
+  commentThread,
+  createCommentThread,
+  listCommentThreads,
+  migrateLegacyComments,
+  setThreadResolved,
+  softDeleteComment,
+  updateComment,
+  type CommentPage,
+} from "./comments";
 import { Document } from "./document";
 import type { Env, MemberContext } from "./env";
 import {
@@ -61,8 +72,16 @@ import {
 } from "../shared/validation";
 import type {
   ClientMemberContext,
+  ExportFormat,
+  NotificationChannelMode,
+  NotificationEventType,
+  NotificationPreference,
   Page,
   PageKind,
+  Role,
+  Space,
+  Tag,
+  TagColor,
   TableLeaseResponse,
   TableLeaseTiming,
   WorkspaceEvent,
@@ -72,6 +91,52 @@ import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } fr
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
+import {
+  consumeDeliveryMessage,
+  createJob,
+  expireJobArtifacts,
+  jobForMember,
+  jobJson,
+  NotesJobWorkflow,
+  recoverQueuedJobs,
+  startJobExecution,
+  sweepOutbox,
+  type DeliveryQueueMessage,
+  type JobRow,
+} from "./jobs";
+import {
+  listNotifications,
+  listSubscriptions,
+  markNotifications,
+  NOTIFICATION_EVENT_TYPES,
+  notificationPreferences,
+  notificationPreferencesConfigured,
+  pageWatchState,
+  sendDueNotificationDigests,
+  setNotificationPreference,
+  setSubscription,
+  spaceWatchState,
+} from "./notifications";
+import { parseSearchRequest, searchPages, searchTitles } from "./search";
+import { cleanupImport } from "./importer";
+import {
+  consumeSlackLink,
+  createSlackOAuthUrl,
+  deleteSlackChannelSubscription,
+  disconnectSlack,
+  finishSlackOAuth,
+  handleSlackCommand,
+  handleSlackEvent,
+  listSlackChannelSubscriptions,
+  pruneSlackSecurityRecords,
+  sendDueSlackChannelDigests,
+  SlackRateLimitError,
+  slackConfigurationStatus,
+  slackWorkspaceStatus,
+  upsertSlackChannelSubscription,
+  verifySlackRequest,
+  type SlackEventPayload,
+} from "./slack";
 
 const app = new Hono<{ Bindings: Env }>();
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -79,13 +144,20 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 // query ceiling while still collapsing a tree level into one request.
 const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
+const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple", "pink"] as const;
+const MAX_IMPORT_UPLOAD_BYTES = 24 * 1024 * 1024;
 
 type PageRow = PageJsonRow & {
+  created_by: string;
   plain_text: string;
   indexed_seq: number;
+  visibility?: "workspace" | "private";
+  space_role?: Exclude<Role, "owner"> | null;
+  effective_role?: Role;
 };
 
 type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
+  spaceId: string;
   parentId: string | null;
   title: string;
 };
@@ -107,6 +179,7 @@ class InvalidPageMoveBatchResultError extends Error {
 const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
   id: "id",
   workspaceId: "workspace_id",
+  spaceId: "space_id",
   parentId: "parent_id",
   kind: "kind",
   position: "position",
@@ -114,6 +187,7 @@ const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
   icon: "icon",
   revision: "revision",
   contentEpoch: "content_epoch",
+  isTemplate: "is_template",
   archivedAt: "archived_at",
   createdAt: "created_at",
   updatedAt: "updated_at",
@@ -152,6 +226,7 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
   if (
     typeof page.id !== "string" ||
     typeof page.workspaceId !== "string" ||
+    (page.spaceId !== undefined && typeof page.spaceId !== "string") ||
     (page.parentId !== null && typeof page.parentId !== "string") ||
     typeof page.kind !== "string" ||
     !PAGE_KINDS.includes(page.kind as PageKind) ||
@@ -160,6 +235,10 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
     (page.icon !== null && typeof page.icon !== "string") ||
     typeof page.revision !== "number" ||
     typeof page.contentEpoch !== "number" ||
+    (page.isTemplate !== undefined &&
+      typeof page.isTemplate !== "boolean" &&
+      page.isTemplate !== 0 &&
+      page.isTemplate !== 1) ||
     (page.archivedAt !== null && typeof page.archivedAt !== "number") ||
     typeof page.createdAt !== "number" ||
     typeof page.updatedAt !== "number"
@@ -172,6 +251,7 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
   return {
     id: page.id,
     workspaceId: page.workspaceId,
+    spaceId: typeof page.spaceId === "string" ? page.spaceId : `${page.workspaceId}-general`,
     parentId: page.parentId,
     kind: page.kind as PageKind,
     position: page.position,
@@ -179,6 +259,7 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
     icon: page.icon,
     revision: page.revision,
     contentEpoch: page.contentEpoch,
+    isTemplate: page.isTemplate === true || page.isTemplate === 1,
     archivedAt: page.archivedAt,
     createdAt: page.createdAt,
     updatedAt: page.updatedAt,
@@ -353,8 +434,8 @@ async function readPageCreateReplay(
 ) {
   const existing = await database
     .prepare(
-      `SELECT p.id, p.workspace_id, p.parent_id, p.kind, p.position, p.title, p.icon,
-              p.revision, p.content_epoch, p.archived_at, p.created_at, p.updated_at,
+      `SELECT p.id, p.workspace_id, p.space_id, p.parent_id, p.kind, p.position, p.title, p.icon,
+              p.revision, p.content_epoch, p.is_template, p.archived_at, p.created_at, p.updated_at,
               r.request_hash receipt_request_hash
          FROM pages p
          LEFT JOIN page_create_receipts r ON r.page_id = p.id AND r.workspace_id = ?
@@ -372,7 +453,11 @@ async function readPageCreateReplay(
     const row = rows[index]!;
     if (row.receipt_request_hash !== null) return row.receipt_request_hash === requestHash;
     return (
-      row.archived_at === null && row.parent_id === page.parentId && row.kind === page.kind && row.title === page.title
+      row.archived_at === null &&
+      row.space_id === page.spaceId &&
+      row.parent_id === page.parentId &&
+      row.kind === page.kind &&
+      row.title === page.title
     );
   });
   if (!replayMatches) throw new HttpError(409, "idempotency_key_reused", conflictMessage);
@@ -391,9 +476,25 @@ async function requestedPageIdsExist(database: D1Database, requested: RequestedP
 }
 
 async function validatePageCreateParents(env: Env, member: MemberContext, requested: RequestedPageCreate[]) {
+  const checkedSpaces = new Set<string>();
   const parentIds = [...new Set(requested.map((page) => page.parentId))];
   for (const parentId of parentIds) {
-    if (parentId) await pageForMember(env, member, parentId);
+    if (!parentId) continue;
+    const parent = await pageForMember(env, member, parentId);
+    requirePageEditor(parent);
+    for (const page of requested) {
+      if (page.parentId === parentId && page.spaceId !== parent.space_id) {
+        throw new HttpError(422, "cross_space_parent", "A parent page must belong to the same space.");
+      }
+    }
+    checkedSpaces.add(parent.space_id!);
+  }
+  for (const spaceId of new Set(requested.map((page) => page.spaceId))) {
+    if (checkedSpaces.has(spaceId)) continue;
+    const space = await spaceForMember(env, member, spaceId);
+    if (effectiveSpaceRole(member.role, space.visibility, space.space_role) === "viewer") {
+      throw new HttpError(403, "read_only", "Your role in this space is read-only.");
+    }
   }
 }
 
@@ -438,6 +539,18 @@ function sendWorkspaceEvent(
     broadcastWorkspaceEvent(c.env, workspaceId, event).catch((error) => {
       console.error("Failed to broadcast workspace event", error);
     }),
+  );
+}
+
+function sendCommentMutationEvents(
+  c: { env: Env; executionCtx: { waitUntil(promise: Promise<unknown>): void } },
+  workspaceId: string,
+  pageId: string,
+) {
+  sendWorkspaceEvent(c, workspaceId, { type: "comments-invalidated", pageId });
+  sendWorkspaceEvent(c, workspaceId, { type: "notifications-invalidated" });
+  c.executionCtx.waitUntil(
+    sweepOutbox(c.env).catch((error) => console.error("Comment notification enqueue failed", error)),
   );
 }
 
@@ -527,12 +640,157 @@ async function signUp(env: Env, request: Request, body: { name: string; email: s
 
 async function pageForMember(env: Env, member: MemberContext, pageId: string, includeArchived = false) {
   const row = await env.DB.prepare(
-    `SELECT * FROM pages WHERE id = ? AND workspace_id = ? ${includeArchived ? "" : "AND archived_at IS NULL"}`,
+    `SELECT p.*, s.visibility, sm.role space_role
+       FROM pages p
+       JOIN spaces s ON s.id = p.space_id AND s.workspace_id = p.workspace_id
+       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+      WHERE p.id = ? AND p.workspace_id = ? ${includeArchived ? "" : "AND p.archived_at IS NULL"}
+        AND p.import_job_id IS NULL
+        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
   )
-    .bind(pageId, member.workspace.id)
+    .bind(member.user.id, pageId, member.workspace.id, member.role)
     .first<PageRow>();
   if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
+  return { ...row, effective_role: effectiveSpaceRole(member.role, row.visibility!, row.space_role ?? null)! };
+}
+
+function commentPage(page: PageRow): CommentPage {
+  return {
+    id: page.id,
+    workspace_id: page.workspace_id,
+    space_id: page.space_id ?? `${page.workspace_id}-general`,
+    content_epoch: page.content_epoch,
+    created_by: page.created_by,
+    effective_role: page.effective_role!,
+  };
+}
+
+async function pageForCommentThread(env: Env, member: MemberContext, threadId: string) {
+  const located = await env.DB.prepare(`SELECT page_id FROM comment_threads WHERE id = ? AND workspace_id = ?`)
+    .bind(threadId, member.workspace.id)
+    .first<{ page_id: string }>();
+  if (!located) throw new HttpError(404, "comment_thread_not_found", "Comment thread not found.");
+  return pageForMember(env, member, located.page_id);
+}
+
+async function pageForComment(env: Env, member: MemberContext, commentId: string) {
+  const located = await env.DB.prepare(
+    `SELECT ct.id thread_id, ct.page_id
+       FROM comments c JOIN comment_threads ct ON ct.id = c.thread_id
+      WHERE c.id = ? AND ct.workspace_id = ?`,
+  )
+    .bind(commentId, member.workspace.id)
+    .first<{ thread_id: string; page_id: string }>();
+  if (!located) throw new HttpError(404, "comment_not_found", "Comment not found.");
+  return { threadId: located.thread_id, page: await pageForMember(env, member, located.page_id) };
+}
+
+function effectiveSpaceRole(
+  workspaceRole: Role,
+  visibility: "workspace" | "private",
+  grant: Exclude<Role, "owner"> | null,
+): Role | null {
+  if (workspaceRole === "owner") return "owner";
+  if (visibility === "private" && !grant) return null;
+  if (workspaceRole === "viewer" || grant === "viewer") return "viewer";
+  return "editor";
+}
+
+function requirePageEditor(page: PageRow) {
+  if (page.effective_role === "viewer") {
+    throw new HttpError(403, "read_only", "Your role in this space is read-only.");
+  }
+}
+
+type SpaceRow = {
+  id: string;
+  workspace_id: string;
+  name: string;
+  slug: string;
+  description: string;
+  icon: string | null;
+  position: string;
+  visibility: "workspace" | "private";
+  space_role: Exclude<Role, "owner"> | null;
+  created_at: number;
+  updated_at: number;
+};
+
+function spaceJson(row: SpaceRow, member: MemberContext): Space {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    name: row.name,
+    slug: row.slug,
+    description: row.description,
+    icon: row.icon,
+    position: row.position,
+    visibility: row.visibility,
+    effectiveRole: effectiveSpaceRole(member.role, row.visibility, row.space_role)!,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function spaceForMember(env: Env, member: MemberContext, spaceId: string) {
+  const row = await env.DB.prepare(
+    `SELECT s.*, sm.role space_role FROM spaces s
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE s.id = ? AND s.workspace_id = ?
+       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
+  )
+    .bind(member.user.id, spaceId, member.workspace.id, member.role)
+    .first<SpaceRow>();
+  if (!row) throw new HttpError(404, "space_not_found", "Space not found.");
   return row;
+}
+
+type TagRow = {
+  id: string;
+  workspace_id: string;
+  name: string;
+  color: TagColor;
+  page_count?: number;
+  created_at: number;
+  updated_at: number;
+};
+
+function tagJson(row: TagRow): Tag {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    name: row.name,
+    color: row.color,
+    pageCount: row.page_count ?? 0,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function tagColor(value: unknown): TagColor {
+  const color = value === undefined ? "gray" : text(value, "color", 20);
+  if (!TAG_COLORS.includes(color as TagColor)) {
+    throw new HttpError(422, "invalid_input", "color is not a supported tag color.");
+  }
+  return color as TagColor;
+}
+
+function refreshSearchV2Statements(database: D1Database, pageId: string) {
+  return [
+    database.prepare(`DELETE FROM page_search_v2 WHERE page_id = ?`).bind(pageId),
+    database
+      .prepare(
+        `INSERT INTO page_search_v2
+          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+         SELECT p.id, p.workspace_id, p.space_id, p.title,
+                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
+                COALESCE(p.plain_text, ''),
+                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
+                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
+           FROM pages p WHERE p.id = ? AND p.archived_at IS NULL AND p.import_job_id IS NULL`,
+      )
+      .bind(pageId),
+  ];
 }
 
 type TablePageExtras = { columns: string; binds: unknown[] };
@@ -547,17 +805,28 @@ async function activeTablePage<T = unknown>(
   member: MemberContext,
   pageId: string,
   extra: TablePageExtras = { columns: "", binds: [] },
+  edit = false,
+  includeArchived = false,
 ) {
   const row = await env.DB.prepare(
-    `SELECT p.*${extra.columns}
+    `SELECT p.*, s.visibility, sm.role space_role${extra.columns}
        FROM pages p
-      WHERE p.id = ? AND p.workspace_id = ? AND p.archived_at IS NULL`,
+       JOIN spaces s ON s.id = p.space_id AND s.workspace_id = p.workspace_id
+       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+      WHERE p.id = ? AND p.workspace_id = ? ${includeArchived ? "" : "AND p.archived_at IS NULL"}
+        AND p.import_job_id IS NULL
+        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
   )
-    .bind(...extra.binds, pageId, member.workspace.id)
+    .bind(...extra.binds, member.user.id, pageId, member.workspace.id, member.role)
     .first<PageRow & T>();
   if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
   if (row.kind !== "table") throw new HttpError(422, "table_required", "This page is not a table.");
-  return row;
+  const accessible = {
+    ...row,
+    effective_role: effectiveSpaceRole(member.role, row.visibility!, row.space_role ?? null)!,
+  };
+  if (edit) requirePageEditor(accessible);
+  return accessible;
 }
 
 function leaseGuards() {
@@ -740,10 +1009,21 @@ app.post("/api/install/bootstrap", async (c) => {
       `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
        VALUES (?, ?, NULL, 'document', ?, 'Welcome', ?, ?, ?)`,
     ).bind(pageId, workspaceId, generateJitteredKeyBetween(null, null), signup.user.id, timestamp, timestamp),
+    c.env.DB.prepare(
+      `INSERT INTO subscriptions
+        (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
+       VALUES (?, ?, ?, 'page', ?, ?, ?)
+       ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
+    ).bind(`page:${pageId}:${signup.user.id}`, workspaceId, signup.user.id, pageId, signup.user.id, timestamp),
     c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, 'Welcome', '')`).bind(
       pageId,
       workspaceId,
     ),
+    c.env.DB.prepare(
+      `INSERT INTO page_search_v2
+        (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+       VALUES (?, ?, ?, 'Welcome', '', '', '', '')`,
+    ).bind(pageId, workspaceId, `${workspaceId}-general`),
   ]);
   return signup.response;
 });
@@ -882,13 +1162,855 @@ app.delete("/api/members/:id", async (c) => {
   return c.json({ ok: true });
 });
 
+app.get("/api/spaces", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const rows = await c.env.DB.prepare(
+    `SELECT s.*, sm.role space_role FROM spaces s
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE s.workspace_id = ?
+       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+     ORDER BY s.position, s.id`,
+  )
+    .bind(member.user.id, member.workspace.id, member.role)
+    .all<SpaceRow>();
+  return c.json({ spaces: rows.results.map((row) => spaceJson(row, member)) });
+});
+
+app.post("/api/spaces", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  const name = text(body.name, "name", 100);
+  const requestedSlug = typeof body.slug === "string" ? body.slug : name;
+  const slug = requestedSlug
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 80);
+  if (!slug) throw new HttpError(422, "invalid_input", "Space slug must contain a letter or number.");
+  const visibility = body.visibility === undefined ? "workspace" : text(body.visibility, "visibility", 20);
+  if (visibility !== "workspace" && visibility !== "private") {
+    throw new HttpError(422, "invalid_input", "visibility must be workspace or private.");
+  }
+  const last = await c.env.DB.prepare(
+    `SELECT position FROM spaces WHERE workspace_id = ? ORDER BY position DESC, id DESC LIMIT 1`,
+  )
+    .bind(member.workspace.id)
+    .first<{ position: string }>();
+  const timestamp = now();
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO spaces
+      (id, workspace_id, name, slug, description, icon, position, visibility, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      id,
+      member.workspace.id,
+      name,
+      slug,
+      typeof body.description === "string" ? body.description.trim().slice(0, 500) : "",
+      body.icon === null || body.icon === undefined ? null : text(body.icon, "icon", 20),
+      generateJitteredKeyBetween(last?.position ?? null, null),
+      visibility,
+      member.user.id,
+      timestamp,
+      timestamp,
+    )
+    .run();
+  const space = await spaceForMember(c.env, member, id);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ space: spaceJson(space, member) }, 201);
+});
+
+app.patch("/api/spaces/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const name = body.name === undefined ? space.name : text(body.name, "name", 100);
+  const visibility = body.visibility === undefined ? space.visibility : text(body.visibility, "visibility", 20);
+  if (visibility !== "workspace" && visibility !== "private") {
+    throw new HttpError(422, "invalid_input", "visibility must be workspace or private.");
+  }
+  const description =
+    body.description === undefined
+      ? space.description
+      : typeof body.description === "string"
+        ? body.description.trim().slice(0, 500)
+        : (() => {
+            throw new HttpError(422, "invalid_input", "description must be text.");
+          })();
+  const icon = body.icon === undefined ? space.icon : body.icon === null ? null : text(body.icon, "icon", 20);
+  await c.env.DB.prepare(
+    `UPDATE spaces SET name = ?, description = ?, icon = ?, visibility = ?, updated_at = ?
+      WHERE id = ? AND workspace_id = ?`,
+  )
+    .bind(name, description, icon, visibility, now(), space.id, member.workspace.id)
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  return c.json({ space: spaceJson(await spaceForMember(c.env, member, space.id), member) });
+});
+
+app.put("/api/spaces/:id/members/:userId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  const userId = text(c.req.param("userId"), "userId", 100);
+  const body = await jsonBody(c.req.raw);
+  const grant = role(body.role);
+  if (grant === "owner") throw new HttpError(422, "invalid_input", "Space grants may be editor or viewer.");
+  const workspaceMember = await c.env.DB.prepare(
+    `SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?`,
+  )
+    .bind(member.workspace.id, userId)
+    .first();
+  if (!workspaceMember) throw new HttpError(404, "member_not_found", "Member not found.");
+  await c.env.DB.prepare(
+    `INSERT INTO space_members (space_id, user_id, role, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(space_id, user_id) DO UPDATE SET role = excluded.role, created_by = excluded.created_by`,
+  )
+    .bind(space.id, userId, grant, member.user.id, now())
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.delete("/api/spaces/:id/members/:userId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  await c.env.DB.prepare(`DELETE FROM space_members WHERE space_id = ? AND user_id = ?`)
+    .bind(space.id, c.req.param("userId"))
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/favorites", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const rows = await c.env.DB.prepare(
+    `SELECT p.* FROM favorites f
+      JOIN pages p ON p.id = f.page_id
+      JOIN spaces s ON s.id = p.space_id
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE f.user_id = ? AND p.workspace_id = ? AND p.archived_at IS NULL
+       AND p.is_template = 0 AND p.import_job_id IS NULL
+       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+     ORDER BY f.position, p.id`,
+  )
+    .bind(member.user.id, member.user.id, member.workspace.id, member.role)
+    .all<PageRow>();
+  return c.json({ pages: rows.results.map(pageJson) });
+});
+
+app.post("/api/favorites/:pageId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  const last = await c.env.DB.prepare(`SELECT position FROM favorites WHERE user_id = ? ORDER BY position DESC LIMIT 1`)
+    .bind(member.user.id)
+    .first<{ position: string }>();
+  await c.env.DB.prepare(`INSERT OR IGNORE INTO favorites (user_id, page_id, position, created_at) VALUES (?, ?, ?, ?)`)
+    .bind(member.user.id, page.id, generateJitteredKeyBetween(last?.position ?? null, null), now())
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ page: pageJson(page) }, 201);
+});
+
+app.delete("/api/favorites/:pageId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await c.env.DB.prepare(
+    `DELETE FROM favorites WHERE user_id = ? AND page_id IN (
+       SELECT id FROM pages WHERE id = ? AND workspace_id = ?
+     )`,
+  )
+    .bind(member.user.id, c.req.param("pageId"), member.workspace.id)
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/spaces/:id/pins", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  const rows = await c.env.DB.prepare(
+    `SELECT p.* FROM space_pins sp JOIN pages p ON p.id = sp.page_id
+      WHERE sp.space_id = ? AND p.space_id = ? AND p.archived_at IS NULL
+        AND p.is_template = 0 AND p.import_job_id IS NULL
+      ORDER BY sp.position, p.id`,
+  )
+    .bind(space.id, space.id)
+    .all<PageRow>();
+  return c.json({ pages: rows.results.map(pageJson) });
+});
+
+app.post("/api/spaces/:id/pins/:pageId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  if (effectiveSpaceRole(member.role, space.visibility, space.space_role) === "viewer") {
+    throw new HttpError(403, "read_only", "Your role in this space is read-only.");
+  }
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.space_id !== space.id) throw new HttpError(422, "pin_space_mismatch", "A pin must belong to its space.");
+  const last = await c.env.DB.prepare(
+    `SELECT position FROM space_pins WHERE space_id = ? ORDER BY position DESC LIMIT 1`,
+  )
+    .bind(space.id)
+    .first<{ position: string }>();
+  await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO space_pins (space_id, page_id, position, created_by, created_at) VALUES (?, ?, ?, ?, ?)`,
+  )
+    .bind(space.id, page.id, generateJitteredKeyBetween(last?.position ?? null, null), member.user.id, now())
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ page: pageJson(page) }, 201);
+});
+
+app.delete("/api/spaces/:id/pins/:pageId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  if (effectiveSpaceRole(member.role, space.visibility, space.space_role) === "viewer") {
+    throw new HttpError(403, "read_only", "Your role in this space is read-only.");
+  }
+  await c.env.DB.prepare(`DELETE FROM space_pins WHERE space_id = ? AND page_id = ?`)
+    .bind(space.id, c.req.param("pageId"))
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/tags", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const rows = await c.env.DB.prepare(
+    `SELECT t.*, COUNT(DISTINCT visible.id) page_count FROM tags t
+      LEFT JOIN page_tags pt ON pt.tag_id = t.id
+      LEFT JOIN (
+        SELECT p.id FROM pages p JOIN spaces s ON s.id = p.space_id
+        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+        WHERE p.workspace_id = ? AND p.archived_at IS NULL
+          AND p.import_job_id IS NULL AND p.is_template = 0
+          AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+      ) visible ON visible.id = pt.page_id
+     WHERE t.workspace_id = ? GROUP BY t.id ORDER BY lower(t.name), t.id`,
+  )
+    .bind(member.user.id, member.workspace.id, member.role, member.workspace.id)
+    .all<TagRow>();
+  return c.json({ tags: rows.results.map(tagJson) });
+});
+
+app.post("/api/tags", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const body = await jsonBody(c.req.raw);
+  const name = text(body.name, "name", 50);
+  const existing = await c.env.DB.prepare(`SELECT id FROM tags WHERE workspace_id = ? AND lower(name) = lower(?)`)
+    .bind(member.workspace.id, name)
+    .first();
+  if (existing) throw new HttpError(409, "tag_exists", "A tag with that name already exists.");
+  const id = crypto.randomUUID();
+  const timestamp = now();
+  await c.env.DB.prepare(
+    `INSERT INTO tags (id, workspace_id, name, color, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, member.workspace.id, name, tagColor(body.color), member.user.id, timestamp, timestamp)
+    .run();
+  const tag = await c.env.DB.prepare(`SELECT * FROM tags WHERE id = ?`).bind(id).first<TagRow>();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ tag: tagJson(tag!) }, 201);
+});
+
+app.patch("/api/tags/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const current = await c.env.DB.prepare(`SELECT * FROM tags WHERE id = ? AND workspace_id = ?`)
+    .bind(c.req.param("id"), member.workspace.id)
+    .first<TagRow>();
+  if (!current) throw new HttpError(404, "tag_not_found", "Tag not found.");
+  const body = await jsonBody(c.req.raw);
+  const name = body.name === undefined ? current.name : text(body.name, "name", 50);
+  const duplicate = await c.env.DB.prepare(
+    `SELECT id FROM tags WHERE workspace_id = ? AND lower(name) = lower(?) AND id <> ?`,
+  )
+    .bind(member.workspace.id, name, current.id)
+    .first();
+  if (duplicate) throw new HttpError(409, "tag_exists", "A tag with that name already exists.");
+  await c.env.DB.prepare(`UPDATE tags SET name = ?, color = ?, updated_at = ? WHERE id = ?`)
+    .bind(name, body.color === undefined ? current.color : tagColor(body.color), now(), current.id)
+    .run();
+  await c.env.DB.prepare(
+    `UPDATE page_search_v2 SET tags = COALESCE(
+       (SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
+         WHERE pt.page_id = page_search_v2.page_id), '')
+      WHERE page_id IN (SELECT page_id FROM page_tags WHERE tag_id = ?)`,
+  )
+    .bind(current.id)
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({
+    tag: tagJson((await c.env.DB.prepare(`SELECT * FROM tags WHERE id = ?`).bind(current.id).first<TagRow>())!),
+  });
+});
+
+app.delete("/api/tags/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const tag = await c.env.DB.prepare(`SELECT id FROM tags WHERE id = ? AND workspace_id = ?`)
+    .bind(c.req.param("id"), member.workspace.id)
+    .first<{ id: string }>();
+  if (!tag) throw new HttpError(404, "tag_not_found", "Tag not found.");
+  const pages = await c.env.DB.prepare(`SELECT page_id id FROM page_tags WHERE tag_id = ?`)
+    .bind(tag.id)
+    .all<{ id: string }>();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`DELETE FROM tags WHERE id = ?`).bind(tag.id),
+    c.env.DB.prepare(
+      `UPDATE page_search_v2 SET tags = COALESCE(
+           (SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
+             WHERE pt.page_id = page_search_v2.page_id), '')
+          WHERE page_id IN (SELECT value FROM json_each(?))`,
+    ).bind(JSON.stringify(pages.results.map((page) => page.id))),
+  ]);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/pages/:id/tags", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"), true);
+  const rows = await c.env.DB.prepare(
+    `SELECT t.*, 0 page_count FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
+      WHERE pt.page_id = ? AND t.workspace_id = ? ORDER BY lower(t.name), t.id`,
+  )
+    .bind(page.id, member.workspace.id)
+    .all<TagRow>();
+  return c.json({ tags: rows.results.map(tagJson) });
+});
+
+app.put("/api/pages/:id/tags/:tagId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(page);
+  const tag = await c.env.DB.prepare(`SELECT id FROM tags WHERE id = ? AND workspace_id = ?`)
+    .bind(c.req.param("tagId"), member.workspace.id)
+    .first<{ id: string }>();
+  if (!tag) throw new HttpError(404, "tag_not_found", "Tag not found.");
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT OR IGNORE INTO page_tags (page_id, tag_id, created_by, created_at) VALUES (?, ?, ?, ?)`,
+    ).bind(page.id, tag.id, member.user.id, now()),
+    ...refreshSearchV2Statements(c.env.DB, page.id),
+  ]);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.delete("/api/pages/:id/tags/:tagId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(page);
+  await c.env.DB.batch([
+    c.env.DB.prepare(`DELETE FROM page_tags WHERE page_id = ? AND tag_id = ?`).bind(page.id, c.req.param("tagId")),
+    ...refreshSearchV2Statements(c.env.DB, page.id),
+  ]);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/templates", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const requestedSpaceId = c.req.query("spaceId");
+  if (requestedSpaceId) await spaceForMember(c.env, member, requestedSpaceId);
+  const rows = await c.env.DB.prepare(
+    `SELECT p.* FROM pages p
+      JOIN spaces s ON s.id = p.space_id
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE p.workspace_id = ? AND p.is_template = 1 AND p.archived_at IS NULL AND p.import_job_id IS NULL
+       AND (? IS NULL OR p.space_id = ?)
+       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+     ORDER BY s.position, p.position, p.id`,
+  )
+    .bind(member.user.id, member.workspace.id, requestedSpaceId ?? null, requestedSpaceId ?? null, member.role)
+    .all<PageRow>();
+  return c.json({ templates: rows.results.map(pageJson) });
+});
+
+app.post("/api/templates", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const body = await jsonBody(c.req.raw);
+  const source = await pageForMember(c.env, member, text(body.pageId, "pageId", 100));
+  requirePageEditor(source);
+  if (source.is_template) throw new HttpError(409, "already_template", "This page is already a template.");
+  if (!source.space_id) throw new HttpError(409, "space_required", "The source page is not assigned to a space.");
+  const title = body.title === undefined ? source.title : text(body.title, "title", PAGE_TITLE_MAX);
+  const targetPageId = crypto.randomUUID();
+  const job = await createJob(c.env, {
+    member,
+    type: "template_clone",
+    spaceId: source.space_id,
+    options: {
+      sourcePageId: source.id,
+      targetPageId,
+      targetSpaceId: source.space_id,
+      parentId: null,
+      title,
+      isTemplate: true,
+    },
+  });
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, job).catch((error) => {
+      console.error("Failed to start template creation workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job) }, 202);
+});
+
+app.post("/api/templates/:id/instantiate", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const template = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(template);
+  if (!template.is_template) throw new HttpError(404, "template_not_found", "Template not found.");
+  if (!template.space_id) throw new HttpError(409, "space_required", "The template is not assigned to a space.");
+  const body = await jsonBody(c.req.raw);
+  const parentId = nullableId(body.parentId, "parentId");
+  if (parentId) {
+    const parent = await pageForMember(c.env, member, parentId);
+    requirePageEditor(parent);
+    if (parent.is_template || parent.space_id !== template.space_id) {
+      throw new HttpError(422, "template_parent_mismatch", "The destination must be a page in the template's space.");
+    }
+  }
+  const title = body.title === undefined ? template.title : text(body.title, "title", PAGE_TITLE_MAX);
+  const targetPageId = crypto.randomUUID();
+  const job = await createJob(c.env, {
+    member,
+    type: "template_clone",
+    spaceId: template.space_id,
+    options: {
+      sourcePageId: template.id,
+      targetPageId,
+      targetSpaceId: template.space_id,
+      parentId,
+      title,
+      isTemplate: false,
+    },
+  });
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, job).catch((error) => {
+      console.error("Failed to start template instantiation workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job) }, 202);
+});
+
+app.post("/api/import-uploads", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const contentLength = Number(c.req.header("content-length") ?? 0);
+  if (contentLength > MAX_IMPORT_UPLOAD_BYTES + 100_000) {
+    throw new HttpError(413, "import_too_large", "Import uploads are limited to 24 MiB.");
+  }
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) throw new HttpError(422, "file_required", "Attach one import file in the file field.");
+  if (!file.size) throw new HttpError(422, "empty_import", "The import file is empty.");
+  if (file.size > MAX_IMPORT_UPLOAD_BYTES) {
+    throw new HttpError(413, "import_too_large", "Import uploads are limited to 24 MiB.");
+  }
+  const spaceId = text(form.get("spaceId"), "spaceId", 100);
+  const space = await spaceForMember(c.env, member, spaceId);
+  if (effectiveSpaceRole(member.role, space.visibility, space.space_role) === "viewer") {
+    throw new HttpError(403, "read_only", "Your role in this space is read-only.");
+  }
+  const filename = normalizeFilename(file.name);
+  const lower = filename.toLowerCase();
+  const format =
+    lower.endsWith(".md") || lower.endsWith(".markdown")
+      ? "markdown"
+      : lower.endsWith(".html") || lower.endsWith(".htm")
+        ? "html"
+        : lower.endsWith(".zip")
+          ? "notion_zip"
+          : null;
+  if (!format) {
+    throw new HttpError(415, "unsupported_import", "Choose a Markdown, HTML, or Notion ZIP file.");
+  }
+  const job = await createJob(c.env, {
+    member,
+    type: "import",
+    spaceId,
+    options: { filename, format, confirmed: false },
+  });
+  const inputKey = `jobs/${job.id}/input/${encodeURIComponent(filename)}`;
+  try {
+    await c.env.BUCKET.put(inputKey, file.stream(), {
+      httpMetadata: { contentType: file.type || "application/octet-stream" },
+      customMetadata: { filename, jobId: job.id },
+    });
+    await c.env.DB.prepare(`UPDATE jobs SET input_key = ?, expires_at = ?, updated_at = ? WHERE id = ?`)
+      .bind(inputKey, now() + 7 * 24 * 60 * 60_000, now(), job.id)
+      .run();
+  } catch (error) {
+    await c.env.BUCKET.delete(inputKey).catch(() => undefined);
+    await c.env.DB.prepare(`DELETE FROM jobs WHERE id = ?`)
+      .bind(job.id)
+      .run()
+      .catch(() => undefined);
+    throw error;
+  }
+  const uploaded = (await c.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(job.id).first<JobRow>())!;
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, uploaded).catch((error) => {
+      console.error("Failed to start import inspection workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(uploaded) }, 202);
+});
+
+async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string) {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const body = routeJobId ? {} : await jsonBody(c.req.raw);
+  const jobId = routeJobId ?? text(body.jobId, "jobId", 100);
+  const job = await jobForMember(c.env, member, jobId);
+  if (job.type !== "import") throw new HttpError(404, "import_not_found", "Import job not found.");
+  if (job.status !== "awaiting_confirmation") {
+    throw new HttpError(409, "import_not_confirmable", "This import is not awaiting confirmation.");
+  }
+  const options = JSON.parse(job.options_json) as Record<string, unknown>;
+  const instanceId = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, options_json = ?, progress_label = 'Queued',
+      error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ? AND status = 'awaiting_confirmation'`,
+  )
+    .bind(instanceId, JSON.stringify({ ...options, confirmed: true }), now(), job.id)
+    .run();
+  const confirmed = await jobForMember(c.env, member, job.id);
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, confirmed).catch((error) => {
+      console.error("Failed to start confirmed import workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(confirmed) }, 202);
+}
+
+app.post("/api/imports", (c) => confirmImport(c));
+app.post("/api/imports/:id/confirm", (c) => confirmImport(c, c.req.param("id")));
+
+app.get("/api/jobs", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const requestedLimit = Number(c.req.query("limit") ?? 50);
+  const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
+  const rows = await c.env.DB.prepare(
+    `SELECT j.* FROM jobs j
+      LEFT JOIN spaces s ON s.id = j.space_id
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE j.workspace_id = ? AND j.requested_by = ?
+       AND (j.space_id IS NULL OR ? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+     ORDER BY j.created_at DESC, j.id DESC LIMIT ?`,
+  )
+    .bind(member.user.id, member.workspace.id, member.user.id, member.role, limit)
+    .all<JobRow>();
+  return c.json({ jobs: rows.results.map(jobJson) });
+});
+
+app.get("/api/jobs/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json({ job: jobJson(await jobForMember(c.env, member, c.req.param("id"))) });
+});
+
+app.post("/api/jobs/search-reindex", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const existing = await c.env.DB.prepare(
+    `SELECT * FROM jobs WHERE workspace_id = ? AND type = 'search_reindex' AND status IN ('queued', 'running')
+      ORDER BY created_at DESC LIMIT 1`,
+  )
+    .bind(member.workspace.id)
+    .first<JobRow>();
+  if (existing) return c.json({ job: jobJson(existing), coalesced: true });
+  const job = await createJob(c.env, { member, type: "search_reindex" });
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, job).catch((error) => {
+      console.error("Failed to start search reindex workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job), coalesced: false }, 202);
+});
+
+app.post("/api/jobs/comment-migration", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const existing = await c.env.DB.prepare(
+    `SELECT * FROM jobs WHERE workspace_id = ? AND type = 'comment_migration' AND status IN ('queued', 'running')
+      ORDER BY created_at DESC LIMIT 1`,
+  )
+    .bind(member.workspace.id)
+    .first<JobRow>();
+  if (existing) return c.json({ job: jobJson(existing), coalesced: true });
+  const job = await createJob(c.env, { member, type: "comment_migration" });
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, job).catch((error) => {
+      console.error("Failed to start comment migration workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job), coalesced: false }, 202);
+});
+
+app.post("/api/jobs/:id/cancel", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const job = await jobForMember(c.env, member, c.req.param("id"));
+  if (["succeeded", "failed", "canceled"].includes(job.status)) {
+    throw new HttpError(409, "job_not_cancelable", "This job is no longer running.");
+  }
+  await c.env.DB.prepare(
+    `UPDATE jobs SET status = 'canceled', progress_label = 'Canceled', updated_at = ?
+      WHERE id = ? AND status IN ('queued', 'running', 'awaiting_confirmation', 'canceling')`,
+  )
+    .bind(now(), job.id)
+    .run();
+  if (job.workflow_instance_id) {
+    c.executionCtx.waitUntil(
+      c.env.NOTES_WORKFLOW.get(job.workflow_instance_id)
+        .then((instance) => instance.terminate())
+        .catch((error) => console.error("Failed to terminate canceled workflow", { jobId: job.id, error })),
+    );
+  }
+  if (job.type === "import") {
+    c.executionCtx.waitUntil(
+      cleanupImport(c.env, job).catch((error) =>
+        console.error("Failed to clean up canceled import", { jobId: job.id, error }),
+      ),
+    );
+  }
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(await jobForMember(c.env, member, job.id)) });
+});
+
+app.post("/api/jobs/:id/retry", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const job = await jobForMember(c.env, member, c.req.param("id"));
+  if (job.status !== "failed" && job.status !== "canceled") {
+    throw new HttpError(409, "job_not_retryable", "Only failed or canceled jobs can be retried.");
+  }
+  const instanceId = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, progress_current = 0, progress_label = 'Queued',
+       error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`,
+  )
+    .bind(instanceId, now(), job.id)
+    .run();
+  const retried = await jobForMember(c.env, member, job.id);
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, retried).catch((error) => {
+      console.error("Failed to restart job workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(retried) }, 202);
+});
+
+app.get("/api/jobs/:id/download", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const job = await jobForMember(c.env, member, c.req.param("id"));
+  if (job.status !== "succeeded" || !job.output_key) {
+    throw new HttpError(409, "job_download_unavailable", "This job does not have a downloadable result.");
+  }
+  if (job.expires_at && job.expires_at <= now()) {
+    throw new HttpError(404, "job_artifact_expired", "This download has expired.");
+  }
+  const artifact = await c.env.BUCKET.get(job.output_key);
+  if (!artifact) throw new HttpError(404, "job_artifact_missing", "This download is no longer available.");
+  const headers = new Headers();
+  artifact.writeHttpMetadata(headers);
+  headers.set("cache-control", "private, max-age=0, must-revalidate");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set(
+    "content-disposition",
+    attachmentDisposition(artifact.customMetadata?.filename ?? `notes-${job.type}`, false),
+  );
+  return new Response(artifact.body, { headers });
+});
+
+app.get("/api/integrations/status", async (c) => {
+  await requireMember(c.req.raw, c.env);
+  return c.json({
+    email: { available: Boolean(c.env.SEND_EMAIL && c.env.EMAIL_FROM) },
+    pdf: { available: Boolean(c.env.BROWSER) },
+    slack: slackConfigurationStatus(c.env),
+  });
+});
+
+app.get("/api/slack/status", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json(await slackWorkspaceStatus(c.env, member));
+});
+
+app.get("/api/slack/oauth/start", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ url: await createSlackOAuthUrl(c.env, member) });
+});
+
+app.get("/api/slack/oauth/callback", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const code = text(c.req.query("code"), "code", 500);
+  const state = text(c.req.query("state"), "state", 500);
+  await finishSlackOAuth(c.env, member, code, state);
+  return c.redirect("/?view=settings&slack=connected", 303);
+});
+
+app.post("/api/slack/disconnect", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await disconnectSlack(c.env, member);
+  return c.json({ ok: true });
+});
+
+app.post("/api/slack/link", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const body = await jsonBody(c.req.raw);
+  await consumeSlackLink(c.env, member, text(body.token, "token", 200));
+  return c.json({ ok: true });
+});
+
+app.post("/api/slack/commands", async (c) => {
+  const rawBody = await c.req.raw.text();
+  const verified = await verifySlackRequest(c.env, c.req.raw, rawBody);
+  if (verified.duplicate) return c.json({ response_type: "ephemeral", text: "Request already handled." });
+  return c.json(await handleSlackCommand(c.env, new URLSearchParams(rawBody)));
+});
+
+app.post("/api/slack/events", async (c) => {
+  const rawBody = await c.req.raw.text();
+  const verified = await verifySlackRequest(c.env, c.req.raw, rawBody);
+  if (verified.duplicate) return c.json({ ok: true });
+  let payload: SlackEventPayload;
+  try {
+    payload = JSON.parse(rawBody) as SlackEventPayload;
+  } catch {
+    throw new HttpError(422, "invalid_slack_event", "Slack event payload is invalid.");
+  }
+  return c.json(await handleSlackEvent(c.env, payload));
+});
+
+app.get("/api/slack/channels", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ subscriptions: await listSlackChannelSubscriptions(c.env, member) });
+});
+
+app.post("/api/slack/channels", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  const spaceId = text(body.spaceId, "spaceId", 100);
+  const pageId = body.pageId === null || body.pageId === undefined ? null : text(body.pageId, "pageId", 100);
+  const channelId = text(body.channelId, "channelId", 30).toUpperCase();
+  if (!/^[CDG][A-Z0-9]{1,29}$/.test(channelId)) {
+    throw new HttpError(422, "invalid_slack_channel", "Enter a valid Slack channel ID.");
+  }
+  const channelName = text(body.channelName, "channelName", 100).replace(/^#/, "");
+  const cadence = text(body.cadence, "cadence", 20);
+  if (cadence !== "immediate" && cadence !== "digest") {
+    throw new HttpError(422, "invalid_slack_cadence", "Slack cadence must be immediate or digest.");
+  }
+  if (!Array.isArray(body.eventTypes) || !body.eventTypes.length) {
+    throw new HttpError(422, "invalid_slack_events", "Choose at least one Slack event.");
+  }
+  const eventTypes = body.eventTypes.map((value) => text(value, "eventType", 40) as NotificationEventType);
+  if (eventTypes.some((value) => !NOTIFICATION_EVENT_TYPES.includes(value))) {
+    throw new HttpError(422, "invalid_slack_events", "A Slack event type is invalid.");
+  }
+  if (new Set(eventTypes).size !== eventTypes.length) {
+    throw new HttpError(422, "invalid_slack_events", "Slack event types may not be repeated.");
+  }
+  await spaceForMember(c.env, member, spaceId);
+  if (pageId) {
+    const page = await pageForMember(c.env, member, pageId);
+    if (page.space_id !== spaceId) {
+      throw new HttpError(422, "slack_page_space_mismatch", "The selected page does not belong to that space.");
+    }
+  }
+  return c.json(
+    {
+      subscription: await upsertSlackChannelSubscription(c.env, member, {
+        spaceId,
+        pageId,
+        channelId,
+        channelName,
+        eventTypes,
+        cadence,
+      }),
+    },
+    201,
+  );
+});
+
+app.delete("/api/slack/channels/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await deleteSlackChannelSubscription(c.env, member, c.req.param("id"));
+  return c.json({ ok: true });
+});
+
+app.post("/api/pages/:id/exports", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const format = text(body.format, "format", 20) as ExportFormat;
+  if (!["markdown", "html", "pdf"].includes(format)) {
+    throw new HttpError(422, "invalid_export_format", "Choose Markdown, HTML, or PDF.");
+  }
+  const portable = body.portable === true;
+  if (format === "pdf" && portable) {
+    throw new HttpError(422, "invalid_export_options", "PDF exports are always a single file.");
+  }
+  if (format === "pdf" && !c.env.BROWSER) {
+    throw new HttpError(503, "pdf_unavailable", "PDF export is not configured for this installation.");
+  }
+  const job = await createJob(c.env, {
+    member,
+    type: "export",
+    spaceId: page.space_id ?? `${member.workspace.id}-general`,
+    options: { pageId: page.id, format, portable },
+  });
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, job).catch((error) => {
+      console.error("Failed to start export workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job) }, 202);
+});
+
 app.get("/api/pages/tree", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const archived = c.req.query("archived") === "true";
   const rows = await c.env.DB.prepare(
-    `SELECT * FROM pages WHERE workspace_id = ? AND archived_at IS ${archived ? "NOT " : ""}NULL ORDER BY position, id`,
+    `SELECT p.* FROM pages p
+      JOIN spaces s ON s.id = p.space_id
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE p.workspace_id = ? AND p.archived_at IS ${archived ? "NOT " : ""}NULL
+       AND p.is_template = 0 AND p.import_job_id IS NULL
+       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+     ORDER BY p.position, p.id`,
   )
-    .bind(member.workspace.id)
+    .bind(member.user.id, member.workspace.id, member.role)
     .all<PageRow>();
   return c.json({ pages: rows.results.map(pageJson) });
 });
@@ -898,13 +2020,22 @@ app.post("/api/pages", async (c) => {
   requireEditor(member);
   const body = await jsonBody(c.req.raw);
   const parentId = nullableId(body.parentId, "parentId");
+  const requestedSpaceId = nullableId(body.spaceId, "spaceId");
   const clientProvidedId = body.id !== undefined;
+  // An exact idempotent replay remains readable after its original parent was
+  // archived. New creates are still rejected by validatePageCreateParents.
+  const parent = parentId ? await pageForMember(c.env, member, parentId, clientProvidedId) : null;
+  if (parent) requirePageEditor(parent);
+  const spaceId = requestedSpaceId ?? parent?.space_id ?? `${member.workspace.id}-general`;
+  if (parent && parent.space_id !== spaceId) {
+    throw new HttpError(422, "cross_space_parent", "A parent page must belong to the same space.");
+  }
   const id = clientProvidedId ? text(body.id, "id", 100) : crypto.randomUUID();
   if (!ID_PATTERN.test(id)) throw new HttpError(422, "invalid_input", "id is not a valid resource id.");
   const kind = pageKind(body.kind ?? "document");
   const title = typeof body.title === "string" ? text(body.title, "title", PAGE_TITLE_MAX) : "Untitled";
-  const requestHash = await pageCreateRequestHash({ parentId, kind, title });
-  const requested = [{ id, parentId, kind, title }];
+  const requestHash = await pageCreateRequestHash({ spaceId, parentId, kind, title });
+  const requested = [{ id, spaceId, parentId, kind, title }];
   const conflictMessage = "That page id already describes a different page.";
   const initialReplay = clientProvidedId
     ? await readInitialPageCreateReplay(c.env, member, requested, requestHash, conflictMessage)
@@ -923,14 +2054,25 @@ app.post("/api/pages", async (c) => {
     const position = generateJitteredKeyBetween(last?.position ?? null, null);
     const results = await c.env.DB.batch<PageRow>([
       c.env.DB.prepare(
-        `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-      ).bind(id, member.workspace.id, parentId, kind, position, title, member.user.id, timestamp, timestamp),
+        `INSERT INTO pages (id, workspace_id, space_id, parent_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      ).bind(id, member.workspace.id, spaceId, parentId, kind, position, title, member.user.id, timestamp, timestamp),
       c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
         id,
         member.workspace.id,
         title,
       ),
+      c.env.DB.prepare(
+        `INSERT INTO page_search_v2
+          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+         VALUES (?, ?, ?, ?, '', '', '', '')`,
+      ).bind(id, member.workspace.id, spaceId, title),
+      c.env.DB.prepare(
+        `INSERT INTO subscriptions
+          (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
+         VALUES (?, ?, ?, 'page', ?, ?, ?)
+         ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
+      ).bind(`page:${id}:${member.user.id}`, member.workspace.id, member.user.id, id, member.user.id, timestamp),
       ...(kind === "table" ? [c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(id)] : []),
       c.env.DB.prepare(
         `INSERT INTO page_create_receipts
@@ -985,11 +2127,17 @@ app.post("/api/pages/batch", async (c) => {
     }
     return {
       id: requestedId,
+      spaceId: nullableId(entry.spaceId, `pages[${index}].spaceId`) ?? `${member.workspace.id}-general`,
       parentId: nullableId(entry.parentId, `pages[${index}].parentId`),
       kind: pageKind(entry.kind ?? "document"),
       title: typeof entry.title === "string" ? text(entry.title, `pages[${index}].title`, PAGE_TITLE_MAX) : "Untitled",
     };
   });
+  for (const [index, page] of parsed.entries()) {
+    if (!page.parentId || entries[index]!.spaceId !== undefined) continue;
+    const parent = await pageForMember(c.env, member, page.parentId);
+    page.spaceId = parent.space_id!;
+  }
   const clientProvidedPages = parsed.filter((_page, index) => entries[index]!.id !== undefined);
   if (new Set(parsed.map(({ id }) => id)).size !== parsed.length) {
     throw new HttpError(422, "invalid_input", "A page id may appear only once in a batch.");
@@ -1028,11 +2176,12 @@ app.post("/api/pages/batch", async (c) => {
     pageResultIndexes.push(statements.length);
     statements.push(
       c.env.DB.prepare(
-        `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        `INSERT INTO pages (id, workspace_id, space_id, parent_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       ).bind(
         page.id,
         member.workspace.id,
+        page.spaceId,
         page.parentId,
         page.kind,
         positions.get(page.id),
@@ -1045,6 +2194,24 @@ app.post("/api/pages/batch", async (c) => {
         page.id,
         member.workspace.id,
         page.title,
+      ),
+      c.env.DB.prepare(
+        `INSERT INTO page_search_v2
+          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+         VALUES (?, ?, ?, ?, '', '', '', '')`,
+      ).bind(page.id, member.workspace.id, page.spaceId, page.title),
+      c.env.DB.prepare(
+        `INSERT INTO subscriptions
+          (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
+         VALUES (?, ?, ?, 'page', ?, ?, ?)
+         ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
+      ).bind(
+        `page:${page.id}:${member.user.id}`,
+        member.workspace.id,
+        member.user.id,
+        page.id,
+        member.user.id,
+        timestamp,
       ),
     );
     if (page.kind === "table") {
@@ -1086,10 +2253,286 @@ app.get("/api/pages/:id", async (c) => {
   return c.json({ page: pageJson(await pageForMember(c.env, member, c.req.param("id"), true)) });
 });
 
+app.get("/api/pages/:id/comments", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const scopedPage = commentPage(page);
+  await migrateLegacyComments(c.env, scopedPage);
+  return c.json({ threads: await listCommentThreads(c.env, member, scopedPage) });
+});
+
+app.post("/api/pages/:id/comments", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const scopedPage = commentPage(page);
+  await migrateLegacyComments(c.env, scopedPage);
+  const body = await jsonBody(c.req.raw);
+  const initialComment = object(body.initialComment);
+  const thread = await createCommentThread(c.env, member, scopedPage, initialComment.body);
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
+  return c.json({ thread }, 201);
+});
+
+app.post("/api/comment-threads/:id/anchor", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, c.req.param("id"));
+  const scopedPage = commentPage(page);
+  const body = await jsonBody(c.req.raw);
+  const selection = object(body.selection);
+  const yjs = selection.yjs;
+  if (!yjs || typeof yjs !== "object" || Array.isArray(yjs)) {
+    return c.json({ thread: await commentThread(c.env, member, scopedPage, c.req.param("id")), anchored: false });
+  }
+  const anchorJson = JSON.stringify(yjs);
+  if (new TextEncoder().encode(anchorJson).byteLength > 16 * 1024) {
+    throw new HttpError(422, "invalid_comment_anchor", "The comment selection is invalid.");
+  }
+  let anchored = false;
+  if (page.kind === "document") {
+    const response = await c.env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
+      new Request("https://document.internal/comment-anchor", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-internal": c.env.BETTER_AUTH_SECRET },
+        body: JSON.stringify({
+          operation: "add",
+          threadId: c.req.param("id"),
+          userId: member.user.id,
+          selection: yjs,
+        }),
+      }),
+    );
+    if (response.ok) anchored = Boolean((await response.json<{ anchored?: boolean }>()).anchored);
+  }
+  await c.env.DB.prepare(`UPDATE comment_threads SET anchor_json = ?, updated_at = ? WHERE id = ? AND page_id = ?`)
+    .bind(anchored ? anchorJson : null, Date.now(), c.req.param("id"), page.id)
+    .run();
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
+  return c.json({ thread: await commentThread(c.env, member, scopedPage, c.req.param("id")), anchored });
+});
+
+async function createReplyResponse(c: Context<{ Bindings: Env }>, threadId: string, body: Record<string, unknown>) {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, threadId);
+  const comment = object(body.comment);
+  const thread = await addCommentReply(c.env, member, commentPage(page), threadId, comment.body, body.parentId);
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
+  return c.json({ thread }, 201);
+}
+
+app.post("/api/comment-threads/:id/replies", async (c) =>
+  createReplyResponse(c, c.req.param("id"), await jsonBody(c.req.raw)),
+);
+
+app.post("/api/comment-threads/:id/comments", async (c) =>
+  createReplyResponse(c, c.req.param("id"), await jsonBody(c.req.raw)),
+);
+
+app.put("/api/comment-threads/:id/comments/:commentId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const comment = object(body.comment);
+  const thread = await updateComment(
+    c.env,
+    member,
+    commentPage(page),
+    c.req.param("id"),
+    c.req.param("commentId"),
+    comment.body,
+  );
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
+  return c.json({ thread });
+});
+
+app.patch("/api/comments/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const located = await pageForComment(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const thread = await updateComment(
+    c.env,
+    member,
+    commentPage(located.page),
+    located.threadId,
+    c.req.param("id"),
+    body.body,
+  );
+  sendCommentMutationEvents(c, member.workspace.id, located.page.id);
+  return c.json({ thread });
+});
+
+async function deleteCommentResponse(c: Context<{ Bindings: Env }>, threadId: string, commentId: string) {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, threadId);
+  const thread = await softDeleteComment(c.env, member, commentPage(page), threadId, commentId);
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
+  return c.json({ thread });
+}
+
+app.delete("/api/comment-threads/:id/comments/:commentId", async (c) =>
+  deleteCommentResponse(c, c.req.param("id"), c.req.param("commentId")),
+);
+
+app.delete("/api/comments/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const located = await pageForComment(c.env, member, c.req.param("id"));
+  const thread = await softDeleteComment(c.env, member, commentPage(located.page), located.threadId, c.req.param("id"));
+  sendCommentMutationEvents(c, member.workspace.id, located.page.id);
+  return c.json({ thread });
+});
+
+async function resolutionResponse(c: Context<{ Bindings: Env }>, threadId: string, resolved: boolean) {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, threadId);
+  const thread = await setThreadResolved(c.env, member, commentPage(page), threadId, resolved);
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
+  return c.json({ thread });
+}
+
+app.post("/api/comment-threads/:id/resolve", async (c) => resolutionResponse(c, c.req.param("id"), true));
+app.post("/api/comment-threads/:id/reopen", async (c) => resolutionResponse(c, c.req.param("id"), false));
+app.post("/api/comment-threads/:id/unresolve", async (c) => resolutionResponse(c, c.req.param("id"), false));
+
+app.get("/api/notifications", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const requestedLimit = Number(c.req.query("limit") ?? 30);
+  const requestedOffset = Number(c.req.query("offset") ?? 0);
+  const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 30;
+  const offset = Number.isInteger(requestedOffset) ? Math.min(Math.max(requestedOffset, 0), 10_000) : 0;
+  return c.json(
+    await listNotifications(c.env, member, {
+      unreadOnly: c.req.query("unread") === "true",
+      limit,
+      offset,
+    }),
+  );
+});
+
+async function markNotificationResponse(c: Context<{ Bindings: Env }>, action: "read" | "archive") {
+  const member = await requireMember(c.req.raw, c.env);
+  const body = await jsonBody(c.req.raw);
+  let ids: string[] | null = null;
+  if (body.ids !== undefined) {
+    if (!Array.isArray(body.ids) || body.ids.length > 500 || body.ids.some((id) => typeof id !== "string")) {
+      throw new HttpError(422, "invalid_notification_ids", "Choose up to 500 notifications.");
+    }
+    ids = body.ids;
+  }
+  await markNotifications(c.env, member, action, ids);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "notifications-invalidated" });
+  return c.json({ ok: true });
+}
+
+app.post("/api/notifications/read", async (c) => markNotificationResponse(c, "read"));
+app.post("/api/notifications/archive", async (c) => markNotificationResponse(c, "archive"));
+
+app.get("/api/notification-preferences", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json({
+    preferences: await notificationPreferences(c.env, member),
+    configured: await notificationPreferencesConfigured(c.env, member),
+    channels: {
+      email: { available: Boolean(c.env.SEND_EMAIL && c.env.EMAIL_FROM) },
+      slack: slackConfigurationStatus(c.env),
+    },
+  });
+});
+
+app.put("/api/notification-preferences", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const body = await jsonBody(c.req.raw);
+  const requested = Array.isArray(body.preferences) ? body.preferences : [body.preference ?? body];
+  if (!requested.length || requested.length > NOTIFICATION_EVENT_TYPES.length) {
+    throw new HttpError(422, "invalid_notification_preferences", "Choose one preference for each event.");
+  }
+  const preferences = requested.map((value): NotificationPreference => {
+    const preference = object(value);
+    const eventType = text(preference.eventType, "eventType", 40) as NotificationEventType;
+    const email = text(preference.email, "email", 20) as NotificationChannelMode;
+    const slack = text(preference.slack, "slack", 20) as NotificationChannelMode;
+    if (typeof preference.inApp !== "boolean") {
+      throw new HttpError(422, "invalid_notification_preference", "inApp must be true or false.");
+    }
+    return {
+      eventType,
+      inApp: preference.inApp,
+      email,
+      slack,
+      timezone: text(preference.timezone, "timezone", 100),
+    };
+  });
+  if (new Set(preferences.map((preference) => preference.eventType)).size !== preferences.length) {
+    throw new HttpError(422, "duplicate_notification_preference", "Each event may only be configured once.");
+  }
+  for (const preference of preferences) await setNotificationPreference(c.env, member, preference);
+  return c.json({ preferences: await notificationPreferences(c.env, member) });
+});
+
+app.get("/api/subscriptions", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json({ subscriptions: await listSubscriptions(c.env, member) });
+});
+
+app.get("/api/pages/:id/watch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  return c.json({ watch: await pageWatchState(c.env, member, page.id, page.space_id!) });
+});
+
+app.put("/api/pages/:id/watch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const state = text(body.state, "state", 20) as "watching" | "muted" | "none";
+  await setSubscription(c.env, member, "page", page.id, state);
+  return c.json({ watch: await pageWatchState(c.env, member, page.id, page.space_id!) });
+});
+
+app.get("/api/spaces/:id/watch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  return c.json({ watch: await spaceWatchState(c.env, member, space.id) });
+});
+
+app.put("/api/spaces/:id/watch", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const state = text(body.state, "state", 20) as "watching" | "muted" | "none";
+  await setSubscription(c.env, member, "space", space.id, state);
+  return c.json({ watch: await spaceWatchState(c.env, member, space.id) });
+});
+
+app.get("/api/pages/:id/content", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  if (page.kind !== "document") {
+    throw new HttpError(422, "document_required", "Structured content is available for document pages.");
+  }
+  const room = `${page.id}~${page.content_epoch}`;
+  const projectionLocation = locationHint(member.workspace.locationHint ?? undefined);
+  const response = await c.env.DOCUMENT.getByName(
+    room,
+    projectionLocation ? { locationHint: projectionLocation } : undefined,
+  ).fetch(
+    new Request("https://document.internal/content", {
+      headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET },
+    }),
+  );
+  if (!response.ok) throw new HttpError(503, "content_unavailable", "Document content is temporarily unavailable.");
+  const headers = new Headers({
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "private, no-store",
+  });
+  const etag = response.headers.get("etag");
+  if (etag) headers.set("etag", etag);
+  return new Response(response.body, { status: response.status, headers });
+});
+
 app.patch("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(page);
   const body = await jsonBody(c.req.raw);
   const revision = Number(body.revision);
   const titleValue = body.title === undefined ? page.title : text(body.title, "title", PAGE_TITLE_MAX);
@@ -1110,6 +2553,7 @@ app.patch("/api/pages/:id", async (c) => {
       titleValue,
       await currentPlainText(c.env, page.id),
     ),
+    ...refreshSearchV2Statements(c.env.DB, page.id),
   ]);
   const updated = pageJson(await pageForMember(c.env, member, page.id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [updated] });
@@ -1134,6 +2578,8 @@ app.post("/api/pages/:id/move", async (c) => {
   const beforeId = nullableId(body.beforeId, "beforeId");
   const afterId = nullableId(body.afterId, "afterId");
   const requestHash = await sha256Hex(canonicalJson({ pageId, parentId, beforeId, afterId }));
+  const authorizedPage = await pageForMember(c.env, member, pageId, true);
+  requirePageEditor(authorizedPage);
   const receiptContext = {
     workspaceId: member.workspace.id,
     pageId,
@@ -1147,8 +2593,13 @@ app.post("/api/pages/:id/move", async (c) => {
   if (replay) return c.json({ page: replay, operationId, replayed: true });
 
   const page = await pageForMember(c.env, member, pageId);
+  requirePageEditor(page);
   if (parentId) {
-    await pageForMember(c.env, member, parentId);
+    const parent = await pageForMember(c.env, member, parentId);
+    requirePageEditor(parent);
+    if (parent.space_id !== page.space_id) {
+      throw new HttpError(422, "cross_space_parent", "Move the subtree to that space before changing its parent.");
+    }
     const cycle = await c.env.DB.prepare(
       `WITH RECURSIVE descendants(id) AS (
          SELECT id FROM pages WHERE id = ?
@@ -1160,9 +2611,9 @@ app.post("/api/pages/:id/move", async (c) => {
     if (cycle) throw new HttpError(409, "page_cycle", "A page cannot be moved beneath itself or a descendant.");
   }
   const neighbors = await c.env.DB.prepare(
-    `SELECT id, position FROM pages WHERE workspace_id = ? AND parent_id IS ? AND archived_at IS NULL`,
+    `SELECT id, position FROM pages WHERE workspace_id = ? AND space_id = ? AND parent_id IS ? AND archived_at IS NULL`,
   )
-    .bind(member.workspace.id, parentId)
+    .bind(member.workspace.id, page.space_id, parentId)
     .all<{ id: string; position: string }>();
   const before = neighbors.results.find((item) => item.id === beforeId)?.position ?? null;
   const after = neighbors.results.find((item) => item.id === afterId)?.position ?? null;
@@ -1304,6 +2755,7 @@ app.post("/api/pages/:id/move", async (c) => {
 app.get("/api/pages/:id/moves/:operationId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const pageId = c.req.param("id");
+  await pageForMember(c.env, member, pageId, true);
   const operationId = c.req.param("operationId");
   if (!ID_PATTERN.test(operationId)) throw new HttpError(404, "move_not_found", "Move receipt not found.");
   const page = await readPageMoveReceiptWithDiagnostics(
@@ -1319,10 +2771,68 @@ app.get("/api/pages/:id/moves/:operationId", async (c) => {
   return c.json({ page, operationId });
 });
 
+app.post("/api/pages/:id/move-space", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(page);
+  const body = await jsonBody(c.req.raw);
+  const spaceId = text(body.spaceId, "spaceId", 120);
+  const parentId = nullableId(body.parentId, "parentId");
+  const targetSpace = await spaceForMember(c.env, member, spaceId);
+  if (effectiveSpaceRole(member.role, targetSpace.visibility, targetSpace.space_role) === "viewer") {
+    throw new HttpError(403, "read_only", "Your role in the destination space is read-only.");
+  }
+  if (parentId) {
+    const parent = await pageForMember(c.env, member, parentId);
+    requirePageEditor(parent);
+    if (parent.space_id !== spaceId) {
+      throw new HttpError(422, "cross_space_parent", "The destination parent is in another space.");
+    }
+    const cycle = await c.env.DB.prepare(
+      `WITH RECURSIVE descendants(id) AS (
+         SELECT id FROM pages WHERE id = ?
+         UNION ALL SELECT p.id FROM pages p JOIN descendants d ON p.parent_id = d.id
+       ) SELECT 1 cycle FROM descendants WHERE id = ? LIMIT 1`,
+    )
+      .bind(page.id, parentId)
+      .first();
+    if (cycle) throw new HttpError(409, "page_cycle", "A page cannot be moved beneath itself or a descendant.");
+  }
+  const last = await c.env.DB.prepare(
+    `SELECT position FROM pages WHERE space_id = ? AND parent_id IS ? AND archived_at IS NULL
+      ORDER BY position DESC, id DESC LIMIT 1`,
+  )
+    .bind(spaceId, parentId)
+    .first<{ position: string }>();
+  const position = generateJitteredKeyBetween(last?.position ?? null, null);
+  const timestamp = now();
+  const subtreeSql = `WITH RECURSIVE subtree(id) AS (
+    SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+  ) SELECT id FROM subtree`;
+  const results = await c.env.DB.batch<PageRow>([
+    c.env.DB.prepare(
+      `UPDATE pages SET
+         space_id = ?,
+         parent_id = CASE WHEN id = ? THEN ? ELSE parent_id END,
+         position = CASE WHEN id = ? THEN ? ELSE position END,
+         revision = revision + 1,
+         updated_at = ?
+       WHERE workspace_id = ? AND id IN (${subtreeSql})`,
+    ).bind(spaceId, page.id, parentId, page.id, position, timestamp, member.workspace.id, page.id),
+    c.env.DB.prepare(`UPDATE page_search_v2 SET space_id = ? WHERE page_id IN (${subtreeSql})`).bind(spaceId, page.id),
+    c.env.DB.prepare(`SELECT * FROM pages WHERE id IN (${subtreeSql}) ORDER BY position, id`).bind(page.id),
+  ]);
+  const moved = results[2]?.results.map(pageJson) ?? [];
+  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  return c.json({ pages: moved });
+});
+
 app.delete("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
+  requirePageEditor(page);
   const requestedOperationId = c.req.header("x-notes-operation-id");
   const operationId = requestedOperationId && ID_PATTERN.test(requestedOperationId) ? requestedOperationId : undefined;
   const timestamp = now();
@@ -1394,6 +2904,7 @@ app.post("/api/pages/:id/restore", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
+  requirePageEditor(page);
   const restoredSnapshotStatement = c.env.DB.prepare(
     `SELECT * FROM pages WHERE id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
@@ -1432,6 +2943,27 @@ app.post("/api/pages/:id/restore", async (c) => {
            SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
          ) SELECT id FROM subtree
        )`,
+      ).bind(page.id),
+      c.env.DB.prepare(
+        `DELETE FROM page_search_v2 WHERE page_id IN (
+         WITH RECURSIVE subtree(id) AS (
+           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+         ) SELECT id FROM subtree
+       )`,
+      ).bind(page.id),
+      c.env.DB.prepare(
+        `INSERT INTO page_search_v2
+          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+         SELECT p.id, p.workspace_id, p.space_id, p.title,
+                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
+                COALESCE(p.plain_text, ''),
+                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
+                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
+           FROM pages p WHERE p.id IN (
+             WITH RECURSIVE subtree(id) AS (
+               SELECT ? UNION ALL SELECT child.id FROM pages child JOIN subtree parent ON child.parent_id = parent.id
+             ) SELECT id FROM subtree
+           ) AND p.import_job_id IS NULL AND p.is_template = 0`,
       ).bind(page.id),
     ],
     // Read the restored snapshot in the same transaction as the update.
@@ -1558,20 +3090,12 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
 
 app.get("/api/search", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const query = (c.req.query("q") ?? "").trim().slice(0, 200);
-  if (!query) return c.json({ results: [] });
-  const terms = query.match(/[\p{L}\p{N}_]+/gu)?.slice(0, 20) ?? [];
-  if (!terms.length) return c.json({ results: [] });
-  const match = terms.map((word) => `"${word.replaceAll('"', '""')}"*`).join(" AND ");
-  const rows = await c.env.DB.prepare(
-    `SELECT p.*, snippet(page_search, 3, '<mark>', '</mark>', '…', 20) snippet
-       FROM page_search JOIN pages p ON p.id = page_search.page_id
-      WHERE page_search MATCH ? AND page_search.workspace_id = ? AND p.archived_at IS NULL
-      ORDER BY bm25(page_search) LIMIT 30`,
-  )
-    .bind(match, member.workspace.id)
-    .all<PageRow & { snippet: string }>();
-  return c.json({ results: rows.results.map((row) => ({ page: pageJson(row), snippet: row.snippet })) });
+  return c.json(await searchPages(c.env.DB, member, parseSearchRequest(c.req.url)));
+});
+
+app.get("/api/search/titles", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json(await searchTitles(c.env.DB, member, c.req.url));
 });
 
 app.get("/api/mentions/suggestions", async (c) => {
@@ -1581,11 +3105,15 @@ app.get("/api/mentions/suggestions", async (c) => {
   const pattern = `%${escapedQuery}%`;
   const [pages, members] = await Promise.all([
     c.env.DB.prepare(
-      `SELECT id, title, icon FROM pages
-        WHERE workspace_id = ? AND archived_at IS NULL AND title LIKE ? ESCAPE '\\'
-        ORDER BY CASE WHEN title LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END, title, id LIMIT 10`,
+      `SELECT p.id, p.title, p.icon FROM pages p
+        JOIN spaces s ON s.id = p.space_id
+        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+        WHERE p.workspace_id = ? AND p.archived_at IS NULL AND p.title LIKE ? ESCAPE '\\'
+          AND p.import_job_id IS NULL AND p.is_template = 0
+          AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+        ORDER BY CASE WHEN p.title LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END, p.title, p.id LIMIT 10`,
     )
-      .bind(member.workspace.id, pattern, `${escapedQuery}%`)
+      .bind(member.user.id, member.workspace.id, pattern, member.role, `${escapedQuery}%`)
       .all<{ id: string; title: string; icon: string | null }>(),
     c.env.DB.prepare(
       `SELECT u.id, u.name, u.email, wm.role
@@ -1618,19 +3146,13 @@ app.get("/api/mentions/suggestions", async (c) => {
 
 app.get("/api/pages/:id/preview", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const row = await c.env.DB.prepare(`SELECT * FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`)
-    .bind(c.req.param("id"), member.workspace.id)
-    .first<PageRow>();
-  if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
+  const row = await pageForMember(c.env, member, c.req.param("id"));
   return c.json({ preview: { page: pageJson(row), excerpt: (row.plain_text ?? "").slice(0, 280) } });
 });
 
 app.get("/api/pages/:id/verification", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const row = await c.env.DB.prepare(`SELECT * FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`)
-    .bind(c.req.param("id"), member.workspace.id)
-    .first<PageRow>();
-  if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
+  const row = await pageForMember(c.env, member, c.req.param("id"));
   const [references, mentions] = await Promise.all([
     c.env.DB.prepare(
       `SELECT target_page_id targetId FROM page_references WHERE source_page_id = ? ORDER BY target_page_id`,
@@ -1664,10 +3186,14 @@ app.get("/api/pages/:id/backlinks", async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT source.*, reference.excerpt
        FROM page_references reference JOIN pages source ON source.id = reference.source_page_id
+       JOIN spaces s ON s.id = source.space_id
+       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
       WHERE reference.target_page_id = ? AND source.workspace_id = ? AND source.archived_at IS NULL
+        AND source.import_job_id IS NULL AND source.is_template = 0
+        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
       ORDER BY source.updated_at DESC, source.id`,
   )
-    .bind(page.id, member.workspace.id)
+    .bind(member.user.id, page.id, member.workspace.id, member.role)
     .all<PageRow & { excerpt: string }>();
   return c.json({ backlinks: rows.results.map((row) => ({ page: pageJson(row), excerpt: row.excerpt })) });
 });
@@ -1677,13 +3203,17 @@ app.get("/api/mentions/unread-count", async (c) => {
   const row = await c.env.DB.prepare(
     `SELECT COUNT(DISTINCT mention.source_page_id) count
        FROM member_mentions mention
-       JOIN pages source ON source.id = mention.source_page_id AND source.archived_at IS NULL
+      JOIN pages source ON source.id = mention.source_page_id AND source.archived_at IS NULL
+       JOIN spaces s ON s.id = source.space_id
+       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
        LEFT JOIN mention_reads reads
          ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
       WHERE mention.workspace_id = ? AND mention.target_user_id = ?
+        AND source.import_job_id IS NULL AND source.is_template = 0
+        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
         AND mention.first_seen_at > COALESCE(reads.read_at, 0)`,
   )
-    .bind(member.workspace.id, member.user.id)
+    .bind(member.user.id, member.workspace.id, member.user.id, member.role)
     .first<{ count: number }>();
   return c.json({ unreadCount: row?.count ?? 0 });
 });
@@ -1712,14 +3242,28 @@ app.get("/api/mentions", async (c) => {
             CASE WHEN mention.first_seen_at > COALESCE(reads.read_at, 0) THEN 1 ELSE 0 END unread
        FROM member_mentions mention
        JOIN pages source ON source.id = mention.source_page_id AND source.archived_at IS NULL
+       JOIN spaces s ON s.id = source.space_id
+       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
        LEFT JOIN mention_reads reads
          ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
       WHERE mention.workspace_id = ? AND mention.target_user_id = ? AND mention.first_seen_at <= ?
+        AND source.import_job_id IS NULL AND source.is_template = 0
+        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
         AND (? IS NULL OR mention.first_seen_at < ?
           OR (mention.first_seen_at = ? AND source.id > ?))
       ORDER BY mention.first_seen_at DESC, source.id LIMIT 101`,
   )
-    .bind(member.workspace.id, member.user.id, asOf, beforeAt, beforeAt, beforeAt, beforeId ?? null)
+    .bind(
+      member.user.id,
+      member.workspace.id,
+      member.user.id,
+      asOf,
+      member.role,
+      beforeAt,
+      beforeAt,
+      beforeAt,
+      beforeId ?? null,
+    )
     .all<PageRow & { excerpt: string; first_seen_at: number; unread: number }>();
   const pageRows = rows.results.slice(0, 100);
   const last = pageRows.at(-1);
@@ -1753,12 +3297,16 @@ app.post("/api/mentions/read", async (c) => {
     `SELECT COUNT(DISTINCT mention.source_page_id) count
        FROM member_mentions mention
        JOIN pages source ON source.id = mention.source_page_id AND source.archived_at IS NULL
+       JOIN spaces s ON s.id = source.space_id
+       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
        LEFT JOIN mention_reads reads
          ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
       WHERE mention.workspace_id = ? AND mention.target_user_id = ?
+        AND source.import_job_id IS NULL AND source.is_template = 0
+        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
         AND mention.first_seen_at > COALESCE(reads.read_at, 0)`,
   )
-    .bind(member.workspace.id, member.user.id)
+    .bind(member.user.id, member.workspace.id, member.user.id, member.role)
     .first<{ count: number }>();
   return c.json({ unreadCount: unread?.count ?? 0 });
 });
@@ -1831,6 +3379,7 @@ app.post("/api/pages/:id/attachments", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(page);
   const contentLength = Number(c.req.header("content-length") ?? 0);
   if (contentLength > MAX_UPLOAD_BYTES + 100_000)
     throw new HttpError(413, "upload_too_large", "Uploads are limited to 10 MiB.");
@@ -1905,12 +3454,14 @@ app.get("/api/attachments/:id", async (c) => {
   )
     .bind(c.req.param("id"), member.workspace.id)
     .first<{
+      page_id: string;
       r2_key: string;
       name: string;
       mime: string;
       size: number;
     }>();
   if (!attachment) throw new HttpError(404, "attachment_not_found", "Attachment not found.");
+  await pageForMember(c.env, member, attachment.page_id);
   const rangeRequested = Boolean(c.req.header("range"));
   let r2Object = await c.env.BUCKET.get(attachment.r2_key, {
     ...(rangeRequested ? { range: c.req.raw.headers } : {}),
@@ -1946,10 +3497,12 @@ app.get("/api/attachments/:id", async (c) => {
 app.delete("/api/attachments/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const attachment = await c.env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ? AND workspace_id = ?`)
+  const attachment = await c.env.DB.prepare(`SELECT page_id, r2_key FROM attachments WHERE id = ? AND workspace_id = ?`)
     .bind(c.req.param("id"), member.workspace.id)
-    .first<{ r2_key: string }>();
+    .first<{ page_id: string; r2_key: string }>();
   if (!attachment) throw new HttpError(404, "attachment_not_found", "Attachment not found.");
+  const page = await pageForMember(c.env, member, attachment.page_id);
+  requirePageEditor(page);
   await c.env.DB.prepare(`DELETE FROM attachments WHERE id = ?`).bind(c.req.param("id")).run();
   await c.env.BUCKET.delete(attachment.r2_key);
   return c.json({ ok: true });
@@ -1976,7 +3529,7 @@ type UploadSessionRow = {
 // Resolves an upload session the caller is allowed to act on. The R2 upload id is
 // never handed to a client: a session is addressed by our own id so every request is
 // authorised against D1 first, and R2's key layout stays server-side.
-async function uploadSession(env: Env, member: MemberContext, uploadId: string) {
+async function uploadSession(env: Env, member: MemberContext, uploadId: string, edit = false) {
   const session = await env.DB.prepare(
     `SELECT u.* FROM attachment_uploads u JOIN pages p ON p.id = u.page_id
       WHERE u.id = ? AND u.workspace_id = ? AND p.archived_at IS NULL`,
@@ -1984,6 +3537,8 @@ async function uploadSession(env: Env, member: MemberContext, uploadId: string) 
     .bind(uploadId, member.workspace.id)
     .first<UploadSessionRow>();
   if (!session) throw new HttpError(404, "upload_session_not_found", "That upload session no longer exists.");
+  const page = await pageForMember(env, member, session.page_id);
+  if (edit) requirePageEditor(page);
   return session;
 }
 
@@ -2035,6 +3590,7 @@ app.post("/api/pages/:id/uploads", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(page);
   const body = await jsonBody(c.req.raw);
   const name = normalizeFilename(text(body.name, "name", 400));
   const mime = body.mime === undefined ? "application/octet-stream" : text(body.mime, "mime", 200);
@@ -2156,7 +3712,10 @@ app.post("/api/pages/:id/uploads", async (c) => {
 app.get("/api/uploads/:uploadId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const completed = await attachmentById(c.env, member.workspace.id, c.req.param("uploadId"));
-  if (completed) return c.json({ status: "committed", attachment: attachmentJson(completed) });
+  if (completed) {
+    await pageForMember(c.env, member, completed.page_id);
+    return c.json({ status: "committed", attachment: attachmentJson(completed) });
+  }
   const session = await uploadSession(c.env, member, c.req.param("uploadId"));
   const parts = await c.env.DB.prepare(
     `SELECT part_number, etag, size FROM attachment_upload_parts WHERE upload_id = ? ORDER BY part_number`,
@@ -2175,7 +3734,7 @@ app.get("/api/uploads/:uploadId", async (c) => {
 app.put("/api/uploads/:uploadId/parts/:partNumber", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  await uploadSession(c.env, member, c.req.param("uploadId"));
+  await uploadSession(c.env, member, c.req.param("uploadId"), true);
   const claimedAt = now();
   const session = await c.env.DB.prepare(
     `UPDATE attachment_uploads SET updated_at = ?, next_attempt_at = ?, last_error = NULL
@@ -2221,8 +3780,12 @@ app.post("/api/uploads/:uploadId/complete", async (c) => {
   requireEditor(member);
   const uploadId = c.req.param("uploadId");
   const completed = await attachmentById(c.env, member.workspace.id, uploadId);
-  if (completed) return c.json({ status: "committed", attachment: attachmentJson(completed), replayed: true });
-  let session = await uploadSession(c.env, member, uploadId);
+  if (completed) {
+    const page = await pageForMember(c.env, member, completed.page_id);
+    requirePageEditor(page);
+    return c.json({ status: "committed", attachment: attachmentJson(completed), replayed: true });
+  }
+  let session = await uploadSession(c.env, member, uploadId, true);
   if (["reaping", "aborting"].includes(session.state)) {
     throw new HttpError(409, "upload_not_active", "That upload is being abandoned and cannot be completed.");
   }
@@ -2249,7 +3812,7 @@ app.post("/api/uploads/:uploadId/complete", async (c) => {
     )
       .bind(claimedAt, claimedAt + UPLOAD_SESSION_TTL_MS, uploadId, member.workspace.id)
       .first<UploadSessionRow>();
-    session = claimed ?? (await uploadSession(c.env, member, uploadId));
+    session = claimed ?? (await uploadSession(c.env, member, uploadId, true));
   }
 
   if (session.state === "completing") {
@@ -2288,7 +3851,7 @@ app.post("/api/uploads/:uploadId/complete", async (c) => {
         .bind(now(), now() + UPLOAD_SESSION_TTL_MS, session.id)
         .run();
     }
-    session = await uploadSession(c.env, member, uploadId);
+    session = await uploadSession(c.env, member, uploadId, true);
   }
   if (session.state !== "r2_complete") {
     throw new HttpError(503, "upload_completion_in_progress", "The upload is still being finalised. Retry it.");
@@ -2320,9 +3883,11 @@ app.delete("/api/uploads/:uploadId", async (c) => {
   requireEditor(member);
   const completed = await attachmentById(c.env, member.workspace.id, c.req.param("uploadId"));
   if (completed) {
+    const page = await pageForMember(c.env, member, completed.page_id);
+    requirePageEditor(page);
     throw new HttpError(409, "upload_already_committed", "The upload is already an attachment and cannot be aborted.");
   }
-  await uploadSession(c.env, member, c.req.param("uploadId"));
+  await uploadSession(c.env, member, c.req.param("uploadId"), true);
   const session = await c.env.DB.prepare(
     `UPDATE attachment_uploads SET state = 'aborting', updated_at = ?, next_attempt_at = ?
       WHERE id = ? AND workspace_id = ? AND state = 'active' RETURNING *`,
@@ -2369,12 +3934,14 @@ app.get("/api/versions/:id", async (c) => {
   )
     .bind(c.req.param("id"), member.workspace.id)
     .first<{
+      page_id: string;
       r2_key: string;
       title: string;
       epoch: number;
       sequence: number;
     }>();
   if (!version) throw new HttpError(404, "version_not_found", "Version not found.");
+  await pageForMember(c.env, member, version.page_id, true);
   const snapshot = await c.env.BUCKET.get(version.r2_key);
   if (!snapshot) throw new HttpError(404, "version_missing", "The version snapshot is missing.");
   return new Response(snapshot.body, {
@@ -2598,7 +4165,7 @@ app.get("/api/tables/:pageId/verification", async (c) => {
 app.post("/api/tables/:pageId/lease", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
+  const page = await activeTablePage(c.env, member, c.req.param("pageId"), undefined, true);
   const token = `${crypto.randomUUID()}${crypto.randomUUID()}`;
   const expiresAt = now() + TABLE_LEASE_DURATION_MS;
   const result = await c.env.DB.prepare(
@@ -2622,7 +4189,7 @@ app.patch("/api/tables/:pageId/lease", async (c) => {
   // Renewal must observe archival like every other table write: otherwise a
   // client that never attempts an edit could keep a lease on an archived
   // table alive indefinitely.
-  const page = await activeTablePage(c.env, member, c.req.param("pageId"));
+  const page = await activeTablePage(c.env, member, c.req.param("pageId"), undefined, true);
   const body = await jsonBody(c.req.raw);
   const expiresAt = now() + TABLE_LEASE_DURATION_MS;
   const result = await c.env.DB.prepare(
@@ -2637,6 +4204,7 @@ app.patch("/api/tables/:pageId/lease", async (c) => {
 
 app.delete("/api/tables/:pageId/lease", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  await activeTablePage(c.env, member, c.req.param("pageId"), undefined, false, true);
   const body = await jsonBody(c.req.raw);
   await c.env.DB.prepare(`DELETE FROM table_leases WHERE page_id = ? AND holder_session_id = ? AND token_hash = ?`)
     .bind(c.req.param("pageId"), member.session.id, await sha256(text(body.leaseToken, "leaseToken", 200)))
@@ -2655,10 +4223,16 @@ app.post("/api/tables/:pageId/force-unlock", async (c) => {
 app.post("/api/tables/:pageId/columns", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = await activeTablePage<{ next_position: number }>(c.env, member, c.req.param("pageId"), {
-    columns: `, (SELECT COALESCE(MAX(position) + 1, 0) FROM table_columns WHERE page_id = p.id) next_position`,
-    binds: [],
-  });
+  const page = await activeTablePage<{ next_position: number }>(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    {
+      columns: `, (SELECT COALESCE(MAX(position) + 1, 0) FROM table_columns WHERE page_id = p.id) next_position`,
+      binds: [],
+    },
+    true,
+  );
   const input = await leaseInputs(await jsonBody(c.req.raw), member);
   const id = crypto.randomUUID();
   const name = text(input.body.name, "name", 100);
@@ -2687,10 +4261,16 @@ app.post("/api/tables/:pageId/columns", async (c) => {
 app.delete("/api/tables/:pageId/columns/:columnId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = await activeTablePage<{ target_exists: number }>(c.env, member, c.req.param("pageId"), {
-    columns: `, EXISTS (SELECT 1 FROM table_columns WHERE id = ? AND page_id = p.id) target_exists`,
-    binds: [c.req.param("columnId")],
-  });
+  const page = await activeTablePage<{ target_exists: number }>(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    {
+      columns: `, EXISTS (SELECT 1 FROM table_columns WHERE id = ? AND page_id = p.id) target_exists`,
+      binds: [c.req.param("columnId")],
+    },
+    true,
+  );
   if (!page.target_exists) throw new HttpError(404, "column_not_found", "Column not found.");
   const input = await leaseInputs(await jsonBody(c.req.raw), member);
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
@@ -2719,6 +4299,7 @@ app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
           (SELECT COALESCE(MAX(position) + 1, 0) FROM table_select_options WHERE column_id = ?) next_position`,
       binds: [c.req.param("columnId"), c.req.param("columnId")],
     },
+    true,
   );
   if (page.column_type === null) throw new HttpError(404, "column_not_found", "Column not found.");
   if (page.column_type !== "select")
@@ -2753,14 +4334,20 @@ app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
 app.delete("/api/tables/:pageId/columns/:columnId/options/:optionId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = await activeTablePage<{ target_exists: number }>(c.env, member, c.req.param("pageId"), {
-    columns: `, EXISTS (
+  const page = await activeTablePage<{ target_exists: number }>(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    {
+      columns: `, EXISTS (
         SELECT 1 FROM table_select_options option
         JOIN table_columns column ON column.id = option.column_id
         WHERE option.id = ? AND option.column_id = ? AND column.page_id = p.id
       ) target_exists`,
-    binds: [c.req.param("optionId"), c.req.param("columnId")],
-  });
+      binds: [c.req.param("optionId"), c.req.param("columnId")],
+    },
+    true,
+  );
   if (!page.target_exists) throw new HttpError(404, "option_not_found", "Option not found.");
   const input = await leaseInputs(await jsonBody(c.req.raw), member);
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
@@ -2786,12 +4373,18 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
     row_count: number;
     next_row_position: number;
     next_column_position: number;
-  }>(c.env, member, pageId, {
-    columns: `, (SELECT COUNT(*) FROM table_rows WHERE page_id = p.id) row_count,
+  }>(
+    c.env,
+    member,
+    pageId,
+    {
+      columns: `, (SELECT COUNT(*) FROM table_rows WHERE page_id = p.id) row_count,
         (SELECT COALESCE(MAX(position) + 1, 0) FROM table_rows WHERE page_id = p.id) next_row_position,
         (SELECT COALESCE(MAX(position) + 1, 0) FROM table_columns WHERE page_id = p.id) next_column_position`,
-    binds: [],
-  });
+      binds: [],
+    },
+    true,
+  );
   const input = await leaseInputs(body, member);
   const clientRequestId =
     body.clientRequestId === undefined ? null : text(body.clientRequestId, "clientRequestId", 200);
@@ -3099,6 +4692,7 @@ app.post("/api/tables/:pageId/rows", async (c) => {
           (SELECT COALESCE(MAX(position) + 1, 0) FROM table_rows WHERE page_id = p.id) next_position`,
       binds: [],
     },
+    true,
   );
   const input = await leaseInputs(await jsonBody(c.req.raw), member);
   if (page.row_count >= TABLE_MAX_ROWS) {
@@ -3130,10 +4724,16 @@ app.post("/api/tables/:pageId/rows", async (c) => {
 app.delete("/api/tables/:pageId/rows/:rowId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const page = await activeTablePage<{ target_exists: number }>(c.env, member, c.req.param("pageId"), {
-    columns: `, EXISTS (SELECT 1 FROM table_rows WHERE id = ? AND page_id = p.id) target_exists`,
-    binds: [c.req.param("rowId")],
-  });
+  const page = await activeTablePage<{ target_exists: number }>(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    {
+      columns: `, EXISTS (SELECT 1 FROM table_rows WHERE id = ? AND page_id = p.id) target_exists`,
+      binds: [c.req.param("rowId")],
+    },
+    true,
+  );
   if (!page.target_exists) throw new HttpError(404, "row_not_found", "Row not found.");
   const input = await leaseInputs(await jsonBody(c.req.raw), member);
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
@@ -3169,6 +4769,7 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
           EXISTS (SELECT 1 FROM table_select_options WHERE id = ? AND column_id = ?) select_option_exists`,
       binds: [c.req.param("columnId"), c.req.param("rowId"), selectOptionId, c.req.param("columnId")],
     },
+    true,
   );
   if (page.column_type === null) throw new HttpError(404, "column_not_found", "Column not found.");
   if (!page.row_exists) throw new HttpError(404, "row_not_found", "Row not found.");
@@ -3359,6 +4960,7 @@ async function handlePartyRequest(request: Request, env: Env) {
   // null when the failure preceded validation, and every value it can hold has
   // been bounded by then, so nothing unvalidated reaches the log.
   let room: string | null = null;
+  let connectionRole: Role | null = null;
   try {
     assertSameOrigin(request, env.BETTER_AUTH_URL);
     const member = await requireMember(request, env);
@@ -3376,9 +4978,11 @@ async function handlePartyRequest(request: Request, env: Env) {
       if (page.kind !== "document" || page.content_epoch !== ids.epoch) {
         throw new HttpError(409, "stale_epoch", "Reload this page to connect to its current document version.");
       }
+      connectionRole = page.effective_role ?? member.role;
     } else {
       if (!ID_PATTERN.test(candidate) || candidate !== member.workspace.id) throw roomNotFound();
       room = candidate;
+      connectionRole = member.role;
     }
     const expiresAt = Math.min(member.session.expiresAt.getTime(), now() + 5 * 60_000);
     const placement = locationHint(member.workspace.locationHint ?? undefined);
@@ -3391,7 +4995,7 @@ async function handlePartyRequest(request: Request, env: Env) {
         for (const name of ["x-notes-user-id", "x-notes-role", "x-notes-expires-at", "x-notes-internal"])
           headers.delete(name);
         headers.set("x-notes-user-id", member.user.id);
-        headers.set("x-notes-role", member.role);
+        headers.set("x-notes-role", connectionRole ?? member.role);
         headers.set("x-notes-expires-at", String(expiresAt));
         return new Request(incoming, { headers });
       },
@@ -3440,7 +5044,54 @@ export default {
         console.error("Failed to prune page move receipts", error);
       }),
     );
+    context.waitUntil(
+      recoverQueuedJobs(env).catch((error) => {
+        console.error("Queued job recovery failed", error);
+      }),
+    );
+    context.waitUntil(
+      sweepOutbox(env).catch((error) => {
+        console.error("Outbox sweep failed", error);
+      }),
+    );
+    context.waitUntil(
+      expireJobArtifacts(env).catch((error) => {
+        console.error("Job artifact expiry failed", error);
+      }),
+    );
+    context.waitUntil(
+      sendDueNotificationDigests(env).catch((error) => {
+        console.error("Notification digest delivery failed", error);
+      }),
+    );
+    context.waitUntil(
+      sendDueSlackChannelDigests(env).catch((error) => {
+        console.error("Slack channel digest delivery failed", error);
+      }),
+    );
+    context.waitUntil(
+      pruneSlackSecurityRecords(env).catch((error) => {
+        console.error("Slack security-record pruning failed", error);
+      }),
+    );
+  },
+  async queue(batch: MessageBatch<DeliveryQueueMessage>, env: Env) {
+    await Promise.all(
+      batch.messages.map(async (message) => {
+        try {
+          await consumeDeliveryMessage(env, message);
+        } catch (error) {
+          console.error("Delivery queue message failed", { messageId: message.id, attempts: message.attempts, error });
+          message.retry({
+            delaySeconds:
+              error instanceof SlackRateLimitError
+                ? error.retryAfter
+                : Math.min(300, 2 ** Math.min(message.attempts, 8)),
+          });
+        }
+      }),
+    );
   },
 };
 
-export { Document, WorkspaceEvents };
+export { Document, NotesJobWorkflow, WorkspaceEvents };

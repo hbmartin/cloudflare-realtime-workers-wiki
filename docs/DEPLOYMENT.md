@@ -95,6 +95,19 @@ Optionally set `DO_LOCATION_HINT` to one of `wnam`, `enam`, `sam`, `weur`, `eeur
 or `me`. If omitted, bootstrap maps the initial request continent to a broad Cloudflare hint. The saved
 workspace hint is immutable in v1, and it is an optimization rather than a data-residency guarantee.
 
+Slack is optional. Import `slack-app-manifest.yaml` in Slack, then set all four values before installing
+from Workspace settings:
+
+```sh
+pnpm wrangler secret put SLACK_CLIENT_ID --env production
+pnpm wrangler secret put SLACK_CLIENT_SECRET --env production
+pnpm wrangler secret put SLACK_SIGNING_SECRET --env production
+pnpm wrangler secret put SLACK_TOKEN_ENCRYPTION_KEY --env production
+```
+
+Use an independently generated high-entropy encryption key. If any value is absent, the application
+keeps in-app notifications active and clearly reports Slack as unavailable.
+
 ## 4. Configure rate limiting
 
 The application performs no rate limiting of its own. It never returns `429`. `/api/install/bootstrap`,

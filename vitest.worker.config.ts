@@ -20,6 +20,9 @@ export default defineConfig({
   ],
   test: {
     include: ["src/worker/**/*.integration.test.ts"],
+    // D1 migrations and Durable Object teardown contend heavily when all worker
+    // files start together under coverage. Two workers keep hook latency bounded.
+    maxWorkers: 2,
     testTimeout: 20_000,
     coverage: {
       provider: "istanbul",

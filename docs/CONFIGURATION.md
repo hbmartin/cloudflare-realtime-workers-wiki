@@ -16,11 +16,15 @@ the repository.
 
 Set for deployment with `wrangler secret put --env production`. Never place these in `wrangler.jsonc`.
 
-| Name                 | Required             | Notes                                                                                                                                                                                                                                        |
-| -------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BETTER_AUTH_SECRET` | Yes                  | At least 32 random bytes. Signs sessions **and** is the `x-notes-internal` shared secret for Worker-to-Durable-Object calls. Rotation has a wider blast radius than it appears; see [Operations](OPERATIONS.md#rotating-better_auth_secret). |
-| `BOOTSTRAP_TOKEN`    | Yes, until bootstrap | One-time operator install credential, compared in constant time against a SHA-256 digest. Delete or rotate after the owner exists.                                                                                                           |
-| `DO_LOCATION_HINT`   | No                   | One of `wnam`, `enam`, `sam`, `weur`, `eeur`, `apac`, `oc`, `afr`, `me`. If unset, derived from the bootstrap request's `cf.continent`, defaulting to `wnam`.                                                                                |
+| Name                         | Required             | Notes                                                                                                                                                                                                                                        |
+| ---------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BETTER_AUTH_SECRET`         | Yes                  | At least 32 random bytes. Signs sessions **and** is the `x-notes-internal` shared secret for Worker-to-Durable-Object calls. Rotation has a wider blast radius than it appears; see [Operations](OPERATIONS.md#rotating-better_auth_secret). |
+| `BOOTSTRAP_TOKEN`            | Yes, until bootstrap | One-time operator install credential, compared in constant time against a SHA-256 digest. Delete or rotate after the owner exists.                                                                                                           |
+| `DO_LOCATION_HINT`           | No                   | One of `wnam`, `enam`, `sam`, `weur`, `eeur`, `apac`, `oc`, `afr`, `me`. If unset, derived from the bootstrap request's `cf.continent`, defaulting to `wnam`.                                                                                |
+| `SLACK_CLIENT_ID`            | No                   | Slack OAuth v2 client ID. Slack remains visibly disabled unless all four Slack values are set.                                                                                                                                               |
+| `SLACK_CLIENT_SECRET`        | No                   | Slack OAuth v2 client secret.                                                                                                                                                                                                                |
+| `SLACK_SIGNING_SECRET`       | No                   | Verifies slash commands and Events API requests; requests older than five minutes and signature replays are rejected.                                                                                                                        |
+| `SLACK_TOKEN_ENCRYPTION_KEY` | No                   | High-entropy key used to encrypt bot access and refresh tokens with AES-GCM before D1 storage. Rotate by reinstalling Slack with the new key before removing the old deployment.                                                             |
 
 `DO_LOCATION_HINT` is frozen into `workspaces.location_hint` at bootstrap and is **immutable in v1**.
 Changing the secret later has no effect on an existing workspace. It influences first Durable Object
@@ -38,10 +42,14 @@ Declared in `wrangler.jsonc`, typed in `src/worker/env.ts`.
 | `DB`               | D1             | `cloudflare-realtime-notes`, migrations in `migrations/`                 |
 | `BUCKET`           | R2             | `cloudflare-realtime-notes`, preview `cloudflare-realtime-notes-preview` |
 | `DOCUMENT`         | Durable Object | class `Document`, SQLite-backed, hibernating                             |
-| `WORKSPACE_EVENTS` | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, read-only           |
+| `WORKSPACE_EVENTS` | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, audience-filtered   |
+| `NOTES_WORKFLOW`   | Workflow       | resumable imports, exports, template clones, migrations, and reindexing  |
+| `DELIVERY_QUEUE`   | Queue          | notification, email, Slack, and digest fan-out; configured with a DLQ    |
+| `BROWSER`          | Browser Run    | optional PDF generation                                                  |
+| `SEND_EMAIL`       | Email Service  | optional email delivery; the UI reports it unavailable when absent       |
 
-No KV, Queues, Workers AI, Vectorize, Hyperdrive, Analytics Engine, Workflows, or Containers bindings
-are used, and there are no third-party HTTP dependencies at runtime.
+No KV, Workers AI, Vectorize, Hyperdrive, Analytics Engine, or Containers bindings are used. Slack is
+the only third-party HTTP dependency and is inactive until its four secrets are configured.
 
 Durable Object class migrations are append-only:
 
@@ -65,7 +73,7 @@ Never rename or delete a class or binding without a Cloudflare Durable Object mi
 | `preview_urls`              | `true`                     | Per-version preview URLs; **inert here**, see below                      |
 | `assets.not_found_handling` | `single-page-application`  | SPA fallback                                                             |
 | `assets.run_worker_first`   | `["/api/*", "/parties/*"]` | Everything else is served by the asset layer without invoking the Worker |
-| `triggers.crons`            | `0 * * * *`                | Hourly cleanup; **required**                                             |
+| `triggers.crons`            | `*/15 * * * *`             | Outbox recovery, digests, expiry, and cleanup; **required**              |
 
 Cloudflare does not generate preview URLs for Workers that implement a Durable Object, and this
 Worker exports two classes, so `preview_urls` has no effect on this deployment. It is left enabled

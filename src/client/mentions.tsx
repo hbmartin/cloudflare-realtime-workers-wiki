@@ -4,6 +4,7 @@ import { useState } from "react";
 import { mentionInlineConfig } from "../shared/mention-spec";
 import type { PagePreview } from "../shared/types";
 import { api } from "./api";
+import { coreBlockSpecs, inlineMathSpec } from "./editor-blocks";
 
 export const PAGE_NAVIGATE_EVENT = "notes:navigate-page";
 
@@ -99,7 +100,7 @@ const mentionInlineSpec = createReactInlineContentSpec(mentionInlineConfig, {
 });
 
 export const notesSchema = BlockNoteSchema.create({
-  blockSpecs: defaultBlockSpecs,
-  inlineContentSpecs: { ...defaultInlineContentSpecs, mention: mentionInlineSpec },
+  blockSpecs: { ...defaultBlockSpecs, ...coreBlockSpecs },
+  inlineContentSpecs: { ...defaultInlineContentSpecs, mention: mentionInlineSpec, inlineMath: inlineMathSpec },
   styleSpecs: defaultStyleSpecs,
 });

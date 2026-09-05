@@ -12,6 +12,7 @@ function page(id: string, revision: number, title = id): Page {
   return {
     id,
     workspaceId: "workspace",
+    spaceId: "workspace-general",
     parentId: null,
     kind: "document",
     position: id,
@@ -19,6 +20,7 @@ function page(id: string, revision: number, title = id): Page {
     icon: null,
     revision,
     contentEpoch: 1,
+    isTemplate: false,
     archivedAt: null,
     createdAt: 1,
     updatedAt: revision,

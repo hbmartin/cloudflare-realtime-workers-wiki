@@ -64,6 +64,7 @@ export const columnType = (value: unknown) =>
 const PAGE_FIELD_VALIDATORS = {
   id: (value: unknown) => typeof value === "string",
   workspaceId: (value: unknown) => typeof value === "string",
+  spaceId: (value: unknown) => value === undefined || typeof value === "string",
   parentId: (value: unknown) => value === null || typeof value === "string",
   kind: (value: unknown) => typeof value === "string" && PAGE_KINDS.includes(value as PageKind),
   position: (value: unknown) => typeof value === "string",
@@ -71,6 +72,7 @@ const PAGE_FIELD_VALIDATORS = {
   icon: (value: unknown) => value === null || typeof value === "string",
   revision: (value: unknown) => typeof value === "number",
   contentEpoch: (value: unknown) => typeof value === "number",
+  isTemplate: (value: unknown) => value === undefined || typeof value === "boolean",
   archivedAt: (value: unknown) => value === null || typeof value === "number",
   createdAt: (value: unknown) => typeof value === "number",
   updatedAt: (value: unknown) => typeof value === "number",
@@ -79,7 +81,10 @@ const PAGE_FIELD_VALIDATORS = {
 export const PAGE_FIELDS: readonly (keyof Page)[] = Object.keys(PAGE_FIELD_VALIDATORS) as (keyof Page)[];
 
 export function pageWithoutUnknownFields(value: Page): Page {
-  return Object.fromEntries(PAGE_FIELDS.map((field) => [field, value[field]])) as Page;
+  const page = Object.fromEntries(PAGE_FIELDS.map((field) => [field, value[field]])) as Page;
+  page.spaceId ??= `${page.workspaceId}-general`;
+  page.isTemplate ??= false;
+  return page;
 }
 
 export function isPage(value: unknown): value is Page {
@@ -142,6 +147,16 @@ export function parseWorkspaceEvent(value: unknown): WorkspaceEvent | null {
       mentionTargetUserIds: [...event.mentionTargetUserIds],
     };
   }
-  if (event.type === "workspace-invalidated") return { type: "workspace-invalidated" };
+  if (event.type === "comments-invalidated" && typeof event.pageId === "string" && ID_PATTERN.test(event.pageId)) {
+    return { type: "comments-invalidated", pageId: event.pageId };
+  }
+  if (
+    event.type === "workspace-invalidated" ||
+    event.type === "organization-invalidated" ||
+    event.type === "notifications-invalidated" ||
+    event.type === "jobs-invalidated"
+  ) {
+    return { type: event.type };
+  }
   return null;
 }
