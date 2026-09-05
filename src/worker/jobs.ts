@@ -4,6 +4,7 @@ import * as Y from "yjs";
 import { sha256Hex } from "../shared/import-integrity";
 import type { Job, JobStatus, JobType } from "../shared/types";
 import type { Env, MemberContext } from "./env";
+import { migrateLegacyComments, type CommentPage } from "./comments";
 import { HttpError } from "./http";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
@@ -636,6 +637,64 @@ async function reindexPageBatch(env: Env, workspaceId: string, afterId: string) 
   return { lastId: pages.results.at(-1)!.id, count: pages.results.length };
 }
 
+async function migrateCommentPageBatch(env: Env, workspaceId: string, afterId: string) {
+  const pages = await env.DB.prepare(
+    `SELECT p.id, p.workspace_id, p.space_id, p.content_epoch, p.created_by
+       FROM pages p LEFT JOIN comment_migrations migration ON migration.page_id = p.id
+      WHERE p.workspace_id = ? AND p.kind = 'document' AND p.import_job_id IS NULL
+        AND migration.page_id IS NULL AND p.id > ? ORDER BY p.id LIMIT ?`,
+  )
+    .bind(workspaceId, afterId, REINDEX_BATCH_SIZE)
+    .all<Omit<CommentPage, "effective_role">>();
+  for (const page of pages.results) {
+    await migrateLegacyComments(env, { ...page, effective_role: "owner" });
+  }
+  return { lastId: pages.results.at(-1)?.id ?? afterId, count: pages.results.length };
+}
+
+export async function runCommentMigration(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
+  const total = await step.do("count legacy comment pages", async () => {
+    await assertJobActive(env, job.id);
+    const count = await env.DB.prepare(
+      `SELECT COUNT(*) count FROM pages p
+        LEFT JOIN comment_migrations migration ON migration.page_id = p.id
+       WHERE p.workspace_id = ? AND p.kind = 'document' AND p.import_job_id IS NULL
+         AND migration.page_id IS NULL`,
+    )
+      .bind(job.workspace_id)
+      .first<{ count: number }>();
+    await updateJob(env, job.id, { total: count?.count ?? 0, label: "Migrating comments" });
+    await notifyJobs(env, job.workspace_id);
+    return count?.count ?? 0;
+  });
+  let migrated = 0;
+  let afterId = "";
+  for (let batchIndex = 0; migrated < total; batchIndex += 1) {
+    const result = await step.do(`migrate comment batch ${batchIndex + 1}`, async () => {
+      await assertJobActive(env, job.id);
+      const batch = await migrateCommentPageBatch(env, job.workspace_id, afterId);
+      const nextCount = migrated + batch.count;
+      await updateJob(env, job.id, { current: nextCount, total, label: "Migrating comments" });
+      await notifyJobs(env, job.workspace_id);
+      return batch;
+    });
+    if (!result.count) break;
+    migrated += result.count;
+    afterId = result.lastId;
+  }
+  await step.do("complete comment migration", async () => {
+    await assertJobActive(env, job.id);
+    await updateJob(env, job.id, {
+      status: "succeeded",
+      current: migrated,
+      total,
+      label: "Complete",
+      resultJson: JSON.stringify({ warnings: [] }),
+    });
+    await notifyJobs(env, job.workspace_id);
+  });
+}
+
 export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
   async run(event: Readonly<WorkflowEvent<JobWorkflowParams>>, step: WorkflowStep) {
     const { jobId } = event.payload;
@@ -649,6 +708,10 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       });
       if (job.type === "template_clone") {
         await runTemplateClone(this.env, job, step);
+        return;
+      }
+      if (job.type === "comment_migration") {
+        await runCommentMigration(this.env, job, step);
         return;
       }
       if (job.type !== "search_reindex") {

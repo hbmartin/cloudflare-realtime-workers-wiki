@@ -1627,6 +1627,26 @@ app.post("/api/jobs/search-reindex", async (c) => {
   return c.json({ job: jobJson(job), coalesced: false }, 202);
 });
 
+app.post("/api/jobs/comment-migration", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const existing = await c.env.DB.prepare(
+    `SELECT * FROM jobs WHERE workspace_id = ? AND type = 'comment_migration' AND status IN ('queued', 'running')
+      ORDER BY created_at DESC LIMIT 1`,
+  )
+    .bind(member.workspace.id)
+    .first<JobRow>();
+  if (existing) return c.json({ job: jobJson(existing), coalesced: true });
+  const job = await createJob(c.env, { member, type: "comment_migration" });
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, job).catch((error) => {
+      console.error("Failed to start comment migration workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job), coalesced: false }, 202);
+});
+
 app.post("/api/jobs/:id/cancel", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const job = await jobForMember(c.env, member, c.req.param("id"));

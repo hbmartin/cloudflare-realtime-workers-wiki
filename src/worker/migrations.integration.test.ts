@@ -126,6 +126,17 @@ describe("D1 migrations", () => {
       ).first(),
     ).toEqual({ user_id: "owner", resource_type: "page", resource_id: "page", muted_at: null });
     expect(await env.DB.prepare(`SELECT page_id FROM comment_migrations`).first()).toBeNull();
+
+    const scanMigration = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0014_comment_migration_jobs.sql",
+    );
+    expect(scanMigration).toBeTruthy();
+    await applyD1Migrations(env.DB, [scanMigration!]);
+    expect(
+      await env.DB.prepare(
+        `SELECT workspace_id, requested_by, type, status FROM jobs WHERE workspace_id = 'workspace'`,
+      ).first(),
+    ).toEqual({ workspace_id: "workspace", requested_by: "owner", type: "comment_migration", status: "queued" });
   });
 
   it("backfills every legacy page into a General space and guards cross-space parents", async () => {

@@ -3,7 +3,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import type { Job } from "../shared/types";
 import type { Env } from "./env";
-import { consumeDeliveryMessage, expireJobArtifacts, runTemplateClone, sweepOutbox, type JobRow } from "./jobs";
+import {
+  consumeDeliveryMessage,
+  expireJobArtifacts,
+  runCommentMigration,
+  runTemplateClone,
+  sweepOutbox,
+  type JobRow,
+} from "./jobs";
 import worker from "./index";
 
 type InstalledWorkspace = { cookie: string; pageId: string; userId: string; workspaceId: string };
@@ -122,6 +129,42 @@ describe("job execution", () => {
     const feed = await worker.fetch(request(installed.cookie, "/api/jobs"), env, createExecutionContext());
     expect(feed.status).toBe(200);
     expect((await feed.json<{ jobs: Job[] }>()).jobs.map((job) => job.id)).toContain(first.job.id);
+  });
+
+  it("runs the owner-initiated legacy comment workspace scan", async () => {
+    const installed = await bootstrap();
+    const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "NOTES_WORKFLOW") return { create };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/jobs/comment-migration", { method: "POST" }),
+      bindings,
+      context,
+    );
+    expect(response.status).toBe(202);
+    const job = (await response.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+    expect(create).toHaveBeenCalledWith({ id: job.id, params: { jobId: job.id } });
+
+    await env.DB.prepare(`UPDATE jobs SET status = 'running' WHERE id = ?`).bind(job.id).run();
+    const row = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(job.id).first<JobRow>())!;
+    const step = {
+      async do<T>(_name: string, callback: () => Promise<T>) {
+        return callback();
+      },
+    };
+    await runCommentMigration(env, row, step as Parameters<typeof runCommentMigration>[2]);
+    expect(
+      await env.DB.prepare(`SELECT page_id FROM comment_migrations WHERE page_id = ?`).bind(installed.pageId).first(),
+    ).toEqual({ page_id: installed.pageId });
+    expect((await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(job.id).first())?.status).toBe(
+      "succeeded",
+    );
   });
 
   it("cancels a pending job and rejects retrying a successful one", async () => {
