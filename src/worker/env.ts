@@ -16,6 +16,7 @@ export interface AppBindings {
   BETTER_AUTH_URL: string;
   BOOTSTRAP_TOKEN: string;
   DO_LOCATION_HINT?: DurableObjectLocationHint;
+  WORKFLOW_INLINE?: "true";
 }
 
 export interface Env extends AppBindings {}

@@ -104,6 +104,7 @@ export type Job = {
   status: JobStatus;
   progress: { current: number; total: number; label: string };
   warnings: string[];
+  result: { pageId?: string } | null;
   error: { code: string; message: string } | null;
   hasDownload: boolean;
   expiresAt: number | null;

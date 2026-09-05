@@ -159,6 +159,33 @@ test("inserts the custom editor block pack from the slash menu", async ({ page }
   await expect(page.locator(".editor-callout.tone-warning")).toBeVisible();
 });
 
+test("creates and instantiates a space-scoped template through the background workflow", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("button", { name: "Save as template" }).click();
+  const tray = page.getByRole("dialog", { name: "Activities" });
+  await expect(tray).toBeVisible();
+  const creation = tray.locator(".activity-list > li").first();
+  await expect(creation).toContainText("Template copy");
+  await expect(creation.locator(".job-status")).toHaveText("succeeded", { timeout: 30_000 });
+  await page.keyboard.press("Escape");
+
+  await openSidebar(page);
+  await page.getByRole("button", { name: "Templates" }).click();
+  const card = page.locator(".template-grid article").filter({ hasText: "Welcome" }).first();
+  await expect(card).toBeVisible();
+  const accessibility = await new AxeBuilder({ page }).include(".template-library").analyze();
+  expect(
+    accessibility.violations.filter((violation) => violation.impact === "critical" || violation.impact === "serious"),
+  ).toEqual([]);
+
+  await card.getByRole("button", { name: "Use template" }).click();
+  await expect(tray).toBeVisible();
+  const instantiation = tray.locator(".activity-list > li").first();
+  await expect(instantiation.locator(".job-status")).toHaveText("succeeded", { timeout: 30_000 });
+  await instantiation.getByRole("button", { name: "Open page" }).click();
+  await expect(page.getByLabel("Page title")).toHaveValue("Welcome");
+});
+
 test("creates, renames, archives, and restores a page through the UI @mobile-sidebar", async ({ page }, testInfo) => {
   await signIn(page);
   const title = `Lifecycle ${testInfo.project.name} ${Date.now()}`;

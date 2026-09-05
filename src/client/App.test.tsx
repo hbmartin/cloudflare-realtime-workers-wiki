@@ -4958,6 +4958,7 @@ describe("App error handling", () => {
       if (path === "/api/spaces") return { spaces: [generalSpace, privateSpace] };
       if (path === "/api/favorites" && !init?.method) return { pages: favorites };
       if (path === "/api/tags" && !init?.method) return { tags: [researchTag] };
+      if (path === "/api/templates" && !init?.method) return { templates: [] };
       if (path === `/api/spaces/${generalSpace.id}/pins` && !init?.method) return { pages: pins };
       if (path === `/api/spaces/${privateSpace.id}/pins` && !init?.method) return { pages: [] };
       if (path === `/api/pages/${page.id}/tags` && !init?.method) return { tags: assignedTags };

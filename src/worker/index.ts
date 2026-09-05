@@ -84,7 +84,7 @@ import {
   jobJson,
   NotesJobWorkflow,
   recoverQueuedJobs,
-  startJobWorkflow,
+  startJobExecution,
   sweepOutbox,
   type DeliveryQueueMessage,
   type JobRow,
@@ -583,6 +583,7 @@ async function pageForMember(env: Env, member: MemberContext, pageId: string, in
        JOIN spaces s ON s.id = p.space_id AND s.workspace_id = p.workspace_id
        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
       WHERE p.id = ? AND p.workspace_id = ? ${includeArchived ? "" : "AND p.archived_at IS NULL"}
+        AND p.import_job_id IS NULL
         AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
   )
     .bind(member.user.id, pageId, member.workspace.id, member.role)
@@ -720,6 +721,7 @@ async function activeTablePage<T = unknown>(
        JOIN spaces s ON s.id = p.space_id AND s.workspace_id = p.workspace_id
        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
       WHERE p.id = ? AND p.workspace_id = ? ${includeArchived ? "" : "AND p.archived_at IS NULL"}
+        AND p.import_job_id IS NULL
         AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
   )
     .bind(...extra.binds, member.user.id, pageId, member.workspace.id, member.role)
@@ -1286,6 +1288,7 @@ app.get("/api/tags", async (c) => {
         SELECT p.id FROM pages p JOIN spaces s ON s.id = p.space_id
         LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
         WHERE p.workspace_id = ? AND p.archived_at IS NULL
+          AND p.import_job_id IS NULL AND p.is_template = 0
           AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
       ) visible ON visible.id = pt.page_id
      WHERE t.workspace_id = ? GROUP BY t.id ORDER BY lower(t.name), t.id`,
@@ -1415,6 +1418,96 @@ app.delete("/api/pages/:id/tags/:tagId", async (c) => {
   return c.json({ ok: true });
 });
 
+app.get("/api/templates", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const requestedSpaceId = c.req.query("spaceId");
+  if (requestedSpaceId) await spaceForMember(c.env, member, requestedSpaceId);
+  const rows = await c.env.DB.prepare(
+    `SELECT p.* FROM pages p
+      JOIN spaces s ON s.id = p.space_id
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE p.workspace_id = ? AND p.is_template = 1 AND p.archived_at IS NULL AND p.import_job_id IS NULL
+       AND (? IS NULL OR p.space_id = ?)
+       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+     ORDER BY s.position, p.position, p.id`,
+  )
+    .bind(member.user.id, member.workspace.id, requestedSpaceId ?? null, requestedSpaceId ?? null, member.role)
+    .all<PageRow>();
+  return c.json({ templates: rows.results.map(pageJson) });
+});
+
+app.post("/api/templates", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const body = await jsonBody(c.req.raw);
+  const source = await pageForMember(c.env, member, text(body.pageId, "pageId", 100));
+  requirePageEditor(source);
+  if (source.is_template) throw new HttpError(409, "already_template", "This page is already a template.");
+  if (!source.space_id) throw new HttpError(409, "space_required", "The source page is not assigned to a space.");
+  const title = body.title === undefined ? source.title : text(body.title, "title", PAGE_TITLE_MAX);
+  const targetPageId = crypto.randomUUID();
+  const job = await createJob(c.env, {
+    member,
+    type: "template_clone",
+    spaceId: source.space_id,
+    options: {
+      sourcePageId: source.id,
+      targetPageId,
+      targetSpaceId: source.space_id,
+      parentId: null,
+      title,
+      isTemplate: true,
+    },
+  });
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, job).catch((error) => {
+      console.error("Failed to start template creation workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job) }, 202);
+});
+
+app.post("/api/templates/:id/instantiate", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const template = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(template);
+  if (!template.is_template) throw new HttpError(404, "template_not_found", "Template not found.");
+  if (!template.space_id) throw new HttpError(409, "space_required", "The template is not assigned to a space.");
+  const body = await jsonBody(c.req.raw);
+  const parentId = nullableId(body.parentId, "parentId");
+  if (parentId) {
+    const parent = await pageForMember(c.env, member, parentId);
+    requirePageEditor(parent);
+    if (parent.is_template || parent.space_id !== template.space_id) {
+      throw new HttpError(422, "template_parent_mismatch", "The destination must be a page in the template's space.");
+    }
+  }
+  const title = body.title === undefined ? template.title : text(body.title, "title", PAGE_TITLE_MAX);
+  const targetPageId = crypto.randomUUID();
+  const job = await createJob(c.env, {
+    member,
+    type: "template_clone",
+    spaceId: template.space_id,
+    options: {
+      sourcePageId: template.id,
+      targetPageId,
+      targetSpaceId: template.space_id,
+      parentId,
+      title,
+      isTemplate: false,
+    },
+  });
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, job).catch((error) => {
+      console.error("Failed to start template instantiation workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job) }, 202);
+});
+
 app.get("/api/jobs", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const requestedLimit = Number(c.req.query("limit") ?? 50);
@@ -1449,7 +1542,7 @@ app.post("/api/jobs/search-reindex", async (c) => {
   if (existing) return c.json({ job: jobJson(existing), coalesced: true });
   const job = await createJob(c.env, { member, type: "search_reindex" });
   c.executionCtx.waitUntil(
-    startJobWorkflow(c.env, job).catch((error) => {
+    startJobExecution(c.env, job).catch((error) => {
       console.error("Failed to start search reindex workflow", { jobId: job.id, error });
     }),
   );
@@ -1495,7 +1588,7 @@ app.post("/api/jobs/:id/retry", async (c) => {
     .run();
   const retried = await jobForMember(c.env, member, job.id);
   c.executionCtx.waitUntil(
-    startJobWorkflow(c.env, retried).catch((error) => {
+    startJobExecution(c.env, retried).catch((error) => {
       console.error("Failed to restart job workflow", { jobId: job.id, error });
     }),
   );
@@ -2328,6 +2421,7 @@ app.get("/api/search", async (c) => {
        JOIN spaces s ON s.id = p.space_id
        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
       WHERE page_search MATCH ? AND page_search.workspace_id = ? AND p.archived_at IS NULL
+        AND p.import_job_id IS NULL AND p.is_template = 0
         AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
       ORDER BY bm25(page_search) LIMIT 30`,
   )
@@ -2347,6 +2441,7 @@ app.get("/api/mentions/suggestions", async (c) => {
         JOIN spaces s ON s.id = p.space_id
         LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
         WHERE p.workspace_id = ? AND p.archived_at IS NULL AND p.title LIKE ? ESCAPE '\\'
+          AND p.import_job_id IS NULL AND p.is_template = 0
           AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
         ORDER BY CASE WHEN p.title LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END, p.title, p.id LIMIT 10`,
     )
@@ -2426,6 +2521,7 @@ app.get("/api/pages/:id/backlinks", async (c) => {
        JOIN spaces s ON s.id = source.space_id
        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
       WHERE reference.target_page_id = ? AND source.workspace_id = ? AND source.archived_at IS NULL
+        AND source.import_job_id IS NULL AND source.is_template = 0
         AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
       ORDER BY source.updated_at DESC, source.id`,
   )
@@ -2439,12 +2535,13 @@ app.get("/api/mentions/unread-count", async (c) => {
   const row = await c.env.DB.prepare(
     `SELECT COUNT(DISTINCT mention.source_page_id) count
        FROM member_mentions mention
-       JOIN pages source ON source.id = mention.source_page_id AND source.archived_at IS NULL
+      JOIN pages source ON source.id = mention.source_page_id AND source.archived_at IS NULL
        JOIN spaces s ON s.id = source.space_id
        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
        LEFT JOIN mention_reads reads
          ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
       WHERE mention.workspace_id = ? AND mention.target_user_id = ?
+        AND source.import_job_id IS NULL AND source.is_template = 0
         AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
         AND mention.first_seen_at > COALESCE(reads.read_at, 0)`,
   )
@@ -2482,6 +2579,7 @@ app.get("/api/mentions", async (c) => {
        LEFT JOIN mention_reads reads
          ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
       WHERE mention.workspace_id = ? AND mention.target_user_id = ? AND mention.first_seen_at <= ?
+        AND source.import_job_id IS NULL AND source.is_template = 0
         AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
         AND (? IS NULL OR mention.first_seen_at < ?
           OR (mention.first_seen_at = ? AND source.id > ?))
@@ -2536,6 +2634,7 @@ app.post("/api/mentions/read", async (c) => {
        LEFT JOIN mention_reads reads
          ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
       WHERE mention.workspace_id = ? AND mention.target_user_id = ?
+        AND source.import_job_id IS NULL AND source.is_template = 0
         AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
         AND mention.first_seen_at > COALESCE(reads.read_at, 0)`,
   )

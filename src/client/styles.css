@@ -684,6 +684,75 @@ select:focus-visible {
   color: var(--ink);
   font-size: 11px;
 }
+
+.template-library > .muted {
+  margin-top: -4px;
+}
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+  margin-top: 24px;
+}
+.template-grid article {
+  min-height: 150px;
+  padding: 18px;
+  border: 1px solid #dedbd2;
+  border-radius: 12px;
+  background: #fffefa;
+  box-shadow: 0 1px 2px #24221d0a;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-content: start;
+  gap: 10px;
+}
+.template-kind {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: #efedf8;
+  color: #5552a5;
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+}
+.template-grid h2 {
+  margin: 2px 0 3px;
+  font-size: 15px;
+}
+.template-grid p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.template-actions {
+  grid-column: 1 / -1;
+  align-self: end;
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 18px;
+}
+.template-empty {
+  max-width: 430px;
+  margin: 68px auto 0;
+  text-align: center;
+  color: var(--muted);
+}
+.template-empty > span {
+  display: block;
+  font-size: 36px;
+  color: #6b68b4;
+}
+.template-empty h2 {
+  margin: 10px 0 5px;
+  color: var(--ink);
+  font-size: 18px;
+}
+.template-empty p {
+  margin: 0;
+  font-size: 13px;
+}
 .tag-create-trigger {
   padding: 4px 6px;
   border: 0;
@@ -1306,6 +1375,9 @@ button.mention-chip:focus-visible {
   max-width: 840px;
   margin: 0 auto;
   padding: 80px 50px 120px;
+}
+.utility-view .eyebrow {
+  color: #5452a8;
 }
 .utility-view h1,
 .empty-workspace h1 {

@@ -1,8 +1,9 @@
 import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as Y from "yjs";
 import type { Job } from "../shared/types";
 import type { Env } from "./env";
-import { consumeDeliveryMessage, expireJobArtifacts, sweepOutbox } from "./jobs";
+import { consumeDeliveryMessage, expireJobArtifacts, runTemplateClone, sweepOutbox, type JobRow } from "./jobs";
 import worker from "./index";
 
 type InstalledWorkspace = { cookie: string; pageId: string; userId: string; workspaceId: string };
@@ -52,6 +53,50 @@ beforeEach(async () => {
 });
 
 describe("job execution", () => {
+  it("keeps staged job pages out of every public page and search surface", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const pageId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'template_clone', 'running', ?, ?, ?)`,
+      ).bind(jobId, installed.workspaceId, `${installed.workspaceId}-general`, installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, parent_id, kind, position, title, is_template, import_job_id,
+           created_by, created_at, updated_at)
+         VALUES (?, ?, ?, NULL, 'document', 'z0', 'Hidden stage', 0, ?, ?, ?, ?)`,
+      ).bind(
+        pageId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        jobId,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, 'Hidden stage', '')`,
+      ).bind(pageId, installed.workspaceId),
+    ]);
+
+    expect(
+      (await worker.fetch(request(installed.cookie, `/api/pages/${pageId}`), env, createExecutionContext())).status,
+    ).toBe(404);
+    const tree = await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext());
+    expect((await tree.json<{ pages: Array<{ id: string }> }>()).pages.map((page) => page.id)).not.toContain(pageId);
+    const search = await worker.fetch(request(installed.cookie, "/api/search?q=Hidden"), env, createExecutionContext());
+    expect((await search.json<{ results: unknown[] }>()).results).toEqual([]);
+    const suggestions = await worker.fetch(
+      request(installed.cookie, "/api/mentions/suggestions?q=Hidden"),
+      env,
+      createExecutionContext(),
+    );
+    expect((await suggestions.json<{ suggestions: Array<{ entityId: string }> }>()).suggestions).toEqual([]);
+  });
+
   it("starts a coalesced search reindex and exposes it only through the requester feed", async () => {
     const installed = await bootstrap();
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
@@ -145,6 +190,169 @@ describe("job execution", () => {
     expect(
       (await env.DB.prepare(`SELECT output_key FROM jobs WHERE id = ?`).bind(jobId).first())?.output_key,
     ).toBeNull();
+  });
+
+  it("publishes a document template atomically and rewrites cloned attachment references", async () => {
+    const installed = await bootstrap();
+    const sourceAttachmentId = crypto.randomUUID();
+    const sourceKey = `assets/${installed.workspaceId}/${sourceAttachmentId}/source`;
+    await env.BUCKET.put(sourceKey, "attachment bytes", { httpMetadata: { contentType: "text/plain" } });
+    await env.DB.prepare(
+      `INSERT INTO attachments
+        (id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, created_at)
+       VALUES (?, ?, ?, ?, 'brief.txt', 'text/plain', 16, ?, ?, ?)`,
+    )
+      .bind(
+        sourceAttachmentId,
+        installed.workspaceId,
+        installed.pageId,
+        sourceKey,
+        "a".repeat(64),
+        installed.userId,
+        Date.now(),
+      )
+      .run();
+    const source = new Y.Doc();
+    const image = new Y.XmlElement("image");
+    image.setAttribute("url", `/api/attachments/${sourceAttachmentId}`);
+    source.getXmlFragment("document-store").insert(0, [image]);
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+
+    const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "NOTES_WORKFLOW") return { create };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const context = createExecutionContext();
+    const queued = await worker.fetch(
+      request(installed.cookie, "/api/templates", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pageId: installed.pageId, title: "Project brief" }),
+      }),
+      bindings,
+      context,
+    );
+    expect(queued.status).toBe(202);
+    const queuedJob = (await queued.json<{ job: Job }>()).job;
+    expect(queuedJob).toMatchObject({ type: "template_clone", status: "queued", result: null });
+    await waitOnExecutionContext(context);
+
+    await env.DB.prepare(`UPDATE jobs SET status = 'running' WHERE id = ?`).bind(queuedJob.id).run();
+    const row = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(queuedJob.id).first<JobRow>())!;
+    const step = {
+      async do<T>(_name: string, callback: () => Promise<T>) {
+        return callback();
+      },
+    };
+    await runTemplateClone(env, row, step as Parameters<typeof runTemplateClone>[2]);
+
+    const completed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${queuedJob.id}`),
+      env,
+      createExecutionContext(),
+    );
+    const completedJob = (await completed.json<{ job: Job }>()).job;
+    expect(completedJob).toMatchObject({ status: "succeeded", result: { pageId: expect.any(String) } });
+    const templateId = completedJob.result!.pageId!;
+    const templates = await worker.fetch(request(installed.cookie, "/api/templates"), env, createExecutionContext());
+    expect((await templates.json<{ templates: Array<{ id: string; title: string }> }>()).templates).toContainEqual(
+      expect.objectContaining({ id: templateId, title: "Project brief" }),
+    );
+    const clonedAttachment = await env.DB.prepare(`SELECT id, r2_key FROM attachments WHERE page_id = ?`)
+      .bind(templateId)
+      .first<{ id: string; r2_key: string }>();
+    expect(clonedAttachment?.id).not.toBe(sourceAttachmentId);
+    expect(await env.BUCKET.get(clonedAttachment!.r2_key)).toBeTruthy();
+    const content = await worker.fetch(
+      request(installed.cookie, `/api/pages/${templateId}/content`),
+      env,
+      createExecutionContext(),
+    );
+    expect(content.status).toBe(200);
+    const envelope = await content.json<{ document: unknown }>();
+    expect(JSON.stringify(envelope.document)).toContain(`/api/attachments/${clonedAttachment!.id}`);
+    expect(JSON.stringify(envelope.document)).not.toContain(`/api/attachments/${sourceAttachmentId}`);
+  });
+
+  it("clones typed table state into a staged template", async () => {
+    const installed = await bootstrap();
+    const created = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "table", parentId: null }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const sourcePageId = (await created.json<{ page: { id: string } }>()).page.id;
+    const columnId = crypto.randomUUID();
+    const optionId = crypto.randomUUID();
+    const rowId = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Status', 'select', 0)`,
+      ).bind(columnId, sourcePageId),
+      env.DB.prepare(
+        `INSERT INTO table_select_options (id, column_id, label, position) VALUES (?, ?, 'Ready', 0)`,
+      ).bind(optionId, columnId),
+      env.DB.prepare(
+        `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
+      ).bind(rowId, sourcePageId, installed.userId, Date.now(), Date.now()),
+      env.DB.prepare(`INSERT INTO table_cells (row_id, column_id, select_value, updated_at) VALUES (?, ?, ?, ?)`).bind(
+        rowId,
+        columnId,
+        optionId,
+        Date.now(),
+      ),
+    ]);
+
+    const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "NOTES_WORKFLOW") return { create };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/templates", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pageId: sourcePageId, title: "Status tracker" }),
+      }),
+      bindings,
+      context,
+    );
+    const jobId = (await response.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(context);
+    await env.DB.prepare(`UPDATE jobs SET status = 'running' WHERE id = ?`).bind(jobId).run();
+    const job = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+    await runTemplateClone(env, job, {
+      async do<T>(_name: string, callback: () => Promise<T>) {
+        return callback();
+      },
+    } as Parameters<typeof runTemplateClone>[2]);
+
+    const result = JSON.parse(
+      (await env.DB.prepare(`SELECT result_json FROM jobs WHERE id = ?`).bind(jobId).first<{ result_json: string }>())!
+        .result_json,
+    ) as { pageId: string };
+    const cloned = await env.DB.prepare(
+      `SELECT p.is_template, column.name, option.label, cell.select_value
+         FROM pages p JOIN table_columns column ON column.page_id = p.id
+         JOIN table_select_options option ON option.column_id = column.id
+         JOIN table_rows row ON row.page_id = p.id
+         JOIN table_cells cell ON cell.row_id = row.id AND cell.column_id = column.id
+        WHERE p.id = ?`,
+    )
+      .bind(result.pageId)
+      .first<{ is_template: number; name: string; label: string; select_value: string }>();
+    expect(cloned).toMatchObject({ is_template: 1, name: "Status", label: "Ready" });
+    expect(cloned?.select_value).toContain(":option:");
   });
 });
 

@@ -27,6 +27,7 @@ export function ActivitiesTray({
   onRefresh,
   onCancel,
   onRetry,
+  onOpenResult,
 }: {
   jobs: Job[];
   loading: boolean;
@@ -36,6 +37,7 @@ export function ActivitiesTray({
   onRefresh: () => void;
   onCancel: (job: Job) => void;
   onRetry: (job: Job) => void;
+  onOpenResult: (job: Job) => void;
 }) {
   const closeButton = useRef<HTMLButtonElement>(null);
   const tray = useRef<HTMLDialogElement>(null);
@@ -135,6 +137,11 @@ export function ActivitiesTray({
                   <div className="activity-meta">
                     <time dateTime={new Date(job.createdAt).toISOString()}>{timestamp(job.createdAt)}</time>
                     <span className="activity-actions">
+                      {job.status === "succeeded" && job.result?.pageId && (
+                        <button className="quiet-button" disabled={pending} onClick={() => onOpenResult(job)}>
+                          Open page
+                        </button>
+                      )}
                       {job.hasDownload && (
                         <a className="quiet-button" href={`/api/jobs/${encodeURIComponent(job.id)}/download`}>
                           Download

@@ -13,6 +13,7 @@ const runningJob: Job = {
   status: "running",
   progress: { current: 2, total: 4, label: "Reindexing pages" },
   warnings: [],
+  result: null,
   error: null,
   hasDownload: false,
   expiresAt: null,
@@ -35,6 +36,7 @@ describe("ActivitiesTray", () => {
         onRefresh={vi.fn()}
         onCancel={cancel}
         onRetry={vi.fn()}
+        onOpenResult={vi.fn()}
       />,
     );
 
@@ -60,6 +62,7 @@ describe("ActivitiesTray", () => {
         onRefresh={vi.fn()}
         onCancel={vi.fn()}
         onRetry={vi.fn()}
+        onOpenResult={vi.fn()}
       />,
     );
     expect(screen.getByRole("button", { name: "Close activities" })).toHaveFocus();

@@ -370,6 +370,86 @@ export class Document extends YServer {
         headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
       });
     }
+    if (request.method === "POST" && url.pathname.endsWith("/initialize")) {
+      let body: { jobId?: unknown; inputKey?: unknown };
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "Invalid initialization request." }, { status: 400 });
+      }
+      const jobId = typeof body.jobId === "string" ? body.jobId : "";
+      const inputKey = typeof body.inputKey === "string" ? body.inputKey : "";
+      if (!jobId || !inputKey.startsWith(`jobs/${jobId}/`)) {
+        return Response.json({ error: "Invalid initialization request." }, { status: 400 });
+      }
+      const { pageId, epoch } = this.ids;
+      const staged = await this.bindings.DB.prepare(
+        `SELECT j.requested_by FROM pages p JOIN jobs j ON j.id = p.import_job_id
+          WHERE p.id = ? AND p.content_epoch = ? AND p.import_job_id = ?
+            AND j.type IN ('import', 'template_clone') AND j.status IN ('queued', 'running')`,
+      )
+        .bind(pageId, epoch, jobId)
+        .first<{ requested_by: string }>();
+      if (!staged) {
+        return Response.json(
+          { error: "Only a staged import or template clone may initialize content." },
+          { status: 409 },
+        );
+      }
+      const existingProjection = await this.bindings.DB.prepare(
+        `SELECT sequence FROM document_projections WHERE page_id = ? AND content_epoch = ?`,
+      )
+        .bind(pageId, epoch)
+        .first<{ sequence: number }>();
+      if (existingProjection) return Response.json({ initialized: true, sequence: existingProjection.sequence });
+      const alreadyStarted =
+        this.metadata.snapshot_seq !== 0 ||
+        this.pendingUpdates.length > 0 ||
+        this.state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM update_events`).one().count > 0 ||
+        Array.from(this.getConnections()).length > 0;
+      if (alreadyStarted) {
+        return Response.json({ error: "The staged document has already been initialized." }, { status: 409 });
+      }
+      const input = await this.bindings.BUCKET.get(inputKey);
+      if (!input) return Response.json({ error: "Initialization content is missing." }, { status: 404 });
+      if (input.size > READ_ONLY_BYTES) {
+        return Response.json({ error: "Initialization content is too large." }, { status: 413 });
+      }
+      const update = new Uint8Array(await input.arrayBuffer());
+      this.pendingAuthorId = staged.requested_by;
+      Y.applyUpdate(this.document, update);
+      this.flushPendingUpdates();
+      // An empty update produces no Yjs event, but still needs a sequence so
+      // compaction persists the canonical empty projection for the staged page.
+      if (!this.metadata.dirty) {
+        this.state.storage.transactionSync(() => {
+          const row = this.state.storage.sql
+            .exec<{ seq: number }>(
+              `INSERT INTO update_events (author_id, created_at) VALUES (?, ?) RETURNING seq`,
+              staged.requested_by,
+              Date.now(),
+            )
+            .one();
+          for (const [index, bytes] of splitBytes(update).entries()) {
+            this.state.storage.sql.exec(
+              `INSERT INTO update_chunks (seq, chunk_index, data) VALUES (?, ?, ?)`,
+              row.seq,
+              index,
+              bytes.buffer,
+            );
+          }
+          this.state.storage.sql.exec(
+            `UPDATE document_meta SET dirty = 1, last_editor_id = ? WHERE id = 1`,
+            staged.requested_by,
+          );
+        });
+        this.metadata.dirty = 1;
+        this.metadata.last_editor_id = staged.requested_by;
+        this.pendingAuthorId = null;
+      }
+      await this.compact();
+      return Response.json({ initialized: true, sequence: this.metadata.snapshot_seq });
+    }
     if (request.method === "POST" && url.pathname.endsWith("/archive")) {
       if (this.validatingTransition || this.transition || this.metadata.restore_pending) {
         return Response.json({ error: "Document transition already in progress." }, { status: 409 });
@@ -601,7 +681,7 @@ export class Document extends YServer {
           this.bindings.DB.prepare(
             `INSERT INTO page_search (page_id, workspace_id, title, body)
               SELECT id, workspace_id, title, ? FROM pages
-               WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
+               WHERE id = ? AND content_epoch = ? AND archived_at IS NULL AND import_job_id IS NULL`,
           ).bind(projection.plainText, pageId, epoch),
           this.bindings.DB.prepare(
             `DELETE FROM page_search_v2 WHERE page_id = ?
@@ -615,7 +695,8 @@ export class Document extends YServer {
                     ?,
                     COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
                     COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-               FROM pages p WHERE p.id = ? AND p.content_epoch = ? AND p.archived_at IS NULL`,
+               FROM pages p WHERE p.id = ? AND p.content_epoch = ? AND p.archived_at IS NULL
+                 AND p.import_job_id IS NULL`,
           ).bind(projection.plainText, pageId, epoch),
           this.bindings.DB.prepare(
             `UPDATE page_references SET projection_seq = -1 WHERE source_page_id = ?

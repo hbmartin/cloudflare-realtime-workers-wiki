@@ -42,6 +42,7 @@ import { LoadingSplash } from "./Splash";
 import { TablePage } from "./TablePage";
 import { ActivitiesTray } from "./ActivitiesTray";
 import { PageTags } from "./PageTags";
+import { TemplateLibrary } from "./TemplateLibrary";
 
 type AppState =
   | { screen: "loading" }
@@ -732,7 +733,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [view, setView] = useState<"pages" | "search" | "mentions" | "trash" | "settings">("pages");
+  const [view, setView] = useState<"pages" | "search" | "mentions" | "templates" | "trash" | "settings">("pages");
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
   const [unreadMentions, setUnreadMentions] = useState(0);
@@ -755,6 +756,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [pins, setPins] = useState<Page[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
   const [pageTags, setPageTags] = useState<Tag[]>([]);
+  const [templates, setTemplates] = useState<Page[]>([]);
+  const [pendingTemplateId, setPendingTemplateId] = useState<string | null>(null);
   const [organizationLoading, setOrganizationLoading] = useState(true);
   const [organizationLoadError, setOrganizationLoadError] = useState("");
   const [pendingOrganizationAction, setPendingOrganizationAction] = useState<string | null>(null);
@@ -1369,15 +1372,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const generation = ++organizationLoadGenerationRef.current;
     const attempt = startWorkspaceErrorAttempt({ source: "organization" });
     try {
-      const [spaceData, favoriteData, tagData] = await Promise.all([
+      const [spaceData, favoriteData, tagData, templateData] = await Promise.all([
         api<{ spaces: Space[] }>("/api/spaces"),
         api<{ pages: Page[] }>("/api/favorites"),
         api<{ tags: Tag[] }>("/api/tags"),
+        api<{ templates: Page[] }>("/api/templates"),
       ]);
       if (generation !== organizationLoadGenerationRef.current) return;
       setSpaces(spaceData.spaces);
       setFavorites(favoriteData.pages);
       setTags(tagData.tags);
+      setTemplates(templateData.templates);
       const resolvedSpaceId = spaceData.spaces.some((space) => space.id === activeSpaceId)
         ? activeSpaceId
         : spaceData.spaces.some((space) => space.id === selectedSpaceId)
@@ -1535,6 +1540,47 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setPendingOrganizationAction(null);
     }
   }
+
+  async function queueTemplateJob(path: string, body: Record<string, unknown>, pendingId: string) {
+    setPendingTemplateId(pendingId);
+    try {
+      const data = await api<{ job: Job }>(path, { method: "POST", body: json(body) });
+      setJobs((current) => [data.job, ...current.filter((job) => job.id !== data.job.id)]);
+      setJobsError("");
+      setActivitiesOpen(true);
+      clearWorkspaceErrors({ source: "organization" });
+    } catch (error) {
+      reportWorkspaceError(
+        { source: "organization" },
+        apiErrorMessage(error, "The template job could not be started."),
+      );
+    } finally {
+      setPendingTemplateId(null);
+    }
+  }
+
+  function editTemplate(template: Page) {
+    dispatchPageAction({ type: "merge", pages: [template] });
+    navigateToPage(template.id);
+  }
+
+  async function openJobResult(job: Job) {
+    if (!job.result?.pageId) return;
+    setPendingJobId(job.id);
+    try {
+      const data = await api<{ page: Page }>(`/api/pages/${encodeURIComponent(job.result.pageId)}`);
+      recordPageUpserts([data.page]);
+      dispatchPageAction({ type: "merge", pages: [data.page] });
+      setActiveSpaceId(data.page.spaceId);
+      localStorage.setItem(`notes:active-space:${member.workspace.id}`, data.page.spaceId);
+      setActivitiesOpen(false);
+      navigateToPage(data.page.id);
+    } catch (error) {
+      setJobsError(apiErrorMessage(error, "The completed page could not be opened."));
+    } finally {
+      setPendingJobId(null);
+    }
+  }
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
       if (event.type === "workspace-invalidated") {
@@ -1650,6 +1696,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     setActivitiesOpen(true);
     void loadJobs();
   }, [loadJobs]);
+  const activeJobCount = jobs.filter((job) =>
+    ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status),
+  ).length;
+  useEffect(() => {
+    if (!activitiesOpen || activeJobCount === 0) return undefined;
+    const timer = window.setTimeout(() => void loadJobs(), 1_000);
+    return () => window.clearTimeout(timer);
+  }, [activeJobCount, activitiesOpen, jobs, loadJobs]);
   const mutateJob = useCallback(async (job: Job, action: "cancel" | "retry") => {
     setPendingJobId(job.id);
     try {
@@ -1677,7 +1731,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const currentSpaceId = activeSpaceId || selected?.spaceId || pages[0]?.spaceId || "";
   const activeSpace = spaces.find((space) => space.id === currentSpaceId) ?? null;
   const activePages = useMemo(
-    () => (currentSpaceId ? pages.filter((page) => page.spaceId === currentSpaceId) : pages),
+    () => pages.filter((page) => !page.isTemplate && (!currentSpaceId || page.spaceId === currentSpaceId)),
     [currentSpaceId, pages],
   );
   const activeSelected = selected && (!currentSpaceId || selected.spaceId === currentSpaceId) ? selected : null;
@@ -2147,7 +2201,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     refreshTrash();
     setView("trash");
   }
-  function showView(next: "search" | "mentions" | "settings") {
+  function showView(next: "search" | "mentions" | "templates" | "settings") {
     cancelPendingSelection();
     setView(next);
     closeSidebar(true);
@@ -2436,6 +2490,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <button className={view === "mentions" ? "active" : ""} onClick={() => showView("mentions")}>
             <span>@</span> Mentions {unreadMentions > 0 && <b className="mention-badge">{unreadMentions}</b>}
           </button>
+          <button className={view === "templates" ? "active" : ""} onClick={() => showView("templates")}>
+            <span>◇</span> Templates
+          </button>
           <button className={view === "settings" ? "active" : ""} onClick={() => showView("settings")}>
             <span>⚙</span> Members
           </button>
@@ -2530,7 +2587,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             ))}
           </div>
           <div className="topbar-actions">
-            {view === "pages" && activeSelected && (
+            {view === "pages" && activeSelected && !activeSelected.isTemplate && (
               <>
                 <button
                   className={`organization-action ${favorites.some((page) => page.id === activeSelected.id) ? "active" : ""}`}
@@ -2542,15 +2599,31 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                   Favorite
                 </button>
                 {canEditActiveSpace && (
-                  <button
-                    className={`organization-action ${pins.some((page) => page.id === activeSelected.id) ? "active" : ""}`}
-                    disabled={pendingOrganizationAction === `pin:${activeSelected.id}`}
-                    aria-pressed={pins.some((page) => page.id === activeSelected.id)}
-                    onClick={() => void togglePin(activeSelected)}
-                  >
-                    <span aria-hidden="true">⌖</span>
-                    Pin
-                  </button>
+                  <>
+                    <button
+                      className={`organization-action ${pins.some((page) => page.id === activeSelected.id) ? "active" : ""}`}
+                      disabled={pendingOrganizationAction === `pin:${activeSelected.id}`}
+                      aria-pressed={pins.some((page) => page.id === activeSelected.id)}
+                      onClick={() => void togglePin(activeSelected)}
+                    >
+                      <span aria-hidden="true">⌖</span>
+                      Pin
+                    </button>
+                    <button
+                      className="organization-action"
+                      disabled={pendingTemplateId === `save:${activeSelected.id}`}
+                      onClick={() =>
+                        void queueTemplateJob(
+                          "/api/templates",
+                          { pageId: activeSelected.id, title: activeSelected.title },
+                          `save:${activeSelected.id}`,
+                        )
+                      }
+                    >
+                      <span aria-hidden="true">◇</span>
+                      {pendingTemplateId === `save:${activeSelected.id}` ? "Saving…" : "Save as template"}
+                    </button>
+                  </>
                 )}
               </>
             )}
@@ -2595,6 +2668,21 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <SearchView value={search} results={searchResults} onChange={runSearch} onSelect={navigateToPage} />
         ) : view === "mentions" ? (
           <MentionsView onSelect={navigateToPage} onRead={handleMentionsRead} />
+        ) : view === "templates" ? (
+          <TemplateLibrary
+            templates={templates.filter((template) => template.spaceId === currentSpaceId)}
+            space={activeSpace}
+            editable={canEditActiveSpace}
+            busyId={pendingTemplateId}
+            onEdit={editTemplate}
+            onUse={(template) =>
+              void queueTemplateJob(
+                `/api/templates/${encodeURIComponent(template.id)}/instantiate`,
+                { parentId: null, title: template.title },
+                template.id,
+              )
+            }
+          />
         ) : view === "trash" ? (
           <TrashView
             pages={trash}
@@ -2663,6 +2751,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onRefresh={() => void loadJobs()}
           onCancel={(job) => void mutateJob(job, "cancel")}
           onRetry={(job) => void mutateJob(job, "retry")}
+          onOpenResult={(job) => void openJobResult(job)}
         />
       )}
       {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
