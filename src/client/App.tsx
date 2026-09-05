@@ -48,6 +48,7 @@ import { WatchControl } from "./WatchControl";
 import { SearchView } from "./SearchView";
 import { ExportDialog } from "./ExportDialog";
 import { ImportDialog } from "./ImportDialog";
+import { SlackSettings } from "./SlackSettings";
 
 type AppState =
   | { screen: "loading" }
@@ -738,9 +739,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [view, setView] = useState<"pages" | "search" | "mentions" | "templates" | "trash" | "settings">(() =>
-    new URLSearchParams(window.location.search).get("view") === "search" ? "search" : "pages",
-  );
+  const [view, setView] = useState<"pages" | "search" | "mentions" | "templates" | "trash" | "settings">(() => {
+    const requested = new URLSearchParams(window.location.search).get("view");
+    return requested && ["search", "mentions", "templates", "trash", "settings"].includes(requested)
+      ? (requested as "search" | "mentions" | "templates" | "trash" | "settings")
+      : "pages";
+  });
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
   const [commentsRevision, setCommentsRevision] = useState(0);
@@ -2765,7 +2769,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             onDelete={permanentlyDeletePage}
           />
         ) : view === "settings" ? (
-          <MembersView member={member} />
+          <MembersView member={member} spaces={spaces} pages={pages} />
         ) : !pagesLoaded ? (
           <PendingPage
             title={initialPageLoadFailed ? "Workspace unavailable" : "Loading workspace…"}
@@ -3153,7 +3157,7 @@ function TrashView({
 }
 
 type MemberRow = { id: string; name: string; email: string; role: Role; createdAt: number };
-function MembersView({ member }: { member: ClientMemberContext }) {
+function MembersView({ member, spaces, pages }: { member: ClientMemberContext; spaces: Space[]; pages: Page[] }) {
   const [members, setMembers] = useState<MemberRow[]>([]);
   const [inviteUrl, setInviteUrl] = useState("");
   const load = useCallback(
@@ -3226,6 +3230,7 @@ function MembersView({ member }: { member: ClientMemberContext }) {
           </div>
         ))}
       </div>
+      <SlackSettings owner={member.role === "owner"} spaces={spaces} pages={pages} />
     </main>
   );
 }

@@ -119,6 +119,24 @@ import {
 } from "./notifications";
 import { parseSearchRequest, searchPages, searchTitles } from "./search";
 import { cleanupImport } from "./importer";
+import {
+  consumeSlackLink,
+  createSlackOAuthUrl,
+  deleteSlackChannelSubscription,
+  disconnectSlack,
+  finishSlackOAuth,
+  handleSlackCommand,
+  handleSlackEvent,
+  listSlackChannelSubscriptions,
+  pruneSlackSecurityRecords,
+  sendDueSlackChannelDigests,
+  SlackRateLimitError,
+  slackConfigurationStatus,
+  slackWorkspaceStatus,
+  upsertSlackChannelSubscription,
+  verifySlackRequest,
+  type SlackEventPayload,
+} from "./slack";
 
 const app = new Hono<{ Bindings: Env }>();
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -1832,8 +1850,122 @@ app.get("/api/integrations/status", async (c) => {
   return c.json({
     email: { available: Boolean(c.env.SEND_EMAIL && c.env.EMAIL_FROM) },
     pdf: { available: Boolean(c.env.BROWSER) },
-    slack: { available: false },
+    slack: slackConfigurationStatus(c.env),
   });
+});
+
+app.get("/api/slack/status", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json(await slackWorkspaceStatus(c.env, member));
+});
+
+app.get("/api/slack/oauth/start", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ url: await createSlackOAuthUrl(c.env, member) });
+});
+
+app.get("/api/slack/oauth/callback", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const code = text(c.req.query("code"), "code", 500);
+  const state = text(c.req.query("state"), "state", 500);
+  await finishSlackOAuth(c.env, member, code, state);
+  return c.redirect("/?view=settings&slack=connected", 303);
+});
+
+app.post("/api/slack/disconnect", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await disconnectSlack(c.env, member);
+  return c.json({ ok: true });
+});
+
+app.post("/api/slack/link", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const body = await jsonBody(c.req.raw);
+  await consumeSlackLink(c.env, member, text(body.token, "token", 200));
+  return c.json({ ok: true });
+});
+
+app.post("/api/slack/commands", async (c) => {
+  const rawBody = await c.req.raw.text();
+  const verified = await verifySlackRequest(c.env, c.req.raw, rawBody);
+  if (verified.duplicate) return c.json({ response_type: "ephemeral", text: "Request already handled." });
+  return c.json(await handleSlackCommand(c.env, new URLSearchParams(rawBody)));
+});
+
+app.post("/api/slack/events", async (c) => {
+  const rawBody = await c.req.raw.text();
+  const verified = await verifySlackRequest(c.env, c.req.raw, rawBody);
+  if (verified.duplicate) return c.json({ ok: true });
+  let payload: SlackEventPayload;
+  try {
+    payload = JSON.parse(rawBody) as SlackEventPayload;
+  } catch {
+    throw new HttpError(422, "invalid_slack_event", "Slack event payload is invalid.");
+  }
+  return c.json(await handleSlackEvent(c.env, payload));
+});
+
+app.get("/api/slack/channels", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ subscriptions: await listSlackChannelSubscriptions(c.env, member) });
+});
+
+app.post("/api/slack/channels", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  const spaceId = text(body.spaceId, "spaceId", 100);
+  const pageId = body.pageId === null || body.pageId === undefined ? null : text(body.pageId, "pageId", 100);
+  const channelId = text(body.channelId, "channelId", 30).toUpperCase();
+  if (!/^[CDG][A-Z0-9]{1,29}$/.test(channelId)) {
+    throw new HttpError(422, "invalid_slack_channel", "Enter a valid Slack channel ID.");
+  }
+  const channelName = text(body.channelName, "channelName", 100).replace(/^#/, "");
+  const cadence = text(body.cadence, "cadence", 20);
+  if (cadence !== "immediate" && cadence !== "digest") {
+    throw new HttpError(422, "invalid_slack_cadence", "Slack cadence must be immediate or digest.");
+  }
+  if (!Array.isArray(body.eventTypes) || !body.eventTypes.length) {
+    throw new HttpError(422, "invalid_slack_events", "Choose at least one Slack event.");
+  }
+  const eventTypes = body.eventTypes.map((value) => text(value, "eventType", 40) as NotificationEventType);
+  if (eventTypes.some((value) => !NOTIFICATION_EVENT_TYPES.includes(value))) {
+    throw new HttpError(422, "invalid_slack_events", "A Slack event type is invalid.");
+  }
+  if (new Set(eventTypes).size !== eventTypes.length) {
+    throw new HttpError(422, "invalid_slack_events", "Slack event types may not be repeated.");
+  }
+  await spaceForMember(c.env, member, spaceId);
+  if (pageId) {
+    const page = await pageForMember(c.env, member, pageId);
+    if (page.space_id !== spaceId) {
+      throw new HttpError(422, "slack_page_space_mismatch", "The selected page does not belong to that space.");
+    }
+  }
+  return c.json(
+    {
+      subscription: await upsertSlackChannelSubscription(c.env, member, {
+        spaceId,
+        pageId,
+        channelId,
+        channelName,
+        eventTypes,
+        cadence,
+      }),
+    },
+    201,
+  );
+});
+
+app.delete("/api/slack/channels/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await deleteSlackChannelSubscription(c.env, member, c.req.param("id"));
+  return c.json({ ok: true });
 });
 
 app.post("/api/pages/:id/exports", async (c) => {
@@ -2300,7 +2432,7 @@ app.get("/api/notification-preferences", async (c) => {
     configured: await notificationPreferencesConfigured(c.env, member),
     channels: {
       email: { available: Boolean(c.env.SEND_EMAIL && c.env.EMAIL_FROM) },
-      slack: { available: false },
+      slack: slackConfigurationStatus(c.env),
     },
   });
 });
@@ -4932,6 +5064,16 @@ export default {
         console.error("Notification digest delivery failed", error);
       }),
     );
+    context.waitUntil(
+      sendDueSlackChannelDigests(env).catch((error) => {
+        console.error("Slack channel digest delivery failed", error);
+      }),
+    );
+    context.waitUntil(
+      pruneSlackSecurityRecords(env).catch((error) => {
+        console.error("Slack security-record pruning failed", error);
+      }),
+    );
   },
   async queue(batch: MessageBatch<DeliveryQueueMessage>, env: Env) {
     await Promise.all(
@@ -4940,7 +5082,12 @@ export default {
           await consumeDeliveryMessage(env, message);
         } catch (error) {
           console.error("Delivery queue message failed", { messageId: message.id, attempts: message.attempts, error });
-          message.retry({ delaySeconds: Math.min(300, 2 ** Math.min(message.attempts, 8)) });
+          message.retry({
+            delaySeconds:
+              error instanceof SlackRateLimitError
+                ? error.retryAfter
+                : Math.min(300, 2 ** Math.min(message.attempts, 8)),
+          });
         }
       }),
     );

@@ -14,6 +14,10 @@ export interface AppBindings {
   SEND_EMAIL?: SendEmail;
   BROWSER?: BrowserRun;
   EMAIL_FROM?: string;
+  SLACK_CLIENT_ID?: string;
+  SLACK_CLIENT_SECRET?: string;
+  SLACK_SIGNING_SECRET?: string;
+  SLACK_TOKEN_ENCRYPTION_KEY?: string;
   ASSETS: Fetcher;
   BETTER_AUTH_SECRET: string;
   BETTER_AUTH_URL: string;

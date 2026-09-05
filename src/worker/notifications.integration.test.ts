@@ -230,7 +230,13 @@ describe("notification feed and subscriptions", () => {
     }>();
     expect(initial.preferences).toHaveLength(5);
     expect(initial.configured).toBe(false);
-    expect(initial.channels).toEqual({ email: { available: false }, slack: { available: false } });
+    expect(initial.channels).toEqual({
+      email: { available: false },
+      slack: {
+        available: false,
+        missing: ["SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET", "SLACK_SIGNING_SECRET", "SLACK_TOKEN_ENCRYPTION_KEY"],
+      },
+    });
 
     const updated = await SELF.fetch(
       request(installed.cookie, "/api/notification-preferences", {

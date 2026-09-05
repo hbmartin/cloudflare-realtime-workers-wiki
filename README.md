@@ -7,13 +7,16 @@ The editor is BlockNote backed by Yjs. Each document epoch has one hibernating `
 ## What works
 
 - Operator-token bootstrap, Better Auth email/password sessions, one-use invites, and owner/editor/viewer roles.
-- Nested pages with fractional ordering, drag-to-reparent, cycle prevention, archive/restore, queued permanent deletion, and FTS5 search.
+- Workspace and private spaces, nested pages, favorites, pins, tags, templates, archive/restore, queued deletion, and scoped weighted FTS5 search.
 - Realtime BlockNote editing, awareness, local undo, offline IndexedDB, hidden-tab disconnects, server-enforced viewer read-only access, and five-minute connection reauthorization.
 - Merged update chunks, 30-second R2 compaction, structured D1 search/reference projection, 16/24 MiB warnings and limits, automatic versions, comparison, and epoch-safe restore.
 - Realtime page-tree metadata, unified page/member mentions, backlinks, authorized hover previews, and a cursor-based mention inbox.
+- Server-authoritative anchored comment threads, watches, in-app notifications, channel preferences, and timezone-aware digests.
 - Private R2 attachments with authorization, all HTTP range forms, conditional ETags, safe disposition, `nosniff`, MIME rejection, inline editor media, and chunked direct-to-R2 uploads for large files.
 - Full-page typed tables with 60-second single-editor leases, revision conflicts, owner force unlock, server-side paging and sorting, replayable bulk writes, and a 20,000-row limit.
-- Bulk Notion import from an HTML export: page tree, block content, inline media, internal links as mentions, and databases as typed tables, resumable and idempotent.
+- In-app Markdown, sanitized HTML, and nested Notion ZIP import with staged verification and atomic publication.
+- Per-page Markdown, HTML, portable ZIP, and PDF export through resumable Cloudflare Workflows.
+- Optional native Slack OAuth, private slash search, access-filtered unfurls, channel mappings, and queued personal/channel notifications.
 
 This is an early v1 implementation. Production billing-grade hibernation verification and high-concurrency load tests still require a deployed Workers Paid account.
 
@@ -72,9 +75,10 @@ Browser
           ├─ authenticated /parties/document/:page~:epoch
           └─ authenticated /parties/workspace-events/:workspace
 Hono Worker
-  ├─ Better Auth + D1 metadata/FTS/projections/tables
-  ├─ authorized R2 attachment/version access
-  ├─ queued deletion + hourly retry handler
+  ├─ Better Auth + D1 metadata/FTS/projections/tables/comments/outbox
+  ├─ authorized R2 attachment/version/job-artifact access
+  ├─ Cloudflare Workflow jobs + Queue/DLQ deliveries
+  ├─ optional Email, Browser Rendering, and Slack integrations
   └─ PartyServer router
           ├────────────────────────────────────┐
 Document Durable Object (hibernating YServer)
@@ -87,7 +91,7 @@ WorkspaceEvents Durable Object (read-only) ────┘
   └─ page and projection invalidation events
 ```
 
-There is intentionally no ORM, Redis, Postgres, custom WebSocket protocol, Hocuspocus adapter, repository layer, or persisted full-document JSON projection.
+There is intentionally no ORM, Redis, Postgres, custom WebSocket protocol, Hocuspocus adapter, or repository layer.
 
 ## Production
 

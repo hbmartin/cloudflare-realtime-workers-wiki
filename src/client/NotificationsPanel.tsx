@@ -230,9 +230,32 @@ export function NotificationsPanel({
                     <option value="digest">Daily digest</option>
                   </select>
                 </label>
-                <span className="slack-disabled" title="Slack integration is not configured">
-                  Slack unavailable
-                </span>
+                {channels?.slack.available ? (
+                  <label>
+                    Slack
+                    <select
+                      aria-label={`${EVENT_LABELS[preference.eventType]} Slack`}
+                      value={preference.slack}
+                      onChange={(event) =>
+                        setPreferences((current) =>
+                          current.map((item, itemIndex) =>
+                            itemIndex === index
+                              ? { ...item, slack: event.target.value as NotificationPreference["slack"] }
+                              : item,
+                          ),
+                        )
+                      }
+                    >
+                      <option value="off">Off</option>
+                      <option value="immediate">Immediately</option>
+                      <option value="digest">Daily digest</option>
+                    </select>
+                  </label>
+                ) : (
+                  <span className="slack-disabled" title="Slack integration is not configured">
+                    Slack unavailable
+                  </span>
+                )}
               </fieldset>
             ))}
             <label className="timezone-field">

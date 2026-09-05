@@ -33,6 +33,11 @@ describe("D1 migrations", () => {
         "outbox",
         "notifications",
         "comment_migrations",
+        "slack_installations",
+        "slack_user_links",
+        "slack_channel_subscriptions",
+        "slack_unfurls",
+        "slack_request_replays",
       ]),
     );
 
@@ -43,6 +48,12 @@ describe("D1 migrations", () => {
     expect(indexes.results.map((index) => index.name)).toContain("idx_page_move_receipts_page");
     expect(indexes.results.map((index) => index.name)).toContain("idx_page_move_receipts_created");
     expect(indexes.results.map((index) => index.name)).toContain("idx_pages_workspace_page");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_slack_channels_unique");
+
+    const slackColumns = await env.DB.prepare(`PRAGMA table_info(slack_installations)`).all<{ name: string }>();
+    expect(slackColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["bot_token_ciphertext", "bot_refresh_token_ciphertext", "token_expires_at"]),
+    );
 
     const uploadColumns = await env.DB.prepare(`PRAGMA table_info(attachment_uploads)`).all<{ name: string }>();
     expect(uploadColumns.results.map((column) => column.name)).toEqual(
@@ -155,6 +166,62 @@ describe("D1 migrations", () => {
           WHERE workspace_id = 'workspace' AND type = 'search_reindex'`,
       ).first(),
     ).toEqual({ workspace_id: "workspace", requested_by: "owner", type: "search_reindex", status: "queued" });
+  });
+
+  it("preserves reserved Slack integration records while upgrading their schema", async () => {
+    const slackMigration = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0016_slack_integration.sql");
+    expect(slackMigration).toBeTruthy();
+    const migrationIndex = env.TEST_MIGRATIONS!.indexOf(slackMigration!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, migrationIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES ('workspace', 'owner', 'owner', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('page', 'workspace', 'workspace-general', 'document', 'a0', 'Page', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
+          (workspace_id, team_id, team_name, bot_user_id, encrypted_bot_token, installed_by, created_at, updated_at)
+         VALUES ('workspace', 'T123', 'Legacy Slack', 'B123', 'encrypted-token', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_user_links (workspace_id, user_id, slack_user_id, created_at)
+         VALUES ('workspace', 'owner', 'U123', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_link_tokens (token_hash, workspace_id, slack_user_id, expires_at)
+         VALUES ('token', 'workspace', 'U123', ?)`,
+      ).bind(timestamp + 600_000),
+      env.DB.prepare(
+        `INSERT INTO slack_channel_subscriptions
+          (id, workspace_id, space_id, page_id, channel_id, channel_name, events_json, cadence, created_by, created_at)
+         VALUES ('channel', 'workspace', 'workspace-general', 'page', 'C123', 'notes', '["page_edit"]', 'digest', 'owner', ?)`,
+      ).bind(timestamp),
+    ]);
+
+    await applyD1Migrations(env.DB, [slackMigration!]);
+    expect(
+      await env.DB.prepare(`SELECT id, workspace_id, team_id, bot_token_ciphertext FROM slack_installations`).first(),
+    ).toEqual({ id: "workspace", workspace_id: "workspace", team_id: "T123", bot_token_ciphertext: "encrypted-token" });
+    expect(await env.DB.prepare(`SELECT installation_id, slack_user_id FROM slack_user_links`).first()).toEqual({
+      installation_id: "workspace",
+      slack_user_id: "U123",
+    });
+    expect(
+      await env.DB.prepare(
+        `SELECT installation_id, event_types_json, cadence FROM slack_channel_subscriptions`,
+      ).first(),
+    ).toEqual({ installation_id: "workspace", event_types_json: '["page_edit"]', cadence: "digest" });
   });
 
   it("backfills every legacy page into a General space and guards cross-space parents", async () => {

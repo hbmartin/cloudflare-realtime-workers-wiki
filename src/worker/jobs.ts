@@ -11,6 +11,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
+import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
 
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
@@ -887,13 +888,20 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
     message.ack();
     return;
   }
-  if (row.topic !== "notification") {
-    throw new Error(`Unsupported outbox topic: ${row.topic}`);
-  }
   const payload = jsonRecord(row.payload_json);
-  const notificationId = payload.notificationId;
-  if (typeof notificationId !== "string") throw new Error("Notification outbox payload is invalid.");
-  await deliverNotification(env, notificationId, outboxId);
+  if (row.topic === "notification") {
+    const notificationId = payload.notificationId;
+    if (typeof notificationId !== "string") throw new Error("Notification outbox payload is invalid.");
+    await deliverNotification(env, notificationId, outboxId);
+  } else if (row.topic === "slack_channel") {
+    const eventId = payload.eventId;
+    if (typeof eventId !== "string") throw new Error("Slack channel outbox payload is invalid.");
+    await deliverSlackChannelEvent(env, eventId);
+  } else if (row.topic === "slack_unfurl") {
+    const unfurlId = payload.unfurlId;
+    if (typeof unfurlId !== "string") throw new Error("Slack unfurl outbox payload is invalid.");
+    await deliverSlackUnfurl(env, unfurlId);
+  } else throw new Error(`Unsupported outbox topic: ${row.topic}`);
   message.ack();
 }
 

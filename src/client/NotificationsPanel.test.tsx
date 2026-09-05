@@ -76,4 +76,30 @@ describe("NotificationsPanel", () => {
     expect(screen.getAllByText("Slack unavailable")).toHaveLength(5);
     expect(screen.getByRole("combobox", { name: "Mentions email" })).toBeDisabled();
   });
+
+  it("allows Slack delivery preferences when the integration is configured", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("notification-preferences")) {
+        if (init?.method === "PUT") return jsonResponse({ preferences });
+        return jsonResponse({
+          preferences,
+          configured: true,
+          channels: { email: { available: true }, slack: { available: true } },
+        });
+      }
+      return jsonResponse({ notifications: [], unreadCount: 0, hasMore: false });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<NotificationsPanel revision={0} onClose={vi.fn()} onSelectPage={vi.fn()} onUnreadCountChange={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Notification settings" }));
+    const slack = await screen.findByRole("combobox", { name: "Mentions Slack" });
+    fireEvent.change(slack, { target: { value: "immediate" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save preferences" }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/notification-preferences",
+        expect.objectContaining({ method: "PUT", body: expect.stringContaining('"slack":"immediate"') }),
+      ),
+    );
+  });
 });

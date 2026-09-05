@@ -8,6 +8,7 @@ import type {
 } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
+import { sendPersonalSlackNotification, slackChannelFanoutStatements } from "./slack";
 
 export const NOTIFICATION_EVENT_TYPES = [
   "mention",
@@ -55,6 +56,7 @@ type DeliveryRow = NotificationRow & {
   recipient_email: string;
   preference_in_app: number | null;
   preference_email: NotificationChannelMode | null;
+  preference_slack: NotificationChannelMode | null;
   preference_timezone: string | null;
 };
 
@@ -64,7 +66,6 @@ function uniqueIds(ids: string[]) {
 
 export function notificationFanoutStatements(database: D1Database, fanout: NotificationFanout) {
   const recipients = uniqueIds(fanout.recipientIds);
-  if (!recipients.length) return [];
   const prefix = `${fanout.eventType}:${fanout.sourceId}`;
   const recipientJson = JSON.stringify(recipients);
   const dataJson = JSON.stringify(fanout.data ?? {});
@@ -109,6 +110,7 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
           WHERE substr(id, 1, length(?) + 1) = ? || ':'`,
       )
       .bind(fanout.createdAt, fanout.createdAt, prefix, prefix),
+    ...slackChannelFanoutStatements(database, fanout),
   ];
 }
 
@@ -386,6 +388,10 @@ function emailMode(row: DeliveryRow) {
   return row.preference_email ?? (row.event_type === "page_edit" ? "digest" : "immediate");
 }
 
+function slackMode(row: DeliveryRow) {
+  return row.preference_slack ?? "off";
+}
+
 async function notificationForDelivery(env: Env, notificationId: string) {
   const locator = await env.DB.prepare(`SELECT user_id, workspace_id FROM notifications WHERE id = ?`)
     .bind(notificationId)
@@ -394,7 +400,7 @@ async function notificationForDelivery(env: Env, notificationId: string) {
   return env.DB.prepare(
     `SELECT ${NOTIFICATION_COLUMNS}, n.workspace_id, n.user_id,
             recipient.name recipient_name, recipient.email recipient_email,
-            preference.in_app preference_in_app, preference.email preference_email,
+            preference.in_app preference_in_app, preference.email preference_email, preference.slack preference_slack,
             preference.timezone preference_timezone
        ${ACCESSIBLE_NOTIFICATION_SQL} AND n.id = ?`,
   )
@@ -405,7 +411,7 @@ async function notificationForDelivery(env: Env, notificationId: string) {
 async function recordDelivery(
   env: Env,
   outboxId: string,
-  channel: "in_app" | "email",
+  channel: "in_app" | "email" | "slack",
   status: "sent" | "failed",
   error: string | null = null,
 ) {
@@ -422,7 +428,7 @@ async function recordDelivery(
     .run();
 }
 
-async function claimDelivery(env: Env, outboxId: string, channel: "email") {
+async function claimDelivery(env: Env, outboxId: string, channel: "email" | "slack") {
   const key = `${outboxId}:${channel}`;
   const timestamp = Date.now();
   const inserted = await env.DB.prepare(
@@ -445,7 +451,7 @@ async function claimDelivery(env: Env, outboxId: string, channel: "email") {
 async function finishClaimedDelivery(
   env: Env,
   outboxId: string,
-  channel: "email",
+  channel: "email" | "slack",
   status: "sent" | "failed",
   error: string | null = null,
 ) {
@@ -500,27 +506,48 @@ export async function deliverNotification(env: Env, notificationId: string, outb
     row.preference_in_app === 0 ? "failed" : "sent",
     row.preference_in_app === 0 ? "disabled" : null,
   );
-  if (emailMode(row) !== "immediate") return;
-  if (!(await claimDelivery(env, outboxId, "email"))) return;
   const copy = notificationCopy(row);
-  try {
-    if (!(await sendNotificationEmail(env, row, copy, copy))) {
-      await finishClaimedDelivery(env, outboxId, "email", "failed", "unavailable");
-      return;
+  if (emailMode(row) === "immediate" && (await claimDelivery(env, outboxId, "email"))) {
+    try {
+      if (!(await sendNotificationEmail(env, row, copy, copy))) {
+        await finishClaimedDelivery(env, outboxId, "email", "failed", "unavailable");
+      } else {
+        await env.DB.prepare(`UPDATE notifications SET emailed_at = COALESCE(emailed_at, ?) WHERE id = ?`)
+          .bind(Date.now(), notificationId)
+          .run();
+        await finishClaimedDelivery(env, outboxId, "email", "sent");
+      }
+    } catch (error) {
+      await finishClaimedDelivery(
+        env,
+        outboxId,
+        "email",
+        "failed",
+        error instanceof Error ? error.message.slice(0, 500) : "Email delivery failed.",
+      );
+      throw error;
     }
-    await env.DB.prepare(`UPDATE notifications SET emailed_at = COALESCE(emailed_at, ?) WHERE id = ?`)
-      .bind(Date.now(), notificationId)
-      .run();
-    await finishClaimedDelivery(env, outboxId, "email", "sent");
-  } catch (error) {
-    await finishClaimedDelivery(
-      env,
-      outboxId,
-      "email",
-      "failed",
-      error instanceof Error ? error.message.slice(0, 500) : "Email delivery failed.",
-    );
-    throw error;
+  }
+  if (slackMode(row) === "immediate" && (await claimDelivery(env, outboxId, "slack"))) {
+    try {
+      if (!(await sendPersonalSlackNotification(env, row.user_id, copy, row.page_id))) {
+        await finishClaimedDelivery(env, outboxId, "slack", "failed", "unavailable");
+      } else {
+        await env.DB.prepare(`UPDATE notifications SET slack_at = COALESCE(slack_at, ?) WHERE id = ?`)
+          .bind(Date.now(), notificationId)
+          .run();
+        await finishClaimedDelivery(env, outboxId, "slack", "sent");
+      }
+    } catch (error) {
+      await finishClaimedDelivery(
+        env,
+        outboxId,
+        "slack",
+        "failed",
+        error instanceof Error ? error.message.slice(0, 500) : "Slack delivery failed.",
+      );
+      throw error;
+    }
   }
 }
 
@@ -539,7 +566,7 @@ function digestDue(timezone: string, timestamp: number) {
   }
 }
 
-export async function sendDueNotificationDigests(env: Env, timestamp = Date.now()) {
+async function sendDueEmailDigests(env: Env, timestamp: number) {
   if (!env.SEND_EMAIL || !env.EMAIL_FROM) return;
   const candidates = await env.DB.prepare(
     `SELECT DISTINCT n.user_id, n.workspace_id, recipient.name, recipient.email,
@@ -607,4 +634,74 @@ export async function sendDueNotificationDigests(env: Env, timestamp = Date.now(
       console.error("Notification digest email failed", { userId: candidate.user_id, error });
     }
   }
+}
+
+async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
+  const candidates = await env.DB.prepare(
+    `SELECT DISTINCT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
+       FROM notifications n
+       LEFT JOIN notification_preferences preference
+         ON preference.user_id = n.user_id AND preference.event_type = 'page_edit'
+      WHERE n.event_type = 'page_edit' AND n.slack_at IS NULL
+        AND COALESCE(preference.slack, 'off') = 'digest' LIMIT 50`,
+  ).all<{ user_id: string; workspace_id: string; timezone: string }>();
+  for (const candidate of candidates.results) {
+    if (!digestDue(candidate.timezone, timestamp)) continue;
+    const ids = await env.DB.prepare(
+      `SELECT id FROM notifications WHERE user_id = ? AND workspace_id = ? AND event_type = 'page_edit'
+        AND slack_at IS NULL ORDER BY created_at LIMIT 40`,
+    )
+      .bind(candidate.user_id, candidate.workspace_id)
+      .all<{ id: string }>();
+    const rows: DeliveryRow[] = [];
+    for (const { id } of ids.results) {
+      const row = await notificationForDelivery(env, id);
+      if (row) rows.push(row);
+      else await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id = ?`).bind(timestamp, id).run();
+    }
+    if (!rows.length) continue;
+    const claimed: DeliveryRow[] = [];
+    for (const row of rows) {
+      if (await claimDelivery(env, `outbox:${row.id}`, "slack")) claimed.push(row);
+    }
+    if (!claimed.length) continue;
+    try {
+      const sent = await sendPersonalSlackNotification(
+        env,
+        candidate.user_id,
+        `Your daily Notes digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
+        claimed[0]!.page_id,
+      );
+      for (const row of claimed) {
+        await finishClaimedDelivery(
+          env,
+          `outbox:${row.id}`,
+          "slack",
+          sent ? "sent" : "failed",
+          sent ? null : "unavailable",
+        );
+      }
+      if (sent) {
+        await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
+          .bind(Date.now(), JSON.stringify(claimed.map((row) => row.id)))
+          .run();
+      }
+    } catch (error) {
+      for (const row of claimed) {
+        await finishClaimedDelivery(
+          env,
+          `outbox:${row.id}`,
+          "slack",
+          "failed",
+          error instanceof Error ? error.message.slice(0, 500) : "Slack digest failed.",
+        );
+      }
+      throw error;
+    }
+  }
+}
+
+export async function sendDueNotificationDigests(env: Env, timestamp = Date.now()) {
+  await sendDueEmailDigests(env, timestamp);
+  await sendDuePersonalSlackDigests(env, timestamp);
 }
