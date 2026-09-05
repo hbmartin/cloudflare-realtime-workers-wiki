@@ -399,7 +399,9 @@ function envRejectingNextBatchAfterCommit(
 function envMutatingNextMoveBatchResult(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
-  mutate: (results: D1BatchResults) => boolean | Promise<boolean>,
+  // The mutator receives a staged clone: true applies its changes, while false discards them and keeps looking.
+  // Database work awaited by the mutator must use this original binding so it cannot re-enter the serialized interceptor.
+  mutate: (results: D1BatchResults, uninterceptedDatabase: D1Database) => boolean | Promise<boolean>,
 ) {
   let intercepted = false;
   let mutateFailure: { error: unknown } | undefined;
@@ -412,7 +414,7 @@ function envMutatingNextMoveBatchResult(
       if (!intercepted && !mutateFailure) {
         try {
           const candidateResults = structuredClone(results);
-          if (await mutate(candidateResults)) {
+          if (await mutate(candidateResults, bindings.DB)) {
             intercepted = true;
             returnedResults = candidateResults;
           }
@@ -429,11 +431,10 @@ function envMutatingNextMoveBatchResult(
   const eventBindings = envWithDatabase(bindings, database);
   return {
     bindings: envWithCapturedWorkspaceEvents(eventBindings, delivered),
-    batchResultWasMutated: () => {
-      if (mutateFailure) throw mutateFailure.error;
-      return intercepted;
-    },
     batchResultMutationWasApplied: () => intercepted,
+    rethrowBatchResultMutationFailure: () => {
+      if (mutateFailure) throw mutateFailure.error;
+    },
   };
 }
 
@@ -4205,7 +4206,8 @@ describe("Worker integration", () => {
     const body = await response.json<{ page: Page; replayed: boolean }>();
     await waitOnExecutionContext(context);
 
-    expect(intercepted.batchResultWasMutated()).toBe(true);
+    intercepted.rethrowBatchResultMutationFailure();
+    expect(intercepted.batchResultMutationWasApplied()).toBe(true);
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
     expect(delivered).toEqual([
@@ -4257,14 +4259,20 @@ describe("Worker integration", () => {
 
     let surfacedError: unknown;
     try {
-      intercepted.batchResultWasMutated();
+      intercepted.rethrowBatchResultMutationFailure();
     } catch (error) {
       surfacedError = error;
     }
     expect(surfacedError).toBe(mutateError);
+    expect(intercepted.batchResultMutationWasApplied()).toBe(false);
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ replayed: false, page: { id: installed.pageId, revision: 2 } });
-    expect(delivered).toHaveLength(1);
+    expect(delivered).toEqual([
+      {
+        workspaceId: installed.workspaceId,
+        event: { type: "pages-upserted", pages: [body.page] },
+      },
+    ]);
     expect(logged).not.toHaveBeenCalled();
   });
 
@@ -4272,10 +4280,11 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
-    const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results) => {
+    const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results, uninterceptedDatabase) => {
       const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
       if (receipt?.page_id !== installed.pageId) return false;
-      await env.DB.prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
+      await uninterceptedDatabase
+        .prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
         .bind(installed.workspaceId, operationId)
         .run();
       results.length = 0;
@@ -4297,7 +4306,8 @@ describe("Worker integration", () => {
     const body = await response.json<{ error: { code: string } }>();
     await waitOnExecutionContext(context);
 
-    expect(intercepted.batchResultWasMutated()).toBe(true);
+    intercepted.rethrowBatchResultMutationFailure();
+    expect(intercepted.batchResultMutationWasApplied()).toBe(true);
     expect(response.status).toBe(500);
     expect(body.error.code).toBe("internal_error");
     expect(delivered).toEqual([]);
@@ -4348,7 +4358,8 @@ describe("Worker integration", () => {
     const body = await response.json<{ error: { code: string } }>();
     await waitOnExecutionContext(context);
 
-    expect(intercepted.batchResultWasMutated()).toBe(true);
+    intercepted.rethrowBatchResultMutationFailure();
+    expect(intercepted.batchResultMutationWasApplied()).toBe(true);
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(delivered).toEqual([]);
@@ -4405,7 +4416,8 @@ describe("Worker integration", () => {
     const body = await response.json<{ page: Page; replayed: boolean }>();
     await waitOnExecutionContext(context);
 
-    expect(intercepted.batchResultWasMutated()).toBe(true);
+    intercepted.rethrowBatchResultMutationFailure();
+    expect(intercepted.batchResultMutationWasApplied()).toBe(true);
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
     expect(delivered).toEqual([
@@ -4453,7 +4465,8 @@ describe("Worker integration", () => {
     const body = await response.json<{ page: Page; replayed: boolean }>();
     await waitOnExecutionContext(context);
 
-    expect(intercepted.batchResultWasMutated()).toBe(true);
+    intercepted.rethrowBatchResultMutationFailure();
+    expect(intercepted.batchResultMutationWasApplied()).toBe(true);
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ replayed: false, page: { id: installed.pageId, revision: 2 } });
     expect(delivered).toEqual([
@@ -4511,7 +4524,8 @@ describe("Worker integration", () => {
     const body = await response.json<{ page: Page; replayed: boolean }>();
     await waitOnExecutionContext(context);
 
-    expect(intercepted.batchResultWasMutated()).toBe(true);
+    intercepted.rethrowBatchResultMutationFailure();
+    expect(intercepted.batchResultMutationWasApplied()).toBe(true);
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
     expect(delivered).toEqual([
@@ -4562,7 +4576,8 @@ describe("Worker integration", () => {
     const body = await response.json<{ page: Page; replayed: boolean }>();
     await waitOnExecutionContext(context);
 
-    expect(intercepted.batchResultWasMutated()).toBe(true);
+    intercepted.rethrowBatchResultMutationFailure();
+    expect(intercepted.batchResultMutationWasApplied()).toBe(true);
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ replayed: false, page: { id: installed.pageId, revision: 2 } });
     expect(delivered).toEqual([
@@ -4600,7 +4615,8 @@ describe("Worker integration", () => {
     const body = await response.json<{ page: Page; replayed: boolean }>();
     await waitOnExecutionContext(context);
 
-    expect(intercepted.batchResultWasMutated()).toBe(true);
+    intercepted.rethrowBatchResultMutationFailure();
+    expect(intercepted.batchResultMutationWasApplied()).toBe(true);
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
     expect(delivered).toEqual([
