@@ -107,6 +107,37 @@ test("opens the Activities tray with keyboard-safe focus and accessible empty st
   await expect(trigger).toBeFocused();
 });
 
+test("organizes pages with spaces, favorites, pins, and tags", async ({ page }) => {
+  await signIn(page);
+  const switcher = page.getByLabel("Current space");
+  await expect(switcher).toBeEnabled();
+  await expect(switcher).toHaveValue(/.+/);
+
+  await page.getByRole("button", { name: "Favorite" }).click();
+  await expect(page.getByLabel("Favorites").getByText("Welcome")).toBeVisible();
+  await page.getByRole("button", { name: "Pin" }).click();
+  await expect(page.getByLabel("Pinned").getByText("Welcome")).toBeVisible();
+
+  await page.getByRole("button", { name: "+ New tag" }).click();
+  await page.getByLabel("Tag name").fill("Getting started");
+  await page.getByLabel("Tag color").selectOption("purple");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Remove Getting started tag" })).toBeVisible();
+
+  const spaceName = `Private plans ${Date.now()}`;
+  await page.getByRole("button", { name: "Create space" }).click();
+  await page.getByLabel("Space name").fill(spaceName);
+  await page.getByLabel("Access").selectOption("private");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(switcher).toHaveText(new RegExp(spaceName));
+  await expect(page.getByRole("heading", { name: "A quiet workspace." })).toBeVisible();
+
+  const results = await new AxeBuilder({ page }).exclude(".bn-editor").analyze();
+  expect(
+    results.violations.filter((violation) => violation.impact === "critical" || violation.impact === "serious"),
+  ).toEqual([]);
+});
+
 test("creates, renames, archives, and restores a page through the UI @mobile-sidebar", async ({ page }, testInfo) => {
   await signIn(page);
   const title = `Lifecycle ${testInfo.project.name} ${Date.now()}`;

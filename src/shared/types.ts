@@ -32,6 +32,18 @@ export type Space = {
   updatedAt: number;
 };
 
+export type TagColor = "gray" | "red" | "orange" | "yellow" | "green" | "blue" | "purple" | "pink";
+
+export type Tag = {
+  id: string;
+  workspaceId: string;
+  name: string;
+  color: TagColor;
+  pageCount: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type MemberContext = {
   user: SessionUser;
   session: { id: string; expiresAt: Date };

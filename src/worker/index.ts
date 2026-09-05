@@ -65,6 +65,8 @@ import type {
   PageKind,
   Role,
   Space,
+  Tag,
+  TagColor,
   TableLeaseResponse,
   TableLeaseTiming,
   WorkspaceEvent,
@@ -94,6 +96,7 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 // query ceiling while still collapsing a tree level into one request.
 const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
+const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple", "pink"] as const;
 
 type PageRow = PageJsonRow & {
   plain_text: string;
@@ -648,6 +651,54 @@ async function spaceForMember(env: Env, member: MemberContext, spaceId: string) 
   return row;
 }
 
+type TagRow = {
+  id: string;
+  workspace_id: string;
+  name: string;
+  color: TagColor;
+  page_count?: number;
+  created_at: number;
+  updated_at: number;
+};
+
+function tagJson(row: TagRow): Tag {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    name: row.name,
+    color: row.color,
+    pageCount: row.page_count ?? 0,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function tagColor(value: unknown): TagColor {
+  const color = value === undefined ? "gray" : text(value, "color", 20);
+  if (!TAG_COLORS.includes(color as TagColor)) {
+    throw new HttpError(422, "invalid_input", "color is not a supported tag color.");
+  }
+  return color as TagColor;
+}
+
+function refreshSearchV2Statements(database: D1Database, pageId: string) {
+  return [
+    database.prepare(`DELETE FROM page_search_v2 WHERE page_id = ?`).bind(pageId),
+    database
+      .prepare(
+        `INSERT INTO page_search_v2
+          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+         SELECT p.id, p.workspace_id, p.space_id, p.title,
+                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
+                COALESCE(p.plain_text, ''),
+                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
+                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
+           FROM pages p WHERE p.id = ? AND p.archived_at IS NULL AND p.import_job_id IS NULL`,
+      )
+      .bind(pageId),
+  ];
+}
+
 type TablePageExtras = { columns: string; binds: unknown[] };
 
 // Resolves the active (unarchived) table page a request targets, failing with
@@ -1129,6 +1180,238 @@ app.delete("/api/spaces/:id/members/:userId", async (c) => {
     .bind(space.id, c.req.param("userId"))
     .run();
   sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/favorites", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const rows = await c.env.DB.prepare(
+    `SELECT p.* FROM favorites f
+      JOIN pages p ON p.id = f.page_id
+      JOIN spaces s ON s.id = p.space_id
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE f.user_id = ? AND p.workspace_id = ? AND p.archived_at IS NULL
+       AND p.is_template = 0 AND p.import_job_id IS NULL
+       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+     ORDER BY f.position, p.id`,
+  )
+    .bind(member.user.id, member.user.id, member.workspace.id, member.role)
+    .all<PageRow>();
+  return c.json({ pages: rows.results.map(pageJson) });
+});
+
+app.post("/api/favorites/:pageId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  const last = await c.env.DB.prepare(`SELECT position FROM favorites WHERE user_id = ? ORDER BY position DESC LIMIT 1`)
+    .bind(member.user.id)
+    .first<{ position: string }>();
+  await c.env.DB.prepare(`INSERT OR IGNORE INTO favorites (user_id, page_id, position, created_at) VALUES (?, ?, ?, ?)`)
+    .bind(member.user.id, page.id, generateJitteredKeyBetween(last?.position ?? null, null), now())
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ page: pageJson(page) }, 201);
+});
+
+app.delete("/api/favorites/:pageId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await c.env.DB.prepare(
+    `DELETE FROM favorites WHERE user_id = ? AND page_id IN (
+       SELECT id FROM pages WHERE id = ? AND workspace_id = ?
+     )`,
+  )
+    .bind(member.user.id, c.req.param("pageId"), member.workspace.id)
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/spaces/:id/pins", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  const rows = await c.env.DB.prepare(
+    `SELECT p.* FROM space_pins sp JOIN pages p ON p.id = sp.page_id
+      WHERE sp.space_id = ? AND p.space_id = ? AND p.archived_at IS NULL
+        AND p.is_template = 0 AND p.import_job_id IS NULL
+      ORDER BY sp.position, p.id`,
+  )
+    .bind(space.id, space.id)
+    .all<PageRow>();
+  return c.json({ pages: rows.results.map(pageJson) });
+});
+
+app.post("/api/spaces/:id/pins/:pageId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  if (effectiveSpaceRole(member.role, space.visibility, space.space_role) === "viewer") {
+    throw new HttpError(403, "read_only", "Your role in this space is read-only.");
+  }
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.space_id !== space.id) throw new HttpError(422, "pin_space_mismatch", "A pin must belong to its space.");
+  const last = await c.env.DB.prepare(
+    `SELECT position FROM space_pins WHERE space_id = ? ORDER BY position DESC LIMIT 1`,
+  )
+    .bind(space.id)
+    .first<{ position: string }>();
+  await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO space_pins (space_id, page_id, position, created_by, created_at) VALUES (?, ?, ?, ?, ?)`,
+  )
+    .bind(space.id, page.id, generateJitteredKeyBetween(last?.position ?? null, null), member.user.id, now())
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ page: pageJson(page) }, 201);
+});
+
+app.delete("/api/spaces/:id/pins/:pageId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const space = await spaceForMember(c.env, member, c.req.param("id"));
+  if (effectiveSpaceRole(member.role, space.visibility, space.space_role) === "viewer") {
+    throw new HttpError(403, "read_only", "Your role in this space is read-only.");
+  }
+  await c.env.DB.prepare(`DELETE FROM space_pins WHERE space_id = ? AND page_id = ?`)
+    .bind(space.id, c.req.param("pageId"))
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/tags", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const rows = await c.env.DB.prepare(
+    `SELECT t.*, COUNT(DISTINCT visible.id) page_count FROM tags t
+      LEFT JOIN page_tags pt ON pt.tag_id = t.id
+      LEFT JOIN (
+        SELECT p.id FROM pages p JOIN spaces s ON s.id = p.space_id
+        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+        WHERE p.workspace_id = ? AND p.archived_at IS NULL
+          AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+      ) visible ON visible.id = pt.page_id
+     WHERE t.workspace_id = ? GROUP BY t.id ORDER BY lower(t.name), t.id`,
+  )
+    .bind(member.user.id, member.workspace.id, member.role, member.workspace.id)
+    .all<TagRow>();
+  return c.json({ tags: rows.results.map(tagJson) });
+});
+
+app.post("/api/tags", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const body = await jsonBody(c.req.raw);
+  const name = text(body.name, "name", 50);
+  const existing = await c.env.DB.prepare(`SELECT id FROM tags WHERE workspace_id = ? AND lower(name) = lower(?)`)
+    .bind(member.workspace.id, name)
+    .first();
+  if (existing) throw new HttpError(409, "tag_exists", "A tag with that name already exists.");
+  const id = crypto.randomUUID();
+  const timestamp = now();
+  await c.env.DB.prepare(
+    `INSERT INTO tags (id, workspace_id, name, color, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, member.workspace.id, name, tagColor(body.color), member.user.id, timestamp, timestamp)
+    .run();
+  const tag = await c.env.DB.prepare(`SELECT * FROM tags WHERE id = ?`).bind(id).first<TagRow>();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ tag: tagJson(tag!) }, 201);
+});
+
+app.patch("/api/tags/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const current = await c.env.DB.prepare(`SELECT * FROM tags WHERE id = ? AND workspace_id = ?`)
+    .bind(c.req.param("id"), member.workspace.id)
+    .first<TagRow>();
+  if (!current) throw new HttpError(404, "tag_not_found", "Tag not found.");
+  const body = await jsonBody(c.req.raw);
+  const name = body.name === undefined ? current.name : text(body.name, "name", 50);
+  const duplicate = await c.env.DB.prepare(
+    `SELECT id FROM tags WHERE workspace_id = ? AND lower(name) = lower(?) AND id <> ?`,
+  )
+    .bind(member.workspace.id, name, current.id)
+    .first();
+  if (duplicate) throw new HttpError(409, "tag_exists", "A tag with that name already exists.");
+  await c.env.DB.prepare(`UPDATE tags SET name = ?, color = ?, updated_at = ? WHERE id = ?`)
+    .bind(name, body.color === undefined ? current.color : tagColor(body.color), now(), current.id)
+    .run();
+  await c.env.DB.prepare(
+    `UPDATE page_search_v2 SET tags = COALESCE(
+       (SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
+         WHERE pt.page_id = page_search_v2.page_id), '')
+      WHERE page_id IN (SELECT page_id FROM page_tags WHERE tag_id = ?)`,
+  )
+    .bind(current.id)
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({
+    tag: tagJson((await c.env.DB.prepare(`SELECT * FROM tags WHERE id = ?`).bind(current.id).first<TagRow>())!),
+  });
+});
+
+app.delete("/api/tags/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const tag = await c.env.DB.prepare(`SELECT id FROM tags WHERE id = ? AND workspace_id = ?`)
+    .bind(c.req.param("id"), member.workspace.id)
+    .first<{ id: string }>();
+  if (!tag) throw new HttpError(404, "tag_not_found", "Tag not found.");
+  const pages = await c.env.DB.prepare(`SELECT page_id id FROM page_tags WHERE tag_id = ?`)
+    .bind(tag.id)
+    .all<{ id: string }>();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`DELETE FROM tags WHERE id = ?`).bind(tag.id),
+    c.env.DB.prepare(
+      `UPDATE page_search_v2 SET tags = COALESCE(
+           (SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
+             WHERE pt.page_id = page_search_v2.page_id), '')
+          WHERE page_id IN (SELECT value FROM json_each(?))`,
+    ).bind(JSON.stringify(pages.results.map((page) => page.id))),
+  ]);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/pages/:id/tags", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"), true);
+  const rows = await c.env.DB.prepare(
+    `SELECT t.*, 0 page_count FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
+      WHERE pt.page_id = ? AND t.workspace_id = ? ORDER BY lower(t.name), t.id`,
+  )
+    .bind(page.id, member.workspace.id)
+    .all<TagRow>();
+  return c.json({ tags: rows.results.map(tagJson) });
+});
+
+app.put("/api/pages/:id/tags/:tagId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(page);
+  const tag = await c.env.DB.prepare(`SELECT id FROM tags WHERE id = ? AND workspace_id = ?`)
+    .bind(c.req.param("tagId"), member.workspace.id)
+    .first<{ id: string }>();
+  if (!tag) throw new HttpError(404, "tag_not_found", "Tag not found.");
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT OR IGNORE INTO page_tags (page_id, tag_id, created_by, created_at) VALUES (?, ?, ?, ?)`,
+    ).bind(page.id, tag.id, member.user.id, now()),
+    ...refreshSearchV2Statements(c.env.DB, page.id),
+  ]);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  return c.json({ ok: true });
+});
+
+app.delete("/api/pages/:id/tags/:tagId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireEditor(member);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(page);
+  await c.env.DB.batch([
+    c.env.DB.prepare(`DELETE FROM page_tags WHERE page_id = ? AND tag_id = ?`).bind(page.id, c.req.param("tagId")),
+    ...refreshSearchV2Statements(c.env.DB, page.id),
+  ]);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   return c.json({ ok: true });
 });
 

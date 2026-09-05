@@ -3,7 +3,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import type { ClientMemberContext, Page, WorkspaceEvent } from "../shared/types";
+import type { ClientMemberContext, Page, Space, Tag, WorkspaceEvent } from "../shared/types";
 import type { EditorPageProps } from "./EditorPage";
 import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
 import { App } from "./App";
@@ -943,7 +943,12 @@ describe("App error handling", () => {
     expect(api).toHaveBeenCalledWith(
       "/api/pages",
       expect.objectContaining({
-        body: JSON.stringify({ id: createdPage.id, kind: "document", parentId: null }),
+        body: JSON.stringify({
+          id: createdPage.id,
+          kind: "document",
+          parentId: null,
+          spaceId: page.spaceId,
+        }),
         method: "POST",
       }),
     );
@@ -4908,5 +4913,83 @@ describe("App error handling", () => {
         errorStack: expect.any(String),
       }),
     );
+  });
+
+  it("switches spaces and manages favorites, pins, and page tags", async () => {
+    const generalSpace: Space = {
+      id: page.spaceId,
+      workspaceId: member.workspace.id,
+      name: "General",
+      slug: "general",
+      description: "",
+      icon: null,
+      position: "a0",
+      visibility: "workspace",
+      effectiveRole: "editor",
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const privateSpace: Space = {
+      ...generalSpace,
+      id: "private-space",
+      name: "Leadership",
+      slug: "leadership",
+      visibility: "private",
+      effectiveRole: "viewer",
+    };
+    const secretPage: Page = { ...page, id: "secret", spaceId: privateSpace.id, title: "Secrets", position: "b0" };
+    const researchTag: Tag = {
+      id: "tag-research",
+      workspaceId: member.workspace.id,
+      name: "Research",
+      color: "blue",
+      pageCount: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    let favorites: Page[] = [];
+    let pins: Page[] = [];
+    let assignedTags: Tag[] = [];
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page, secretPage] };
+      if (path === "/api/spaces") return { spaces: [generalSpace, privateSpace] };
+      if (path === "/api/favorites" && !init?.method) return { pages: favorites };
+      if (path === "/api/tags" && !init?.method) return { tags: [researchTag] };
+      if (path === `/api/spaces/${generalSpace.id}/pins` && !init?.method) return { pages: pins };
+      if (path === `/api/spaces/${privateSpace.id}/pins` && !init?.method) return { pages: [] };
+      if (path === `/api/pages/${page.id}/tags` && !init?.method) return { tags: assignedTags };
+      if (path === `/api/pages/${secretPage.id}/tags` && !init?.method) return { tags: [] };
+      if (path === `/api/favorites/${page.id}` && init?.method === "POST") {
+        favorites = [page];
+        return { page };
+      }
+      if (path === `/api/spaces/${generalSpace.id}/pins/${page.id}` && init?.method === "POST") {
+        pins = [page];
+        return { page };
+      }
+      if (path === `/api/pages/${page.id}/tags/${researchTag.id}` && init?.method === "PUT") {
+        assignedTags = [researchTag];
+        return { ok: true };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    const switcher = await screen.findByLabelText("Current space");
+    await waitFor(() => expect(switcher).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Favorite" }));
+    expect(await within(await screen.findByLabelText("Favorites")).findByText("Roadmap")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+    expect(await within(await screen.findByLabelText("Pinned")).findByText("Roadmap")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Add tag"), { target: { value: researchTag.id } });
+    expect(await screen.findByRole("button", { name: "Remove Research tag" })).toBeInTheDocument();
+
+    fireEvent.change(switcher, { target: { value: privateSpace.id } });
+    expect((await screen.findAllByText("Secrets")).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: "Pin" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Archive Secrets" })).not.toBeInTheDocument();
   });
 });
