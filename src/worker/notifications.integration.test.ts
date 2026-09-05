@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import type { CommentThread, Notification, NotificationPreference, Page } from "../shared/types";
 import type { Env } from "./env";
-import { deliverNotification } from "./notifications";
+import { deliverNotification, sendDueNotificationDigests } from "./notifications";
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -309,5 +309,64 @@ describe("notification feed and subscriptions", () => {
         .bind(`outbox:${viewerNotification!.id}:in_app`)
         .first(),
     ).toMatchObject({ status: "failed", last_error: "access_revoked" });
+  });
+
+  it("delivers digest-mode mentions without letting other timezones consume the candidate limit", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+    await env.DB.batch([
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         SELECT printf('digest-user-%02d', n), printf('Digest User %02d', n),
+                printf('digest-user-%02d@example.test', n), 1, ?, ? FROM sequence`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         SELECT ?, printf('digest-user-%02d', n), 'viewer', ? FROM sequence`,
+      ).bind(installed.workspaceId, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
+         SELECT printf('digest-user-%02d', n), 'mention', 1, 'digest', 'off',
+                CASE WHEN n = 51 THEN 'UTC' ELSE 'America/Los_Angeles' END FROM sequence`,
+      ),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO notifications
+           (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         SELECT printf('mention:digest:%02d', n), ?, printf('digest-user-%02d', n), 'mention', ?, ?, ?, '{}',
+                printf('digest:%02d', n), ? + n FROM sequence`,
+      ).bind(installed.workspaceId, installed.userId, installed.page.spaceId, installed.page.id, timestamp),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
+           FROM notifications WHERE id LIKE 'mention:digest:%'`,
+      ).bind(timestamp, timestamp),
+    ]);
+    const send = vi.fn(async () => ({ messageId: "digest-email" }));
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "SEND_EMAIL") return { send };
+        if (property === "EMAIL_FROM") return "notes@example.test";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    await sendDueNotificationDigests(bindings, timestamp);
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "digest-user-51@example.test",
+        text: expect.stringContaining("mentioned you"),
+      }),
+    );
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) count FROM notifications WHERE emailed_at IS NOT NULL AND id LIKE 'mention:digest:%'`,
+      ).first(),
+    ).toEqual({ count: 1 });
   });
 });

@@ -96,9 +96,10 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
   const children = node.content ?? [];
   const inline = children.map((child) => serializeInline(child, format)).join("");
   const blockChildren = () => children.map((child) => serializeNode(child, format, depth + 1)).join("");
+  const transparentChildren = () => children.map((child) => serializeNode(child, format, depth)).join("");
   const type = node.type ?? "unknown";
 
-  if (type === "doc") return blockChildren();
+  if (type === "doc" || type === "blockGroup" || type === "blockContainer") return transparentChildren();
   if (type === "text" || type === "mention" || type === "inlineMath") return serializeInline(node, format);
   if (type === "paragraph") return format === "html" ? `<p>${inline}</p>` : `${inline}\n\n`;
   if (type === "heading" || /^heading[1-6]$/.test(type)) {

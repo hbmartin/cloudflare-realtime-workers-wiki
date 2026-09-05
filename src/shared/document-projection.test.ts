@@ -127,4 +127,28 @@ describe("structured document projection", () => {
     expect(serialized.html).toContain('data-unsupported-node="futureWidget"');
     expect(serialized.html).toContain("&lt;still readable&gt;");
   });
+
+  it("serializes BlockNote wrapper nodes without flattening blocks or emitting unsupported wrappers", () => {
+    const serialized = serializeDocument(
+      document({
+        type: "blockGroup",
+        content: [
+          {
+            type: "blockContainer",
+            attrs: { id: "one" },
+            content: [{ type: "heading", attrs: { level: 2 }, content: [{ type: "text", text: "First" }] }],
+          },
+          {
+            type: "blockContainer",
+            attrs: { id: "two" },
+            content: [{ type: "paragraph", content: [{ type: "text", text: "Second" }] }],
+          },
+        ],
+      }),
+    );
+
+    expect(serialized.markdown).toBe("## First\n\nSecond\n");
+    expect(serialized.html).toContain("<h2>First</h2><p>Second</p>");
+    expect(serialized.html).not.toContain("data-unsupported-node");
+  });
 });

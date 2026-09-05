@@ -108,4 +108,26 @@ describe("ServerThreadStore", () => {
     expect(store.getThreads()).toHaveLength(1);
     expect(onError).toHaveBeenCalledWith("Comments could not be loaded. Try again shortly.");
   });
+
+  it("does not let an older refresh overwrite a completed mutation", async () => {
+    let resolveRefresh!: (value: { threads: CommentThread[] }) => void;
+    mockedApi.mockImplementationOnce(
+      () => new Promise<{ threads: CommentThread[] }>((resolve) => (resolveRefresh = resolve)),
+    );
+    const store = new ServerThreadStore("page-1", "user-1", vi.fn());
+    const refresh = store.refresh();
+    const replied = thread({
+      comments: [
+        ...thread().comments,
+        { ...thread().comments[0]!, id: "comment-2", plainText: "New reply", createdAt: 2, updatedAt: 2 },
+      ],
+    });
+    mockedApi.mockResolvedValueOnce({ thread: replied });
+
+    await store.addComment({ threadId: "thread-1", comment: { body: [] } });
+    resolveRefresh({ threads: [thread()] });
+    await refresh;
+
+    expect(store.getThread("thread-1").comments.map((comment) => comment.id)).toEqual(["comment-1", "comment-2"]);
+  });
 });

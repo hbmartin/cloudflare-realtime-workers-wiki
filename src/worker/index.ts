@@ -93,6 +93,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 import {
   consumeDeliveryMessage,
+  cleanupTemplateClone,
   createJob,
   expireJobArtifacts,
   jobForMember,
@@ -118,6 +119,7 @@ import {
   spaceWatchState,
 } from "./notifications";
 import { parseSearchRequest, searchPages, searchTitles } from "./search";
+import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import { cleanupImport } from "./importer";
 import {
   consumeSlackLink,
@@ -773,24 +775,6 @@ function tagColor(value: unknown): TagColor {
     throw new HttpError(422, "invalid_input", "color is not a supported tag color.");
   }
   return color as TagColor;
-}
-
-function refreshSearchV2Statements(database: D1Database, pageId: string) {
-  return [
-    database.prepare(`DELETE FROM page_search_v2 WHERE page_id = ?`).bind(pageId),
-    database
-      .prepare(
-        `INSERT INTO page_search_v2
-          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-         SELECT p.id, p.workspace_id, p.space_id, p.title,
-                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
-                COALESCE(p.plain_text, ''),
-                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-           FROM pages p WHERE p.id = ? AND p.archived_at IS NULL AND p.import_job_id IS NULL`,
-      )
-      .bind(pageId),
-  ];
 }
 
 type TablePageExtras = { columns: string; binds: unknown[] };
@@ -1503,7 +1487,7 @@ app.put("/api/pages/:id/tags/:tagId", async (c) => {
     c.env.DB.prepare(
       `INSERT OR IGNORE INTO page_tags (page_id, tag_id, created_by, created_at) VALUES (?, ?, ?, ?)`,
     ).bind(page.id, tag.id, member.user.id, now()),
-    ...refreshSearchV2Statements(c.env.DB, page.id),
+    ...refreshPageSearchV2Statements(c.env.DB, page.id),
   ]);
   sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   return c.json({ ok: true });
@@ -1516,7 +1500,7 @@ app.delete("/api/pages/:id/tags/:tagId", async (c) => {
   requirePageEditor(page);
   await c.env.DB.batch([
     c.env.DB.prepare(`DELETE FROM page_tags WHERE page_id = ? AND tag_id = ?`).bind(page.id, c.req.param("tagId")),
-    ...refreshSearchV2Statements(c.env.DB, page.id),
+    ...refreshPageSearchV2Statements(c.env.DB, page.id),
   ]);
   sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   return c.json({ ok: true });
@@ -1782,20 +1766,17 @@ app.post("/api/jobs/:id/cancel", async (c) => {
   )
     .bind(now(), job.id)
     .run();
-  if (job.workflow_instance_id) {
-    c.executionCtx.waitUntil(
-      c.env.NOTES_WORKFLOW.get(job.workflow_instance_id)
-        .then((instance) => instance.terminate())
-        .catch((error) => console.error("Failed to terminate canceled workflow", { jobId: job.id, error })),
-    );
-  }
-  if (job.type === "import") {
-    c.executionCtx.waitUntil(
-      cleanupImport(c.env, job).catch((error) =>
-        console.error("Failed to clean up canceled import", { jobId: job.id, error }),
-      ),
-    );
-  }
+  c.executionCtx.waitUntil(
+    (async () => {
+      if (job.workflow_instance_id) {
+        await c.env.NOTES_WORKFLOW.get(job.workflow_instance_id)
+          .then((instance) => instance.terminate())
+          .catch((error) => console.error("Failed to terminate canceled workflow", { jobId: job.id, error }));
+      }
+      if (job.type === "import") await cleanupImport(c.env, job);
+      if (job.type === "template_clone") await cleanupTemplateClone(c.env, job);
+    })().catch((error) => console.error("Failed to clean up canceled job", { jobId: job.id, error })),
+  );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
   return c.json({ job: jobJson(await jobForMember(c.env, member, job.id)) });
 });
@@ -2553,7 +2534,7 @@ app.patch("/api/pages/:id", async (c) => {
       titleValue,
       await currentPlainText(c.env, page.id),
     ),
-    ...refreshSearchV2Statements(c.env.DB, page.id),
+    ...refreshPageSearchV2Statements(c.env.DB, page.id),
   ]);
   const updated = pageJson(await pageForMember(c.env, member, page.id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [updated] });
@@ -2944,27 +2925,7 @@ app.post("/api/pages/:id/restore", async (c) => {
          ) SELECT id FROM subtree
        )`,
       ).bind(page.id),
-      c.env.DB.prepare(
-        `DELETE FROM page_search_v2 WHERE page_id IN (
-         WITH RECURSIVE subtree(id) AS (
-           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-         ) SELECT id FROM subtree
-       )`,
-      ).bind(page.id),
-      c.env.DB.prepare(
-        `INSERT INTO page_search_v2
-          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-         SELECT p.id, p.workspace_id, p.space_id, p.title,
-                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
-                COALESCE(p.plain_text, ''),
-                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-           FROM pages p WHERE p.id IN (
-             WITH RECURSIVE subtree(id) AS (
-               SELECT ? UNION ALL SELECT child.id FROM pages child JOIN subtree parent ON child.parent_id = parent.id
-             ) SELECT id FROM subtree
-           ) AND p.import_job_id IS NULL AND p.is_template = 0`,
-      ).bind(page.id),
+      ...refreshPageSearchV2SubtreeStatements(c.env.DB, page.id),
     ],
     // Read the restored snapshot in the same transaction as the update.
     restoredSnapshotStatement,

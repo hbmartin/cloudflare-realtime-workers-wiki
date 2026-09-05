@@ -626,6 +626,7 @@ export function slackChannelFanoutStatements(
   },
 ) {
   const eventId = `${fanout.eventType}:${fanout.sourceId}`;
+  const idPrefix = `${eventId}:`;
   return [
     database
       .prepare(
@@ -655,10 +656,10 @@ export function slackChannelFanoutStatements(
       .prepare(
         `INSERT OR IGNORE INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
          SELECT 'outbox:' || event.id, event.workspace_id, 'slack_channel', json_object('eventId', event.id), ?, ?
-           FROM slack_channel_events event WHERE substr(event.id, 1, length(?) + 1) = ? || ':'
+           FROM slack_channel_events event WHERE event.id >= ? AND event.id < ?
              AND event.cadence = 'immediate'`,
       )
-      .bind(fanout.createdAt, fanout.createdAt, eventId, eventId),
+      .bind(fanout.createdAt, fanout.createdAt, idPrefix, `${eventId};`),
   ];
 }
 

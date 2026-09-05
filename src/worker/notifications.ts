@@ -27,6 +27,7 @@ export type NotificationFanout = {
   eventType: NotificationEventType;
   sourceId: string;
   recipientIds: string[];
+  emitSlackChannel: boolean;
   data?: Record<string, unknown>;
   createdAt: number;
 };
@@ -67,6 +68,7 @@ function uniqueIds(ids: string[]) {
 export function notificationFanoutStatements(database: D1Database, fanout: NotificationFanout) {
   const recipients = uniqueIds(fanout.recipientIds);
   const prefix = `${fanout.eventType}:${fanout.sourceId}`;
+  const idPrefix = `${prefix}:`;
   const recipientJson = JSON.stringify(recipients);
   const dataJson = JSON.stringify(fanout.data ?? {});
   return [
@@ -107,10 +109,10 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
           (id, workspace_id, topic, payload_json, available_at, created_at)
          SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
            FROM notifications
-          WHERE substr(id, 1, length(?) + 1) = ? || ':'`,
+          WHERE id >= ? AND id < ?`,
       )
-      .bind(fanout.createdAt, fanout.createdAt, prefix, prefix),
-    ...slackChannelFanoutStatements(database, fanout),
+      .bind(fanout.createdAt, fanout.createdAt, idPrefix, `${prefix};`),
+    ...(fanout.emitSlackChannel ? slackChannelFanoutStatements(database, fanout) : []),
   ];
 }
 
@@ -566,27 +568,55 @@ function digestDue(timezone: string, timestamp: number) {
   }
 }
 
+type DigestChannel = "email" | "slack";
+
+function digestModeSql(channel: DigestChannel) {
+  return channel === "email"
+    ? `COALESCE(preference.email, CASE WHEN n.event_type = 'page_edit' THEN 'digest' ELSE 'immediate' END) = 'digest'`
+    : `COALESCE(preference.slack, 'off') = 'digest'`;
+}
+
+async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: number) {
+  const deliveredColumn = channel === "email" ? "emailed_at" : "slack_at";
+  const rows = await env.DB.prepare(
+    `SELECT DISTINCT COALESCE(preference.timezone, 'UTC') timezone
+       FROM notifications n
+       LEFT JOIN notification_preferences preference
+         ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+      WHERE n.${deliveredColumn} IS NULL AND ${digestModeSql(channel)}`,
+  ).all<{ timezone: string }>();
+  return rows.results.map((row) => row.timezone).filter((timezone) => digestDue(timezone, timestamp));
+}
+
 async function sendDueEmailDigests(env: Env, timestamp: number) {
   if (!env.SEND_EMAIL || !env.EMAIL_FROM) return;
+  const dueTimezones = await dueDigestTimezones(env, "email", timestamp);
+  if (!dueTimezones.length) return;
   const candidates = await env.DB.prepare(
-    `SELECT DISTINCT n.user_id, n.workspace_id, recipient.name, recipient.email,
+    `SELECT n.user_id, n.workspace_id, recipient.name, recipient.email,
             COALESCE(preference.timezone, 'UTC') timezone
        FROM notifications n
        JOIN user recipient ON recipient.id = n.user_id
        LEFT JOIN notification_preferences preference
-         ON preference.user_id = n.user_id AND preference.event_type = 'page_edit'
-      WHERE n.event_type = 'page_edit' AND n.emailed_at IS NULL
-        AND COALESCE(preference.email, 'digest') = 'digest'
+         ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+      WHERE n.emailed_at IS NULL AND ${digestModeSql("email")}
+        AND COALESCE(preference.timezone, 'UTC') IN (SELECT value FROM json_each(?))
+      GROUP BY n.user_id, n.workspace_id, recipient.name, recipient.email, timezone
+      ORDER BY MIN(n.created_at), n.user_id, n.workspace_id, timezone
       LIMIT 50`,
-  ).all<{ user_id: string; workspace_id: string; name: string; email: string; timezone: string }>();
+  )
+    .bind(JSON.stringify(dueTimezones))
+    .all<{ user_id: string; workspace_id: string; name: string; email: string; timezone: string }>();
   for (const candidate of candidates.results) {
-    if (!digestDue(candidate.timezone, timestamp)) continue;
     const ids = await env.DB.prepare(
-      `SELECT id FROM notifications
-        WHERE user_id = ? AND workspace_id = ? AND event_type = 'page_edit' AND emailed_at IS NULL
-        ORDER BY created_at LIMIT 40`,
+      `SELECT n.id FROM notifications n
+        LEFT JOIN notification_preferences preference
+          ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+        WHERE n.user_id = ? AND n.workspace_id = ? AND n.emailed_at IS NULL
+          AND ${digestModeSql("email")} AND COALESCE(preference.timezone, 'UTC') = ?
+        ORDER BY n.created_at, n.id LIMIT 40`,
     )
-      .bind(candidate.user_id, candidate.workspace_id)
+      .bind(candidate.user_id, candidate.workspace_id, candidate.timezone)
       .all<{ id: string }>();
     const rows: DeliveryRow[] = [];
     const suppressed: string[] = [];
@@ -637,21 +667,31 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
 }
 
 async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
+  const dueTimezones = await dueDigestTimezones(env, "slack", timestamp);
+  if (!dueTimezones.length) return;
   const candidates = await env.DB.prepare(
-    `SELECT DISTINCT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
+    `SELECT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
        FROM notifications n
        LEFT JOIN notification_preferences preference
-         ON preference.user_id = n.user_id AND preference.event_type = 'page_edit'
-      WHERE n.event_type = 'page_edit' AND n.slack_at IS NULL
-        AND COALESCE(preference.slack, 'off') = 'digest' LIMIT 50`,
-  ).all<{ user_id: string; workspace_id: string; timezone: string }>();
+         ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+      WHERE n.slack_at IS NULL AND ${digestModeSql("slack")}
+        AND COALESCE(preference.timezone, 'UTC') IN (SELECT value FROM json_each(?))
+      GROUP BY n.user_id, n.workspace_id, timezone
+      ORDER BY MIN(n.created_at), n.user_id, n.workspace_id, timezone
+      LIMIT 50`,
+  )
+    .bind(JSON.stringify(dueTimezones))
+    .all<{ user_id: string; workspace_id: string; timezone: string }>();
   for (const candidate of candidates.results) {
-    if (!digestDue(candidate.timezone, timestamp)) continue;
     const ids = await env.DB.prepare(
-      `SELECT id FROM notifications WHERE user_id = ? AND workspace_id = ? AND event_type = 'page_edit'
-        AND slack_at IS NULL ORDER BY created_at LIMIT 40`,
+      `SELECT n.id FROM notifications n
+        LEFT JOIN notification_preferences preference
+          ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+        WHERE n.user_id = ? AND n.workspace_id = ? AND n.slack_at IS NULL
+          AND ${digestModeSql("slack")} AND COALESCE(preference.timezone, 'UTC') = ?
+        ORDER BY n.created_at, n.id LIMIT 40`,
     )
-      .bind(candidate.user_id, candidate.workspace_id)
+      .bind(candidate.user_id, candidate.workspace_id, candidate.timezone)
       .all<{ id: string }>();
     const rows: DeliveryRow[] = [];
     for (const { id } of ids.results) {

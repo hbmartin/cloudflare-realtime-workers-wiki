@@ -21,7 +21,10 @@ function decodeHtml(value: string) {
     quot: '"',
   };
   return value.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (entity, body: string) => {
-    if (body[0] !== "#") return named[body.toLowerCase()] ?? entity;
+    if (body[0] !== "#") {
+      const key = body.toLowerCase();
+      return Object.hasOwn(named, key) ? named[key]! : entity;
+    }
     const hexadecimal = body[1]?.toLowerCase() === "x";
     const codePoint = Number.parseInt(body.slice(hexadecimal ? 2 : 1), hexadecimal ? 16 : 10);
     return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
@@ -227,10 +230,18 @@ export function htmlToDocument(source: string) {
   let link: string | null = null;
   let list: "bullet" | "numbered" | null = null;
   const marks: Array<"bold" | "italic" | "strike" | "code"> = [];
+  const resetBlock = () => {
+    content = [];
+    kind = "paragraph";
+    level = 1;
+    checked = false;
+    link = null;
+    marks.length = 0;
+  };
   const flush = () => {
     const compact = content.filter((node) => node.text !== "" && node.text !== undefined);
     if (!compact.length) {
-      content = [];
+      resetBlock();
       return;
     }
     const attrs =
@@ -242,9 +253,7 @@ export function htmlToDocument(source: string) {
             ? { language: "" }
             : { ...BLOCK_ATTRS };
     blocks.push({ type: kind, attrs, content: compact });
-    content = [];
-    kind = "paragraph";
-    checked = false;
+    resetBlock();
   };
   for (const token of tokens) {
     if (token[0] !== "<") {

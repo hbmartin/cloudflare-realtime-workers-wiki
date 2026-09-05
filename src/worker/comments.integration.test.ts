@@ -304,4 +304,46 @@ describe("server-authoritative comments", () => {
     const repeated = await SELF.fetch(request(installed.cookie, `/api/pages/${installed.pageId}/comments`));
     expect((await repeated.json<{ threads: CommentThread[] }>()).threads).toHaveLength(1);
   });
+
+  it("migrates legacy threads whose author or resolver no longer exists", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(
+      new Request("https://document.internal/noop", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    const threadId = crypto.randomUUID();
+    await runInDurableObject(stub, async (instance) => {
+      const comment = new Y.Map<unknown>();
+      comment.set("id", crypto.randomUUID());
+      comment.set("userId", "deleted-user");
+      comment.set("body", commentBody("Former collaborator"));
+      comment.set("createdAt", 100);
+      comment.set("updatedAt", 200);
+      const comments = new Y.Array<Y.Map<unknown>>();
+      comments.push([comment]);
+      const thread = new Y.Map<unknown>();
+      thread.set("id", threadId);
+      thread.set("comments", comments);
+      thread.set("createdAt", 100);
+      thread.set("updatedAt", 200);
+      thread.set("resolved", true);
+      thread.set("resolvedBy", "deleted-resolver");
+      thread.set("resolvedUpdatedAt", 200);
+      (instance as unknown as { document: Y.Doc }).document.getMap("comments").set(threadId, thread);
+    });
+
+    const response = await SELF.fetch(request(installed.cookie, `/api/pages/${installed.pageId}/comments`));
+
+    expect(response.status).toBe(200);
+    expect(
+      await env.DB.prepare(`SELECT created_by, resolved_by FROM comment_threads WHERE id = ?`).bind(threadId).first(),
+    ).toEqual({ created_by: installed.userId, resolved_by: null });
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM comments WHERE thread_id = ?`).bind(threadId).first(),
+    ).toEqual({
+      count: 0,
+    });
+  });
 });

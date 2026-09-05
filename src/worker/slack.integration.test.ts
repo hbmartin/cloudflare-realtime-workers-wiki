@@ -432,6 +432,7 @@ describe("Slack security and integration", () => {
         eventType: "page_edit",
         sourceId: "projection-1",
         recipientIds: [],
+        emitSlackChannel: true,
         createdAt: Date.now(),
       }),
     );
@@ -439,6 +440,25 @@ describe("Slack security and integration", () => {
       .bind(installed.page.id)
       .first<{ id: string }>();
     expect(event).not.toBeNull();
+    await env.DB.batch(
+      notificationFanoutStatements(env.DB, {
+        workspaceId: installed.member.workspace.id,
+        spaceId: installed.page.spaceId,
+        pageId: installed.page.id,
+        threadId: null,
+        actorId: installed.member.user.id,
+        eventType: "page_edit",
+        sourceId: "suppressed-projection",
+        recipientIds: [],
+        emitSlackChannel: false,
+        createdAt: Date.now(),
+      }),
+    );
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM slack_channel_events WHERE page_id = ?`)
+        .bind(installed.page.id)
+        .first(),
+    ).toEqual({ count: 1 });
     expect(
       await env.DB.prepare(`SELECT topic FROM outbox WHERE payload_json = json_object('eventId', ?)`)
         .bind(event!.id)

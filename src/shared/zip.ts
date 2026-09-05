@@ -50,11 +50,10 @@ function header(size: number) {
 export function createZip(entries: ZipEntry[]) {
   if (entries.length > MAX_ZIP_ENTRIES) throw new Error("The archive contains too many files.");
   const encoder = new TextEncoder();
-  const files = entries.map((entry) => ({
-    ...entry,
-    path: safeArchivePath(entry.path),
-    name: encoder.encode(entry.path),
-  }));
+  const files = entries.map((entry) => {
+    const path = safeArchivePath(entry.path);
+    return { ...entry, path, name: encoder.encode(path) };
+  });
   if (files.reduce((total, entry) => total + entry.bytes.byteLength, 0) > MAX_EXPANDED_BYTES) {
     throw new Error("The archive expands beyond the supported size.");
   }
@@ -113,14 +112,19 @@ function findEnd(view: DataView) {
   throw new Error("The ZIP central directory is missing.");
 }
 
-export async function readZip(bytes: Uint8Array): Promise<ZipEntry[]> {
+export async function readZip(
+  bytes: Uint8Array,
+  limits: { maxEntries?: number; maxExpandedBytes?: number } = {},
+): Promise<ZipEntry[]> {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const endOffset = findEnd(view);
   if (view.getUint16(endOffset + 4, true) !== 0 || view.getUint16(endOffset + 6, true) !== 0) {
     throw new Error("Multi-disk ZIP archives are not supported.");
   }
   const entries = view.getUint16(endOffset + 10, true);
-  if (entries > MAX_ZIP_ENTRIES) throw new Error("The archive contains too many files.");
+  const maxEntries = Math.min(MAX_ZIP_ENTRIES, limits.maxEntries ?? MAX_ZIP_ENTRIES);
+  const maxExpandedBytes = Math.min(MAX_EXPANDED_BYTES, limits.maxExpandedBytes ?? MAX_EXPANDED_BYTES);
+  if (entries > maxEntries) throw new Error("The archive contains too many files.");
   const centralSize = view.getUint32(endOffset + 12, true);
   const centralOffset = view.getUint32(endOffset + 16, true);
   if (centralOffset + centralSize > endOffset) throw new Error("The ZIP central directory is invalid.");
@@ -150,7 +154,7 @@ export async function readZip(bytes: Uint8Array): Promise<ZipEntry[]> {
     if (offset > endOffset) throw new Error("The ZIP central directory is truncated.");
     if (path.endsWith("/")) continue;
     expanded += uncompressedSize;
-    if (expanded > MAX_EXPANDED_BYTES || (compressedSize > 0 && uncompressedSize / compressedSize > 200)) {
+    if (expanded > maxExpandedBytes || (compressedSize > 0 && uncompressedSize / compressedSize > 200)) {
       throw new Error("The archive expands beyond the supported size.");
     }
     if (localOffset + 30 > centralOffset || view.getUint32(localOffset, true) !== LOCAL_FILE_HEADER) {

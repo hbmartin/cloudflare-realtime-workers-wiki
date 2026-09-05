@@ -2,6 +2,7 @@ import type { Comment, CommentBody, CommentThread, Role } from "../shared/types"
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { notificationFanoutStatements } from "./notifications";
+import { refreshPageSearchV2Statements } from "./search-index";
 
 const COMMENT_BODY_MAX_BYTES = 32 * 1024;
 const COMMENT_BODY_MAX_NODES = 2_000;
@@ -231,24 +232,6 @@ export async function commentThread(env: Env, member: MemberContext, page: Comme
   return threadJson(row, comments.get(threadId) ?? [], member, page);
 }
 
-function refreshCommentSearchStatements(database: D1Database, pageId: string) {
-  return [
-    database.prepare(`DELETE FROM page_search_v2 WHERE page_id = ?`).bind(pageId),
-    database
-      .prepare(
-        `INSERT INTO page_search_v2
-          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-         SELECT p.id, p.workspace_id, p.space_id, p.title,
-                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
-                COALESCE(p.plain_text, ''),
-                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-           FROM pages p WHERE p.id = ? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0`,
-      )
-      .bind(pageId),
-  ];
-}
-
 function watchPageStatement(database: D1Database, page: CommentPage, userId: string, timestamp: number) {
   return database
     .prepare(
@@ -275,6 +258,7 @@ export async function createCommentThread(env: Env, member: MemberContext, page:
   const threadId = crypto.randomUUID();
   const commentId = crypto.randomUUID();
   const timestamp = Date.now();
+  const mentionedUserIds = commentMentionUserIds(body.body);
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO comment_threads
@@ -295,11 +279,12 @@ export async function createCommentThread(env: Env, member: MemberContext, page:
       actorId: member.user.id,
       eventType: "mention",
       sourceId: commentId,
-      recipientIds: commentMentionUserIds(body.body),
+      recipientIds: mentionedUserIds,
+      emitSlackChannel: mentionedUserIds.length > 0,
       data: { commentId },
       createdAt: timestamp,
     }),
-    ...refreshCommentSearchStatements(env.DB, page.id),
+    ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
 }
@@ -350,6 +335,7 @@ export async function addCommentReply(
       eventType: "mention",
       sourceId: commentId,
       recipientIds: mentionedUserIds,
+      emitSlackChannel: mentionedUserIds.length > 0,
       data: { commentId },
       createdAt: timestamp,
     }),
@@ -362,10 +348,11 @@ export async function addCommentReply(
       eventType: "reply",
       sourceId: commentId,
       recipientIds: participantIds,
+      emitSlackChannel: true,
       data: { commentId },
       createdAt: timestamp,
     }),
-    ...refreshCommentSearchStatements(env.DB, page.id),
+    ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
 }
@@ -410,10 +397,11 @@ export async function updateComment(
       eventType: "mention",
       sourceId: commentId,
       recipientIds: newMentionIds,
+      emitSlackChannel: newMentionIds.length > 0,
       data: { commentId },
       createdAt: timestamp,
     }),
-    ...refreshCommentSearchStatements(env.DB, page.id),
+    ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
 }
@@ -440,7 +428,7 @@ export async function softDeleteComment(
         WHERE id = ?`,
     ).bind(timestamp, timestamp, commentId),
     env.DB.prepare(`UPDATE comment_threads SET updated_at = ? WHERE id = ?`).bind(timestamp, threadId),
-    ...refreshCommentSearchStatements(env.DB, page.id),
+    ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
 }
@@ -475,6 +463,7 @@ export async function setThreadResolved(
       eventType: resolved ? "thread_resolved" : "thread_reopened",
       sourceId: `${threadId}:${timestamp}`,
       recipientIds: participantIds,
+      emitSlackChannel: true,
       createdAt: timestamp,
     }),
   ]);
@@ -513,13 +502,15 @@ export async function migrateLegacyComments(env: Env, page: CommentPage) {
         `INSERT OR IGNORE INTO comment_threads
           (id, workspace_id, space_id, page_id, created_by, resolved_at, resolved_by, anchor_json,
            legacy_migrated, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+         SELECT ?, ?, ?, ?, COALESCE((SELECT id FROM user WHERE id = ?), ?), ?,
+                (SELECT id FROM user WHERE id = ?), ?, 1, ?, ?`,
       ).bind(
         thread.id,
         page.workspace_id,
         page.space_id,
         page.id,
         thread.comments[0]?.userId ?? page.created_by,
+        page.created_by,
         thread.resolved ? (thread.resolvedUpdatedAt ?? thread.updatedAt) : null,
         thread.resolved ? (thread.resolvedBy ?? null) : null,
         thread.anchored ? JSON.stringify({ legacy: true }) : null,
@@ -565,7 +556,7 @@ export async function migrateLegacyComments(env: Env, page: CommentPage) {
       page.id,
       Date.now(),
     ),
-    ...refreshCommentSearchStatements(env.DB, page.id),
+    ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`)
     .fetch(

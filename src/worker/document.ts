@@ -10,6 +10,7 @@ import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
 import { sweepOutbox } from "./jobs";
 import { notificationFanoutStatements } from "./notifications";
+import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
 const COMPACTION_DELAY_MS = 30_000;
@@ -900,21 +901,7 @@ export class Document extends YServer {
               SELECT id, workspace_id, title, ? FROM pages
                WHERE id = ? AND content_epoch = ? AND archived_at IS NULL AND import_job_id IS NULL`,
           ).bind(projection.plainText, pageId, epoch),
-          this.bindings.DB.prepare(
-            `DELETE FROM page_search_v2 WHERE page_id = ?
-              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
-          ).bind(pageId, pageId, epoch),
-          this.bindings.DB.prepare(
-            `INSERT INTO page_search_v2
-              (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-             SELECT p.id, p.workspace_id, p.space_id, p.title,
-                    COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
-                    ?,
-                    COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-                    COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-               FROM pages p WHERE p.id = ? AND p.content_epoch = ? AND p.archived_at IS NULL
-                 AND p.import_job_id IS NULL`,
-          ).bind(projection.plainText, pageId, epoch),
+          ...refreshPageSearchV2Statements(this.bindings.DB, pageId, epoch),
           this.bindings.DB.prepare(
             `UPDATE page_references SET projection_seq = -1 WHERE source_page_id = ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
@@ -970,6 +957,9 @@ export class Document extends YServer {
             eventType: "mention",
             sourceId: `${pageId}:${epoch}:${maximum}`,
             recipientIds: metadataAtStart.notify_edit && metadataAtStart.last_editor_id ? newMentionIds : [],
+            emitSlackChannel: Boolean(
+              metadataAtStart.notify_edit && metadataAtStart.last_editor_id && newMentionIds.length,
+            ),
             data: { sequence: maximum },
             createdAt: timestamp,
           }),
@@ -982,6 +972,7 @@ export class Document extends YServer {
             eventType: "page_edit",
             sourceId: `${pageId}:${epoch}:${maximum}`,
             recipientIds: metadataAtStart.notify_edit ? watcherIds : [],
+            emitSlackChannel: Boolean(metadataAtStart.notify_edit && metadataAtStart.last_editor_id),
             data: { sequence: maximum },
             createdAt: timestamp,
           }),

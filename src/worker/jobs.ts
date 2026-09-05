@@ -8,6 +8,7 @@ import { migrateLegacyComments, type CommentPage } from "./comments";
 import { HttpError } from "./http";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
+import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
@@ -386,14 +387,7 @@ async function publishTemplateClone(env: Env, job: JobRow, options: TemplateClon
        SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages
         WHERE id = ? AND import_job_id IS NULL AND is_template = 0`,
     ).bind(options.targetPageId),
-    env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id = ?`).bind(options.targetPageId),
-    env.DB.prepare(
-      `INSERT INTO page_search_v2
-        (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-       SELECT p.id, p.workspace_id, p.space_id, p.title, '', COALESCE(p.plain_text, ''), '',
-              COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-         FROM pages p WHERE p.id = ? AND p.import_job_id IS NULL AND p.is_template = 0`,
-    ).bind(options.targetPageId),
+    ...refreshPageSearchV2Statements(env.DB, options.targetPageId),
     env.DB.prepare(
       `UPDATE jobs SET status = 'succeeded', progress_current = 4, progress_total = 4,
         progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
@@ -422,15 +416,19 @@ async function deleteR2Prefix(bucket: R2Bucket, prefix: string) {
   } while (cursor);
 }
 
-async function cleanupTemplateClone(env: Env, job: JobRow, options: TemplateCloneOptions) {
+export async function cleanupTemplateClone(env: Env, job: JobRow) {
+  const options = templateCloneOptions(job);
   const staged = await env.DB.prepare(`SELECT id, kind, content_epoch FROM pages WHERE id = ? AND import_job_id = ?`)
     .bind(options.targetPageId, job.id)
     .first<{ id: string; kind: "document" | "table"; content_epoch: number }>();
-  if (!staged) return;
-  const attachments = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE page_id = ?`)
-    .bind(options.targetPageId)
-    .all<{ r2_key: string }>();
-  if (staged.kind === "document") {
+  const attachments = staged
+    ? (
+        await env.DB.prepare(`SELECT r2_key FROM attachments WHERE page_id = ?`)
+          .bind(options.targetPageId)
+          .all<{ r2_key: string }>()
+      ).results
+    : [];
+  if (staged?.kind === "document") {
     const purged = await env.DOCUMENT.getByName(`${staged.id}~${staged.content_epoch}`).fetch(
       new Request("https://document.internal/purge", {
         method: "POST",
@@ -439,16 +437,18 @@ async function cleanupTemplateClone(env: Env, job: JobRow, options: TemplateClon
     );
     if (!purged.ok) throw new Error("The staged document could not be purged.");
   }
-  await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ?`).bind(options.targetPageId, job.id).run();
+  if (staged) {
+    await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ?`)
+      .bind(options.targetPageId, job.id)
+      .run();
+  }
   const keys = [
     ...new Set(
-      [job.input_key, `jobs/${job.id}/template-content.bin`, ...attachments.results.map((row) => row.r2_key)].filter(
-        Boolean,
-      ),
+      [job.input_key, `jobs/${job.id}/template-content.bin`, ...attachments.map((row) => row.r2_key)].filter(Boolean),
     ),
   ] as string[];
   if (keys.length) await env.BUCKET.delete(keys);
-  await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/`);
+  if (staged) await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/`);
   await env.DB.prepare(`UPDATE jobs SET input_key = NULL, updated_at = ? WHERE id = ?`).bind(Date.now(), job.id).run();
 }
 
@@ -558,7 +558,7 @@ export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "work
     else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
     if (row.type === "template_clone") {
-      await cleanupTemplateClone(env, row, templateCloneOptions(row)).catch((cleanupError) => {
+      await cleanupTemplateClone(env, row).catch((cleanupError) => {
         console.error("Failed to clean up inline template clone", { jobId: row.id, cleanupError });
       });
     } else if (row.type === "import") {
@@ -632,26 +632,14 @@ async function assertJobActive(env: Env, jobId: string) {
 async function reindexPageBatch(env: Env, workspaceId: string, afterId: string) {
   const pages = await env.DB.prepare(
     `SELECT id FROM pages WHERE workspace_id = ?
-      AND import_job_id IS NULL AND is_template = 0 AND id > ? ORDER BY id LIMIT ?`,
+      AND archived_at IS NULL AND import_job_id IS NULL AND is_template = 0 AND id > ? ORDER BY id LIMIT ?`,
   )
     .bind(workspaceId, afterId, REINDEX_BATCH_SIZE)
     .all<{ id: string }>();
   if (!pages.results.length) return { lastId: afterId, count: 0 };
   const statements: D1PreparedStatement[] = [];
   for (const page of pages.results) {
-    statements.push(
-      env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id = ?`).bind(page.id),
-      env.DB.prepare(
-        `INSERT INTO page_search_v2
-          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-         SELECT p.id, p.workspace_id, p.space_id, p.title,
-                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
-                COALESCE(p.plain_text, ''),
-                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-           FROM pages p WHERE p.id = ? AND p.import_job_id IS NULL AND p.is_template = 0`,
-      ).bind(page.id),
-    );
+    statements.push(...refreshPageSearchV2Statements(env.DB, page.id));
   }
   await env.DB.batch(statements);
   return { lastId: pages.results.at(-1)!.id, count: pages.results.length };
@@ -788,7 +776,7 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       if (current?.status === "canceling" || current?.status === "canceled") {
         const canceledJob = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>();
         if (canceledJob?.type === "template_clone") {
-          await cleanupTemplateClone(this.env, canceledJob, templateCloneOptions(canceledJob)).catch((cleanupError) => {
+          await cleanupTemplateClone(this.env, canceledJob).catch((cleanupError) => {
             console.error("Failed to clean up canceled template clone", { jobId, cleanupError });
           });
         }
@@ -802,7 +790,7 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       }
       const failedJob = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>();
       if (failedJob?.type === "template_clone") {
-        await cleanupTemplateClone(this.env, failedJob, templateCloneOptions(failedJob)).catch((cleanupError) => {
+        await cleanupTemplateClone(this.env, failedJob).catch((cleanupError) => {
           console.error("Failed to clean up failed template clone", { jobId, cleanupError });
         });
       }
