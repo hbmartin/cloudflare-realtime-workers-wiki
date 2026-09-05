@@ -2,6 +2,7 @@ import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionC
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import type { Job } from "../shared/types";
+import { readZip } from "../shared/zip";
 import type { Env } from "./env";
 import {
   consumeDeliveryMessage,
@@ -233,6 +234,107 @@ describe("job execution", () => {
     expect(
       (await env.DB.prepare(`SELECT output_key FROM jobs WHERE id = ?`).bind(jobId).first())?.output_key,
     ).toBeNull();
+  });
+
+  it("exports a freshly flushed document with portable attachments", async () => {
+    const installed = await bootstrap();
+    const attachmentId = crypto.randomUUID();
+    const attachmentKey = `assets/${installed.workspaceId}/${attachmentId}/brief`;
+    await env.BUCKET.put(attachmentKey, "portable bytes", { httpMetadata: { contentType: "text/plain" } });
+    await env.DB.prepare(
+      `INSERT INTO attachments
+        (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+       VALUES (?, ?, ?, ?, 'brief.txt', 'text/plain', 14, ?, ?)`,
+    )
+      .bind(attachmentId, installed.workspaceId, installed.pageId, attachmentKey, installed.userId, Date.now())
+      .run();
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "WORKFLOW_INLINE") return "true";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "markdown", portable: true }),
+      }),
+      bindings,
+      context,
+    );
+    expect(response.status).toBe(202);
+    const job = (await response.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    const completed = await worker.fetch(request(installed.cookie, `/api/jobs/${job.id}`), env, createExecutionContext());
+    expect((await completed.json<{ job: Job }>()).job).toMatchObject({ status: "succeeded", hasDownload: true });
+    const download = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}/download`),
+      env,
+      createExecutionContext(),
+    );
+    expect(download.headers.get("content-type")).toContain("application/zip");
+    const entries = await readZip(new Uint8Array(await download.arrayBuffer()));
+    expect(entries.map((entry) => entry.path)).toEqual(["Welcome.md", "assets/brief.txt"]);
+    expect(new TextDecoder().decode(entries[0]!.bytes)).toContain("# Welcome");
+    expect(new TextDecoder().decode(entries[1]!.bytes)).toBe("portable bytes");
+  });
+
+  it("reports PDF configuration and renders through the Browser Run binding", async () => {
+    const installed = await bootstrap();
+    const unavailableBindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "BROWSER") return undefined;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(
+      (
+        await worker.fetch(
+          request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ format: "pdf" }),
+          }),
+          unavailableBindings,
+          createExecutionContext(),
+        )
+      ).status,
+    ).toBe(503);
+
+    const quickAction = vi.fn(async (_action: string, options: { html?: string }) => {
+      expect(options.html).toContain("<h1>Welcome</h1>");
+      return new Response("%PDF-test", { headers: { "content-type": "application/pdf" } });
+    });
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "WORKFLOW_INLINE") return "true";
+        if (property === "BROWSER") return { quickAction } as unknown as BrowserRun;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const context = createExecutionContext();
+    const queued = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "pdf" }),
+      }),
+      bindings,
+      context,
+    );
+    const job = (await queued.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+    expect(quickAction).toHaveBeenCalledWith("pdf", expect.objectContaining({ html: expect.any(String) }));
+    const download = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}/download`),
+      env,
+      createExecutionContext(),
+    );
+    expect(download.headers.get("content-type")).toContain("application/pdf");
+    expect(new TextDecoder().decode(await download.arrayBuffer())).toBe("%PDF-test");
   });
 
   it("publishes a document template atomically and rewrites cloned attachment references", async () => {

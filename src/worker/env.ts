@@ -12,6 +12,7 @@ export interface AppBindings {
   NOTES_WORKFLOW: Workflow<Readonly<JobWorkflowParams>>;
   DELIVERY_QUEUE: Queue;
   SEND_EMAIL?: SendEmail;
+  BROWSER?: BrowserRun;
   EMAIL_FROM?: string;
   ASSETS: Fetcher;
   BETTER_AUTH_SECRET: string;

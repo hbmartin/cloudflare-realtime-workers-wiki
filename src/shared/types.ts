@@ -171,13 +171,24 @@ export type Job = {
   status: JobStatus;
   progress: { current: number; total: number; label: string };
   warnings: string[];
-  result: { pageId?: string } | null;
+  result: { pageId?: string; preview?: ImportPreview } | null;
   error: { code: string; message: string } | null;
   hasDownload: boolean;
   expiresAt: number | null;
   createdAt: number;
   updatedAt: number;
 };
+
+export type ImportPreview = {
+  format: "markdown" | "html" | "notion_zip";
+  filename: string;
+  pages: number;
+  tables: number;
+  assets: number;
+  warnings: string[];
+};
+
+export type ExportFormat = "markdown" | "html" | "pdf";
 
 export type SearchArchiveState = "active" | "archived" | "all";
 export type SearchSnippetSource = "title" | "tag" | "body" | "comment" | "attachment";

@@ -1690,6 +1690,86 @@ button.mention-chip:focus-visible {
   padding: 0;
   color: var(--ink);
 }
+.export-dialog {
+  position: fixed;
+  z-index: 31;
+  inset: 50% auto auto 50%;
+  width: min(520px, calc(100vw - 28px));
+  max-height: calc(100vh - 40px);
+  margin: 0;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--canvas);
+  color: var(--ink);
+  box-shadow: 0 24px 70px #25231f38;
+}
+.export-dialog > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px;
+  border-bottom: 1px solid var(--line);
+}
+.export-dialog h2,
+.export-dialog p {
+  margin: 0;
+}
+.export-dialog h2 {
+  margin-top: 4px;
+  font-family: Georgia, serif;
+  font-size: 24px;
+  font-weight: 400;
+}
+.export-dialog form {
+  display: grid;
+  gap: 18px;
+  padding: 20px;
+}
+.export-dialog fieldset {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.export-dialog legend {
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 750;
+}
+.export-dialog fieldset label,
+.portable-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fffefa;
+}
+.export-dialog label input {
+  grid-row: 1 / span 2;
+}
+.export-dialog label strong {
+  display: block;
+  grid-column: 2;
+}
+.export-dialog label small {
+  display: block;
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 11px;
+}
+.export-dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 .activities-tray > header {
   min-height: 76px;
   padding: 16px 20px;

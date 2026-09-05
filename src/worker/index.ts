@@ -72,6 +72,7 @@ import {
 } from "../shared/validation";
 import type {
   ClientMemberContext,
+  ExportFormat,
   NotificationChannelMode,
   NotificationEventType,
   NotificationPreference,
@@ -1719,6 +1720,45 @@ app.get("/api/jobs/:id/download", async (c) => {
     attachmentDisposition(artifact.customMetadata?.filename ?? `notes-${job.type}`, false),
   );
   return new Response(artifact.body, { headers });
+});
+
+app.get("/api/integrations/status", async (c) => {
+  await requireMember(c.req.raw, c.env);
+  return c.json({
+    email: { available: Boolean(c.env.SEND_EMAIL && c.env.EMAIL_FROM) },
+    pdf: { available: Boolean(c.env.BROWSER) },
+    slack: { available: false },
+  });
+});
+
+app.post("/api/pages/:id/exports", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const format = text(body.format, "format", 20) as ExportFormat;
+  if (!["markdown", "html", "pdf"].includes(format)) {
+    throw new HttpError(422, "invalid_export_format", "Choose Markdown, HTML, or PDF.");
+  }
+  const portable = body.portable === true;
+  if (format === "pdf" && portable) {
+    throw new HttpError(422, "invalid_export_options", "PDF exports are always a single file.");
+  }
+  if (format === "pdf" && !c.env.BROWSER) {
+    throw new HttpError(503, "pdf_unavailable", "PDF export is not configured for this installation.");
+  }
+  const job = await createJob(c.env, {
+    member,
+    type: "export",
+    spaceId: page.space_id ?? `${member.workspace.id}-general`,
+    options: { pageId: page.id, format, portable },
+  });
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, job).catch((error) => {
+      console.error("Failed to start export workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job) }, 202);
 });
 
 app.get("/api/pages/tree", async (c) => {

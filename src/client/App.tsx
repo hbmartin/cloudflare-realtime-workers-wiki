@@ -46,6 +46,7 @@ import { TemplateLibrary } from "./TemplateLibrary";
 import { NotificationsPanel } from "./NotificationsPanel";
 import { WatchControl } from "./WatchControl";
 import { SearchView } from "./SearchView";
+import { ExportDialog } from "./ExportDialog";
 
 type AppState =
   | { screen: "loading" }
@@ -749,6 +750,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
   const [activitiesOpen, setActivitiesOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
   const [notificationsRevision, setNotificationsRevision] = useState(0);
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -2442,8 +2444,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}
         aria-label="Workspace navigation"
         tabIndex={-1}
-        inert={activitiesOpen || notificationsOpen ? true : undefined}
-        aria-hidden={activitiesOpen || notificationsOpen || undefined}
+        inert={activitiesOpen || notificationsOpen || exportOpen ? true : undefined}
+        aria-hidden={activitiesOpen || notificationsOpen || exportOpen || undefined}
       >
         <header className="workspace-header">
           <span className="workspace-avatar">{member.workspace.name.slice(0, 1).toUpperCase()}</span>
@@ -2590,8 +2592,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
       <section
         className="workspace-content"
-        inert={activitiesOpen || notificationsOpen ? true : undefined}
-        aria-hidden={activitiesOpen || notificationsOpen || undefined}
+        inert={activitiesOpen || notificationsOpen || exportOpen ? true : undefined}
+        aria-hidden={activitiesOpen || notificationsOpen || exportOpen || undefined}
       >
         {workspaceError && (
           <div className="form-error workspace-error" role="alert">
@@ -2637,6 +2639,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                 >
                   <span aria-hidden="true">★</span>
                   Favorite
+                </button>
+                <button className="organization-action" onClick={() => setExportOpen(true)}>
+                  <span aria-hidden="true">⇩</span>
+                  Export
                 </button>
                 {canEditActiveSpace && (
                   <>
@@ -2811,6 +2817,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onClose={() => setNotificationsOpen(false)}
           onSelectPage={navigateToPage}
           onUnreadCountChange={setUnreadNotifications}
+        />
+      )}
+      {exportOpen && activeSelected && (
+        <ExportDialog
+          page={activeSelected}
+          onClose={() => setExportOpen(false)}
+          onQueued={(job) => {
+            setJobs((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)]);
+            setExportOpen(false);
+            setActivitiesOpen(true);
+          }}
         />
       )}
       {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
