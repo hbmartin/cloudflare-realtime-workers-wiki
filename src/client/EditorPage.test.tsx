@@ -75,6 +75,7 @@ vi.mock("@blocknote/react", () => ({
 }));
 
 vi.mock("./BacklinksPanel", () => ({ BacklinksPanel: () => null }));
+vi.mock("./editor-blocks", () => ({ editorBlockFactories: [] }));
 vi.mock("./mentions", () => ({ notesSchema: {} }));
 
 const page: Page = {

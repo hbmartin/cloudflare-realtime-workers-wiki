@@ -138,6 +138,27 @@ test("organizes pages with spaces, favorites, pins, and tags", async ({ page }) 
   ).toEqual([]);
 });
 
+test("inserts the custom editor block pack from the slash menu", async ({ page }) => {
+  await signIn(page);
+  const editor = page.locator(".bn-editor");
+  await editor.click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("/");
+
+  await expect(page.getByText("Callout", { exact: true }).last()).toBeVisible();
+  await expect(page.getByText("Math", { exact: true }).last()).toBeVisible();
+  await expect(page.getByText("Diagram", { exact: true }).last()).toBeVisible();
+  await expect(page.getByText("Columns", { exact: true }).last()).toBeVisible();
+  await expect(page.getByText("Embed", { exact: true }).last()).toBeVisible();
+  await page.getByText("Callout", { exact: true }).last().click();
+
+  await expect(page.getByLabel("Callout icon")).toBeVisible();
+  await expect(page.getByLabel("Callout tone")).toHaveValue("info");
+  await page.getByLabel("Callout tone").selectOption("warning");
+  await expect(page.locator(".editor-callout.tone-warning")).toBeVisible();
+});
+
 test("creates, renames, archives, and restores a page through the UI @mobile-sidebar", async ({ page }, testInfo) => {
   await signIn(page);
   const title = `Lifecycle ${testInfo.project.name} ${Date.now()}`;

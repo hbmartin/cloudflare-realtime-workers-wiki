@@ -791,6 +791,147 @@ select:focus-visible {
   min-height: 360px;
   font-family: Inter, sans-serif;
 }
+.editor-callout {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  width: 100%;
+  padding: 14px;
+  border: 1px solid #cbd6e5;
+  border-left: 4px solid #6783a5;
+  border-radius: 8px;
+  background: #edf4fb;
+}
+.editor-callout.tone-success {
+  background: #edf7ef;
+  border-color: #a9cfb2;
+  border-left-color: #4b9360;
+}
+.editor-callout.tone-warning {
+  background: #fff8df;
+  border-color: #e8d28a;
+  border-left-color: #b28d21;
+}
+.editor-callout.tone-danger {
+  background: #fff0ed;
+  border-color: #e2b2aa;
+  border-left-color: #bc554b;
+}
+.callout-icon,
+.callout-icon-readonly {
+  width: 34px;
+  min-height: 29px;
+  padding: 2px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  text-align: center;
+  font-size: 19px;
+}
+.callout-icon:hover,
+.callout-icon:focus {
+  border-color: #aaa;
+  background: #ffffff88;
+  outline: none;
+}
+.callout-content {
+  min-width: 0;
+  padding-top: 3px;
+}
+.callout-tone select,
+.editor-columns select {
+  padding: 3px 5px;
+  border: 1px solid #bdb9af;
+  border-radius: 5px;
+  background: #fffefa;
+  color: var(--muted);
+  font-size: 10px;
+}
+.editor-math-block,
+.editor-mermaid,
+.editor-embed {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  padding: 14px;
+  border: 1px solid #dfdbd1;
+  border-radius: 8px;
+  background: #faf9f5;
+}
+.math-preview {
+  min-height: 45px;
+  overflow-x: auto;
+  display: grid;
+  place-items: center;
+}
+.editor-math-block textarea,
+.editor-mermaid textarea,
+.editor-embed input {
+  width: 100%;
+  resize: vertical;
+  padding: 7px 9px;
+  border: 1px solid #d4d0c6;
+  border-radius: 6px;
+  background: white;
+  color: var(--ink);
+  font:
+    12px/1.45 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}
+.editor-inline-math {
+  display: inline-block;
+  padding: 0 2px;
+  border-radius: 4px;
+  background: #f3f0e9;
+}
+.editor-mermaid iframe,
+.editor-embed iframe {
+  width: 100%;
+  min-height: 280px;
+  border: 0;
+  border-radius: 6px;
+  background: white;
+}
+.diagram-placeholder {
+  min-height: 100px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+.editor-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  width: 100%;
+  padding: 12px;
+  border: 1px dashed #c9c4b8;
+  border-radius: 8px;
+}
+.editor-columns > div {
+  column-count: var(--column-count);
+  column-gap: 28px;
+  column-rule: 1px solid #e3dfd6;
+}
+.editor-embed > a {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid #d7d2c8;
+  border-radius: 7px;
+  background: white;
+  color: var(--ink);
+  text-decoration: none;
+}
+.editor-embed > a span {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
 .mention-wrap {
   position: relative;
   display: inline;
@@ -1587,6 +1728,15 @@ button.mention-chip:focus-visible {
   }
   .page-tags {
     padding-inline: 12px;
+  }
+  .editor-callout {
+    grid-template-columns: 30px minmax(0, 1fr);
+  }
+  .callout-tone {
+    grid-column: 1 / -1;
+  }
+  .editor-columns > div {
+    column-count: 1;
   }
   /* Touch devices never hover, so the row actions have to stay put. */
   .tree-actions {

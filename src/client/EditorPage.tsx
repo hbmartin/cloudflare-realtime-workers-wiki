@@ -1,7 +1,13 @@
 import { CommentsExtension, DefaultThreadStoreAuth, ThreadStoreAuth } from "@blocknote/core/comments";
+import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
 import { withCollaboration, YjsThreadStore } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
-import { SuggestionMenuController, ThreadsSidebar, useCreateBlockNote } from "@blocknote/react";
+import {
+  getDefaultReactSlashMenuItems,
+  SuggestionMenuController,
+  ThreadsSidebar,
+  useCreateBlockNote,
+} from "@blocknote/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
@@ -13,6 +19,7 @@ import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
 import { createDocumentCloseReconciler } from "./document-connection";
+import { editorBlockFactories } from "./editor-blocks";
 import { notesSchema } from "./mentions";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 
@@ -509,6 +516,32 @@ function CollaborativeEditor({
 }) {
   const options = useMemo(() => editorOptions(bundle, member, editable, pageId), [bundle, editable, member, pageId]);
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
+  const getSlashItems = async (query: string) =>
+    filterSuggestionItems(
+      [
+        ...getDefaultReactSlashMenuItems(editor),
+        ...editorBlockFactories.map((item) => ({
+          title: item.label,
+          subtext: item.description,
+          aliases: [item.type],
+          group: "Notes blocks",
+          icon: <span>{item.icon}</span>,
+          onItemClick: () => insertOrUpdateBlockForSlashMenu(editor, { type: item.type }),
+        })),
+        {
+          title: "Inline math",
+          subtext: "Insert a KaTeX formula in this line",
+          aliases: ["formula", "latex"],
+          group: "Notes blocks",
+          icon: <span>𝑥</span>,
+          onItemClick: () =>
+            editor.insertInlineContent([{ type: "inlineMath", props: { formula: "x" } }], {
+              updateSelection: true,
+            }),
+        },
+      ],
+      query,
+    );
   const getMentionItems = async (query: string) => {
     const data = await api<{ suggestions: MentionSuggestion[] }>(
       `/api/mentions/suggestions?q=${encodeURIComponent(query)}`,
@@ -536,7 +569,8 @@ function CollaborativeEditor({
     }));
   };
   return (
-    <BlockNoteView editor={editor} editable={editable} className="notes-editor" theme="light">
+    <BlockNoteView editor={editor} editable={editable} className="notes-editor" theme="light" slashMenu={false}>
+      {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
       {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
       {commentsOpen && (
         <aside className="side-panel comments-panel">
