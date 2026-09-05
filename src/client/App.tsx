@@ -45,6 +45,7 @@ import { PageTags } from "./PageTags";
 import { TemplateLibrary } from "./TemplateLibrary";
 import { NotificationsPanel } from "./NotificationsPanel";
 import { WatchControl } from "./WatchControl";
+import { SearchView } from "./SearchView";
 
 type AppState =
   | { screen: "loading" }
@@ -735,9 +736,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [view, setView] = useState<"pages" | "search" | "mentions" | "templates" | "trash" | "settings">("pages");
-  const [search, setSearch] = useState("");
-  const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
+  const [view, setView] = useState<"pages" | "search" | "mentions" | "templates" | "trash" | "settings">(() =>
+    new URLSearchParams(window.location.search).get("view") === "search" ? "search" : "pages",
+  );
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
   const [commentsRevision, setCommentsRevision] = useState(0);
@@ -2225,17 +2226,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       finishWorkspaceErrorAttempt(attempt);
     }
   }
-  async function runSearch(value: string) {
-    setSearch(value);
-    if (!value.trim()) {
-      setSearchResults([]);
-      return;
-    }
-    const data = await api<{ results: Array<{ page: Page; snippet: string }> }>(
-      `/api/search?q=${encodeURIComponent(value)}`,
-    );
-    setSearchResults(data.results);
-  }
   // Under the mobile breakpoint the open drawer sits over a full-viewport scrim,
   // so navigating without closing it strands the reader behind the thing they
   // just opened. Selecting a page already closes it; these do the same.
@@ -2725,7 +2715,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         )}
 
         {view === "search" ? (
-          <SearchView value={search} results={searchResults} onChange={runSearch} onSelect={navigateToPage} />
+          <SearchView spaces={spaces} tags={tags} onSelect={navigateToPage} />
         ) : view === "mentions" ? (
           <MentionsView onSelect={navigateToPage} onRead={handleMentionsRead} />
         ) : view === "templates" ? (
@@ -2952,41 +2942,6 @@ function PageTree({
       )}
     </div>
   ));
-}
-
-function SearchView({
-  value,
-  results,
-  onChange,
-  onSelect,
-}: {
-  value: string;
-  results: Array<{ page: Page; snippet: string }>;
-  onChange: (value: string) => Promise<void>;
-  onSelect: (id: string) => void;
-}) {
-  return (
-    <main className="utility-view">
-      <p className="eyebrow">Workspace search</p>
-      <h1>Find anything</h1>
-      <input
-        className="search-input"
-        value={value}
-        onChange={(event) => void onChange(event.target.value)}
-        placeholder="Search titles and documents…"
-        autoFocus
-      />
-      <div className="search-results">
-        {results.map(({ page, snippet }) => (
-          <button key={page.id} onClick={() => onSelect(page.id)}>
-            <strong>{page.title}</strong>
-            <span>{snippet.replace(/<\/?mark>/g, "")}</span>
-          </button>
-        ))}
-        {value && !results.length && <p className="empty-copy">No matching pages.</p>}
-      </div>
-    </main>
-  );
 }
 
 type MentionPageResponse = {

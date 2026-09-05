@@ -116,6 +116,7 @@ import {
   setSubscription,
   spaceWatchState,
 } from "./notifications";
+import { parseSearchRequest, searchPages, searchTitles } from "./search";
 
 const app = new Hono<{ Bindings: Env }>();
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -997,6 +998,11 @@ app.post("/api/install/bootstrap", async (c) => {
       pageId,
       workspaceId,
     ),
+    c.env.DB.prepare(
+      `INSERT INTO page_search_v2
+        (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+       VALUES (?, ?, ?, 'Welcome', '', '', '', '')`,
+    ).bind(pageId, workspaceId, `${workspaceId}-general`),
   ]);
   return signup.response;
 });
@@ -1780,6 +1786,11 @@ app.post("/api/pages", async (c) => {
         title,
       ),
       c.env.DB.prepare(
+        `INSERT INTO page_search_v2
+          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+         VALUES (?, ?, ?, ?, '', '', '', '')`,
+      ).bind(id, member.workspace.id, spaceId, title),
+      c.env.DB.prepare(
         `INSERT INTO subscriptions
           (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
          VALUES (?, ?, ?, 'page', ?, ?, ?)
@@ -1907,6 +1918,11 @@ app.post("/api/pages/batch", async (c) => {
         member.workspace.id,
         page.title,
       ),
+      c.env.DB.prepare(
+        `INSERT INTO page_search_v2
+          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+         VALUES (?, ?, ?, ?, '', '', '', '')`,
+      ).bind(page.id, member.workspace.id, page.spaceId, page.title),
       c.env.DB.prepare(
         `INSERT INTO subscriptions
           (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
@@ -2260,6 +2276,7 @@ app.patch("/api/pages/:id", async (c) => {
       titleValue,
       await currentPlainText(c.env, page.id),
     ),
+    ...refreshSearchV2Statements(c.env.DB, page.id),
   ]);
   const updated = pageJson(await pageForMember(c.env, member, page.id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [updated] });
@@ -2650,6 +2667,27 @@ app.post("/api/pages/:id/restore", async (c) => {
          ) SELECT id FROM subtree
        )`,
       ).bind(page.id),
+      c.env.DB.prepare(
+        `DELETE FROM page_search_v2 WHERE page_id IN (
+         WITH RECURSIVE subtree(id) AS (
+           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+         ) SELECT id FROM subtree
+       )`,
+      ).bind(page.id),
+      c.env.DB.prepare(
+        `INSERT INTO page_search_v2
+          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+         SELECT p.id, p.workspace_id, p.space_id, p.title,
+                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
+                COALESCE(p.plain_text, ''),
+                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
+                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
+           FROM pages p WHERE p.id IN (
+             WITH RECURSIVE subtree(id) AS (
+               SELECT ? UNION ALL SELECT child.id FROM pages child JOIN subtree parent ON child.parent_id = parent.id
+             ) SELECT id FROM subtree
+           ) AND p.import_job_id IS NULL AND p.is_template = 0`,
+      ).bind(page.id),
     ],
     // Read the restored snapshot in the same transaction as the update.
     restoredSnapshotStatement,
@@ -2775,24 +2813,12 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
 
 app.get("/api/search", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const query = (c.req.query("q") ?? "").trim().slice(0, 200);
-  if (!query) return c.json({ results: [] });
-  const terms = query.match(/[\p{L}\p{N}_]+/gu)?.slice(0, 20) ?? [];
-  if (!terms.length) return c.json({ results: [] });
-  const match = terms.map((word) => `"${word.replaceAll('"', '""')}"*`).join(" AND ");
-  const rows = await c.env.DB.prepare(
-    `SELECT p.*, snippet(page_search, 3, '<mark>', '</mark>', '…', 20) snippet
-       FROM page_search JOIN pages p ON p.id = page_search.page_id
-       JOIN spaces s ON s.id = p.space_id
-       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
-      WHERE page_search MATCH ? AND page_search.workspace_id = ? AND p.archived_at IS NULL
-        AND p.import_job_id IS NULL AND p.is_template = 0
-        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
-      ORDER BY bm25(page_search) LIMIT 30`,
-  )
-    .bind(member.user.id, match, member.workspace.id, member.role)
-    .all<PageRow & { snippet: string }>();
-  return c.json({ results: rows.results.map((row) => ({ page: pageJson(row), snippet: row.snippet })) });
+  return c.json(await searchPages(c.env.DB, member, parseSearchRequest(c.req.url)));
+});
+
+app.get("/api/search/titles", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json(await searchTitles(c.env.DB, member, c.req.url));
 });
 
 app.get("/api/mentions/suggestions", async (c) => {

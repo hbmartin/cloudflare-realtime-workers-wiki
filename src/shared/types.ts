@@ -179,6 +179,38 @@ export type Job = {
   updatedAt: number;
 };
 
+export type SearchArchiveState = "active" | "archived" | "all";
+export type SearchSnippetSource = "title" | "tag" | "body" | "comment" | "attachment";
+
+export type SearchFilters = {
+  spaceId?: string;
+  tagIds?: string[];
+  creatorId?: string;
+  kind?: PageKind;
+  updatedFrom?: number;
+  updatedTo?: number;
+  hasComments?: boolean;
+  archive?: SearchArchiveState;
+};
+
+export type SearchResult = {
+  page: Page;
+  space: { id: string; name: string; icon: string | null };
+  snippet: { source: SearchSnippetSource; text: string };
+};
+
+export type SearchResponse = {
+  results: SearchResult[];
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+};
+
+export type SearchTitleSuggestion = {
+  page: Pick<Page, "id" | "spaceId" | "kind" | "title" | "icon" | "archivedAt" | "updatedAt">;
+  space: { id: string; name: string; icon: string | null };
+};
+
 export type PageNode = Page & { children: PageNode[] };
 
 export type MentionEntityType = "page" | "user";

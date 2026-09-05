@@ -137,6 +137,26 @@ describe("D1 migrations", () => {
         `SELECT workspace_id, requested_by, type, status FROM jobs WHERE workspace_id = 'workspace'`,
       ).first(),
     ).toEqual({ workspace_id: "workspace", requested_by: "owner", type: "comment_migration", status: "queued" });
+
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = 'page'`).bind(timestamp),
+      env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id = 'page'`),
+    ]);
+    const searchMigration = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0015_search_v2_rollout.sql",
+    );
+    expect(searchMigration).toBeTruthy();
+    await applyD1Migrations(env.DB, [searchMigration!]);
+    expect(await env.DB.prepare(`SELECT page_id, title FROM page_search_v2 WHERE page_id = 'page'`).first()).toEqual({
+      page_id: "page",
+      title: "Page",
+    });
+    expect(
+      await env.DB.prepare(
+        `SELECT workspace_id, requested_by, type, status FROM jobs
+          WHERE workspace_id = 'workspace' AND type = 'search_reindex'`,
+      ).first(),
+    ).toEqual({ workspace_id: "workspace", requested_by: "owner", type: "search_reindex", status: "queued" });
   });
 
   it("backfills every legacy page into a General space and guards cross-space parents", async () => {

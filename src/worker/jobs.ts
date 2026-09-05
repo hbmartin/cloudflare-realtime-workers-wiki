@@ -610,7 +610,7 @@ async function assertJobActive(env: Env, jobId: string) {
 
 async function reindexPageBatch(env: Env, workspaceId: string, afterId: string) {
   const pages = await env.DB.prepare(
-    `SELECT id FROM pages WHERE workspace_id = ? AND archived_at IS NULL
+    `SELECT id FROM pages WHERE workspace_id = ?
       AND import_job_id IS NULL AND is_template = 0 AND id > ? ORDER BY id LIMIT ?`,
   )
     .bind(workspaceId, afterId, REINDEX_BATCH_SIZE)
@@ -628,8 +628,7 @@ async function reindexPageBatch(env: Env, workspaceId: string, afterId: string) 
                 COALESCE(p.plain_text, ''),
                 COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
                 COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-           FROM pages p WHERE p.id = ? AND p.archived_at IS NULL
-             AND p.import_job_id IS NULL AND p.is_template = 0`,
+           FROM pages p WHERE p.id = ? AND p.import_job_id IS NULL AND p.is_template = 0`,
       ).bind(page.id),
     );
   }
@@ -720,7 +719,7 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       const total = await step.do("count pages", async () => {
         await assertJobActive(this.env, jobId);
         const count = await this.env.DB.prepare(
-          `SELECT COUNT(*) count FROM pages WHERE workspace_id = ? AND archived_at IS NULL
+          `SELECT COUNT(*) count FROM pages WHERE workspace_id = ?
             AND import_job_id IS NULL AND is_template = 0`,
         )
           .bind(job.workspace_id)
