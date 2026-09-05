@@ -2255,6 +2255,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }
   function showView(next: "search" | "mentions" | "templates" | "settings") {
     cancelPendingSelection();
+    if (next === "templates") void loadOrganization();
     setView(next);
     closeSidebar(true);
   }
@@ -2713,8 +2714,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             </button>
             {member.role !== "viewer" && (
               <div className="new-menu">
-                <button className="quiet-button" disabled={!canCreatePage} onClick={() => setImportOpen(true)}>
-                  ⇧ Import
+                <button
+                  className="quiet-button import-trigger"
+                  aria-label="Import notes"
+                  disabled={!canCreatePage}
+                  onClick={() => setImportOpen(true)}
+                >
+                  <span aria-hidden="true">⇧</span>
+                  <span className="import-trigger-label">Import</span>
                 </button>
                 <button className="primary-small" disabled={!canCreatePage} onClick={() => void createPage("document")}>
                   + Page

@@ -487,6 +487,7 @@ function CollaborativeEditor({
   commentsRevision: number;
 }) {
   const [commentError, setCommentError] = useState("");
+  const commentsPanel = useRef<HTMLElement>(null);
   const threadStore = useMemo(
     () => new ServerThreadStore(pageId, member.user.id, setCommentError),
     [member.user.id, pageId],
@@ -494,6 +495,22 @@ function CollaborativeEditor({
   useEffect(() => {
     void threadStore.refresh(commentsRevision);
   }, [commentsRevision, threadStore]);
+  useEffect(() => {
+    const panel = commentsPanel.current;
+    if (!commentsOpen || !panel) return undefined;
+    const labelGeneratedEditors = () => {
+      for (const textbox of panel.querySelectorAll<HTMLElement>('[role="textbox"]:not([aria-label])')) {
+        textbox.setAttribute(
+          "aria-label",
+          textbox.getAttribute("contenteditable") === "false" ? "Comment content" : "Write a reply",
+        );
+      }
+    };
+    labelGeneratedEditors();
+    const observer = new MutationObserver(labelGeneratedEditors);
+    observer.observe(panel, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [commentsOpen]);
   const options = useMemo(
     () => editorOptions(bundle, member, editable, pageId, threadStore),
     [bundle, editable, member, pageId, threadStore],
@@ -556,7 +573,7 @@ function CollaborativeEditor({
       {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
       {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
       {commentsOpen && (
-        <aside className="side-panel comments-panel">
+        <aside ref={commentsPanel} className="side-panel comments-panel">
           <h2>Comments</h2>
           <p className="muted">
             {editable
