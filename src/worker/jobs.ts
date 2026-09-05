@@ -203,13 +203,13 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     .bind(options.targetSpaceId, options.parentId, options.isTemplate ? 1 : 0)
     .first<{ position: string }>();
   const timestamp = Date.now();
-  await env.DB.prepare(
-    `INSERT INTO pages
-      (id, workspace_id, space_id, parent_id, kind, position, title, icon, is_template, import_job_id,
-       created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO pages
+        (id, workspace_id, space_id, parent_id, kind, position, title, icon, is_template, import_job_id,
+         created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
       options.targetPageId,
       job.workspace_id,
       options.targetSpaceId,
@@ -223,8 +223,21 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
       job.requested_by,
       timestamp,
       timestamp,
-    )
-    .run();
+    ),
+    env.DB.prepare(
+      `INSERT INTO subscriptions
+        (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
+       VALUES (?, ?, ?, 'page', ?, ?, ?)
+       ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
+    ).bind(
+      `page:${options.targetPageId}:${job.requested_by}`,
+      job.workspace_id,
+      job.requested_by,
+      options.targetPageId,
+      job.requested_by,
+      timestamp,
+    ),
+  ]);
   if (source.kind === "table") {
     const target = options.targetPageId;
     await env.DB.batch([

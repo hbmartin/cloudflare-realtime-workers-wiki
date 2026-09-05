@@ -738,6 +738,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
+  const [commentsRevision, setCommentsRevision] = useState(0);
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
   const [trashRefreshVersion, setTrashRefreshVersion] = useState(0);
   const [trashLoading, setTrashLoading] = useState(false);
@@ -1600,6 +1601,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         return;
       }
       if (event.type === "notifications-invalidated") return;
+      if (event.type === "comments-invalidated") {
+        if (event.pageId === selectedId) setCommentsRevision((current) => current + 1);
+        return;
+      }
       if (event.type === "pages-upserted") {
         const restoredRootId = event.restored
           ? (event.restoredRootId ?? restoredEventRoot(event.pages)?.id ?? null)
@@ -1661,6 +1666,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       loadUnreadMentions,
       activitiesOpen,
       member.user.id,
+      selectedId,
       reconcileRestoredEvent,
       recordPageRemovals,
       recordPageUpserts,
@@ -2725,6 +2731,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               onAccessDenied={documentAccessDenied}
               onSelectPage={navigateToPage}
               backlinksRevision={backlinksRevision}
+              commentsRevision={commentsRevision}
             />
           ) : (
             <TablePage

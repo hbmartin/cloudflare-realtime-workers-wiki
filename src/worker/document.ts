@@ -55,6 +55,135 @@ interface RestoreRecoveryRow extends Record<string, SqlStorageValue> {
   pre_key: string | null;
 }
 
+type RelativePositionJson = ReturnType<typeof Y.relativePositionToJSON>;
+
+function documentTextNodes(document: Y.Doc) {
+  const nodes: Y.XmlText[] = [];
+  const visit = (parent: Y.XmlFragment | Y.XmlElement) => {
+    for (const child of parent.toArray()) {
+      if (child instanceof Y.XmlText) nodes.push(child);
+      else if (child instanceof Y.XmlElement) visit(child);
+    }
+  };
+  visit(document.getXmlFragment("document-store"));
+  return nodes;
+}
+
+function commentMarkThreadId(markName: string, value: unknown) {
+  const baseName = markName.replace(/--[a-zA-Z0-9+/=]{8}$/, "");
+  if (baseName !== "comment" || !value || typeof value !== "object") return null;
+  const threadId = (value as Record<string, unknown>).threadId;
+  return typeof threadId === "string" ? threadId : null;
+}
+
+function anchoredCommentThreadIds(document: Y.Doc) {
+  const ids = new Set<string>();
+  for (const text of documentTextNodes(document)) {
+    for (const delta of text.toDelta()) {
+      for (const [markName, value] of Object.entries(delta.attributes ?? {})) {
+        const threadId = commentMarkThreadId(markName, value);
+        if (threadId) ids.add(threadId);
+      }
+    }
+  }
+  return ids;
+}
+
+function legacyComments(document: Y.Doc) {
+  const anchored = anchoredCommentThreadIds(document);
+  const threads: Array<Record<string, unknown>> = [];
+  document.getMap<Y.Map<unknown>>("comments").forEach((thread, id) => {
+    if (!(thread instanceof Y.Map)) return;
+    const rawComments = thread.get("comments");
+    const comments =
+      rawComments instanceof Y.Array
+        ? rawComments
+            .toArray()
+            .filter((comment): comment is Y.Map<unknown> => comment instanceof Y.Map)
+            .map((comment) => ({
+              id: comment.get("id"),
+              userId: comment.get("userId"),
+              body: comment.get("body") ?? null,
+              deletedAt: comment.get("deletedAt"),
+              createdAt: comment.get("createdAt"),
+              updatedAt: comment.get("updatedAt"),
+            }))
+        : [];
+    threads.push({
+      id: typeof thread.get("id") === "string" ? thread.get("id") : id,
+      createdAt: thread.get("createdAt"),
+      updatedAt: thread.get("updatedAt"),
+      resolved: Boolean(thread.get("resolved")),
+      resolvedUpdatedAt: thread.get("resolvedUpdatedAt"),
+      resolvedBy: thread.get("resolvedBy"),
+      anchored: anchored.has(id),
+      comments,
+    });
+  });
+  return threads;
+}
+
+function removeCommentMark(document: Y.Doc, threadId: string) {
+  let changed = false;
+  document.transact(() => {
+    for (const text of documentTextNodes(document)) {
+      let offset = 0;
+      for (const delta of text.toDelta()) {
+        const length = typeof delta.insert === "string" ? delta.insert.length : 1;
+        for (const [markName, value] of Object.entries(delta.attributes ?? {})) {
+          if (commentMarkThreadId(markName, value) === threadId) {
+            text.format(offset, length, { [markName]: null });
+            changed = true;
+          }
+        }
+        offset += length;
+      }
+    }
+  }, "comment-anchor");
+  return changed;
+}
+
+async function addCommentMark(
+  document: Y.Doc,
+  threadId: string,
+  selection: { head: RelativePositionJson; anchor: RelativePositionJson },
+) {
+  let head: Y.AbsolutePosition | null;
+  let anchor: Y.AbsolutePosition | null;
+  try {
+    head = Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(selection.head), document);
+    anchor = Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(selection.anchor), document);
+  } catch {
+    return false;
+  }
+  if (!head || !anchor || !(head.type instanceof Y.XmlText) || !(anchor.type instanceof Y.XmlText)) return false;
+  const nodes = documentTextNodes(document);
+  let headNode = nodes.indexOf(head.type);
+  let anchorNode = nodes.indexOf(anchor.type);
+  if (headNode < 0 || anchorNode < 0) return false;
+  let headOffset = head.index;
+  let anchorOffset = anchor.index;
+  if (headNode > anchorNode || (headNode === anchorNode && headOffset > anchorOffset)) {
+    [headNode, anchorNode] = [anchorNode, headNode];
+    [headOffset, anchorOffset] = [anchorOffset, headOffset];
+  }
+  const ranges = nodes.slice(headNode, anchorNode + 1).map((text, index, selected) => {
+    const from = index === 0 ? headOffset : 0;
+    const to = index === selected.length - 1 ? anchorOffset : text.length;
+    return { text, from, length: Math.max(0, to - from) };
+  });
+  const selectedLength = ranges.reduce((total, range) => total + range.length, 0);
+  if (!selectedLength || selectedLength > 100_000) return false;
+  const markName = `comment--${(await sha256Hex(threadId)).slice(0, 8)}`;
+  document.transact(() => {
+    removeCommentMark(document, threadId);
+    for (const range of ranges) {
+      if (range.length) range.text.format(range.from, range.length, { [markName]: { threadId, orphan: false } });
+    }
+  }, "comment-anchor");
+  return true;
+}
+
 export class Document extends YServer {
   static options = { hibernate: true };
   static callbackOptions = { debounceWait: 1_000, debounceMaxWait: 5_000 };
@@ -369,6 +498,56 @@ export class Document extends YServer {
       return Response.json(envelope, {
         headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
       });
+    }
+    if (request.method === "GET" && url.pathname.endsWith("/legacy-comments")) {
+      return Response.json({ threads: legacyComments(this.document) });
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/legacy-comments/clear")) {
+      const legacy = this.document.getMap("comments");
+      if (legacy.size) {
+        this.document.transact(() => legacy.clear(), "comment-migration");
+        this.flushPendingUpdates();
+        if (this.metadata.dirty) await this.compact();
+      }
+      return Response.json({ cleared: true });
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/comment-anchor")) {
+      let body: {
+        threadId?: unknown;
+        userId?: unknown;
+        operation?: unknown;
+        selection?: { head?: unknown; anchor?: unknown };
+      };
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "Invalid comment anchor request." }, { status: 400 });
+      }
+      if (
+        typeof body.threadId !== "string" ||
+        typeof body.userId !== "string" ||
+        (body.operation !== "add" && body.operation !== "remove")
+      ) {
+        return Response.json({ error: "Invalid comment anchor request." }, { status: 400 });
+      }
+      const { pageId } = this.ids;
+      const thread = await this.bindings.DB.prepare(`SELECT id FROM comment_threads WHERE id = ? AND page_id = ?`)
+        .bind(body.threadId, pageId)
+        .first<{ id: string }>();
+      if (!thread) return Response.json({ error: "Comment thread not found." }, { status: 404 });
+      this.pendingAuthorId = body.userId;
+      const anchored =
+        body.operation === "remove"
+          ? !removeCommentMark(this.document, body.threadId)
+          : body.selection?.head && body.selection.anchor
+            ? await addCommentMark(this.document, body.threadId, {
+                head: body.selection.head as RelativePositionJson,
+                anchor: body.selection.anchor as RelativePositionJson,
+              })
+            : false;
+      this.flushPendingUpdates();
+      if (this.metadata.dirty) await this.compact();
+      return Response.json({ anchored: body.operation === "remove" ? false : anchored });
     }
     if (request.method === "POST" && url.pathname.endsWith("/initialize")) {
       let body: { jobId?: unknown; inputKey?: unknown };

@@ -32,6 +32,7 @@ describe("D1 migrations", () => {
         "jobs",
         "outbox",
         "notifications",
+        "comment_migrations",
       ]),
     );
 
@@ -90,6 +91,41 @@ describe("D1 migrations", () => {
     expect(applied.results.map((migration) => migration.name)).toEqual(
       env.TEST_MIGRATIONS!.map((migration) => migration.name),
     );
+  });
+
+  it("marks legacy comment migrations separately and enrolls existing page creators as watchers", async () => {
+    const commentsMigration = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0013_comments_notifications.sql",
+    );
+    expect(commentsMigration).toBeTruthy();
+    const migrationIndex = env.TEST_MIGRATIONS!.indexOf(commentsMigration!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, migrationIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES ('workspace', 'owner', 'owner', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('page', 'workspace', 'workspace-general', 'document', 'a0', 'Page', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+    ]);
+
+    await applyD1Migrations(env.DB, [commentsMigration!]);
+
+    expect(
+      await env.DB.prepare(
+        `SELECT user_id, resource_type, resource_id, muted_at FROM subscriptions WHERE resource_id = 'page'`,
+      ).first(),
+    ).toEqual({ user_id: "owner", resource_type: "page", resource_id: "page", muted_at: null });
+    expect(await env.DB.prepare(`SELECT page_id FROM comment_migrations`).first()).toBeNull();
   });
 
   it("backfills every legacy page into a General space and guards cross-space parents", async () => {

@@ -1,5 +1,5 @@
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
@@ -13,6 +13,17 @@ import {
   UPLOAD_SESSION_TTL_MS,
 } from "./attachments";
 import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
+import {
+  addCommentReply,
+  commentThread,
+  createCommentThread,
+  listCommentThreads,
+  migrateLegacyComments,
+  setThreadResolved,
+  softDeleteComment,
+  updateComment,
+  type CommentPage,
+} from "./comments";
 import { Document } from "./document";
 import type { Env, MemberContext } from "./env";
 import {
@@ -99,6 +110,7 @@ const TABLE_LEASE_DURATION_MS = 60_000;
 const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple", "pink"] as const;
 
 type PageRow = PageJsonRow & {
+  created_by: string;
   plain_text: string;
   indexed_seq: number;
   visibility?: "workspace" | "private";
@@ -592,6 +604,37 @@ async function pageForMember(env: Env, member: MemberContext, pageId: string, in
   return { ...row, effective_role: effectiveSpaceRole(member.role, row.visibility!, row.space_role ?? null)! };
 }
 
+function commentPage(page: PageRow): CommentPage {
+  return {
+    id: page.id,
+    workspace_id: page.workspace_id,
+    space_id: page.space_id ?? `${page.workspace_id}-general`,
+    content_epoch: page.content_epoch,
+    created_by: page.created_by,
+    effective_role: page.effective_role!,
+  };
+}
+
+async function pageForCommentThread(env: Env, member: MemberContext, threadId: string) {
+  const located = await env.DB.prepare(`SELECT page_id FROM comment_threads WHERE id = ? AND workspace_id = ?`)
+    .bind(threadId, member.workspace.id)
+    .first<{ page_id: string }>();
+  if (!located) throw new HttpError(404, "comment_thread_not_found", "Comment thread not found.");
+  return pageForMember(env, member, located.page_id);
+}
+
+async function pageForComment(env: Env, member: MemberContext, commentId: string) {
+  const located = await env.DB.prepare(
+    `SELECT ct.id thread_id, ct.page_id
+       FROM comments c JOIN comment_threads ct ON ct.id = c.thread_id
+      WHERE c.id = ? AND ct.workspace_id = ?`,
+  )
+    .bind(commentId, member.workspace.id)
+    .first<{ thread_id: string; page_id: string }>();
+  if (!located) throw new HttpError(404, "comment_not_found", "Comment not found.");
+  return { threadId: located.thread_id, page: await pageForMember(env, member, located.page_id) };
+}
+
 function effectiveSpaceRole(
   workspaceRole: Role,
   visibility: "workspace" | "private",
@@ -916,6 +959,12 @@ app.post("/api/install/bootstrap", async (c) => {
       `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
        VALUES (?, ?, NULL, 'document', ?, 'Welcome', ?, ?, ?)`,
     ).bind(pageId, workspaceId, generateJitteredKeyBetween(null, null), signup.user.id, timestamp, timestamp),
+    c.env.DB.prepare(
+      `INSERT INTO subscriptions
+        (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
+       VALUES (?, ?, ?, 'page', ?, ?, ?)
+       ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
+    ).bind(`page:${pageId}:${signup.user.id}`, workspaceId, signup.user.id, pageId, signup.user.id, timestamp),
     c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, 'Welcome', '')`).bind(
       pageId,
       workspaceId,
@@ -1682,6 +1731,12 @@ app.post("/api/pages", async (c) => {
         member.workspace.id,
         title,
       ),
+      c.env.DB.prepare(
+        `INSERT INTO subscriptions
+          (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
+         VALUES (?, ?, ?, 'page', ?, ?, ?)
+         ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
+      ).bind(`page:${id}:${member.user.id}`, member.workspace.id, member.user.id, id, member.user.id, timestamp),
       ...(kind === "table" ? [c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(id)] : []),
       c.env.DB.prepare(
         `INSERT INTO page_create_receipts
@@ -1804,6 +1859,19 @@ app.post("/api/pages/batch", async (c) => {
         member.workspace.id,
         page.title,
       ),
+      c.env.DB.prepare(
+        `INSERT INTO subscriptions
+          (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
+         VALUES (?, ?, ?, 'page', ?, ?, ?)
+         ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
+      ).bind(
+        `page:${page.id}:${member.user.id}`,
+        member.workspace.id,
+        member.user.id,
+        page.id,
+        member.user.id,
+        timestamp,
+      ),
     );
     if (page.kind === "table") {
       statements.push(c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(page.id));
@@ -1843,6 +1911,145 @@ app.get("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   return c.json({ page: pageJson(await pageForMember(c.env, member, c.req.param("id"), true)) });
 });
+
+app.get("/api/pages/:id/comments", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const scopedPage = commentPage(page);
+  await migrateLegacyComments(c.env, scopedPage);
+  return c.json({ threads: await listCommentThreads(c.env, member, scopedPage) });
+});
+
+app.post("/api/pages/:id/comments", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const scopedPage = commentPage(page);
+  await migrateLegacyComments(c.env, scopedPage);
+  const body = await jsonBody(c.req.raw);
+  const initialComment = object(body.initialComment);
+  const thread = await createCommentThread(c.env, member, scopedPage, initialComment.body);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  return c.json({ thread }, 201);
+});
+
+app.post("/api/comment-threads/:id/anchor", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, c.req.param("id"));
+  const scopedPage = commentPage(page);
+  const body = await jsonBody(c.req.raw);
+  const selection = object(body.selection);
+  const yjs = selection.yjs;
+  if (!yjs || typeof yjs !== "object" || Array.isArray(yjs)) {
+    return c.json({ thread: await commentThread(c.env, member, scopedPage, c.req.param("id")), anchored: false });
+  }
+  const anchorJson = JSON.stringify(yjs);
+  if (new TextEncoder().encode(anchorJson).byteLength > 16 * 1024) {
+    throw new HttpError(422, "invalid_comment_anchor", "The comment selection is invalid.");
+  }
+  let anchored = false;
+  if (page.kind === "document") {
+    const response = await c.env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
+      new Request("https://document.internal/comment-anchor", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-internal": c.env.BETTER_AUTH_SECRET },
+        body: JSON.stringify({
+          operation: "add",
+          threadId: c.req.param("id"),
+          userId: member.user.id,
+          selection: yjs,
+        }),
+      }),
+    );
+    if (response.ok) anchored = Boolean((await response.json<{ anchored?: boolean }>()).anchored);
+  }
+  await c.env.DB.prepare(`UPDATE comment_threads SET anchor_json = ?, updated_at = ? WHERE id = ? AND page_id = ?`)
+    .bind(anchored ? anchorJson : null, Date.now(), c.req.param("id"), page.id)
+    .run();
+  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  return c.json({ thread: await commentThread(c.env, member, scopedPage, c.req.param("id")), anchored });
+});
+
+async function createReplyResponse(c: Context<{ Bindings: Env }>, threadId: string, body: Record<string, unknown>) {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, threadId);
+  const comment = object(body.comment);
+  const thread = await addCommentReply(c.env, member, commentPage(page), threadId, comment.body, body.parentId);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  return c.json({ thread }, 201);
+}
+
+app.post("/api/comment-threads/:id/replies", async (c) =>
+  createReplyResponse(c, c.req.param("id"), await jsonBody(c.req.raw)),
+);
+
+app.post("/api/comment-threads/:id/comments", async (c) =>
+  createReplyResponse(c, c.req.param("id"), await jsonBody(c.req.raw)),
+);
+
+app.put("/api/comment-threads/:id/comments/:commentId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const comment = object(body.comment);
+  const thread = await updateComment(
+    c.env,
+    member,
+    commentPage(page),
+    c.req.param("id"),
+    c.req.param("commentId"),
+    comment.body,
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  return c.json({ thread });
+});
+
+app.patch("/api/comments/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const located = await pageForComment(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw);
+  const thread = await updateComment(
+    c.env,
+    member,
+    commentPage(located.page),
+    located.threadId,
+    c.req.param("id"),
+    body.body,
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: located.page.id });
+  return c.json({ thread });
+});
+
+async function deleteCommentResponse(c: Context<{ Bindings: Env }>, threadId: string, commentId: string) {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, threadId);
+  const thread = await softDeleteComment(c.env, member, commentPage(page), threadId, commentId);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  return c.json({ thread });
+}
+
+app.delete("/api/comment-threads/:id/comments/:commentId", async (c) =>
+  deleteCommentResponse(c, c.req.param("id"), c.req.param("commentId")),
+);
+
+app.delete("/api/comments/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const located = await pageForComment(c.env, member, c.req.param("id"));
+  const thread = await softDeleteComment(c.env, member, commentPage(located.page), located.threadId, c.req.param("id"));
+  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: located.page.id });
+  return c.json({ thread });
+});
+
+async function resolutionResponse(c: Context<{ Bindings: Env }>, threadId: string, resolved: boolean) {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, threadId);
+  const thread = await setThreadResolved(c.env, member, commentPage(page), threadId, resolved);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "comments-invalidated", pageId: page.id });
+  return c.json({ thread });
+}
+
+app.post("/api/comment-threads/:id/resolve", async (c) => resolutionResponse(c, c.req.param("id"), true));
+app.post("/api/comment-threads/:id/reopen", async (c) => resolutionResponse(c, c.req.param("id"), false));
+app.post("/api/comment-threads/:id/unresolve", async (c) => resolutionResponse(c, c.req.param("id"), false));
 
 app.get("/api/pages/:id/content", async (c) => {
   const member = await requireMember(c.req.raw, c.env);

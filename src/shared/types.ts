@@ -86,6 +86,36 @@ export type DocumentContentEnvelope = {
   document: ProseMirrorJson;
 };
 
+export type CommentBody = ProseMirrorJson | ProseMirrorJson[];
+
+export type Comment = {
+  id: string;
+  threadId: string;
+  parentId: string | null;
+  userId: string;
+  user: SessionUser;
+  body: CommentBody | null;
+  plainText: string;
+  deletedAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type CommentThread = {
+  id: string;
+  workspaceId: string;
+  spaceId: string;
+  pageId: string;
+  createdBy: string;
+  resolvedAt: number | null;
+  resolvedBy: string | null;
+  anchored: boolean;
+  canResolve: boolean;
+  comments: Comment[];
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type JobType = "import" | "export" | "template_clone" | "comment_migration" | "search_reindex";
 export type JobStatus =
   | "queued"
@@ -148,6 +178,7 @@ export type WorkspaceEvent =
   | { type: "workspace-invalidated" }
   | { type: "organization-invalidated" }
   | { type: "notifications-invalidated" }
+  | { type: "comments-invalidated"; pageId: string }
   | { type: "jobs-invalidated" }
   | {
       type: "projection-updated";

@@ -134,6 +134,7 @@ export class WorkspaceEvents extends YServer {
     // not read D1, so a slow lifecycle check must not hold them behind it.
     if (
       event.type === "projection-updated" ||
+      event.type === "comments-invalidated" ||
       event.type === "workspace-invalidated" ||
       event.type === "organization-invalidated" ||
       event.type === "notifications-invalidated" ||

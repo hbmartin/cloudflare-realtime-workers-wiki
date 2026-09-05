@@ -1,6 +1,6 @@
-import { CommentsExtension, DefaultThreadStoreAuth, ThreadStoreAuth } from "@blocknote/core/comments";
+import { CommentsExtension } from "@blocknote/core/comments";
 import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
-import { withCollaboration, YjsThreadStore } from "@blocknote/core/yjs";
+import { withCollaboration } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
 import {
   getDefaultReactSlashMenuItems,
@@ -21,6 +21,7 @@ import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userCol
 import { createDocumentCloseReconciler } from "./document-connection";
 import { editorBlockFactories } from "./editor-blocks";
 import { notesSchema } from "./mentions";
+import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 
 export type EditorPageProps = {
@@ -31,6 +32,7 @@ export type EditorPageProps = {
   onAccessDenied: (pageId: string, error: ApiClientError) => void;
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
+  commentsRevision?: number;
 };
 
 export function EditorPage({
@@ -41,6 +43,7 @@ export function EditorPage({
   onAccessDenied,
   onSelectPage,
   backlinksRevision,
+  commentsRevision = 0,
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
@@ -337,6 +340,7 @@ export function EditorPage({
               editable={editable}
               commentsOpen={commentsVisible}
               pageId={page.id}
+              commentsRevision={commentsRevision}
             />
           ) : storageError ? (
             <div className="editor-loading">
@@ -434,42 +438,13 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
   );
 }
 
-class ReadOnlyThreadStoreAuth extends ThreadStoreAuth {
-  canCreateThread() {
-    return false;
-  }
-  canAddComment() {
-    return false;
-  }
-  canUpdateComment() {
-    return false;
-  }
-  canDeleteComment() {
-    return false;
-  }
-  canDeleteThread() {
-    return false;
-  }
-  canResolveThread() {
-    return false;
-  }
-  canUnresolveThread() {
-    return false;
-  }
-  canAddReaction() {
-    return false;
-  }
-  canDeleteReaction() {
-    return false;
-  }
-}
-
-function editorOptions(bundle: CollaborationBundle, member: ClientMemberContext, editable: boolean, pageId: string) {
-  const threadStore = new YjsThreadStore(
-    member.user.id,
-    bundle.doc.getMap("comments"),
-    editable ? new DefaultThreadStoreAuth(member.user.id, "editor") : new ReadOnlyThreadStoreAuth(),
-  );
+function editorOptions(
+  bundle: CollaborationBundle,
+  member: ClientMemberContext,
+  editable: boolean,
+  pageId: string,
+  threadStore: ServerThreadStore,
+) {
   return withCollaboration({
     schema: notesSchema,
     // Media dropped or pasted into the body becomes a real attachment on this page, so
@@ -490,12 +465,7 @@ function editorOptions(bundle: CollaborationBundle, member: ClientMemberContext,
       CommentsExtension({
         threadStore,
         resolveUsers: async (ids: string[]) =>
-          ids.map((id) => ({
-            id,
-            username: id === member.user.id ? member.user.name : "Collaborator",
-            avatarUrl: "",
-            color: userColor(id),
-          })),
+          threadStore.resolveUsers(ids).map((user) => ({ ...user, color: userColor(user.id) })),
       }),
     ],
   });
@@ -507,14 +477,27 @@ function CollaborativeEditor({
   editable,
   commentsOpen,
   pageId,
+  commentsRevision,
 }: {
   bundle: CollaborationBundle;
   member: ClientMemberContext;
   editable: boolean;
   commentsOpen: boolean;
   pageId: string;
+  commentsRevision: number;
 }) {
-  const options = useMemo(() => editorOptions(bundle, member, editable, pageId), [bundle, editable, member, pageId]);
+  const [commentError, setCommentError] = useState("");
+  const threadStore = useMemo(
+    () => new ServerThreadStore(pageId, member.user.id, setCommentError),
+    [member.user.id, pageId],
+  );
+  useEffect(() => {
+    void threadStore.refresh(commentsRevision);
+  }, [commentsRevision, threadStore]);
+  const options = useMemo(
+    () => editorOptions(bundle, member, editable, pageId, threadStore),
+    [bundle, editable, member, pageId, threadStore],
+  );
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
   const getSlashItems = async (query: string) =>
     filterSuggestionItems(
@@ -578,8 +561,9 @@ function CollaborativeEditor({
           <p className="muted">
             {editable
               ? "Select text and use the formatting toolbar to start a thread."
-              : "Comments are read-only while this document is not editable."}
+              : "You can comment and reply even while the document is read-only."}
           </p>
+          {commentError && <p className="form-error">{commentError}</p>}
           <ThreadsSidebar filter="all" sort="position" />
         </aside>
       )}

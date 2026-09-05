@@ -147,6 +147,9 @@ export function parseWorkspaceEvent(value: unknown): WorkspaceEvent | null {
       mentionTargetUserIds: [...event.mentionTargetUserIds],
     };
   }
+  if (event.type === "comments-invalidated" && typeof event.pageId === "string" && ID_PATTERN.test(event.pageId)) {
+    return { type: "comments-invalidated", pageId: event.pageId };
+  }
   if (
     event.type === "workspace-invalidated" ||
     event.type === "organization-invalidated" ||

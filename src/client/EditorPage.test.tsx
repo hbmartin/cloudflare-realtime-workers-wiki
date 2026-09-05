@@ -57,6 +57,12 @@ vi.mock("@blocknote/core/comments", () => ({
   CommentsExtension: vi.fn(() => ({})),
   DefaultThreadStoreAuth: class {},
   ThreadStoreAuth: class {},
+  ThreadStore: class {
+    auth: unknown;
+    constructor(auth: unknown) {
+      this.auth = auth;
+    }
+  },
 }));
 
 vi.mock("@blocknote/core/yjs", () => ({
@@ -160,7 +166,7 @@ describe("EditorPage close reconciliation", () => {
     });
     for (const delay of [1_000, 2_000, 4_000, 8_000]) await advanceRetry(delay);
 
-    expect(mocks.api).toHaveBeenCalledTimes(5);
+    expect(mocks.api.mock.calls.filter(([path]) => path === "/api/pages/page-1")).toHaveLength(5);
     expect(mocks.provider.disconnect).toHaveBeenCalledOnce();
     expect(mocks.provider.connect).not.toHaveBeenCalled();
     expect(unavailable).not.toHaveBeenCalled();
