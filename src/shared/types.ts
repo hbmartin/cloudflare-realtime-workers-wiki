@@ -3,6 +3,7 @@ import type { PageKind } from "./page-kind";
 export type { PageKind } from "./page-kind";
 
 export type Role = "owner" | "editor" | "viewer";
+export type SpaceRole = "owner" | "editor" | "viewer";
 export type ColumnType = "text" | "number" | "checkbox" | "date" | "select";
 
 export type SessionUser = {
@@ -17,6 +18,20 @@ export type Workspace = {
   locationHint: string | null;
 };
 
+export type Space = {
+  id: string;
+  workspaceId: string;
+  name: string;
+  slug: string;
+  description: string;
+  icon: string | null;
+  position: string;
+  visibility: "workspace" | "private";
+  effectiveRole: SpaceRole;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type MemberContext = {
   user: SessionUser;
   session: { id: string; expiresAt: Date };
@@ -29,6 +44,7 @@ export type ClientMemberContext = Omit<MemberContext, "session">;
 export type Page = {
   id: string;
   workspaceId: string;
+  spaceId: string;
   parentId: string | null;
   kind: PageKind;
   position: string;
@@ -36,9 +52,26 @@ export type Page = {
   icon: string | null;
   revision: number;
   contentEpoch: number;
+  isTemplate: boolean;
   archivedAt: number | null;
   createdAt: number;
   updatedAt: number;
+};
+
+export type ProseMirrorJson = {
+  type?: string;
+  text?: string;
+  attrs?: Record<string, unknown>;
+  marks?: Array<{ type?: string; attrs?: Record<string, unknown> }>;
+  content?: ProseMirrorJson[];
+};
+
+export type DocumentContentEnvelope = {
+  schemaVersion: 1;
+  pageId: string;
+  contentEpoch: number;
+  sequence: number;
+  document: ProseMirrorJson;
 };
 
 export type PageNode = Page & { children: PageNode[] };
@@ -75,6 +108,9 @@ export type WorkspaceEvent =
   | { type: "pages-upserted"; pages: Page[]; restored?: false; restoredRootId?: never }
   | { type: "pages-removed"; pageIds: string[]; permanently: boolean; operationId?: string }
   | { type: "workspace-invalidated" }
+  | { type: "organization-invalidated" }
+  | { type: "notifications-invalidated" }
+  | { type: "jobs-invalidated" }
   | {
       type: "projection-updated";
       pageId: string;

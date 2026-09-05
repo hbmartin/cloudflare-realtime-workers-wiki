@@ -15,6 +15,7 @@ vi.mock("./api", async (importOriginal) => ({
 const page: Page = {
   id: "page-1",
   workspaceId: "workspace-1",
+  spaceId: "workspace-1-general",
   parentId: null,
   kind: "document",
   position: "a0",
@@ -22,6 +23,7 @@ const page: Page = {
   icon: null,
   revision: 1,
   contentEpoch: 1,
+  isTemplate: false,
   archivedAt: null,
   createdAt: 1,
   updatedAt: 1,

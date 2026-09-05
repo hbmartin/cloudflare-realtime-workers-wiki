@@ -5572,6 +5572,53 @@ describe("Worker integration", () => {
     });
   });
 
+  it("flushes and returns a versioned structured-content envelope", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      const fragment = document.document.getXmlFragment("document-store");
+      const paragraph = new Y.XmlElement("paragraph");
+      const text = new Y.XmlText();
+      text.insert(0, "Structured on the server");
+      paragraph.insert(0, [text]);
+      fragment.insert(0, [paragraph]);
+      await document.onSave();
+    });
+
+    const response = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/content`));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(response.headers.get("etag")).toMatch(/^"[a-f0-9]{64}"$/);
+    const envelope = await response.json<{
+      schemaVersion: number;
+      pageId: string;
+      contentEpoch: number;
+      sequence: number;
+      document: unknown;
+    }>();
+    expect(envelope).toMatchObject({
+      schemaVersion: 1,
+      pageId: installed.pageId,
+      contentEpoch: 1,
+      sequence: expect.any(Number),
+    });
+    expect(JSON.stringify(envelope.document)).toContain("Structured on the server");
+
+    const projection = await env.DB.prepare(
+      `SELECT sequence, schema_version, r2_key, content_hash FROM document_projections WHERE page_id = ?`,
+    )
+      .bind(installed.pageId)
+      .first<{ sequence: number; schema_version: number; r2_key: string; content_hash: string }>();
+    expect(projection).toMatchObject({
+      sequence: envelope.sequence,
+      schema_version: 1,
+      content_hash: await sha256Hex(canonicalJson(envelope)),
+    });
+    expect(await env.BUCKET.get(projection!.r2_key)).toBeTruthy();
+  });
+
   it("rejects a batch that is empty, oversized, or names a missing parent", async () => {
     const installed = await bootstrap();
     async function batch(body: unknown) {

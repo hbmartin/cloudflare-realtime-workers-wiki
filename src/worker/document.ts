@@ -3,6 +3,8 @@ import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
 import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import type { DocumentContentEnvelope } from "../shared/types";
+import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import { joinBytes, splitBytes } from "../shared/bytes";
 import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
@@ -41,6 +43,7 @@ interface MetaRow extends Record<string, SqlStorageValue> {
 
 interface PageProjectionRow {
   workspace_id: string;
+  space_id: string;
   title: string;
   archived_at: number | null;
 }
@@ -351,6 +354,22 @@ export class Document extends YServer {
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
     }
+    if (request.method === "GET" && url.pathname.endsWith("/content")) {
+      this.flushPendingUpdates();
+      if (this.metadata.dirty) await this.compact();
+      const { pageId, epoch } = this.ids;
+      const document = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
+      const envelope: DocumentContentEnvelope = {
+        schemaVersion: 1,
+        pageId,
+        contentEpoch: epoch,
+        sequence: this.metadata.snapshot_seq,
+        document,
+      };
+      return Response.json(envelope, {
+        headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
+      });
+    }
     if (request.method === "POST" && url.pathname.endsWith("/archive")) {
       if (this.validatingTransition || this.transition || this.metadata.restore_pending) {
         return Response.json({ error: "Document transition already in progress." }, { status: 409 });
@@ -478,6 +497,16 @@ export class Document extends YServer {
     const snapshot = Y.encodeStateAsUpdate(this.document);
     const json = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
     const projection = projectDocument(json);
+    const envelope: DocumentContentEnvelope = {
+      schemaVersion: 1,
+      pageId,
+      contentEpoch: epoch,
+      sequence: maximum,
+      document: json,
+    };
+    const structuredJson = canonicalJson(envelope);
+    const structuredBytes = new TextEncoder().encode(structuredJson);
+    const structuredKey = this.projectionKey(pageId, epoch, maximum);
     const readOnly = snapshot.byteLength >= READ_ONLY_BYTES;
     if (snapshot.byteLength >= WARN_BYTES) {
       this.broadcastCustomMessage(
@@ -503,13 +532,26 @@ export class Document extends YServer {
     if (readOnly) this.metadata.read_only = 1;
 
     try {
+      // Keep the dirty-state handoff synchronous with capturing `maximum`.
+      // Updates received while hashing or writing R2 must remain dirty for the
+      // next compaction instead of being cleared by this one.
+      const structuredHash = await sha256Hex(structuredJson);
       await this.bindings.BUCKET.put(this.snapshotKey(pageId, epoch), snapshot, {
         httpMetadata: { contentType: "application/octet-stream" },
         customMetadata: { pageId, epoch: String(epoch), sequence: String(maximum) },
       });
+      await this.bindings.BUCKET.put(structuredKey, structuredBytes, {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+        customMetadata: {
+          pageId,
+          epoch: String(epoch),
+          sequence: String(maximum),
+          contentHash: structuredHash,
+        },
+      });
 
       const page = await this.bindings.DB.prepare(
-        `SELECT workspace_id, title, archived_at FROM pages WHERE id = ? AND content_epoch = ?`,
+        `SELECT workspace_id, space_id, title, archived_at FROM pages WHERE id = ? AND content_epoch = ?`,
       )
         .bind(pageId, epoch)
         .first<PageProjectionRow>();
@@ -539,6 +581,20 @@ export class Document extends YServer {
               WHERE id = ? AND content_epoch = ?`,
           ).bind(projection.plainText, maximum, readOnly ? 1 : 0, timestamp, pageId, epoch),
           this.bindings.DB.prepare(
+            `INSERT INTO document_projections
+              (page_id, content_epoch, sequence, schema_version, r2_key, content_hash, byte_size, updated_at)
+             SELECT id, ?, ?, 1, ?, ?, ?, ? FROM pages
+              WHERE id = ? AND content_epoch = ?
+             ON CONFLICT(page_id) DO UPDATE SET
+              content_epoch = excluded.content_epoch,
+              sequence = excluded.sequence,
+              schema_version = excluded.schema_version,
+              r2_key = excluded.r2_key,
+              content_hash = excluded.content_hash,
+              byte_size = excluded.byte_size,
+              updated_at = excluded.updated_at`,
+          ).bind(epoch, maximum, structuredKey, structuredHash, structuredBytes.byteLength, timestamp, pageId, epoch),
+          this.bindings.DB.prepare(
             `DELETE FROM page_search WHERE page_id = ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, pageId, epoch),
@@ -546,6 +602,20 @@ export class Document extends YServer {
             `INSERT INTO page_search (page_id, workspace_id, title, body)
               SELECT id, workspace_id, title, ? FROM pages
                WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
+          ).bind(projection.plainText, pageId, epoch),
+          this.bindings.DB.prepare(
+            `DELETE FROM page_search_v2 WHERE page_id = ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, pageId, epoch),
+          this.bindings.DB.prepare(
+            `INSERT INTO page_search_v2
+              (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+             SELECT p.id, p.workspace_id, p.space_id, p.title,
+                    COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
+                    ?,
+                    COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
+                    COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
+               FROM pages p WHERE p.id = ? AND p.content_epoch = ? AND p.archived_at IS NULL`,
           ).bind(projection.plainText, pageId, epoch),
           this.bindings.DB.prepare(
             `UPDATE page_references SET projection_seq = -1 WHERE source_page_id = ?
@@ -1010,6 +1080,10 @@ export class Document extends YServer {
 
   private snapshotKey(pageId: string, epoch: number) {
     return `documents/${pageId}/epochs/${epoch}/current.bin`;
+  }
+
+  private projectionKey(pageId: string, epoch: number, sequence: number) {
+    return `documents/${pageId}/epochs/${epoch}/projections/${sequence}.json`;
   }
 
   private async finishTransition() {

@@ -1328,6 +1328,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         void refreshInvalidatedWorkspace();
         return;
       }
+      if (event.type === "organization-invalidated") {
+        void loadPages();
+        return;
+      }
+      if (event.type === "notifications-invalidated" || event.type === "jobs-invalidated") return;
       if (event.type === "pages-upserted") {
         const restoredRootId = event.restored
           ? (event.restoredRootId ?? restoredEventRoot(event.pages)?.id ?? null)
@@ -1384,6 +1389,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       archiveRemovalTombstones,
       clearConfirmedRestores,
       excludeConfirmedRestoresFromTrash,
+      loadPages,
       loadUnreadMentions,
       member.user.id,
       reconcileRestoredEvent,

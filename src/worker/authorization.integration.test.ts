@@ -2,7 +2,7 @@ import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 
 type Role = "owner" | "editor" | "viewer";
-type InstalledWorkspace = { cookie: string; pageId: string; userId: string };
+type InstalledWorkspace = { cookie: string; pageId: string; userId: string; workspaceId: string };
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -25,10 +25,12 @@ async function bootstrap(): Promise<InstalledWorkspace> {
   });
   expect(response.status).toBe(200);
   const cookie = response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
-  const me = await (await SELF.fetch(request(cookie, "/api/me"))).json<{ user: { id: string }; session?: unknown }>();
+  const me = await (
+    await SELF.fetch(request(cookie, "/api/me"))
+  ).json<{ user: { id: string }; workspace: { id: string }; session?: unknown }>();
   expect(me).not.toHaveProperty("session");
   const tree = await (await SELF.fetch(request(cookie, "/api/pages/tree"))).json<{ pages: Array<{ id: string }> }>();
-  return { cookie, userId: me.user.id, pageId: tree.pages[0]!.id };
+  return { cookie, userId: me.user.id, workspaceId: me.workspace.id, pageId: tree.pages[0]!.id };
 }
 
 async function invite(ownerCookie: string, role: Exclude<Role, "owner">) {
@@ -141,5 +143,54 @@ describe("authorization matrix", () => {
       );
       expect(response.status, `${init.method} ${path}`).toBe(403);
     }
+  });
+
+  it("hides private spaces until granted and never lets a grant elevate the workspace role", async () => {
+    const installed = await bootstrap();
+    const editorCookie = await invite(installed.cookie, "editor");
+    const editor = await (await SELF.fetch(request(editorCookie, "/api/me"))).json<{ user: { id: string } }>();
+    const createdSpace = await SELF.fetch(
+      request(installed.cookie, "/api/spaces", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "Leadership", visibility: "private" }),
+      }),
+    );
+    expect(createdSpace.status).toBe(201);
+    const { space } = await createdSpace.json<{ space: { id: string } }>();
+    const createdPage = await SELF.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Private roadmap", kind: "document", parentId: null, spaceId: space.id }),
+      }),
+    );
+    expect(createdPage.status).toBe(201);
+    const { page } = await createdPage.json<{ page: { id: string } }>();
+
+    expect((await SELF.fetch(request(editorCookie, `/api/pages/${page.id}`))).status).toBe(404);
+    expect(
+      (
+        await (await SELF.fetch(request(editorCookie, "/api/pages/tree"))).json<{ pages: Array<{ id: string }> }>()
+      ).pages.map(({ id }) => id),
+    ).not.toContain(page.id);
+
+    const grant = await SELF.fetch(
+      request(installed.cookie, `/api/spaces/${space.id}/members/${editor.user.id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role: "viewer" }),
+      }),
+    );
+    expect(grant.status).toBe(200);
+    expect((await SELF.fetch(request(editorCookie, `/api/pages/${page.id}`))).status).toBe(200);
+    const denied = await SELF.fetch(
+      request(editorCookie, `/api/pages/${page.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "No", revision: 1 }),
+      }),
+    );
+    expect(denied.status).toBe(403);
   });
 });

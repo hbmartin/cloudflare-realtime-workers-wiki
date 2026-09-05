@@ -67,6 +67,7 @@ const member: ClientMemberContext = {
 const page: Page = {
   id: "page",
   workspaceId: member.workspace.id,
+  spaceId: `${member.workspace.id}-general`,
   parentId: null,
   kind: "document",
   position: "a0",
@@ -74,6 +75,7 @@ const page: Page = {
   icon: null,
   revision: 1,
   contentEpoch: 1,
+  isTemplate: false,
   archivedAt: null,
   createdAt: 1,
   updatedAt: 1,

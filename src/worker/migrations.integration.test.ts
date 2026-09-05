@@ -25,6 +25,13 @@ describe("D1 migrations", () => {
         "attachment_upload_parts",
         "attachment_uploads",
         "table_bulk_writes",
+        "spaces",
+        "space_members",
+        "document_projections",
+        "page_search_v2",
+        "jobs",
+        "outbox",
+        "notifications",
       ]),
     );
 
@@ -83,6 +90,63 @@ describe("D1 migrations", () => {
     expect(applied.results.map((migration) => migration.name)).toEqual(
       env.TEST_MIGRATIONS!.map((migration) => migration.name),
     );
+  });
+
+  it("backfills every legacy page into a General space and guards cross-space parents", async () => {
+    const foundation = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0012_parity_foundations.sql");
+    expect(foundation).toBeTruthy();
+    const foundationIndex = env.TEST_MIGRATIONS!.indexOf(foundation!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, foundationIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES ('workspace', 'owner', 'owner', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages (id, workspace_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('parent', 'workspace', 'document', 'a0', 'Parent', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('child', 'workspace', 'parent', 'document', 'a1', 'Child', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+    ]);
+
+    await applyD1Migrations(env.DB, [foundation!]);
+
+    expect(await env.DB.prepare(`SELECT id FROM spaces WHERE workspace_id = 'workspace'`).first()).toEqual({
+      id: "workspace-general",
+    });
+    expect(
+      await env.DB.prepare(`SELECT id, space_id FROM pages ORDER BY id`).all<{ id: string; space_id: string }>(),
+    ).toMatchObject({
+      results: [
+        { id: "child", space_id: "workspace-general" },
+        { id: "parent", space_id: "workspace-general" },
+      ],
+    });
+
+    await env.DB.prepare(
+      `INSERT INTO spaces (id, workspace_id, name, slug, position, created_at, updated_at)
+       VALUES ('private', 'workspace', 'Private', 'private', 'a1', ?, ?)`,
+    )
+      .bind(timestamp, timestamp)
+      .run();
+    await expect(
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, created_at, updated_at)
+         VALUES ('invalid', 'workspace', 'private', 'parent', 'document', 'a2', 'Invalid', 'owner', ?, ?)`,
+      )
+        .bind(timestamp, timestamp)
+        .run(),
+    ).rejects.toThrow(/cross_space_parent/);
   });
 
   it("enforces the owner guards and workspace cascade on a fresh database", async () => {
