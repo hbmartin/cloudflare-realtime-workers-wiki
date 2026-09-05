@@ -74,6 +74,31 @@ export type DocumentContentEnvelope = {
   document: ProseMirrorJson;
 };
 
+export type JobType = "import" | "export" | "template_clone" | "comment_migration" | "search_reindex";
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "awaiting_confirmation"
+  | "succeeded"
+  | "failed"
+  | "canceling"
+  | "canceled";
+
+export type Job = {
+  id: string;
+  workspaceId: string;
+  spaceId: string | null;
+  type: JobType;
+  status: JobStatus;
+  progress: { current: number; total: number; label: string };
+  warnings: string[];
+  error: { code: string; message: string } | null;
+  hasDownload: boolean;
+  expiresAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type PageNode = Page & { children: PageNode[] };
 
 export type MentionEntityType = "page" | "user";

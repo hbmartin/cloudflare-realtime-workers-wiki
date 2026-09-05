@@ -4,6 +4,7 @@ import { errorLogFields } from "../shared/error-log";
 import { buildTree, compareBinaryText } from "../shared/tree-model";
 import type {
   ClientMemberContext,
+  Job,
   MentionInboxItem,
   Page,
   PageKind,
@@ -36,6 +37,7 @@ import {
 import { observeUntilAborted, waitForReconciliationRetry, waitForWorkspaceInvalidationRetry } from "./retry";
 import { LoadingSplash } from "./Splash";
 import { TablePage } from "./TablePage";
+import { ActivitiesTray } from "./ActivitiesTray";
 
 type AppState =
   | { screen: "loading" }
@@ -733,10 +735,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [trashLoading, setTrashLoading] = useState(false);
   const [pageTreeRetrying, setPageTreeRetrying] = useState(false);
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [activitiesOpen, setActivitiesOpen] = useState(false);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [jobsLoading, setJobsLoading] = useState(false);
+  const [jobsError, setJobsError] = useState("");
+  const [pendingJobId, setPendingJobId] = useState<string | null>(null);
   const sidebarOpenRef = useRef(false);
   const sidebarRef = useRef<HTMLElement>(null);
   const sidebarTriggerRef = useRef<HTMLButtonElement>(null);
+  const activityTriggerRef = useRef<HTMLButtonElement>(null);
   const restoreSidebarTriggerFocus = useRef(false);
+  const restoreActivityTriggerFocus = useRef(false);
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const [archiveRemovalTombstones] = useState(() => new PageRemovalTombstones());
   // Archived-tree reads may lag a confirmed restore. Keep the newest restored
@@ -1318,6 +1327,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   useEffect(() => {
     void loadUnreadMentions();
   }, [loadUnreadMentions]);
+  const loadJobs = useCallback(async () => {
+    setJobsLoading(true);
+    try {
+      const data = await api<{ jobs: Job[] }>("/api/jobs");
+      setJobs(data.jobs);
+      setJobsError("");
+    } catch (error) {
+      setJobsError(apiErrorMessage(error, "Activities could not be refreshed."));
+    } finally {
+      setJobsLoading(false);
+    }
+  }, []);
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
       if (event.type === "workspace-invalidated") {
@@ -1332,7 +1353,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         void loadPages();
         return;
       }
-      if (event.type === "notifications-invalidated" || event.type === "jobs-invalidated") return;
+      if (event.type === "jobs-invalidated") {
+        if (activitiesOpen) void loadJobs();
+        return;
+      }
+      if (event.type === "notifications-invalidated") return;
       if (event.type === "pages-upserted") {
         const restoredRootId = event.restored
           ? (event.restoredRootId ?? restoredEventRoot(event.pages)?.id ?? null)
@@ -1390,7 +1415,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       clearConfirmedRestores,
       excludeConfirmedRestoresFromTrash,
       loadPages,
+      loadJobs,
       loadUnreadMentions,
+      activitiesOpen,
       member.user.id,
       reconcileRestoredEvent,
       recordPageRemovals,
@@ -1412,6 +1439,33 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     });
     return () => bundle.destroy();
   }, [handleWorkspaceEvent, loadPages, loadUnreadMentions, member.workspace.id, reportWorkspaceError]);
+
+  const closeActivities = useCallback(() => {
+    restoreActivityTriggerFocus.current = true;
+    setActivitiesOpen(false);
+  }, []);
+  useEffect(() => {
+    if (activitiesOpen || !restoreActivityTriggerFocus.current) return;
+    restoreActivityTriggerFocus.current = false;
+    activityTriggerRef.current?.focus();
+  }, [activitiesOpen]);
+  const openActivities = useCallback(() => {
+    restoreActivityTriggerFocus.current = false;
+    setActivitiesOpen(true);
+    void loadJobs();
+  }, [loadJobs]);
+  const mutateJob = useCallback(async (job: Job, action: "cancel" | "retry") => {
+    setPendingJobId(job.id);
+    try {
+      const data = await api<{ job: Job }>(`/api/jobs/${encodeURIComponent(job.id)}/${action}`, { method: "POST" });
+      setJobs((current) => current.map((candidate) => (candidate.id === data.job.id ? data.job : candidate)));
+      setJobsError("");
+    } catch (error) {
+      setJobsError(apiErrorMessage(error, `The job could not be ${action === "cancel" ? "canceled" : "retried"}.`));
+    } finally {
+      setPendingJobId(null);
+    }
+  }, []);
 
   useEffect(() => {
     const navigate = (event: Event) => {
@@ -2094,6 +2148,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}
         aria-label="Workspace navigation"
         tabIndex={-1}
+        inert={activitiesOpen ? true : undefined}
+        aria-hidden={activitiesOpen || undefined}
       >
         <header className="workspace-header">
           <span className="workspace-avatar">{member.workspace.name.slice(0, 1).toUpperCase()}</span>
@@ -2171,7 +2227,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         </footer>
       </aside>
 
-      <section className="workspace-content">
+      <section
+        className="workspace-content"
+        inert={activitiesOpen ? true : undefined}
+        aria-hidden={activitiesOpen || undefined}
+      >
         {workspaceError && (
           <div className="form-error workspace-error" role="alert">
             <span>{workspaceError}</span>
@@ -2204,16 +2264,30 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               </span>
             ))}
           </div>
-          {member.role !== "viewer" && (
-            <div className="new-menu">
-              <button className="primary-small" disabled={!canCreatePage} onClick={() => void createPage("document")}>
-                + Page
-              </button>
-              <button className="quiet-button" disabled={!canCreatePage} onClick={() => void createPage("table")}>
-                + Table
-              </button>
-            </div>
-          )}
+          <div className="topbar-actions">
+            <button
+              ref={activityTriggerRef}
+              className="activity-trigger"
+              aria-haspopup="dialog"
+              onClick={openActivities}
+            >
+              <span aria-hidden="true">↻</span>
+              Activities
+              {jobs.some((job) => ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status)) && (
+                <i aria-label="Background work in progress" />
+              )}
+            </button>
+            {member.role !== "viewer" && (
+              <div className="new-menu">
+                <button className="primary-small" disabled={!canCreatePage} onClick={() => void createPage("document")}>
+                  + Page
+                </button>
+                <button className="quiet-button" disabled={!canCreatePage} onClick={() => void createPage("table")}>
+                  + Table
+                </button>
+              </div>
+            )}
+          </div>
         </header>
 
         {view === "search" ? (
@@ -2278,6 +2352,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <EmptyWorkspace canEdit={member.role !== "viewer"} onCreate={() => void createPage("document", null)} />
         )}
       </section>
+      {activitiesOpen && (
+        <ActivitiesTray
+          jobs={jobs}
+          loading={jobsLoading}
+          error={jobsError}
+          pendingJobId={pendingJobId}
+          onClose={closeActivities}
+          onRefresh={() => void loadJobs()}
+          onCancel={(job) => void mutateJob(job, "cancel")}
+          onRetry={(job) => void mutateJob(job, "retry")}
+        />
+      )}
       {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
     </div>
   );

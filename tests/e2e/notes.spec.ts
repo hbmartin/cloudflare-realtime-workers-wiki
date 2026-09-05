@@ -88,6 +88,25 @@ test("bootstraps or signs in and passes critical accessibility checks", async ({
   expect(critical).toEqual([]);
 });
 
+test("opens the Activities tray with keyboard-safe focus and accessible empty state", async ({ page }) => {
+  await signIn(page);
+  const trigger = page.getByRole("button", { name: "Activities" });
+  await trigger.click();
+  const tray = page.getByRole("dialog", { name: "Activities" });
+  await expect(tray).toBeVisible();
+  await expect(tray.getByRole("heading", { name: "No background work yet" })).toBeVisible();
+  await expect(tray.getByRole("button", { name: "Close activities" })).toBeFocused();
+
+  const results = await new AxeBuilder({ page }).include(".activities-tray").analyze();
+  expect(
+    results.violations.filter((violation) => violation.impact === "critical" || violation.impact === "serious"),
+  ).toEqual([]);
+
+  await page.keyboard.press("Escape");
+  await expect(tray).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+});
+
 test("creates, renames, archives, and restores a page through the UI @mobile-sidebar", async ({ page }, testInfo) => {
   await signIn(page);
   const title = `Lifecycle ${testInfo.project.name} ${Date.now()}`;

@@ -418,6 +418,36 @@ select:focus-visible {
   display: flex;
   gap: 6px;
 }
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.activity-trigger {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 7px;
+  padding: 6px 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.activity-trigger:hover {
+  background: #f0eee7;
+  color: var(--ink);
+}
+.activity-trigger > span {
+  font-size: 16px;
+}
+.activity-trigger > i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
 .primary-small,
 .quiet-button {
   padding: 6px 10px;
@@ -1058,6 +1088,176 @@ button.mention-chip:focus-visible {
   display: none;
 }
 
+.activity-scrim {
+  position: fixed;
+  z-index: 29;
+  inset: 0;
+  border: 0;
+  background: #25231f35;
+  cursor: default;
+}
+.activities-tray {
+  position: fixed;
+  z-index: 30;
+  inset: 0 0 0 auto;
+  width: min(440px, 100vw);
+  background: var(--canvas);
+  border-left: 1px solid var(--line);
+  box-shadow: -16px 0 44px #25231f20;
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  color: var(--ink);
+}
+.activities-tray > header {
+  min-height: 76px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.activities-tray h2,
+.activities-tray h3,
+.activities-tray p {
+  margin: 0;
+}
+.activities-tray h2 {
+  font-family: Georgia, serif;
+  font-size: 26px;
+}
+.activities-tray .eyebrow {
+  color: #5452a8;
+}
+.activities-toolbar {
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.activity-list {
+  margin: 0;
+  padding: 0 20px 40px;
+  list-style: none;
+  overflow-y: auto;
+}
+.activity-list li {
+  padding: 18px 0;
+  border-bottom: 1px solid var(--line);
+  content-visibility: auto;
+  contain-intrinsic-size: 150px;
+}
+.activity-heading,
+.activity-meta,
+.activity-actions {
+  display: flex;
+  align-items: center;
+}
+.activity-heading,
+.activity-meta {
+  justify-content: space-between;
+  gap: 12px;
+}
+.activity-heading strong {
+  font-size: 14px;
+}
+.job-status {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: #ebe9e2;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: capitalize;
+}
+.status-running,
+.status-queued,
+.status-awaiting_confirmation {
+  background: #e8e7fb;
+  color: #454386;
+}
+.status-succeeded {
+  background: #e5f2e9;
+  color: #28603c;
+}
+.status-failed,
+.status-canceled {
+  background: #f5e5e2;
+  color: #8b3d32;
+}
+.activity-list li > p {
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.job-progress {
+  display: block;
+  width: 100%;
+  height: 5px;
+  border: 0;
+  margin-top: 11px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e5e2da;
+  appearance: none;
+}
+.job-progress::-webkit-progress-bar {
+  background: #e5e2da;
+}
+.job-progress::-webkit-progress-value,
+.job-progress::-moz-progress-bar {
+  background: var(--accent);
+}
+.activity-list .activity-job-error {
+  color: var(--danger);
+}
+.activity-list .activity-warning {
+  color: #865a20;
+}
+.activity-meta {
+  margin-top: 14px;
+}
+.activity-meta time {
+  color: var(--muted);
+  font-size: 10px;
+}
+.activity-actions {
+  gap: 6px;
+}
+.activity-actions a {
+  color: inherit;
+  text-decoration: none;
+}
+.activity-empty,
+.activity-error {
+  margin: auto;
+  max-width: 300px;
+  padding: 32px 20px;
+  text-align: center;
+}
+.activity-empty > span {
+  color: var(--accent);
+  font-size: 42px;
+}
+.activity-empty h3 {
+  margin-top: 12px;
+  font-family: Georgia, serif;
+}
+.activity-empty p,
+.activity-error p {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.activity-error .quiet-button {
+  margin-top: 12px;
+}
+
 @media (max-width: 1050px) {
   .document-layout.with-panel .document-paper {
     margin-right: 0;
@@ -1137,6 +1337,12 @@ button.mention-chip:focus-visible {
   }
   .new-menu .quiet-button {
     display: none;
+  }
+  .activity-trigger {
+    font-size: 0;
+  }
+  .activity-trigger > span {
+    font-size: 19px;
   }
   /* Touch devices never hover, so the row actions have to stay put. */
   .tree-actions {

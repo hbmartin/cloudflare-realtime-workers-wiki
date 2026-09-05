@@ -74,6 +74,19 @@ import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } fr
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
+import {
+  consumeDeliveryMessage,
+  createJob,
+  expireJobArtifacts,
+  jobForMember,
+  jobJson,
+  NotesJobWorkflow,
+  recoverQueuedJobs,
+  startJobWorkflow,
+  sweepOutbox,
+  type DeliveryQueueMessage,
+  type JobRow,
+} from "./jobs";
 
 const app = new Hono<{ Bindings: Env }>();
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -1117,6 +1130,116 @@ app.delete("/api/spaces/:id/members/:userId", async (c) => {
     .run();
   sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
   return c.json({ ok: true });
+});
+
+app.get("/api/jobs", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const requestedLimit = Number(c.req.query("limit") ?? 50);
+  const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
+  const rows = await c.env.DB.prepare(
+    `SELECT j.* FROM jobs j
+      LEFT JOIN spaces s ON s.id = j.space_id
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE j.workspace_id = ? AND j.requested_by = ?
+       AND (j.space_id IS NULL OR ? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+     ORDER BY j.created_at DESC, j.id DESC LIMIT ?`,
+  )
+    .bind(member.user.id, member.workspace.id, member.user.id, member.role, limit)
+    .all<JobRow>();
+  return c.json({ jobs: rows.results.map(jobJson) });
+});
+
+app.get("/api/jobs/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json({ job: jobJson(await jobForMember(c.env, member, c.req.param("id"))) });
+});
+
+app.post("/api/jobs/search-reindex", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const existing = await c.env.DB.prepare(
+    `SELECT * FROM jobs WHERE workspace_id = ? AND type = 'search_reindex' AND status IN ('queued', 'running')
+      ORDER BY created_at DESC LIMIT 1`,
+  )
+    .bind(member.workspace.id)
+    .first<JobRow>();
+  if (existing) return c.json({ job: jobJson(existing), coalesced: true });
+  const job = await createJob(c.env, { member, type: "search_reindex" });
+  c.executionCtx.waitUntil(
+    startJobWorkflow(c.env, job).catch((error) => {
+      console.error("Failed to start search reindex workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(job), coalesced: false }, 202);
+});
+
+app.post("/api/jobs/:id/cancel", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const job = await jobForMember(c.env, member, c.req.param("id"));
+  if (["succeeded", "failed", "canceled"].includes(job.status)) {
+    throw new HttpError(409, "job_not_cancelable", "This job is no longer running.");
+  }
+  await c.env.DB.prepare(
+    `UPDATE jobs SET status = 'canceled', progress_label = 'Canceled', updated_at = ?
+      WHERE id = ? AND status IN ('queued', 'running', 'awaiting_confirmation', 'canceling')`,
+  )
+    .bind(now(), job.id)
+    .run();
+  if (job.workflow_instance_id) {
+    c.executionCtx.waitUntil(
+      c.env.NOTES_WORKFLOW.get(job.workflow_instance_id)
+        .then((instance) => instance.terminate())
+        .catch((error) => console.error("Failed to terminate canceled workflow", { jobId: job.id, error })),
+    );
+  }
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(await jobForMember(c.env, member, job.id)) });
+});
+
+app.post("/api/jobs/:id/retry", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const job = await jobForMember(c.env, member, c.req.param("id"));
+  if (job.status !== "failed" && job.status !== "canceled") {
+    throw new HttpError(409, "job_not_retryable", "Only failed or canceled jobs can be retried.");
+  }
+  const instanceId = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, progress_current = 0, progress_label = 'Queued',
+       error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`,
+  )
+    .bind(instanceId, now(), job.id)
+    .run();
+  const retried = await jobForMember(c.env, member, job.id);
+  c.executionCtx.waitUntil(
+    startJobWorkflow(c.env, retried).catch((error) => {
+      console.error("Failed to restart job workflow", { jobId: job.id, error });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(retried) }, 202);
+});
+
+app.get("/api/jobs/:id/download", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const job = await jobForMember(c.env, member, c.req.param("id"));
+  if (job.status !== "succeeded" || !job.output_key) {
+    throw new HttpError(409, "job_download_unavailable", "This job does not have a downloadable result.");
+  }
+  if (job.expires_at && job.expires_at <= now()) {
+    throw new HttpError(404, "job_artifact_expired", "This download has expired.");
+  }
+  const artifact = await c.env.BUCKET.get(job.output_key);
+  if (!artifact) throw new HttpError(404, "job_artifact_missing", "This download is no longer available.");
+  const headers = new Headers();
+  artifact.writeHttpMetadata(headers);
+  headers.set("cache-control", "private, max-age=0, must-revalidate");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set(
+    "content-disposition",
+    attachmentDisposition(artifact.customMetadata?.filename ?? `notes-${job.type}`, false),
+  );
+  return new Response(artifact.body, { headers });
 });
 
 app.get("/api/pages/tree", async (c) => {
@@ -3871,7 +3994,34 @@ export default {
         console.error("Failed to prune page move receipts", error);
       }),
     );
+    context.waitUntil(
+      recoverQueuedJobs(env).catch((error) => {
+        console.error("Queued job recovery failed", error);
+      }),
+    );
+    context.waitUntil(
+      sweepOutbox(env).catch((error) => {
+        console.error("Outbox sweep failed", error);
+      }),
+    );
+    context.waitUntil(
+      expireJobArtifacts(env).catch((error) => {
+        console.error("Job artifact expiry failed", error);
+      }),
+    );
+  },
+  async queue(batch: MessageBatch<DeliveryQueueMessage>, env: Env) {
+    await Promise.all(
+      batch.messages.map(async (message) => {
+        try {
+          await consumeDeliveryMessage(env, message);
+        } catch (error) {
+          console.error("Delivery queue message failed", { messageId: message.id, attempts: message.attempts, error });
+          message.retry({ delaySeconds: Math.min(300, 2 ** Math.min(message.attempts, 8)) });
+        }
+      }),
+    );
   },
 };
 
-export { Document, WorkspaceEvents };
+export { Document, NotesJobWorkflow, WorkspaceEvents };

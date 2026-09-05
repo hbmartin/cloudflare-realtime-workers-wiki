@@ -1,5 +1,6 @@
 import type { Document } from "./document";
 import type { WorkspaceEvents } from "./workspace-events";
+import type { JobWorkflowParams } from "./jobs";
 
 export type { MemberContext } from "../shared/types";
 
@@ -8,6 +9,8 @@ export interface AppBindings {
   BUCKET: R2Bucket;
   DOCUMENT: DurableObjectNamespace<Document>;
   WORKSPACE_EVENTS: DurableObjectNamespace<WorkspaceEvents>;
+  NOTES_WORKFLOW: Workflow<Readonly<JobWorkflowParams>>;
+  DELIVERY_QUEUE: Queue;
   ASSETS: Fetcher;
   BETTER_AUTH_SECRET: string;
   BETTER_AUTH_URL: string;
