@@ -66,25 +66,26 @@ CREATE TRIGGER pages_validate_space_insert
 BEFORE INSERT ON pages
 WHEN NEW.space_id IS NOT NULL
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'invalid_page_space') WHERE NOT EXISTS (
     SELECT 1 FROM spaces s WHERE s.id = NEW.space_id AND s.workspace_id = NEW.workspace_id
-  ) THEN RAISE(ABORT, 'invalid_page_space') END;
-  SELECT CASE WHEN NEW.parent_id IS NOT NULL AND NOT EXISTS (
+  );
+  SELECT RAISE(ABORT, 'cross_space_parent') WHERE NEW.parent_id IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM pages p
      WHERE p.id = NEW.parent_id AND p.workspace_id = NEW.workspace_id AND p.space_id = NEW.space_id
-  ) THEN RAISE(ABORT, 'cross_space_parent') END;
+  );
 END;
 
 CREATE TRIGGER pages_validate_space_update
 BEFORE UPDATE OF space_id, parent_id ON pages
 BEGIN
-  SELECT CASE WHEN NEW.space_id IS NULL OR NOT EXISTS (
+  SELECT RAISE(ABORT, 'invalid_page_space') WHERE NEW.space_id IS NULL OR NOT EXISTS (
     SELECT 1 FROM spaces s WHERE s.id = NEW.space_id AND s.workspace_id = NEW.workspace_id
-  ) THEN RAISE(ABORT, 'invalid_page_space') END;
-  SELECT CASE WHEN NEW.parent_id IS NOT OLD.parent_id AND NEW.parent_id IS NOT NULL AND NOT EXISTS (
+  );
+  SELECT RAISE(ABORT, 'cross_space_parent')
+   WHERE NEW.parent_id IS NOT OLD.parent_id AND NEW.parent_id IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM pages p
      WHERE p.id = NEW.parent_id AND p.workspace_id = NEW.workspace_id AND p.space_id = NEW.space_id
-  ) THEN RAISE(ABORT, 'cross_space_parent') END;
+  );
 END;
 
 CREATE TABLE document_projections (
