@@ -61,6 +61,16 @@ function isJsonContentType(contentType: string | null) {
   return mediaType === "application/json" || mediaType?.endsWith("+json") === true;
 }
 
+function isDeliberateAbort(cause: unknown, signal: AbortSignal | null | undefined) {
+  return (
+    signal?.aborted === true &&
+    typeof cause === "object" &&
+    cause !== null &&
+    "name" in cause &&
+    cause.name === "AbortError"
+  );
+}
+
 /**
  * A 2xx response whose body could not be decoded into the API contract.
  * @expected-unused -- Exported as the base type of the public concrete response errors.
@@ -196,6 +206,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
         }
       }
     } catch (cause) {
+      if (isDeliberateAbort(cause, init?.signal)) throw cause;
       responseBodyFailure = "read";
       responseBodyCause = cause;
     }
@@ -227,6 +238,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     payload = await response.text();
   } catch (cause) {
+    if (isDeliberateAbort(cause, init?.signal)) throw cause;
     const error = new UnreadableApiResponseError(response.status, {
       requestPath: path,
       responseUrl,

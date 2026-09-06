@@ -3,9 +3,13 @@ import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
 import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import type { DocumentContentEnvelope } from "../shared/types";
+import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import { joinBytes, splitBytes } from "../shared/bytes";
 import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
+import { sweepOutbox } from "./jobs";
+import { notificationFanoutStatements } from "./notifications";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
 const COMPACTION_DELAY_MS = 30_000;
@@ -37,10 +41,12 @@ interface MetaRow extends Record<string, SqlStorageValue> {
   read_only: number;
   last_version_at: number;
   last_editor_id: string | null;
+  notify_edit: number;
 }
 
 interface PageProjectionRow {
   workspace_id: string;
+  space_id: string;
   title: string;
   archived_at: number | null;
 }
@@ -52,6 +58,135 @@ interface RestoreRecoveryRow extends Record<string, SqlStorageValue> {
   pre_key: string | null;
 }
 
+type RelativePositionJson = ReturnType<typeof Y.relativePositionToJSON>;
+
+function documentTextNodes(document: Y.Doc) {
+  const nodes: Y.XmlText[] = [];
+  const visit = (parent: Y.XmlFragment | Y.XmlElement) => {
+    for (const child of parent.toArray()) {
+      if (child instanceof Y.XmlText) nodes.push(child);
+      else if (child instanceof Y.XmlElement) visit(child);
+    }
+  };
+  visit(document.getXmlFragment("document-store"));
+  return nodes;
+}
+
+function commentMarkThreadId(markName: string, value: unknown) {
+  const baseName = markName.replace(/--[a-zA-Z0-9+/=]{8}$/, "");
+  if (baseName !== "comment" || !value || typeof value !== "object") return null;
+  const threadId = (value as Record<string, unknown>).threadId;
+  return typeof threadId === "string" ? threadId : null;
+}
+
+function anchoredCommentThreadIds(document: Y.Doc) {
+  const ids = new Set<string>();
+  for (const text of documentTextNodes(document)) {
+    for (const delta of text.toDelta()) {
+      for (const [markName, value] of Object.entries(delta.attributes ?? {})) {
+        const threadId = commentMarkThreadId(markName, value);
+        if (threadId) ids.add(threadId);
+      }
+    }
+  }
+  return ids;
+}
+
+function legacyComments(document: Y.Doc) {
+  const anchored = anchoredCommentThreadIds(document);
+  const threads: Array<Record<string, unknown>> = [];
+  document.getMap<Y.Map<unknown>>("comments").forEach((thread, id) => {
+    if (!(thread instanceof Y.Map)) return;
+    const rawComments = thread.get("comments");
+    const comments =
+      rawComments instanceof Y.Array
+        ? rawComments
+            .toArray()
+            .filter((comment): comment is Y.Map<unknown> => comment instanceof Y.Map)
+            .map((comment) => ({
+              id: comment.get("id"),
+              userId: comment.get("userId"),
+              body: comment.get("body") ?? null,
+              deletedAt: comment.get("deletedAt"),
+              createdAt: comment.get("createdAt"),
+              updatedAt: comment.get("updatedAt"),
+            }))
+        : [];
+    threads.push({
+      id: typeof thread.get("id") === "string" ? thread.get("id") : id,
+      createdAt: thread.get("createdAt"),
+      updatedAt: thread.get("updatedAt"),
+      resolved: Boolean(thread.get("resolved")),
+      resolvedUpdatedAt: thread.get("resolvedUpdatedAt"),
+      resolvedBy: thread.get("resolvedBy"),
+      anchored: anchored.has(id),
+      comments,
+    });
+  });
+  return threads;
+}
+
+function removeCommentMark(document: Y.Doc, threadId: string) {
+  let changed = false;
+  document.transact(() => {
+    for (const text of documentTextNodes(document)) {
+      let offset = 0;
+      for (const delta of text.toDelta()) {
+        const length = typeof delta.insert === "string" ? delta.insert.length : 1;
+        for (const [markName, value] of Object.entries(delta.attributes ?? {})) {
+          if (commentMarkThreadId(markName, value) === threadId) {
+            text.format(offset, length, { [markName]: null });
+            changed = true;
+          }
+        }
+        offset += length;
+      }
+    }
+  }, "comment-anchor");
+  return changed;
+}
+
+async function addCommentMark(
+  document: Y.Doc,
+  threadId: string,
+  selection: { head: RelativePositionJson; anchor: RelativePositionJson },
+) {
+  let head: Y.AbsolutePosition | null;
+  let anchor: Y.AbsolutePosition | null;
+  try {
+    head = Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(selection.head), document);
+    anchor = Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(selection.anchor), document);
+  } catch {
+    return false;
+  }
+  if (!head || !anchor || !(head.type instanceof Y.XmlText) || !(anchor.type instanceof Y.XmlText)) return false;
+  const nodes = documentTextNodes(document);
+  let headNode = nodes.indexOf(head.type);
+  let anchorNode = nodes.indexOf(anchor.type);
+  if (headNode < 0 || anchorNode < 0) return false;
+  let headOffset = head.index;
+  let anchorOffset = anchor.index;
+  if (headNode > anchorNode || (headNode === anchorNode && headOffset > anchorOffset)) {
+    [headNode, anchorNode] = [anchorNode, headNode];
+    [headOffset, anchorOffset] = [anchorOffset, headOffset];
+  }
+  const ranges = nodes.slice(headNode, anchorNode + 1).map((text, index, selected) => {
+    const from = index === 0 ? headOffset : 0;
+    const to = index === selected.length - 1 ? anchorOffset : text.length;
+    return { text, from, length: Math.max(0, to - from) };
+  });
+  const selectedLength = ranges.reduce((total, range) => total + range.length, 0);
+  if (!selectedLength || selectedLength > 100_000) return false;
+  const markName = `comment--${(await sha256Hex(threadId)).slice(0, 8)}`;
+  document.transact(() => {
+    removeCommentMark(document, threadId);
+    for (const range of ranges) {
+      if (range.length) range.text.format(range.from, range.length, { [markName]: { threadId, orphan: false } });
+    }
+  }, "comment-anchor");
+  return true;
+}
+
 export class Document extends YServer {
   static options = { hibernate: true };
   static callbackOptions = { debounceWait: 1_000, debounceMaxWait: 5_000 };
@@ -61,6 +196,7 @@ export class Document extends YServer {
   private metadata!: MetaRow;
   private pendingUpdates: Uint8Array[] = [];
   private pendingAuthorId: string | null = null;
+  private pendingNotifyEdit = false;
   private purged = false;
   private transition: "archive" | "restore" | null = null;
   private transitionAlarmDeferred = false;
@@ -101,7 +237,8 @@ export class Document extends YServer {
       restore_retry_at INTEGER NOT NULL DEFAULT 0,
       read_only INTEGER NOT NULL DEFAULT 0,
       last_version_at INTEGER NOT NULL DEFAULT 0,
-      last_editor_id TEXT
+      last_editor_id TEXT,
+      notify_edit INTEGER NOT NULL DEFAULT 0
     )`);
     const metaColumns = sql.exec<{ name: string }>(`PRAGMA table_info(document_meta)`).toArray();
     if (!metaColumns.some((column) => column.name === "snapshot_bytes")) {
@@ -115,6 +252,9 @@ export class Document extends YServer {
     }
     if (!metaColumns.some((column) => column.name === "restore_retry_at")) {
       sql.exec(`ALTER TABLE document_meta ADD COLUMN restore_retry_at INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!metaColumns.some((column) => column.name === "notify_edit")) {
+      sql.exec(`ALTER TABLE document_meta ADD COLUMN notify_edit INTEGER NOT NULL DEFAULT 0`);
     }
     const hadMetadata = Boolean(
       sql.exec<{ present: number }>(`SELECT EXISTS(SELECT 1 FROM document_meta WHERE id = 1) present`).one().present,
@@ -351,6 +491,152 @@ export class Document extends YServer {
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
     }
+    if (request.method === "GET" && url.pathname.endsWith("/content")) {
+      this.flushPendingUpdates();
+      if (this.metadata.dirty) await this.compact();
+      const { pageId, epoch } = this.ids;
+      const document = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
+      const envelope: DocumentContentEnvelope = {
+        schemaVersion: 1,
+        pageId,
+        contentEpoch: epoch,
+        sequence: this.metadata.snapshot_seq,
+        document,
+      };
+      return Response.json(envelope, {
+        headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
+      });
+    }
+    if (request.method === "GET" && url.pathname.endsWith("/legacy-comments")) {
+      return Response.json({ threads: legacyComments(this.document) });
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/legacy-comments/clear")) {
+      const legacy = this.document.getMap("comments");
+      if (legacy.size) {
+        this.document.transact(() => legacy.clear(), "comment-migration");
+        this.flushPendingUpdates();
+        if (this.metadata.dirty) await this.compact();
+      }
+      return Response.json({ cleared: true });
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/comment-anchor")) {
+      let body: {
+        threadId?: unknown;
+        userId?: unknown;
+        operation?: unknown;
+        selection?: { head?: unknown; anchor?: unknown };
+      };
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "Invalid comment anchor request." }, { status: 400 });
+      }
+      if (
+        typeof body.threadId !== "string" ||
+        typeof body.userId !== "string" ||
+        (body.operation !== "add" && body.operation !== "remove")
+      ) {
+        return Response.json({ error: "Invalid comment anchor request." }, { status: 400 });
+      }
+      const { pageId } = this.ids;
+      const thread = await this.bindings.DB.prepare(`SELECT id FROM comment_threads WHERE id = ? AND page_id = ?`)
+        .bind(body.threadId, pageId)
+        .first<{ id: string }>();
+      if (!thread) return Response.json({ error: "Comment thread not found." }, { status: 404 });
+      this.pendingAuthorId = body.userId;
+      const anchored =
+        body.operation === "remove"
+          ? !removeCommentMark(this.document, body.threadId)
+          : body.selection?.head && body.selection.anchor
+            ? await addCommentMark(this.document, body.threadId, {
+                head: body.selection.head as RelativePositionJson,
+                anchor: body.selection.anchor as RelativePositionJson,
+              })
+            : false;
+      this.flushPendingUpdates();
+      if (this.metadata.dirty) await this.compact();
+      return Response.json({ anchored: body.operation === "remove" ? false : anchored });
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/initialize")) {
+      let body: { jobId?: unknown; inputKey?: unknown };
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "Invalid initialization request." }, { status: 400 });
+      }
+      const jobId = typeof body.jobId === "string" ? body.jobId : "";
+      const inputKey = typeof body.inputKey === "string" ? body.inputKey : "";
+      if (!jobId || !inputKey.startsWith(`jobs/${jobId}/`)) {
+        return Response.json({ error: "Invalid initialization request." }, { status: 400 });
+      }
+      const { pageId, epoch } = this.ids;
+      const staged = await this.bindings.DB.prepare(
+        `SELECT j.requested_by FROM pages p JOIN jobs j ON j.id = p.import_job_id
+          WHERE p.id = ? AND p.content_epoch = ? AND p.import_job_id = ?
+            AND j.type IN ('import', 'template_clone') AND j.status IN ('queued', 'running')`,
+      )
+        .bind(pageId, epoch, jobId)
+        .first<{ requested_by: string }>();
+      if (!staged) {
+        return Response.json(
+          { error: "Only a staged import or template clone may initialize content." },
+          { status: 409 },
+        );
+      }
+      const existingProjection = await this.bindings.DB.prepare(
+        `SELECT sequence FROM document_projections WHERE page_id = ? AND content_epoch = ?`,
+      )
+        .bind(pageId, epoch)
+        .first<{ sequence: number }>();
+      if (existingProjection) return Response.json({ initialized: true, sequence: existingProjection.sequence });
+      const alreadyStarted =
+        this.metadata.snapshot_seq !== 0 ||
+        this.pendingUpdates.length > 0 ||
+        this.state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) count FROM update_events`).one().count > 0 ||
+        Array.from(this.getConnections()).length > 0;
+      if (alreadyStarted) {
+        return Response.json({ error: "The staged document has already been initialized." }, { status: 409 });
+      }
+      const input = await this.bindings.BUCKET.get(inputKey);
+      if (!input) return Response.json({ error: "Initialization content is missing." }, { status: 404 });
+      if (input.size > READ_ONLY_BYTES) {
+        return Response.json({ error: "Initialization content is too large." }, { status: 413 });
+      }
+      const update = new Uint8Array(await input.arrayBuffer());
+      this.pendingAuthorId = staged.requested_by;
+      Y.applyUpdate(this.document, update);
+      this.flushPendingUpdates();
+      // An empty update produces no Yjs event, but still needs a sequence so
+      // compaction persists the canonical empty projection for the staged page.
+      if (!this.metadata.dirty) {
+        this.state.storage.transactionSync(() => {
+          const row = this.state.storage.sql
+            .exec<{ seq: number }>(
+              `INSERT INTO update_events (author_id, created_at) VALUES (?, ?) RETURNING seq`,
+              staged.requested_by,
+              Date.now(),
+            )
+            .one();
+          for (const [index, bytes] of splitBytes(update).entries()) {
+            this.state.storage.sql.exec(
+              `INSERT INTO update_chunks (seq, chunk_index, data) VALUES (?, ?, ?)`,
+              row.seq,
+              index,
+              bytes.buffer,
+            );
+          }
+          this.state.storage.sql.exec(
+            `UPDATE document_meta SET dirty = 1, last_editor_id = ? WHERE id = 1`,
+            staged.requested_by,
+          );
+        });
+        this.metadata.dirty = 1;
+        this.metadata.last_editor_id = staged.requested_by;
+        this.pendingAuthorId = null;
+      }
+      await this.compact();
+      return Response.json({ initialized: true, sequence: this.metadata.snapshot_seq });
+    }
     if (request.method === "POST" && url.pathname.endsWith("/archive")) {
       if (this.validatingTransition || this.transition || this.metadata.restore_pending) {
         return Response.json({ error: "Document transition already in progress." }, { status: 409 });
@@ -403,6 +689,7 @@ export class Document extends YServer {
       this.metadata.retired = 1;
       this.pendingUpdates = [];
       this.pendingAuthorId = null;
+      this.pendingNotifyEdit = false;
       for (const connection of this.getConnections()) {
         connection.close(4411, "This page was permanently deleted.");
       }
@@ -417,12 +704,14 @@ export class Document extends YServer {
     if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) return;
     this.pendingUpdates.push(update);
     this.pendingAuthorId = origin?.state?.userId ?? this.pendingAuthorId;
+    this.pendingNotifyEdit ||= Boolean(origin?.state?.userId);
   }
 
   private flushPendingUpdates() {
     if (!this.pendingUpdates.length || this.purged) return;
     const updates = this.pendingUpdates;
     const authorId = this.pendingAuthorId;
+    const notifyEdit = this.pendingNotifyEdit;
     const merged = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
     this.state.storage.transactionSync(() => {
       const row = this.state.storage.sql
@@ -441,14 +730,18 @@ export class Document extends YServer {
         );
       }
       this.state.storage.sql.exec(
-        `UPDATE document_meta SET dirty = 1, last_editor_id = COALESCE(?, last_editor_id) WHERE id = 1`,
+        `UPDATE document_meta SET dirty = 1, last_editor_id = COALESCE(?, last_editor_id),
+          notify_edit = CASE WHEN ? THEN 1 ELSE notify_edit END WHERE id = 1`,
         authorId,
+        notifyEdit ? 1 : 0,
       );
     });
     this.pendingUpdates = [];
     this.pendingAuthorId = null;
+    this.pendingNotifyEdit = false;
     this.metadata.dirty = 1;
     if (authorId) this.metadata.last_editor_id = authorId;
+    if (notifyEdit) this.metadata.notify_edit = 1;
   }
 
   private compact(forceVersion = false): Promise<void> {
@@ -478,6 +771,16 @@ export class Document extends YServer {
     const snapshot = Y.encodeStateAsUpdate(this.document);
     const json = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
     const projection = projectDocument(json);
+    const envelope: DocumentContentEnvelope = {
+      schemaVersion: 1,
+      pageId,
+      contentEpoch: epoch,
+      sequence: maximum,
+      document: json,
+    };
+    const structuredJson = canonicalJson(envelope);
+    const structuredBytes = new TextEncoder().encode(structuredJson);
+    const structuredKey = this.projectionKey(pageId, epoch, maximum);
     const readOnly = snapshot.byteLength >= READ_ONLY_BYTES;
     if (snapshot.byteLength >= WARN_BYTES) {
       this.broadcastCustomMessage(
@@ -492,24 +795,38 @@ export class Document extends YServer {
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(
         `UPDATE document_meta
-            SET dirty = 0, snapshot_bytes = ?, read_only = CASE WHEN ? THEN 1 ELSE read_only END
+            SET dirty = 0, notify_edit = 0, snapshot_bytes = ?, read_only = CASE WHEN ? THEN 1 ELSE read_only END
           WHERE id = 1`,
         snapshot.byteLength,
         readOnly ? 1 : 0,
       );
     });
     this.metadata.dirty = 0;
+    this.metadata.notify_edit = 0;
     this.metadata.snapshot_bytes = snapshot.byteLength;
     if (readOnly) this.metadata.read_only = 1;
 
     try {
+      // Keep the dirty-state handoff synchronous with capturing `maximum`.
+      // Updates received while hashing or writing R2 must remain dirty for the
+      // next compaction instead of being cleared by this one.
+      const structuredHash = await sha256Hex(structuredJson);
       await this.bindings.BUCKET.put(this.snapshotKey(pageId, epoch), snapshot, {
         httpMetadata: { contentType: "application/octet-stream" },
         customMetadata: { pageId, epoch: String(epoch), sequence: String(maximum) },
       });
+      await this.bindings.BUCKET.put(structuredKey, structuredBytes, {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+        customMetadata: {
+          pageId,
+          epoch: String(epoch),
+          sequence: String(maximum),
+          contentHash: structuredHash,
+        },
+      });
 
       const page = await this.bindings.DB.prepare(
-        `SELECT workspace_id, title, archived_at FROM pages WHERE id = ? AND content_epoch = ?`,
+        `SELECT workspace_id, space_id, title, archived_at FROM pages WHERE id = ? AND content_epoch = ?`,
       )
         .bind(pageId, epoch)
         .first<PageProjectionRow>();
@@ -519,15 +836,37 @@ export class Document extends YServer {
       let pageProjected = false;
 
       if (page) {
-        const [oldPageTargets, oldUserTargets] = await Promise.all([
+        const [oldPageTargets, oldUserTargets, watcherRows] = await Promise.all([
           this.bindings.DB.prepare(`SELECT target_page_id id FROM page_references WHERE source_page_id = ?`)
             .bind(pageId)
             .all<{ id: string }>(),
           this.bindings.DB.prepare(`SELECT target_user_id id FROM member_mentions WHERE source_page_id = ?`)
             .bind(pageId)
             .all<{ id: string }>(),
+          metadataAtStart.notify_edit && metadataAtStart.last_editor_id
+            ? this.bindings.DB.prepare(
+                `SELECT user_id id FROM subscriptions
+                  WHERE resource_type = 'page' AND resource_id = ? AND muted_at IS NULL
+                 UNION
+                SELECT space_watch.user_id id FROM subscriptions space_watch
+                  WHERE space_watch.resource_type = 'space' AND space_watch.resource_id = ?
+                    AND space_watch.muted_at IS NULL
+                    AND NOT EXISTS (
+                      SELECT 1 FROM subscriptions page_override
+                       WHERE page_override.user_id = space_watch.user_id
+                         AND page_override.resource_type = 'page' AND page_override.resource_id = ?
+                    )`,
+              )
+                .bind(pageId, page.space_id, pageId)
+                .all<{ id: string }>()
+            : Promise.resolve({ results: [] as Array<{ id: string }> }),
         ]);
         const timestamp = Date.now();
+        const oldMentionIds = new Set(oldUserTargets.results.map((row) => row.id));
+        const newMentionIds = projection.memberMentions
+          .map((mention) => mention.targetId)
+          .filter((id) => !oldMentionIds.has(id));
+        const watcherIds = watcherRows.results.map((row) => row.id).filter((id) => !newMentionIds.includes(id));
         const makeVersion = Boolean(
           forceVersion ||
           !metadataAtStart.last_version_at ||
@@ -539,13 +878,42 @@ export class Document extends YServer {
               WHERE id = ? AND content_epoch = ?`,
           ).bind(projection.plainText, maximum, readOnly ? 1 : 0, timestamp, pageId, epoch),
           this.bindings.DB.prepare(
+            `INSERT INTO document_projections
+              (page_id, content_epoch, sequence, schema_version, r2_key, content_hash, byte_size, updated_at)
+             SELECT id, ?, ?, 1, ?, ?, ?, ? FROM pages
+              WHERE id = ? AND content_epoch = ?
+             ON CONFLICT(page_id) DO UPDATE SET
+              content_epoch = excluded.content_epoch,
+              sequence = excluded.sequence,
+              schema_version = excluded.schema_version,
+              r2_key = excluded.r2_key,
+              content_hash = excluded.content_hash,
+              byte_size = excluded.byte_size,
+              updated_at = excluded.updated_at`,
+          ).bind(epoch, maximum, structuredKey, structuredHash, structuredBytes.byteLength, timestamp, pageId, epoch),
+          this.bindings.DB.prepare(
             `DELETE FROM page_search WHERE page_id = ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
             `INSERT INTO page_search (page_id, workspace_id, title, body)
               SELECT id, workspace_id, title, ? FROM pages
-               WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
+               WHERE id = ? AND content_epoch = ? AND archived_at IS NULL AND import_job_id IS NULL`,
+          ).bind(projection.plainText, pageId, epoch),
+          this.bindings.DB.prepare(
+            `DELETE FROM page_search_v2 WHERE page_id = ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, pageId, epoch),
+          this.bindings.DB.prepare(
+            `INSERT INTO page_search_v2
+              (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+             SELECT p.id, p.workspace_id, p.space_id, p.title,
+                    COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
+                    ?,
+                    COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
+                    COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
+               FROM pages p WHERE p.id = ? AND p.content_epoch = ? AND p.archived_at IS NULL
+                 AND p.import_job_id IS NULL`,
           ).bind(projection.plainText, pageId, epoch),
           this.bindings.DB.prepare(
             `UPDATE page_references SET projection_seq = -1 WHERE source_page_id = ?
@@ -593,6 +961,30 @@ export class Document extends YServer {
             `DELETE FROM member_mentions WHERE source_page_id = ? AND projection_seq <> ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, maximum, pageId, epoch),
+          ...notificationFanoutStatements(this.bindings.DB, {
+            workspaceId: page.workspace_id,
+            spaceId: page.space_id,
+            pageId,
+            threadId: null,
+            actorId: metadataAtStart.last_editor_id ?? "",
+            eventType: "mention",
+            sourceId: `${pageId}:${epoch}:${maximum}`,
+            recipientIds: metadataAtStart.notify_edit && metadataAtStart.last_editor_id ? newMentionIds : [],
+            data: { sequence: maximum },
+            createdAt: timestamp,
+          }),
+          ...notificationFanoutStatements(this.bindings.DB, {
+            workspaceId: page.workspace_id,
+            spaceId: page.space_id,
+            pageId,
+            threadId: null,
+            actorId: metadataAtStart.last_editor_id ?? "",
+            eventType: "page_edit",
+            sourceId: `${pageId}:${epoch}:${maximum}`,
+            recipientIds: metadataAtStart.notify_edit ? watcherIds : [],
+            data: { sequence: maximum },
+            createdAt: timestamp,
+          }),
         ];
         const currentPageTargetsIndex = statements.length;
         statements.push(
@@ -663,6 +1055,18 @@ export class Document extends YServer {
               mentionTargetUserIds,
             }).catch((error) => console.error("Failed to broadcast projection update", error)),
           );
+          if (
+            metadataAtStart.notify_edit &&
+            metadataAtStart.last_editor_id &&
+            (newMentionIds.length || watcherIds.length)
+          ) {
+            this.state.waitUntil(
+              Promise.all([
+                broadcastWorkspaceEvent(this.bindings, page.workspace_id, { type: "notifications-invalidated" }),
+                sweepOutbox(this.bindings),
+              ]).catch((error) => console.error("Failed to enqueue document notifications", error)),
+            );
+          }
         }
       }
 
@@ -689,7 +1093,11 @@ export class Document extends YServer {
       }
     } catch (error) {
       this.metadata.dirty = 1;
-      this.state.storage.sql.exec(`UPDATE document_meta SET dirty = 1 WHERE id = 1`);
+      if (metadataAtStart.notify_edit) this.metadata.notify_edit = 1;
+      this.state.storage.sql.exec(
+        `UPDATE document_meta SET dirty = 1, notify_edit = CASE WHEN ? THEN 1 ELSE notify_edit END WHERE id = 1`,
+        metadataAtStart.notify_edit ? 1 : 0,
+      );
       try {
         await this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS);
       } catch (alarmError) {
@@ -1010,6 +1418,10 @@ export class Document extends YServer {
 
   private snapshotKey(pageId: string, epoch: number) {
     return `documents/${pageId}/epochs/${epoch}/current.bin`;
+  }
+
+  private projectionKey(pageId: string, epoch: number, sequence: number) {
+    return `documents/${pageId}/epochs/${epoch}/projections/${sequence}.json`;
   }
 
   private async finishTransition() {

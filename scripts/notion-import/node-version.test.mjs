@@ -1,7 +1,14 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { assertSupportedNode } from "./node-version.mjs";
+import { SUPPORTED_NODE_RANGE, assertSupportedNode } from "./node-version.mjs";
+
+const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
 
 describe("node version guard", () => {
+  it("matches the repository's declared Node engine range", () => {
+    expect(packageJson.engines.node).toBe(SUPPORTED_NODE_RANGE);
+  });
+
   it("accepts versions in the repository's supported Node ranges", () => {
     for (const version of ["22.18.0", "24.2.0", "25.0.0"]) {
       expect(() => assertSupportedNode(version)).not.toThrow();

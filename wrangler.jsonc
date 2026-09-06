@@ -26,17 +26,37 @@
       "preview_bucket_name": "cloudflare-realtime-notes-preview",
     },
   ],
+  "browser": { "binding": "BROWSER" },
   "durable_objects": {
     "bindings": [
       { "name": "DOCUMENT", "class_name": "Document" },
       { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
     ],
   },
+  "workflows": [
+    {
+      "name": "cloudflare-realtime-notes-jobs-local",
+      "binding": "NOTES_WORKFLOW",
+      "class_name": "NotesJobWorkflow",
+    },
+  ],
+  "queues": {
+    "producers": [{ "binding": "DELIVERY_QUEUE", "queue": "cloudflare-realtime-notes-delivery-local" }],
+    "consumers": [
+      {
+        "queue": "cloudflare-realtime-notes-delivery-local",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "cloudflare-realtime-notes-delivery-dlq-local",
+      },
+    ],
+  },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Document"] },
     { "tag": "v2", "new_sqlite_classes": ["WorkspaceEvents"] },
   ],
-  "triggers": { "crons": ["0 * * * *"] },
+  "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
     "BETTER_AUTH_URL": "http://localhost:5173",
   },
@@ -58,10 +78,30 @@
           "preview_bucket_name": "cloudflare-realtime-notes-preview",
         },
       ],
+      "browser": { "binding": "BROWSER" },
       "durable_objects": {
         "bindings": [
           { "name": "DOCUMENT", "class_name": "Document" },
           { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
+        ],
+      },
+      "workflows": [
+        {
+          "name": "cloudflare-realtime-notes-jobs",
+          "binding": "NOTES_WORKFLOW",
+          "class_name": "NotesJobWorkflow",
+        },
+      ],
+      "queues": {
+        "producers": [{ "binding": "DELIVERY_QUEUE", "queue": "cloudflare-realtime-notes-delivery" }],
+        "consumers": [
+          {
+            "queue": "cloudflare-realtime-notes-delivery",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "cloudflare-realtime-notes-delivery-dlq",
+          },
         ],
       },
       "vars": {
@@ -90,8 +130,28 @@
           { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
         ],
       },
+      "workflows": [
+        {
+          "name": "cloudflare-realtime-notes-jobs-e2e",
+          "binding": "NOTES_WORKFLOW",
+          "class_name": "NotesJobWorkflow",
+        },
+      ],
+      "queues": {
+        "producers": [{ "binding": "DELIVERY_QUEUE", "queue": "cloudflare-realtime-notes-delivery-e2e" }],
+        "consumers": [
+          {
+            "queue": "cloudflare-realtime-notes-delivery-e2e",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "cloudflare-realtime-notes-delivery-dlq-e2e",
+          },
+        ],
+      },
       "vars": {
         "BETTER_AUTH_URL": "http://127.0.0.1:4173",
+        "WORKFLOW_INLINE": "true",
       },
     },
   },

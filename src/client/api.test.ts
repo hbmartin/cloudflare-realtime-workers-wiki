@@ -398,6 +398,27 @@ describe("api", () => {
     expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
   });
 
+  it("preserves deliberate cancellation without reporting a response failure", async () => {
+    const reported = silenceApiResponseReport();
+    const controller = new AbortController();
+    const abort = new DOMException("The operation was aborted.", "AbortError");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => {
+        controller.abort();
+        return Promise.resolve(
+          unreadableResponseAt("https://example.test/api/example", abort, {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }),
+    );
+
+    await expect(api("/api/example", { signal: controller.signal })).rejects.toBe(abort);
+    expect(reported).not.toHaveBeenCalled();
+  });
+
   it("normalizes API error codes and messages and replaces blank values", async () => {
     const fetchMock = vi
       .fn()

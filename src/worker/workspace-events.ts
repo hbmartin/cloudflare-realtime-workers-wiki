@@ -22,8 +22,8 @@ export async function eventForCurrentWorkspaceState(
     const candidates = event.pages.filter((page) => page.workspaceId === workspaceId && page.archivedAt === null);
     if (!candidates.length) return null;
     const active = await env.DB.prepare(
-      `SELECT id, workspace_id, parent_id, kind, position, title, icon, revision,
-              content_epoch, archived_at, created_at, updated_at FROM pages
+      `SELECT id, workspace_id, space_id, parent_id, kind, position, title, icon, revision,
+              content_epoch, is_template, archived_at, created_at, updated_at FROM pages
         WHERE workspace_id = ? AND archived_at IS NULL
           AND id IN (SELECT value FROM json_each(?))`,
     )
@@ -132,8 +132,15 @@ export class WorkspaceEvents extends YServer {
 
     // Projection notifications do not depend on page lifecycle ordering and do
     // not read D1, so a slow lifecycle check must not hold them behind it.
-    if (event.type === "projection-updated" || event.type === "workspace-invalidated") {
-      this.broadcastEvent(event);
+    if (
+      event.type === "projection-updated" ||
+      event.type === "comments-invalidated" ||
+      event.type === "workspace-invalidated" ||
+      event.type === "organization-invalidated" ||
+      event.type === "notifications-invalidated" ||
+      event.type === "jobs-invalidated"
+    ) {
+      await this.broadcastEvent(event, workspaceId);
       return Response.json({ delivered: true });
     }
     if (this.queuedDeliveries >= WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT) {
@@ -161,7 +168,7 @@ export class WorkspaceEvents extends YServer {
       this.queuedDeliveries -= 1;
       if (this.queuedDeliveries === 0 && this.resyncRequired) {
         this.resyncRequired = false;
-        this.broadcastEvent({ type: "workspace-invalidated" });
+        await this.broadcastEvent({ type: "workspace-invalidated" }, workspaceId);
       }
     }
   }
@@ -169,7 +176,7 @@ export class WorkspaceEvents extends YServer {
   private async deliver(workspaceId: string, event: WorkspaceEvent) {
     try {
       const currentEvent = await eventForCurrentWorkspaceState(this.bindings, workspaceId, event);
-      if (currentEvent) this.broadcastEvent(currentEvent);
+      if (currentEvent) await this.broadcastEvent(currentEvent, workspaceId);
       return Response.json({ delivered: currentEvent !== null });
     } catch (error) {
       console.error("Workspace event state check failed; scheduling workspace invalidation.", {
@@ -181,8 +188,87 @@ export class WorkspaceEvents extends YServer {
     }
   }
 
-  private broadcastEvent(event: WorkspaceEvent) {
-    this.broadcastCustomMessage(JSON.stringify(event));
+  private async broadcastEvent(event: WorkspaceEvent, workspaceId: string) {
+    if (
+      event.type === "workspace-invalidated" ||
+      event.type === "organization-invalidated" ||
+      event.type === "notifications-invalidated" ||
+      event.type === "jobs-invalidated"
+    ) {
+      this.broadcastCustomMessage(JSON.stringify(event));
+    } else {
+      const pageIds =
+        event.type === "pages-upserted"
+          ? event.pages.map((page) => page.id)
+          : event.type === "pages-removed"
+            ? event.pageIds
+            : [event.pageId];
+      const pages = await this.bindings.DB.prepare(
+        `SELECT p.id, p.space_id, s.visibility FROM pages p JOIN spaces s ON s.id = p.space_id
+          WHERE p.workspace_id = ? AND p.id IN (SELECT value FROM json_each(?))`,
+      )
+        .bind(workspaceId, JSON.stringify(pageIds))
+        .all<{ id: string; space_id: string; visibility: "workspace" | "private" }>();
+
+      // A permanently deleted page no longer carries a scope. A metadata-free
+      // refresh is safe for every member and avoids leaking its former identity.
+      if (!pages.results.length) {
+        this.broadcastCustomMessage(JSON.stringify({ type: "workspace-invalidated" } satisfies WorkspaceEvent));
+        return;
+      }
+
+      const privateSpaceIds = [
+        ...new Set(pages.results.filter((page) => page.visibility === "private").map((page) => page.space_id)),
+      ];
+      const grants = privateSpaceIds.length
+        ? await this.bindings.DB.prepare(
+            `SELECT sm.space_id, sm.user_id FROM space_members sm
+              WHERE sm.space_id IN (SELECT value FROM json_each(?))
+              UNION ALL
+              SELECT s.id, wm.user_id FROM spaces s JOIN workspace_members wm ON wm.workspace_id = s.workspace_id
+               WHERE s.id IN (SELECT value FROM json_each(?)) AND wm.role = 'owner'`,
+          )
+            .bind(JSON.stringify(privateSpaceIds), JSON.stringify(privateSpaceIds))
+            .all<{ space_id: string; user_id: string }>()
+        : { results: [] as Array<{ space_id: string; user_id: string }> };
+      const allowed = new Map<string, Set<string>>();
+      for (const grant of grants.results) {
+        const users = allowed.get(grant.space_id) ?? new Set<string>();
+        users.add(grant.user_id);
+        allowed.set(grant.space_id, users);
+      }
+      const byId = new Map(pages.results.map((page) => [page.id, page]));
+      const eventForAudience = (canRead: (pageId: string) => boolean): WorkspaceEvent | null => {
+        if (event.type === "pages-upserted") {
+          const visiblePages = event.pages.filter((page) => canRead(page.id));
+          if (!visiblePages.length) return null;
+          const includesRestoredRoot =
+            event.restoredRootId === undefined || visiblePages.some((page) => page.id === event.restoredRootId);
+          return includesRestoredRoot
+            ? { ...event, pages: visiblePages }
+            : { type: "pages-upserted", pages: visiblePages };
+        }
+        if (event.type === "pages-removed") {
+          const visibleIds = event.pageIds.filter(canRead);
+          return visibleIds.length ? { ...event, pageIds: visibleIds } : null;
+        }
+        return canRead(event.pageId) ? event : null;
+      };
+
+      // Workspace-visible spaces share one safe audience, so keep the fast
+      // broadcast path. Private-space events are partitioned per connection.
+      const workspaceEvent = eventForAudience((pageId) => byId.get(pageId)?.visibility === "workspace");
+      if (workspaceEvent) this.broadcastCustomMessage(JSON.stringify(workspaceEvent));
+      for (const connection of this.getConnections<EventConnectionAuth>()) {
+        const userId = connection.state?.userId;
+        if (!userId) continue;
+        const visible = eventForAudience((pageId) => {
+          const page = byId.get(pageId);
+          return Boolean(page?.visibility === "private" && allowed.get(page.space_id)?.has(userId));
+        });
+        if (visible) this.sendCustomMessage(connection, JSON.stringify(visible));
+      }
+    }
     if (event.type !== "workspace-invalidated") return;
 
     // Older bundles do not recognize this event type. Closing after the

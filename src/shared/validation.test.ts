@@ -25,6 +25,7 @@ describe("request validation", () => {
     const page = {
       id: "page",
       workspaceId: "workspace",
+      spaceId: "workspace-general",
       parentId: null,
       kind: "document",
       position: "a0",
@@ -32,6 +33,7 @@ describe("request validation", () => {
       icon: null,
       revision: 1,
       contentEpoch: 1,
+      isTemplate: false,
       archivedAt: null,
       createdAt: 1,
       updatedAt: 1,

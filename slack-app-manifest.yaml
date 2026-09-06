@@ -1,0 +1,33 @@
+display_information:
+  name: Realtime Notes
+  description: Search notes, receive notifications, and safely unfurl page links.
+  background_color: "#5452a8"
+features:
+  bot_user:
+    display_name: Realtime Notes
+    always_online: false
+  slash_commands:
+    - command: /notes
+      url: https://cloudflare-realtime-notes.harold-martin.workers.dev/api/slack/commands
+      description: Search your accessible Notes pages
+      usage_hint: <query> or link
+      should_escape: false
+oauth_config:
+  redirect_urls:
+    - https://cloudflare-realtime-notes.harold-martin.workers.dev/api/slack/oauth/callback
+  scopes:
+    bot:
+      - commands
+      - chat:write
+      - links:read
+      - links:write
+settings:
+  event_subscriptions:
+    request_url: https://cloudflare-realtime-notes.harold-martin.workers.dev/api/slack/events
+    bot_events:
+      - link_shared
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: true

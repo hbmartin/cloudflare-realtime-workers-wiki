@@ -4,11 +4,15 @@ import { errorLogFields } from "../shared/error-log";
 import { buildTree, compareBinaryText } from "../shared/tree-model";
 import type {
   ClientMemberContext,
+  Job,
   MentionInboxItem,
   Page,
   PageKind,
   PageNode,
   Role,
+  Space,
+  Tag,
+  TagColor,
   WorkspaceEvent,
 } from "../shared/types";
 import { isPage } from "../shared/validation";
@@ -36,6 +40,15 @@ import {
 import { observeUntilAborted, waitForReconciliationRetry, waitForWorkspaceInvalidationRetry } from "./retry";
 import { LoadingSplash } from "./Splash";
 import { TablePage } from "./TablePage";
+import { ActivitiesTray } from "./ActivitiesTray";
+import { PageTags } from "./PageTags";
+import { TemplateLibrary } from "./TemplateLibrary";
+import { NotificationsPanel } from "./NotificationsPanel";
+import { WatchControl } from "./WatchControl";
+import { SearchView } from "./SearchView";
+import { ExportDialog } from "./ExportDialog";
+import { ImportDialog } from "./ImportDialog";
+import { SlackSettings } from "./SlackSettings";
 
 type AppState =
   | { screen: "loading" }
@@ -47,6 +60,7 @@ type AppState =
 type WorkspaceErrorSource =
   | "archive"
   | "mentions"
+  | "organization"
   | "page-access"
   | "page-mutation"
   | "page-tree"
@@ -154,6 +168,7 @@ type PageMutationExpectation = {
   workspaceId: string;
   parentId: string | null;
   kind: PageKind;
+  spaceId?: string;
   minimumRevision?: number;
   movePlacement?: { beforeId: string | null; afterId: string | null; existingSiblingIds: string[] };
 };
@@ -167,6 +182,7 @@ function matchesPageMutationExpectation(page: Page, expectation: PageMutationExp
     page.workspaceId === expectation.workspaceId &&
     page.parentId === expectation.parentId &&
     page.kind === expectation.kind &&
+    (expectation.spaceId === undefined || page.spaceId === expectation.spaceId) &&
     page.archivedAt === null &&
     (expectation.minimumRevision === undefined || page.revision >= expectation.minimumRevision)
   );
@@ -716,27 +732,58 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     () => ({
       pages: [],
       pagesLoaded: false,
-      selectedId: localStorage.getItem("notes:last-page"),
+      selectedId: new URLSearchParams(window.location.search).get("page") ?? localStorage.getItem("notes:last-page"),
       pendingSelectionId: null,
       pendingRestoredRoot: null,
     }),
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [view, setView] = useState<"pages" | "search" | "mentions" | "trash" | "settings">("pages");
-  const [search, setSearch] = useState("");
-  const [searchResults, setSearchResults] = useState<Array<{ page: Page; snippet: string }>>([]);
+  const [view, setView] = useState<"pages" | "search" | "mentions" | "templates" | "trash" | "settings">(() => {
+    const requested = new URLSearchParams(window.location.search).get("view");
+    return requested && ["search", "mentions", "templates", "trash", "settings"].includes(requested)
+      ? (requested as "search" | "mentions" | "templates" | "trash" | "settings")
+      : "pages";
+  });
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
+  const [commentsRevision, setCommentsRevision] = useState(0);
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
   const [trashRefreshVersion, setTrashRefreshVersion] = useState(0);
   const [trashLoading, setTrashLoading] = useState(false);
   const [pageTreeRetrying, setPageTreeRetrying] = useState(false);
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [activitiesOpen, setActivitiesOpen] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [notificationsRevision, setNotificationsRevision] = useState(0);
+  const [unreadNotifications, setUnreadNotifications] = useState(0);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [jobsLoading, setJobsLoading] = useState(false);
+  const [jobsError, setJobsError] = useState("");
+  const [pendingJobId, setPendingJobId] = useState<string | null>(null);
+  const [spaces, setSpaces] = useState<Space[]>([]);
+  const [activeSpaceId, setActiveSpaceId] = useState(
+    () => localStorage.getItem(`notes:active-space:${member.workspace.id}`) ?? "",
+  );
+  const [favorites, setFavorites] = useState<Page[]>([]);
+  const [pins, setPins] = useState<Page[]>([]);
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [pageTags, setPageTags] = useState<Tag[]>([]);
+  const [templates, setTemplates] = useState<Page[]>([]);
+  const [pendingTemplateId, setPendingTemplateId] = useState<string | null>(null);
+  const [organizationLoading, setOrganizationLoading] = useState(true);
+  const [organizationLoadError, setOrganizationLoadError] = useState("");
+  const [pendingOrganizationAction, setPendingOrganizationAction] = useState<string | null>(null);
+  const [spaceFormOpen, setSpaceFormOpen] = useState(false);
   const sidebarOpenRef = useRef(false);
   const sidebarRef = useRef<HTMLElement>(null);
   const sidebarTriggerRef = useRef<HTMLButtonElement>(null);
+  const activityTriggerRef = useRef<HTMLButtonElement>(null);
+  const notificationTriggerRef = useRef<HTMLButtonElement>(null);
   const restoreSidebarTriggerFocus = useRef(false);
+  const restoreActivityTriggerFocus = useRef(false);
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const [archiveRemovalTombstones] = useState(() => new PageRemovalTombstones());
   // Archived-tree reads may lag a confirmed restore. Keep the newest restored
@@ -770,6 +817,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const workspaceErrorAttemptRef = useRef(0);
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
   const pageTreeErrorRevisionRef = useRef(0);
+  const organizationLoadGenerationRef = useRef(0);
   const abortWorkspaceRequests = useCallback(() => {
     const activePageLoad = pageLoadRequest.current;
     if (activePageLoad) {
@@ -903,11 +951,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (activeRetry?.target.source !== "page-access" || activeRetry.pendingPageId !== pageId) {
         cancelPageTreeRetry({ source: "page-access" });
       }
+      const page = pages.find((candidate) => candidate.id === pageId);
+      if (page) {
+        setActiveSpaceId(page.spaceId);
+        localStorage.setItem(`notes:active-space:${member.workspace.id}`, page.spaceId);
+      }
       dispatchPageAction({ type: "select", pageId });
+      history.replaceState(null, "", `/?page=${encodeURIComponent(pageId)}`);
       setView("pages");
       closeSidebar(true);
     },
-    [cancelPageTreeRetry, closeSidebar],
+    [cancelPageTreeRetry, closeSidebar, member.workspace.id, pages],
   );
 
   useEffect(() => {
@@ -1318,6 +1372,245 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   useEffect(() => {
     void loadUnreadMentions();
   }, [loadUnreadMentions]);
+  const loadUnreadNotifications = useCallback(async () => {
+    try {
+      const data = await api<{ unreadCount: number }>("/api/notifications?limit=1&unread=true");
+      setUnreadNotifications(data.unreadCount);
+    } catch {
+      // The panel presents actionable loading errors; the shell badge may stay stale.
+    }
+  }, []);
+  useEffect(() => {
+    void api<{ unreadCount: number }>("/api/notifications?limit=1&unread=true")
+      .then((data) => setUnreadNotifications(data.unreadCount))
+      .catch(() => undefined);
+  }, []);
+  const loadJobs = useCallback(async () => {
+    setJobsLoading(true);
+    try {
+      const data = await api<{ jobs: Job[] }>("/api/jobs");
+      setJobs(data.jobs);
+      setJobsError("");
+    } catch (error) {
+      setJobsError(apiErrorMessage(error, "Activities could not be refreshed."));
+    } finally {
+      setJobsLoading(false);
+    }
+  }, []);
+  const selectedSpaceId = pages.find((page) => page.id === selectedId)?.spaceId ?? null;
+  const loadOrganization = useCallback(async () => {
+    const generation = ++organizationLoadGenerationRef.current;
+    const attempt = startWorkspaceErrorAttempt({ source: "organization" });
+    try {
+      const [spaceData, favoriteData, tagData, templateData] = await Promise.all([
+        api<{ spaces: Space[] }>("/api/spaces"),
+        api<{ pages: Page[] }>("/api/favorites"),
+        api<{ tags: Tag[] }>("/api/tags"),
+        api<{ templates: Page[] }>("/api/templates"),
+      ]);
+      if (generation !== organizationLoadGenerationRef.current) return;
+      setSpaces(spaceData.spaces);
+      setFavorites(favoriteData.pages);
+      setTags(tagData.tags);
+      setTemplates(templateData.templates);
+      const resolvedSpaceId = spaceData.spaces.some((space) => space.id === activeSpaceId)
+        ? activeSpaceId
+        : spaceData.spaces.some((space) => space.id === selectedSpaceId)
+          ? selectedSpaceId!
+          : (spaceData.spaces[0]?.id ?? "");
+      if (resolvedSpaceId !== activeSpaceId) {
+        setActiveSpaceId(resolvedSpaceId);
+        if (resolvedSpaceId) localStorage.setItem(`notes:active-space:${member.workspace.id}`, resolvedSpaceId);
+      }
+      const [pinResult, pageTagResult] = await Promise.allSettled([
+        resolvedSpaceId
+          ? api<{ pages: Page[] }>(`/api/spaces/${encodeURIComponent(resolvedSpaceId)}/pins`)
+          : Promise.resolve({ pages: [] }),
+        selectedId
+          ? api<{ tags: Tag[] }>(`/api/pages/${encodeURIComponent(selectedId)}/tags`)
+          : Promise.resolve({ tags: [] }),
+      ]);
+      if (generation !== organizationLoadGenerationRef.current) return;
+      if (pinResult.status === "fulfilled") setPins(pinResult.value.pages);
+      if (pageTagResult.status === "fulfilled") setPageTags(pageTagResult.value.tags);
+      const rejected = [pinResult, pageTagResult].find((result) => result.status === "rejected");
+      if (rejected?.status === "rejected") throw rejected.reason;
+      setOrganizationLoadError("");
+      clearWorkspaceErrors(attempt);
+    } catch (error) {
+      setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
+    } finally {
+      if (generation === organizationLoadGenerationRef.current) setOrganizationLoading(false);
+      finishWorkspaceErrorAttempt(attempt);
+    }
+  }, [
+    activeSpaceId,
+    clearWorkspaceErrors,
+    finishWorkspaceErrorAttempt,
+    member.workspace.id,
+    selectedId,
+    selectedSpaceId,
+    startWorkspaceErrorAttempt,
+  ]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void loadOrganization(), 0);
+    return () => window.clearTimeout(timer);
+  }, [loadOrganization]);
+
+  const selectSpace = useCallback(
+    (spaceId: string) => {
+      setActiveSpaceId(spaceId);
+      localStorage.setItem(`notes:active-space:${member.workspace.id}`, spaceId);
+      const firstPage = pages.find((page) => page.spaceId === spaceId);
+      if (firstPage) dispatchPageAction({ type: "select", pageId: firstPage.id });
+      setView("pages");
+      closeSidebar(true);
+    },
+    [closeSidebar, member.workspace.id, pages],
+  );
+
+  async function createSpace(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    setPendingOrganizationAction("space:create");
+    try {
+      const data = await api<{ space: Space }>("/api/spaces", {
+        method: "POST",
+        body: json({ name: values.get("name"), visibility: values.get("visibility") }),
+      });
+      form.reset();
+      setSpaceFormOpen(false);
+      setSpaces((current) => [...current.filter((space) => space.id !== data.space.id), data.space]);
+      selectSpace(data.space.id);
+      clearWorkspaceErrors({ source: "organization" });
+    } catch (error) {
+      reportWorkspaceError({ source: "organization" }, apiErrorMessage(error, "The space could not be created."));
+    } finally {
+      setPendingOrganizationAction(null);
+    }
+  }
+
+  async function toggleFavorite(page: Page) {
+    const favorite = favorites.some((candidate) => candidate.id === page.id);
+    setPendingOrganizationAction(`favorite:${page.id}`);
+    try {
+      await api(`/api/favorites/${encodeURIComponent(page.id)}`, { method: favorite ? "DELETE" : "POST" });
+      setFavorites((current) =>
+        favorite ? current.filter((candidate) => candidate.id !== page.id) : [...current, page],
+      );
+      clearWorkspaceErrors({ source: "organization" });
+    } catch (error) {
+      reportWorkspaceError({ source: "organization" }, apiErrorMessage(error, "The favorite could not be updated."));
+    } finally {
+      setPendingOrganizationAction(null);
+    }
+  }
+
+  async function togglePin(page: Page) {
+    const pinned = pins.some((candidate) => candidate.id === page.id);
+    setPendingOrganizationAction(`pin:${page.id}`);
+    try {
+      await api(`/api/spaces/${encodeURIComponent(page.spaceId)}/pins/${encodeURIComponent(page.id)}`, {
+        method: pinned ? "DELETE" : "POST",
+      });
+      setPins((current) => (pinned ? current.filter((candidate) => candidate.id !== page.id) : [...current, page]));
+      clearWorkspaceErrors({ source: "organization" });
+    } catch (error) {
+      reportWorkspaceError({ source: "organization" }, apiErrorMessage(error, "The space pin could not be updated."));
+    } finally {
+      setPendingOrganizationAction(null);
+    }
+  }
+
+  async function setPageTag(page: Page, tag: Tag, assigned: boolean) {
+    setPendingOrganizationAction(`tag:${tag.id}`);
+    try {
+      await api(`/api/pages/${encodeURIComponent(page.id)}/tags/${encodeURIComponent(tag.id)}`, {
+        method: assigned ? "PUT" : "DELETE",
+      });
+      setPageTags((current) =>
+        assigned
+          ? [...current.filter((candidate) => candidate.id !== tag.id), tag]
+          : current.filter((item) => item.id !== tag.id),
+      );
+      setTags((current) =>
+        current.map((candidate) =>
+          candidate.id === tag.id
+            ? { ...candidate, pageCount: Math.max(0, candidate.pageCount + (assigned ? 1 : -1)) }
+            : candidate,
+        ),
+      );
+      clearWorkspaceErrors({ source: "organization" });
+      return true;
+    } catch (error) {
+      reportWorkspaceError({ source: "organization" }, apiErrorMessage(error, "The page tag could not be updated."));
+      return false;
+    } finally {
+      setPendingOrganizationAction(null);
+    }
+  }
+
+  async function createAndAddTag(page: Page, name: string, color: TagColor) {
+    setPendingOrganizationAction("tag:create");
+    try {
+      const data = await api<{ tag: Tag }>("/api/tags", { method: "POST", body: json({ name, color }) });
+      await api(`/api/pages/${encodeURIComponent(page.id)}/tags/${encodeURIComponent(data.tag.id)}`, {
+        method: "PUT",
+      });
+      const assignedTag = { ...data.tag, pageCount: 1 };
+      setTags((current) => [...current.filter((tag) => tag.id !== assignedTag.id), assignedTag]);
+      setPageTags((current) => [...current.filter((tag) => tag.id !== assignedTag.id), assignedTag]);
+      clearWorkspaceErrors({ source: "organization" });
+      return true;
+    } catch (error) {
+      reportWorkspaceError({ source: "organization" }, apiErrorMessage(error, "The tag could not be created."));
+      return false;
+    } finally {
+      setPendingOrganizationAction(null);
+    }
+  }
+
+  async function queueTemplateJob(path: string, body: Record<string, unknown>, pendingId: string) {
+    setPendingTemplateId(pendingId);
+    try {
+      const data = await api<{ job: Job }>(path, { method: "POST", body: json(body) });
+      setJobs((current) => [data.job, ...current.filter((job) => job.id !== data.job.id)]);
+      setJobsError("");
+      setActivitiesOpen(true);
+      clearWorkspaceErrors({ source: "organization" });
+    } catch (error) {
+      reportWorkspaceError(
+        { source: "organization" },
+        apiErrorMessage(error, "The template job could not be started."),
+      );
+    } finally {
+      setPendingTemplateId(null);
+    }
+  }
+
+  function editTemplate(template: Page) {
+    dispatchPageAction({ type: "merge", pages: [template] });
+    navigateToPage(template.id);
+  }
+
+  async function openJobResult(job: Job) {
+    if (!job.result?.pageId) return;
+    setPendingJobId(job.id);
+    try {
+      const data = await api<{ page: Page }>(`/api/pages/${encodeURIComponent(job.result.pageId)}`);
+      recordPageUpserts([data.page]);
+      dispatchPageAction({ type: "merge", pages: [data.page] });
+      setActiveSpaceId(data.page.spaceId);
+      localStorage.setItem(`notes:active-space:${member.workspace.id}`, data.page.spaceId);
+      setActivitiesOpen(false);
+      navigateToPage(data.page.id);
+    } catch (error) {
+      setJobsError(apiErrorMessage(error, "The completed page could not be opened."));
+    } finally {
+      setPendingJobId(null);
+    }
+  }
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
       if (event.type === "workspace-invalidated") {
@@ -1326,6 +1619,23 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         refreshTrash();
         void loadUnreadMentions();
         void refreshInvalidatedWorkspace();
+        return;
+      }
+      if (event.type === "organization-invalidated") {
+        void loadOrganization();
+        return;
+      }
+      if (event.type === "jobs-invalidated") {
+        if (activitiesOpen) void loadJobs();
+        return;
+      }
+      if (event.type === "notifications-invalidated") {
+        setNotificationsRevision((current) => current + 1);
+        void loadUnreadNotifications();
+        return;
+      }
+      if (event.type === "comments-invalidated") {
+        if (event.pageId === selectedId) setCommentsRevision((current) => current + 1);
         return;
       }
       if (event.type === "pages-upserted") {
@@ -1384,8 +1694,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       archiveRemovalTombstones,
       clearConfirmedRestores,
       excludeConfirmedRestoresFromTrash,
+      loadJobs,
+      loadOrganization,
+      loadUnreadNotifications,
       loadUnreadMentions,
+      activitiesOpen,
       member.user.id,
+      selectedId,
       reconcileRestoredEvent,
       recordPageRemovals,
       recordPageUpserts,
@@ -1403,9 +1718,67 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be refreshed."));
       });
       void loadUnreadMentions();
+      void loadUnreadNotifications();
     });
     return () => bundle.destroy();
-  }, [handleWorkspaceEvent, loadPages, loadUnreadMentions, member.workspace.id, reportWorkspaceError]);
+  }, [
+    handleWorkspaceEvent,
+    loadPages,
+    loadUnreadMentions,
+    loadUnreadNotifications,
+    member.workspace.id,
+    reportWorkspaceError,
+  ]);
+
+  const closeActivities = useCallback(() => {
+    restoreActivityTriggerFocus.current = true;
+    setActivitiesOpen(false);
+  }, []);
+  useEffect(() => {
+    if (activitiesOpen || !restoreActivityTriggerFocus.current) return;
+    restoreActivityTriggerFocus.current = false;
+    activityTriggerRef.current?.focus();
+  }, [activitiesOpen]);
+  const openActivities = useCallback(() => {
+    restoreActivityTriggerFocus.current = false;
+    setNotificationsOpen(false);
+    setActivitiesOpen(true);
+    void loadJobs();
+  }, [loadJobs]);
+  const openNotifications = useCallback(() => {
+    setActivitiesOpen(false);
+    setNotificationsOpen(true);
+    setNotificationsRevision((current) => current + 1);
+  }, []);
+  const activeJobCount = jobs.filter((job) =>
+    ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status),
+  ).length;
+  useEffect(() => {
+    if (!activitiesOpen || activeJobCount === 0) return undefined;
+    const timer = window.setTimeout(() => void loadJobs(), 1_000);
+    return () => window.clearTimeout(timer);
+  }, [activeJobCount, activitiesOpen, jobs, loadJobs]);
+  const mutateJob = useCallback(async (job: Job, action: "cancel" | "retry" | "confirm") => {
+    setPendingJobId(job.id);
+    try {
+      const path =
+        action === "confirm"
+          ? `/api/imports/${encodeURIComponent(job.id)}/confirm`
+          : `/api/jobs/${encodeURIComponent(job.id)}/${action}`;
+      const data = await api<{ job: Job }>(path, { method: "POST" });
+      setJobs((current) => current.map((candidate) => (candidate.id === data.job.id ? data.job : candidate)));
+      setJobsError("");
+    } catch (error) {
+      setJobsError(
+        apiErrorMessage(
+          error,
+          `The job could not be ${action === "cancel" ? "canceled" : action === "confirm" ? "confirmed" : "retried"}.`,
+        ),
+      );
+    } finally {
+      setPendingJobId(null);
+    }
+  }, []);
 
   useEffect(() => {
     const navigate = (event: Event) => {
@@ -1418,22 +1791,31 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }, [navigateToPage]);
 
   const selected = pages.find((page) => page.id === selectedId) ?? null;
-  const resolvedSelectedId = pendingSelectionId ? null : pagesLoaded ? (selected?.id ?? null) : selectedId;
-  const canCreatePage = member.role !== "viewer" && pagesLoaded && pendingSelectionId === null;
+  const currentSpaceId = activeSpaceId || selected?.spaceId || pages[0]?.spaceId || "";
+  const activeSpace = spaces.find((space) => space.id === currentSpaceId) ?? null;
+  const activePages = useMemo(
+    () => pages.filter((page) => !page.isTemplate && (!currentSpaceId || page.spaceId === currentSpaceId)),
+    [currentSpaceId, pages],
+  );
+  const activeSelected = selected && (!currentSpaceId || selected.spaceId === currentSpaceId) ? selected : null;
+  const resolvedSelectedId = pendingSelectionId ? null : pagesLoaded ? (activeSelected?.id ?? null) : selectedId;
+  const canEditActiveSpace = (activeSpace?.effectiveRole ?? member.role) !== "viewer";
+  const canCreatePage = canEditActiveSpace && pagesLoaded && pendingSelectionId === null && Boolean(currentSpaceId);
+  const activeMember = activeSpace ? { ...member, role: activeSpace.effectiveRole } : member;
   useEffect(() => {
     if (resolvedSelectedId) localStorage.setItem("notes:last-page", resolvedSelectedId);
   }, [resolvedSelectedId]);
-  const tree = useMemo(() => buildTree(pages), [pages]);
+  const tree = useMemo(() => buildTree(activePages), [activePages]);
   const breadcrumbs = useMemo(() => {
     if (pendingSelectionId) return [];
     const items: Page[] = [];
-    let cursor = selected;
+    let cursor = activeSelected;
     while (cursor) {
       items.unshift(cursor);
       cursor = pages.find((page) => page.id === cursor?.parentId) ?? null;
     }
     return items;
-  }, [pages, pendingSelectionId, selected]);
+  }, [activeSelected, pages, pendingSelectionId]);
 
   async function reconcilePages(signal: AbortSignal, onFailure?: (error: unknown) => void) {
     try {
@@ -1553,7 +1935,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   async function createPage(kind: PageKind, parentId?: string | null) {
     if (!canCreatePage) return;
     const signal = workspaceAbortController.current.signal;
-    const resolvedParentId = parentId === undefined ? (selected?.parentId ?? null) : parentId;
+    const resolvedParentId = parentId === undefined ? (activeSelected?.parentId ?? null) : parentId;
     const attempt = startWorkspaceErrorAttempt({
       source: "page-mutation",
       scope: `create:${++pageMutationScopeRef.current}`,
@@ -1566,6 +1948,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const expectation: PageMutationExpectation = {
         id: operationId,
         workspaceId: member.workspace.id,
+        spaceId: currentSpaceId,
         parentId: resolvedParentId,
         kind,
       };
@@ -1574,7 +1957,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         "/api/pages",
         {
           method: "POST",
-          body: json({ id: operationId, kind, parentId: resolvedParentId }),
+          body: json({ id: operationId, kind, parentId: resolvedParentId, spaceId: currentSpaceId }),
           signal,
         },
         (value) => pageMutationResponse(value, expectation),
@@ -1861,17 +2244,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       finishWorkspaceErrorAttempt(attempt);
     }
   }
-  async function runSearch(value: string) {
-    setSearch(value);
-    if (!value.trim()) {
-      setSearchResults([]);
-      return;
-    }
-    const data = await api<{ results: Array<{ page: Page; snippet: string }> }>(
-      `/api/search?q=${encodeURIComponent(value)}`,
-    );
-    setSearchResults(data.results);
-  }
   // Under the mobile breakpoint the open drawer sits over a full-viewport scrim,
   // so navigating without closing it strands the reader behind the thing they
   // just opened. Selecting a page already closes it; these do the same.
@@ -1881,8 +2253,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     refreshTrash();
     setView("trash");
   }
-  function showView(next: "search" | "mentions" | "settings") {
+  function showView(next: "search" | "mentions" | "templates" | "settings") {
     cancelPendingSelection();
+    if (next === "templates") void loadOrganization();
     setView(next);
     closeSidebar(true);
   }
@@ -2088,6 +2461,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         className={`workspace-sidebar ${sidebarOpen ? "open" : ""}`}
         aria-label="Workspace navigation"
         tabIndex={-1}
+        inert={activitiesOpen || notificationsOpen || exportOpen || importOpen ? true : undefined}
+        aria-hidden={activitiesOpen || notificationsOpen || exportOpen || importOpen || undefined}
       >
         <header className="workspace-header">
           <span className="workspace-avatar">{member.workspace.name.slice(0, 1).toUpperCase()}</span>
@@ -2106,6 +2481,61 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             ×
           </button>
         </header>
+        <div className="space-switcher">
+          <label>
+            <span className="visually-hidden">Current space</span>
+            <select
+              aria-label="Current space"
+              value={currentSpaceId}
+              disabled={organizationLoading || spaces.length === 0}
+              onChange={(event) => selectSpace(event.target.value)}
+            >
+              {spaces.length === 0 && currentSpaceId && <option value={currentSpaceId}>General</option>}
+              {spaces.map((space) => (
+                <option key={space.id} value={space.id}>
+                  {space.visibility === "private" ? "Private · " : ""}
+                  {space.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {member.role === "owner" && (
+            <button
+              className="space-create-trigger"
+              aria-label="Create space"
+              aria-expanded={spaceFormOpen}
+              onClick={() => setSpaceFormOpen((open) => !open)}
+            >
+              +
+            </button>
+          )}
+        </div>
+        {spaceFormOpen && (
+          <form className="space-create-form" onSubmit={createSpace}>
+            <label>
+              <span>Space name</span>
+              <input name="name" maxLength={100} required autoFocus />
+            </label>
+            <label>
+              <span>Access</span>
+              <select name="visibility" defaultValue="workspace">
+                <option value="workspace">Everyone</option>
+                <option value="private">Private</option>
+              </select>
+            </label>
+            <div>
+              <button className="primary-small" disabled={pendingOrganizationAction === "space:create"}>
+                Create
+              </button>
+              <button type="button" className="quiet-button" onClick={() => setSpaceFormOpen(false)}>
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
+        {organizationLoadError && (
+          <p className="sidebar-load-error">Organization unavailable. Core pages remain usable.</p>
+        )}
         <nav className="sidebar-nav">
           <button className={view === "search" ? "active" : ""} onClick={() => showView("search")}>
             <span>⌕</span> Search
@@ -2113,21 +2543,33 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <button className={view === "mentions" ? "active" : ""} onClick={() => showView("mentions")}>
             <span>@</span> Mentions {unreadMentions > 0 && <b className="mention-badge">{unreadMentions}</b>}
           </button>
+          <button className={view === "templates" ? "active" : ""} onClick={() => showView("templates")}>
+            <span>◇</span> Templates
+          </button>
           <button className={view === "settings" ? "active" : ""} onClick={() => showView("settings")}>
             <span>⚙</span> Members
           </button>
         </nav>
+        {favorites.length > 0 && (
+          <SidebarPageLinks label="Favorites" pages={favorites} icon="★" onSelect={navigateToPage} />
+        )}
+        {pins.length > 0 && <SidebarPageLinks label="Pinned" pages={pins} icon="⌖" onSelect={navigateToPage} />}
         <div className="sidebar-section-title">
-          <span>Pages</span>
-          {member.role !== "viewer" && (
-            <button
-              aria-label="Create a root page"
-              disabled={!canCreatePage}
-              onClick={() => void createPage("document", null)}
-            >
-              +
-            </button>
-          )}
+          <span>{activeSpace?.name ?? "Pages"}</span>
+          <span className="sidebar-section-actions">
+            {activeSpace && (
+              <WatchControl key={activeSpace.id} resourceType="space" resourceId={activeSpace.id} compact />
+            )}
+            {canEditActiveSpace && (
+              <button
+                aria-label="Create a root page"
+                disabled={!canCreatePage}
+                onClick={() => void createPage("document", null)}
+              >
+                +
+              </button>
+            )}
+          </span>
         </div>
         <div
           className="tree-root"
@@ -2140,7 +2582,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <PageTree
             nodes={tree}
             selectedId={resolvedSelectedId}
-            editable={member.role !== "viewer"}
+            editable={canEditActiveSpace}
             canCreate={canCreatePage}
             onSelect={navigateToPage}
             onCreate={(parentId) => void createPage("document", parentId)}
@@ -2165,7 +2607,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         </footer>
       </aside>
 
-      <section className="workspace-content">
+      <section
+        className="workspace-content"
+        inert={activitiesOpen || notificationsOpen || exportOpen || importOpen ? true : undefined}
+        aria-hidden={activitiesOpen || notificationsOpen || exportOpen || importOpen || undefined}
+      >
         {workspaceError && (
           <div className="form-error workspace-error" role="alert">
             <span>{workspaceError}</span>
@@ -2198,22 +2644,127 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               </span>
             ))}
           </div>
-          {member.role !== "viewer" && (
-            <div className="new-menu">
-              <button className="primary-small" disabled={!canCreatePage} onClick={() => void createPage("document")}>
-                + Page
-              </button>
-              <button className="quiet-button" disabled={!canCreatePage} onClick={() => void createPage("table")}>
-                + Table
-              </button>
-            </div>
-          )}
+          <div className="topbar-actions">
+            {view === "pages" && activeSelected && !activeSelected.isTemplate && (
+              <>
+                <WatchControl key={activeSelected.id} resourceType="page" resourceId={activeSelected.id} />
+                <button
+                  className={`organization-action ${favorites.some((page) => page.id === activeSelected.id) ? "active" : ""}`}
+                  disabled={pendingOrganizationAction === `favorite:${activeSelected.id}`}
+                  aria-pressed={favorites.some((page) => page.id === activeSelected.id)}
+                  onClick={() => void toggleFavorite(activeSelected)}
+                >
+                  <span aria-hidden="true">★</span>
+                  Favorite
+                </button>
+                <button className="organization-action" onClick={() => setExportOpen(true)}>
+                  <span aria-hidden="true">⇩</span>
+                  Export
+                </button>
+                {canEditActiveSpace && (
+                  <>
+                    <button
+                      className={`organization-action ${pins.some((page) => page.id === activeSelected.id) ? "active" : ""}`}
+                      disabled={pendingOrganizationAction === `pin:${activeSelected.id}`}
+                      aria-pressed={pins.some((page) => page.id === activeSelected.id)}
+                      onClick={() => void togglePin(activeSelected)}
+                    >
+                      <span aria-hidden="true">⌖</span>
+                      Pin
+                    </button>
+                    <button
+                      className="organization-action"
+                      disabled={pendingTemplateId === `save:${activeSelected.id}`}
+                      onClick={() =>
+                        void queueTemplateJob(
+                          "/api/templates",
+                          { pageId: activeSelected.id, title: activeSelected.title },
+                          `save:${activeSelected.id}`,
+                        )
+                      }
+                    >
+                      <span aria-hidden="true">◇</span>
+                      {pendingTemplateId === `save:${activeSelected.id}` ? "Saving…" : "Save as template"}
+                    </button>
+                  </>
+                )}
+              </>
+            )}
+            <button
+              ref={notificationTriggerRef}
+              className="notification-trigger"
+              aria-label={unreadNotifications ? `Notifications, ${unreadNotifications} unread` : "Notifications"}
+              aria-haspopup="dialog"
+              onClick={openNotifications}
+            >
+              <span aria-hidden="true">🔔</span>
+              {unreadNotifications > 0 && <b>{unreadNotifications > 99 ? "99+" : unreadNotifications}</b>}
+            </button>
+            <button
+              ref={activityTriggerRef}
+              className="activity-trigger"
+              aria-haspopup="dialog"
+              onClick={openActivities}
+            >
+              <span aria-hidden="true">↻</span>
+              Activities
+              {jobs.some((job) => ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status)) && (
+                <i aria-label="Background work in progress" />
+              )}
+            </button>
+            {member.role !== "viewer" && (
+              <div className="new-menu">
+                <button
+                  className="quiet-button import-trigger"
+                  aria-label="Import notes"
+                  disabled={!canCreatePage}
+                  onClick={() => setImportOpen(true)}
+                >
+                  <span aria-hidden="true">⇧</span>
+                  <span className="import-trigger-label">Import</span>
+                </button>
+                <button className="primary-small" disabled={!canCreatePage} onClick={() => void createPage("document")}>
+                  + Page
+                </button>
+                <button className="quiet-button" disabled={!canCreatePage} onClick={() => void createPage("table")}>
+                  + Table
+                </button>
+              </div>
+            )}
+          </div>
         </header>
 
+        {view === "pages" && activeSelected && (
+          <PageTags
+            assigned={pageTags}
+            available={tags}
+            editable={canEditActiveSpace}
+            busy={pendingOrganizationAction?.startsWith("tag:") ?? false}
+            onAdd={(tag) => setPageTag(activeSelected, tag, true)}
+            onRemove={(tag) => setPageTag(activeSelected, tag, false)}
+            onCreate={(name, color) => createAndAddTag(activeSelected, name, color)}
+          />
+        )}
+
         {view === "search" ? (
-          <SearchView value={search} results={searchResults} onChange={runSearch} onSelect={navigateToPage} />
+          <SearchView spaces={spaces} tags={tags} onSelect={navigateToPage} />
         ) : view === "mentions" ? (
           <MentionsView onSelect={navigateToPage} onRead={handleMentionsRead} />
+        ) : view === "templates" ? (
+          <TemplateLibrary
+            templates={templates.filter((template) => template.spaceId === currentSpaceId)}
+            space={activeSpace}
+            editable={canEditActiveSpace}
+            busyId={pendingTemplateId}
+            onEdit={editTemplate}
+            onUse={(template) =>
+              void queueTemplateJob(
+                `/api/templates/${encodeURIComponent(template.id)}/instantiate`,
+                { parentId: null, title: template.title },
+                template.id,
+              )
+            }
+          />
         ) : view === "trash" ? (
           <TrashView
             pages={trash}
@@ -2225,7 +2776,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             onDelete={permanentlyDeletePage}
           />
         ) : view === "settings" ? (
-          <MembersView member={member} />
+          <MembersView member={member} spaces={spaces} pages={pages} />
         ) : !pagesLoaded ? (
           <PendingPage
             title={initialPageLoadFailed ? "Workspace unavailable" : "Loading workspace…"}
@@ -2245,23 +2796,24 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             onRetry={retryPendingSelection}
             retrying={pageTreeRetrying}
           />
-        ) : selected ? (
-          selected.kind === "document" ? (
+        ) : activeSelected ? (
+          activeSelected.kind === "document" ? (
             <EditorPage
-              key={`${selected.id}:${selected.contentEpoch}`}
-              page={selected}
-              member={member}
+              key={`${activeSelected.id}:${activeSelected.contentEpoch}`}
+              page={activeSelected}
+              member={activeMember}
               onPageChanged={updatePage}
               onPageUnavailable={pageUnavailable}
               onAccessDenied={documentAccessDenied}
               onSelectPage={navigateToPage}
               backlinksRevision={backlinksRevision}
+              commentsRevision={commentsRevision}
             />
           ) : (
             <TablePage
-              key={selected.id}
-              page={selected}
-              member={member}
+              key={activeSelected.id}
+              page={activeSelected}
+              member={activeMember}
               onPageChanged={updatePage}
               onPageUnavailable={pageUnavailable}
               onSelectPage={navigateToPage}
@@ -2269,11 +2821,84 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             />
           )
         ) : (
-          <EmptyWorkspace canEdit={member.role !== "viewer"} onCreate={() => void createPage("document", null)} />
+          <EmptyWorkspace canEdit={canEditActiveSpace} onCreate={() => void createPage("document", null)} />
         )}
       </section>
+      {activitiesOpen && (
+        <ActivitiesTray
+          jobs={jobs}
+          loading={jobsLoading}
+          error={jobsError}
+          pendingJobId={pendingJobId}
+          onClose={closeActivities}
+          onRefresh={() => void loadJobs()}
+          onCancel={(job) => void mutateJob(job, "cancel")}
+          onRetry={(job) => void mutateJob(job, "retry")}
+          onConfirm={(job) => void mutateJob(job, "confirm")}
+          onOpenResult={(job) => void openJobResult(job)}
+        />
+      )}
+      {notificationsOpen && (
+        <NotificationsPanel
+          revision={notificationsRevision}
+          onClose={() => setNotificationsOpen(false)}
+          onSelectPage={navigateToPage}
+          onUnreadCountChange={setUnreadNotifications}
+        />
+      )}
+      {exportOpen && activeSelected && (
+        <ExportDialog
+          page={activeSelected}
+          onClose={() => setExportOpen(false)}
+          onQueued={(job) => {
+            setJobs((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)]);
+            setExportOpen(false);
+            setActivitiesOpen(true);
+          }}
+        />
+      )}
+      {importOpen && (
+        <ImportDialog
+          spaces={spaces.filter((space) => space.effectiveRole !== "viewer")}
+          initialSpaceId={currentSpaceId}
+          onClose={() => setImportOpen(false)}
+          onQueued={(job) => {
+            setJobs((current) => [job, ...current.filter((candidate) => candidate.id !== job.id)]);
+            setImportOpen(false);
+            setActivitiesOpen(true);
+          }}
+        />
+      )}
       {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
     </div>
+  );
+}
+
+function SidebarPageLinks({
+  label,
+  pages,
+  icon,
+  onSelect,
+}: {
+  label: string;
+  pages: Page[];
+  icon: string;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <section className="sidebar-page-section" aria-label={label}>
+      <div className="sidebar-section-title">
+        <span>{label}</span>
+      </div>
+      <div className="sidebar-page-links">
+        {pages.map((page) => (
+          <button key={page.id} onClick={() => onSelect(page.id)}>
+            <span aria-hidden="true">{icon}</span>
+            <span>{page.title}</span>
+          </button>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -2373,41 +2998,6 @@ function PageTree({
       )}
     </div>
   ));
-}
-
-function SearchView({
-  value,
-  results,
-  onChange,
-  onSelect,
-}: {
-  value: string;
-  results: Array<{ page: Page; snippet: string }>;
-  onChange: (value: string) => Promise<void>;
-  onSelect: (id: string) => void;
-}) {
-  return (
-    <main className="utility-view">
-      <p className="eyebrow">Workspace search</p>
-      <h1>Find anything</h1>
-      <input
-        className="search-input"
-        value={value}
-        onChange={(event) => void onChange(event.target.value)}
-        placeholder="Search titles and documents…"
-        autoFocus
-      />
-      <div className="search-results">
-        {results.map(({ page, snippet }) => (
-          <button key={page.id} onClick={() => onSelect(page.id)}>
-            <strong>{page.title}</strong>
-            <span>{snippet.replace(/<\/?mark>/g, "")}</span>
-          </button>
-        ))}
-        {value && !results.length && <p className="empty-copy">No matching pages.</p>}
-      </div>
-    </main>
-  );
 }
 
 type MentionPageResponse = {
@@ -2574,7 +3164,7 @@ function TrashView({
 }
 
 type MemberRow = { id: string; name: string; email: string; role: Role; createdAt: number };
-function MembersView({ member }: { member: ClientMemberContext }) {
+function MembersView({ member, spaces, pages }: { member: ClientMemberContext; spaces: Space[]; pages: Page[] }) {
   const [members, setMembers] = useState<MemberRow[]>([]);
   const [inviteUrl, setInviteUrl] = useState("");
   const load = useCallback(
@@ -2647,6 +3237,7 @@ function MembersView({ member }: { member: ClientMemberContext }) {
           </div>
         ))}
       </div>
+      <SlackSettings owner={member.role === "owner"} spaces={spaces} pages={pages} />
     </main>
   );
 }
