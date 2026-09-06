@@ -39,6 +39,7 @@ export type JobRow = {
   error_code: string | null;
   error_message: string | null;
   expires_at: number | null;
+  attempt: number;
   created_at: number;
   updated_at: number;
 };
@@ -184,6 +185,13 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     if (existing.import_job_id === null && existing.created_by === job.requested_by)
       return { published: true, page: existing };
     if (existing.import_job_id !== job.id) throw new Error("The template target id is already in use.");
+    if (existing.content_epoch !== job.attempt) {
+      // A retry must not reuse the purged document room of the previous attempt.
+      await env.DB.prepare(`UPDATE pages SET content_epoch = ? WHERE id = ? AND import_job_id = ?`)
+        .bind(job.attempt, existing.id, job.id)
+        .run();
+      existing.content_epoch = job.attempt;
+    }
     return { published: false, page: existing };
   }
   const source = await env.DB.prepare(
@@ -221,8 +229,8 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     env.DB.prepare(
       `INSERT INTO pages
         (id, workspace_id, space_id, parent_id, kind, position, title, icon, is_template, import_job_id,
-         created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         content_epoch, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       options.targetPageId,
       job.workspace_id,
@@ -234,6 +242,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
       source.icon,
       options.isTemplate ? 1 : 0,
       job.id,
+      job.attempt,
       job.requested_by,
       timestamp,
       timestamp,

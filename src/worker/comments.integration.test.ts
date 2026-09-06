@@ -240,6 +240,28 @@ describe("server-authoritative comments", () => {
     );
     expect(fallback.status).toBe(200);
     expect(await fallback.json()).toMatchObject({ anchored: false, thread: { anchored: false } });
+
+    // A drifted re-anchor leaves the existing mark and stored selection in place.
+    const kept = await SELF.fetch(
+      request(installed.cookie, `/api/comment-threads/${thread.id}/anchor`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ selection: { yjs: { head: position, anchor: position } } }),
+      }),
+    );
+    expect(await kept.json()).toMatchObject({ anchored: false, thread: { anchored: true } });
+
+    // Only the thread author may place or move its anchor in the document body.
+    const viewer = await invite(installed.cookie, "anchor");
+    const forbidden = await SELF.fetch(
+      request(viewer.cookie, `/api/comment-threads/${thread.id}/anchor`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ selection: { yjs: selection } }),
+      }),
+    );
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toMatchObject({ error: { code: "comment_author_required" } });
   });
 
   it("migrates legacy Yjs thread bodies once while preserving ids and anchors", async () => {

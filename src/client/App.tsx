@@ -382,6 +382,17 @@ function assertNeverWorkspacePageAction(action: never): never {
   throw new Error(`Unhandled workspace page action: ${actionType}`);
 }
 
+// When the selected page disappears, stay in its space rather than jumping to the workspace's first root.
+function fallbackPageId(pages: Page[], previousPages: Page[], previousSelectedId: string | null) {
+  const previousSpaceId = previousSelectedId
+    ? previousPages.find((page) => page.id === previousSelectedId)?.spaceId
+    : undefined;
+  const sameSpace = previousSpaceId
+    ? pages.find((page) => page.spaceId === previousSpaceId && !page.isTemplate)
+    : undefined;
+  return sameSpace?.id ?? pages[0]?.id ?? null;
+}
+
 function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAction): WorkspacePageState {
   if (action.type === "select") {
     const selectionIsAvailable = state.pages.some((page) => page.id === action.pageId);
@@ -416,7 +427,7 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
           ? state.pendingRestoredRoot.id
           : state.pendingRestoredRoot
             ? null
-            : (pages[0]?.id ?? null);
+            : fallbackPageId(pages, state.pages, state.selectedId);
     const pendingSelectionId = pendingSelectionResolved ? null : state.pendingSelectionId;
     const pendingRestoredRoot = selectedId === null ? state.pendingRestoredRoot : null;
     if (
@@ -457,7 +468,7 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
   if (action.type === "remove") {
     const pages = state.pages.filter((page) => !action.pageIds.has(page.id));
     const selectedWasRemoved = state.selectedId !== null && action.pageIds.has(state.selectedId);
-    const selectedId = selectedWasRemoved ? (pages[0]?.id ?? null) : state.selectedId;
+    const selectedId = selectedWasRemoved ? fallbackPageId(pages, state.pages, state.selectedId) : state.selectedId;
     const pendingSelectionId =
       state.pendingSelectionId && action.pageIds.has(state.pendingSelectionId) ? null : state.pendingSelectionId;
     const pendingRestoredRoot =
@@ -1457,6 +1468,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     return () => window.clearTimeout(timer);
   }, [loadOrganization]);
 
+  // The shell only renders a selection inside the active space, so a deep link or a fallback selection
+  // that lands in another space switches the space instead of showing an empty workspace.
+  const activeSpaceIdRef = useRef(activeSpaceId);
+  useEffect(() => {
+    activeSpaceIdRef.current = activeSpaceId;
+  }, [activeSpaceId]);
+  useEffect(() => {
+    if (!selectedSpaceId || selectedSpaceId === activeSpaceIdRef.current) return;
+    setActiveSpaceId(selectedSpaceId);
+    localStorage.setItem(`notes:active-space:${member.workspace.id}`, selectedSpaceId);
+  }, [member.workspace.id, selectedId, selectedSpaceId]);
+
   const selectSpace = useCallback(
     (spaceId: string) => {
       setActiveSpaceId(spaceId);
@@ -1710,25 +1733,32 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     ],
   );
 
+  // The handler closes over the selection and panel state, so a ref keeps the socket itself stable:
+  // rebuilding it on every page click would drop any event broadcast during the reconnect gap.
+  const handleWorkspaceEventRef = useRef(handleWorkspaceEvent);
+  useEffect(() => {
+    handleWorkspaceEventRef.current = handleWorkspaceEvent;
+  }, [handleWorkspaceEvent]);
+
   useEffect(() => {
     const signal = workspaceAbortController.current.signal;
-    const bundle = createWorkspaceEvents(member.workspace.id, handleWorkspaceEvent, () => {
-      void loadPages().catch((error) => {
-        if (signal.aborted) return;
-        reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be refreshed."));
-      });
-      void loadUnreadMentions();
-      void loadUnreadNotifications();
-    });
+    const bundle = createWorkspaceEvents(
+      member.workspace.id,
+      (event) => handleWorkspaceEventRef.current(event),
+      () => {
+        void loadPages().catch((error) => {
+          if (signal.aborted) return;
+          reportWorkspaceError(
+            { source: "page-tree" },
+            apiErrorMessage(error, "The page tree could not be refreshed."),
+          );
+        });
+        void loadUnreadMentions();
+        void loadUnreadNotifications();
+      },
+    );
     return () => bundle.destroy();
-  }, [
-    handleWorkspaceEvent,
-    loadPages,
-    loadUnreadMentions,
-    loadUnreadNotifications,
-    member.workspace.id,
-    reportWorkspaceError,
-  ]);
+  }, [loadPages, loadUnreadMentions, loadUnreadNotifications, member.workspace.id, reportWorkspaceError]);
 
   const closeActivities = useCallback(() => {
     restoreActivityTriggerFocus.current = true;

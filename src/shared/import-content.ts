@@ -27,7 +27,13 @@ function decodeHtml(value: string) {
     }
     const hexadecimal = body[1]?.toLowerCase() === "x";
     const codePoint = Number.parseInt(body.slice(hexadecimal ? 2 : 1), hexadecimal ? 16 : 10);
-    return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
+    // NUL and lone surrogates cannot round-trip through Yjs text, so those entities stay literal.
+    const encodable =
+      Number.isFinite(codePoint) &&
+      codePoint > 0 &&
+      codePoint <= 0x10ffff &&
+      (codePoint < 0xd800 || codePoint > 0xdfff);
+    return encodable ? String.fromCodePoint(codePoint) : entity;
   });
 }
 

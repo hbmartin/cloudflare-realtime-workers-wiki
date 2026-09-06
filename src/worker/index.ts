@@ -108,6 +108,7 @@ import {
 import {
   listNotifications,
   listSubscriptions,
+  DeliveryInProgressError,
   markNotifications,
   NOTIFICATION_EVENT_TYPES,
   notificationPreferences,
@@ -1789,8 +1790,8 @@ app.post("/api/jobs/:id/retry", async (c) => {
   }
   const instanceId = crypto.randomUUID();
   await c.env.DB.prepare(
-    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, progress_current = 0, progress_label = 'Queued',
-       error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`,
+    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1, progress_current = 0,
+       progress_label = 'Queued', error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`,
   )
     .bind(instanceId, now(), job.id)
     .run();
@@ -2256,13 +2257,22 @@ app.post("/api/pages/:id/comments", async (c) => {
 
 app.post("/api/comment-threads/:id/anchor", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const page = await pageForCommentThread(c.env, member, c.req.param("id"));
+  const threadId = c.req.param("id");
+  const page = await pageForCommentThread(c.env, member, threadId);
   const scopedPage = commentPage(page);
+  const thread = await c.env.DB.prepare(`SELECT created_by FROM comment_threads WHERE id = ? AND page_id = ?`)
+    .bind(threadId, page.id)
+    .first<{ created_by: string }>();
+  if (!thread) throw new HttpError(404, "comment_thread_not_found", "Comment thread not found.");
+  // Anchoring writes a mark into the document body, so only the thread's author may place or move it.
+  if (thread.created_by !== member.user.id) {
+    throw new HttpError(403, "comment_author_required", "Only the thread author may anchor it.");
+  }
   const body = await jsonBody(c.req.raw);
   const selection = object(body.selection);
   const yjs = selection.yjs;
   if (!yjs || typeof yjs !== "object" || Array.isArray(yjs)) {
-    return c.json({ thread: await commentThread(c.env, member, scopedPage, c.req.param("id")), anchored: false });
+    return c.json({ thread: await commentThread(c.env, member, scopedPage, threadId), anchored: false });
   }
   const anchorJson = JSON.stringify(yjs);
   if (new TextEncoder().encode(anchorJson).byteLength > 16 * 1024) {
@@ -2274,21 +2284,25 @@ app.post("/api/comment-threads/:id/anchor", async (c) => {
       new Request("https://document.internal/comment-anchor", {
         method: "POST",
         headers: { "content-type": "application/json", "x-notes-internal": c.env.BETTER_AUTH_SECRET },
-        body: JSON.stringify({
-          operation: "add",
-          threadId: c.req.param("id"),
-          userId: member.user.id,
-          selection: yjs,
-        }),
+        body: JSON.stringify({ operation: "add", threadId, userId: member.user.id, selection: yjs }),
       }),
     );
     if (response.ok) anchored = Boolean((await response.json<{ anchored?: boolean }>()).anchored);
+    else if (response.status === 404) {
+      throw new HttpError(404, "comment_thread_not_found", "Comment thread not found.");
+    } else if (![409, 410, 413].includes(response.status)) {
+      throw new HttpError(503, "comments_unavailable", "Comments are temporarily unavailable.");
+    }
   }
-  await c.env.DB.prepare(`UPDATE comment_threads SET anchor_json = ?, updated_at = ? WHERE id = ? AND page_id = ?`)
-    .bind(anchored ? anchorJson : null, Date.now(), c.req.param("id"), page.id)
-    .run();
-  sendCommentMutationEvents(c, member.workspace.id, page.id);
-  return c.json({ thread: await commentThread(c.env, member, scopedPage, c.req.param("id")), anchored });
+  // A selection that no longer resolves, or a document that cannot take marks, leaves the thread as it was:
+  // the previous anchor (if any) is still in the document, so the stored selection must not be cleared.
+  if (anchored) {
+    await c.env.DB.prepare(`UPDATE comment_threads SET anchor_json = ?, updated_at = ? WHERE id = ? AND page_id = ?`)
+      .bind(anchorJson, Date.now(), threadId, page.id)
+      .run();
+    sendCommentMutationEvents(c, member.workspace.id, page.id);
+  }
+  return c.json({ thread: await commentThread(c.env, member, scopedPage, threadId), anchored });
 });
 
 async function createReplyResponse(c: Context<{ Bindings: Env }>, threadId: string, body: Record<string, unknown>) {
@@ -5045,7 +5059,7 @@ export default {
           console.error("Delivery queue message failed", { messageId: message.id, attempts: message.attempts, error });
           message.retry({
             delaySeconds:
-              error instanceof SlackRateLimitError
+              error instanceof SlackRateLimitError || error instanceof DeliveryInProgressError
                 ? error.retryAfter
                 : Math.min(300, 2 ** Math.min(message.attempts, 8)),
           });

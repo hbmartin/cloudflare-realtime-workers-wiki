@@ -27,6 +27,14 @@ describe("import content", () => {
     expect(parsed.issues).toEqual([{ code: "unsafe_url", detail: "javascript:alert(1)" }]);
   });
 
+  it("keeps NUL and lone-surrogate entities literal so imports round-trip through Yjs", () => {
+    const parsed = htmlToDocument("<p>a&#xD800;b&#0;c&#x1F600;d&#65;</p>");
+    const text = JSON.stringify(parsed.document);
+    expect(text).toContain("a&#xD800;b&#0;c😀dA");
+    expect(text).not.toContain("\\ud800");
+    expect(text).not.toContain("\\u0000");
+  });
+
   it("resets block and inline state at HTML block boundaries", () => {
     const parsed = htmlToDocument("<h1></h1><p><strong>Bold</p><p>Plain</p>");
     const containers = parsed.document.content?.[0]?.content ?? [];

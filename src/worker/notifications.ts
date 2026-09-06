@@ -65,8 +65,22 @@ function uniqueIds(ids: string[]) {
   return [...new Set(ids.filter(Boolean))];
 }
 
+// Continuous editing compacts every ~30s; edits by the same actor on the same page within this window,
+// or while the previous edit notification is still unread, collapse into one notification.
+const PAGE_EDIT_COALESCE_MS = 60 * 60 * 1000;
+// A pending delivery claim older than this belongs to a consumer that died mid-send and may be reclaimed.
+const DELIVERY_CLAIM_STALE_MS = 60_000;
+
+export class DeliveryInProgressError extends Error {
+  readonly retryAfter = Math.ceil(DELIVERY_CLAIM_STALE_MS / 1000);
+  constructor() {
+    super("Delivery is already in progress.");
+  }
+}
+
 export function notificationFanoutStatements(database: D1Database, fanout: NotificationFanout) {
   const recipients = uniqueIds(fanout.recipientIds);
+  const coalesceAfter = fanout.eventType === "page_edit" ? fanout.createdAt - PAGE_EDIT_COALESCE_MS : null;
   const prefix = `${fanout.eventType}:${fanout.sourceId}`;
   const idPrefix = `${prefix}:`;
   const recipientJson = JSON.stringify(recipients);
@@ -85,7 +99,12 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
            JOIN spaces s ON s.id = p.space_id
            LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = recipient.value
           WHERE recipient.value <> ? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
-            AND (wm.role = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
+            AND (wm.role = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+            AND NOT EXISTS (
+              SELECT 1 FROM notifications recent
+               WHERE ? IS NOT NULL AND recent.user_id = recipient.value AND recent.page_id = ?
+                 AND recent.event_type = ? AND recent.actor_id = ?
+                 AND ((recent.read_at IS NULL AND recent.archived_at IS NULL) OR recent.created_at > ?))`,
       )
       .bind(
         prefix,
@@ -102,6 +121,11 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         fanout.workspaceId,
         fanout.pageId,
         fanout.actorId,
+        coalesceAfter,
+        fanout.pageId,
+        fanout.eventType,
+        fanout.actorId,
+        coalesceAfter ?? 0,
       ),
     database
       .prepare(
@@ -112,7 +136,7 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
           WHERE id >= ? AND id < ?`,
       )
       .bind(fanout.createdAt, fanout.createdAt, idPrefix, `${prefix};`),
-    ...(fanout.emitSlackChannel ? slackChannelFanoutStatements(database, fanout) : []),
+    ...(fanout.emitSlackChannel ? slackChannelFanoutStatements(database, { ...fanout, coalesceAfter }) : []),
   ];
 }
 
@@ -204,7 +228,8 @@ export async function markNotifications(
       AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
   )`;
-  if (ids?.length) {
+  // An explicit selection, even an empty one, never widens into the mark-all branch.
+  if (ids !== null) {
     await env.DB.prepare(
       `UPDATE notifications SET ${column} = COALESCE(${column}, ?)
         WHERE user_id = ? AND workspace_id = ? AND id IN (SELECT value FROM json_each(?)) ${access}`,
@@ -440,14 +465,19 @@ async function claimDelivery(env: Env, outboxId: string, channel: "email" | "sla
   )
     .bind(key, outboxId, channel, timestamp)
     .run();
-  if (inserted.meta.changes) return true;
+  if (inserted.meta.changes) return "claimed";
+  // A failed attempt is retried; a pending claim whose consumer died mid-send is reclaimed once stale.
   const retry = await env.DB.prepare(
     `UPDATE deliveries SET status = 'pending', attempts = attempts + 1, last_error = NULL, updated_at = ?
-      WHERE idempotency_key = ? AND status = 'failed'`,
+      WHERE idempotency_key = ? AND (status = 'failed' OR (status = 'pending' AND updated_at <= ?))`,
   )
-    .bind(timestamp, key)
+    .bind(timestamp, key, timestamp - DELIVERY_CLAIM_STALE_MS)
     .run();
-  return Boolean(retry.meta.changes);
+  if (retry.meta.changes) return "claimed";
+  const current = await env.DB.prepare(`SELECT status FROM deliveries WHERE idempotency_key = ?`)
+    .bind(key)
+    .first<{ status: "pending" | "sent" | "failed" }>();
+  return current?.status === "pending" ? "in_progress" : "settled";
 }
 
 async function finishClaimedDelivery(
@@ -509,7 +539,10 @@ export async function deliverNotification(env: Env, notificationId: string, outb
     row.preference_in_app === 0 ? "disabled" : null,
   );
   const copy = notificationCopy(row);
-  if (emailMode(row) === "immediate" && (await claimDelivery(env, outboxId, "email"))) {
+  let deferred = false;
+  const emailClaim = emailMode(row) === "immediate" ? await claimDelivery(env, outboxId, "email") : "settled";
+  if (emailClaim === "in_progress") deferred = true;
+  if (emailClaim === "claimed") {
     try {
       if (!(await sendNotificationEmail(env, row, copy, copy))) {
         await finishClaimedDelivery(env, outboxId, "email", "failed", "unavailable");
@@ -530,9 +563,11 @@ export async function deliverNotification(env: Env, notificationId: string, outb
       throw error;
     }
   }
-  if (slackMode(row) === "immediate" && (await claimDelivery(env, outboxId, "slack"))) {
+  const slackClaim = slackMode(row) === "immediate" ? await claimDelivery(env, outboxId, "slack") : "settled";
+  if (slackClaim === "in_progress") deferred = true;
+  if (slackClaim === "claimed") {
     try {
-      if (!(await sendPersonalSlackNotification(env, row.user_id, copy, row.page_id))) {
+      if (!(await sendPersonalSlackNotification(env, row.user_id, row.workspace_id, copy, row.page_id))) {
         await finishClaimedDelivery(env, outboxId, "slack", "failed", "unavailable");
       } else {
         await env.DB.prepare(`UPDATE notifications SET slack_at = COALESCE(slack_at, ?) WHERE id = ?`)
@@ -551,6 +586,8 @@ export async function deliverNotification(env: Env, notificationId: string, outb
       throw error;
     }
   }
+  // Another consumer holds a live claim; let the queue redeliver once it settles or goes stale.
+  if (deferred) throw new DeliveryInProgressError();
 }
 
 function digestDue(timezone: string, timestamp: number) {
@@ -632,7 +669,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
     }
     const claimed: DeliveryRow[] = [];
     for (const row of rows) {
-      if (await claimDelivery(env, `outbox:${row.id}`, "email")) claimed.push(row);
+      if ((await claimDelivery(env, `outbox:${row.id}`, "email")) === "claimed") claimed.push(row);
     }
     if (!claimed.length) continue;
     const lines = claimed.map((row) => `• ${notificationCopy(row)}`);
@@ -702,13 +739,14 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
     if (!rows.length) continue;
     const claimed: DeliveryRow[] = [];
     for (const row of rows) {
-      if (await claimDelivery(env, `outbox:${row.id}`, "slack")) claimed.push(row);
+      if ((await claimDelivery(env, `outbox:${row.id}`, "slack")) === "claimed") claimed.push(row);
     }
     if (!claimed.length) continue;
     try {
       const sent = await sendPersonalSlackNotification(
         env,
         candidate.user_id,
+        candidate.workspace_id,
         `Your daily Notes digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
         claimed[0]!.page_id,
       );
@@ -736,7 +774,8 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           error instanceof Error ? error.message.slice(0, 500) : "Slack digest failed.",
         );
       }
-      throw error;
+      // One unreachable recipient must not starve the digests queued behind it.
+      console.error("Notification digest Slack message failed", { userId: candidate.user_id, error });
     }
   }
 }

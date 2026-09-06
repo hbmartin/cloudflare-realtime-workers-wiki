@@ -539,6 +539,12 @@ export class Document extends YServer {
       ) {
         return Response.json({ error: "Invalid comment anchor request." }, { status: 400 });
       }
+      if (this.purged || this.metadata.retired || this.metadata.restore_pending || this.transition) {
+        return Response.json({ error: "This document version has been retired." }, { status: 410 });
+      }
+      if (this.metadata.read_only && body.operation === "add") {
+        return Response.json({ error: "This document is read-only." }, { status: 409 });
+      }
       const { pageId } = this.ids;
       const thread = await this.bindings.DB.prepare(`SELECT id FROM comment_threads WHERE id = ? AND page_id = ?`)
         .bind(body.threadId, pageId)
@@ -569,6 +575,9 @@ export class Document extends YServer {
       const inputKey = typeof body.inputKey === "string" ? body.inputKey : "";
       if (!jobId || !inputKey.startsWith(`jobs/${jobId}/`)) {
         return Response.json({ error: "Invalid initialization request." }, { status: 400 });
+      }
+      if (this.purged || this.metadata.retired) {
+        return Response.json({ error: "This document version has been retired." }, { status: 410 });
       }
       const { pageId, epoch } = this.ids;
       const staged = await this.bindings.DB.prepare(

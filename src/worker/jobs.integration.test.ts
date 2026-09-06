@@ -662,6 +662,11 @@ describe("job execution", () => {
       },
       {
         path: "Project 0123456789abcdef0123456789abcdef/Tasks aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.csv",
+        bytes: encoder.encode("Task,Done,Estimate\nShip,yes,2\n"),
+      },
+      {
+        // Notion ships a view-filtered CSV next to the unfiltered `_all` CSV; only the latter is imported.
+        path: "Project 0123456789abcdef0123456789abcdef/Tasks aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_all.csv",
         bytes: encoder.encode("Task,Done,Estimate\nShip,yes,2\nTest,no,3\n"),
       },
       {
@@ -703,6 +708,7 @@ describe("job execution", () => {
       await tree.json<{ pages: Array<{ id: string; parentId: string | null; kind: string; title: string }> }>()
     ).pages;
     const project = imported.find((page) => page.title === "Project")!;
+    expect(imported.filter((page) => page.title === "Tasks")).toHaveLength(1);
     const tasks = imported.find((page) => page.title === "Tasks")!;
     expect(tasks).toMatchObject({ parentId: project.id, kind: "table" });
     expect(

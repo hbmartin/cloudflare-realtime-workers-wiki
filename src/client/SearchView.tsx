@@ -60,7 +60,11 @@ function persistSearch(query: string, filters: UiFilters) {
   parameters.delete("limit");
   parameters.delete("offset");
   parameters.set("view", "search");
-  window.history.replaceState(null, "", `${window.location.pathname}?${parameters}`);
+  try {
+    window.history.replaceState(null, "", `${window.location.pathname}?${parameters}`);
+  } catch {
+    // WebKit throws once a page exceeds 100 history updates per 30 seconds; the URL is a convenience only.
+  }
 }
 
 function sourceLabel(source: SearchResult["snippet"]["source"]) {
@@ -102,7 +106,9 @@ export function SearchView({
   }, []);
 
   useEffect(() => {
-    persistSearch(query, filters);
+    // Debounced so fast typing does not burn through WebKit's history-update budget.
+    const timer = window.setTimeout(() => persistSearch(query, filters), 300);
+    return () => window.clearTimeout(timer);
   }, [filters, query]);
 
   useEffect(() => {

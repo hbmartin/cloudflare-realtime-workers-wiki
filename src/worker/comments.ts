@@ -172,14 +172,14 @@ function canResolve(member: MemberContext, page: CommentPage, thread: ThreadRow)
 
 async function commentsForThreads(env: Env, threadIds: string[]) {
   if (!threadIds.length) return new Map<string, Comment[]>();
-  const placeholders = threadIds.map(() => "?").join(",");
+  // D1 caps bound parameters per statement, so pass the id list as one JSON document.
   const rows = await env.DB.prepare(
     `SELECT c.*, u.name user_name, u.email user_email
        FROM comments c JOIN user u ON u.id = c.user_id
-      WHERE c.thread_id IN (${placeholders})
+      WHERE c.thread_id IN (SELECT value FROM json_each(?))
       ORDER BY c.created_at, c.id`,
   )
-    .bind(...threadIds)
+    .bind(JSON.stringify(threadIds))
     .all<CommentRow>();
   const grouped = new Map<string, Comment[]>();
   for (const row of rows.results) {

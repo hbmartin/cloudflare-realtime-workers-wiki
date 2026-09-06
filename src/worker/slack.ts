@@ -30,6 +30,7 @@ export type SlackEventPayload = {
     type?: unknown;
     user?: unknown;
     channel?: unknown;
+    message_ts?: unknown;
     links?: Array<{ url?: unknown }>;
   };
 };
@@ -623,9 +624,13 @@ export function slackChannelFanoutStatements(
     eventType: NotificationEventType;
     sourceId: string;
     createdAt: number;
+    // When set, a subscription that already recorded this event type for the page and actor
+    // after this timestamp is skipped so continuous editing does not flood the channel.
+    coalesceAfter?: number | null;
   },
 ) {
   const eventId = `${fanout.eventType}:${fanout.sourceId}`;
+  const coalesceAfter = fanout.coalesceAfter ?? null;
   const idPrefix = `${eventId}:`;
   return [
     database
@@ -637,7 +642,11 @@ export function slackChannelFanoutStatements(
            JOIN slack_installations installation ON installation.id = subscription.installation_id
           WHERE installation.workspace_id = ? AND installation.disconnected_at IS NULL
             AND subscription.space_id = ? AND (subscription.page_id IS NULL OR subscription.page_id = ?)
-            AND EXISTS (SELECT 1 FROM json_each(subscription.event_types_json) WHERE value = ?)`,
+            AND EXISTS (SELECT 1 FROM json_each(subscription.event_types_json) WHERE value = ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM slack_channel_events recent
+               WHERE ? IS NOT NULL AND recent.subscription_id = subscription.id AND recent.page_id = ?
+                 AND recent.event_type = ? AND recent.actor_id = ? AND recent.created_at > ?)`,
       )
       .bind(
         eventId,
@@ -651,6 +660,11 @@ export function slackChannelFanoutStatements(
         fanout.spaceId,
         fanout.pageId,
         fanout.eventType,
+        coalesceAfter,
+        fanout.pageId,
+        fanout.eventType,
+        fanout.actorId,
+        coalesceAfter ?? 0,
       ),
     database
       .prepare(
@@ -725,13 +739,20 @@ export async function deliverSlackChannelEvent(env: Env, eventId: string) {
     .run();
 }
 
-export async function sendPersonalSlackNotification(env: Env, userId: string, text: string, pageId: string) {
+export async function sendPersonalSlackNotification(
+  env: Env,
+  userId: string,
+  workspaceId: string,
+  text: string,
+  pageId: string,
+) {
+  // A user linked in several workspaces must only hear about a workspace through that workspace's installation.
   const row = await env.DB.prepare(
     `SELECT link.slack_user_id, installation.* FROM slack_user_links link
        JOIN slack_installations installation ON installation.id = link.installation_id
-      WHERE link.user_id = ? AND installation.disconnected_at IS NULL`,
+      WHERE link.user_id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL`,
   )
-    .bind(userId)
+    .bind(userId, workspaceId)
     .first<SlackInstallation & { slack_user_id: string }>();
   if (!row) return false;
   const safeText = escapeSlackMrkdwn(text);
@@ -760,7 +781,8 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     payload.event?.type !== "link_shared" ||
     typeof payload.team_id !== "string" ||
     typeof payload.event.user !== "string" ||
-    typeof payload.event.channel !== "string"
+    typeof payload.event.channel !== "string" ||
+    typeof payload.event.message_ts !== "string"
   ) {
     return { ok: true };
   }
@@ -824,14 +846,15 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     await env.DB.batch([
       env.DB.prepare(
         `INSERT OR IGNORE INTO slack_unfurls
-          (id, installation_id, workspace_id, user_id, channel_id, unfurls_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          (id, installation_id, workspace_id, user_id, channel_id, message_ts, unfurls_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id,
         installation.id,
         installation.workspace_id,
         member.user.id,
         payload.event.channel,
+        payload.event.message_ts,
         JSON.stringify(unfurls),
         timestamp,
       ),
@@ -854,7 +877,7 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
 
 export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
   const row = await env.DB.prepare(
-    `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.unfurls_json,
+    `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.message_ts, unfurl.unfurls_json,
             installation.id, installation.workspace_id, installation.team_id, installation.team_name,
             installation.bot_user_id, installation.bot_token_ciphertext,
             installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at
@@ -863,7 +886,15 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
       WHERE unfurl.id = ? AND unfurl.delivered_at IS NULL AND installation.disconnected_at IS NULL`,
   )
     .bind(unfurlId)
-    .first<SlackInstallation & { unfurl_id: string; user_id: string; channel_id: string; unfurls_json: string }>();
+    .first<
+      SlackInstallation & {
+        unfurl_id: string;
+        user_id: string;
+        channel_id: string;
+        message_ts: string | null;
+        unfurls_json: string;
+      }
+    >();
   if (!row) return;
   const stored = JSON.parse(row.unfurls_json) as Record<string, unknown>;
   const unfurls: Record<string, unknown> = {};
@@ -896,7 +927,10 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
     }
     unfurls[url] = value;
   }
-  if (Object.keys(unfurls).length) await slackApi(env, row, "chat.unfurl", { channel: row.channel_id, unfurls });
+  // Slack attaches previews to a specific message, so rows staged without its timestamp cannot be delivered.
+  if (Object.keys(unfurls).length && row.message_ts) {
+    await slackApi(env, row, "chat.unfurl", { channel: row.channel_id, ts: row.message_ts, unfurls });
+  }
   await env.DB.prepare(`UPDATE slack_unfurls SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL`)
     .bind(Date.now(), unfurlId)
     .run();
@@ -910,8 +944,9 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
       WHERE cadence = 'digest' AND delivered_at IS NULL ORDER BY created_at LIMIT 50`,
   ).all<{ subscription_id: string }>();
   for (const { subscription_id: subscriptionId } of subscriptions.results) {
-    const events = await env.DB.prepare(
-      `SELECT event.id, event.event_type, event.page_id, page.title page_title, actor.name actor_name,
+    try {
+      const events = await env.DB.prepare(
+        `SELECT event.id, event.event_type, event.page_id, page.title page_title, actor.name actor_name,
               subscription.channel_id,
               installation.id installation_id, installation.workspace_id, installation.team_id,
               installation.team_name, installation.bot_user_id, installation.bot_token_ciphertext,
@@ -926,36 +961,40 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
         WHERE event.subscription_id = ? AND event.cadence = 'digest'
           AND event.delivered_at IS NULL AND installation.disconnected_at IS NULL
         ORDER BY event.created_at LIMIT 40`,
-    )
-      .bind(subscriptionId)
-      .all<
-        SlackInstallation & {
-          id: string;
-          event_type: NotificationEventType;
-          page_id: string;
-          page_title: string;
-          actor_name: string | null;
-          channel_id: string;
-          installation_id: string;
-        }
-      >();
-    const [first] = events.results;
-    if (!first) continue;
-    const installation: SlackInstallation = { ...first, id: first.installation_id };
-    const lines = events.results.map(
-      (event) =>
-        `• ${escapeSlackMrkdwn(eventCopy(event.event_type, event.actor_name, event.page_title))} — <${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(event.page_id)}|open>`,
-    );
-    await slackApi(env, installation, "chat.postMessage", {
-      channel: first.channel_id,
-      text: `${events.results.length} Notes update${events.results.length === 1 ? "" : "s"}`,
-      blocks: [{ type: "section", text: { type: "mrkdwn", text: `*Your Notes digest*\n${lines.join("\n")}` } }],
-    });
-    await env.DB.prepare(
-      `UPDATE slack_channel_events SET delivered_at = ? WHERE id IN (SELECT value FROM json_each(?))`,
-    )
-      .bind(timestamp, JSON.stringify(events.results.map((event) => event.id)))
-      .run();
+      )
+        .bind(subscriptionId)
+        .all<
+          SlackInstallation & {
+            id: string;
+            event_type: NotificationEventType;
+            page_id: string;
+            page_title: string;
+            actor_name: string | null;
+            channel_id: string;
+            installation_id: string;
+          }
+        >();
+      const [first] = events.results;
+      if (!first) continue;
+      const installation: SlackInstallation = { ...first, id: first.installation_id };
+      const lines = events.results.map(
+        (event) =>
+          `• ${escapeSlackMrkdwn(eventCopy(event.event_type, event.actor_name, event.page_title))} — <${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(event.page_id)}|open>`,
+      );
+      await slackApi(env, installation, "chat.postMessage", {
+        channel: first.channel_id,
+        text: `${events.results.length} Notes update${events.results.length === 1 ? "" : "s"}`,
+        blocks: [{ type: "section", text: { type: "mrkdwn", text: `*Your Notes digest*\n${lines.join("\n")}` } }],
+      });
+      await env.DB.prepare(
+        `UPDATE slack_channel_events SET delivered_at = ? WHERE id IN (SELECT value FROM json_each(?))`,
+      )
+        .bind(timestamp, JSON.stringify(events.results.map((event) => event.id)))
+        .run();
+    } catch (error) {
+      // One unreachable channel must not starve the digests queued behind it.
+      console.error("Slack channel digest failed", { subscriptionId, error });
+    }
   }
 }
 

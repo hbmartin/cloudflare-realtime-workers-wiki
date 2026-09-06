@@ -131,6 +131,15 @@ describe("notification feed and subscriptions", () => {
       }),
     );
     expect((await notificationFeed(viewer.cookie)).unreadCount).toBe(1);
+    // An empty selection archives nothing rather than everything.
+    await SELF.fetch(
+      request(viewer.cookie, "/api/notifications/archive", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ids: [] }),
+      }),
+    );
+    expect((await notificationFeed(viewer.cookie)).notifications).toHaveLength(2);
     await SELF.fetch(
       request(viewer.cookie, "/api/notifications/archive", {
         method: "POST",
