@@ -55,13 +55,18 @@ async function bootstrap(): Promise<InstalledWorkspace> {
   return { cookie, pageId: tree.pages[0]!.id, userId: me.user.id, workspaceId: me.workspace.id };
 }
 
-function inlineBindings() {
+// `in` rather than a nullish fallback: some tests override a binding to undefined.
+function bindingsWith(overrides: Record<string, unknown>) {
   return new Proxy(env as Env, {
     get(target, property, receiver) {
-      if (property === "WORKFLOW_INLINE") return "true";
+      if (typeof property === "string" && property in overrides) return overrides[property];
       return Reflect.get(target, property, receiver);
     },
   });
+}
+
+function inlineBindings() {
+  return bindingsWith({ WORKFLOW_INLINE: "true" });
 }
 
 beforeEach(async () => {
@@ -117,12 +122,7 @@ describe("job execution", () => {
   it("starts a coalesced search reindex and exposes it only through the requester feed", async () => {
     const installed = await bootstrap();
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "NOTES_WORKFLOW") return { create };
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
     const context = createExecutionContext();
     const started = await worker.fetch(
       request(installed.cookie, "/api/jobs/search-reindex", { method: "POST" }),
@@ -144,12 +144,7 @@ describe("job execution", () => {
   it("runs the owner-initiated legacy comment workspace scan", async () => {
     const installed = await bootstrap();
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "NOTES_WORKFLOW") return { create };
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
     const context = createExecutionContext();
     const response = await worker.fetch(
       request(installed.cookie, "/api/jobs/comment-migration", { method: "POST" }),
@@ -332,12 +327,7 @@ describe("job execution", () => {
     )
       .bind(attachmentId, installed.workspaceId, installed.pageId, attachmentKey, installed.userId, Date.now())
       .run();
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "WORKFLOW_INLINE") return "true";
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ WORKFLOW_INLINE: "true" });
     const context = createExecutionContext();
     const response = await worker.fetch(
       request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
@@ -372,12 +362,7 @@ describe("job execution", () => {
 
   it("reports PDF configuration and renders through the Browser Run binding", async () => {
     const installed = await bootstrap();
-    const unavailableBindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "BROWSER") return undefined;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const unavailableBindings = bindingsWith({ BROWSER: undefined });
     expect(
       (
         await worker.fetch(
@@ -396,13 +381,7 @@ describe("job execution", () => {
       expect(options.html).toContain("<h1>Welcome</h1>");
       return new Response("%PDF-test", { headers: { "content-type": "application/pdf" } });
     });
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "WORKFLOW_INLINE") return "true";
-        if (property === "BROWSER") return { quickAction } as unknown as BrowserRun;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ WORKFLOW_INLINE: "true", BROWSER: { quickAction } as unknown as BrowserRun });
     const context = createExecutionContext();
     const queued = await worker.fetch(
       request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
@@ -452,12 +431,7 @@ describe("job execution", () => {
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
 
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "NOTES_WORKFLOW") return { create };
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
     const context = createExecutionContext();
     const queued = await worker.fetch(
       request(installed.cookie, "/api/templates", {
@@ -544,12 +518,7 @@ describe("job execution", () => {
     ]);
 
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "NOTES_WORKFLOW") return { create };
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
     const context = createExecutionContext();
     const response = await worker.fetch(
       request(installed.cookie, "/api/templates", {
@@ -739,14 +708,7 @@ describe("delivery outbox", () => {
       .run();
 
     const sent: unknown[] = [];
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "DELIVERY_QUEUE") {
-          return { send: vi.fn(async (body: unknown) => void sent.push(body)) };
-        }
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send: vi.fn(async (body: unknown) => void sent.push(body)) } });
     await sweepOutbox(bindings);
     expect(sent).toEqual([{ outboxId }]);
     expect(

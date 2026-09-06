@@ -551,9 +551,10 @@ export class Document extends YServer {
         .first<{ id: string }>();
       if (!thread) return Response.json({ error: "Comment thread not found." }, { status: 404 });
       this.pendingAuthorId = body.userId;
+      if (body.operation === "remove") removeCommentMark(this.document, body.threadId);
       const anchored =
         body.operation === "remove"
-          ? !removeCommentMark(this.document, body.threadId)
+          ? false
           : body.selection?.head && body.selection.anchor
             ? await addCommentMark(this.document, body.threadId, {
                 head: body.selection.head as RelativePositionJson,
@@ -562,7 +563,7 @@ export class Document extends YServer {
             : false;
       this.flushPendingUpdates();
       if (this.metadata.dirty) await this.compact();
-      return Response.json({ anchored: body.operation === "remove" ? false : anchored });
+      return Response.json({ anchored });
     }
     if (request.method === "POST" && url.pathname.endsWith("/initialize")) {
       let body: { jobId?: unknown; inputKey?: unknown };
@@ -840,6 +841,13 @@ export class Document extends YServer {
       )
         .bind(pageId, epoch)
         .first<PageProjectionRow>();
+      // Every compaction writes a new projection object; without this the superseded
+      // ones accumulate in R2 for the life of the page.
+      const supersededProjection = await this.bindings.DB.prepare(
+        `SELECT r2_key FROM document_projections WHERE page_id = ? AND content_epoch = ?`,
+      )
+        .bind(pageId, epoch)
+        .first<{ r2_key: string }>();
       let versionAt = metadataAtStart.last_version_at;
       let versionKey: string | null = null;
       let versionStatementIndex = -1;
@@ -1032,6 +1040,14 @@ export class Document extends YServer {
 
         const results = await this.bindings.DB.batch(statements);
         pageProjected = Boolean(results[0]?.meta.changes);
+        const superseded = supersededProjection?.r2_key;
+        if (pageProjected && superseded && superseded !== structuredKey) {
+          this.state.waitUntil(
+            this.bindings.BUCKET.delete(superseded).catch((error: unknown) => {
+              console.error("Failed to delete superseded document projection", { pageId, epoch, error });
+            }),
+          );
+        }
         if (versionStatementIndex >= 0 && !results[versionStatementIndex]?.meta.changes && versionKey) {
           await this.bindings.BUCKET.delete(versionKey);
           versionKey = null;

@@ -212,7 +212,9 @@ export class WorkspaceEvents extends YServer {
 
       // A permanently deleted page no longer carries a scope. A metadata-free
       // refresh is safe for every member and avoids leaking its former identity.
-      if (!pages.results.length) {
+      // Any unresolved id takes this path: filtering it out of a mixed batch would
+      // leave clients showing a page that no longer exists.
+      if (pages.results.length !== new Set(pageIds).size) {
         this.broadcastCustomMessage(JSON.stringify({ type: "workspace-invalidated" } satisfies WorkspaceEvent));
         return;
       }

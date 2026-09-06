@@ -98,10 +98,33 @@ export function createZip(entries: ZipEntry[]) {
   return concatBytes([...localParts, central, end.bytes]);
 }
 
-async function inflateRaw(bytes: Uint8Array) {
+// The pre-decompression guards can only weigh the sizes the archive declares, so a
+// entry that lies about them would otherwise be buffered in full before the integrity
+// check rejects it. `limit` is the real ceiling, enforced as the output is produced.
+async function inflateRaw(bytes: Uint8Array, limit: number) {
   const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
   const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) throw new Error("The archive expands beyond the supported size.");
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
 }
 
 function findEnd(view: DataView) {
@@ -165,7 +188,7 @@ export async function readZip(
     const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
     if (dataOffset + compressedSize > centralOffset) throw new Error("The ZIP entry data is truncated.");
     const compressed = bytes.subarray(dataOffset, dataOffset + compressedSize);
-    const contents = method === 0 ? compressed.slice() : await inflateRaw(compressed);
+    const contents = method === 0 ? compressed.slice() : await inflateRaw(compressed, uncompressedSize);
     if (contents.byteLength !== uncompressedSize || crc32(contents) !== checksum) {
       throw new Error("The ZIP entry failed its integrity check.");
     }

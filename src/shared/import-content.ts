@@ -92,7 +92,10 @@ function markdownInline(value: string, issues: ImportIssue[]) {
         issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
         output.push(...inline(label ?? ""));
       } else if (image) {
-        output.push(...inline(whole));
+        // Images are not inline nodes in this schema, so both branches degrade to the
+        // label; the issue keeps that downgrade visible in the import warnings.
+        issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
+        output.push(...inline(label ?? ""));
       } else {
         output.push(...inline(label ?? "", [{ type: "link", attrs: { href: url } }]));
       }
@@ -245,7 +248,9 @@ export function htmlToDocument(source: string) {
     marks.length = 0;
   };
   const flush = () => {
-    const compact = content.filter((node) => node.text !== "" && node.text !== undefined);
+    // Only empty text is dropped: a hardBreak carries no `text` at all, and testing
+    // for undefined here deleted every <br> along with any block holding just one.
+    const compact = content.filter((node) => node.text !== "");
     if (!compact.length) {
       resetBlock();
       return;

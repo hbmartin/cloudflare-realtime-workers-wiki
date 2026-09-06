@@ -422,7 +422,7 @@ async function pruneExpiredPageMoveReceipts(database: D1Database, timestamp = no
     .bind(expiredBefore)
     .first();
   if (!remaining) return;
-  console.warn("Page move receipt pruning reached its hourly catch-up limit; expired receipts may remain.", {
+  console.warn("Page move receipt pruning reached its catch-up limit; expired receipts may remain.", {
     batchSize: PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
     maxBatches: PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
   });

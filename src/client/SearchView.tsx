@@ -15,9 +15,13 @@ type UiFilters = {
   archive: SearchArchiveState;
 };
 
+// The date input speaks local calendar days, so both directions have to. Reading the
+// timestamp back through UTC shifted the day either side of the meridian.
 function dateFromTimestamp(value: string | null) {
   if (!value || !/^\d+$/.test(value)) return "";
-  return new Date(Number(value)).toISOString().slice(0, 10);
+  const date = new Date(Number(value));
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
 function initialSearchState() {

@@ -30,6 +30,26 @@ function normalizeText(text: string) {
   return text.replace(/\s+/g, " ").trim();
 }
 
+// CommonMark inline punctuation that would otherwise turn imported literals into
+// markup. `_` is deliberately absent: CommonMark does not emphasise intraword `_`,
+// so escaping it would mangle every snake_case identifier.
+function escapeMarkdownInline(value: string) {
+  return value.replaceAll(/[\\`*[\]<>|]/g, (character) => `\\${character}`);
+}
+
+// Block-level constructs are only meaningful at the start of a line.
+function escapeMarkdownText(value: string) {
+  return escapeMarkdownInline(value).replace(
+    /(^|\n)([ \t]*)(#{1,6}(?=\s|$)|>|[-+](?=\s|$)|\d{1,9}[.)](?=\s|$)|={2,}$|-{2,}$)/g,
+    (_match, lineStart: string, indent: string, token: string) => `${lineStart}${indent}\\${token}`,
+  );
+}
+
+// Markdown link and image destinations break on whitespace and unbalanced parens.
+function markdownDestination(value: string) {
+  return /[\s()<>]/.test(value) ? `<${value.replaceAll(/[<>]/g, encodeURIComponent)}>` : value;
+}
+
 function escapeHtml(value: string) {
   return value
     .replaceAll("&", "&amp;")
@@ -50,7 +70,10 @@ function safeUrl(value: unknown) {
 }
 
 function markedText(node: ProseMirrorJson, format: "markdown" | "html") {
-  let value = format === "html" ? escapeHtml(node.text ?? "") : (node.text ?? "");
+  const text = node.text ?? "";
+  // A code span is verbatim in Markdown, so backslash escapes would be literal there.
+  const code = (node.marks ?? []).some((mark) => mark.type === "code");
+  let value = format === "html" ? escapeHtml(text) : code ? text : escapeMarkdownText(text);
   for (const mark of node.marks ?? []) {
     if (mark.type === "bold" || mark.type === "strong")
       value = format === "html" ? `<strong>${value}</strong>` : `**${value}**`;
@@ -62,7 +85,9 @@ function markedText(node: ProseMirrorJson, format: "markdown" | "html") {
       const href = safeUrl(mark.attrs?.href);
       if (href)
         value =
-          format === "html" ? `<a href="${escapeHtml(href)}" rel="noreferrer">${value}</a>` : `[${value}](${href})`;
+          format === "html"
+            ? `<a href="${escapeHtml(href)}" rel="noreferrer">${value}</a>`
+            : `[${value}](${markdownDestination(href)})`;
     }
   }
   return value;
@@ -74,13 +99,17 @@ function nodeText(node: ProseMirrorJson): string {
   return (node.content ?? []).map(nodeText).join("");
 }
 
+const LIST_ITEM_TYPES = new Set(["bulletListItem", "numberedListItem", "checkListItem", "listItem"]);
+// A list item's own line stops here; these carry its nested structure instead.
+const NESTED_BLOCK_TYPES = new Set(["bulletList", "numberedList", "blockGroup"]);
+
 function serializeInline(node: ProseMirrorJson, format: "markdown" | "html"): string {
   if (typeof node.text === "string") return markedText(node, format);
   if (node.type === "mention") {
     const label = stringAttr(node, "label") ?? "Mention";
     const id = stringAttr(node, "entityId");
     if (format === "html") return `<span data-mention-id="${escapeHtml(id ?? "")}">${escapeHtml(label)}</span>`;
-    return `@${label}`;
+    return `@${escapeMarkdownInline(label)}`;
   }
   if (node.type === "hardBreak") return format === "html" ? "<br>" : "  \n";
   if (node.type === "inlineMath") {
@@ -92,6 +121,51 @@ function serializeInline(node: ProseMirrorJson, format: "markdown" | "html"): st
   return (node.content ?? []).map((child) => serializeInline(child, format)).join("");
 }
 
+// BlockNote keeps list items as plain siblings with no list node around them, so
+// HTML needs the `ul`/`ol` wrapper synthesised from runs of adjacent items.
+function listTagFor(node: ProseMirrorJson): "ul" | "ol" | null {
+  const type = node.type ?? "";
+  if (type === "numberedListItem") return "ol";
+  if (LIST_ITEM_TYPES.has(type)) return "ul";
+  if (type !== "blockContainer") return null;
+  for (const child of node.content ?? []) {
+    const childType = child.type ?? "";
+    if (childType === "numberedListItem") return "ol";
+    if (LIST_ITEM_TYPES.has(childType)) return "ul";
+  }
+  return null;
+}
+
+function serializeSequence(children: ProseMirrorJson[], format: "markdown" | "html", depth: number) {
+  if (format !== "html") return children.map((child) => serializeNode(child, format, depth)).join("");
+  let output = "";
+  for (let index = 0; index < children.length;) {
+    const tag = listTagFor(children[index]!);
+    if (!tag) {
+      output += serializeNode(children[index]!, format, depth);
+      index += 1;
+      continue;
+    }
+    let end = index;
+    while (end < children.length && listTagFor(children[end]!) === tag) end += 1;
+    const items = children.slice(index, end).map((child) => serializeNode(child, format, depth));
+    output += `<${tag}>${items.join("")}</${tag}>`;
+    index = end;
+  }
+  return output;
+}
+
+// A cell's text is inlined into one pipe-delimited line, so newlines are collapsed
+// and every literal pipe is escaped or it would open a new column.
+function markdownTableCell(node: ProseMirrorJson) {
+  const rendered = (node.content ?? []).map((child) => serializeInline(child, "markdown")).join("");
+  return normalizeText(rendered || escapeMarkdownInline(nodeText(node)));
+}
+
+function markdownTableRow(row: ProseMirrorJson) {
+  return `| ${(row.content ?? []).map((cell) => markdownTableCell(cell)).join(" | ")} |\n`;
+}
+
 function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth = 0): string {
   const children = node.content ?? [];
   const inline = children.map((child) => serializeInline(child, format)).join("");
@@ -99,7 +173,17 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
   const transparentChildren = () => children.map((child) => serializeNode(child, format, depth)).join("");
   const type = node.type ?? "unknown";
 
-  if (type === "doc" || type === "blockGroup" || type === "blockContainer") return transparentChildren();
+  if (type === "blockContainer") {
+    // BlockNote stores a list item and its children as siblings; fold the children
+    // back into the item so nesting survives in both formats.
+    const item = children.find((child) => LIST_ITEM_TYPES.has(child.type ?? ""));
+    const groups = children.filter((child) => child.type === "blockGroup");
+    if (item && groups.length) {
+      return serializeNode({ ...item, content: [...(item.content ?? []), ...groups] }, format, depth);
+    }
+    return transparentChildren();
+  }
+  if (type === "doc" || type === "blockGroup") return serializeSequence(children, format, depth);
   if (type === "text" || type === "mention" || type === "inlineMath") return serializeInline(node, format);
   if (type === "paragraph") return format === "html" ? `<p>${inline}</p>` : `${inline}\n\n`;
   if (type === "heading" || /^heading[1-6]$/.test(type)) {
@@ -107,7 +191,7 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
     return format === "html" ? `<h${level}>${inline}</h${level}>` : `${"#".repeat(level)} ${inline}\n\n`;
   }
   if (type === "blockquote" || type === "quote") {
-    const text = nodeText(node).trim();
+    const text = escapeMarkdownText(nodeText(node).trim());
     return format === "html"
       ? `<blockquote>${blockChildren() || escapeHtml(text)}</blockquote>`
       : `${text
@@ -115,22 +199,21 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
           .map((line) => `> ${line}`)
           .join("\n")}\n\n`;
   }
-  if (
-    type === "bulletList" ||
-    type === "bulletListItem" ||
-    type === "numberedList" ||
-    type === "numberedListItem" ||
-    type === "checkListItem"
-  ) {
+  if (type === "bulletList" || type === "numberedList" || LIST_ITEM_TYPES.has(type)) {
     if (type.endsWith("List")) {
       const tag = type === "bulletList" ? "ul" : "ol";
-      return format === "html" ? `<${tag}>${blockChildren()}</${tag}>` : blockChildren();
+      // Items own their own indentation, so the container keeps the current depth.
+      return format === "html" ? `<${tag}>${transparentChildren()}</${tag}>` : transparentChildren();
     }
+    // Paragraph content belongs on the item's own line; child lists nest below it.
+    const nested = children.filter((child) => NESTED_BLOCK_TYPES.has(child.type ?? ""));
+    const own = children.filter((child) => !NESTED_BLOCK_TYPES.has(child.type ?? ""));
+    const label = own.map((child) => serializeInline(child, format)).join("");
+    const nestedOutput = nested.map((child) => serializeNode(child, format, depth + 1)).join("");
+    if (format === "html") return `<li>${label}${nestedOutput}</li>`;
     const marker =
       type === "numberedListItem" ? "1." : type === "checkListItem" ? `- [${node.attrs?.checked ? "x" : " "}]` : "-";
-    return format === "html"
-      ? `<li>${inline || blockChildren()}</li>`
-      : `${"  ".repeat(depth)}${marker} ${nodeText(node).trim()}\n`;
+    return `${"  ".repeat(depth)}${marker} ${label.trim()}\n${nestedOutput}`;
   }
   if (type === "codeBlock" || type === "code") {
     const language = stringAttr(node, "language") ?? "";
@@ -143,7 +226,11 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
   if (["image", "audio", "video", "file"].includes(type)) {
     const url = safeUrl(node.attrs?.url) ?? "";
     const caption = stringAttr(node, "caption") ?? type;
-    if (format === "markdown") return type === "image" ? `![${caption}](${url})\n\n` : `[${caption}](${url})\n\n`;
+    if (format === "markdown") {
+      const label = escapeMarkdownInline(caption);
+      const target = markdownDestination(url);
+      return type === "image" ? `![${label}](${target})\n\n` : `[${label}](${target})\n\n`;
+    }
     if (type === "image")
       return `<figure><img src="${escapeHtml(url)}" alt="${escapeHtml(caption)}"><figcaption>${escapeHtml(caption)}</figcaption></figure>`;
     return `<p><a href="${escapeHtml(url)}">${escapeHtml(caption)}</a></p>`;
@@ -153,7 +240,7 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
     const icon = stringAttr(node, "icon") ?? "ℹ";
     return format === "html"
       ? `<aside class="callout callout-${escapeHtml(tone)}"><span>${escapeHtml(icon)}</span>${blockChildren() || `<p>${inline}</p>`}</aside>`
-      : `> ${icon} ${nodeText(node).trim().replaceAll("\n", "\n> ")}\n\n`;
+      : `> ${icon} ${escapeMarkdownText(nodeText(node).trim()).replaceAll("\n", "\n> ")}\n\n`;
   }
   if (type === "math") {
     const formula = stringAttr(node, "formula") ?? nodeText(node);
@@ -175,21 +262,29 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
     const title = stringAttr(node, "title") ?? url;
     return format === "html"
       ? `<p class="bookmark"><a href="${escapeHtml(url)}" rel="noreferrer">${escapeHtml(title)}</a></p>`
-      : `[${title}](${url})\n\n`;
+      : `[${escapeMarkdownInline(title)}](${markdownDestination(url)})\n\n`;
   }
   if (type === "table" || type === "tableRow" || type === "tableCell" || type === "tableHeader") {
     if (format === "html") {
       const tag = type === "table" ? "table" : type === "tableRow" ? "tr" : type === "tableHeader" ? "th" : "td";
       return `<${tag}>${blockChildren() || inline}</${tag}>`;
     }
-    if (type === "tableRow") return `| ${children.map((child) => nodeText(child).trim()).join(" | ")} |\n`;
-    return blockChildren();
+    if (type === "tableRow") return markdownTableRow(node);
+    if (type !== "table") return blockChildren();
+    const rows = children.filter((child) => child.type === "tableRow");
+    const header = rows[0]?.content ?? [];
+    // Without a separator row no Markdown reader renders these lines as a table,
+    // and its width has to come from the header rather than any individual row.
+    const headed = header.length > 0 && header.every((cell) => cell.type === "tableHeader");
+    const lines = rows.map((row) => markdownTableRow(row));
+    if (headed) lines.splice(1, 0, `| ${header.map(() => "---").join(" | ")} |\n`);
+    return `${lines.join("")}\n`;
   }
 
   const fallback = blockChildren() || inline || escapeHtml(nodeText(node));
   return format === "html"
     ? `<div data-unsupported-node="${escapeHtml(type)}">${fallback}</div>`
-    : `${nodeText(node).trim()}\n\n`;
+    : `${escapeMarkdownText(nodeText(node).trim())}\n\n`;
 }
 
 function excerptAround(text: string, offset: number) {

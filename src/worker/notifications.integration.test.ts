@@ -262,6 +262,26 @@ describe("notification feed and subscriptions", () => {
         (preference) => preference.eventType === "page_edit",
       ),
     ).toMatchObject({ inApp: false, email: "off", timezone: "Asia/Kathmandu" });
+
+    const reject = async (preference: Record<string, unknown>) => {
+      const rejected = await SELF.fetch(
+        request(installed.cookie, "/api/notification-preferences", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ preference }),
+        }),
+      );
+      expect(rejected.status).toBe(422);
+      return (await rejected.json<{ error?: { code?: string } }>()).error?.code ?? "";
+    };
+    const valid = { eventType: "page_edit", inApp: false, email: "off", slack: "off", timezone: "UTC" };
+    expect(await reject({ ...valid, eventType: "page_renamed" })).toBe("invalid_notification_event");
+    expect(await reject({ ...valid, email: "hourly" })).toBe("invalid_notification_channel");
+    expect(await reject({ ...valid, slack: "hourly" })).toBe("invalid_notification_channel");
+    expect(await reject({ ...valid, timezone: "Mars/Olympus" })).toBe("invalid_timezone");
+    // The route caps the field at 100 characters, so setNotificationPreference's own
+    // length guard is only reachable by a direct call; over the wire this is invalid_input.
+    expect(await reject({ ...valid, timezone: "U".repeat(101) })).toBe("invalid_input");
   });
 
   it("sends immediate email once and rechecks access at delivery time", async () => {

@@ -1,6 +1,7 @@
 import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Page, SearchResponse, SearchTitleSuggestion, Space, Tag } from "../shared/types";
+import { refreshPageSearchV2Statements } from "./search-index";
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -157,6 +158,15 @@ describe("search v2", () => {
       await SELF.fetch(request(installed.cookie, "/api/search?q=Orchid&archive=archived"))
     ).json<SearchResponse>();
     expect(archivedOnly.results.map((result) => result.page.id)).toEqual([archived.id]);
+
+    // Archiving leaves the index row untouched, so the assertion above passes even when
+    // the refresh drops archived pages. A compaction lands after the archive commits
+    // whenever the page had unsaved edits, and that is what used to empty this filter.
+    await env.DB.batch(refreshPageSearchV2Statements(env.DB, archived.id));
+    const afterReindex = await (
+      await SELF.fetch(request(installed.cookie, "/api/search?q=Orchid&archive=archived"))
+    ).json<SearchResponse>();
+    expect(afterReindex.results.map((result) => result.page.id)).toEqual([archived.id]);
 
     const ownerTitles = await (
       await SELF.fetch(request(installed.cookie, "/api/search/titles?q=Orchid"))

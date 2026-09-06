@@ -151,4 +151,64 @@ describe("structured document projection", () => {
     expect(serialized.html).toContain("<h2>First</h2><p>Second</p>");
     expect(serialized.html).not.toContain("data-unsupported-node");
   });
+  it("keeps nested lists and header separators out of flattened text", () => {
+    const serialized = serializeDocument({
+      type: "doc",
+      content: [
+        {
+          type: "bulletList",
+          content: [
+            {
+              type: "bulletListItem",
+              content: [
+                { type: "text", text: "Parent" },
+                {
+                  type: "bulletList",
+                  content: [{ type: "bulletListItem", content: [{ type: "text", text: "Child" }] }],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          type: "table",
+          content: [
+            {
+              type: "tableRow",
+              content: [
+                { type: "tableHeader", content: [{ type: "text", text: "Name" }] },
+                { type: "tableHeader", content: [{ type: "text", text: "Role" }] },
+              ],
+            },
+            {
+              type: "tableRow",
+              content: [
+                { type: "tableCell", content: [{ type: "text", text: "Ada" }] },
+                { type: "tableCell", content: [{ type: "text", text: "Eng | Lead" }] },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(serialized.markdown).toContain("- Parent\n  - Child\n");
+    expect(serialized.html).toContain("<ul><li>Parent<ul><li>Child</li></ul></li></ul>");
+    expect(serialized.markdown).toContain("| Name | Role |\n| --- | --- |\n| Ada | Eng \\| Lead |\n");
+  });
+
+  it("keeps Markdown literals literal without escaping code spans", () => {
+    const serialized = serializeDocument({
+      type: "doc",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "# Not a heading and **not bold** and snake_case" }] },
+        { type: "paragraph", content: [{ type: "text", text: "a*b", marks: [{ type: "code" }] }] },
+        { type: "paragraph", content: [{ type: "text", text: "really bold", marks: [{ type: "bold" }] }] },
+      ],
+    });
+
+    expect(serialized.markdown).toContain("\\# Not a heading and \\*\\*not bold\\*\\* and snake_case");
+    expect(serialized.markdown).toContain("`a*b`");
+    expect(serialized.markdown).toContain("**really bold**");
+  });
 });

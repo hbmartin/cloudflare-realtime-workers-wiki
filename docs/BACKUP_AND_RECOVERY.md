@@ -132,7 +132,7 @@ Permanent deletion removes page metadata and commits a D1 cleanup job before ret
 document epoch Durable Object has its alarm canceled and is purged with `storage.deleteAll()` before the
 job deletes exact attachment keys and complete `documents/{pageId}/` prefixes.
 
-Inspect `deletion_jobs` and unfinished `deletion_targets`; the hourly cron retries them idempotently
+Inspect `deletion_jobs` and unfinished `deletion_targets`; the cron retries them idempotently
 with backoff capped at 16 hours. Because only 10 jobs drain per tick and the first retry is a full hour
 out, a job that looks stuck may simply be waiting — check `next_attempt_at` before intervening.
 
@@ -143,7 +143,7 @@ records to seed targeted cleanup.
 ### Archived editors remain connected
 
 Archiving commits page metadata and an `archive_disconnect_targets` row before contacting each document
-room. The page disappears from clients immediately; the hourly cron retries any room that could not be
+room. The page disappears from clients immediately; the cron retries any room that could not be
 closed. Inspect `archive_disconnect_targets.last_error` and allow the retry to finish, or restore the
 page to cancel its pending target.
 

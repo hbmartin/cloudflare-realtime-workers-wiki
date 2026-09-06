@@ -15,6 +15,7 @@ import { readZip, type ZipEntry } from "../shared/zip";
 import { isUnsafeMime } from "./attachments";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
+import { deleteR2Prefix } from "./r2";
 import { normalizeFilename } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { refreshPageSearchV2ForIdsStatements } from "./search-index";
@@ -138,7 +139,9 @@ async function nestedEntries(
   budget.bytes += entries.reduce((total, entry) => total + entry.bytes.byteLength, 0);
   for (const entry of entries) {
     if (extension(entry.path) === ".zip" && /^Part-\d+\.zip$/i.test(entry.path.split("/").at(-1) ?? "")) {
-      await nestedEntries(entry.bytes, depth + 1, prefix, budget, output);
+      // Each Part-N.zip repeats the same inner layout, so without a per-archive prefix
+      // their entries collide in `byPath` and pages hydrate another part's assets.
+      await nestedEntries(entry.bytes, depth + 1, `${prefix}${entry.path}/`, budget, output);
       continue;
     }
     output.push({ path: `${prefix}${entry.path}`, bytes: entry.bytes });
@@ -242,9 +245,13 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   const byPath = new Map(entries.map((entry) => [entry.path, entry]));
   const pageEntries = entries.filter((entry) => {
     const ext = extension(entry.path);
+    const parent = parentPath(entry.path);
+    // Nested Part-N.zip entries are prefixed by their archive, so "root" means the top
+    // level of whichever archive the entry came out of.
+    const atArchiveRoot = parent === "" || /\.zip$/i.test(parent);
     return (
       [".html", ".htm", ".md", ".markdown"].includes(ext) &&
-      !(parentPath(entry.path) === "" && /^index\.html?$/i.test(entry.path))
+      !(atArchiveRoot && /^index\.html?$/i.test(entry.path.split("/").at(-1) ?? ""))
     );
   });
   // Notion writes both a view CSV and an `_all` CSV per database; the latter ignores view filters.
@@ -673,11 +680,17 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
     .all<PageJsonRow>();
   if (published.results.length !== bundle.pages.length)
     throw new Error("The imported pages could not be published atomically.");
-  await broadcastWorkspaceEvent(env, job.workspace_id, {
-    type: "pages-upserted",
-    pages: published.results.map(pageJson),
-  });
-  await broadcastWorkspaceEvent(env, job.workspace_id, { type: "jobs-invalidated" });
+  // The pages are published and the job is already marked succeeded, so a broadcast
+  // failure must not throw the step back to the workflow for a retry.
+  const broadcast = async (event: Parameters<typeof broadcastWorkspaceEvent>[2]) => {
+    try {
+      await broadcastWorkspaceEvent(env, job.workspace_id, event);
+    } catch (error) {
+      console.error("Failed to broadcast a published import", { jobId: job.id, type: event.type, error });
+    }
+  };
+  await broadcast({ type: "pages-upserted", pages: published.results.map(pageJson) });
+  await broadcast({ type: "jobs-invalidated" });
 }
 
 export async function cleanupImport(env: Env, job: JobRow) {
@@ -701,20 +714,8 @@ export async function cleanupImport(env: Env, job: JobRow) {
   }
   await env.DB.prepare(`DELETE FROM pages WHERE import_job_id = ?`).bind(job.id).run();
   if (attachments.results.length) await env.BUCKET.delete(attachments.results.map((attachment) => attachment.r2_key));
-  for (const page of pages.results) {
-    let cursor: string | undefined;
-    do {
-      const objects = await env.BUCKET.list({ prefix: `documents/${page.id}/`, ...(cursor ? { cursor } : {}) });
-      if (objects.objects.length) await env.BUCKET.delete(objects.objects.map((object) => object.key));
-      cursor = objects.truncated ? objects.cursor : undefined;
-    } while (cursor);
-  }
-  let cursor: string | undefined;
-  do {
-    const objects = await env.BUCKET.list({ prefix: `jobs/${job.id}/documents/`, ...(cursor ? { cursor } : {}) });
-    if (objects.objects.length) await env.BUCKET.delete(objects.objects.map((object) => object.key));
-    cursor = objects.truncated ? objects.cursor : undefined;
-  } while (cursor);
+  for (const page of pages.results) await deleteR2Prefix(env.BUCKET, `documents/${page.id}/`);
+  await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/documents/`);
 }
 
 export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {

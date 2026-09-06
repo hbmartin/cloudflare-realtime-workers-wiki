@@ -781,7 +781,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [favorites, setFavorites] = useState<Page[]>([]);
   const [pins, setPins] = useState<Page[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
-  const [pageTags, setPageTags] = useState<Tag[]>([]);
+  const [pageTags, setPageTags] = useState<{ pageId: string; tags: Tag[] }>({ pageId: "", tags: [] });
   const [templates, setTemplates] = useState<Page[]>([]);
   const [pendingTemplateId, setPendingTemplateId] = useState<string | null>(null);
   const [organizationLoading, setOrganizationLoading] = useState(true);
@@ -795,6 +795,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const notificationTriggerRef = useRef<HTMLButtonElement>(null);
   const restoreSidebarTriggerFocus = useRef(false);
   const restoreActivityTriggerFocus = useRef(false);
+  const restoreNotificationTriggerFocus = useRef(false);
   const pendingPageEvents = useRef(new PageLoadEventBuffer());
   const [archiveRemovalTombstones] = useState(() => new PageRemovalTombstones());
   // Archived-tree reads may lag a confirmed restore. Keep the newest restored
@@ -829,6 +830,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
   const pageTreeErrorRevisionRef = useRef(0);
   const organizationLoadGenerationRef = useRef(0);
+  const pageTagsLoadGenerationRef = useRef(0);
+  const selectedSpaceIdRef = useRef<string | null>(null);
   const abortWorkspaceRequests = useCallback(() => {
     const activePageLoad = pageLoadRequest.current;
     if (activePageLoad) {
@@ -1409,6 +1412,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     }
   }, []);
   const selectedSpaceId = pages.find((page) => page.id === selectedId)?.spaceId ?? null;
+  useEffect(() => {
+    selectedSpaceIdRef.current = selectedSpaceId;
+  }, [selectedSpaceId]);
+  // Keyed on the selection rather than folded into loadOrganization: the selection
+  // changes on every page click, and only the page's own tags depend on it.
+  const [organizationRevision, setOrganizationRevision] = useState(0);
   const loadOrganization = useCallback(async () => {
     const generation = ++organizationLoadGenerationRef.current;
     const attempt = startWorkspaceErrorAttempt({ source: "organization" });
@@ -1424,28 +1433,25 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setFavorites(favoriteData.pages);
       setTags(tagData.tags);
       setTemplates(templateData.templates);
+      const selectedSpace = selectedSpaceIdRef.current;
       const resolvedSpaceId = spaceData.spaces.some((space) => space.id === activeSpaceId)
         ? activeSpaceId
-        : spaceData.spaces.some((space) => space.id === selectedSpaceId)
-          ? selectedSpaceId!
+        : selectedSpace && spaceData.spaces.some((space) => space.id === selectedSpace)
+          ? selectedSpace
           : (spaceData.spaces[0]?.id ?? "");
       if (resolvedSpaceId !== activeSpaceId) {
         setActiveSpaceId(resolvedSpaceId);
         if (resolvedSpaceId) localStorage.setItem(`notes:active-space:${member.workspace.id}`, resolvedSpaceId);
       }
-      const [pinResult, pageTagResult] = await Promise.allSettled([
+      const [pinResult] = await Promise.allSettled([
         resolvedSpaceId
           ? api<{ pages: Page[] }>(`/api/spaces/${encodeURIComponent(resolvedSpaceId)}/pins`)
           : Promise.resolve({ pages: [] }),
-        selectedId
-          ? api<{ tags: Tag[] }>(`/api/pages/${encodeURIComponent(selectedId)}/tags`)
-          : Promise.resolve({ tags: [] }),
       ]);
       if (generation !== organizationLoadGenerationRef.current) return;
       if (pinResult.status === "fulfilled") setPins(pinResult.value.pages);
-      if (pageTagResult.status === "fulfilled") setPageTags(pageTagResult.value.tags);
-      const rejected = [pinResult, pageTagResult].find((result) => result.status === "rejected");
-      if (rejected?.status === "rejected") throw rejected.reason;
+      if (pinResult.status === "rejected") throw pinResult.reason;
+      setOrganizationRevision((current) => current + 1);
       setOrganizationLoadError("");
       clearWorkspaceErrors(attempt);
     } catch (error) {
@@ -1459,14 +1465,24 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     clearWorkspaceErrors,
     finishWorkspaceErrorAttempt,
     member.workspace.id,
-    selectedId,
-    selectedSpaceId,
     startWorkspaceErrorAttempt,
   ]);
   useEffect(() => {
     const timer = window.setTimeout(() => void loadOrganization(), 0);
     return () => window.clearTimeout(timer);
   }, [loadOrganization]);
+  useEffect(() => {
+    const generation = ++pageTagsLoadGenerationRef.current;
+    if (!selectedId) return;
+    void api<{ tags: Tag[] }>(`/api/pages/${encodeURIComponent(selectedId)}/tags`)
+      .then((data) => {
+        if (generation === pageTagsLoadGenerationRef.current) setPageTags({ pageId: selectedId, tags: data.tags });
+      })
+      .catch((error: unknown) => {
+        if (generation !== pageTagsLoadGenerationRef.current) return;
+        setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
+      });
+  }, [organizationRevision, selectedId]);
 
   // The shell only renders a selection inside the active space, so a deep link or a fallback selection
   // that lands in another space switches the space instead of showing an empty workspace.
@@ -1552,11 +1568,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       await api(`/api/pages/${encodeURIComponent(page.id)}/tags/${encodeURIComponent(tag.id)}`, {
         method: assigned ? "PUT" : "DELETE",
       });
-      setPageTags((current) =>
-        assigned
-          ? [...current.filter((candidate) => candidate.id !== tag.id), tag]
-          : current.filter((item) => item.id !== tag.id),
-      );
+      setPageTags((current) => ({
+        pageId: page.id,
+        tags:
+          current.pageId === page.id
+            ? assigned
+              ? [...current.tags.filter((candidate) => candidate.id !== tag.id), tag]
+              : current.tags.filter((item) => item.id !== tag.id)
+            : assigned
+              ? [tag]
+              : [],
+      }));
       setTags((current) =>
         current.map((candidate) =>
           candidate.id === tag.id
@@ -1583,7 +1605,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       });
       const assignedTag = { ...data.tag, pageCount: 1 };
       setTags((current) => [...current.filter((tag) => tag.id !== assignedTag.id), assignedTag]);
-      setPageTags((current) => [...current.filter((tag) => tag.id !== assignedTag.id), assignedTag]);
+      setPageTags((current) => ({
+        pageId: page.id,
+        tags:
+          current.pageId === page.id
+            ? [...current.tags.filter((tag) => tag.id !== assignedTag.id), assignedTag]
+            : [assignedTag],
+      }));
       clearWorkspaceErrors({ source: "organization" });
       return true;
     } catch (error) {
@@ -1760,6 +1788,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     return () => bundle.destroy();
   }, [loadPages, loadUnreadMentions, loadUnreadNotifications, member.workspace.id, reportWorkspaceError]);
 
+  const closeNotifications = useCallback(() => {
+    restoreNotificationTriggerFocus.current = true;
+    setNotificationsOpen(false);
+  }, []);
+  useEffect(() => {
+    if (notificationsOpen || !restoreNotificationTriggerFocus.current) return;
+    restoreNotificationTriggerFocus.current = false;
+    notificationTriggerRef.current?.focus();
+  }, [notificationsOpen]);
   const closeActivities = useCallback(() => {
     restoreActivityTriggerFocus.current = true;
     setActivitiesOpen(false);
@@ -1776,6 +1813,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     void loadJobs();
   }, [loadJobs]);
   const openNotifications = useCallback(() => {
+    restoreNotificationTriggerFocus.current = false;
     setActivitiesOpen(false);
     setNotificationsOpen(true);
     setNotificationsRevision((current) => current + 1);
@@ -1831,7 +1869,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const resolvedSelectedId = pendingSelectionId ? null : pagesLoaded ? (activeSelected?.id ?? null) : selectedId;
   const canEditActiveSpace = (activeSpace?.effectiveRole ?? member.role) !== "viewer";
   const canCreatePage = canEditActiveSpace && pagesLoaded && pendingSelectionId === null && Boolean(currentSpaceId);
-  const activeMember = activeSpace ? { ...member, role: activeSpace.effectiveRole } : member;
+  const activeMember = useMemo(
+    () => (activeSpace ? { ...member, role: activeSpace.effectiveRole } : member),
+    [activeSpace, member],
+  );
   useEffect(() => {
     if (resolvedSelectedId) localStorage.setItem("notes:last-page", resolvedSelectedId);
   }, [resolvedSelectedId]);
@@ -2520,7 +2561,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               disabled={organizationLoading || spaces.length === 0}
               onChange={(event) => selectSpace(event.target.value)}
             >
-              {spaces.length === 0 && currentSpaceId && <option value={currentSpaceId}>General</option>}
+              {spaces.length === 0 && currentSpaceId && (
+                <option value={currentSpaceId}>{organizationLoading ? "Loading spaces…" : "Unknown space"}</option>
+              )}
               {spaces.map((space) => (
                 <option key={space.id} value={space.id}>
                   {space.visibility === "private" ? "Private · " : ""}
@@ -2766,7 +2809,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
         {view === "pages" && activeSelected && (
           <PageTags
-            assigned={pageTags}
+            assigned={pageTags.pageId === activeSelected.id ? pageTags.tags : []}
             available={tags}
             editable={canEditActiveSpace}
             busy={pendingOrganizationAction?.startsWith("tag:") ?? false}
@@ -2871,7 +2914,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       {notificationsOpen && (
         <NotificationsPanel
           revision={notificationsRevision}
-          onClose={() => setNotificationsOpen(false)}
+          onClose={closeNotifications}
           onSelectPage={navigateToPage}
           onUnreadCountChange={setUnreadNotifications}
         />

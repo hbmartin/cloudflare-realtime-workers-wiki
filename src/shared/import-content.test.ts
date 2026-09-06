@@ -66,4 +66,12 @@ describe("import content", () => {
       ],
     });
   });
+  it("keeps line breaks and the blocks that hold them", () => {
+    const inline = htmlToDocument("<p>alpha<br>beta</p>");
+    const blocks = inline.document.content[0]!.content!.map((container) => container.content![0]!);
+    expect(blocks[0]!.content!.map((node) => node.type ?? "text")).toEqual(["text", "hardBreak", "text"]);
+
+    const breakOnly = htmlToDocument("<p><br></p>");
+    expect(breakOnly.document.content[0]!.content).toHaveLength(1);
+  });
 });

@@ -252,8 +252,8 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
         filename = `${fileStem(page.title)}.${options.format === "markdown" ? "md" : "html"}`;
       }
     }
-    if (!bytes.byteLength || bytes.byteLength > EXPORT_MAX_BYTES)
-      throw new Error("The export exceeds the 64 MiB limit.");
+    if (!bytes.byteLength) throw new Error("The export produced an empty file.");
+    if (bytes.byteLength > EXPORT_MAX_BYTES) throw new Error("The export exceeds the 64 MiB limit.");
     const outputKey = `jobs/${job.id}/output/${encodeURIComponent(filename)}`;
     await env.BUCKET.put(outputKey, bytes, {
       httpMetadata: { contentType },

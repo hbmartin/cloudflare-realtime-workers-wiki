@@ -19,8 +19,14 @@ export function ImportDialog({
   const [error, setError] = useState("");
   const closeButton = useRef<HTMLButtonElement>(null);
 
+  // `onClose` is a new closure on every parent render and `busy` flips on submit, so
+  // pairing the initial focus with the Escape listener yanked focus out of whatever
+  // field the user was in each time either changed.
   useEffect(() => {
     closeButton.current?.focus();
+  }, []);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onClose();
     };

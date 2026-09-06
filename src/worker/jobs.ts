@@ -8,6 +8,7 @@ import { migrateLegacyComments, type CommentPage } from "./comments";
 import { HttpError } from "./http";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
+import { deleteR2Prefix } from "./r2";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { runExport } from "./exporter";
@@ -16,6 +17,11 @@ import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
 
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
+// A row that keeps failing must fall out of the sweep window rather than hold the
+// oldest `created_at` slot forever and crowd out every newer delivery.
+const OUTBOX_MAX_ATTEMPTS = 10;
+const OUTBOX_RETRY_BASE_MS = 10_000;
+const OUTBOX_RETRY_MAX_MS = 60 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 
 export type JobWorkflowParams = { jobId: string };
@@ -416,15 +422,6 @@ async function publishTemplateClone(env: Env, job: JobRow, options: TemplateClon
   }
 }
 
-async function deleteR2Prefix(bucket: R2Bucket, prefix: string) {
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ prefix, ...(cursor ? { cursor } : {}) });
-    if (page.objects.length) await bucket.delete(page.objects.map((object) => object.key));
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-}
-
 export async function cleanupTemplateClone(env: Env, job: JobRow) {
   const options = templateCloneOptions(job);
   const staged = await env.DB.prepare(`SELECT id, kind, content_epoch FROM pages WHERE id = ? AND import_job_id = ?`)
@@ -641,7 +638,7 @@ async function assertJobActive(env: Env, jobId: string) {
 async function reindexPageBatch(env: Env, workspaceId: string, afterId: string) {
   const pages = await env.DB.prepare(
     `SELECT id FROM pages WHERE workspace_id = ?
-      AND archived_at IS NULL AND import_job_id IS NULL AND is_template = 0 AND id > ? ORDER BY id LIMIT ?`,
+      AND import_job_id IS NULL AND is_template = 0 AND id > ? ORDER BY id LIMIT ?`,
   )
     .bind(workspaceId, afterId, REINDEX_BATCH_SIZE)
     .all<{ id: string }>();
@@ -850,8 +847,18 @@ async function enqueueOutbox(env: Env, outboxId: string) {
       .bind(Date.now(), outboxId)
       .run();
   } catch (error) {
-    await env.DB.prepare(`UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?`)
-      .bind(error instanceof Error ? error.message.slice(0, 500) : "Queue enqueue failed.", outboxId)
+    await env.DB.prepare(
+      `UPDATE outbox SET attempts = attempts + 1, last_error = ?,
+         available_at = ? + MIN(?, ? * (1 << MIN(attempts, 8)))
+        WHERE id = ?`,
+    )
+      .bind(
+        error instanceof Error ? error.message.slice(0, 500) : "Queue enqueue failed.",
+        Date.now(),
+        OUTBOX_RETRY_MAX_MS,
+        OUTBOX_RETRY_BASE_MS,
+        outboxId,
+      )
       .run();
     throw error;
   }
@@ -859,9 +866,10 @@ async function enqueueOutbox(env: Env, outboxId: string) {
 
 export async function sweepOutbox(env: Env) {
   const rows = await env.DB.prepare(
-    `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ? ORDER BY created_at LIMIT ?`,
+    `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ? AND attempts < ?
+      ORDER BY created_at LIMIT ?`,
   )
-    .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
+    .bind(Date.now(), OUTBOX_MAX_ATTEMPTS, OUTBOX_SWEEP_BATCH_SIZE)
     .all<{ id: string }>();
   for (const row of rows.results) {
     try {
@@ -870,6 +878,13 @@ export async function sweepOutbox(env: Env) {
       console.error("Outbox enqueue failed", { outboxId: row.id, error });
     }
   }
+  const exhausted = await env.DB.prepare(
+    `SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL AND attempts >= ?`,
+  )
+    .bind(OUTBOX_MAX_ATTEMPTS)
+    .first<{ count: number }>();
+  // These rows are now invisible to the sweep, so say so rather than dropping them silently.
+  if (exhausted?.count) console.error("Outbox rows exhausted their attempts", { rows: exhausted.count });
 }
 
 export async function consumeDeliveryMessage(env: Env, message: Message<DeliveryQueueMessage>) {
@@ -886,17 +901,24 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
     return;
   }
   const payload = jsonRecord(row.payload_json);
+  // A payload that fails validation will never become valid, so record it and ack
+  // instead of retrying. An unknown topic still throws: a rolling deploy can leave an
+  // older consumer reading a topic a newer one writes, and that does resolve on retry.
+  const rejectPayload = async (reason: string) => {
+    await env.DB.prepare(`UPDATE outbox SET last_error = ? WHERE id = ?`).bind(reason, outboxId).run();
+    message.ack();
+  };
   if (row.topic === "notification") {
     const notificationId = payload.notificationId;
-    if (typeof notificationId !== "string") throw new Error("Notification outbox payload is invalid.");
+    if (typeof notificationId !== "string") return await rejectPayload("Notification outbox payload is invalid.");
     await deliverNotification(env, notificationId, outboxId);
   } else if (row.topic === "slack_channel") {
     const eventId = payload.eventId;
-    if (typeof eventId !== "string") throw new Error("Slack channel outbox payload is invalid.");
+    if (typeof eventId !== "string") return await rejectPayload("Slack channel outbox payload is invalid.");
     await deliverSlackChannelEvent(env, eventId);
   } else if (row.topic === "slack_unfurl") {
     const unfurlId = payload.unfurlId;
-    if (typeof unfurlId !== "string") throw new Error("Slack unfurl outbox payload is invalid.");
+    if (typeof unfurlId !== "string") return await rejectPayload("Slack unfurl outbox payload is invalid.");
     await deliverSlackUnfurl(env, unfurlId);
   } else throw new Error(`Unsupported outbox topic: ${row.topic}`);
   message.ack();

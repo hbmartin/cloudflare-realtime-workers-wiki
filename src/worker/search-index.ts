@@ -7,7 +7,9 @@ const SEARCH_PROJECTION = `SELECT p.id, p.workspace_id, p.space_id, p.title,
     COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
   FROM pages p`;
 
-const SEARCHABLE_PAGE = `p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0`;
+// Archived pages stay indexed: the archive-state search filter reads `pages.archived_at`
+// through the join, so removing them here would empty `archive=archived` results.
+const SEARCHABLE_PAGE = `p.import_job_id IS NULL AND p.is_template = 0`;
 
 export function refreshPageSearchV2Statements(database: D1Database, pageId: string, expectedContentEpoch?: number) {
   const epochGuard = expectedContentEpoch === undefined ? "" : ` AND p.content_epoch = ?`;
