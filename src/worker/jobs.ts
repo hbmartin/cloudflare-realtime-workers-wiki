@@ -17,14 +17,12 @@ import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
 
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
-// A row that keeps failing must fall out of the sweep window rather than hold the
-// oldest `created_at` slot forever and crowd out every newer delivery.
-const OUTBOX_MAX_ATTEMPTS = 10;
 const OUTBOX_RETRY_BASE_MS = 10_000;
 const OUTBOX_RETRY_MAX_MS = 60 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
+const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 
-export type JobWorkflowParams = { jobId: string };
+export type JobWorkflowParams = { jobId: string; attempt?: number };
 export type DeliveryQueueMessage = { outboxId: string };
 
 export type JobRow = {
@@ -44,6 +42,9 @@ export type JobRow = {
   result_json: string;
   error_code: string | null;
   error_message: string | null;
+  cleanup_token: string | null;
+  cleanup_started_at: number | null;
+  cleanup_target: "failed" | "canceled" | null;
   expires_at: number | null;
   attempt: number;
   created_at: number;
@@ -183,7 +184,7 @@ async function templateAttachmentId(jobId: string, sourceId: string) {
 }
 
 async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneOptions) {
-  await assertJobActive(env, job.id);
+  await assertJobActive(env, job);
   const existing = await env.DB.prepare(`SELECT * FROM pages WHERE id = ? AND workspace_id = ?`)
     .bind(options.targetPageId, job.workspace_id)
     .first<TemplateSourceRow>();
@@ -193,8 +194,11 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     if (existing.import_job_id !== job.id) throw new Error("The template target id is already in use.");
     if (existing.content_epoch !== job.attempt) {
       // A retry must not reuse the purged document room of the previous attempt.
-      await env.DB.prepare(`UPDATE pages SET content_epoch = ? WHERE id = ? AND import_job_id = ?`)
-        .bind(job.attempt, existing.id, job.id)
+      await env.DB.prepare(
+        `UPDATE pages SET content_epoch = ? WHERE id = ? AND import_job_id = ?
+          AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
+      )
+        .bind(job.attempt, existing.id, job.id, job.id, job.attempt)
         .run();
       existing.content_epoch = job.attempt;
     }
@@ -301,13 +305,13 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     .bind(options.targetPageId)
     .first<TemplateSourceRow>();
   if (!page) throw new Error("The staged template page was not created.");
-  await updateJob(env, job.id, { current: 1, total: 4, label: "Cloning content" });
+  await updateJob(env, job, { current: 1, total: 4, label: "Cloning content" });
   await notifyJobs(env, job.workspace_id);
   return { published: false, page };
 }
 
 async function cloneTemplateAttachments(env: Env, job: JobRow, options: TemplateCloneOptions) {
-  await assertJobActive(env, job.id);
+  await assertJobActive(env, job);
   const attachments = await env.DB.prepare(`SELECT * FROM attachments WHERE page_id = ? AND workspace_id = ?`)
     .bind(options.sourcePageId, job.workspace_id)
     .all<TemplateAttachmentRow>();
@@ -315,7 +319,7 @@ async function cloneTemplateAttachments(env: Env, job: JobRow, options: Template
   for (const attachment of attachments.results) {
     const targetId = await templateAttachmentId(job.id, attachment.id);
     ids.set(attachment.id, targetId);
-    const key = `assets/${job.workspace_id}/${targetId}/${attachment.content_sha256 ?? "clone"}`;
+    const key = `assets/${job.workspace_id}/${targetId}/attempts/${job.attempt}/${attachment.content_sha256 ?? "clone"}`;
     const existing = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ?`)
       .bind(targetId)
       .first<{ r2_key: string }>();
@@ -348,7 +352,7 @@ async function cloneTemplateAttachments(env: Env, job: JobRow, options: Template
       throw new Error("A cloned attachment id is already in use.");
     }
   }
-  await updateJob(env, job.id, { current: 2, total: 4, label: "Initializing page" });
+  await updateJob(env, job, { current: 2, total: 4, label: "Initializing page" });
   await notifyJobs(env, job.workspace_id);
   return ids;
 }
@@ -361,7 +365,7 @@ async function initializeTemplateDocument(
   ids: ReadonlyMap<string, string>,
 ) {
   if (page.kind !== "document") return;
-  await assertJobActive(env, job.id);
+  await assertJobActive(env, job);
   const source = await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ? AND workspace_id = ?`)
     .bind(options.sourcePageId, job.workspace_id)
     .first<{ content_epoch: number }>();
@@ -369,13 +373,13 @@ async function initializeTemplateDocument(
   const snapshot = await env.BUCKET.get(`documents/${options.sourcePageId}/epochs/${source.content_epoch}/current.bin`);
   const sourceUpdate = snapshot ? new Uint8Array(await snapshot.arrayBuffer()) : Y.encodeStateAsUpdate(new Y.Doc());
   const update = rewriteSnapshotAttachments(sourceUpdate, ids);
-  const inputKey = `jobs/${job.id}/template-content.bin`;
+  const inputKey = `jobs/${job.id}/attempts/${job.attempt}/template-content.bin`;
   await env.BUCKET.put(inputKey, update, {
     httpMetadata: { contentType: "application/octet-stream" },
     customMetadata: { jobId: job.id, pageId: options.targetPageId },
   });
-  await env.DB.prepare(`UPDATE jobs SET input_key = ?, updated_at = ? WHERE id = ?`)
-    .bind(inputKey, Date.now(), job.id)
+  await env.DB.prepare(`UPDATE jobs SET input_key = ?, updated_at = ? WHERE id = ? AND attempt = ?`)
+    .bind(inputKey, Date.now(), job.id, job.attempt)
     .run();
   const response = await env.DOCUMENT.getByName(`${options.targetPageId}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/initialize", {
@@ -388,14 +392,15 @@ async function initializeTemplateDocument(
 }
 
 async function publishTemplateClone(env: Env, job: JobRow, options: TemplateCloneOptions) {
-  await assertJobActive(env, job.id);
+  await assertJobActive(env, job);
   const timestamp = Date.now();
   const result = JSON.stringify({ warnings: [], pageId: options.targetPageId });
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE pages SET import_job_id = NULL, updated_at = ? WHERE id = ? AND import_job_id = ?
-        AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = 'running')`,
-    ).bind(timestamp, options.targetPageId, job.id, job.id),
+        AND content_epoch = ?
+        AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
+    ).bind(timestamp, options.targetPageId, job.id, job.attempt, job.id, job.attempt),
     env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(options.targetPageId),
     env.DB.prepare(
       `INSERT INTO page_search (page_id, workspace_id, title, body)
@@ -407,8 +412,8 @@ async function publishTemplateClone(env: Env, job: JobRow, options: TemplateClon
       `UPDATE jobs SET status = 'succeeded', progress_current = 4, progress_total = 4,
         progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
         updated_at = ?
-       WHERE id = ? AND status = 'running'`,
-    ).bind(result, timestamp + JOB_ARTIFACT_TTL_MS, timestamp, job.id),
+       WHERE id = ? AND attempt = ? AND status = 'running'`,
+    ).bind(result, timestamp + JOB_ARTIFACT_TTL_MS, timestamp, job.id, job.attempt),
   ]);
   const page = await env.DB.prepare(`SELECT * FROM pages WHERE id = ? AND import_job_id IS NULL`)
     .bind(options.targetPageId)
@@ -422,10 +427,23 @@ async function publishTemplateClone(env: Env, job: JobRow, options: TemplateClon
   }
 }
 
-export async function cleanupTemplateClone(env: Env, job: JobRow) {
+export async function cleanupTemplateClone(
+  env: Env,
+  job: JobRow,
+  stillOwned: () => Promise<boolean> = async () => true,
+) {
+  const current = await env.DB.prepare(
+    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN ('running', 'canceling')`,
+  )
+    .bind(job.id, job.attempt)
+    .first();
+  if (!current || !(await stillOwned())) return;
   const options = templateCloneOptions(job);
-  const staged = await env.DB.prepare(`SELECT id, kind, content_epoch FROM pages WHERE id = ? AND import_job_id = ?`)
-    .bind(options.targetPageId, job.id)
+  const staged = await env.DB.prepare(
+    `SELECT id, kind, content_epoch FROM pages
+      WHERE id = ? AND import_job_id = ? AND content_epoch = ?`,
+  )
+    .bind(options.targetPageId, job.id, job.attempt)
     .first<{ id: string; kind: "document" | "table"; content_epoch: number }>();
   const attachments = staged
     ? (
@@ -435,34 +453,46 @@ export async function cleanupTemplateClone(env: Env, job: JobRow) {
       ).results
     : [];
   if (staged?.kind === "document") {
+    if (!(await stillOwned())) return;
     const purged = await env.DOCUMENT.getByName(`${staged.id}~${staged.content_epoch}`).fetch(
       new Request("https://document.internal/purge", {
         method: "POST",
         headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
       }),
     );
+    if (!(await stillOwned())) return;
     if (!purged.ok) throw new Error("The staged document could not be purged.");
   }
   if (staged) {
-    await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ?`)
-      .bind(options.targetPageId, job.id)
+    if (!(await stillOwned())) return;
+    await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ? AND content_epoch = ?`)
+      .bind(options.targetPageId, job.id, job.attempt)
       .run();
   }
   const keys = [
     ...new Set(
-      [job.input_key, `jobs/${job.id}/template-content.bin`, ...attachments.map((row) => row.r2_key)].filter(Boolean),
+      [
+        job.input_key,
+        `jobs/${job.id}/attempts/${job.attempt}/template-content.bin`,
+        ...(job.attempt === 1 ? [`jobs/${job.id}/template-content.bin`] : []),
+        ...attachments.map((row) => row.r2_key),
+      ].filter(Boolean),
     ),
   ] as string[];
-  if (keys.length) await env.BUCKET.delete(keys);
-  if (staged) await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/`);
-  await env.DB.prepare(`UPDATE jobs SET input_key = NULL, updated_at = ? WHERE id = ?`).bind(Date.now(), job.id).run();
+  if (keys.length && (await stillOwned())) await env.BUCKET.delete(keys);
+  if (staged && (await stillOwned()))
+    await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/epochs/${job.attempt}/`);
+  if (!(await stillOwned())) return;
+  await env.DB.prepare(`UPDATE jobs SET input_key = NULL, updated_at = ? WHERE id = ? AND attempt = ?`)
+    .bind(Date.now(), job.id, job.attempt)
+    .run();
 }
 
 export async function runTemplateClone(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   const options = templateCloneOptions(job);
   const staged = await step.do("stage template clone", () => stageTemplateClone(env, job, options));
   if (staged.published) {
-    await updateJob(env, job.id, {
+    await updateJob(env, job, {
       status: "succeeded",
       current: 4,
       total: 4,
@@ -477,7 +507,7 @@ export async function runTemplateClone(env: Env, job: JobRow, step: Pick<Workflo
   ]);
   await step.do("initialize template content", async () => {
     await initializeTemplateDocument(env, job, options, staged.page, new Map(attachmentEntries));
-    await updateJob(env, job.id, { current: 3, total: 4, label: "Publishing page" });
+    await updateJob(env, job, { current: 3, total: 4, label: "Publishing page" });
     await notifyJobs(env, job.workspace_id);
   });
   await step.do("publish template clone", () => publishTemplateClone(env, job, options));
@@ -531,10 +561,10 @@ export async function createJob(
   return (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(id).first<JobRow>())!;
 }
 
-async function startJobWorkflow(env: Env, job: Pick<JobRow, "id" | "workflow_instance_id">) {
+async function startJobWorkflow(env: Env, job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt">) {
   const instanceId = job.workflow_instance_id ?? job.id;
   try {
-    await env.NOTES_WORKFLOW.create({ id: instanceId, params: { jobId: job.id } });
+    await env.NOTES_WORKFLOW.create({ id: instanceId, params: { jobId: job.id, attempt: job.attempt } });
   } catch (error) {
     // A successful create followed by a lost response is indistinguishable from
     // an existing instance. Its status is authoritative and makes retries safe.
@@ -545,12 +575,15 @@ async function startJobWorkflow(env: Env, job: Pick<JobRow, "id" | "workflow_ins
   }
 }
 
-export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "workflow_instance_id">) {
+export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt">) {
   if (env.WORKFLOW_INLINE !== "true") return startJobWorkflow(env, job);
-  const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(job.id).first<JobRow>();
+  const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
+    .bind(job.id, job.attempt)
+    .first<JobRow>();
   if (!row || (row.type !== "template_clone" && row.type !== "export" && row.type !== "import"))
     return startJobWorkflow(env, job);
-  await updateJob(env, row.id, { status: "running", current: 0, label: "Preparing" });
+  const started = await updateJob(env, row, { status: "running", current: 0, label: "Preparing" });
+  if (!started.meta.changes) return;
   await notifyJobs(env, row.workspace_id);
   const inlineStep = {
     async do<T>(_name: string, callback: () => Promise<T>) {
@@ -563,22 +596,7 @@ export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "work
     else if (row.type === "export") await runExport(env, row, inlineStep as Parameters<typeof runExport>[2]);
     else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
-    if (row.type === "template_clone") {
-      await cleanupTemplateClone(env, row).catch((cleanupError) => {
-        console.error("Failed to clean up inline template clone", { jobId: row.id, cleanupError });
-      });
-    } else if (row.type === "import") {
-      await cleanupImport(env, row).catch((cleanupError) => {
-        console.error("Failed to clean up inline import", { jobId: row.id, cleanupError });
-      });
-    }
-    await updateJob(env, row.id, {
-      status: "failed",
-      label: "Failed",
-      errorCode: "job_failed",
-      errorMessage: error instanceof Error ? error.message.slice(0, 500) : "The job failed.",
-    });
-    await notifyJobs(env, row.workspace_id);
+    await failJobWithCleanup(env, row, error instanceof Error ? error.message.slice(0, 500) : "The job failed.");
     throw error;
   }
 }
@@ -591,9 +609,123 @@ async function notifyJobs(env: Env, workspaceId: string) {
   }
 }
 
+export async function beginJobCancellation(env: Env, job: Pick<JobRow, "id" | "attempt">) {
+  return env.DB.prepare(
+    `UPDATE jobs SET status = 'canceling', progress_label = 'Canceling', cleanup_target = 'canceled',
+       error_code = NULL, error_message = NULL, updated_at = ?
+     WHERE id = ? AND attempt = ?
+       AND status IN ('queued', 'running', 'awaiting_confirmation', 'canceling')
+     RETURNING *`,
+  )
+    .bind(Date.now(), job.id, job.attempt)
+    .first<JobRow>();
+}
+
+async function cleanupLeaseOwned(env: Env, job: Pick<JobRow, "id" | "attempt">, token: string) {
+  return Boolean(
+    await env.DB.prepare(
+      `SELECT 1 owned FROM jobs WHERE id = ? AND attempt = ? AND cleanup_token = ?
+        AND cleanup_target IS NOT NULL AND status IN ('running', 'canceling')`,
+    )
+      .bind(job.id, job.attempt, token)
+      .first(),
+  );
+}
+
+/**
+ * Finishes staged-resource cleanup under an attempt-scoped lease. The terminal
+ * state remains unavailable to retry until cleanup succeeds, and a cancellation
+ * arriving during failed-job cleanup wins by changing cleanup_target atomically.
+ */
+export async function finishPendingJobCleanup(
+  env: Env,
+  identity: Pick<JobRow, "id" | "attempt">,
+  options: { terminateWorkflow?: boolean } = {},
+) {
+  const token = crypto.randomUUID();
+  const timestamp = Date.now();
+  const job = await env.DB.prepare(
+    `UPDATE jobs SET cleanup_token = ?, cleanup_started_at = ?, updated_at = ?
+      WHERE id = ? AND attempt = ? AND cleanup_target IS NOT NULL
+        AND status IN ('running', 'canceling')
+        AND (cleanup_token IS NULL OR cleanup_started_at IS NULL OR cleanup_started_at <= ?)
+      RETURNING *`,
+  )
+    .bind(token, timestamp, timestamp, identity.id, identity.attempt, timestamp - JOB_CLEANUP_LEASE_MS)
+    .first<JobRow>();
+  if (!job) return false;
+
+  const stillOwned = () => cleanupLeaseOwned(env, identity, token);
+  try {
+    if (options.terminateWorkflow !== false && job.workflow_instance_id && env.WORKFLOW_INLINE !== "true") {
+      const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
+      const status = await instance.status();
+      if (["queued", "running", "paused", "waiting", "waitingForPause"].includes(status.status)) {
+        await instance.terminate();
+      }
+    }
+    if (!(await stillOwned())) return false;
+    if (job.type === "import") await cleanupImport(env, job, stillOwned);
+    if (job.type === "template_clone") await cleanupTemplateClone(env, job, stillOwned);
+    if (!(await stillOwned())) return false;
+    const completedAt = Date.now();
+    const finished = await env.DB.prepare(
+      `UPDATE jobs SET
+         status = cleanup_target,
+         progress_label = CASE cleanup_target WHEN 'canceled' THEN 'Canceled' ELSE 'Failed' END,
+         error_code = CASE cleanup_target WHEN 'canceled' THEN NULL ELSE error_code END,
+         error_message = CASE cleanup_target WHEN 'canceled' THEN NULL ELSE error_message END,
+         cleanup_token = NULL, cleanup_started_at = NULL, cleanup_target = NULL, updated_at = ?
+       WHERE id = ? AND attempt = ? AND cleanup_token = ? AND cleanup_target IS NOT NULL
+         AND status IN ('running', 'canceling')`,
+    )
+      .bind(completedAt, job.id, job.attempt, token)
+      .run();
+    if (finished.meta.changes) await notifyJobs(env, job.workspace_id);
+    return Boolean(finished.meta.changes);
+  } catch (error) {
+    // Keep the job non-retryable while cleanup is incomplete. The scheduled
+    // recovery pass (or an explicit retry-cancel request) can claim it again.
+    await env.DB.prepare(
+      `UPDATE jobs SET status = 'canceling', progress_label = 'Cleanup pending',
+         cleanup_token = NULL, cleanup_started_at = NULL, updated_at = ?
+       WHERE id = ? AND attempt = ? AND cleanup_token = ?`,
+    )
+      .bind(Date.now(), job.id, job.attempt, token)
+      .run();
+    await notifyJobs(env, job.workspace_id);
+    throw error;
+  }
+}
+
+async function failJobWithCleanup(env: Env, job: JobRow, message: string) {
+  if (job.type !== "import" && job.type !== "template_clone") {
+    await updateJob(env, job, {
+      status: "failed",
+      label: "Failed",
+      errorCode: "job_failed",
+      errorMessage: message,
+    });
+    await notifyJobs(env, job.workspace_id);
+    return;
+  }
+  const pending = await env.DB.prepare(
+    `UPDATE jobs SET cleanup_target = COALESCE(cleanup_target, 'failed'),
+       progress_label = 'Cleaning up', error_code = 'job_failed', error_message = ?, updated_at = ?
+     WHERE id = ? AND attempt = ? AND status = 'running'`,
+  )
+    .bind(message, Date.now(), job.id, job.attempt)
+    .run();
+  if (!pending.meta.changes) return;
+  await notifyJobs(env, job.workspace_id);
+  await finishPendingJobCleanup(env, job, { terminateWorkflow: false }).catch((cleanupError) => {
+    console.error("Failed to clean up failed job", { jobId: job.id, cleanupError });
+  });
+}
+
 async function updateJob(
   env: Env,
-  jobId: string,
+  job: Pick<JobRow, "id" | "attempt">,
   fields: {
     status?: JobStatus;
     current?: number;
@@ -604,7 +736,9 @@ async function updateJob(
     resultJson?: string;
   },
 ) {
-  await env.DB.prepare(
+  const expectedStatus =
+    fields.status === "running" ? "queued" : fields.status === "canceled" ? "canceling" : "running";
+  return env.DB.prepare(
     `UPDATE jobs SET
        status = COALESCE(?, status),
        progress_current = COALESCE(?, progress_current),
@@ -612,7 +746,7 @@ async function updateJob(
        progress_label = COALESCE(?, progress_label),
        error_code = ?, error_message = ?,
        result_json = COALESCE(?, result_json), updated_at = ?
-     WHERE id = ?`,
+     WHERE id = ? AND attempt = ? AND status = ?`,
   )
     .bind(
       fields.status ?? null,
@@ -623,16 +757,19 @@ async function updateJob(
       fields.errorMessage ?? null,
       fields.resultJson ?? null,
       Date.now(),
-      jobId,
+      job.id,
+      job.attempt,
+      expectedStatus,
     )
     .run();
 }
 
-async function assertJobActive(env: Env, jobId: string) {
-  const row = await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(jobId).first<{ status: JobStatus }>();
-  if (!row || row.status === "canceling" || row.status === "canceled") {
-    throw new Error("Job canceled.");
-  }
+async function assertJobActive(env: Env, job: Pick<JobRow, "id" | "attempt">) {
+  const row = await env.DB.prepare(`SELECT status FROM jobs WHERE id = ? AND attempt = ?`)
+    .bind(job.id, job.attempt)
+    .first<{ status: JobStatus }>();
+  if (!row || row.status !== "running")
+    throw new Error(row?.status === "canceling" || row?.status === "canceled" ? "Job canceled." : "Job is not active.");
 }
 
 async function reindexPageBatch(env: Env, workspaceId: string, afterId: string) {
@@ -668,7 +805,7 @@ async function migrateCommentPageBatch(env: Env, workspaceId: string, afterId: s
 
 export async function runCommentMigration(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   const total = await step.do("count legacy comment pages", async () => {
-    await assertJobActive(env, job.id);
+    await assertJobActive(env, job);
     const count = await env.DB.prepare(
       `SELECT COUNT(*) count FROM pages p
         LEFT JOIN comment_migrations migration ON migration.page_id = p.id
@@ -677,7 +814,7 @@ export async function runCommentMigration(env: Env, job: JobRow, step: Pick<Work
     )
       .bind(job.workspace_id)
       .first<{ count: number }>();
-    await updateJob(env, job.id, { total: count?.count ?? 0, label: "Migrating comments" });
+    await updateJob(env, job, { total: count?.count ?? 0, label: "Migrating comments" });
     await notifyJobs(env, job.workspace_id);
     return count?.count ?? 0;
   });
@@ -685,10 +822,10 @@ export async function runCommentMigration(env: Env, job: JobRow, step: Pick<Work
   let afterId = "";
   for (let batchIndex = 0; migrated < total; batchIndex += 1) {
     const result = await step.do(`migrate comment batch ${batchIndex + 1}`, async () => {
-      await assertJobActive(env, job.id);
+      await assertJobActive(env, job);
       const batch = await migrateCommentPageBatch(env, job.workspace_id, afterId);
       const nextCount = migrated + batch.count;
-      await updateJob(env, job.id, { current: nextCount, total, label: "Migrating comments" });
+      await updateJob(env, job, { current: nextCount, total, label: "Migrating comments" });
       await notifyJobs(env, job.workspace_id);
       return batch;
     });
@@ -697,8 +834,8 @@ export async function runCommentMigration(env: Env, job: JobRow, step: Pick<Work
     afterId = result.lastId;
   }
   await step.do("complete comment migration", async () => {
-    await assertJobActive(env, job.id);
-    await updateJob(env, job.id, {
+    await assertJobActive(env, job);
+    await updateJob(env, job, {
       status: "succeeded",
       current: migrated,
       total,
@@ -709,14 +846,37 @@ export async function runCommentMigration(env: Env, job: JobRow, step: Pick<Work
   });
 }
 
+export async function resolveJobWorkflowAttempt(
+  env: Env,
+  event: Pick<WorkflowEvent<JobWorkflowParams>, "payload" | "instanceId">,
+) {
+  if (Number.isInteger(event.payload.attempt) && event.payload.attempt! > 0) return event.payload.attempt!;
+  const legacy = await env.DB.prepare(`SELECT attempt FROM jobs WHERE id = ? AND workflow_instance_id = ?`)
+    .bind(event.payload.jobId, event.instanceId)
+    .first<{ attempt: number }>();
+  return legacy?.attempt ?? null;
+}
+
 export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
   async run(event: Readonly<WorkflowEvent<JobWorkflowParams>>, step: WorkflowStep) {
     const { jobId } = event.payload;
+    const attempt =
+      event.payload.attempt ??
+      (await step.do("resolve legacy job attempt", async () => {
+        return resolveJobWorkflowAttempt(this.env, event);
+      }));
+    // A missing row means this is an obsolete legacy workflow instance. It must
+    // not attach itself to whichever attempt happens to be current now.
+    if (attempt === null) return;
+    const identity = { id: jobId, attempt };
     try {
       const job = await step.do("load job", async () => {
-        const row = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>();
+        const row = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
+          .bind(jobId, attempt)
+          .first<JobRow>();
         if (!row) throw new Error("Job not found.");
-        await updateJob(this.env, jobId, { status: "running", current: 0, label: "Preparing" });
+        const started = await updateJob(this.env, row, { status: "running", current: 0, label: "Preparing" });
+        if (!started.meta.changes) throw new Error("Job is not queued.");
         await notifyJobs(this.env, row.workspace_id);
         return row;
       });
@@ -737,14 +897,14 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         return;
       }
       const total = await step.do("count pages", async () => {
-        await assertJobActive(this.env, jobId);
+        await assertJobActive(this.env, identity);
         const count = await this.env.DB.prepare(
           `SELECT COUNT(*) count FROM pages WHERE workspace_id = ?
             AND import_job_id IS NULL AND is_template = 0`,
         )
           .bind(job.workspace_id)
           .first<{ count: number }>();
-        await updateJob(this.env, jobId, { total: count?.count ?? 0, label: "Reindexing pages" });
+        await updateJob(this.env, identity, { total: count?.count ?? 0, label: "Reindexing pages" });
         await notifyJobs(this.env, job.workspace_id);
         return count?.count ?? 0;
       });
@@ -752,10 +912,10 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       let afterId = "";
       for (let batchIndex = 0; indexed < total; batchIndex += 1) {
         const result = await step.do(`reindex batch ${batchIndex + 1}`, async () => {
-          await assertJobActive(this.env, jobId);
+          await assertJobActive(this.env, identity);
           const batch = await reindexPageBatch(this.env, job.workspace_id, afterId);
           const nextCount = indexed + batch.count;
-          await updateJob(this.env, jobId, { current: nextCount, total, label: "Reindexing pages" });
+          await updateJob(this.env, identity, { current: nextCount, total, label: "Reindexing pages" });
           await notifyJobs(this.env, job.workspace_id);
           return batch;
         });
@@ -764,8 +924,8 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         afterId = result.lastId;
       }
       await step.do("complete job", async () => {
-        await assertJobActive(this.env, jobId);
-        await updateJob(this.env, jobId, {
+        await assertJobActive(this.env, identity);
+        await updateJob(this.env, identity, {
           status: "succeeded",
           current: indexed,
           total,
@@ -776,57 +936,32 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       });
     } catch (error) {
       const message = error instanceof Error ? error.message.slice(0, 500) : "The job failed.";
-      const current = await this.env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`)
-        .bind(jobId)
-        .first<{ status: JobStatus }>();
+      const current = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
+        .bind(jobId, attempt)
+        .first<JobRow>();
+      // A superseded workflow belongs to an older attempt and must not clean up or
+      // report failure against the replacement attempt.
+      if (!current) return;
       if (current?.status === "canceling" || current?.status === "canceled") {
-        const canceledJob = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>();
-        if (canceledJob?.type === "template_clone") {
-          await cleanupTemplateClone(this.env, canceledJob).catch((cleanupError) => {
-            console.error("Failed to clean up canceled template clone", { jobId, cleanupError });
-          });
-        }
-        if (canceledJob?.type === "import") {
-          await cleanupImport(this.env, canceledJob).catch((cleanupError) => {
-            console.error("Failed to clean up canceled import", { jobId, cleanupError });
-          });
-        }
-        await updateJob(this.env, jobId, { status: "canceled", label: "Canceled" });
+        if (current.status === "canceling")
+          await finishPendingJobCleanup(this.env, current, { terminateWorkflow: false });
         return;
       }
-      const failedJob = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>();
-      if (failedJob?.type === "template_clone") {
-        await cleanupTemplateClone(this.env, failedJob).catch((cleanupError) => {
-          console.error("Failed to clean up failed template clone", { jobId, cleanupError });
-        });
-      }
-      if (failedJob?.type === "import") {
-        await cleanupImport(this.env, failedJob).catch((cleanupError) => {
-          console.error("Failed to clean up failed import", { jobId, cleanupError });
-        });
-      }
-      await updateJob(this.env, jobId, {
-        status: "failed",
-        label: "Failed",
-        errorCode: "job_failed",
-        errorMessage: message,
-      });
-      const failed = await this.env.DB.prepare(`SELECT workspace_id FROM jobs WHERE id = ?`)
-        .bind(jobId)
-        .first<{ workspace_id: string }>();
-      if (failed) await notifyJobs(this.env, failed.workspace_id);
+      if (current.status !== "running") return;
+      await failJobWithCleanup(this.env, current, message);
       throw error;
     }
   }
 }
 
 export async function recoverQueuedJobs(env: Env) {
+  const cutoff = Date.now() - 30_000;
   const queued = await env.DB.prepare(
-    `SELECT id, workflow_instance_id FROM jobs
+    `SELECT id, workflow_instance_id, attempt FROM jobs
       WHERE status = 'queued' AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
   )
-    .bind(Date.now() - 30_000)
-    .all<Pick<JobRow, "id" | "workflow_instance_id">>();
+    .bind(cutoff)
+    .all<Pick<JobRow, "id" | "workflow_instance_id" | "attempt">>();
   for (const job of queued.results) {
     try {
       await startJobExecution(env, job);
@@ -836,6 +971,19 @@ export async function recoverQueuedJobs(env: Env) {
       )
         .bind(error instanceof Error ? error.message.slice(0, 500) : "Workflow start failed.", Date.now(), job.id)
         .run();
+    }
+  }
+  const cleanups = await env.DB.prepare(
+    `SELECT id, attempt FROM jobs WHERE cleanup_target IS NOT NULL
+      AND status IN ('running', 'canceling') AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
+  )
+    .bind(cutoff)
+    .all<Pick<JobRow, "id" | "attempt">>();
+  for (const job of cleanups.results) {
+    try {
+      await finishPendingJobCleanup(env, job);
+    } catch (error) {
+      console.error("Pending job cleanup failed", { jobId: job.id, error });
     }
   }
 }
@@ -866,10 +1014,10 @@ async function enqueueOutbox(env: Env, outboxId: string) {
 
 export async function sweepOutbox(env: Env) {
   const rows = await env.DB.prepare(
-    `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ? AND attempts < ?
-      ORDER BY created_at LIMIT ?`,
+    `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
+      ORDER BY available_at, created_at, id LIMIT ?`,
   )
-    .bind(Date.now(), OUTBOX_MAX_ATTEMPTS, OUTBOX_SWEEP_BATCH_SIZE)
+    .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
     .all<{ id: string }>();
   for (const row of rows.results) {
     try {
@@ -878,13 +1026,6 @@ export async function sweepOutbox(env: Env) {
       console.error("Outbox enqueue failed", { outboxId: row.id, error });
     }
   }
-  const exhausted = await env.DB.prepare(
-    `SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL AND attempts >= ?`,
-  )
-    .bind(OUTBOX_MAX_ATTEMPTS)
-    .first<{ count: number }>();
-  // These rows are now invisible to the sweep, so say so rather than dropping them silently.
-  if (exhausted?.count) console.error("Outbox rows exhausted their attempts", { rows: exhausted.count });
 }
 
 export async function consumeDeliveryMessage(env: Env, message: Message<DeliveryQueueMessage>) {
@@ -926,15 +1067,18 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
 
 export async function expireJobArtifacts(env: Env) {
   const rows = await env.DB.prepare(
-    `SELECT id, type, input_key, output_key FROM jobs WHERE expires_at IS NOT NULL AND expires_at <= ?
+    `SELECT id, type, input_key, output_key, attempt FROM jobs WHERE expires_at IS NOT NULL AND expires_at <= ?
       AND (input_key IS NOT NULL OR output_key IS NOT NULL) LIMIT 50`,
   )
     .bind(Date.now())
-    .all<Pick<JobRow, "id" | "type" | "input_key" | "output_key">>();
+    .all<Pick<JobRow, "id" | "type" | "input_key" | "output_key" | "attempt">>();
   for (const row of rows.results) {
     const keys = [...new Set([row.input_key, row.output_key].filter((key): key is string => Boolean(key)))];
     if (keys.length) await env.BUCKET.delete(keys);
-    if (row.type === "import") await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/documents/`);
+    if (row.type === "import") {
+      await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/attempts/${row.attempt}/documents/`);
+      if (row.attempt === 1) await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/documents/`);
+    }
     await env.DB.prepare(`UPDATE jobs SET input_key = NULL, output_key = NULL, updated_at = ? WHERE id = ?`)
       .bind(Date.now(), row.id)
       .run();

@@ -61,10 +61,29 @@ const UNSAFE_FILE_EXTENSIONS = new Set([
   ".cjs",
 ]);
 
+// RFC-style media type tokens with optional token or quoted-string parameters.
+// This deliberately rejects bare quotes and controls while preserving legitimate
+// values such as quoted charset parameters. Only literal spaces are accepted around
+// separators so header-breaking CR/LF and other ASCII controls cannot slip through.
+const VALID_MIME =
+  /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?: *; *[!#$%&'*+.^_`|~0-9A-Za-z-]+ *= *(?:[!#$%&'*+.^_`|~0-9A-Za-z-]+|"(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])*"))*$/;
+
+function baseMime(mime: string) {
+  return mime.toLowerCase().split(";", 1)[0]!.trim();
+}
+
 export function isUnsafeMime(mime: string, name: string) {
-  const normalizedMime = mime.toLowerCase().split(";", 1)[0]!.trim();
+  if (!VALID_MIME.test(mime)) return true;
+  const normalizedMime = baseMime(mime);
   const extension = name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
   return UNSAFE_MIME_TYPES.has(normalizedMime) || UNSAFE_FILE_EXTENSIONS.has(extension);
+}
+
+/** Returns the fixed media type that may be embedded in Browser Rendering HTML. */
+export function inlineImageMime(mime: string) {
+  if (!VALID_MIME.test(mime)) return null;
+  const normalized = baseMime(mime);
+  return /^image\/(png|jpeg|gif|webp|avif)$/.test(normalized) ? normalized : null;
 }
 
 /**

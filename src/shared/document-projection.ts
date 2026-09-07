@@ -61,12 +61,26 @@ function escapeHtml(value: string) {
 
 function safeUrl(value: unknown) {
   if (typeof value !== "string") return null;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return null;
+  }
   try {
     const url = new URL(value, "https://notes.invalid");
     return ["http:", "https:", "mailto:"].includes(url.protocol) ? value : null;
   } catch {
     return null;
   }
+}
+
+function markdownCodeSpan(value: string) {
+  const longestRun = Math.max(0, ...[...value.matchAll(/`+/g)].map((match) => match[0].length));
+  const delimiter = "`".repeat(longestRun + 1);
+  const needsPadding =
+    value.startsWith("`") ||
+    value.endsWith("`") ||
+    (value.startsWith(" ") && value.endsWith(" ") && !/^ +$/.test(value));
+  return needsPadding ? `${delimiter} ${value} ${delimiter}` : `${delimiter}${value}${delimiter}`;
 }
 
 function markedText(node: ProseMirrorJson, format: "markdown" | "html") {
@@ -80,7 +94,7 @@ function markedText(node: ProseMirrorJson, format: "markdown" | "html") {
     else if (mark.type === "italic" || mark.type === "em")
       value = format === "html" ? `<em>${value}</em>` : `_${value}_`;
     else if (mark.type === "strike") value = format === "html" ? `<s>${value}</s>` : `~~${value}~~`;
-    else if (mark.type === "code") value = format === "html" ? `<code>${value}</code>` : `\`${value}\``;
+    else if (mark.type === "code") value = format === "html" ? `<code>${value}</code>` : markdownCodeSpan(value);
     else if (mark.type === "link") {
       const href = safeUrl(mark.attrs?.href);
       if (href)
@@ -277,7 +291,12 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
     // and its width has to come from the header rather than any individual row.
     const headed = header.length > 0 && header.every((cell) => cell.type === "tableHeader");
     const lines = rows.map((row) => markdownTableRow(row));
+    const width = Math.max(0, ...rows.map((row) => row.content?.length ?? 0));
     if (headed) lines.splice(1, 0, `| ${header.map(() => "---").join(" | ")} |\n`);
+    else if (width) {
+      lines.unshift(`| ${Array.from({ length: width }, () => "").join(" | ")} |\n`);
+      lines.splice(1, 0, `| ${Array.from({ length: width }, () => "---").join(" | ")} |\n`);
+    }
     return `${lines.join("")}\n`;
   }
 

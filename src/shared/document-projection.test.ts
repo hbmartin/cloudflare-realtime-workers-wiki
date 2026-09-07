@@ -211,4 +211,60 @@ describe("structured document projection", () => {
     expect(serialized.markdown).toContain("`a*b`");
     expect(serialized.markdown).toContain("**really bold**");
   });
+
+  it("uses a longer code-span delimiter when inline code contains backticks", () => {
+    const serialized = serializeDocument(
+      document({
+        type: "paragraph",
+        content: [{ type: "text", text: "call `nested` here", marks: [{ type: "code" }] }],
+      }),
+    );
+
+    expect(serialized.markdown).toContain("``call `nested` here``");
+  });
+
+  it("synthesizes a header for headerless Markdown tables without dropping data", () => {
+    const serialized = serializeDocument(
+      document({
+        type: "table",
+        content: [
+          {
+            type: "tableRow",
+            content: [
+              { type: "tableCell", content: [{ type: "text", text: "Ada" }] },
+              { type: "tableCell", content: [{ type: "text", text: "Engineer" }] },
+            ],
+          },
+          {
+            type: "tableRow",
+            content: [
+              { type: "tableCell", content: [{ type: "text", text: "Grace" }] },
+              { type: "tableCell", content: [{ type: "text", text: "Admiral" }] },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(serialized.markdown).toContain("|  |  |\n| --- | --- |\n| Ada | Engineer |\n| Grace | Admiral |\n");
+  });
+
+  it("rejects control characters in HTML and Markdown link destinations", () => {
+    const serialized = serializeDocument(
+      document({
+        type: "paragraph",
+        content: [
+          {
+            type: "text",
+            text: "unsafe link",
+            marks: [{ type: "link", attrs: { href: "https://example.test/path\n)\n# injected" } }],
+          },
+        ],
+      }),
+    );
+
+    expect(serialized.markdown).toBe("unsafe link\n");
+    expect(serialized.html).toContain("<p>unsafe link</p>");
+    expect(serialized.markdown).not.toContain("# injected");
+  });
 });

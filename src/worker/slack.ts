@@ -711,25 +711,32 @@ function isTimeoutAbort(error: unknown) {
 }
 
 async function claimSlackRows(env: Env, table: "slack_channel_events" | "slack_unfurls", ids: readonly string[]) {
-  if (!ids.length) return [] as string[];
+  if (!ids.length) return { ids: [] as string[], token: "" };
   const timestamp = Date.now();
+  const token = crypto.randomUUID();
   const claimed = await env.DB.prepare(
-    `UPDATE ${table} SET claimed_at = ?
+    `UPDATE ${table} SET claimed_at = ?, claim_token = ?
       WHERE id IN (SELECT value FROM json_each(?)) AND delivered_at IS NULL
         AND (claimed_at IS NULL OR claimed_at <= ?)
       RETURNING id`,
   )
-    .bind(timestamp, JSON.stringify([...ids]), timestamp - SLACK_CLAIM_STALE_MS)
+    .bind(timestamp, token, JSON.stringify([...ids]), timestamp - SLACK_CLAIM_STALE_MS)
     .all<{ id: string }>();
-  return claimed.results.map((row) => row.id);
+  return { ids: claimed.results.map((row) => row.id), token };
 }
 
-async function releaseSlackClaims(env: Env, table: "slack_channel_events" | "slack_unfurls", ids: readonly string[]) {
+async function releaseSlackClaims(
+  env: Env,
+  table: "slack_channel_events" | "slack_unfurls",
+  ids: readonly string[],
+  token: string,
+) {
   if (!ids.length) return;
   await env.DB.prepare(
-    `UPDATE ${table} SET claimed_at = NULL WHERE id IN (SELECT value FROM json_each(?)) AND delivered_at IS NULL`,
+    `UPDATE ${table} SET claimed_at = NULL, claim_token = NULL
+      WHERE id IN (SELECT value FROM json_each(?)) AND delivered_at IS NULL AND claim_token = ?`,
   )
-    .bind(JSON.stringify([...ids]))
+    .bind(JSON.stringify([...ids]), token)
     .run();
 }
 
@@ -776,7 +783,8 @@ function escapeSlackMrkdwn(value: string) {
 export async function deliverSlackChannelEvent(env: Env, eventId: string) {
   const row = await channelEvent(env, eventId);
   if (!row) return;
-  if (!(await claimSlackRows(env, "slack_channel_events", [eventId])).length) return;
+  const claim = await claimSlackRows(env, "slack_channel_events", [eventId]);
+  if (!claim.ids.length) return;
   const copy = escapeSlackMrkdwn(eventCopy(row.event_type, row.actor_name, row.page_title));
   try {
     await slackApi(env, row, "chat.postMessage", {
@@ -793,11 +801,14 @@ export async function deliverSlackChannelEvent(env: Env, eventId: string) {
       ],
     });
   } catch (error) {
-    await releaseSlackClaims(env, "slack_channel_events", [eventId]);
+    await releaseSlackClaims(env, "slack_channel_events", [eventId], claim.token);
     throw error;
   }
-  await env.DB.prepare(`UPDATE slack_channel_events SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL`)
-    .bind(Date.now(), eventId)
+  await env.DB.prepare(
+    `UPDATE slack_channel_events SET delivered_at = ?
+      WHERE id = ? AND delivered_at IS NULL AND claim_token = ?`,
+  )
+    .bind(Date.now(), eventId, claim.token)
     .run();
 }
 
@@ -937,6 +948,20 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
   return { ok: true };
 }
 
+async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_message_ts") {
+  const timestamp = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE slack_unfurls SET retired_at = ?, retirement_reason = ?
+        WHERE id = ? AND delivered_at IS NULL AND retired_at IS NULL`,
+    ).bind(timestamp, reason, unfurlId),
+    env.DB.prepare(
+      `UPDATE outbox SET last_error = ?
+        WHERE topic = 'slack_unfurl' AND json_extract(payload_json, '$.unfurlId') = ?`,
+    ).bind(`slack_unfurl_${reason}`, unfurlId),
+  ]);
+}
+
 export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
   const row = await env.DB.prepare(
     `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.message_ts, unfurl.unfurls_json,
@@ -945,7 +970,8 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
             installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at
        FROM slack_unfurls unfurl
        JOIN slack_installations installation ON installation.id = unfurl.installation_id
-      WHERE unfurl.id = ? AND unfurl.delivered_at IS NULL AND installation.disconnected_at IS NULL`,
+      WHERE unfurl.id = ? AND unfurl.delivered_at IS NULL AND unfurl.retired_at IS NULL
+        AND installation.disconnected_at IS NULL`,
   )
     .bind(unfurlId)
     .first<
@@ -958,6 +984,10 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
       }
     >();
   if (!row) return;
+  if (!row.message_ts) {
+    await retireSlackUnfurl(env, unfurlId, "missing_message_ts");
+    return;
+  }
   const stored = JSON.parse(row.unfurls_json) as Record<string, unknown>;
   const unfurls: Record<string, unknown> = {};
   for (const [url, value] of Object.entries(stored)) {
@@ -989,15 +1019,22 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
     }
     unfurls[url] = value;
   }
-  // Slack attaches previews to a specific message, so rows staged without its timestamp cannot be delivered.
-  if (Object.keys(unfurls).length && row.message_ts) {
-    if (!(await claimSlackRows(env, "slack_unfurls", [unfurlId])).length) return;
+  if (Object.keys(unfurls).length) {
+    const claim = await claimSlackRows(env, "slack_unfurls", [unfurlId]);
+    if (!claim.ids.length) return;
     try {
       await slackApi(env, row, "chat.unfurl", { channel: row.channel_id, ts: row.message_ts, unfurls });
     } catch (error) {
-      await releaseSlackClaims(env, "slack_unfurls", [unfurlId]);
+      await releaseSlackClaims(env, "slack_unfurls", [unfurlId], claim.token);
       throw error;
     }
+    await env.DB.prepare(
+      `UPDATE slack_unfurls SET delivered_at = ?
+        WHERE id = ? AND delivered_at IS NULL AND claim_token = ?`,
+    )
+      .bind(Date.now(), unfurlId, claim.token)
+      .run();
+    return;
   }
   await env.DB.prepare(`UPDATE slack_unfurls SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL`)
     .bind(Date.now(), unfurlId)
@@ -1008,10 +1045,16 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
   const date = new Date(timestamp);
   if (date.getUTCHours() !== 9 || date.getUTCMinutes() >= 15) return;
   const subscriptions = await env.DB.prepare(
-    `SELECT DISTINCT subscription_id FROM slack_channel_events
-      WHERE cadence = 'digest' AND delivered_at IS NULL ORDER BY created_at LIMIT 50`,
-  ).all<{ subscription_id: string }>();
-  for (const { subscription_id: subscriptionId } of subscriptions.results) {
+    `SELECT event.subscription_id, subscription.installation_id
+       FROM slack_channel_events event
+       JOIN slack_channel_subscriptions subscription ON subscription.id = event.subscription_id
+      WHERE event.cadence = 'digest' AND event.delivered_at IS NULL
+      GROUP BY event.subscription_id, subscription.installation_id
+      ORDER BY MIN(event.created_at), event.subscription_id LIMIT 50`,
+  ).all<{ subscription_id: string; installation_id: string }>();
+  const rateLimitedInstallations = new Set<string>();
+  for (const { subscription_id: subscriptionId, installation_id: installationId } of subscriptions.results) {
+    if (rateLimitedInstallations.has(installationId)) continue;
     try {
       const events = await env.DB.prepare(
         `SELECT event.id, event.event_type, event.page_id, page.title page_title, actor.name actor_name,
@@ -1044,13 +1087,12 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
         >();
       const [first] = events.results;
       if (!first) continue;
-      const claimedIds = new Set(
-        await claimSlackRows(
-          env,
-          "slack_channel_events",
-          events.results.map((event) => event.id),
-        ),
+      const claim = await claimSlackRows(
+        env,
+        "slack_channel_events",
+        events.results.map((event) => event.id),
       );
+      const claimedIds = new Set(claim.ids);
       const claimed = events.results.filter((event) => claimedIds.has(event.id));
       if (!claimed.length) continue;
       const installation: SlackInstallation = { ...first, id: first.installation_id };
@@ -1069,15 +1111,18 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
           env,
           "slack_channel_events",
           claimed.map((event) => event.id),
+          claim.token,
         );
         throw error;
       }
       await env.DB.prepare(
-        `UPDATE slack_channel_events SET delivered_at = ? WHERE id IN (SELECT value FROM json_each(?))`,
+        `UPDATE slack_channel_events SET delivered_at = ?
+          WHERE id IN (SELECT value FROM json_each(?)) AND claim_token = ?`,
       )
-        .bind(timestamp, JSON.stringify(claimed.map((event) => event.id)))
+        .bind(timestamp, JSON.stringify(claimed.map((event) => event.id)), claim.token)
         .run();
     } catch (error) {
+      if (error instanceof SlackRateLimitError) rateLimitedInstallations.add(installationId);
       // One unreachable channel must not starve the digests queued behind it.
       console.error("Slack channel digest failed", { subscriptionId, error });
     }

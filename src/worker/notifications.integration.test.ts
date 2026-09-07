@@ -4,6 +4,18 @@ import * as Y from "yjs";
 import type { CommentThread, Notification, NotificationPreference, Page } from "../shared/types";
 import type { Env } from "./env";
 import { deliverNotification, sendDueNotificationDigests } from "./notifications";
+import { encryptSlackToken } from "./slack";
+
+const SLACK_SECRETS = {
+  SLACK_CLIENT_ID: "123.456",
+  SLACK_CLIENT_SECRET: "slack-client-secret",
+  SLACK_SIGNING_SECRET: "slack-signing-secret",
+  SLACK_TOKEN_ENCRYPTION_KEY: "slack-token-encryption-key-with-enough-entropy",
+};
+
+function slackEnv(): Env {
+  return { ...env, ...SLACK_SECRETS } as unknown as Env;
+}
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -340,6 +352,69 @@ describe("notification feed and subscriptions", () => {
     ).toMatchObject({ status: "failed", last_error: "access_revoked" });
   });
 
+  it("does not let a stale delivery claimant finish a newer email lease", async () => {
+    const installed = await bootstrap();
+    const viewer = await invite(installed.cookie, "delivery-lease");
+    await SELF.fetch(
+      request(viewer.cookie, `/api/pages/${installed.page.id}/comments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          initialComment: { body: commentBody("Please review ", { id: installed.userId, label: "Owner" }) },
+        }),
+      }),
+    );
+    const notification = await env.DB.prepare(
+      `SELECT id FROM notifications WHERE user_id = ? AND event_type = 'mention'`,
+    )
+      .bind(installed.userId)
+      .first<{ id: string }>();
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => (firstStarted = resolve));
+    const blocked = new Promise<void>((resolve) => (releaseFirst = resolve));
+    const bindings = (send: (message: unknown) => Promise<unknown>) =>
+      new Proxy(env as Env, {
+        get(target, property, receiver) {
+          if (property === "SEND_EMAIL") return { send };
+          if (property === "EMAIL_FROM") return "notes@example.test";
+          return Reflect.get(target, property, receiver);
+        },
+      });
+    const first = deliverNotification(
+      bindings(async () => {
+        firstStarted();
+        await blocked;
+        return { messageId: "first" };
+      }),
+      notification!.id,
+    );
+    await started;
+    const key = `outbox:${notification!.id}:email`;
+    const firstLease = await env.DB.prepare(`SELECT claim_token FROM deliveries WHERE idempotency_key = ?`)
+      .bind(key)
+      .first<{ claim_token: string }>();
+    await env.DB.prepare(`UPDATE deliveries SET updated_at = 0 WHERE idempotency_key = ?`).bind(key).run();
+
+    await deliverNotification(
+      bindings(async () => ({ messageId: "second" })),
+      notification!.id,
+    );
+    const secondLease = await env.DB.prepare(
+      `SELECT status, attempts, claim_token FROM deliveries WHERE idempotency_key = ?`,
+    )
+      .bind(key)
+      .first<{ status: string; attempts: number; claim_token: string }>();
+    expect(secondLease).toMatchObject({ status: "sent", attempts: 2 });
+    expect(secondLease?.claim_token).not.toBe(firstLease?.claim_token);
+
+    releaseFirst();
+    await first;
+    expect(
+      await env.DB.prepare(`SELECT status, claim_token FROM deliveries WHERE idempotency_key = ?`).bind(key).first(),
+    ).toEqual({ status: "sent", claim_token: secondLease!.claim_token });
+  });
+
   it("delivers digest-mode mentions without letting other timezones consume the candidate limit", async () => {
     const installed = await bootstrap();
     const timestamp = Date.UTC(2026, 8, 5, 9, 5);
@@ -397,5 +472,193 @@ describe("notification feed and subscriptions", () => {
         `SELECT COUNT(*) count FROM notifications WHERE emailed_at IS NOT NULL AND id LIKE 'mention:digest:%'`,
       ).first(),
     ).toEqual({ count: 1 });
+  });
+
+  it("stops personal digest requests only for the rate-limited Slack installation", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+    const configured = slackEnv();
+    const [firstToken, secondToken] = await Promise.all([
+      encryptSlackToken(configured, "xoxb-rate-limited"),
+      encryptSlackToken(configured, "xoxb-available"),
+    ]);
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO workspaces (id, name, created_at) VALUES ('rate-workspace-two', 'Second workspace', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES
+          ('rate-user-a', 'Rate A', 'rate-a@example.test', 1, ?, ?),
+          ('rate-user-b', 'Rate B', 'rate-b@example.test', 1, ?, ?),
+          ('rate-user-c', 'Rate C', 'rate-c@example.test', 1, ?, ?)`,
+      ).bind(timestamp, timestamp, timestamp, timestamp, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES
+          (?, 'rate-user-a', 'viewer', ?),
+          (?, 'rate-user-b', 'viewer', ?),
+          ('rate-workspace-two', ?, 'owner', ?),
+          ('rate-workspace-two', 'rate-user-c', 'viewer', ?)`,
+      ).bind(
+        installed.workspaceId,
+        timestamp,
+        installed.workspaceId,
+        timestamp,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, kind, position, title, created_by, created_at, updated_at, space_id)
+         VALUES ('rate-page-two', 'rate-workspace-two', 'document', 'a0', 'Second page', ?, ?, ?,
+                 'rate-workspace-two-general')`,
+      ).bind(installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
+          (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
+           installed_by, created_at, updated_at)
+         VALUES
+          ('rate-installation-one', ?, 'TRATE1', 'Rate limited', 'BRATE1', ?, 'chat:write', ?, ?, ?),
+          ('rate-installation-two', 'rate-workspace-two', 'TRATE2', 'Available', 'BRATE2', ?, 'chat:write', ?, ?, ?)`,
+      ).bind(
+        installed.workspaceId,
+        firstToken,
+        installed.userId,
+        timestamp,
+        timestamp,
+        secondToken,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at) VALUES
+          ('rate-installation-one', 'rate-user-a', 'URATEA', ?),
+          ('rate-installation-one', 'rate-user-b', 'URATEB', ?),
+          ('rate-installation-two', 'rate-user-c', 'URATEC', ?)`,
+      ).bind(timestamp, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone) VALUES
+          ('rate-user-a', 'mention', 1, 'off', 'digest', 'UTC'),
+          ('rate-user-b', 'mention', 1, 'off', 'digest', 'UTC'),
+          ('rate-user-c', 'mention', 1, 'off', 'digest', 'UTC')`,
+      ),
+      env.DB.prepare(
+        `INSERT INTO notifications
+          (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         VALUES
+          ('rate-notification-a', ?, 'rate-user-a', 'mention', ?, ?, ?, '{}', 'rate-a', ?),
+          ('rate-notification-b', ?, 'rate-user-b', 'mention', ?, ?, ?, '{}', 'rate-b', ?),
+          ('rate-notification-c', 'rate-workspace-two', 'rate-user-c', 'mention', ?,
+           'rate-workspace-two-general', 'rate-page-two', '{}', 'rate-c', ?)`,
+      ).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp,
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp,
+        installed.userId,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
+           FROM notifications WHERE id LIKE 'rate-notification-%'`,
+      ).bind(timestamp, timestamp),
+    ]);
+    const channels: string[] = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      channels.push(JSON.parse(String(init?.body)).channel as string);
+      const authorization = new Headers(init?.headers).get("authorization");
+      return authorization === "Bearer xoxb-rate-limited"
+        ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
+        : Response.json({ ok: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await sendDueNotificationDigests(configured, timestamp);
+
+    expect(channels).toEqual(["URATEA", "URATEC"]);
+    expect(
+      await env.DB.prepare(
+        `SELECT id, slack_at IS NOT NULL delivered FROM notifications
+          WHERE id LIKE 'rate-notification-%' ORDER BY id`,
+      ).all(),
+    ).toMatchObject({
+      results: [
+        { id: "rate-notification-a", delivered: 0 },
+        { id: "rate-notification-b", delivered: 0 },
+        { id: "rate-notification-c", delivered: 1 },
+      ],
+    });
+    log.mockRestore();
+  });
+
+  it("advances the persisted digest cursor past a failing leading cohort", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+    await env.DB.batch([
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         SELECT printf('cursor-user-%02d', n), printf('Cursor User %02d', n),
+                printf('cursor-user-%02d@example.test', n), 1, ?, ? FROM sequence`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         SELECT ?, printf('cursor-user-%02d', n), 'viewer', ? FROM sequence`,
+      ).bind(installed.workspaceId, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
+         SELECT printf('cursor-user-%02d', n), 'mention', 1, 'digest', 'off', 'UTC' FROM sequence`,
+      ),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO notifications
+           (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         SELECT printf('mention:cursor:%02d', n), ?, printf('cursor-user-%02d', n), 'mention', ?, ?, ?, '{}',
+                printf('cursor:%02d', n), ? + n FROM sequence`,
+      ).bind(installed.workspaceId, installed.userId, installed.page.spaceId, installed.page.id, timestamp),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
+           FROM notifications WHERE id LIKE 'mention:cursor:%'`,
+      ).bind(timestamp, timestamp),
+    ]);
+    const send = vi.fn(async (message: { to: string }) => {
+      if (!message.to.startsWith("cursor-user-51@")) throw new Error("mailbox unavailable");
+      return { messageId: "tail-delivered" };
+    });
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "SEND_EMAIL") return { send };
+        if (property === "EMAIL_FROM") return "notes@example.test";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await sendDueNotificationDigests(bindings, timestamp);
+    expect(send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")).toBe(false);
+    for (let tick = 0; tick < 5; tick += 1) {
+      await sendDueNotificationDigests(bindings, timestamp);
+      if (send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")) break;
+    }
+
+    expect(send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")).toBe(true);
+    expect(
+      await env.DB.prepare(
+        `SELECT emailed_at IS NOT NULL delivered FROM notifications WHERE id = 'mention:cursor:51'`,
+      ).first(),
+    ).toEqual({ delivered: 1 });
+    log.mockRestore();
   });
 });

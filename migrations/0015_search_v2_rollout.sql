@@ -1,9 +1,3 @@
--- 0012 backfilled every non-archived page without excluding templates and staged
--- import pages, so drop those before completing the corpus.
-DELETE FROM page_search_v2 WHERE page_id IN (
-  SELECT id FROM pages WHERE import_job_id IS NOT NULL OR is_template = 1
-);
-
 -- Complete the v2 corpus before switching reads. Active rows were backfilled by
 -- 0012; archived rows are retained so the archive-state search filter works.
 INSERT INTO page_search_v2
@@ -15,11 +9,6 @@ SELECT p.id, p.workspace_id, p.space_id, p.title,
        COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
   FROM pages p
  WHERE p.import_job_id IS NULL AND p.is_template = 0
-   -- 0012 indexed only non-archived pages, so archived rows are the outstanding
-   -- complement. The NOT EXISTS stays as the correctness guard for anything the
-   -- running app indexed between 0012 and this migration; the archive predicate
-   -- keeps that scan (page_search_v2.page_id is UNINDEXED) off most pages.
-   AND p.archived_at IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM page_search_v2 search WHERE search.page_id = p.id);
 
 -- One coalesced, resumable verification pass per existing workspace. The

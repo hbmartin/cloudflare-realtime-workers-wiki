@@ -92,10 +92,11 @@ import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 import {
+  beginJobCancellation,
   consumeDeliveryMessage,
-  cleanupTemplateClone,
   createJob,
   expireJobArtifacts,
+  finishPendingJobCleanup,
   jobForMember,
   jobJson,
   NotesJobWorkflow,
@@ -121,7 +122,6 @@ import {
 } from "./notifications";
 import { parseSearchRequest, searchPages, searchTitles } from "./search";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
-import { cleanupImport } from "./importer";
 import {
   consumeSlackLink,
   createSlackOAuthUrl,
@@ -1638,7 +1638,9 @@ app.post("/api/import-uploads", async (c) => {
   const inputKey = `jobs/${job.id}/input/${encodeURIComponent(filename)}`;
   try {
     await c.env.BUCKET.put(inputKey, file.stream(), {
-      httpMetadata: { contentType: file.type || "application/octet-stream" },
+      httpMetadata: {
+        contentType: format === "markdown" ? "text/markdown" : format === "html" ? "text/html" : "application/zip",
+      },
       customMetadata: { filename, jobId: job.id },
     });
     await c.env.DB.prepare(`UPDATE jobs SET input_key = ?, expires_at = ?, updated_at = ? WHERE id = ?`)
@@ -1674,12 +1676,16 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
   }
   const options = JSON.parse(job.options_json) as Record<string, unknown>;
   const instanceId = crypto.randomUUID();
-  await c.env.DB.prepare(
+  const queued = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, options_json = ?, progress_label = 'Queued',
-      error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ? AND status = 'awaiting_confirmation'`,
+      error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE id = ? AND attempt = ? AND status = 'awaiting_confirmation'`,
   )
-    .bind(instanceId, JSON.stringify({ ...options, confirmed: true }), now(), job.id)
+    .bind(instanceId, JSON.stringify({ ...options, confirmed: true }), now(), job.id, job.attempt)
     .run();
+  if (!queued.meta.changes) {
+    throw new HttpError(409, "import_not_confirmable", "This import is no longer awaiting confirmation.");
+  }
   const confirmed = await jobForMember(c.env, member, job.id);
   c.executionCtx.waitUntil(
     startJobExecution(c.env, confirmed).catch((error) => {
@@ -1761,25 +1767,20 @@ app.post("/api/jobs/:id/cancel", async (c) => {
   if (["succeeded", "failed", "canceled"].includes(job.status)) {
     throw new HttpError(409, "job_not_cancelable", "This job is no longer running.");
   }
-  await c.env.DB.prepare(
-    `UPDATE jobs SET status = 'canceled', progress_label = 'Canceled', updated_at = ?
-      WHERE id = ? AND status IN ('queued', 'running', 'awaiting_confirmation', 'canceling')`,
-  )
-    .bind(now(), job.id)
-    .run();
+  const canceledAt = now();
+  const canceling = await beginJobCancellation(c.env, job);
+  if (!canceling) {
+    throw new HttpError(409, "job_not_cancelable", "This job is no longer running.");
+  }
   c.executionCtx.waitUntil(
-    (async () => {
-      if (job.workflow_instance_id) {
-        await c.env.NOTES_WORKFLOW.get(job.workflow_instance_id)
-          .then((instance) => instance.terminate())
-          .catch((error) => console.error("Failed to terminate canceled workflow", { jobId: job.id, error }));
-      }
-      if (job.type === "import") await cleanupImport(c.env, job);
-      if (job.type === "template_clone") await cleanupTemplateClone(c.env, job);
-    })().catch((error) => console.error("Failed to clean up canceled job", { jobId: job.id, error })),
+    finishPendingJobCleanup(c.env, job).catch((error) =>
+      console.error("Failed to terminate or clean up canceled job", { jobId: job.id, error }),
+    ),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
-  return c.json({ job: jobJson(await jobForMember(c.env, member, job.id)) });
+  return c.json({
+    job: jobJson({ ...canceling, status: "canceling", progress_label: "Canceling", updated_at: canceledAt }),
+  });
 });
 
 app.post("/api/jobs/:id/retry", async (c) => {
@@ -1789,13 +1790,15 @@ app.post("/api/jobs/:id/retry", async (c) => {
     throw new HttpError(409, "job_not_retryable", "Only failed or canceled jobs can be retried.");
   }
   const instanceId = crypto.randomUUID();
-  await c.env.DB.prepare(
+  const retried = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1, progress_current = 0,
-       progress_label = 'Queued', error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`,
+       progress_label = 'Queued', error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE id = ? AND attempt = ? AND status IN ('failed', 'canceled')
+      RETURNING *`,
   )
-    .bind(instanceId, now(), job.id)
-    .run();
-  const retried = await jobForMember(c.env, member, job.id);
+    .bind(instanceId, now(), job.id, job.attempt)
+    .first<JobRow>();
+  if (!retried) throw new HttpError(409, "job_not_retryable", "This job was already retried.");
   c.executionCtx.waitUntil(
     startJobExecution(c.env, retried).catch((error) => {
       console.error("Failed to restart job workflow", { jobId: job.id, error });

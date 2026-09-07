@@ -78,8 +78,6 @@ CREATE TABLE slack_channel_events (
   thread_id TEXT REFERENCES comment_threads(id) ON DELETE CASCADE,
   cadence TEXT NOT NULL CHECK (cadence IN ('immediate', 'digest')),
   delivered_at INTEGER,
-  -- Held while a consumer is posting to Slack, so a queue redelivery cannot post twice.
-  claimed_at INTEGER,
   created_at INTEGER NOT NULL
 );
 
@@ -93,8 +91,6 @@ CREATE TABLE slack_unfurls (
   channel_id TEXT NOT NULL,
   unfurls_json TEXT NOT NULL,
   delivered_at INTEGER,
-  -- Held while a consumer is posting to Slack, so a queue redelivery cannot post twice.
-  claimed_at INTEGER,
   created_at INTEGER NOT NULL
 );
 
