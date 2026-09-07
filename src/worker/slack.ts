@@ -1043,15 +1043,18 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
 
 export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now()) {
   const date = new Date(timestamp);
-  if (date.getUTCHours() !== 9 || date.getUTCMinutes() >= 15) return;
+  if (date.getUTCHours() < 9) return;
+  const cutoff = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 9);
   const subscriptions = await env.DB.prepare(
     `SELECT event.subscription_id, subscription.installation_id
        FROM slack_channel_events event
        JOIN slack_channel_subscriptions subscription ON subscription.id = event.subscription_id
-      WHERE event.cadence = 'digest' AND event.delivered_at IS NULL
+      WHERE event.cadence = 'digest' AND event.delivered_at IS NULL AND event.created_at < ?
       GROUP BY event.subscription_id, subscription.installation_id
       ORDER BY MIN(event.created_at), event.subscription_id LIMIT 50`,
-  ).all<{ subscription_id: string; installation_id: string }>();
+  )
+    .bind(cutoff)
+    .all<{ subscription_id: string; installation_id: string }>();
   const rateLimitedInstallations = new Set<string>();
   for (const { subscription_id: subscriptionId, installation_id: installationId } of subscriptions.results) {
     if (rateLimitedInstallations.has(installationId)) continue;
@@ -1070,10 +1073,10 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
            AND page.import_job_id IS NULL AND page.is_template = 0
          LEFT JOIN user actor ON actor.id = event.actor_id
         WHERE event.subscription_id = ? AND event.cadence = 'digest'
-          AND event.delivered_at IS NULL AND installation.disconnected_at IS NULL
+          AND event.delivered_at IS NULL AND event.created_at < ? AND installation.disconnected_at IS NULL
         ORDER BY event.created_at LIMIT 40`,
       )
-        .bind(subscriptionId)
+        .bind(subscriptionId, cutoff)
         .all<
           SlackInstallation & {
             id: string;

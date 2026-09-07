@@ -442,7 +442,13 @@ describe("notification feed and subscriptions", () => {
            (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
          SELECT printf('mention:digest:%02d', n), ?, printf('digest-user-%02d', n), 'mention', ?, ?, ?, '{}',
                 printf('digest:%02d', n), ? + n FROM sequence`,
-      ).bind(installed.workspaceId, installed.userId, installed.page.spaceId, installed.page.id, timestamp),
+      ).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 10 * 60_000,
+      ),
       env.DB.prepare(
         `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
          SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
@@ -474,7 +480,7 @@ describe("notification feed and subscriptions", () => {
     ).toEqual({ count: 1 });
   });
 
-  it("stops personal digest requests only for the rate-limited Slack installation", async () => {
+  it("defers only the rate-limited Slack installation and retries it on a later tick", async () => {
     const installed = await bootstrap();
     const timestamp = Date.UTC(2026, 8, 5, 9, 5);
     const configured = slackEnv();
@@ -556,14 +562,14 @@ describe("notification feed and subscriptions", () => {
         installed.userId,
         installed.page.spaceId,
         installed.page.id,
-        timestamp,
+        timestamp - 10 * 60_000,
         installed.workspaceId,
         installed.userId,
         installed.page.spaceId,
         installed.page.id,
-        timestamp,
+        timestamp - 10 * 60_000,
         installed.userId,
-        timestamp,
+        timestamp - 10 * 60_000,
       ),
       env.DB.prepare(
         `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
@@ -572,10 +578,11 @@ describe("notification feed and subscriptions", () => {
       ).bind(timestamp, timestamp),
     ]);
     const channels: string[] = [];
+    let remainingRateLimits = 1;
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       channels.push(JSON.parse(String(init?.body)).channel as string);
       const authorization = new Headers(init?.headers).get("authorization");
-      return authorization === "Bearer xoxb-rate-limited"
+      return authorization === "Bearer xoxb-rate-limited" && remainingRateLimits-- > 0
         ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
         : Response.json({ ok: true });
     });
@@ -597,6 +604,16 @@ describe("notification feed and subscriptions", () => {
         { id: "rate-notification-c", delivered: 1 },
       ],
     });
+
+    await sendDueNotificationDigests(configured, timestamp + 15 * 60_000);
+
+    expect(channels).toEqual(["URATEA", "URATEC", "URATEA", "URATEB"]);
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) delivered FROM notifications
+          WHERE id LIKE 'rate-notification-%' AND slack_at IS NOT NULL`,
+      ).first(),
+    ).toEqual({ delivered: 3 });
     log.mockRestore();
   });
 
@@ -605,28 +622,34 @@ describe("notification feed and subscriptions", () => {
     const timestamp = Date.UTC(2026, 8, 5, 9, 5);
     await env.DB.batch([
       env.DB.prepare(
-        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 31)
          INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
          SELECT printf('cursor-user-%02d', n), printf('Cursor User %02d', n),
                 printf('cursor-user-%02d@example.test', n), 1, ?, ? FROM sequence`,
       ).bind(timestamp, timestamp),
       env.DB.prepare(
-        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 31)
          INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
          SELECT ?, printf('cursor-user-%02d', n), 'viewer', ? FROM sequence`,
       ).bind(installed.workspaceId, timestamp),
       env.DB.prepare(
-        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 31)
          INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
          SELECT printf('cursor-user-%02d', n), 'mention', 1, 'digest', 'off', 'UTC' FROM sequence`,
       ),
       env.DB.prepare(
-        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 31)
          INSERT INTO notifications
            (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
          SELECT printf('mention:cursor:%02d', n), ?, printf('cursor-user-%02d', n), 'mention', ?, ?, ?, '{}',
                 printf('cursor:%02d', n), ? + n FROM sequence`,
-      ).bind(installed.workspaceId, installed.userId, installed.page.spaceId, installed.page.id, timestamp),
+      ).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 10 * 60_000,
+      ),
       env.DB.prepare(
         `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
          SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
@@ -634,7 +657,7 @@ describe("notification feed and subscriptions", () => {
       ).bind(timestamp, timestamp),
     ]);
     const send = vi.fn(async (message: { to: string }) => {
-      if (!message.to.startsWith("cursor-user-51@")) throw new Error("mailbox unavailable");
+      if (!message.to.startsWith("cursor-user-31@")) throw new Error("mailbox unavailable");
       return { messageId: "tail-delivered" };
     });
     const bindings = new Proxy(env as Env, {
@@ -647,16 +670,16 @@ describe("notification feed and subscriptions", () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     await sendDueNotificationDigests(bindings, timestamp);
-    expect(send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")).toBe(false);
-    for (let tick = 0; tick < 5; tick += 1) {
-      await sendDueNotificationDigests(bindings, timestamp);
-      if (send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")) break;
+    expect(send.mock.calls.some(([message]) => message.to === "cursor-user-31@example.test")).toBe(false);
+    for (let tick = 1; tick < 4; tick += 1) {
+      await sendDueNotificationDigests(bindings, timestamp + tick * 15 * 60_000);
+      if (send.mock.calls.some(([message]) => message.to === "cursor-user-31@example.test")) break;
     }
 
-    expect(send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")).toBe(true);
+    expect(send.mock.calls.some(([message]) => message.to === "cursor-user-31@example.test")).toBe(true);
     expect(
       await env.DB.prepare(
-        `SELECT emailed_at IS NOT NULL delivered FROM notifications WHERE id = 'mention:cursor:51'`,
+        `SELECT emailed_at IS NOT NULL delivered FROM notifications WHERE id = 'mention:cursor:31'`,
       ).first(),
     ).toEqual({ delivered: 1 });
     log.mockRestore();

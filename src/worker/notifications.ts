@@ -700,18 +700,23 @@ const DIGEST_CANDIDATE_PAGE = DIGEST_CANDIDATE_MAX;
 // two timezones and appear as two groups that a coarser cursor would skip past.
 type DigestCursor = { userId: string; workspaceId: string; timezone: string };
 
-function digestDue(timezone: string, timestamp: number) {
+function digestWindow(timezone: string, timestamp: number) {
   try {
     const parts = new Intl.DateTimeFormat("en-US", {
       timeZone: timezone,
       hour: "2-digit",
       minute: "2-digit",
+      second: "2-digit",
       hourCycle: "h23",
     }).formatToParts(timestamp);
     const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-    return Number(values.hour) === 9 && Number(values.minute) < 15;
+    const hour = Number(values.hour);
+    if (hour < 9) return null;
+    const elapsed =
+      ((hour - 9) * 60 * 60 + Number(values.minute) * 60 + Number(values.second)) * 1000 + (timestamp % 1000);
+    return { timezone, cutoff: timestamp - elapsed };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -726,13 +731,22 @@ function digestModeSql(channel: DigestChannel) {
 async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: number) {
   const deliveredColumn = channel === "email" ? "emailed_at" : "slack_at";
   const rows = await env.DB.prepare(
-    `SELECT DISTINCT COALESCE(preference.timezone, 'UTC') timezone
+    `SELECT COALESCE(preference.timezone, 'UTC') timezone,
+            COALESCE(cursor.updated_at, 0) cursor_updated_at
        FROM notifications n
        LEFT JOIN notification_preferences preference
          ON preference.user_id = n.user_id AND preference.event_type = n.event_type
-      WHERE n.${deliveredColumn} IS NULL AND ${digestModeSql(channel)}`,
-  ).all<{ timezone: string }>();
-  return rows.results.map((row) => row.timezone).filter((timezone) => digestDue(timezone, timestamp));
+       LEFT JOIN digest_delivery_cursors cursor
+         ON cursor.channel = ? AND cursor.timezone = COALESCE(preference.timezone, 'UTC')
+      WHERE n.${deliveredColumn} IS NULL AND ${digestModeSql(channel)}
+      GROUP BY COALESCE(preference.timezone, 'UTC'), COALESCE(cursor.updated_at, 0)
+      ORDER BY 2, 1`,
+  )
+    .bind(channel)
+    .all<{ timezone: string; cursor_updated_at: number }>();
+  return rows.results
+    .map((row) => digestWindow(row.timezone, timestamp))
+    .filter((window): window is { timezone: string; cutoff: number } => Boolean(window));
 }
 
 function digestCursor(row: { user_id: string; workspace_id: string; timezone: string }): DigestCursor {
@@ -746,22 +760,25 @@ function digestCursorKey(cursor: DigestCursor) {
 async function digestCandidates<T extends { user_id: string; workspace_id: string; timezone: string }>(
   env: Env,
   channel: DigestChannel,
-  read: (cursor: DigestCursor) => Promise<{ results: T[] }>,
+  timezone: string,
+  limit: number,
+  read: (cursor: DigestCursor, pageSize: number) => Promise<{ results: T[] }>,
 ) {
   const stored = await env.DB.prepare(
-    `SELECT user_id, workspace_id, timezone FROM digest_delivery_cursors WHERE channel = ?`,
+    `SELECT user_id, workspace_id, timezone FROM digest_delivery_cursors WHERE channel = ? AND timezone = ?`,
   )
-    .bind(channel)
+    .bind(channel, timezone)
     .first<{ user_id: string; workspace_id: string; timezone: string }>();
-  let cursor = stored ? digestCursor(stored) : { userId: "", workspaceId: "", timezone: "" };
+  let cursor = stored ? digestCursor(stored) : { userId: "", workspaceId: "", timezone };
   let wrapped = !stored;
   const candidates: T[] = [];
   const seen = new Set<string>();
-  while (candidates.length < DIGEST_CANDIDATE_MAX) {
-    const page = await read(cursor);
+  while (candidates.length < limit) {
+    const pageSize = Math.min(DIGEST_CANDIDATE_PAGE, limit - candidates.length);
+    const page = await read(cursor, pageSize);
     if (!page.results.length) {
       if (wrapped) break;
-      cursor = { userId: "", workspaceId: "", timezone: "" };
+      cursor = { userId: "", workspaceId: "", timezone };
       wrapped = true;
       continue;
     }
@@ -772,27 +789,29 @@ async function digestCandidates<T extends { user_id: string; workspace_id: strin
       if (seen.has(key)) continue;
       seen.add(key);
       candidates.push(row);
-      if (candidates.length >= DIGEST_CANDIDATE_MAX) break;
+      if (candidates.length >= limit) break;
     }
-    if (candidates.length >= DIGEST_CANDIDATE_MAX) break;
-    if (page.results.length < DIGEST_CANDIDATE_PAGE) {
+    if (candidates.length >= limit) break;
+    if (page.results.length < pageSize) {
       if (wrapped) break;
-      cursor = { userId: "", workspaceId: "", timezone: "" };
+      cursor = { userId: "", workspaceId: "", timezone };
       wrapped = true;
     }
   }
-  if (candidates.length >= DIGEST_CANDIDATE_MAX) {
+  if (candidates.length) {
     const last = digestCursor(candidates.at(-1)!);
     await env.DB.prepare(
       `INSERT INTO digest_delivery_cursors (channel, user_id, workspace_id, timezone, updated_at)
        VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(channel) DO UPDATE SET user_id = excluded.user_id, workspace_id = excluded.workspace_id,
-         timezone = excluded.timezone, updated_at = excluded.updated_at`,
+       ON CONFLICT(channel, timezone) DO UPDATE SET user_id = excluded.user_id,
+         workspace_id = excluded.workspace_id, updated_at = excluded.updated_at`,
     )
       .bind(channel, last.userId, last.workspaceId, last.timezone, Date.now())
       .run();
   } else {
-    await env.DB.prepare(`DELETE FROM digest_delivery_cursors WHERE channel = ?`).bind(channel).run();
+    await env.DB.prepare(`DELETE FROM digest_delivery_cursors WHERE channel = ? AND timezone = ?`)
+      .bind(channel, timezone)
+      .run();
   }
   return candidates;
 }
@@ -801,90 +820,87 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
   if (!env.SEND_EMAIL || !env.EMAIL_FROM) return;
   const dueTimezones = await dueDigestTimezones(env, "email", timestamp);
   if (!dueTimezones.length) return;
-  const readCandidates = (cursor: DigestCursor) =>
-    env.DB.prepare(
-      `SELECT n.user_id, n.workspace_id, recipient.name, recipient.email,
+  let remaining = DIGEST_CANDIDATE_MAX;
+  for (const window of dueTimezones) {
+    if (!remaining) break;
+    const readCandidates = (cursor: DigestCursor, pageSize: number) =>
+      env.DB.prepare(
+        `SELECT n.user_id, n.workspace_id, recipient.name, recipient.email,
               COALESCE(preference.timezone, 'UTC') timezone
          FROM notifications n
          JOIN user recipient ON recipient.id = n.user_id
          LEFT JOIN notification_preferences preference
            ON preference.user_id = n.user_id AND preference.event_type = n.event_type
         WHERE n.emailed_at IS NULL AND ${digestModeSql("email")}
-          AND COALESCE(preference.timezone, 'UTC') IN (SELECT value FROM json_each(?))
-          AND (n.user_id > ? OR (n.user_id = ? AND (n.workspace_id > ? OR (n.workspace_id = ?
-              AND COALESCE(preference.timezone, 'UTC') > ?))))
+          AND COALESCE(preference.timezone, 'UTC') = ? AND n.created_at < ?
+          AND (n.user_id > ? OR (n.user_id = ? AND n.workspace_id > ?))
         GROUP BY n.user_id, n.workspace_id, recipient.name, recipient.email, timezone
-        ORDER BY n.user_id, n.workspace_id, timezone
+        ORDER BY n.user_id, n.workspace_id
         LIMIT ?`,
-    )
-      .bind(
-        JSON.stringify(dueTimezones),
-        cursor.userId,
-        cursor.userId,
-        cursor.workspaceId,
-        cursor.workspaceId,
-        cursor.timezone,
-        DIGEST_CANDIDATE_PAGE,
       )
-      .all<{ user_id: string; workspace_id: string; name: string; email: string; timezone: string }>();
-  for (const candidate of await digestCandidates(env, "email", readCandidates)) {
-    const ids = await env.DB.prepare(
-      `SELECT n.id FROM notifications n
+        .bind(window.timezone, window.cutoff, cursor.userId, cursor.userId, cursor.workspaceId, pageSize)
+        .all<{ user_id: string; workspace_id: string; name: string; email: string; timezone: string }>();
+    const candidates = await digestCandidates(env, "email", window.timezone, remaining, readCandidates);
+    remaining -= candidates.length;
+    for (const candidate of candidates) {
+      const ids = await env.DB.prepare(
+        `SELECT n.id FROM notifications n
         LEFT JOIN notification_preferences preference
           ON preference.user_id = n.user_id AND preference.event_type = n.event_type
         WHERE n.user_id = ? AND n.workspace_id = ? AND n.emailed_at IS NULL
-          AND ${digestModeSql("email")} AND COALESCE(preference.timezone, 'UTC') = ?
+          AND ${digestModeSql("email")} AND COALESCE(preference.timezone, 'UTC') = ? AND n.created_at < ?
         ORDER BY n.created_at, n.id LIMIT 40`,
-    )
-      .bind(candidate.user_id, candidate.workspace_id, candidate.timezone)
-      .all<{ id: string }>();
-    const { rows, suppressed } = await accessibleNotifications(
-      env,
-      candidate.user_id,
-      candidate.workspace_id,
-      ids.results.map((row) => row.id),
-    );
-    if (suppressed.length) {
-      await env.DB.prepare(`UPDATE notifications SET emailed_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-        .bind(timestamp, JSON.stringify(suppressed))
-        .run();
-    }
-    const claim = await claimDeliveries(
-      env,
-      rows.map((row) => `outbox:${row.id}`),
-      "email",
-    );
-    const claimedIds = new Set(claim.outboxIds);
-    const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
-    if (!claimed.length) continue;
-    const lines = claimed.map((row) => `• ${notificationCopy(row)}`);
-    try {
-      await env.SEND_EMAIL.send({
-        from: env.EMAIL_FROM,
-        to: candidate.email,
-        subject: `${claimed.length} Notes update${claimed.length === 1 ? "" : "s"}`,
-        text: `Your daily Notes digest:\n\n${lines.join("\n")}`,
-        html: `<p>Your daily Notes digest:</p><ul>${claimed
-          .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
-          .join("")}</ul>`,
-      });
-      const finished = await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent");
-      const deliveredIds = finished.map((outboxId) => outboxId.slice("outbox:".length));
-      if (deliveredIds.length) {
+      )
+        .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
+        .all<{ id: string }>();
+      const { rows, suppressed } = await accessibleNotifications(
+        env,
+        candidate.user_id,
+        candidate.workspace_id,
+        ids.results.map((row) => row.id),
+      );
+      if (suppressed.length) {
         await env.DB.prepare(`UPDATE notifications SET emailed_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-          .bind(Date.now(), JSON.stringify(deliveredIds))
+          .bind(timestamp, JSON.stringify(suppressed))
           .run();
       }
-    } catch (error) {
-      await finishClaimedDeliveries(
+      const claim = await claimDeliveries(
         env,
-        claim.outboxIds,
+        rows.map((row) => `outbox:${row.id}`),
         "email",
-        claim.token,
-        "failed",
-        error instanceof Error ? error.message.slice(0, 500) : "Digest delivery failed.",
       );
-      console.error("Notification digest email failed", { userId: candidate.user_id, error });
+      const claimedIds = new Set(claim.outboxIds);
+      const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
+      if (!claimed.length) continue;
+      const lines = claimed.map((row) => `• ${notificationCopy(row)}`);
+      try {
+        await env.SEND_EMAIL.send({
+          from: env.EMAIL_FROM,
+          to: candidate.email,
+          subject: `${claimed.length} Notes update${claimed.length === 1 ? "" : "s"}`,
+          text: `Your daily Notes digest:\n\n${lines.join("\n")}`,
+          html: `<p>Your daily Notes digest:</p><ul>${claimed
+            .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
+            .join("")}</ul>`,
+        });
+        const finished = await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent");
+        const deliveredIds = finished.map((outboxId) => outboxId.slice("outbox:".length));
+        if (deliveredIds.length) {
+          await env.DB.prepare(`UPDATE notifications SET emailed_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
+            .bind(Date.now(), JSON.stringify(deliveredIds))
+            .run();
+        }
+      } catch (error) {
+        await finishClaimedDeliveries(
+          env,
+          claim.outboxIds,
+          "email",
+          claim.token,
+          "failed",
+          error instanceof Error ? error.message.slice(0, 500) : "Digest delivery failed.",
+        );
+        console.error("Notification digest email failed", { userId: candidate.user_id, error });
+      }
     }
   }
 }
@@ -892,9 +908,13 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
 async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
   const dueTimezones = await dueDigestTimezones(env, "slack", timestamp);
   if (!dueTimezones.length) return;
-  const readCandidates = (cursor: DigestCursor) =>
-    env.DB.prepare(
-      `SELECT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
+  let remaining = DIGEST_CANDIDATE_MAX;
+  const rateLimitedWorkspaces = new Set<string>();
+  for (const window of dueTimezones) {
+    if (!remaining) break;
+    const readCandidates = (cursor: DigestCursor, pageSize: number) =>
+      env.DB.prepare(
+        `SELECT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
          FROM notifications n
          JOIN slack_installations installation
            ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL
@@ -903,89 +923,82 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
          LEFT JOIN notification_preferences preference
            ON preference.user_id = n.user_id AND preference.event_type = n.event_type
         WHERE n.slack_at IS NULL AND ${digestModeSql("slack")}
-          AND COALESCE(preference.timezone, 'UTC') IN (SELECT value FROM json_each(?))
-          AND (n.user_id > ? OR (n.user_id = ? AND (n.workspace_id > ? OR (n.workspace_id = ?
-              AND COALESCE(preference.timezone, 'UTC') > ?))))
+          AND COALESCE(preference.timezone, 'UTC') = ? AND n.created_at < ?
+          AND (n.user_id > ? OR (n.user_id = ? AND n.workspace_id > ?))
         GROUP BY n.user_id, n.workspace_id, timezone
-        ORDER BY n.user_id, n.workspace_id, timezone
+        ORDER BY n.user_id, n.workspace_id
         LIMIT ?`,
-    )
-      .bind(
-        JSON.stringify(dueTimezones),
-        cursor.userId,
-        cursor.userId,
-        cursor.workspaceId,
-        cursor.workspaceId,
-        cursor.timezone,
-        DIGEST_CANDIDATE_PAGE,
       )
-      .all<{ user_id: string; workspace_id: string; timezone: string }>();
-  const rateLimitedWorkspaces = new Set<string>();
-  for (const candidate of await digestCandidates(env, "slack", readCandidates)) {
-    if (rateLimitedWorkspaces.has(candidate.workspace_id)) continue;
-    const ids = await env.DB.prepare(
-      `SELECT n.id FROM notifications n
+        .bind(window.timezone, window.cutoff, cursor.userId, cursor.userId, cursor.workspaceId, pageSize)
+        .all<{ user_id: string; workspace_id: string; timezone: string }>();
+    const candidates = await digestCandidates(env, "slack", window.timezone, remaining, readCandidates);
+    remaining -= candidates.length;
+    for (const candidate of candidates) {
+      if (rateLimitedWorkspaces.has(candidate.workspace_id)) continue;
+      const ids = await env.DB.prepare(
+        `SELECT n.id FROM notifications n
         LEFT JOIN notification_preferences preference
           ON preference.user_id = n.user_id AND preference.event_type = n.event_type
         WHERE n.user_id = ? AND n.workspace_id = ? AND n.slack_at IS NULL
-          AND ${digestModeSql("slack")} AND COALESCE(preference.timezone, 'UTC') = ?
+          AND ${digestModeSql("slack")} AND COALESCE(preference.timezone, 'UTC') = ? AND n.created_at < ?
         ORDER BY n.created_at, n.id LIMIT 40`,
-    )
-      .bind(candidate.user_id, candidate.workspace_id, candidate.timezone)
-      .all<{ id: string }>();
-    const { rows, suppressed } = await accessibleNotifications(
-      env,
-      candidate.user_id,
-      candidate.workspace_id,
-      ids.results.map((row) => row.id),
-    );
-    if (suppressed.length) {
-      await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-        .bind(timestamp, JSON.stringify(suppressed))
-        .run();
-    }
-    if (!rows.length) continue;
-    const claim = await claimDeliveries(
-      env,
-      rows.map((row) => `outbox:${row.id}`),
-      "slack",
-    );
-    const claimedIds = new Set(claim.outboxIds);
-    const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
-    if (!claimed.length) continue;
-    try {
-      const sent = await sendPersonalSlackNotification(
+      )
+        .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
+        .all<{ id: string }>();
+      const { rows, suppressed } = await accessibleNotifications(
         env,
         candidate.user_id,
         candidate.workspace_id,
-        `Your daily Notes digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
-        claimed[0]!.page_id,
+        ids.results.map((row) => row.id),
       );
-      const finished = await finishClaimedDeliveries(
-        env,
-        claim.outboxIds,
-        "slack",
-        claim.token,
-        sent ? "sent" : "failed",
-        sent ? null : "unavailable",
-      );
-      if (sent) {
+      if (suppressed.length) {
         await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-          .bind(Date.now(), JSON.stringify(finished.map((outboxId) => outboxId.slice("outbox:".length))))
+          .bind(timestamp, JSON.stringify(suppressed))
           .run();
       }
-    } catch (error) {
-      await finishClaimedDeliveries(
+      if (!rows.length) continue;
+      const claim = await claimDeliveries(
         env,
-        claim.outboxIds,
+        rows.map((row) => `outbox:${row.id}`),
         "slack",
-        claim.token,
-        "failed",
-        error instanceof Error ? error.message.slice(0, 500) : "Slack digest failed.",
       );
-      if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
-      // One unreachable recipient must not starve the digests queued behind it.
-      console.error("Notification digest Slack message failed", { userId: candidate.user_id, error });
+      const claimedIds = new Set(claim.outboxIds);
+      const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
+      if (!claimed.length) continue;
+      try {
+        const sent = await sendPersonalSlackNotification(
+          env,
+          candidate.user_id,
+          candidate.workspace_id,
+          `Your daily Notes digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
+          claimed[0]!.page_id,
+        );
+        const finished = await finishClaimedDeliveries(
+          env,
+          claim.outboxIds,
+          "slack",
+          claim.token,
+          sent ? "sent" : "failed",
+          sent ? null : "unavailable",
+        );
+        if (sent) {
+          await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
+            .bind(Date.now(), JSON.stringify(finished.map((outboxId) => outboxId.slice("outbox:".length))))
+            .run();
+        }
+      } catch (error) {
+        await finishClaimedDeliveries(
+          env,
+          claim.outboxIds,
+          "slack",
+          claim.token,
+          "failed",
+          error instanceof Error ? error.message.slice(0, 500) : "Slack digest failed.",
+        );
+        if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
+        // One unreachable recipient must not starve the digests queued behind it.
+        console.error("Notification digest Slack message failed", { userId: candidate.user_id, error });
+      }
     }
   }
 }

@@ -4,10 +4,13 @@ import * as Y from "yjs";
 import type { Job } from "../shared/types";
 import { createZip, readZip } from "../shared/zip";
 import type { Env } from "./env";
+import { runImport } from "./importer";
 import {
+  claimJobWorkflowRun,
   cleanupTemplateClone,
   consumeDeliveryMessage,
   expireJobArtifacts,
+  finishPendingJobCleanup,
   recoverQueuedJobs,
   resolveJobWorkflowAttempt,
   runCommentMigration,
@@ -321,6 +324,82 @@ describe("job execution", () => {
     );
   });
 
+  it("loads the same running workflow attempt idempotently", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, workflow_instance_id, attempt, created_at, updated_at)
+       VALUES (?, ?, 'search_reindex', 'queued', ?, 'workflow-retry', 2, ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+      .run();
+    const event = { payload: { jobId, attempt: 2 }, instanceId: "workflow-retry" };
+
+    expect(await claimJobWorkflowRun(env, event, 2)).toMatchObject({ id: jobId, status: "running", attempt: 2 });
+    expect(await claimJobWorkflowRun(env, event, 2)).toMatchObject({ id: jobId, status: "running", attempt: 2 });
+    expect(await claimJobWorkflowRun(env, { ...event, instanceId: "stale-workflow" }, 2)).toBeNull();
+  });
+
+  it("finishes cancellation cleanup when its workflow instance has expired", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, workflow_instance_id, cleanup_target,
+         progress_label, created_at, updated_at)
+       VALUES (?, ?, 'import', 'canceling', ?, 'expired-workflow', 'canceled', 'Canceling', ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+      .run();
+    const get = vi.fn(async () => {
+      throw new Error("Workflow instance expired");
+    });
+
+    await finishPendingJobCleanup(bindingsWith({ NOTES_WORKFLOW: { get } }), { id: jobId, attempt: 1 });
+
+    expect(get).toHaveBeenCalledWith("expired-workflow");
+    expect(
+      await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`).bind(jobId).first(),
+    ).toEqual({ status: "canceled", cleanup_target: null, progress_label: "Canceled" });
+  });
+
+  it("keeps failed export cleanup recoverable and labeled as a failure", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const outputKey = `jobs/${jobId}/attempts/1/output/export.md`;
+    const timestamp = Date.now();
+    await env.BUCKET.put(outputKey, "orphaned export");
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, cleanup_target, progress_label,
+         error_code, error_message, created_at, updated_at)
+       VALUES (?, ?, 'export', 'running', ?, 'failed', 'Cleaning up', 'job_failed', 'render failed', ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+      .run();
+    const failingBucket = { list: vi.fn(async () => Promise.reject(new Error("R2 unavailable"))) };
+
+    await expect(
+      finishPendingJobCleanup(bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: failingBucket }), {
+        id: jobId,
+        attempt: 1,
+      }),
+    ).rejects.toThrow("R2 unavailable");
+    expect(
+      await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`).bind(jobId).first(),
+    ).toEqual({ status: "running", cleanup_target: "failed", progress_label: "Failure cleanup pending" });
+
+    await finishPendingJobCleanup(inlineBindings(), { id: jobId, attempt: 1 });
+
+    expect(await env.BUCKET.get(outputKey)).toBeNull();
+    expect(
+      await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`).bind(jobId).first(),
+    ).toEqual({ status: "failed", cleanup_target: null, progress_label: "Failed" });
+  });
+
   it("cleans staged template clone resources after cancellation", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
@@ -447,6 +526,55 @@ describe("job execution", () => {
     ).toEqual({ import_job_id: jobId, content_epoch: 2 });
   });
 
+  it("cleans a staged template page left at an older epoch by the current attempt", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const targetPageId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const options = JSON.stringify({
+      sourcePageId: installed.pageId,
+      targetPageId,
+      targetSpaceId: `${installed.workspaceId}-general`,
+      parentId: null,
+      title: "Unfenced clone",
+      isTemplate: false,
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, space_id, type, status, requested_by, options_json, attempt, created_at, updated_at)
+         VALUES (?, ?, ?, 'template_clone', 'running', ?, ?, 2, ?, ?)`,
+      ).bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        options,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, import_job_id, content_epoch,
+           created_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'table', 'z-unfenced', 'Unfenced clone', ?, 1, ?, ?, ?)`,
+      ).bind(
+        targetPageId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        jobId,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+    ]);
+    const current = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+
+    await cleanupTemplateClone(env, current);
+
+    expect(await env.DB.prepare(`SELECT id FROM pages WHERE id = ?`).bind(targetPageId).first()).toBeNull();
+  });
+
   it("authorizes job artifacts and expires their exact R2 keys", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
@@ -485,7 +613,7 @@ describe("job execution", () => {
 
   it("exports a freshly flushed document with portable attachments", async () => {
     const installed = await bootstrap();
-    const attachmentId = crypto.randomUUID();
+    const attachmentId = "brief[1";
     const attachmentKey = `assets/${installed.workspaceId}/${attachmentId}/brief`;
     await env.BUCKET.put(attachmentKey, "portable bytes", { httpMetadata: { contentType: "text/plain" } });
     await env.DB.prepare(
@@ -893,9 +1021,108 @@ describe("job execution", () => {
       await env.DB.prepare(`SELECT name FROM attachments WHERE page_id = ?`).bind(project.id).first(),
     ).toMatchObject({ name: "photo.png" });
   });
+
+  it("re-fences staged pages and attachments that survive into an import retry", async () => {
+    const installed = await bootstrap();
+    const sourcePath = "Project 0123456789abcdef0123456789abcdef";
+    const zip = createZip([
+      {
+        path: `${sourcePath}.html`,
+        bytes: new TextEncoder().encode(
+          `<article><div class="page-body"><p>Overview</p><img src="${sourcePath}/photo.png"></div></article>`,
+        ),
+      },
+      { path: `${sourcePath}/photo.png`, bytes: new Uint8Array([137, 80, 78, 71]) },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "retry.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await response.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const awaiting = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+    await env.DB.prepare(`UPDATE jobs SET status = 'running', options_json = ? WHERE id = ?`)
+      .bind(JSON.stringify({ ...JSON.parse(awaiting.options_json), confirmed: true }), jobId)
+      .run();
+    const firstAttempt = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+
+    await expect(
+      runImport(env, firstAttempt, {
+        async do<T>(name: string, callback: () => Promise<T>) {
+          if (name === "write imported content") throw new Error("interrupted after asset upload");
+          return callback();
+        },
+      } as Parameters<typeof runImport>[2]),
+    ).rejects.toThrow("interrupted after asset upload");
+    const surviving = (await env.DB.prepare(
+      `SELECT attachment.r2_key, page.content_epoch
+         FROM attachments attachment JOIN pages page ON page.id = attachment.page_id
+        WHERE page.import_job_id = ?`,
+    )
+      .bind(jobId)
+      .first<{ r2_key: string; content_epoch: number }>())!;
+    expect(surviving).toMatchObject({ content_epoch: 1 });
+    expect(surviving.r2_key).toContain("/attempts/1/");
+
+    await env.DB.prepare(`UPDATE jobs SET attempt = 2, progress_current = 0 WHERE id = ?`).bind(jobId).run();
+    const retry = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+    await runImport(env, retry, {
+      async do<T>(_name: string, callback: () => Promise<T>) {
+        return callback();
+      },
+    } as Parameters<typeof runImport>[2]);
+
+    const published = await env.DB.prepare(
+      `SELECT attachment.r2_key, page.content_epoch, page.import_job_id
+         FROM attachments attachment JOIN pages page ON page.id = attachment.page_id
+        WHERE page.workspace_id = ? AND page.title = 'Project'`,
+    )
+      .bind(installed.workspaceId)
+      .first<{ r2_key: string; content_epoch: number; import_job_id: string | null }>();
+    expect(published).toMatchObject({ content_epoch: 2, import_job_id: null });
+    expect(published?.r2_key).toContain("/attempts/2/");
+    expect(await env.BUCKET.get(surviving.r2_key)).toBeNull();
+    expect(await env.BUCKET.get(published!.r2_key)).toBeTruthy();
+  });
 });
 
 describe("delivery outbox", () => {
+  it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {
+    const installed = await bootstrap();
+    const outboxId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO outbox
+        (id, workspace_id, topic, payload_json, available_at, attempts, created_at)
+       VALUES (?, ?, 'notification', '{}', ?, 9, ?)`,
+    )
+      .bind(outboxId, installed.workspaceId, timestamp - 1, timestamp - 10_000)
+      .run();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await sweepOutbox(
+      bindingsWith({ DELIVERY_QUEUE: { send: vi.fn(async () => Promise.reject(new Error("poison"))) } }),
+    );
+
+    expect(log).toHaveBeenCalledWith("Outbox row has persistent enqueue failures", {
+      outboxId,
+      attempts: 10,
+      error: "poison",
+    });
+    expect(await env.DB.prepare(`SELECT attempts, last_error FROM outbox WHERE id = ?`).bind(outboxId).first()).toEqual(
+      {
+        attempts: 10,
+        last_error: "poison",
+      },
+    );
+    log.mockRestore();
+  });
+
   it("keeps retrying an outbox row after ten transient enqueue failures", async () => {
     const installed = await bootstrap();
     const outboxId = crypto.randomUUID();

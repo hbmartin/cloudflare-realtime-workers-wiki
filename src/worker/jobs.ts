@@ -11,16 +11,19 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
-import { runExport } from "./exporter";
+import { cleanupExport, runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
 import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
 
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
+const OUTBOX_POISON_WARNING_ATTEMPTS = 10;
+const OUTBOX_POISON_WARNING_INTERVAL = 24;
 const OUTBOX_RETRY_BASE_MS = 10_000;
 const OUTBOX_RETRY_MAX_MS = 60 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
+const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
 
 export type JobWorkflowParams = { jobId: string; attempt?: number };
 export type DeliveryQueueMessage = { outboxId: string };
@@ -194,12 +197,21 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     if (existing.import_job_id !== job.id) throw new Error("The template target id is already in use.");
     if (existing.content_epoch !== job.attempt) {
       // A retry must not reuse the purged document room of the previous attempt.
-      await env.DB.prepare(
+      const updated = await env.DB.prepare(
         `UPDATE pages SET content_epoch = ? WHERE id = ? AND import_job_id = ?
           AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
       )
         .bind(job.attempt, existing.id, job.id, job.id, job.attempt)
         .run();
+      if (!updated.meta.changes) {
+        await assertJobActive(env, job);
+        const current = await env.DB.prepare(`SELECT import_job_id, content_epoch FROM pages WHERE id = ?`)
+          .bind(existing.id)
+          .first<{ import_job_id: string | null; content_epoch: number }>();
+        if (current?.import_job_id !== job.id || current.content_epoch !== job.attempt) {
+          throw new Error("The staged template page could not be fenced to this attempt.");
+        }
+      }
       existing.content_epoch = job.attempt;
     }
     return { published: false, page: existing };
@@ -320,9 +332,9 @@ async function cloneTemplateAttachments(env: Env, job: JobRow, options: Template
     const targetId = await templateAttachmentId(job.id, attachment.id);
     ids.set(attachment.id, targetId);
     const key = `assets/${job.workspace_id}/${targetId}/attempts/${job.attempt}/${attachment.content_sha256 ?? "clone"}`;
-    const existing = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ?`)
+    const existing = await env.DB.prepare(`SELECT page_id, r2_key FROM attachments WHERE id = ?`)
       .bind(targetId)
-      .first<{ r2_key: string }>();
+      .first<{ page_id: string; r2_key: string }>();
     if (!existing) {
       const object = await env.BUCKET.get(attachment.r2_key);
       if (!object) throw new Error(`Template attachment ${attachment.id} is missing.`);
@@ -348,8 +360,30 @@ async function cloneTemplateAttachments(env: Env, job: JobRow, options: Template
           Date.now(),
         )
         .run();
-    } else if (existing.r2_key !== key) {
+    } else if (existing.page_id !== options.targetPageId) {
       throw new Error("A cloned attachment id is already in use.");
+    } else if (existing.r2_key !== key) {
+      const object = await env.BUCKET.get(attachment.r2_key);
+      if (!object) throw new Error(`Template attachment ${attachment.id} is missing.`);
+      await env.BUCKET.put(key, object.body, {
+        ...(object.httpMetadata && { httpMetadata: object.httpMetadata }),
+        customMetadata: { ...object.customMetadata, attachmentId: targetId },
+      });
+      const moved = await env.DB.prepare(
+        `UPDATE attachments SET r2_key = ? WHERE id = ? AND page_id = ? AND r2_key = ?
+          AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
+      )
+        .bind(key, targetId, options.targetPageId, existing.r2_key, job.id, job.attempt)
+        .run();
+      if (!moved.meta.changes) {
+        const replay = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ?`)
+          .bind(targetId)
+          .first<{ r2_key: string }>();
+        if (replay?.r2_key !== key) await env.BUCKET.delete(key);
+        if (replay?.r2_key !== key) throw new Error("The cloned attachment could not be fenced to this attempt.");
+      } else {
+        await env.BUCKET.delete(existing.r2_key);
+      }
     }
   }
   await updateJob(env, job, { current: 2, total: 4, label: "Initializing page" });
@@ -441,7 +475,7 @@ export async function cleanupTemplateClone(
   const options = templateCloneOptions(job);
   const staged = await env.DB.prepare(
     `SELECT id, kind, content_epoch FROM pages
-      WHERE id = ? AND import_job_id = ? AND content_epoch = ?`,
+      WHERE id = ? AND import_job_id = ? AND content_epoch <= ?`,
   )
     .bind(options.targetPageId, job.id, job.attempt)
     .first<{ id: string; kind: "document" | "table"; content_epoch: number }>();
@@ -466,7 +500,7 @@ export async function cleanupTemplateClone(
   if (staged) {
     if (!(await stillOwned())) return;
     await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ? AND content_epoch = ?`)
-      .bind(options.targetPageId, job.id, job.attempt)
+      .bind(options.targetPageId, job.id, staged.content_epoch)
       .run();
   }
   const keys = [
@@ -481,7 +515,7 @@ export async function cleanupTemplateClone(
   ] as string[];
   if (keys.length && (await stillOwned())) await env.BUCKET.delete(keys);
   if (staged && (await stillOwned()))
-    await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/epochs/${job.attempt}/`);
+    await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/epochs/${staged.content_epoch}/`);
   if (!(await stillOwned())) return;
   await env.DB.prepare(`UPDATE jobs SET input_key = NULL, updated_at = ? WHERE id = ? AND attempt = ?`)
     .bind(Date.now(), job.id, job.attempt)
@@ -621,14 +655,34 @@ export async function beginJobCancellation(env: Env, job: Pick<JobRow, "id" | "a
     .first<JobRow>();
 }
 
-async function cleanupLeaseOwned(env: Env, job: Pick<JobRow, "id" | "attempt">, token: string) {
-  return Boolean(
-    await env.DB.prepare(
-      `SELECT 1 owned FROM jobs WHERE id = ? AND attempt = ? AND cleanup_token = ?
-        AND cleanup_target IS NOT NULL AND status IN ('running', 'canceling')`,
+function cleanupLeaseGuard(env: Env, job: Pick<JobRow, "id" | "attempt">, token: string, claimedAt: number) {
+  let refreshAfter = claimedAt + JOB_CLEANUP_LEASE_RENEW_MS;
+  return async () => {
+    const timestamp = Date.now();
+    if (timestamp < refreshAfter) return true;
+    const renewed = await env.DB.prepare(
+      `UPDATE jobs SET cleanup_started_at = ?, updated_at = ?
+        WHERE id = ? AND attempt = ? AND cleanup_token = ?
+          AND cleanup_target IS NOT NULL AND status IN ('running', 'canceling')`,
     )
-      .bind(job.id, job.attempt, token)
-      .first(),
+      .bind(timestamp, timestamp, job.id, job.attempt, token)
+      .run();
+    if (renewed.meta.changes) refreshAfter = timestamp + JOB_CLEANUP_LEASE_RENEW_MS;
+    return Boolean(renewed.meta.changes);
+  };
+}
+
+function workflowInstanceMissing(error: unknown) {
+  const value =
+    error && typeof error === "object"
+      ? (error as { code?: unknown; status?: unknown; message?: unknown })
+      : { message: error };
+  if (value.code === 404 || value.status === 404) return true;
+  return (
+    typeof value.message === "string" &&
+    /(?:not found|does not exist|no longer exists|unknown (?:workflow )?instance|(?:workflow )?instance (?:has )?(?:expired|deleted))/i.test(
+      value.message,
+    )
   );
 }
 
@@ -655,18 +709,23 @@ export async function finishPendingJobCleanup(
     .first<JobRow>();
   if (!job) return false;
 
-  const stillOwned = () => cleanupLeaseOwned(env, identity, token);
+  const stillOwned = cleanupLeaseGuard(env, identity, token, timestamp);
   try {
     if (options.terminateWorkflow !== false && job.workflow_instance_id && env.WORKFLOW_INLINE !== "true") {
-      const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
-      const status = await instance.status();
-      if (["queued", "running", "paused", "waiting", "waitingForPause"].includes(status.status)) {
-        await instance.terminate();
+      try {
+        const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
+        const status = await instance.status();
+        if (["queued", "running", "paused", "waiting", "waitingForPause"].includes(status.status)) {
+          await instance.terminate();
+        }
+      } catch (error) {
+        if (!workflowInstanceMissing(error)) throw error;
       }
     }
     if (!(await stillOwned())) return false;
     if (job.type === "import") await cleanupImport(env, job, stillOwned);
     if (job.type === "template_clone") await cleanupTemplateClone(env, job, stillOwned);
+    if (job.type === "export") await cleanupExport(env, job, stillOwned);
     if (!(await stillOwned())) return false;
     const completedAt = Date.now();
     const finished = await env.DB.prepare(
@@ -687,7 +746,9 @@ export async function finishPendingJobCleanup(
     // Keep the job non-retryable while cleanup is incomplete. The scheduled
     // recovery pass (or an explicit retry-cancel request) can claim it again.
     await env.DB.prepare(
-      `UPDATE jobs SET status = 'canceling', progress_label = 'Cleanup pending',
+      `UPDATE jobs SET
+         status = CASE cleanup_target WHEN 'canceled' THEN 'canceling' ELSE 'running' END,
+         progress_label = CASE cleanup_target WHEN 'canceled' THEN 'Cleanup pending' ELSE 'Failure cleanup pending' END,
          cleanup_token = NULL, cleanup_started_at = NULL, updated_at = ?
        WHERE id = ? AND attempt = ? AND cleanup_token = ?`,
     )
@@ -699,7 +760,7 @@ export async function finishPendingJobCleanup(
 }
 
 async function failJobWithCleanup(env: Env, job: JobRow, message: string) {
-  if (job.type !== "import" && job.type !== "template_clone") {
+  if (job.type !== "import" && job.type !== "template_clone" && job.type !== "export") {
     await updateJob(env, job, {
       status: "failed",
       label: "Failed",
@@ -857,6 +918,30 @@ export async function resolveJobWorkflowAttempt(
   return legacy?.attempt ?? null;
 }
 
+export async function claimJobWorkflowRun(
+  env: Env,
+  event: Pick<WorkflowEvent<JobWorkflowParams>, "payload" | "instanceId">,
+  attempt: number,
+) {
+  const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
+    .bind(event.payload.jobId, attempt)
+    .first<JobRow>();
+  if (!row || (row.workflow_instance_id ?? row.id) !== event.instanceId) return null;
+  if (row.status === "running") return row;
+  if (row.status !== "queued") return null;
+  const started = await updateJob(env, row, { status: "running", current: 0, label: "Preparing" });
+  if (started.meta.changes) {
+    await notifyJobs(env, row.workspace_id);
+    return { ...row, status: "running" as const, progress_current: 0, progress_label: "Preparing" };
+  }
+  const current = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
+    .bind(event.payload.jobId, attempt)
+    .first<JobRow>();
+  return current && current.status === "running" && (current.workflow_instance_id ?? current.id) === event.instanceId
+    ? current
+    : null;
+}
+
 export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
   async run(event: Readonly<WorkflowEvent<JobWorkflowParams>>, step: WorkflowStep) {
     const { jobId } = event.payload;
@@ -870,16 +955,8 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
     if (attempt === null) return;
     const identity = { id: jobId, attempt };
     try {
-      const job = await step.do("load job", async () => {
-        const row = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
-          .bind(jobId, attempt)
-          .first<JobRow>();
-        if (!row) throw new Error("Job not found.");
-        const started = await updateJob(this.env, row, { status: "running", current: 0, label: "Preparing" });
-        if (!started.meta.changes) throw new Error("Job is not queued.");
-        await notifyJobs(this.env, row.workspace_id);
-        return row;
-      });
+      const job = await step.do("load job", async () => claimJobWorkflowRun(this.env, event, attempt));
+      if (!job) return;
       if (job.type === "template_clone") {
         await runTemplateClone(this.env, job, step);
         return;
@@ -995,10 +1072,10 @@ async function enqueueOutbox(env: Env, outboxId: string) {
       .bind(Date.now(), outboxId)
       .run();
   } catch (error) {
-    await env.DB.prepare(
+    const failed = await env.DB.prepare(
       `UPDATE outbox SET attempts = attempts + 1, last_error = ?,
          available_at = ? + MIN(?, ? * (1 << MIN(attempts, 8)))
-        WHERE id = ?`,
+        WHERE id = ? RETURNING attempts, last_error`,
     )
       .bind(
         error instanceof Error ? error.message.slice(0, 500) : "Queue enqueue failed.",
@@ -1007,7 +1084,18 @@ async function enqueueOutbox(env: Env, outboxId: string) {
         OUTBOX_RETRY_BASE_MS,
         outboxId,
       )
-      .run();
+      .first<{ attempts: number; last_error: string | null }>();
+    if (
+      failed &&
+      (failed.attempts === OUTBOX_POISON_WARNING_ATTEMPTS ||
+        (failed.attempts > OUTBOX_POISON_WARNING_ATTEMPTS && failed.attempts % OUTBOX_POISON_WARNING_INTERVAL === 0))
+    ) {
+      console.error("Outbox row has persistent enqueue failures", {
+        outboxId,
+        attempts: failed.attempts,
+        error: failed.last_error,
+      });
+    }
     throw error;
   }
 }

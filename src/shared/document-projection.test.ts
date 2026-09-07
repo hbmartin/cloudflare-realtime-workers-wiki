@@ -104,6 +104,21 @@ describe("structured document projection", () => {
     expect(projection.pageReferences[0]!.excerpt).toContain("Late");
   });
 
+  it("serializes inputs with more delimiter and table entries than a function call can spread", () => {
+    const code = "`x".repeat(150_000);
+    const rows = Array.from({ length: 150_000 }, () => ({ type: "tableRow", content: [] }));
+
+    const serialized = serializeDocument(
+      document(
+        { type: "paragraph", content: [{ type: "text", text: code, marks: [{ type: "code" }] }] },
+        { type: "table", content: rows },
+      ),
+    );
+
+    expect(serialized.markdown).toContain(code);
+    expect(serialized.markdown.endsWith("|  |\n")).toBe(true);
+  });
+
   it("serializes custom nodes and neutralizes unsafe links and unknown nodes", () => {
     const serialized = serializeDocument(
       document(

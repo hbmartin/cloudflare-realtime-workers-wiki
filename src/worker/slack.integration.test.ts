@@ -546,7 +546,7 @@ describe("Slack security and integration", () => {
     ).toEqual({ delivered: 1 });
   });
 
-  it("stops channel digest requests only for the rate-limited Slack installation", async () => {
+  it("defers only the rate-limited Slack installation and retries it on a later tick", async () => {
     const installed = await bootstrap();
     await installSlack(installed.member);
     const timestamp = Date.UTC(2026, 8, 5, 9, 5);
@@ -614,20 +614,21 @@ describe("Slack security and integration", () => {
         installed.member.workspace.id,
         installed.member.user.id,
         installed.page.id,
-        timestamp,
+        timestamp - 10 * 60_000,
         installed.member.workspace.id,
         installed.member.user.id,
         installed.page.id,
-        timestamp + 1,
+        timestamp - 10 * 60_000 + 1,
         installed.member.user.id,
-        timestamp + 2,
+        timestamp - 10 * 60_000 + 2,
       ),
     ]);
     const channels: string[] = [];
+    let remainingRateLimits = 1;
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       channels.push(JSON.parse(String(init?.body)).channel as string);
       const authorization = new Headers(init?.headers).get("authorization");
-      return authorization === "Bearer xoxb-test-bot-token"
+      return authorization === "Bearer xoxb-test-bot-token" && remainingRateLimits-- > 0
         ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
         : Response.json({ ok: true });
     });
@@ -649,6 +650,16 @@ describe("Slack security and integration", () => {
         { id: "channel-event-c", delivered: 1 },
       ],
     });
+
+    await sendDueSlackChannelDigests(slackEnv(), timestamp + 15 * 60_000);
+
+    expect(channels).toEqual(["CRATEA", "CRATEC", "CRATEA", "CRATEB"]);
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) delivered FROM slack_channel_events
+          WHERE id LIKE 'channel-event-%' AND delivered_at IS NOT NULL`,
+      ).first(),
+    ).toEqual({ delivered: 3 });
     log.mockRestore();
   });
 });

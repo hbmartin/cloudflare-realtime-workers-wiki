@@ -830,7 +830,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
   const pageTreeErrorRevisionRef = useRef(0);
   const organizationLoadGenerationRef = useRef(0);
-  const pageTagsLoadGenerationRef = useRef(new Map<string, number>());
+  const pageTagsLoadGenerationRef = useRef(0);
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
   const selectedSpaceIdRef = useRef<string | null>(null);
@@ -1475,17 +1475,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }, [loadOrganization]);
   useEffect(() => {
     if (!selectedId) return;
-    const generations = pageTagsLoadGenerationRef.current;
-    const generation = (generations.get(selectedId) ?? 0) + 1;
-    generations.set(selectedId, generation);
+    const generation = ++pageTagsLoadGenerationRef.current;
     void api<{ tags: Tag[] }>(`/api/pages/${encodeURIComponent(selectedId)}/tags`)
       .then((data) => {
-        if (generation === generations.get(selectedId) && selectedIdRef.current === selectedId) {
+        if (generation === pageTagsLoadGenerationRef.current && selectedIdRef.current === selectedId) {
           setPageTags({ pageId: selectedId, tags: data.tags });
         }
       })
       .catch((error: unknown) => {
-        if (generation !== generations.get(selectedId) || selectedIdRef.current !== selectedId) return;
+        if (generation !== pageTagsLoadGenerationRef.current || selectedIdRef.current !== selectedId) return;
         setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
       });
   }, [organizationRevision, selectedId]);
@@ -1574,8 +1572,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       await api(`/api/pages/${encodeURIComponent(page.id)}/tags/${encodeURIComponent(tag.id)}`, {
         method: assigned ? "PUT" : "DELETE",
       });
-      const generations = pageTagsLoadGenerationRef.current;
-      generations.set(page.id, (generations.get(page.id) ?? 0) + 1);
+      if (selectedIdRef.current === page.id) pageTagsLoadGenerationRef.current += 1;
       setPageTags((current) => {
         if (selectedIdRef.current !== page.id) return current;
         const currentTags = current.pageId === page.id ? current.tags : [];
@@ -1611,8 +1608,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         method: "PUT",
       });
       const assignedTag = { ...data.tag, pageCount: 1 };
-      const generations = pageTagsLoadGenerationRef.current;
-      generations.set(page.id, (generations.get(page.id) ?? 0) + 1);
+      if (selectedIdRef.current === page.id) pageTagsLoadGenerationRef.current += 1;
       setTags((current) => [...current.filter((tag) => tag.id !== assignedTag.id), assignedTag]);
       setPageTags((current) => {
         if (selectedIdRef.current !== page.id) return current;
