@@ -8,6 +8,8 @@ import { migrateLegacyComments, type CommentPage } from "./comments";
 import { HttpError } from "./http";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
+import { deleteR2Prefix } from "./r2";
+import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
@@ -15,6 +17,11 @@ import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
 
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
+// A row that keeps failing must fall out of the sweep window rather than hold the
+// oldest `created_at` slot forever and crowd out every newer delivery.
+const OUTBOX_MAX_ATTEMPTS = 10;
+const OUTBOX_RETRY_BASE_MS = 10_000;
+const OUTBOX_RETRY_MAX_MS = 60 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 
 export type JobWorkflowParams = { jobId: string };
@@ -38,6 +45,7 @@ export type JobRow = {
   error_code: string | null;
   error_message: string | null;
   expires_at: number | null;
+  attempt: number;
   created_at: number;
   updated_at: number;
 };
@@ -183,6 +191,13 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     if (existing.import_job_id === null && existing.created_by === job.requested_by)
       return { published: true, page: existing };
     if (existing.import_job_id !== job.id) throw new Error("The template target id is already in use.");
+    if (existing.content_epoch !== job.attempt) {
+      // A retry must not reuse the purged document room of the previous attempt.
+      await env.DB.prepare(`UPDATE pages SET content_epoch = ? WHERE id = ? AND import_job_id = ?`)
+        .bind(job.attempt, existing.id, job.id)
+        .run();
+      existing.content_epoch = job.attempt;
+    }
     return { published: false, page: existing };
   }
   const source = await env.DB.prepare(
@@ -220,8 +235,8 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     env.DB.prepare(
       `INSERT INTO pages
         (id, workspace_id, space_id, parent_id, kind, position, title, icon, is_template, import_job_id,
-         created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         content_epoch, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       options.targetPageId,
       job.workspace_id,
@@ -233,6 +248,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
       source.icon,
       options.isTemplate ? 1 : 0,
       job.id,
+      job.attempt,
       job.requested_by,
       timestamp,
       timestamp,
@@ -386,14 +402,7 @@ async function publishTemplateClone(env: Env, job: JobRow, options: TemplateClon
        SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages
         WHERE id = ? AND import_job_id IS NULL AND is_template = 0`,
     ).bind(options.targetPageId),
-    env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id = ?`).bind(options.targetPageId),
-    env.DB.prepare(
-      `INSERT INTO page_search_v2
-        (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-       SELECT p.id, p.workspace_id, p.space_id, p.title, '', COALESCE(p.plain_text, ''), '',
-              COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-         FROM pages p WHERE p.id = ? AND p.import_job_id IS NULL AND p.is_template = 0`,
-    ).bind(options.targetPageId),
+    ...refreshPageSearchV2Statements(env.DB, options.targetPageId),
     env.DB.prepare(
       `UPDATE jobs SET status = 'succeeded', progress_current = 4, progress_total = 4,
         progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
@@ -413,24 +422,19 @@ async function publishTemplateClone(env: Env, job: JobRow, options: TemplateClon
   }
 }
 
-async function deleteR2Prefix(bucket: R2Bucket, prefix: string) {
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ prefix, ...(cursor ? { cursor } : {}) });
-    if (page.objects.length) await bucket.delete(page.objects.map((object) => object.key));
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-}
-
-async function cleanupTemplateClone(env: Env, job: JobRow, options: TemplateCloneOptions) {
+export async function cleanupTemplateClone(env: Env, job: JobRow) {
+  const options = templateCloneOptions(job);
   const staged = await env.DB.prepare(`SELECT id, kind, content_epoch FROM pages WHERE id = ? AND import_job_id = ?`)
     .bind(options.targetPageId, job.id)
     .first<{ id: string; kind: "document" | "table"; content_epoch: number }>();
-  if (!staged) return;
-  const attachments = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE page_id = ?`)
-    .bind(options.targetPageId)
-    .all<{ r2_key: string }>();
-  if (staged.kind === "document") {
+  const attachments = staged
+    ? (
+        await env.DB.prepare(`SELECT r2_key FROM attachments WHERE page_id = ?`)
+          .bind(options.targetPageId)
+          .all<{ r2_key: string }>()
+      ).results
+    : [];
+  if (staged?.kind === "document") {
     const purged = await env.DOCUMENT.getByName(`${staged.id}~${staged.content_epoch}`).fetch(
       new Request("https://document.internal/purge", {
         method: "POST",
@@ -439,16 +443,18 @@ async function cleanupTemplateClone(env: Env, job: JobRow, options: TemplateClon
     );
     if (!purged.ok) throw new Error("The staged document could not be purged.");
   }
-  await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ?`).bind(options.targetPageId, job.id).run();
+  if (staged) {
+    await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ?`)
+      .bind(options.targetPageId, job.id)
+      .run();
+  }
   const keys = [
     ...new Set(
-      [job.input_key, `jobs/${job.id}/template-content.bin`, ...attachments.results.map((row) => row.r2_key)].filter(
-        Boolean,
-      ),
+      [job.input_key, `jobs/${job.id}/template-content.bin`, ...attachments.map((row) => row.r2_key)].filter(Boolean),
     ),
   ] as string[];
   if (keys.length) await env.BUCKET.delete(keys);
-  await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/`);
+  if (staged) await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/`);
   await env.DB.prepare(`UPDATE jobs SET input_key = NULL, updated_at = ? WHERE id = ?`).bind(Date.now(), job.id).run();
 }
 
@@ -558,7 +564,7 @@ export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "work
     else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
     if (row.type === "template_clone") {
-      await cleanupTemplateClone(env, row, templateCloneOptions(row)).catch((cleanupError) => {
+      await cleanupTemplateClone(env, row).catch((cleanupError) => {
         console.error("Failed to clean up inline template clone", { jobId: row.id, cleanupError });
       });
     } else if (row.type === "import") {
@@ -639,19 +645,7 @@ async function reindexPageBatch(env: Env, workspaceId: string, afterId: string) 
   if (!pages.results.length) return { lastId: afterId, count: 0 };
   const statements: D1PreparedStatement[] = [];
   for (const page of pages.results) {
-    statements.push(
-      env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id = ?`).bind(page.id),
-      env.DB.prepare(
-        `INSERT INTO page_search_v2
-          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-         SELECT p.id, p.workspace_id, p.space_id, p.title,
-                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
-                COALESCE(p.plain_text, ''),
-                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-           FROM pages p WHERE p.id = ? AND p.import_job_id IS NULL AND p.is_template = 0`,
-      ).bind(page.id),
-    );
+    statements.push(...refreshPageSearchV2Statements(env.DB, page.id));
   }
   await env.DB.batch(statements);
   return { lastId: pages.results.at(-1)!.id, count: pages.results.length };
@@ -788,7 +782,7 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       if (current?.status === "canceling" || current?.status === "canceled") {
         const canceledJob = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>();
         if (canceledJob?.type === "template_clone") {
-          await cleanupTemplateClone(this.env, canceledJob, templateCloneOptions(canceledJob)).catch((cleanupError) => {
+          await cleanupTemplateClone(this.env, canceledJob).catch((cleanupError) => {
             console.error("Failed to clean up canceled template clone", { jobId, cleanupError });
           });
         }
@@ -802,7 +796,7 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       }
       const failedJob = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>();
       if (failedJob?.type === "template_clone") {
-        await cleanupTemplateClone(this.env, failedJob, templateCloneOptions(failedJob)).catch((cleanupError) => {
+        await cleanupTemplateClone(this.env, failedJob).catch((cleanupError) => {
           console.error("Failed to clean up failed template clone", { jobId, cleanupError });
         });
       }
@@ -853,8 +847,18 @@ async function enqueueOutbox(env: Env, outboxId: string) {
       .bind(Date.now(), outboxId)
       .run();
   } catch (error) {
-    await env.DB.prepare(`UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?`)
-      .bind(error instanceof Error ? error.message.slice(0, 500) : "Queue enqueue failed.", outboxId)
+    await env.DB.prepare(
+      `UPDATE outbox SET attempts = attempts + 1, last_error = ?,
+         available_at = ? + MIN(?, ? * (1 << MIN(attempts, 8)))
+        WHERE id = ?`,
+    )
+      .bind(
+        error instanceof Error ? error.message.slice(0, 500) : "Queue enqueue failed.",
+        Date.now(),
+        OUTBOX_RETRY_MAX_MS,
+        OUTBOX_RETRY_BASE_MS,
+        outboxId,
+      )
       .run();
     throw error;
   }
@@ -862,9 +866,10 @@ async function enqueueOutbox(env: Env, outboxId: string) {
 
 export async function sweepOutbox(env: Env) {
   const rows = await env.DB.prepare(
-    `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ? ORDER BY created_at LIMIT ?`,
+    `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ? AND attempts < ?
+      ORDER BY created_at LIMIT ?`,
   )
-    .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
+    .bind(Date.now(), OUTBOX_MAX_ATTEMPTS, OUTBOX_SWEEP_BATCH_SIZE)
     .all<{ id: string }>();
   for (const row of rows.results) {
     try {
@@ -873,6 +878,13 @@ export async function sweepOutbox(env: Env) {
       console.error("Outbox enqueue failed", { outboxId: row.id, error });
     }
   }
+  const exhausted = await env.DB.prepare(
+    `SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL AND attempts >= ?`,
+  )
+    .bind(OUTBOX_MAX_ATTEMPTS)
+    .first<{ count: number }>();
+  // These rows are now invisible to the sweep, so say so rather than dropping them silently.
+  if (exhausted?.count) console.error("Outbox rows exhausted their attempts", { rows: exhausted.count });
 }
 
 export async function consumeDeliveryMessage(env: Env, message: Message<DeliveryQueueMessage>) {
@@ -889,17 +901,24 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
     return;
   }
   const payload = jsonRecord(row.payload_json);
+  // A payload that fails validation will never become valid, so record it and ack
+  // instead of retrying. An unknown topic still throws: a rolling deploy can leave an
+  // older consumer reading a topic a newer one writes, and that does resolve on retry.
+  const rejectPayload = async (reason: string) => {
+    await env.DB.prepare(`UPDATE outbox SET last_error = ? WHERE id = ?`).bind(reason, outboxId).run();
+    message.ack();
+  };
   if (row.topic === "notification") {
     const notificationId = payload.notificationId;
-    if (typeof notificationId !== "string") throw new Error("Notification outbox payload is invalid.");
+    if (typeof notificationId !== "string") return await rejectPayload("Notification outbox payload is invalid.");
     await deliverNotification(env, notificationId, outboxId);
   } else if (row.topic === "slack_channel") {
     const eventId = payload.eventId;
-    if (typeof eventId !== "string") throw new Error("Slack channel outbox payload is invalid.");
+    if (typeof eventId !== "string") return await rejectPayload("Slack channel outbox payload is invalid.");
     await deliverSlackChannelEvent(env, eventId);
   } else if (row.topic === "slack_unfurl") {
     const unfurlId = payload.unfurlId;
-    if (typeof unfurlId !== "string") throw new Error("Slack unfurl outbox payload is invalid.");
+    if (typeof unfurlId !== "string") return await rejectPayload("Slack unfurl outbox payload is invalid.");
     await deliverSlackUnfurl(env, unfurlId);
   } else throw new Error(`Unsupported outbox topic: ${row.topic}`);
   message.ack();

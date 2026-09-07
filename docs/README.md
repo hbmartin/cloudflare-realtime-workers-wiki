@@ -37,14 +37,14 @@ compaction, not keystrokes, so they lag edits by up to the 30-second compaction 
 `WorkspaceEvents` Durable Objects hold no authoritative state. They only fan out page-tree and
 projection-invalidation events; losing one costs freshness, not data.
 
-## The hourly cron is load-bearing
+## The cron is load-bearing
 
-`triggers.crons` in `wrangler.jsonc` is set to `0 * * * *`. The scheduled handler retries document-room
+`triggers.crons` in `wrangler.jsonc` is set to `*/15 * * * *`. The scheduled handler retries document-room
 disconnects left behind by archive, and Durable Object and R2 targets left behind by permanent deletion.
 Disabling it does not degrade gracefully: archived pages keep live editors connected, and permanently
 deleted pages leak Durable Objects and R2 objects indefinitely.
 
-Each tick drains at most 10 deletion jobs and 50 archive-disconnect targets. See
+Each tick drains at most 10 deletion jobs and 50 archive-disconnect targets, four times an hour. See
 [Configuration](CONFIGURATION.md#cron-drain-rates-and-backoff) for what that means for backlogs.
 
 ## Degradation matrix
@@ -56,7 +56,7 @@ What survives when a dependency fails. Read this first during an incident.
 | D1                   | Warm and hibernating document rooms keep accepting edits and buffering to their own SQLite | Every API request and WebSocket upgrade fails; a _cold_ Durable Object cannot start; compaction fails, re-dirties the room, and retries every 30 seconds       |
 | R2                   | The Durable Object update log is preserved intact                                          | Rooms cannot load; compaction retries; attachments return `attachment_missing`; versions return `version_missing`; restore returns 503                         |
 | `WorkspaceEvents` DO | Everything, silently                                                                       | Page-tree, backlink, and mention pushes stop. The UI goes stale until a reconnect triggers a full `/api/pages/tree` reload. **No user-facing error is raised** |
-| One `Document` DO    | The rest of the workspace                                                                  | That one page is unavailable. Archive and permanent-delete cleanup land in the retry tables and drain hourly                                                   |
+| One `Document` DO    | The rest of the workspace                                                                  | That one page is unavailable. Archive and permanent-delete cleanup land in the retry tables and drain on the cron                                              |
 
 `GET /api/health` only probes D1. It reports healthy during a complete R2 or Durable Object outage. See
 [Observability](OBSERVABILITY.md#health-checking).

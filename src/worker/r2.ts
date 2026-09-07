@@ -74,3 +74,13 @@ export function conditionalGetStatus(headers: Headers, object: Pick<R2Object, "h
   if (modifiedSince !== null && uploadedAtSeconds <= Math.floor(modifiedSince / 1_000)) return 304;
   return 200;
 }
+
+/** Delete every object under a prefix, following R2's list pagination to the end. */
+export async function deleteR2Prefix(bucket: R2Bucket, prefix: string) {
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, ...(cursor ? { cursor } : {}) });
+    if (page.objects.length) await bucket.delete(page.objects.map((object) => object.key));
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+}

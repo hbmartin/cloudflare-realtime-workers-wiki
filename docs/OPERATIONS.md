@@ -63,7 +63,7 @@ Expected blast radius:
 
 - Every session is invalidated. All users must sign in again.
 - Internal Durable Object calls fail while the old and new values are both in flight. Archive
-  operations that fail land in `archive_disconnect_targets` and are retried by the hourly cron;
+  operations that fail land in `archive_disconnect_targets` and are retried by the scheduled cron;
   permanent-delete cleanup lands in `deletion_targets` and is likewise retried. Neither loses data.
 - Live WebSocket connections are closed at their next grant expiry, within five minutes.
 
@@ -143,13 +143,13 @@ pnpm wrangler d1 execute DB --env production --remote --command \
      FROM archive_disconnect_targets ORDER BY next_attempt_at;"
 ```
 
-Restoring the page cancels its pending target. Otherwise allow the hourly retry to finish.
+Restoring the page cancels its pending target. Otherwise allow the scheduled retry to finish.
 
 ### Forcing the scheduled handler
 
 There is no supported way to invoke the deployed cron on demand. Options:
 
-- Wait for the next hourly tick.
+- Wait for the next cron tick (at most 15 minutes).
 - Trigger the work indirectly: archiving or permanently deleting anything runs an immediate attempt in
   the same request via `waitUntil`.
 - Locally, `pnpm wrangler dev --test-scheduled` exposes a `/__scheduled` endpoint.

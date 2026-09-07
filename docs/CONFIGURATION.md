@@ -118,9 +118,9 @@ configurable at runtime.
 | Bulk write caps                                         | 50 columns, 200 rows, 2000 cells, 1 MiB body per request                 | `src/shared/table-limits.ts`                    |
 | Bulk receipt retention                                  | Durable until the table/page cascade removes it                          | `table_bulk_writes`                             |
 | Page-create receipt retention                           | Durable until the page/workspace cascade removes it                      | `page_create_receipts`                          |
-| `PAGE_MOVE_RECEIPT_RETENTION_MS`                        | 7 days; expired receipts are pruned hourly                               | `src/shared/page-move.ts`                       |
+| `PAGE_MOVE_RECEIPT_RETENTION_MS`                        | 7 days; expired receipts are pruned on each cron tick                    | `src/shared/page-move.ts`                       |
 | `PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE`                    | 1000 expired receipts per delete                                         | `src/shared/page-move.ts`                       |
-| `PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES`                   | 10 deletes per hourly pass                                               | `src/shared/page-move.ts`                       |
+| `PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES`                   | 10 delete batches per cron tick                                          | `src/shared/page-move.ts`                       |
 | `DELETION_TARGET_BATCH_SIZE`                            | 50                                                                       | `src/worker/index.ts`                           |
 | `CLEANUP_LEASE_MS`                                      | 15 min                                                                   | `src/worker/cleanup.ts`                         |
 | `DOCUMENT_PURGE_TIMEOUT_MS`                             | 30 s                                                                     | `src/worker/cleanup.ts`                         |
@@ -150,8 +150,9 @@ requires restoring an earlier version into a fresh epoch. See
 
 ## Cron drain rates and backoff
 
-The hourly handler processes retry queues and retention cleanup with per-tick caps. These determine how
-long a backlog takes to clear, and whether a stalled row is broken or merely waiting.
+The scheduled handler runs every 15 minutes (`triggers.crons`) and processes retry queues and retention
+cleanup with per-tick caps. These determine how long a backlog takes to clear, and whether a stalled row
+is broken or merely waiting. Four ticks per hour, so multiply any per-tick cap by four for hourly capacity.
 
 | Work item                    | Per tick | Backoff                                 | Effective ceiling |
 | ---------------------------- | -------- | --------------------------------------- | ----------------- |
@@ -167,14 +168,15 @@ Two consequences worth internalising:
 
 - A deletion job's **first** retry is a full hour away. A job that fails once will not be retried
   sooner, no matter how transient the cause.
-- At 10 jobs per hour, a backlog of 60 deletion jobs takes at least six hours to drain even if every
-  attempt succeeds.
+- At 10 jobs per tick and four ticks per hour, a backlog of 60 deletion jobs takes at least 90 minutes to
+  drain even if every attempt succeeds.
 
 Archive disconnects are far more forgiving: 50 per tick with a 10-second initial backoff.
 
 Expired move receipts are retention cleanup, not retry work. Each pass deletes up to ten batches of
 1000 rows. Reaching that catch-up limit emits a warning because expired rows may remain; a sustained
-expiration rate above 10000 receipts per hour will outgrow the configured cleanup capacity.
+expiration rate above 40000 receipts per hour (10000 per tick, four ticks) will outgrow the configured
+cleanup capacity.
 
 ## Security headers
 

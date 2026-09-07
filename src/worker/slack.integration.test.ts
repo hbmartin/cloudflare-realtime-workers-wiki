@@ -224,7 +224,13 @@ describe("Slack security and integration", () => {
         : Response.json({ ok: true });
     });
     await expect(
-      sendPersonalSlackNotification(configured, installed.member.user.id, "A note changed", installed.page.id),
+      sendPersonalSlackNotification(
+        configured,
+        installed.member.user.id,
+        installed.member.workspace.id,
+        "A note changed",
+        installed.page.id,
+      ),
     ).resolves.toBe(true);
     const rotated = await env.DB.prepare(
       `SELECT bot_token_ciphertext, bot_refresh_token_ciphertext, token_expires_at
@@ -336,7 +342,7 @@ describe("Slack security and integration", () => {
         )
       ).json<{ page: Page }>()
     ).page;
-    const fetchMock = vi.fn(async (_input: string | URL | Request) => Response.json({ ok: true }));
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => Response.json({ ok: true }));
     vi.stubGlobal("fetch", fetchMock);
     const payload = {
       type: "event_callback",
@@ -346,6 +352,7 @@ describe("Slack security and integration", () => {
         type: "link_shared",
         user: "UVIEWER",
         channel: "C0123456789",
+        message_ts: "1700000000.000100",
         links: [
           { url: `http://example.test/?page=${page.id}` },
           { url: `http://example.test.evil.invalid/?page=${page.id}` },
@@ -391,6 +398,19 @@ describe("Slack security and integration", () => {
     await deliverSlackUnfurl(slackEnv(), "Ev-private-unfurl");
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0]![0]).toBe("https://slack.com/api/chat.unfurl");
+    // chat.unfurl only attaches previews when told which message they belong to.
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body))).toMatchObject({
+      channel: "C0123456789",
+      ts: "1700000000.000100",
+    });
+
+    fetchMock.mockClear();
+    await handleSlackEvent(slackEnv(), {
+      ...payload,
+      event_id: "Ev-no-ts",
+      event: { ...payload.event, message_ts: undefined },
+    });
+    expect(await env.DB.prepare(`SELECT id FROM slack_unfurls WHERE id = 'Ev-no-ts'`).first()).toBeNull();
 
     fetchMock.mockClear();
     await handleSlackEvent(slackEnv(), { ...payload, event_id: "Ev-revoked-unfurl" });
@@ -432,6 +452,7 @@ describe("Slack security and integration", () => {
         eventType: "page_edit",
         sourceId: "projection-1",
         recipientIds: [],
+        emitSlackChannel: true,
         createdAt: Date.now(),
       }),
     );
@@ -439,6 +460,25 @@ describe("Slack security and integration", () => {
       .bind(installed.page.id)
       .first<{ id: string }>();
     expect(event).not.toBeNull();
+    await env.DB.batch(
+      notificationFanoutStatements(env.DB, {
+        workspaceId: installed.member.workspace.id,
+        spaceId: installed.page.spaceId,
+        pageId: installed.page.id,
+        threadId: null,
+        actorId: installed.member.user.id,
+        eventType: "page_edit",
+        sourceId: "suppressed-projection",
+        recipientIds: [],
+        emitSlackChannel: false,
+        createdAt: Date.now(),
+      }),
+    );
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM slack_channel_events WHERE page_id = ?`)
+        .bind(installed.page.id)
+        .first(),
+    ).toEqual({ count: 1 });
     expect(
       await env.DB.prepare(`SELECT topic FROM outbox WHERE payload_json = json_object('eventId', ?)`)
         .bind(event!.id)

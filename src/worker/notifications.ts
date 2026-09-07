@@ -27,6 +27,7 @@ export type NotificationFanout = {
   eventType: NotificationEventType;
   sourceId: string;
   recipientIds: string[];
+  emitSlackChannel: boolean;
   data?: Record<string, unknown>;
   createdAt: number;
 };
@@ -64,9 +65,24 @@ function uniqueIds(ids: string[]) {
   return [...new Set(ids.filter(Boolean))];
 }
 
+// Continuous editing compacts every ~30s; edits by the same actor on the same page within this window,
+// or while the previous edit notification is still unread, collapse into one notification.
+const PAGE_EDIT_COALESCE_MS = 60 * 60 * 1000;
+// A pending delivery claim older than this belongs to a consumer that died mid-send and may be reclaimed.
+const DELIVERY_CLAIM_STALE_MS = 60_000;
+
+export class DeliveryInProgressError extends Error {
+  readonly retryAfter = Math.ceil(DELIVERY_CLAIM_STALE_MS / 1000);
+  constructor() {
+    super("Delivery is already in progress.");
+  }
+}
+
 export function notificationFanoutStatements(database: D1Database, fanout: NotificationFanout) {
   const recipients = uniqueIds(fanout.recipientIds);
+  const coalesceAfter = fanout.eventType === "page_edit" ? fanout.createdAt - PAGE_EDIT_COALESCE_MS : null;
   const prefix = `${fanout.eventType}:${fanout.sourceId}`;
+  const idPrefix = `${prefix}:`;
   const recipientJson = JSON.stringify(recipients);
   const dataJson = JSON.stringify(fanout.data ?? {});
   return [
@@ -83,7 +99,12 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
            JOIN spaces s ON s.id = p.space_id
            LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = recipient.value
           WHERE recipient.value <> ? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
-            AND (wm.role = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
+            AND (wm.role = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+            AND NOT EXISTS (
+              SELECT 1 FROM notifications recent
+               WHERE ? IS NOT NULL AND recent.user_id = recipient.value AND recent.page_id = ?
+                 AND recent.event_type = ? AND recent.actor_id = ?
+                 AND ((recent.read_at IS NULL AND recent.archived_at IS NULL) OR recent.created_at > ?))`,
       )
       .bind(
         prefix,
@@ -100,6 +121,11 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         fanout.workspaceId,
         fanout.pageId,
         fanout.actorId,
+        coalesceAfter,
+        fanout.pageId,
+        fanout.eventType,
+        fanout.actorId,
+        coalesceAfter ?? 0,
       ),
     database
       .prepare(
@@ -107,10 +133,10 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
           (id, workspace_id, topic, payload_json, available_at, created_at)
          SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
            FROM notifications
-          WHERE substr(id, 1, length(?) + 1) = ? || ':'`,
+          WHERE id >= ? AND id < ?`,
       )
-      .bind(fanout.createdAt, fanout.createdAt, prefix, prefix),
-    ...slackChannelFanoutStatements(database, fanout),
+      .bind(fanout.createdAt, fanout.createdAt, idPrefix, `${prefix};`),
+    ...(fanout.emitSlackChannel ? slackChannelFanoutStatements(database, { ...fanout, coalesceAfter }) : []),
   ];
 }
 
@@ -202,7 +228,8 @@ export async function markNotifications(
       AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
   )`;
-  if (ids?.length) {
+  // An explicit selection, even an empty one, never widens into the mark-all branch.
+  if (ids !== null) {
     await env.DB.prepare(
       `UPDATE notifications SET ${column} = COALESCE(${column}, ?)
         WHERE user_id = ? AND workspace_id = ? AND id IN (SELECT value FROM json_each(?)) ${access}`,
@@ -438,14 +465,19 @@ async function claimDelivery(env: Env, outboxId: string, channel: "email" | "sla
   )
     .bind(key, outboxId, channel, timestamp)
     .run();
-  if (inserted.meta.changes) return true;
+  if (inserted.meta.changes) return "claimed";
+  // A failed attempt is retried; a pending claim whose consumer died mid-send is reclaimed once stale.
   const retry = await env.DB.prepare(
     `UPDATE deliveries SET status = 'pending', attempts = attempts + 1, last_error = NULL, updated_at = ?
-      WHERE idempotency_key = ? AND status = 'failed'`,
+      WHERE idempotency_key = ? AND (status = 'failed' OR (status = 'pending' AND updated_at <= ?))`,
   )
-    .bind(timestamp, key)
+    .bind(timestamp, key, timestamp - DELIVERY_CLAIM_STALE_MS)
     .run();
-  return Boolean(retry.meta.changes);
+  if (retry.meta.changes) return "claimed";
+  const current = await env.DB.prepare(`SELECT status FROM deliveries WHERE idempotency_key = ?`)
+    .bind(key)
+    .first<{ status: "pending" | "sent" | "failed" }>();
+  return current?.status === "pending" ? "in_progress" : "settled";
 }
 
 async function finishClaimedDelivery(
@@ -507,7 +539,10 @@ export async function deliverNotification(env: Env, notificationId: string, outb
     row.preference_in_app === 0 ? "disabled" : null,
   );
   const copy = notificationCopy(row);
-  if (emailMode(row) === "immediate" && (await claimDelivery(env, outboxId, "email"))) {
+  let deferred = false;
+  const emailClaim = emailMode(row) === "immediate" ? await claimDelivery(env, outboxId, "email") : "settled";
+  if (emailClaim === "in_progress") deferred = true;
+  if (emailClaim === "claimed") {
     try {
       if (!(await sendNotificationEmail(env, row, copy, copy))) {
         await finishClaimedDelivery(env, outboxId, "email", "failed", "unavailable");
@@ -528,9 +563,11 @@ export async function deliverNotification(env: Env, notificationId: string, outb
       throw error;
     }
   }
-  if (slackMode(row) === "immediate" && (await claimDelivery(env, outboxId, "slack"))) {
+  const slackClaim = slackMode(row) === "immediate" ? await claimDelivery(env, outboxId, "slack") : "settled";
+  if (slackClaim === "in_progress") deferred = true;
+  if (slackClaim === "claimed") {
     try {
-      if (!(await sendPersonalSlackNotification(env, row.user_id, copy, row.page_id))) {
+      if (!(await sendPersonalSlackNotification(env, row.user_id, row.workspace_id, copy, row.page_id))) {
         await finishClaimedDelivery(env, outboxId, "slack", "failed", "unavailable");
       } else {
         await env.DB.prepare(`UPDATE notifications SET slack_at = COALESCE(slack_at, ?) WHERE id = ?`)
@@ -549,7 +586,18 @@ export async function deliverNotification(env: Env, notificationId: string, outb
       throw error;
     }
   }
+  // Another consumer holds a live claim; let the queue redeliver once it settles or goes stale.
+  if (deferred) throw new DeliveryInProgressError();
 }
+
+// A timezone is due for a single cron tick each day, so a fixed LIMIT would strand
+// everyone past it until the next day. Page through the candidates instead.
+const DIGEST_CANDIDATE_PAGE = 50;
+const DIGEST_CANDIDATE_MAX = 1000;
+
+// Timezone is part of the key: preferences are per event type, so one user can hold
+// two timezones and appear as two groups that a coarser cursor would skip past.
+type DigestCursor = { userId: string; workspaceId: string; timezone: string };
 
 function digestDue(timezone: string, timestamp: number) {
   try {
@@ -566,27 +614,86 @@ function digestDue(timezone: string, timestamp: number) {
   }
 }
 
+type DigestChannel = "email" | "slack";
+
+function digestModeSql(channel: DigestChannel) {
+  return channel === "email"
+    ? `COALESCE(preference.email, CASE WHEN n.event_type = 'page_edit' THEN 'digest' ELSE 'immediate' END) = 'digest'`
+    : `COALESCE(preference.slack, 'off') = 'digest'`;
+}
+
+async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: number) {
+  const deliveredColumn = channel === "email" ? "emailed_at" : "slack_at";
+  const rows = await env.DB.prepare(
+    `SELECT DISTINCT COALESCE(preference.timezone, 'UTC') timezone
+       FROM notifications n
+       LEFT JOIN notification_preferences preference
+         ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+      WHERE n.${deliveredColumn} IS NULL AND ${digestModeSql(channel)}`,
+  ).all<{ timezone: string }>();
+  return rows.results.map((row) => row.timezone).filter((timezone) => digestDue(timezone, timestamp));
+}
+
+async function* pagedDigestCandidates<T extends { user_id: string; workspace_id: string; timezone: string }>(
+  read: (cursor: DigestCursor) => Promise<{ results: T[] }>,
+  label: string,
+) {
+  let cursor: DigestCursor = { userId: "", workspaceId: "", timezone: "" };
+  let seen = 0;
+  for (;;) {
+    const page = await read(cursor);
+    for (const row of page.results) yield row;
+    seen += page.results.length;
+    const last = page.results.at(-1);
+    if (!last || page.results.length < DIGEST_CANDIDATE_PAGE) return;
+    if (seen >= DIGEST_CANDIDATE_MAX) {
+      console.error(`${label} reached its per-run candidate ceiling`, { candidates: seen });
+      return;
+    }
+    cursor = { userId: last.user_id, workspaceId: last.workspace_id, timezone: last.timezone };
+  }
+}
+
 async function sendDueEmailDigests(env: Env, timestamp: number) {
   if (!env.SEND_EMAIL || !env.EMAIL_FROM) return;
-  const candidates = await env.DB.prepare(
-    `SELECT DISTINCT n.user_id, n.workspace_id, recipient.name, recipient.email,
-            COALESCE(preference.timezone, 'UTC') timezone
-       FROM notifications n
-       JOIN user recipient ON recipient.id = n.user_id
-       LEFT JOIN notification_preferences preference
-         ON preference.user_id = n.user_id AND preference.event_type = 'page_edit'
-      WHERE n.event_type = 'page_edit' AND n.emailed_at IS NULL
-        AND COALESCE(preference.email, 'digest') = 'digest'
-      LIMIT 50`,
-  ).all<{ user_id: string; workspace_id: string; name: string; email: string; timezone: string }>();
-  for (const candidate of candidates.results) {
-    if (!digestDue(candidate.timezone, timestamp)) continue;
-    const ids = await env.DB.prepare(
-      `SELECT id FROM notifications
-        WHERE user_id = ? AND workspace_id = ? AND event_type = 'page_edit' AND emailed_at IS NULL
-        ORDER BY created_at LIMIT 40`,
+  const dueTimezones = await dueDigestTimezones(env, "email", timestamp);
+  if (!dueTimezones.length) return;
+  const readCandidates = (cursor: DigestCursor) =>
+    env.DB.prepare(
+      `SELECT n.user_id, n.workspace_id, recipient.name, recipient.email,
+              COALESCE(preference.timezone, 'UTC') timezone
+         FROM notifications n
+         JOIN user recipient ON recipient.id = n.user_id
+         LEFT JOIN notification_preferences preference
+           ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+        WHERE n.emailed_at IS NULL AND ${digestModeSql("email")}
+          AND COALESCE(preference.timezone, 'UTC') IN (SELECT value FROM json_each(?))
+          AND (n.user_id > ? OR (n.user_id = ? AND (n.workspace_id > ? OR (n.workspace_id = ?
+              AND COALESCE(preference.timezone, 'UTC') > ?))))
+        GROUP BY n.user_id, n.workspace_id, recipient.name, recipient.email, timezone
+        ORDER BY n.user_id, n.workspace_id, timezone
+        LIMIT ?`,
     )
-      .bind(candidate.user_id, candidate.workspace_id)
+      .bind(
+        JSON.stringify(dueTimezones),
+        cursor.userId,
+        cursor.userId,
+        cursor.workspaceId,
+        cursor.workspaceId,
+        cursor.timezone,
+        DIGEST_CANDIDATE_PAGE,
+      )
+      .all<{ user_id: string; workspace_id: string; name: string; email: string; timezone: string }>();
+  for await (const candidate of pagedDigestCandidates(readCandidates, "Email digest")) {
+    const ids = await env.DB.prepare(
+      `SELECT n.id FROM notifications n
+        LEFT JOIN notification_preferences preference
+          ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+        WHERE n.user_id = ? AND n.workspace_id = ? AND n.emailed_at IS NULL
+          AND ${digestModeSql("email")} AND COALESCE(preference.timezone, 'UTC') = ?
+        ORDER BY n.created_at, n.id LIMIT 40`,
+    )
+      .bind(candidate.user_id, candidate.workspace_id, candidate.timezone)
       .all<{ id: string }>();
     const rows: DeliveryRow[] = [];
     const suppressed: string[] = [];
@@ -602,7 +709,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
     }
     const claimed: DeliveryRow[] = [];
     for (const row of rows) {
-      if (await claimDelivery(env, `outbox:${row.id}`, "email")) claimed.push(row);
+      if ((await claimDelivery(env, `outbox:${row.id}`, "email")) === "claimed") claimed.push(row);
     }
     if (!claimed.length) continue;
     const lines = claimed.map((row) => `• ${notificationCopy(row)}`);
@@ -637,21 +744,42 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
 }
 
 async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
-  const candidates = await env.DB.prepare(
-    `SELECT DISTINCT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
-       FROM notifications n
-       LEFT JOIN notification_preferences preference
-         ON preference.user_id = n.user_id AND preference.event_type = 'page_edit'
-      WHERE n.event_type = 'page_edit' AND n.slack_at IS NULL
-        AND COALESCE(preference.slack, 'off') = 'digest' LIMIT 50`,
-  ).all<{ user_id: string; workspace_id: string; timezone: string }>();
-  for (const candidate of candidates.results) {
-    if (!digestDue(candidate.timezone, timestamp)) continue;
-    const ids = await env.DB.prepare(
-      `SELECT id FROM notifications WHERE user_id = ? AND workspace_id = ? AND event_type = 'page_edit'
-        AND slack_at IS NULL ORDER BY created_at LIMIT 40`,
+  const dueTimezones = await dueDigestTimezones(env, "slack", timestamp);
+  if (!dueTimezones.length) return;
+  const readCandidates = (cursor: DigestCursor) =>
+    env.DB.prepare(
+      `SELECT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
+         FROM notifications n
+         LEFT JOIN notification_preferences preference
+           ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+        WHERE n.slack_at IS NULL AND ${digestModeSql("slack")}
+          AND COALESCE(preference.timezone, 'UTC') IN (SELECT value FROM json_each(?))
+          AND (n.user_id > ? OR (n.user_id = ? AND (n.workspace_id > ? OR (n.workspace_id = ?
+              AND COALESCE(preference.timezone, 'UTC') > ?))))
+        GROUP BY n.user_id, n.workspace_id, timezone
+        ORDER BY n.user_id, n.workspace_id, timezone
+        LIMIT ?`,
     )
-      .bind(candidate.user_id, candidate.workspace_id)
+      .bind(
+        JSON.stringify(dueTimezones),
+        cursor.userId,
+        cursor.userId,
+        cursor.workspaceId,
+        cursor.workspaceId,
+        cursor.timezone,
+        DIGEST_CANDIDATE_PAGE,
+      )
+      .all<{ user_id: string; workspace_id: string; timezone: string }>();
+  for await (const candidate of pagedDigestCandidates(readCandidates, "Slack digest")) {
+    const ids = await env.DB.prepare(
+      `SELECT n.id FROM notifications n
+        LEFT JOIN notification_preferences preference
+          ON preference.user_id = n.user_id AND preference.event_type = n.event_type
+        WHERE n.user_id = ? AND n.workspace_id = ? AND n.slack_at IS NULL
+          AND ${digestModeSql("slack")} AND COALESCE(preference.timezone, 'UTC') = ?
+        ORDER BY n.created_at, n.id LIMIT 40`,
+    )
+      .bind(candidate.user_id, candidate.workspace_id, candidate.timezone)
       .all<{ id: string }>();
     const rows: DeliveryRow[] = [];
     for (const { id } of ids.results) {
@@ -662,13 +790,14 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
     if (!rows.length) continue;
     const claimed: DeliveryRow[] = [];
     for (const row of rows) {
-      if (await claimDelivery(env, `outbox:${row.id}`, "slack")) claimed.push(row);
+      if ((await claimDelivery(env, `outbox:${row.id}`, "slack")) === "claimed") claimed.push(row);
     }
     if (!claimed.length) continue;
     try {
       const sent = await sendPersonalSlackNotification(
         env,
         candidate.user_id,
+        candidate.workspace_id,
         `Your daily Notes digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
         claimed[0]!.page_id,
       );
@@ -696,7 +825,8 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           error instanceof Error ? error.message.slice(0, 500) : "Slack digest failed.",
         );
       }
-      throw error;
+      // One unreachable recipient must not starve the digests queued behind it.
+      console.error("Notification digest Slack message failed", { userId: candidate.user_id, error });
     }
   }
 }

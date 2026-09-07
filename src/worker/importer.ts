@@ -15,8 +15,10 @@ import { readZip, type ZipEntry } from "../shared/zip";
 import { isUnsafeMime } from "./attachments";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
+import { deleteR2Prefix } from "./r2";
 import { normalizeFilename } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
+import { refreshPageSearchV2ForIdsStatements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
 const IMPORT_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -119,18 +121,30 @@ function normalizedRelativePath(sourcePath: string, href: string) {
   }
 }
 
-async function nestedEntries(bytes: Uint8Array, depth = 0, prefix = ""): Promise<ZipEntry[]> {
+type ArchiveBudget = { entries: number; bytes: number };
+
+async function nestedEntries(
+  bytes: Uint8Array,
+  depth = 0,
+  prefix = "",
+  budget: ArchiveBudget = { entries: 0, bytes: 0 },
+  output: ZipEntry[] = [],
+): Promise<ZipEntry[]> {
   if (depth > MAX_NESTED_ZIP_DEPTH) throw new Error("The Notion export contains too many nested ZIP levels.");
-  const entries = await readZip(bytes);
-  const output: ZipEntry[] = [];
+  const entries = await readZip(bytes, {
+    maxEntries: MAX_ARCHIVE_ENTRIES - budget.entries,
+    maxExpandedBytes: MAX_EXPANDED_BYTES - budget.bytes,
+  });
+  budget.entries += entries.length;
+  budget.bytes += entries.reduce((total, entry) => total + entry.bytes.byteLength, 0);
   for (const entry of entries) {
     if (extension(entry.path) === ".zip" && /^Part-\d+\.zip$/i.test(entry.path.split("/").at(-1) ?? "")) {
-      output.push(...(await nestedEntries(entry.bytes, depth + 1, prefix)));
-    } else output.push({ path: `${prefix}${entry.path}`, bytes: entry.bytes });
-  }
-  if (output.length > MAX_ARCHIVE_ENTRIES) throw new Error("The Notion export contains too many files.");
-  if (output.reduce((total, entry) => total + entry.bytes.byteLength, 0) > MAX_EXPANDED_BYTES) {
-    throw new Error("The Notion export expands beyond the supported size.");
+      // Each Part-N.zip repeats the same inner layout, so without a per-archive prefix
+      // their entries collide in `byPath` and pages hydrate another part's assets.
+      await nestedEntries(entry.bytes, depth + 1, `${prefix}${entry.path}/`, budget, output);
+      continue;
+    }
+    output.push({ path: `${prefix}${entry.path}`, bytes: entry.bytes });
   }
   return output;
 }
@@ -231,12 +245,24 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   const byPath = new Map(entries.map((entry) => [entry.path, entry]));
   const pageEntries = entries.filter((entry) => {
     const ext = extension(entry.path);
+    const parent = parentPath(entry.path);
+    // Nested Part-N.zip entries are prefixed by their archive, so "root" means the top
+    // level of whichever archive the entry came out of.
+    const atArchiveRoot = parent === "" || /\.zip$/i.test(parent);
     return (
       [".html", ".htm", ".md", ".markdown"].includes(ext) &&
-      !(parentPath(entry.path) === "" && /^index\.html?$/i.test(entry.path))
+      !(atArchiveRoot && /^index\.html?$/i.test(entry.path.split("/").at(-1) ?? ""))
     );
   });
-  const csvEntries = entries.filter((entry) => extension(entry.path) === ".csv");
+  // Notion writes both a view CSV and an `_all` CSV per database; the latter ignores view filters.
+  const csvByDatabase = new Map<string, (typeof entries)[number]>();
+  for (const entry of entries) {
+    if (extension(entry.path) !== ".csv") continue;
+    const name = stem(entry.path);
+    const key = `${parentPath(entry.path)}/${name.replace(/_all$/i, "")}`;
+    if (!csvByDatabase.has(key) || /_all$/i.test(name)) csvByDatabase.set(key, entry);
+  }
+  const csvEntries = [...csvByDatabase.values()];
   if (!pageEntries.length && !csvEntries.length)
     throw new Error("The ZIP does not contain any importable Notion pages or databases.");
   if (pageEntries.length + csvEntries.length > MAX_IMPORT_PAGES)
@@ -249,10 +275,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   const pages: ImportPage[] = [];
   for (const entry of pageEntries) {
     const rawStem = stem(entry.path);
-    const csv = csvEntries.find((candidate) => {
-      const candidateStem = stem(candidate.path).replace(/_all$/i, "");
-      return parentPath(candidate.path) === parentPath(entry.path) && candidateStem === rawStem;
-    });
+    const csv = csvByDatabase.get(`${parentPath(entry.path)}/${rawStem}`);
     const parentSource = pageOwnerPath(entry.path, knownSources);
     const sourceText = new TextDecoder().decode(entry.bytes);
     const parsed = extension(entry.path).startsWith(".htm")
@@ -358,11 +381,17 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
       left.source.split("/").length - right.source.split("/").length || left.source.localeCompare(right.source),
   )) {
     await assertImportActive(env, job.id);
-    const existing = await env.DB.prepare(`SELECT import_job_id FROM pages WHERE id = ?`)
+    const existing = await env.DB.prepare(`SELECT import_job_id, content_epoch FROM pages WHERE id = ?`)
       .bind(page.id)
-      .first<{ import_job_id: string | null }>();
+      .first<{ import_job_id: string | null; content_epoch: number }>();
     if (existing) {
       if (existing.import_job_id !== job.id) throw new Error("An imported page id is already in use.");
+      if (existing.content_epoch !== job.attempt) {
+        // A retry must not reuse the purged document room of the previous attempt.
+        await env.DB.prepare(`UPDATE pages SET content_epoch = ? WHERE id = ? AND import_job_id = ?`)
+          .bind(job.attempt, page.id, job.id)
+          .run();
+      }
       continue;
     }
     const parentKey = page.parentId ?? "root";
@@ -379,8 +408,9 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
     previous.set(parentKey, position);
     await env.DB.prepare(
       `INSERT INTO pages
-        (id, workspace_id, space_id, parent_id, kind, position, title, import_job_id, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, workspace_id, space_id, parent_id, kind, position, title, import_job_id, content_epoch,
+         created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         page.id,
@@ -391,6 +421,7 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
         position,
         page.title,
         job.id,
+        job.attempt,
         job.requested_by,
         timestamp,
         timestamp,
@@ -452,7 +483,7 @@ async function initializeDocument(env: Env, job: JobRow, page: ImportPage) {
     httpMetadata: { contentType: "application/octet-stream" },
     customMetadata: { jobId: job.id, pageId: page.id },
   });
-  const response = await env.DOCUMENT.getByName(`${page.id}~1`).fetch(
+  const response = await env.DOCUMENT.getByName(`${page.id}~${job.attempt}`).fetch(
     new Request("https://document.internal/initialize", {
       method: "POST",
       headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
@@ -545,9 +576,9 @@ async function initializeTable(env: Env, job: JobRow, page: ImportPage) {
   }
 }
 
-async function verifyPage(env: Env, page: ImportPage) {
+async function verifyPage(env: Env, job: JobRow, page: ImportPage) {
   if (page.document) {
-    const response = await env.DOCUMENT.getByName(`${page.id}~1`).fetch(
+    const response = await env.DOCUMENT.getByName(`${page.id}~${job.attempt}`).fetch(
       new Request("https://document.internal/content", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
     );
     if (!response.ok) throw new Error(`Imported document verification failed (${response.status}).`);
@@ -614,7 +645,8 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
   await assertImportActive(env, job.id);
   const timestamp = Date.now();
   const roots = bundle.pages.filter((page) => page.parentId === null);
-  const pageIds = JSON.stringify(bundle.pages.map((page) => page.id));
+  const pageIdValues = bundle.pages.map((page) => page.id);
+  const pageIds = JSON.stringify(pageIdValues);
   const result = JSON.stringify({
     warnings: issueMessages(bundle.issues),
     pageId: roots[0]?.id ?? bundle.pages[0]?.id,
@@ -626,19 +658,15 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
         WHERE import_job_id = ?`,
     ).bind(job.id, job.requested_by, job.requested_by, timestamp, job.id),
     env.DB.prepare(
-      `INSERT INTO page_search (page_id, workspace_id, title, body)
-       SELECT id, workspace_id, title, plain_text FROM pages WHERE import_job_id = ?`,
-    ).bind(job.id),
-    env.DB.prepare(
-      `INSERT INTO page_search_v2 (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-       SELECT p.id, p.workspace_id, p.space_id, p.title, '', p.plain_text, '',
-              COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-         FROM pages p WHERE p.import_job_id = ?`,
-    ).bind(job.id),
-    env.DB.prepare(
       `UPDATE pages SET import_job_id = NULL, updated_at = ? WHERE import_job_id = ?
         AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = 'running')`,
     ).bind(timestamp, job.id, job.id),
+    env.DB.prepare(
+      `INSERT INTO page_search (page_id, workspace_id, title, body)
+       SELECT id, workspace_id, title, plain_text FROM pages
+        WHERE id IN (SELECT value FROM json_each(?)) AND import_job_id IS NULL AND is_template = 0`,
+    ).bind(pageIds),
+    ...refreshPageSearchV2ForIdsStatements(env.DB, pageIdValues),
     env.DB.prepare(
       `UPDATE jobs SET status = 'succeeded', progress_current = 7, progress_total = 7,
         progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
@@ -652,11 +680,17 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
     .all<PageJsonRow>();
   if (published.results.length !== bundle.pages.length)
     throw new Error("The imported pages could not be published atomically.");
-  await broadcastWorkspaceEvent(env, job.workspace_id, {
-    type: "pages-upserted",
-    pages: published.results.map(pageJson),
-  });
-  await broadcastWorkspaceEvent(env, job.workspace_id, { type: "jobs-invalidated" });
+  // The pages are published and the job is already marked succeeded, so a broadcast
+  // failure must not throw the step back to the workflow for a retry.
+  const broadcast = async (event: Parameters<typeof broadcastWorkspaceEvent>[2]) => {
+    try {
+      await broadcastWorkspaceEvent(env, job.workspace_id, event);
+    } catch (error) {
+      console.error("Failed to broadcast a published import", { jobId: job.id, type: event.type, error });
+    }
+  };
+  await broadcast({ type: "pages-upserted", pages: published.results.map(pageJson) });
+  await broadcast({ type: "jobs-invalidated" });
 }
 
 export async function cleanupImport(env: Env, job: JobRow) {
@@ -680,28 +714,17 @@ export async function cleanupImport(env: Env, job: JobRow) {
   }
   await env.DB.prepare(`DELETE FROM pages WHERE import_job_id = ?`).bind(job.id).run();
   if (attachments.results.length) await env.BUCKET.delete(attachments.results.map((attachment) => attachment.r2_key));
-  for (const page of pages.results) {
-    let cursor: string | undefined;
-    do {
-      const objects = await env.BUCKET.list({ prefix: `documents/${page.id}/`, ...(cursor ? { cursor } : {}) });
-      if (objects.objects.length) await env.BUCKET.delete(objects.objects.map((object) => object.key));
-      cursor = objects.truncated ? objects.cursor : undefined;
-    } while (cursor);
-  }
-  let cursor: string | undefined;
-  do {
-    const objects = await env.BUCKET.list({ prefix: `jobs/${job.id}/documents/`, ...(cursor ? { cursor } : {}) });
-    if (objects.objects.length) await env.BUCKET.delete(objects.objects.map((object) => object.key));
-    cursor = objects.truncated ? objects.cursor : undefined;
-  } while (cursor);
+  for (const page of pages.results) await deleteR2Prefix(env.BUCKET, `documents/${page.id}/`);
+  await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/documents/`);
 }
 
 export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   const options = importOptions(job);
+  let bundlePromise: Promise<ImportBundle> | null = null;
+  const bundle = () => (bundlePromise ??= loadBundle(env, job, options));
   const preview = await step.do("inspect import", async () => {
     await assertImportActive(env, job.id);
-    const bundle = await loadBundle(env, job, options);
-    return bundle.preview;
+    return (await bundle()).preview;
   });
   if (!options.confirmed) {
     await step.do("await confirmation", async () => {
@@ -723,32 +746,32 @@ export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
     return;
   }
   await step.do("create staged resources", async () => {
-    const bundle = await loadBundle(env, job, options);
+    const loaded = await bundle();
     await setProgress(env, job, 2, 7, "Creating staged pages");
-    await stagePageRows(env, job, bundle);
+    await stagePageRows(env, job, loaded);
   });
   await step.do("upload imported assets", async () => {
-    const bundle = await loadBundle(env, job, options);
+    const loaded = await bundle();
     await setProgress(env, job, 3, 7, "Uploading assets");
-    for (const page of bundle.pages) await stageAttachments(env, job, page);
+    for (const page of loaded.pages) await stageAttachments(env, job, page);
   });
   await step.do("write imported content", async () => {
-    const bundle = await loadBundle(env, job, options);
+    const loaded = await bundle();
     await setProgress(env, job, 4, 7, "Writing content");
-    for (const page of bundle.pages) {
+    for (const page of loaded.pages) {
       await assertImportActive(env, job.id);
       if (page.kind === "document") await initializeDocument(env, job, page);
       else await initializeTable(env, job, page);
     }
   });
   await step.do("verify imported content", async () => {
-    const bundle = await loadBundle(env, job, options);
+    const loaded = await bundle();
     await setProgress(env, job, 5, 7, "Verifying import");
-    for (const page of bundle.pages) await verifyPage(env, page);
+    for (const page of loaded.pages) await verifyPage(env, job, page);
   });
   await step.do("publish import", async () => {
-    const bundle = await loadBundle(env, job, options);
+    const loaded = await bundle();
     await setProgress(env, job, 6, 7, "Publishing pages");
-    await publishImport(env, job, bundle);
+    await publishImport(env, job, loaded);
   });
 }

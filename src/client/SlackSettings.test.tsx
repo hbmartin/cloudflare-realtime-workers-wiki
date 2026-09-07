@@ -92,14 +92,16 @@ describe("SlackSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save channel mapping" }));
 
     await waitFor(() =>
-      expect(api).toHaveBeenCalledWith(
-        "/api/slack/channels",
-        expect.objectContaining({
-          method: "POST",
-          body: expect.stringContaining('"channelId":"C0123456789"'),
-        }),
-      ),
+      expect(api).toHaveBeenCalledWith("/api/slack/channels", expect.objectContaining({ method: "POST" })),
     );
+    const saved = vi
+      .mocked(api)
+      .mock.calls.find(([path, init]) => path === "/api/slack/channels" && init?.method === "POST");
+    expect(JSON.parse(String(saved?.[1]?.body))).toMatchObject({
+      channelId: "C0123456789",
+      pageId: page.id,
+      cadence: "digest",
+    });
     expect(await screen.findByText("Slack channel mapping saved.")).toBeInTheDocument();
   });
 
@@ -114,8 +116,12 @@ describe("SlackSettings", () => {
     });
     render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
     expect(await screen.findByText("Your Notes and Slack accounts are linked.")).toBeInTheDocument();
-    expect(api).toHaveBeenCalledWith(
-      "/api/slack/link",
+    // The token is single use, so a second POST would burn it and 4xx the retry.
+    const linkCalls = vi
+      .mocked(api)
+      .mock.calls.filter(([path, init]) => path === "/api/slack/link" && init?.method === "POST");
+    expect(linkCalls).toHaveLength(1);
+    expect(linkCalls[0]?.[1]).toEqual(
       expect.objectContaining({ method: "POST", body: '{"token":"single-use-token"}' }),
     );
     expect(window.location.search).toBe("?view=settings");

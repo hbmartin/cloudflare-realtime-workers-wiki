@@ -112,6 +112,7 @@ export class ServerThreadStore extends ThreadStore {
   }
 
   private upsert(thread: CommentThread) {
+    this.refreshGeneration += 1;
     this.threads.set(thread.id, blockNoteThread(thread));
     for (const comment of thread.comments) this.users.set(comment.user.id, comment.user);
     this.publish();

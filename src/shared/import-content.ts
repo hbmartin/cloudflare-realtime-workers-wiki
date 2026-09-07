@@ -21,10 +21,19 @@ function decodeHtml(value: string) {
     quot: '"',
   };
   return value.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (entity, body: string) => {
-    if (body[0] !== "#") return named[body.toLowerCase()] ?? entity;
+    if (body[0] !== "#") {
+      const key = body.toLowerCase();
+      return Object.hasOwn(named, key) ? named[key]! : entity;
+    }
     const hexadecimal = body[1]?.toLowerCase() === "x";
     const codePoint = Number.parseInt(body.slice(hexadecimal ? 2 : 1), hexadecimal ? 16 : 10);
-    return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
+    // NUL and lone surrogates cannot round-trip through Yjs text, so those entities stay literal.
+    const encodable =
+      Number.isFinite(codePoint) &&
+      codePoint > 0 &&
+      codePoint <= 0x10ffff &&
+      (codePoint < 0xd800 || codePoint > 0xdfff);
+    return encodable ? String.fromCodePoint(codePoint) : entity;
   });
 }
 
@@ -83,7 +92,10 @@ function markdownInline(value: string, issues: ImportIssue[]) {
         issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
         output.push(...inline(label ?? ""));
       } else if (image) {
-        output.push(...inline(whole));
+        // Images are not inline nodes in this schema, so both branches degrade to the
+        // label; the issue keeps that downgrade visible in the import warnings.
+        issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
+        output.push(...inline(label ?? ""));
       } else {
         output.push(...inline(label ?? "", [{ type: "link", attrs: { href: url } }]));
       }
@@ -227,10 +239,20 @@ export function htmlToDocument(source: string) {
   let link: string | null = null;
   let list: "bullet" | "numbered" | null = null;
   const marks: Array<"bold" | "italic" | "strike" | "code"> = [];
+  const resetBlock = () => {
+    content = [];
+    kind = "paragraph";
+    level = 1;
+    checked = false;
+    link = null;
+    marks.length = 0;
+  };
   const flush = () => {
-    const compact = content.filter((node) => node.text !== "" && node.text !== undefined);
+    // Only empty text is dropped: a hardBreak carries no `text` at all, and testing
+    // for undefined here deleted every <br> along with any block holding just one.
+    const compact = content.filter((node) => node.text !== "");
     if (!compact.length) {
-      content = [];
+      resetBlock();
       return;
     }
     const attrs =
@@ -242,9 +264,7 @@ export function htmlToDocument(source: string) {
             ? { language: "" }
             : { ...BLOCK_ATTRS };
     blocks.push({ type: kind, attrs, content: compact });
-    content = [];
-    kind = "paragraph";
-    checked = false;
+    resetBlock();
   };
   for (const token of tokens) {
     if (token[0] !== "<") {

@@ -14,6 +14,7 @@ export function WatchControl({
   const [watch, setWatch] = useState<WatchState | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [updateError, setUpdateError] = useState("");
   const label = resourceType === "page" ? "page" : "space";
 
   useEffect(() => {
@@ -32,7 +33,9 @@ export function WatchControl({
     };
   }, [label, resourceId, resourceType]);
 
-  if (error)
+  // Only an initial load failure leaves nothing to render. Replacing a loaded button
+  // with this span would strip the control mid-click, taking focus and retry with it.
+  if (error && !watch)
     return (
       <span className="watch-error" title={error}>
         !
@@ -50,11 +53,11 @@ export function WatchControl({
 
   return (
     <button
-      className={`watch-control state-${state}${compact ? " compact" : ""}`}
+      className={`watch-control state-${state}${compact ? " compact" : ""}${updateError ? " has-error" : ""}`}
       aria-label={action}
       aria-pressed={state === "watching"}
       disabled={!watch || busy}
-      title={inherited ? "Watching through this space" : action}
+      title={updateError || (inherited ? "Watching through this space" : action)}
       onClick={async () => {
         setBusy(true);
         try {
@@ -64,8 +67,9 @@ export function WatchControl({
           );
           setWatch(data.watch);
           setError("");
+          setUpdateError("");
         } catch (cause) {
-          setError(apiErrorMessage(cause, `Watch status for this ${label} could not be changed.`));
+          setUpdateError(apiErrorMessage(cause, `Watch status for this ${label} could not be changed.`));
         } finally {
           setBusy(false);
         }

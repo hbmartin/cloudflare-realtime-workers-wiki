@@ -50,22 +50,28 @@ export function NotificationsPanel({
   const [saving, setSaving] = useState(false);
   const closeButton = useRef<HTMLButtonElement>(null);
   const tray = useRef<HTMLDialogElement>(null);
+  // Toggling the filter starts a second request while the first is still in flight;
+  // without this the slower response wins and the list stops matching the toggle.
+  const loadGeneration = useRef(0);
 
   async function load(offset = 0) {
+    const generation = ++loadGeneration.current;
     setLoading(true);
     try {
       const data = await api<{ notifications: Notification[]; unreadCount: number; hasMore: boolean }>(
         `/api/notifications?limit=20&offset=${offset}${unreadOnly ? "&unread=true" : ""}`,
       );
+      if (generation !== loadGeneration.current) return;
       setNotifications((current) => (offset ? [...current, ...data.notifications] : data.notifications));
       setUnreadCount(data.unreadCount);
       setHasMore(data.hasMore);
       onUnreadCountChange(data.unreadCount);
       setError("");
     } catch (cause) {
+      if (generation !== loadGeneration.current) return;
       setError(apiErrorMessage(cause, "Notifications could not be loaded."));
     } finally {
-      setLoading(false);
+      if (generation === loadGeneration.current) setLoading(false);
     }
   }
 
@@ -75,12 +81,19 @@ export function NotificationsPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [revision, unreadOnly]);
 
+  // `onClose` is a fresh closure on every parent render, so the focus work below is
+  // kept out of the effect's dependencies: re-running it stole focus mid-interaction.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     closeButton.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (event.key !== "Tab" || !tray.current) return;
@@ -107,7 +120,7 @@ export function NotificationsPanel({
         if (previousFocus?.isConnected) previousFocus.focus();
       });
     };
-  }, [onClose]);
+  }, []);
 
   async function mark(action: "read" | "archive", ids?: string[]) {
     try {

@@ -27,6 +27,31 @@ describe("import content", () => {
     expect(parsed.issues).toEqual([{ code: "unsafe_url", detail: "javascript:alert(1)" }]);
   });
 
+  it("keeps NUL and lone-surrogate entities literal so imports round-trip through Yjs", () => {
+    const parsed = htmlToDocument("<p>a&#xD800;b&#0;c&#x1F600;d&#65;</p>");
+    const text = JSON.stringify(parsed.document);
+    expect(text).toContain("a&#xD800;b&#0;c😀dA");
+    expect(text).not.toContain("\\ud800");
+    expect(text).not.toContain("\\u0000");
+  });
+
+  it("resets block and inline state at HTML block boundaries", () => {
+    const parsed = htmlToDocument("<h1></h1><p><strong>Bold</p><p>Plain</p>");
+    const containers = parsed.document.content?.[0]?.content ?? [];
+    const blocks = containers.map((container) => container.content?.[0]);
+
+    expect(blocks.map((block) => block?.type)).toEqual(["paragraph", "paragraph"]);
+    expect(blocks[0]?.content?.[0]).toMatchObject({ text: "Bold", marks: [{ type: "bold" }] });
+    expect(blocks[1]?.content?.[0]).toMatchObject({ text: "Plain" });
+    expect(blocks[1]?.content?.[0]?.marks).toBeUndefined();
+  });
+
+  it("leaves unknown named HTML entities intact", () => {
+    const parsed = htmlToDocument("<p>&constructor;</p>");
+    expect(JSON.stringify(parsed.document)).toContain("&constructor;");
+    expect(JSON.stringify(parsed.document)).not.toContain("function Object");
+  });
+
   it("parses quoted CSV and conservatively infers table types", () => {
     expect(parseCsv('Name,Active,Score\n"A, one",yes,2\nB,no,3\n')).toEqual([
       ["Name", "Active", "Score"],
@@ -40,5 +65,13 @@ describe("import content", () => {
         ["B", false, 3],
       ],
     });
+  });
+  it("keeps line breaks and the blocks that hold them", () => {
+    const inline = htmlToDocument("<p>alpha<br>beta</p>");
+    const blocks = inline.document.content[0]!.content!.map((container) => container.content![0]!);
+    expect(blocks[0]!.content!.map((node) => node.type ?? "text")).toEqual(["text", "hardBreak", "text"]);
+
+    const breakOnly = htmlToDocument("<p><br></p>");
+    expect(breakOnly.document.content[0]!.content).toHaveLength(1);
   });
 });

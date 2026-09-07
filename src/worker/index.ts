@@ -93,6 +93,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 import {
   consumeDeliveryMessage,
+  cleanupTemplateClone,
   createJob,
   expireJobArtifacts,
   jobForMember,
@@ -107,6 +108,7 @@ import {
 import {
   listNotifications,
   listSubscriptions,
+  DeliveryInProgressError,
   markNotifications,
   NOTIFICATION_EVENT_TYPES,
   notificationPreferences,
@@ -118,6 +120,7 @@ import {
   spaceWatchState,
 } from "./notifications";
 import { parseSearchRequest, searchPages, searchTitles } from "./search";
+import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import { cleanupImport } from "./importer";
 import {
   consumeSlackLink,
@@ -419,7 +422,7 @@ async function pruneExpiredPageMoveReceipts(database: D1Database, timestamp = no
     .bind(expiredBefore)
     .first();
   if (!remaining) return;
-  console.warn("Page move receipt pruning reached its hourly catch-up limit; expired receipts may remain.", {
+  console.warn("Page move receipt pruning reached its catch-up limit; expired receipts may remain.", {
     batchSize: PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
     maxBatches: PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
   });
@@ -773,24 +776,6 @@ function tagColor(value: unknown): TagColor {
     throw new HttpError(422, "invalid_input", "color is not a supported tag color.");
   }
   return color as TagColor;
-}
-
-function refreshSearchV2Statements(database: D1Database, pageId: string) {
-  return [
-    database.prepare(`DELETE FROM page_search_v2 WHERE page_id = ?`).bind(pageId),
-    database
-      .prepare(
-        `INSERT INTO page_search_v2
-          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-         SELECT p.id, p.workspace_id, p.space_id, p.title,
-                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
-                COALESCE(p.plain_text, ''),
-                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-           FROM pages p WHERE p.id = ? AND p.archived_at IS NULL AND p.import_job_id IS NULL`,
-      )
-      .bind(pageId),
-  ];
 }
 
 type TablePageExtras = { columns: string; binds: unknown[] };
@@ -1503,7 +1488,7 @@ app.put("/api/pages/:id/tags/:tagId", async (c) => {
     c.env.DB.prepare(
       `INSERT OR IGNORE INTO page_tags (page_id, tag_id, created_by, created_at) VALUES (?, ?, ?, ?)`,
     ).bind(page.id, tag.id, member.user.id, now()),
-    ...refreshSearchV2Statements(c.env.DB, page.id),
+    ...refreshPageSearchV2Statements(c.env.DB, page.id),
   ]);
   sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   return c.json({ ok: true });
@@ -1516,7 +1501,7 @@ app.delete("/api/pages/:id/tags/:tagId", async (c) => {
   requirePageEditor(page);
   await c.env.DB.batch([
     c.env.DB.prepare(`DELETE FROM page_tags WHERE page_id = ? AND tag_id = ?`).bind(page.id, c.req.param("tagId")),
-    ...refreshSearchV2Statements(c.env.DB, page.id),
+    ...refreshPageSearchV2Statements(c.env.DB, page.id),
   ]);
   sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   return c.json({ ok: true });
@@ -1782,20 +1767,17 @@ app.post("/api/jobs/:id/cancel", async (c) => {
   )
     .bind(now(), job.id)
     .run();
-  if (job.workflow_instance_id) {
-    c.executionCtx.waitUntil(
-      c.env.NOTES_WORKFLOW.get(job.workflow_instance_id)
-        .then((instance) => instance.terminate())
-        .catch((error) => console.error("Failed to terminate canceled workflow", { jobId: job.id, error })),
-    );
-  }
-  if (job.type === "import") {
-    c.executionCtx.waitUntil(
-      cleanupImport(c.env, job).catch((error) =>
-        console.error("Failed to clean up canceled import", { jobId: job.id, error }),
-      ),
-    );
-  }
+  c.executionCtx.waitUntil(
+    (async () => {
+      if (job.workflow_instance_id) {
+        await c.env.NOTES_WORKFLOW.get(job.workflow_instance_id)
+          .then((instance) => instance.terminate())
+          .catch((error) => console.error("Failed to terminate canceled workflow", { jobId: job.id, error }));
+      }
+      if (job.type === "import") await cleanupImport(c.env, job);
+      if (job.type === "template_clone") await cleanupTemplateClone(c.env, job);
+    })().catch((error) => console.error("Failed to clean up canceled job", { jobId: job.id, error })),
+  );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
   return c.json({ job: jobJson(await jobForMember(c.env, member, job.id)) });
 });
@@ -1808,8 +1790,8 @@ app.post("/api/jobs/:id/retry", async (c) => {
   }
   const instanceId = crypto.randomUUID();
   await c.env.DB.prepare(
-    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, progress_current = 0, progress_label = 'Queued',
-       error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`,
+    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1, progress_current = 0,
+       progress_label = 'Queued', error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`,
   )
     .bind(instanceId, now(), job.id)
     .run();
@@ -2275,13 +2257,22 @@ app.post("/api/pages/:id/comments", async (c) => {
 
 app.post("/api/comment-threads/:id/anchor", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const page = await pageForCommentThread(c.env, member, c.req.param("id"));
+  const threadId = c.req.param("id");
+  const page = await pageForCommentThread(c.env, member, threadId);
   const scopedPage = commentPage(page);
+  const thread = await c.env.DB.prepare(`SELECT created_by FROM comment_threads WHERE id = ? AND page_id = ?`)
+    .bind(threadId, page.id)
+    .first<{ created_by: string }>();
+  if (!thread) throw new HttpError(404, "comment_thread_not_found", "Comment thread not found.");
+  // Anchoring writes a mark into the document body, so only the thread's author may place or move it.
+  if (thread.created_by !== member.user.id) {
+    throw new HttpError(403, "comment_author_required", "Only the thread author may anchor it.");
+  }
   const body = await jsonBody(c.req.raw);
   const selection = object(body.selection);
   const yjs = selection.yjs;
   if (!yjs || typeof yjs !== "object" || Array.isArray(yjs)) {
-    return c.json({ thread: await commentThread(c.env, member, scopedPage, c.req.param("id")), anchored: false });
+    return c.json({ thread: await commentThread(c.env, member, scopedPage, threadId), anchored: false });
   }
   const anchorJson = JSON.stringify(yjs);
   if (new TextEncoder().encode(anchorJson).byteLength > 16 * 1024) {
@@ -2293,21 +2284,25 @@ app.post("/api/comment-threads/:id/anchor", async (c) => {
       new Request("https://document.internal/comment-anchor", {
         method: "POST",
         headers: { "content-type": "application/json", "x-notes-internal": c.env.BETTER_AUTH_SECRET },
-        body: JSON.stringify({
-          operation: "add",
-          threadId: c.req.param("id"),
-          userId: member.user.id,
-          selection: yjs,
-        }),
+        body: JSON.stringify({ operation: "add", threadId, userId: member.user.id, selection: yjs }),
       }),
     );
     if (response.ok) anchored = Boolean((await response.json<{ anchored?: boolean }>()).anchored);
+    else if (response.status === 404) {
+      throw new HttpError(404, "comment_thread_not_found", "Comment thread not found.");
+    } else if (![409, 410, 413].includes(response.status)) {
+      throw new HttpError(503, "comments_unavailable", "Comments are temporarily unavailable.");
+    }
   }
-  await c.env.DB.prepare(`UPDATE comment_threads SET anchor_json = ?, updated_at = ? WHERE id = ? AND page_id = ?`)
-    .bind(anchored ? anchorJson : null, Date.now(), c.req.param("id"), page.id)
-    .run();
-  sendCommentMutationEvents(c, member.workspace.id, page.id);
-  return c.json({ thread: await commentThread(c.env, member, scopedPage, c.req.param("id")), anchored });
+  // A selection that no longer resolves, or a document that cannot take marks, leaves the thread as it was:
+  // the previous anchor (if any) is still in the document, so the stored selection must not be cleared.
+  if (anchored) {
+    await c.env.DB.prepare(`UPDATE comment_threads SET anchor_json = ?, updated_at = ? WHERE id = ? AND page_id = ?`)
+      .bind(anchorJson, Date.now(), threadId, page.id)
+      .run();
+    sendCommentMutationEvents(c, member.workspace.id, page.id);
+  }
+  return c.json({ thread: await commentThread(c.env, member, scopedPage, threadId), anchored });
 });
 
 async function createReplyResponse(c: Context<{ Bindings: Env }>, threadId: string, body: Record<string, unknown>) {
@@ -2553,7 +2548,7 @@ app.patch("/api/pages/:id", async (c) => {
       titleValue,
       await currentPlainText(c.env, page.id),
     ),
-    ...refreshSearchV2Statements(c.env.DB, page.id),
+    ...refreshPageSearchV2Statements(c.env.DB, page.id),
   ]);
   const updated = pageJson(await pageForMember(c.env, member, page.id));
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [updated] });
@@ -2944,27 +2939,7 @@ app.post("/api/pages/:id/restore", async (c) => {
          ) SELECT id FROM subtree
        )`,
       ).bind(page.id),
-      c.env.DB.prepare(
-        `DELETE FROM page_search_v2 WHERE page_id IN (
-         WITH RECURSIVE subtree(id) AS (
-           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-         ) SELECT id FROM subtree
-       )`,
-      ).bind(page.id),
-      c.env.DB.prepare(
-        `INSERT INTO page_search_v2
-          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
-         SELECT p.id, p.workspace_id, p.space_id, p.title,
-                COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
-                COALESCE(p.plain_text, ''),
-                COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-                COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
-           FROM pages p WHERE p.id IN (
-             WITH RECURSIVE subtree(id) AS (
-               SELECT ? UNION ALL SELECT child.id FROM pages child JOIN subtree parent ON child.parent_id = parent.id
-             ) SELECT id FROM subtree
-           ) AND p.import_job_id IS NULL AND p.is_template = 0`,
-      ).bind(page.id),
+      ...refreshPageSearchV2SubtreeStatements(c.env.DB, page.id),
     ],
     // Read the restored snapshot in the same transaction as the update.
     restoredSnapshotStatement,
@@ -5084,7 +5059,7 @@ export default {
           console.error("Delivery queue message failed", { messageId: message.id, attempts: message.attempts, error });
           message.retry({
             delaySeconds:
-              error instanceof SlackRateLimitError
+              error instanceof SlackRateLimitError || error instanceof DeliveryInProgressError
                 ? error.retryAfter
                 : Math.min(300, 2 ** Math.min(message.attempts, 8)),
           });

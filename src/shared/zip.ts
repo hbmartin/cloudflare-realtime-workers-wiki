@@ -50,11 +50,10 @@ function header(size: number) {
 export function createZip(entries: ZipEntry[]) {
   if (entries.length > MAX_ZIP_ENTRIES) throw new Error("The archive contains too many files.");
   const encoder = new TextEncoder();
-  const files = entries.map((entry) => ({
-    ...entry,
-    path: safeArchivePath(entry.path),
-    name: encoder.encode(entry.path),
-  }));
+  const files = entries.map((entry) => {
+    const path = safeArchivePath(entry.path);
+    return { ...entry, path, name: encoder.encode(path) };
+  });
   if (files.reduce((total, entry) => total + entry.bytes.byteLength, 0) > MAX_EXPANDED_BYTES) {
     throw new Error("The archive expands beyond the supported size.");
   }
@@ -99,10 +98,33 @@ export function createZip(entries: ZipEntry[]) {
   return concatBytes([...localParts, central, end.bytes]);
 }
 
-async function inflateRaw(bytes: Uint8Array) {
+// The pre-decompression guards can only weigh the sizes the archive declares, so a
+// entry that lies about them would otherwise be buffered in full before the integrity
+// check rejects it. `limit` is the real ceiling, enforced as the output is produced.
+async function inflateRaw(bytes: Uint8Array, limit: number) {
   const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
   const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) throw new Error("The archive expands beyond the supported size.");
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
 }
 
 function findEnd(view: DataView) {
@@ -113,14 +135,19 @@ function findEnd(view: DataView) {
   throw new Error("The ZIP central directory is missing.");
 }
 
-export async function readZip(bytes: Uint8Array): Promise<ZipEntry[]> {
+export async function readZip(
+  bytes: Uint8Array,
+  limits: { maxEntries?: number; maxExpandedBytes?: number } = {},
+): Promise<ZipEntry[]> {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const endOffset = findEnd(view);
   if (view.getUint16(endOffset + 4, true) !== 0 || view.getUint16(endOffset + 6, true) !== 0) {
     throw new Error("Multi-disk ZIP archives are not supported.");
   }
   const entries = view.getUint16(endOffset + 10, true);
-  if (entries > MAX_ZIP_ENTRIES) throw new Error("The archive contains too many files.");
+  const maxEntries = Math.min(MAX_ZIP_ENTRIES, limits.maxEntries ?? MAX_ZIP_ENTRIES);
+  const maxExpandedBytes = Math.min(MAX_EXPANDED_BYTES, limits.maxExpandedBytes ?? MAX_EXPANDED_BYTES);
+  if (entries > maxEntries) throw new Error("The archive contains too many files.");
   const centralSize = view.getUint32(endOffset + 12, true);
   const centralOffset = view.getUint32(endOffset + 16, true);
   if (centralOffset + centralSize > endOffset) throw new Error("The ZIP central directory is invalid.");
@@ -150,7 +177,7 @@ export async function readZip(bytes: Uint8Array): Promise<ZipEntry[]> {
     if (offset > endOffset) throw new Error("The ZIP central directory is truncated.");
     if (path.endsWith("/")) continue;
     expanded += uncompressedSize;
-    if (expanded > MAX_EXPANDED_BYTES || (compressedSize > 0 && uncompressedSize / compressedSize > 200)) {
+    if (expanded > maxExpandedBytes || (compressedSize > 0 && uncompressedSize / compressedSize > 200)) {
       throw new Error("The archive expands beyond the supported size.");
     }
     if (localOffset + 30 > centralOffset || view.getUint32(localOffset, true) !== LOCAL_FILE_HEADER) {
@@ -161,7 +188,7 @@ export async function readZip(bytes: Uint8Array): Promise<ZipEntry[]> {
     const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
     if (dataOffset + compressedSize > centralOffset) throw new Error("The ZIP entry data is truncated.");
     const compressed = bytes.subarray(dataOffset, dataOffset + compressedSize);
-    const contents = method === 0 ? compressed.slice() : await inflateRaw(compressed);
+    const contents = method === 0 ? compressed.slice() : await inflateRaw(compressed, uncompressedSize);
     if (contents.byteLength !== uncompressedSize || crc32(contents) !== checksum) {
       throw new Error("The ZIP entry failed its integrity check.");
     }

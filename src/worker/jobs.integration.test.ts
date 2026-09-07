@@ -55,13 +55,18 @@ async function bootstrap(): Promise<InstalledWorkspace> {
   return { cookie, pageId: tree.pages[0]!.id, userId: me.user.id, workspaceId: me.workspace.id };
 }
 
-function inlineBindings() {
+// `in` rather than a nullish fallback: some tests override a binding to undefined.
+function bindingsWith(overrides: Record<string, unknown>) {
   return new Proxy(env as Env, {
     get(target, property, receiver) {
-      if (property === "WORKFLOW_INLINE") return "true";
+      if (typeof property === "string" && property in overrides) return overrides[property];
       return Reflect.get(target, property, receiver);
     },
   });
+}
+
+function inlineBindings() {
+  return bindingsWith({ WORKFLOW_INLINE: "true" });
 }
 
 beforeEach(async () => {
@@ -117,12 +122,7 @@ describe("job execution", () => {
   it("starts a coalesced search reindex and exposes it only through the requester feed", async () => {
     const installed = await bootstrap();
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "NOTES_WORKFLOW") return { create };
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
     const context = createExecutionContext();
     const started = await worker.fetch(
       request(installed.cookie, "/api/jobs/search-reindex", { method: "POST" }),
@@ -144,12 +144,7 @@ describe("job execution", () => {
   it("runs the owner-initiated legacy comment workspace scan", async () => {
     const installed = await bootstrap();
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "NOTES_WORKFLOW") return { create };
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
     const context = createExecutionContext();
     const response = await worker.fetch(
       request(installed.cookie, "/api/jobs/comment-migration", { method: "POST" }),
@@ -209,6 +204,81 @@ describe("job execution", () => {
     expect(retry.status).toBe(409);
   });
 
+  it("cleans staged template clone resources after cancellation", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const targetPageId = crypto.randomUUID();
+    const attachmentId = crypto.randomUUID();
+    const attachmentKey = `assets/${installed.workspaceId}/${attachmentId}/clone`;
+    const inputKey = `jobs/${jobId}/template-content.bin`;
+    const documentKey = `documents/${targetPageId}/epochs/1/current.bin`;
+    const timestamp = Date.now();
+    const options = JSON.stringify({
+      sourcePageId: installed.pageId,
+      targetPageId,
+      targetSpaceId: `${installed.workspaceId}-general`,
+      parentId: null,
+      title: "Canceled clone",
+      isTemplate: false,
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, space_id, type, status, requested_by, input_key, options_json, created_at, updated_at)
+         VALUES (?, ?, ?, 'template_clone', 'running', ?, ?, ?, ?, ?)`,
+      ).bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        inputKey,
+        options,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, import_job_id, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'table', 'z-canceled', 'Canceled clone', ?, ?, ?, ?)`,
+      ).bind(
+        targetPageId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        jobId,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO attachments
+          (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+         VALUES (?, ?, ?, ?, 'clone.txt', 'text/plain', 1, ?, ?)`,
+      ).bind(attachmentId, installed.workspaceId, targetPageId, attachmentKey, installed.userId, timestamp),
+    ]);
+    await Promise.all([
+      env.BUCKET.put(attachmentKey, "a"),
+      env.BUCKET.put(inputKey, "input"),
+      env.BUCKET.put(documentKey, "document"),
+    ]);
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}/cancel`, { method: "POST" }),
+      env,
+      context,
+    );
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(200);
+    expect(await env.DB.prepare(`SELECT id FROM pages WHERE id = ?`).bind(targetPageId).first()).toBeNull();
+    expect(await env.DB.prepare(`SELECT id FROM attachments WHERE id = ?`).bind(attachmentId).first()).toBeNull();
+    expect(await Promise.all([attachmentKey, inputKey, documentKey].map((key) => env.BUCKET.get(key)))).toEqual([
+      null,
+      null,
+      null,
+    ]);
+  });
+
   it("authorizes job artifacts and expires their exact R2 keys", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
@@ -257,12 +327,7 @@ describe("job execution", () => {
     )
       .bind(attachmentId, installed.workspaceId, installed.pageId, attachmentKey, installed.userId, Date.now())
       .run();
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "WORKFLOW_INLINE") return "true";
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ WORKFLOW_INLINE: "true" });
     const context = createExecutionContext();
     const response = await worker.fetch(
       request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
@@ -297,12 +362,7 @@ describe("job execution", () => {
 
   it("reports PDF configuration and renders through the Browser Run binding", async () => {
     const installed = await bootstrap();
-    const unavailableBindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "BROWSER") return undefined;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const unavailableBindings = bindingsWith({ BROWSER: undefined });
     expect(
       (
         await worker.fetch(
@@ -321,13 +381,7 @@ describe("job execution", () => {
       expect(options.html).toContain("<h1>Welcome</h1>");
       return new Response("%PDF-test", { headers: { "content-type": "application/pdf" } });
     });
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "WORKFLOW_INLINE") return "true";
-        if (property === "BROWSER") return { quickAction } as unknown as BrowserRun;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ WORKFLOW_INLINE: "true", BROWSER: { quickAction } as unknown as BrowserRun });
     const context = createExecutionContext();
     const queued = await worker.fetch(
       request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
@@ -377,12 +431,7 @@ describe("job execution", () => {
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
 
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "NOTES_WORKFLOW") return { create };
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
     const context = createExecutionContext();
     const queued = await worker.fetch(
       request(installed.cookie, "/api/templates", {
@@ -469,12 +518,7 @@ describe("job execution", () => {
     ]);
 
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "NOTES_WORKFLOW") return { create };
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
     const context = createExecutionContext();
     const response = await worker.fetch(
       request(installed.cookie, "/api/templates", {
@@ -587,6 +631,11 @@ describe("job execution", () => {
       },
       {
         path: "Project 0123456789abcdef0123456789abcdef/Tasks aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.csv",
+        bytes: encoder.encode("Task,Done,Estimate\nShip,yes,2\n"),
+      },
+      {
+        // Notion ships a view-filtered CSV next to the unfiltered `_all` CSV; only the latter is imported.
+        path: "Project 0123456789abcdef0123456789abcdef/Tasks aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_all.csv",
         bytes: encoder.encode("Task,Done,Estimate\nShip,yes,2\nTest,no,3\n"),
       },
       {
@@ -628,6 +677,7 @@ describe("job execution", () => {
       await tree.json<{ pages: Array<{ id: string; parentId: string | null; kind: string; title: string }> }>()
     ).pages;
     const project = imported.find((page) => page.title === "Project")!;
+    expect(imported.filter((page) => page.title === "Tasks")).toHaveLength(1);
     const tasks = imported.find((page) => page.title === "Tasks")!;
     expect(tasks).toMatchObject({ parentId: project.id, kind: "table" });
     expect(
@@ -658,14 +708,7 @@ describe("delivery outbox", () => {
       .run();
 
     const sent: unknown[] = [];
-    const bindings = new Proxy(env as Env, {
-      get(target, property, receiver) {
-        if (property === "DELIVERY_QUEUE") {
-          return { send: vi.fn(async (body: unknown) => void sent.push(body)) };
-        }
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send: vi.fn(async (body: unknown) => void sent.push(body)) } });
     await sweepOutbox(bindings);
     expect(sent).toEqual([{ outboxId }]);
     expect(

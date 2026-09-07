@@ -75,7 +75,7 @@ accrue duration, hibernation is not working and cost scales with connections rat
 | Invalid move batch       | Any `Page move batch result was invalid or inconsistent.` log line                                        | D1 returned malformed metadata or a result that contradicted the read-back state. `recoveredFromReceipt` records whether recovery succeeded |
 | Conflicting move replay  | Any `Page move recovery found a conflicting receipt.` log line                                            | A failed move raced with reuse of its operation id. Inspect the flattened move and receipt errors                                           |
 | Deletion backlog         | `deletion_jobs` count above 10                                                                            | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                                        |
-| Move-receipt backlog     | Any `Page move receipt pruning reached its hourly catch-up limit` log line                                | More than 10000 expired receipts reached one pass; retention cleanup may be falling behind                                                  |
+| Move-receipt backlog     | Any `Page move receipt pruning reached its catch-up limit` log line                                       | More than 10000 expired receipts reached one pass; retention cleanup may be falling behind                                                  |
 | Stuck deletion           | Any `deletion_jobs` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5              | Overdue by more than a cron interval, so the runner is not clearing it; `attempts` past the clamp means it is at the 16-hour ceiling        |
 | Stuck archive            | Any `archive_disconnect_targets` row with `next_attempt_at` more than 2 hours past, or `attempts` above 9 | Same, against the 42 min 40 s ceiling                                                                                                       |
 | Stuck upload             | Any `attachment_uploads` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5         | The reaper is not clearing it, so R2 keeps holding the parts                                                                                |
@@ -86,7 +86,7 @@ The queue-based alerts have no push mechanism in this repository. Run the querie
 non-zero count.
 
 Alert on `next_attempt_at` and `attempts`, never on how old a row is. The only general runner is the
-hourly cron, so a row that failed with a 10-second backoff still waits until the next tick: a healthy
+15-minute cron, so a row that failed with a 10-second backoff still waits until the next tick: a healthy
 retrying row is routinely older than the delay that scheduled it. Row age says nothing about whether
 work is progressing.
 
@@ -130,4 +130,4 @@ pnpm wrangler d1 execute DB --env production --remote --command \
   "SELECT COUNT(*) jobs FROM deletion_jobs;"
 ```
 
-Then confirm the next hourly cron tick succeeds before considering the deploy settled.
+Then confirm the next cron tick succeeds before considering the deploy settled.

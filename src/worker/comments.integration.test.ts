@@ -240,6 +240,28 @@ describe("server-authoritative comments", () => {
     );
     expect(fallback.status).toBe(200);
     expect(await fallback.json()).toMatchObject({ anchored: false, thread: { anchored: false } });
+
+    // A drifted re-anchor leaves the existing mark and stored selection in place.
+    const kept = await SELF.fetch(
+      request(installed.cookie, `/api/comment-threads/${thread.id}/anchor`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ selection: { yjs: { head: position, anchor: position } } }),
+      }),
+    );
+    expect(await kept.json()).toMatchObject({ anchored: false, thread: { anchored: true } });
+
+    // Only the thread author may place or move its anchor in the document body.
+    const viewer = await invite(installed.cookie, "anchor");
+    const forbidden = await SELF.fetch(
+      request(viewer.cookie, `/api/comment-threads/${thread.id}/anchor`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ selection: { yjs: selection } }),
+      }),
+    );
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toMatchObject({ error: { code: "comment_author_required" } });
   });
 
   it("migrates legacy Yjs thread bodies once while preserving ids and anchors", async () => {
@@ -303,5 +325,47 @@ describe("server-authoritative comments", () => {
 
     const repeated = await SELF.fetch(request(installed.cookie, `/api/pages/${installed.pageId}/comments`));
     expect((await repeated.json<{ threads: CommentThread[] }>()).threads).toHaveLength(1);
+  });
+
+  it("migrates legacy threads whose author or resolver no longer exists", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(
+      new Request("https://document.internal/noop", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    const threadId = crypto.randomUUID();
+    await runInDurableObject(stub, async (instance) => {
+      const comment = new Y.Map<unknown>();
+      comment.set("id", crypto.randomUUID());
+      comment.set("userId", "deleted-user");
+      comment.set("body", commentBody("Former collaborator"));
+      comment.set("createdAt", 100);
+      comment.set("updatedAt", 200);
+      const comments = new Y.Array<Y.Map<unknown>>();
+      comments.push([comment]);
+      const thread = new Y.Map<unknown>();
+      thread.set("id", threadId);
+      thread.set("comments", comments);
+      thread.set("createdAt", 100);
+      thread.set("updatedAt", 200);
+      thread.set("resolved", true);
+      thread.set("resolvedBy", "deleted-resolver");
+      thread.set("resolvedUpdatedAt", 200);
+      (instance as unknown as { document: Y.Doc }).document.getMap("comments").set(threadId, thread);
+    });
+
+    const response = await SELF.fetch(request(installed.cookie, `/api/pages/${installed.pageId}/comments`));
+
+    expect(response.status).toBe(200);
+    expect(
+      await env.DB.prepare(`SELECT created_by, resolved_by FROM comment_threads WHERE id = ?`).bind(threadId).first(),
+    ).toEqual({ created_by: installed.userId, resolved_by: null });
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM comments WHERE thread_id = ?`).bind(threadId).first(),
+    ).toEqual({
+      count: 0,
+    });
   });
 });

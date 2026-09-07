@@ -14,8 +14,9 @@ import { pageJson, type PageJsonRow } from "./page-row";
 const SEARCH_LIMIT_DEFAULT = 20;
 const SEARCH_LIMIT_MAX = 50;
 const SEARCH_OFFSET_MAX = 1_000;
-const SNIPPET_OPEN = "";
-const SNIPPET_CLOSE = "";
+// Private-use sentinels, written as escapes so they survive editors and review.
+const SNIPPET_OPEN = "\uE000";
+const SNIPPET_CLOSE = "\uE001";
 
 type SearchRow = PageJsonRow & {
   space_name: string;

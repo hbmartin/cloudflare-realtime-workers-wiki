@@ -176,6 +176,40 @@ async function portableExport(
   return createZip(entries);
 }
 
+// Browser Rendering loads the HTML from about:blank, so session-gated attachment URLs never resolve there.
+const PDF_INLINE_ASSET_LIMIT = 24 * 1024 * 1024;
+
+function base64(bytes: Uint8Array) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function pdfExportHtml(env: Env, job: JobRow, page: ExportPage, html: string) {
+  const attachments = await env.DB.prepare(`SELECT id, r2_key, name, mime FROM attachments WHERE page_id = ?`)
+    .bind(page.id)
+    .all<ExportAttachment>();
+  let rewritten = html;
+  let inlined = 0;
+  for (const attachment of attachments.results) {
+    const relative = `/api/attachments/${attachment.id}`;
+    if (!rewritten.includes(relative)) continue;
+    await assertExportActive(env, job.id);
+    let replacement = `${env.BETTER_AUTH_URL}${relative}`;
+    if (attachment.mime.startsWith("image/")) {
+      const object = await env.BUCKET.get(attachment.r2_key);
+      if (object && inlined + object.size <= PDF_INLINE_ASSET_LIMIT) {
+        inlined += object.size;
+        replacement = `data:${attachment.mime};base64,${base64(new Uint8Array(await object.arrayBuffer()))}`;
+      }
+    }
+    rewritten = rewritten.replaceAll(relative, replacement);
+  }
+  return rewritten;
+}
+
 export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   const options = exportOptions(job);
   const artifact = await step.do("render export", async () => {
@@ -195,7 +229,7 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
     if (options.format === "pdf") {
       if (!env.BROWSER) throw new Error("PDF export is not configured.");
       const response = await env.BROWSER.quickAction("pdf", {
-        html: serialized.html,
+        html: await pdfExportHtml(env, job, page, serialized.html),
         pdfOptions: {
           format: "a4",
           printBackground: true,
@@ -218,8 +252,8 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
         filename = `${fileStem(page.title)}.${options.format === "markdown" ? "md" : "html"}`;
       }
     }
-    if (!bytes.byteLength || bytes.byteLength > EXPORT_MAX_BYTES)
-      throw new Error("The export exceeds the 64 MiB limit.");
+    if (!bytes.byteLength) throw new Error("The export produced an empty file.");
+    if (bytes.byteLength > EXPORT_MAX_BYTES) throw new Error("The export exceeds the 64 MiB limit.");
     const outputKey = `jobs/${job.id}/output/${encodeURIComponent(filename)}`;
     await env.BUCKET.put(outputKey, bytes, {
       httpMetadata: { contentType },

@@ -36,7 +36,7 @@ export function TemplateLibrary({
               </div>
               <div className="template-actions">
                 <button className="quiet-button" onClick={() => onEdit(template)}>
-                  Edit
+                  {editable ? "Edit" : "Open"}
                 </button>
                 {editable && (
                   <button className="primary-small" disabled={busy} onClick={() => onUse(template)}>

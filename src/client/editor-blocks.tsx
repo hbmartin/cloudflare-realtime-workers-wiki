@@ -1,6 +1,6 @@
 import { renderToString } from "katex";
 import { createReactBlockSpec, createReactInlineContentSpec } from "@blocknote/react";
-import { useEffect, useId, useState, type CSSProperties } from "react";
+import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 import "katex/dist/katex.min.css";
 
 const CALLOUT_TONES = ["info", "success", "warning", "danger"] as const;
@@ -106,13 +106,15 @@ const math = createReactBlockSpec(
   },
 )();
 
-function MermaidBlock({ source, update }: { source: string; update?: (source: string) => void }) {
-  const renderId = `notes-mermaid-${useId().replaceAll(":", "")}`;
+export function MermaidBlock({ source, update }: { source: string; update?: (source: string) => void }) {
+  const renderBaseId = `notes-mermaid-${useId().replaceAll(":", "")}`;
+  const renderSequence = useRef(0);
   const [preview, setPreview] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
     let active = true;
+    const renderId = `${renderBaseId}-${++renderSequence.current}`;
     void import("mermaid")
       .then(async ({ default: mermaid }) => {
         mermaid.initialize({ startOnLoad: false, securityLevel: "strict", suppressErrorRendering: true });
@@ -129,7 +131,7 @@ function MermaidBlock({ source, update }: { source: string; update?: (source: st
     return () => {
       active = false;
     };
-  }, [renderId, source]);
+  }, [renderBaseId, source]);
 
   return (
     <div className="editor-mermaid">

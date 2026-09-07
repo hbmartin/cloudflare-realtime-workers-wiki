@@ -144,5 +144,19 @@ describe("organization APIs", () => {
         .status,
     ).toBe(403);
     expect((await SELF.fetch(request(viewer, "/api/tags", { method: "POST" }))).status).toBe(403);
+
+    // Creating a tag and assigning one are separate routes with separate guards.
+    const created = await SELF.fetch(
+      request(installed.cookie, "/api/tags", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "Restricted", color: "blue" }),
+      }),
+    );
+    expect(created.status).toBe(201);
+    const tag = (await created.json<{ tag: Tag }>()).tag;
+    const assignPath = `/api/pages/${installed.pageId}/tags/${tag.id}`;
+    expect((await SELF.fetch(request(viewer, assignPath, { method: "PUT" }))).status).toBe(403);
+    expect((await SELF.fetch(request(viewer, assignPath, { method: "DELETE" }))).status).toBe(403);
   });
 });

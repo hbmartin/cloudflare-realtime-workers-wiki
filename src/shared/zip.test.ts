@@ -40,4 +40,19 @@ describe("ZIP utilities", () => {
     new DataView(bomb.buffer).setUint32(nextCentral + 24, compressed.byteLength * 201, true);
     await expect(readZip(bomb)).rejects.toThrow(/expands beyond/);
   });
+
+  it("stores normalized paths in ZIP headers", () => {
+    const zip = createZip([{ path: ".\\folder\\file.txt", bytes: new Uint8Array([1]) }]);
+    const nameLength = new DataView(zip.buffer, zip.byteOffset, zip.byteLength).getUint16(26, true);
+    expect(new TextDecoder().decode(zip.subarray(30, 30 + nameLength))).toBe("folder/file.txt");
+  });
+
+  it("honors a caller's remaining archive budget before inflating entries", async () => {
+    const zip = createZip([
+      { path: "one.txt", bytes: new TextEncoder().encode("one") },
+      { path: "two.txt", bytes: new TextEncoder().encode("two") },
+    ]);
+    await expect(readZip(zip, { maxEntries: 1 })).rejects.toThrow(/too many files/);
+    await expect(readZip(zip, { maxExpandedBytes: 5 })).rejects.toThrow(/expands beyond/);
+  });
 });

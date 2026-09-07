@@ -4990,6 +4990,13 @@ describe("App error handling", () => {
 
     fireEvent.change(switcher, { target: { value: privateSpace.id } });
     expect((await screen.findAllByText("Secrets")).length).toBeGreaterThan(0);
+    // Without selecting the page the toolbar is absent because nothing is selected, so
+    // the restriction assertions below would pass even with the viewer checks removed.
+    const secretsNode = screen
+      .getAllByRole("button", { name: /Secrets/ })
+      .find((button) => button.classList.contains("page-link"))!;
+    fireEvent.click(secretsNode);
+    expect(await screen.findByRole("button", { name: "Favorite" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Pin" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Archive Secrets" })).not.toBeInTheDocument();
   });

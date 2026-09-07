@@ -4933,7 +4933,7 @@ describe("Worker integration", () => {
     expect(await countExpired()).toEqual({ count: 1 });
     expect(warned).toHaveBeenCalledOnce();
     expect(warned).toHaveBeenCalledWith(
-      "Page move receipt pruning reached its hourly catch-up limit; expired receipts may remain.",
+      "Page move receipt pruning reached its catch-up limit; expired receipts may remain.",
       {
         batchSize: PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
         maxBatches: PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
