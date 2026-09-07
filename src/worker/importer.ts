@@ -357,18 +357,20 @@ async function loadBundle(env: Env, job: JobRow, options: ImportOptions) {
   return options.format === "notion_zip" ? notionBundle(job, options, bytes) : singlePageBundle(job, options, bytes);
 }
 
-async function assertImportActive(env: Env, jobId: string) {
-  const row = await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(jobId).first<{ status: string }>();
+async function assertImportActive(env: Env, job: Pick<JobRow, "id" | "attempt">) {
+  const row = await env.DB.prepare(`SELECT status FROM jobs WHERE id = ? AND attempt = ?`)
+    .bind(job.id, job.attempt)
+    .first<{ status: string }>();
   if (!row || row.status !== "running")
-    throw new Error(row?.status === "canceled" ? "Job canceled." : "Job is not active.");
+    throw new Error(row?.status === "canceling" || row?.status === "canceled" ? "Job canceled." : "Job is not active.");
 }
 
 async function setProgress(env: Env, job: JobRow, current: number, total: number, label: string) {
   await env.DB.prepare(
     `UPDATE jobs SET progress_current = ?, progress_total = ?, progress_label = ?, updated_at = ?
-      WHERE id = ? AND status = 'running'`,
+      WHERE id = ? AND attempt = ? AND status = 'running'`,
   )
-    .bind(current, total, label, Date.now(), job.id)
+    .bind(current, total, label, Date.now(), job.id, job.attempt)
     .run();
   await broadcastWorkspaceEvent(env, job.workspace_id, { type: "jobs-invalidated" });
 }
@@ -380,7 +382,7 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
     (left, right) =>
       left.source.split("/").length - right.source.split("/").length || left.source.localeCompare(right.source),
   )) {
-    await assertImportActive(env, job.id);
+    await assertImportActive(env, job);
     const existing = await env.DB.prepare(`SELECT import_job_id, content_epoch FROM pages WHERE id = ?`)
       .bind(page.id)
       .first<{ import_job_id: string | null; content_epoch: number }>();
@@ -388,8 +390,11 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
       if (existing.import_job_id !== job.id) throw new Error("An imported page id is already in use.");
       if (existing.content_epoch !== job.attempt) {
         // A retry must not reuse the purged document room of the previous attempt.
-        await env.DB.prepare(`UPDATE pages SET content_epoch = ? WHERE id = ? AND import_job_id = ?`)
-          .bind(job.attempt, page.id, job.id)
+        await env.DB.prepare(
+          `UPDATE pages SET content_epoch = ? WHERE id = ? AND import_job_id = ?
+            AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
+        )
+          .bind(job.attempt, page.id, job.id, job.id, job.attempt)
           .run();
       }
       continue;
@@ -432,10 +437,10 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
 
 async function stageAttachments(env: Env, job: JobRow, page: ImportPage) {
   for (const asset of page.assets) {
-    await assertImportActive(env, job.id);
+    await assertImportActive(env, job);
     const id = await stableId(job.id, "attachment", `${page.source}:${asset.source}`);
     const hash = await sha256Hex(asset.bytes);
-    const key = `assets/${job.workspace_id}/${id}/${hash}`;
+    const key = `assets/${job.workspace_id}/${id}/attempts/${job.attempt}/${hash}`;
     const existing = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ?`)
       .bind(id)
       .first<{ r2_key: string }>();
@@ -478,7 +483,7 @@ async function stageAttachments(env: Env, job: JobRow, page: ImportPage) {
 
 async function initializeDocument(env: Env, job: JobRow, page: ImportPage) {
   if (!page.document) throw new Error("Imported document content is missing.");
-  const inputKey = `jobs/${job.id}/documents/${page.id}.bin`;
+  const inputKey = `jobs/${job.id}/attempts/${job.attempt}/documents/${page.id}.bin`;
   await env.BUCKET.put(inputKey, documentToYjsUpdate(page.document), {
     httpMetadata: { contentType: "application/octet-stream" },
     customMetadata: { jobId: job.id, pageId: page.id },
@@ -542,7 +547,7 @@ async function initializeTable(env: Env, job: JobRow, page: ImportPage) {
     ).bind(JSON.stringify(optionRows)),
   ]);
   for (let offset = 0; offset < table.rows.length; offset += 100) {
-    await assertImportActive(env, job.id);
+    await assertImportActive(env, job);
     const values = await Promise.all(
       table.rows.slice(offset, offset + 100).map(async (row, rowOffset) => {
         const position = offset + rowOffset;
@@ -642,7 +647,7 @@ async function verifyPage(env: Env, job: JobRow, page: ImportPage) {
 }
 
 async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
-  await assertImportActive(env, job.id);
+  await assertImportActive(env, job);
   const timestamp = Date.now();
   const roots = bundle.pages.filter((page) => page.parentId === null);
   const pageIdValues = bundle.pages.map((page) => page.id);
@@ -655,12 +660,12 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
     env.DB.prepare(
       `INSERT OR IGNORE INTO subscriptions (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
        SELECT ? || ':' || id, workspace_id, ?, 'page', id, ?, ? FROM pages
-        WHERE import_job_id = ?`,
-    ).bind(job.id, job.requested_by, job.requested_by, timestamp, job.id),
+        WHERE import_job_id = ? AND content_epoch = ?`,
+    ).bind(job.id, job.requested_by, job.requested_by, timestamp, job.id, job.attempt),
     env.DB.prepare(
-      `UPDATE pages SET import_job_id = NULL, updated_at = ? WHERE import_job_id = ?
-        AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = 'running')`,
-    ).bind(timestamp, job.id, job.id),
+      `UPDATE pages SET import_job_id = NULL, updated_at = ? WHERE import_job_id = ? AND content_epoch = ?
+        AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
+    ).bind(timestamp, job.id, job.attempt, job.id, job.attempt),
     env.DB.prepare(
       `INSERT INTO page_search (page_id, workspace_id, title, body)
        SELECT id, workspace_id, title, plain_text FROM pages
@@ -670,8 +675,8 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
     env.DB.prepare(
       `UPDATE jobs SET status = 'succeeded', progress_current = 7, progress_total = 7,
         progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
-        updated_at = ? WHERE id = ? AND status = 'running'`,
-    ).bind(result, timestamp + IMPORT_ARTIFACT_TTL_MS, timestamp, job.id),
+        updated_at = ? WHERE id = ? AND attempt = ? AND status = 'running'`,
+    ).bind(result, timestamp + IMPORT_ARTIFACT_TTL_MS, timestamp, job.id, job.attempt),
   ]);
   const published = await env.DB.prepare(
     `SELECT * FROM pages WHERE id IN (SELECT value FROM json_each(?)) AND import_job_id IS NULL ORDER BY position, id`,
@@ -693,29 +698,52 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
   await broadcast({ type: "jobs-invalidated" });
 }
 
-export async function cleanupImport(env: Env, job: JobRow) {
-  const pages = await env.DB.prepare(`SELECT id, kind, content_epoch FROM pages WHERE import_job_id = ?`)
-    .bind(job.id)
+export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Promise<boolean> = async () => true) {
+  const current = await env.DB.prepare(
+    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN ('running', 'canceling')`,
+  )
+    .bind(job.id, job.attempt)
+    .first();
+  if (!current || !(await stillOwned())) return;
+  const pages = await env.DB.prepare(
+    `SELECT id, kind, content_epoch FROM pages WHERE import_job_id = ? AND content_epoch = ?`,
+  )
+    .bind(job.id, job.attempt)
     .all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
   const attachments = await env.DB.prepare(
-    `SELECT r2_key FROM attachments WHERE page_id IN (SELECT id FROM pages WHERE import_job_id = ?)`,
+    `SELECT r2_key FROM attachments WHERE page_id IN (
+      SELECT id FROM pages WHERE import_job_id = ? AND content_epoch = ?
+    )`,
   )
-    .bind(job.id)
+    .bind(job.id, job.attempt)
     .all<{ r2_key: string }>();
   for (const page of pages.results) {
     if (page.kind !== "document") continue;
+    if (!(await stillOwned())) return;
     const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
       new Request("https://document.internal/purge", {
         method: "POST",
         headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
       }),
     );
+    if (!(await stillOwned())) return;
     if (!response.ok) throw new Error("A staged import document could not be purged.");
   }
-  await env.DB.prepare(`DELETE FROM pages WHERE import_job_id = ?`).bind(job.id).run();
-  if (attachments.results.length) await env.BUCKET.delete(attachments.results.map((attachment) => attachment.r2_key));
-  for (const page of pages.results) await deleteR2Prefix(env.BUCKET, `documents/${page.id}/`);
-  await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/documents/`);
+  if (!(await stillOwned())) return;
+  await env.DB.prepare(`DELETE FROM pages WHERE import_job_id = ? AND content_epoch = ?`)
+    .bind(job.id, job.attempt)
+    .run();
+  if (attachments.results.length && (await stillOwned()))
+    await env.BUCKET.delete(attachments.results.map((attachment) => attachment.r2_key));
+  for (const page of pages.results) {
+    if (!(await stillOwned())) return;
+    await deleteR2Prefix(env.BUCKET, `documents/${page.id}/epochs/${job.attempt}/`);
+  }
+  if (!(await stillOwned())) return;
+  await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${job.attempt}/documents/`);
+  if (job.attempt === 1 && (await stillOwned())) {
+    await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/documents/`);
+  }
 }
 
 export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
@@ -723,22 +751,23 @@ export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
   let bundlePromise: Promise<ImportBundle> | null = null;
   const bundle = () => (bundlePromise ??= loadBundle(env, job, options));
   const preview = await step.do("inspect import", async () => {
-    await assertImportActive(env, job.id);
+    await assertImportActive(env, job);
     return (await bundle()).preview;
   });
   if (!options.confirmed) {
     await step.do("await confirmation", async () => {
-      await assertImportActive(env, job.id);
+      await assertImportActive(env, job);
       await env.DB.prepare(
         `UPDATE jobs SET status = 'awaiting_confirmation', progress_current = 2, progress_total = 7,
           progress_label = 'Ready to import', result_json = ?, expires_at = ?, updated_at = ?
-         WHERE id = ? AND status = 'running'`,
+         WHERE id = ? AND attempt = ? AND status = 'running'`,
       )
         .bind(
           JSON.stringify({ warnings: preview.warnings, preview }),
           Date.now() + IMPORT_ARTIFACT_TTL_MS,
           Date.now(),
           job.id,
+          job.attempt,
         )
         .run();
       await broadcastWorkspaceEvent(env, job.workspace_id, { type: "jobs-invalidated" });
@@ -759,7 +788,7 @@ export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
     const loaded = await bundle();
     await setProgress(env, job, 4, 7, "Writing content");
     for (const page of loaded.pages) {
-      await assertImportActive(env, job.id);
+      await assertImportActive(env, job);
       if (page.kind === "document") await initializeDocument(env, job, page);
       else await initializeTable(env, job, page);
     }

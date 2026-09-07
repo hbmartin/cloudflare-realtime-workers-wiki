@@ -3403,7 +3403,7 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
 
     expect(await screen.findByRole("button", { name: "Archive Other" })).toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page")).toBe(otherPage.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(otherPage.id));
   });
 
   it("preserves navigation to a page until its workspace event reaches the loaded tree", async () => {

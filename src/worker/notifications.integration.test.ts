@@ -340,6 +340,69 @@ describe("notification feed and subscriptions", () => {
     ).toMatchObject({ status: "failed", last_error: "access_revoked" });
   });
 
+  it("does not let a stale delivery claimant finish a newer email lease", async () => {
+    const installed = await bootstrap();
+    const viewer = await invite(installed.cookie, "delivery-lease");
+    await SELF.fetch(
+      request(viewer.cookie, `/api/pages/${installed.page.id}/comments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          initialComment: { body: commentBody("Please review ", { id: installed.userId, label: "Owner" }) },
+        }),
+      }),
+    );
+    const notification = await env.DB.prepare(
+      `SELECT id FROM notifications WHERE user_id = ? AND event_type = 'mention'`,
+    )
+      .bind(installed.userId)
+      .first<{ id: string }>();
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => (firstStarted = resolve));
+    const blocked = new Promise<void>((resolve) => (releaseFirst = resolve));
+    const bindings = (send: (message: unknown) => Promise<unknown>) =>
+      new Proxy(env as Env, {
+        get(target, property, receiver) {
+          if (property === "SEND_EMAIL") return { send };
+          if (property === "EMAIL_FROM") return "notes@example.test";
+          return Reflect.get(target, property, receiver);
+        },
+      });
+    const first = deliverNotification(
+      bindings(async () => {
+        firstStarted();
+        await blocked;
+        return { messageId: "first" };
+      }),
+      notification!.id,
+    );
+    await started;
+    const key = `outbox:${notification!.id}:email`;
+    const firstLease = await env.DB.prepare(`SELECT claim_token FROM deliveries WHERE idempotency_key = ?`)
+      .bind(key)
+      .first<{ claim_token: string }>();
+    await env.DB.prepare(`UPDATE deliveries SET updated_at = 0 WHERE idempotency_key = ?`).bind(key).run();
+
+    await deliverNotification(
+      bindings(async () => ({ messageId: "second" })),
+      notification!.id,
+    );
+    const secondLease = await env.DB.prepare(
+      `SELECT status, attempts, claim_token FROM deliveries WHERE idempotency_key = ?`,
+    )
+      .bind(key)
+      .first<{ status: string; attempts: number; claim_token: string }>();
+    expect(secondLease).toMatchObject({ status: "sent", attempts: 2 });
+    expect(secondLease?.claim_token).not.toBe(firstLease?.claim_token);
+
+    releaseFirst();
+    await first;
+    expect(
+      await env.DB.prepare(`SELECT status, claim_token FROM deliveries WHERE idempotency_key = ?`).bind(key).first(),
+    ).toEqual({ status: "sent", claim_token: secondLease!.claim_token });
+  });
+
   it("delivers digest-mode mentions without letting other timezones consume the candidate limit", async () => {
     const installed = await bootstrap();
     const timestamp = Date.UTC(2026, 8, 5, 9, 5);
@@ -397,5 +460,64 @@ describe("notification feed and subscriptions", () => {
         `SELECT COUNT(*) count FROM notifications WHERE emailed_at IS NOT NULL AND id LIKE 'mention:digest:%'`,
       ).first(),
     ).toEqual({ count: 1 });
+  });
+
+  it("advances the persisted digest cursor past a failing leading cohort", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+    await env.DB.batch([
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         SELECT printf('cursor-user-%02d', n), printf('Cursor User %02d', n),
+                printf('cursor-user-%02d@example.test', n), 1, ?, ? FROM sequence`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         SELECT ?, printf('cursor-user-%02d', n), 'viewer', ? FROM sequence`,
+      ).bind(installed.workspaceId, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
+         SELECT printf('cursor-user-%02d', n), 'mention', 1, 'digest', 'off', 'UTC' FROM sequence`,
+      ),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 51)
+         INSERT INTO notifications
+           (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         SELECT printf('mention:cursor:%02d', n), ?, printf('cursor-user-%02d', n), 'mention', ?, ?, ?, '{}',
+                printf('cursor:%02d', n), ? + n FROM sequence`,
+      ).bind(installed.workspaceId, installed.userId, installed.page.spaceId, installed.page.id, timestamp),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
+           FROM notifications WHERE id LIKE 'mention:cursor:%'`,
+      ).bind(timestamp, timestamp),
+    ]);
+    const send = vi.fn(async (message: { to: string }) => {
+      if (!message.to.startsWith("cursor-user-51@")) throw new Error("mailbox unavailable");
+      return { messageId: "tail-delivered" };
+    });
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "SEND_EMAIL") return { send };
+        if (property === "EMAIL_FROM") return "notes@example.test";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await sendDueNotificationDigests(bindings, timestamp);
+    expect(send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")).toBe(false);
+    await sendDueNotificationDigests(bindings, timestamp);
+
+    expect(send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")).toBe(true);
+    expect(
+      await env.DB.prepare(
+        `SELECT emailed_at IS NOT NULL delivered FROM notifications WHERE id = 'mention:cursor:51'`,
+      ).first(),
+    ).toEqual({ delivered: 1 });
+    log.mockRestore();
   });
 });

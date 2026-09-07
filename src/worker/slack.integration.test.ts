@@ -471,7 +471,9 @@ describe("Slack security and integration", () => {
         sourceId: "suppressed-projection",
         recipientIds: [],
         emitSlackChannel: false,
-        createdAt: Date.now(),
+        // Keep this outside the page-edit coalescing window so the flag itself,
+        // rather than deduplication, is what prevents a second channel event.
+        createdAt: Date.now() + 2 * 60 * 60_000,
       }),
     );
     expect(

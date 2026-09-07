@@ -4,6 +4,7 @@ import { serializeDocument } from "../shared/document-projection";
 import { createZip, type ZipEntry } from "../shared/zip";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
+import { inlineImageMime } from "./attachments";
 import { normalizeFilename } from "./http";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
@@ -56,9 +57,13 @@ function fileStem(title: string) {
   return normalized || "Untitled";
 }
 
-async function assertExportActive(env: Env, jobId: string) {
-  const row = await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(jobId).first<{ status: string }>();
-  if (!row || row.status === "canceling" || row.status === "canceled") throw new Error("Job canceled.");
+async function assertExportActive(env: Env, job: Pick<JobRow, "id" | "attempt">) {
+  const row = await env.DB.prepare(`SELECT status FROM jobs WHERE id = ? AND attempt = ?`)
+    .bind(job.id, job.attempt)
+    .first<{ status: string }>();
+  if (!row || row.status !== "running") {
+    throw new Error(row?.status === "canceling" || row?.status === "canceled" ? "Job canceled." : "Job is not active.");
+  }
 }
 
 async function documentExport(env: Env, page: ExportPage) {
@@ -144,6 +149,10 @@ function uniqueAssetName(name: string, used: Set<string>) {
   }
 }
 
+function replaceAttachmentReference(content: string, attachmentId: string, replacement: string) {
+  return content.replace(new RegExp(`/api/attachments/${attachmentId}(?![\\w-])`, "g"), replacement);
+}
+
 async function portableExport(
   env: Env,
   job: JobRow,
@@ -158,13 +167,14 @@ async function portableExport(
   const used = new Set<string>();
   let rewritten = content;
   for (const attachment of attachments.results) {
-    await assertExportActive(env, job.id);
+    await assertExportActive(env, job);
     const object = await env.BUCKET.get(attachment.r2_key);
     if (!object) throw new Error(`Attachment ${attachment.name} is missing.`);
     const name = uniqueAssetName(attachment.name, used);
     const relative = `assets/${name}`;
-    rewritten = rewritten.replaceAll(
-      `/api/attachments/${attachment.id}`,
+    rewritten = replaceAttachmentReference(
+      rewritten,
+      attachment.id,
       relative.split("/").map(encodeURIComponent).join("/"),
     );
     entries.push({ path: relative, bytes: new Uint8Array(await object.arrayBuffer()) });
@@ -191,29 +201,34 @@ async function pdfExportHtml(env: Env, job: JobRow, page: ExportPage, html: stri
   const attachments = await env.DB.prepare(`SELECT id, r2_key, name, mime FROM attachments WHERE page_id = ?`)
     .bind(page.id)
     .all<ExportAttachment>();
-  let rewritten = html;
+  const referenced = new Set([...html.matchAll(/\b(?:src|href)="([^"]*)"/g)].map((match) => match[1]!));
+  const replacements = new Map<string, string>();
   let inlined = 0;
   for (const attachment of attachments.results) {
     const relative = `/api/attachments/${attachment.id}`;
-    if (!rewritten.includes(relative)) continue;
-    await assertExportActive(env, job.id);
+    if (!referenced.has(relative)) continue;
+    await assertExportActive(env, job);
     let replacement = `${env.BETTER_AUTH_URL}${relative}`;
-    if (attachment.mime.startsWith("image/")) {
+    const imageMime = inlineImageMime(attachment.mime);
+    if (imageMime) {
       const object = await env.BUCKET.get(attachment.r2_key);
       if (object && inlined + object.size <= PDF_INLINE_ASSET_LIMIT) {
         inlined += object.size;
-        replacement = `data:${attachment.mime};base64,${base64(new Uint8Array(await object.arrayBuffer()))}`;
+        replacement = `data:${imageMime};base64,${base64(new Uint8Array(await object.arrayBuffer()))}`;
       }
     }
-    rewritten = rewritten.replaceAll(relative, replacement);
+    replacements.set(relative, escapeHtml(replacement));
   }
-  return rewritten;
+  return html.replace(/\b(src|href)="([^"]*)"/g, (attribute, name: string, value: string) => {
+    const replacement = replacements.get(value);
+    return replacement === undefined ? attribute : `${name}="${replacement}"`;
+  });
 }
 
 export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   const options = exportOptions(job);
   const artifact = await step.do("render export", async () => {
-    await assertExportActive(env, job.id);
+    await assertExportActive(env, job);
     const page = await env.DB.prepare(
       `SELECT id, workspace_id, content_epoch, kind, title FROM pages
         WHERE id = ? AND workspace_id = ? AND space_id = ? AND import_job_id IS NULL AND is_template = 0`,
@@ -222,7 +237,7 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
       .first<ExportPage>();
     if (!page) throw new Error("The page is no longer available for export.");
     const serialized = page.kind === "document" ? await documentExport(env, page) : await tableExport(env, page);
-    await assertExportActive(env, job.id);
+    await assertExportActive(env, job);
     let bytes: Uint8Array;
     let contentType: string;
     let filename: string;
@@ -254,7 +269,7 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
     }
     if (!bytes.byteLength) throw new Error("The export produced an empty file.");
     if (bytes.byteLength > EXPORT_MAX_BYTES) throw new Error("The export exceeds the 64 MiB limit.");
-    const outputKey = `jobs/${job.id}/output/${encodeURIComponent(filename)}`;
+    const outputKey = `jobs/${job.id}/attempts/${job.attempt}/output/${encodeURIComponent(filename)}`;
     await env.BUCKET.put(outputKey, bytes, {
       httpMetadata: { contentType },
       customMetadata: { filename, pageId: page.id, jobId: job.id },
@@ -262,12 +277,12 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
     return { outputKey, filename, byteLength: bytes.byteLength };
   });
   await step.do("publish export", async () => {
-    await assertExportActive(env, job.id);
+    await assertExportActive(env, job);
     const timestamp = Date.now();
     await env.DB.prepare(
       `UPDATE jobs SET status = 'succeeded', output_key = ?, progress_current = 2, progress_total = 2,
          progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
-         updated_at = ? WHERE id = ? AND status = 'running'`,
+         updated_at = ? WHERE id = ? AND attempt = ? AND status = 'running'`,
     )
       .bind(
         artifact.outputKey,
@@ -275,6 +290,7 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
         timestamp + EXPORT_ARTIFACT_TTL_MS,
         timestamp,
         job.id,
+        job.attempt,
       )
       .run();
     await broadcastWorkspaceEvent(env, job.workspace_id, { type: "jobs-invalidated" });

@@ -54,6 +54,16 @@ describe("D1 migrations", () => {
     expect(slackColumns.results.map((column) => column.name)).toEqual(
       expect.arrayContaining(["bot_token_ciphertext", "bot_refresh_token_ciphertext", "token_expires_at"]),
     );
+    const channelEventColumns = await env.DB.prepare(`PRAGMA table_info(slack_channel_events)`).all<{ name: string }>();
+    expect(channelEventColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["claimed_at", "claim_token"]),
+    );
+    const unfurlColumns = await env.DB.prepare(`PRAGMA table_info(slack_unfurls)`).all<{ name: string }>();
+    expect(unfurlColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["message_ts", "claimed_at", "claim_token"]),
+    );
+    const deliveryColumns = await env.DB.prepare(`PRAGMA table_info(deliveries)`).all<{ name: string }>();
+    expect(deliveryColumns.results.map((column) => column.name)).toContain("claim_token");
 
     const uploadColumns = await env.DB.prepare(`PRAGMA table_info(attachment_uploads)`).all<{ name: string }>();
     expect(uploadColumns.results.map((column) => column.name)).toEqual(
@@ -102,6 +112,49 @@ describe("D1 migrations", () => {
     expect(applied.results.map((migration) => migration.name)).toEqual(
       env.TEST_MIGRATIONS!.map((migration) => migration.name),
     );
+  });
+
+  it("applies review follow-ups through a new migration after the old history was recorded", async () => {
+    const followup = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0018_delivery_and_search_fences.sql");
+    expect(followup).toBeTruthy();
+    const followupIndex = env.TEST_MIGRATIONS!.indexOf(followup!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, followupIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', 1, ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES ('workspace', 'owner', 'owner', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, is_template, created_by, created_at, updated_at)
+         VALUES ('template', 'workspace', 'workspace-general', 'document', 'a0', 'Template', 1, 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO page_search_v2
+          (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
+         VALUES ('template', 'workspace', 'workspace-general', 'Template', '', '', '', '')`,
+      ),
+    ]);
+
+    await applyD1Migrations(env.DB, [followup!]);
+
+    expect(await env.DB.prepare(`SELECT page_id FROM page_search_v2 WHERE page_id = 'template'`).first()).toBeNull();
+    expect(
+      await env.DB.prepare(
+        `SELECT id, type, status FROM jobs WHERE id = 'workspace-search-reindex-v2-followup'`,
+      ).first(),
+    ).toEqual({ id: "workspace-search-reindex-v2-followup", type: "search_reindex", status: "queued" });
+    expect(
+      (await env.DB.prepare(`PRAGMA table_info(slack_channel_events)`).all<{ name: string }>()).results.map(
+        (column) => column.name,
+      ),
+    ).toEqual(expect.arrayContaining(["claimed_at", "claim_token"]));
   });
 
   it("marks legacy comment migrations separately and enrolls existing page creators as watchers", async () => {

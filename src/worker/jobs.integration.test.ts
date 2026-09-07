@@ -5,8 +5,11 @@ import type { Job } from "../shared/types";
 import { createZip, readZip } from "../shared/zip";
 import type { Env } from "./env";
 import {
+  cleanupTemplateClone,
   consumeDeliveryMessage,
   expireJobArtifacts,
+  recoverQueuedJobs,
+  resolveJobWorkflowAttempt,
   runCommentMigration,
   runTemplateClone,
   sweepOutbox,
@@ -134,7 +137,7 @@ describe("job execution", () => {
     expect(first.coalesced).toBe(false);
     expect(first.job).toMatchObject({ type: "search_reindex", status: "queued", hasDownload: false });
     await waitOnExecutionContext(context);
-    expect(create).toHaveBeenCalledWith({ id: first.job.id, params: { jobId: first.job.id } });
+    expect(create).toHaveBeenCalledWith({ id: first.job.id, params: { jobId: first.job.id, attempt: 1 } });
 
     const feed = await worker.fetch(request(installed.cookie, "/api/jobs"), env, createExecutionContext());
     expect(feed.status).toBe(200);
@@ -154,7 +157,7 @@ describe("job execution", () => {
     expect(response.status).toBe(202);
     const job = (await response.json<{ job: Job }>()).job;
     await waitOnExecutionContext(context);
-    expect(create).toHaveBeenCalledWith({ id: job.id, params: { jobId: job.id } });
+    expect(create).toHaveBeenCalledWith({ id: job.id, params: { jobId: job.id, attempt: 1 } });
 
     await env.DB.prepare(`UPDATE jobs SET status = 'running' WHERE id = ?`).bind(job.id).run();
     const row = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(job.id).first<JobRow>())!;
@@ -188,13 +191,22 @@ describe("job execution", () => {
       ).bind(succeededId, installed.workspaceId, installed.userId, timestamp, timestamp),
     ]);
 
+    const cancelContext = createExecutionContext();
     const canceled = await worker.fetch(
       request(installed.cookie, `/api/jobs/${canceledId}/cancel`, { method: "POST" }),
       env,
-      createExecutionContext(),
+      cancelContext,
     );
     expect(canceled.status).toBe(200);
-    expect((await canceled.json<{ job: Job }>()).job.status).toBe("canceled");
+    expect((await canceled.json<{ job: Job }>()).job.status).toBe("canceling");
+    await waitOnExecutionContext(cancelContext);
+    expect(
+      (
+        await (
+          await worker.fetch(request(installed.cookie, `/api/jobs/${canceledId}`), env, createExecutionContext())
+        ).json<{ job: Job }>()
+      ).job.status,
+    ).toBe("canceled");
 
     const retry = await worker.fetch(
       request(installed.cookie, `/api/jobs/${succeededId}/retry`, { method: "POST" }),
@@ -202,6 +214,44 @@ describe("job execution", () => {
       createExecutionContext(),
     );
     expect(retry.status).toBe(409);
+  });
+
+  it("recovers an interrupted cancellation before making the job retryable", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now() - 60_000;
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, cleanup_target, progress_label, created_at, updated_at)
+       VALUES (?, ?, 'import', 'canceling', ?, 'canceled', 'Cleanup pending', ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+      .run();
+
+    await recoverQueuedJobs(env);
+
+    expect(
+      await env.DB.prepare(`SELECT status, cleanup_target, cleanup_token FROM jobs WHERE id = ?`).bind(jobId).first(),
+    ).toEqual({ status: "canceled", cleanup_target: null, cleanup_token: null });
+  });
+
+  it("resolves legacy workflow payloads only through their stored instance identity", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, workflow_instance_id, attempt, created_at, updated_at)
+       VALUES (?, ?, 'export', 'queued', ?, 'legacy-instance', 3, ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+      .run();
+
+    expect(await resolveJobWorkflowAttempt(env, { payload: { jobId }, instanceId: "legacy-instance" })).toBe(3);
+    expect(await resolveJobWorkflowAttempt(env, { payload: { jobId }, instanceId: "stale-instance" })).toBeNull();
+    expect(await resolveJobWorkflowAttempt(env, { payload: { jobId, attempt: 4 }, instanceId: "stale-instance" })).toBe(
+      4,
+    );
   });
 
   it("cleans staged template clone resources after cancellation", async () => {
@@ -277,6 +327,57 @@ describe("job execution", () => {
       null,
       null,
     ]);
+  });
+
+  it("does not let stale attempt cleanup delete a retried template clone", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const targetPageId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const options = JSON.stringify({
+      sourcePageId: installed.pageId,
+      targetPageId,
+      targetSpaceId: `${installed.workspaceId}-general`,
+      parentId: null,
+      title: "Retried clone",
+      isTemplate: false,
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, space_id, type, status, requested_by, options_json, attempt, created_at, updated_at)
+         VALUES (?, ?, ?, 'template_clone', 'running', ?, ?, 2, ?, ?)`,
+      ).bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        options,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, import_job_id, content_epoch,
+           created_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'document', 'z-retry', 'Retried clone', ?, 2, ?, ?, ?)`,
+      ).bind(
+        targetPageId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        jobId,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+    ]);
+    const current = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+
+    await cleanupTemplateClone(env, { ...current, attempt: 1 });
+
+    expect(
+      await env.DB.prepare(`SELECT import_job_id, content_epoch FROM pages WHERE id = ?`).bind(targetPageId).first(),
+    ).toEqual({ import_job_id: jobId, content_epoch: 2 });
   });
 
   it("authorizes job artifacts and expires their exact R2 keys", async () => {
@@ -377,8 +478,46 @@ describe("job execution", () => {
       ).status,
     ).toBe(503);
 
+    const prefixKey = `assets/${installed.workspaceId}/a/prefix`;
+    const exactKey = `assets/${installed.workspaceId}/ab/exact`;
+    const hostileKey = `assets/${installed.workspaceId}/evil/hostile`;
+    const hostileMime = `image/png" onerror="fetch('https://attacker.invalid')//`;
+    await Promise.all([
+      env.BUCKET.put(prefixKey, "wrong"),
+      env.BUCKET.put(exactKey, "right"),
+      env.BUCKET.put(hostileKey, "invalid"),
+    ]);
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO attachments
+          (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+         VALUES ('a', ?, ?, ?, 'prefix.png', 'image/png', 5, ?, ?)`,
+      ).bind(installed.workspaceId, installed.pageId, prefixKey, installed.userId, Date.now()),
+      env.DB.prepare(
+        `INSERT INTO attachments
+          (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+         VALUES ('ab', ?, ?, ?, 'exact.png', 'image/png', 5, ?, ?)`,
+      ).bind(installed.workspaceId, installed.pageId, exactKey, installed.userId, Date.now()),
+      env.DB.prepare(
+        `INSERT INTO attachments
+          (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+         VALUES ('evil', ?, ?, ?, 'evil.png', ?, 7, ?, ?)`,
+      ).bind(installed.workspaceId, installed.pageId, hostileKey, hostileMime, installed.userId, Date.now()),
+    ]);
+    const source = new Y.Doc();
+    for (const id of ["ab", "evil"]) {
+      const image = new Y.XmlElement("image");
+      image.setAttribute("url", `/api/attachments/${id}`);
+      source.getXmlFragment("document-store").push([image]);
+    }
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+
     const quickAction = vi.fn(async (_action: string, options: { html?: string }) => {
       expect(options.html).toContain("<h1>Welcome</h1>");
+      expect(options.html).toContain("data:image/png;base64,cmlnaHQ=");
+      expect(options.html).not.toContain("d3Jvbmc=");
+      expect(options.html).not.toContain(" onerror=");
+      expect(options.html).not.toContain("attacker.invalid");
       return new Response("%PDF-test", { headers: { "content-type": "application/pdf" } });
     });
     const bindings = bindingsWith({ WORKFLOW_INLINE: "true", BROWSER: { quickAction } as unknown as BrowserRun });
@@ -690,6 +829,27 @@ describe("job execution", () => {
 });
 
 describe("delivery outbox", () => {
+  it("keeps retrying an outbox row after ten transient enqueue failures", async () => {
+    const installed = await bootstrap();
+    const outboxId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO outbox
+        (id, workspace_id, topic, payload_json, available_at, attempts, last_error, created_at)
+       VALUES (?, ?, 'notification', '{}', ?, 10, 'temporary outage', ?)`,
+    )
+      .bind(outboxId, installed.workspaceId, timestamp - 1, timestamp - 10_000)
+      .run();
+    const send = vi.fn(async () => undefined);
+
+    await sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }));
+
+    expect(send).toHaveBeenCalledWith({ outboxId });
+    expect(
+      await env.DB.prepare(`SELECT attempts, enqueued_at, last_error FROM outbox WHERE id = ?`).bind(outboxId).first(),
+    ).toMatchObject({ attempts: 11, enqueued_at: expect.any(Number), last_error: null });
+  });
+
   it("recovers a committed record and records duplicate delivery idempotently", async () => {
     const installed = await bootstrap();
     const outboxId = crypto.randomUUID();

@@ -8,7 +8,7 @@ import type {
 } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
-import { sendPersonalSlackNotification, slackChannelFanoutStatements } from "./slack";
+import { sendPersonalSlackNotification, SlackRateLimitError, slackChannelFanoutStatements } from "./slack";
 
 export const NOTIFICATION_EVENT_TYPES = [
   "mention",
@@ -458,42 +458,124 @@ async function recordDelivery(
 async function claimDelivery(env: Env, outboxId: string, channel: "email" | "slack") {
   const key = `${outboxId}:${channel}`;
   const timestamp = Date.now();
+  const token = crypto.randomUUID();
   const inserted = await env.DB.prepare(
     `INSERT OR IGNORE INTO deliveries
-      (idempotency_key, outbox_id, channel, status, attempts, updated_at)
-     VALUES (?, ?, ?, 'pending', 1, ?)`,
+      (idempotency_key, outbox_id, channel, status, attempts, updated_at, claim_token)
+     VALUES (?, ?, ?, 'pending', 1, ?, ?)`,
   )
-    .bind(key, outboxId, channel, timestamp)
+    .bind(key, outboxId, channel, timestamp, token)
     .run();
-  if (inserted.meta.changes) return "claimed";
+  if (inserted.meta.changes) return { state: "claimed" as const, token };
   // A failed attempt is retried; a pending claim whose consumer died mid-send is reclaimed once stale.
   const retry = await env.DB.prepare(
-    `UPDATE deliveries SET status = 'pending', attempts = attempts + 1, last_error = NULL, updated_at = ?
+    `UPDATE deliveries SET status = 'pending', attempts = attempts + 1, last_error = NULL,
+       updated_at = ?, claim_token = ?
       WHERE idempotency_key = ? AND (status = 'failed' OR (status = 'pending' AND updated_at <= ?))`,
   )
-    .bind(timestamp, key, timestamp - DELIVERY_CLAIM_STALE_MS)
+    .bind(timestamp, token, key, timestamp - DELIVERY_CLAIM_STALE_MS)
     .run();
-  if (retry.meta.changes) return "claimed";
+  if (retry.meta.changes) return { state: "claimed" as const, token };
   const current = await env.DB.prepare(`SELECT status FROM deliveries WHERE idempotency_key = ?`)
     .bind(key)
     .first<{ status: "pending" | "sent" | "failed" }>();
-  return current?.status === "pending" ? "in_progress" : "settled";
+  return { state: current?.status === "pending" ? ("in_progress" as const) : ("settled" as const) };
 }
 
 async function finishClaimedDelivery(
   env: Env,
   outboxId: string,
   channel: "email" | "slack",
+  token: string,
   status: "sent" | "failed",
   error: string | null = null,
 ) {
   const timestamp = Date.now();
-  await env.DB.prepare(
+  return env.DB.prepare(
     `UPDATE deliveries SET status = ?, last_error = ?, delivered_at = ?, updated_at = ?
-      WHERE idempotency_key = ? AND status = 'pending'`,
+      WHERE idempotency_key = ? AND status = 'pending' AND claim_token = ?`,
   )
-    .bind(status, error, status === "sent" ? timestamp : null, timestamp, `${outboxId}:${channel}`)
+    .bind(status, error, status === "sent" ? timestamp : null, timestamp, `${outboxId}:${channel}`, token)
     .run();
+}
+
+async function claimDeliveries(env: Env, outboxIds: readonly string[], channel: "email" | "slack") {
+  if (!outboxIds.length) return { token: "", outboxIds: [] as string[] };
+  const ids = JSON.stringify(uniqueIds([...outboxIds]));
+  const timestamp = Date.now();
+  const token = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO deliveries
+      (idempotency_key, outbox_id, channel, status, attempts, updated_at, claim_token)
+     SELECT value || ':' || ?, value, ?, 'pending', 1, ?, ? FROM json_each(?)`,
+  )
+    .bind(channel, channel, timestamp, token, ids)
+    .run();
+  await env.DB.prepare(
+    `UPDATE deliveries SET status = 'pending', attempts = attempts + 1, last_error = NULL,
+       updated_at = ?, claim_token = ?
+      WHERE outbox_id IN (SELECT value FROM json_each(?)) AND channel = ?
+        AND (status = 'failed' OR (status = 'pending' AND updated_at <= ?))`,
+  )
+    .bind(timestamp, token, ids, channel, timestamp - DELIVERY_CLAIM_STALE_MS)
+    .run();
+  const claimed = await env.DB.prepare(
+    `SELECT outbox_id FROM deliveries
+      WHERE outbox_id IN (SELECT value FROM json_each(?)) AND channel = ?
+        AND status = 'pending' AND claim_token = ?`,
+  )
+    .bind(ids, channel, token)
+    .all<{ outbox_id: string }>();
+  return { token, outboxIds: claimed.results.map((row) => row.outbox_id) };
+}
+
+async function finishClaimedDeliveries(
+  env: Env,
+  outboxIds: readonly string[],
+  channel: "email" | "slack",
+  token: string,
+  status: "sent" | "failed",
+  error: string | null = null,
+) {
+  if (!outboxIds.length) return [] as string[];
+  const timestamp = Date.now();
+  const finished = await env.DB.prepare(
+    `UPDATE deliveries SET status = ?, last_error = ?, delivered_at = ?, updated_at = ?
+      WHERE outbox_id IN (SELECT value FROM json_each(?)) AND channel = ?
+        AND status = 'pending' AND claim_token = ?
+      RETURNING outbox_id`,
+  )
+    .bind(
+      status,
+      error,
+      status === "sent" ? timestamp : null,
+      timestamp,
+      JSON.stringify([...outboxIds]),
+      channel,
+      token,
+    )
+    .all<{ outbox_id: string }>();
+  return finished.results.map((row) => row.outbox_id);
+}
+
+async function accessibleNotifications(
+  env: Env,
+  userId: string,
+  workspaceId: string,
+  notificationIds: readonly string[],
+) {
+  if (!notificationIds.length) return { rows: [] as DeliveryRow[], suppressed: [] as string[] };
+  const rows = await env.DB.prepare(
+    `SELECT ${NOTIFICATION_COLUMNS}, n.workspace_id, n.user_id,
+            recipient.name recipient_name, recipient.email recipient_email,
+            preference.in_app preference_in_app, preference.email preference_email, preference.slack preference_slack,
+            preference.timezone preference_timezone
+       ${ACCESSIBLE_NOTIFICATION_SQL} AND n.id IN (SELECT value FROM json_each(?))`,
+  )
+    .bind(userId, workspaceId, JSON.stringify([...notificationIds]))
+    .all<DeliveryRow>();
+  const accessible = new Set(rows.results.map((row) => row.id));
+  return { rows: rows.results, suppressed: notificationIds.filter((id) => !accessible.has(id)) };
 }
 
 function escapeHtml(value: string) {
@@ -540,46 +622,54 @@ export async function deliverNotification(env: Env, notificationId: string, outb
   );
   const copy = notificationCopy(row);
   let deferred = false;
-  const emailClaim = emailMode(row) === "immediate" ? await claimDelivery(env, outboxId, "email") : "settled";
-  if (emailClaim === "in_progress") deferred = true;
-  if (emailClaim === "claimed") {
+  const emailClaim =
+    emailMode(row) === "immediate" ? await claimDelivery(env, outboxId, "email") : { state: "settled" as const };
+  if (emailClaim.state === "in_progress") deferred = true;
+  if (emailClaim.state === "claimed") {
     try {
       if (!(await sendNotificationEmail(env, row, copy, copy))) {
-        await finishClaimedDelivery(env, outboxId, "email", "failed", "unavailable");
+        await finishClaimedDelivery(env, outboxId, "email", emailClaim.token, "failed", "unavailable");
       } else {
-        await env.DB.prepare(`UPDATE notifications SET emailed_at = COALESCE(emailed_at, ?) WHERE id = ?`)
-          .bind(Date.now(), notificationId)
-          .run();
-        await finishClaimedDelivery(env, outboxId, "email", "sent");
+        const finished = await finishClaimedDelivery(env, outboxId, "email", emailClaim.token, "sent");
+        if (finished.meta.changes) {
+          await env.DB.prepare(`UPDATE notifications SET emailed_at = COALESCE(emailed_at, ?) WHERE id = ?`)
+            .bind(Date.now(), notificationId)
+            .run();
+        }
       }
     } catch (error) {
       await finishClaimedDelivery(
         env,
         outboxId,
         "email",
+        emailClaim.token,
         "failed",
         error instanceof Error ? error.message.slice(0, 500) : "Email delivery failed.",
       );
       throw error;
     }
   }
-  const slackClaim = slackMode(row) === "immediate" ? await claimDelivery(env, outboxId, "slack") : "settled";
-  if (slackClaim === "in_progress") deferred = true;
-  if (slackClaim === "claimed") {
+  const slackClaim =
+    slackMode(row) === "immediate" ? await claimDelivery(env, outboxId, "slack") : { state: "settled" as const };
+  if (slackClaim.state === "in_progress") deferred = true;
+  if (slackClaim.state === "claimed") {
     try {
       if (!(await sendPersonalSlackNotification(env, row.user_id, row.workspace_id, copy, row.page_id))) {
-        await finishClaimedDelivery(env, outboxId, "slack", "failed", "unavailable");
+        await finishClaimedDelivery(env, outboxId, "slack", slackClaim.token, "failed", "unavailable");
       } else {
-        await env.DB.prepare(`UPDATE notifications SET slack_at = COALESCE(slack_at, ?) WHERE id = ?`)
-          .bind(Date.now(), notificationId)
-          .run();
-        await finishClaimedDelivery(env, outboxId, "slack", "sent");
+        const finished = await finishClaimedDelivery(env, outboxId, "slack", slackClaim.token, "sent");
+        if (finished.meta.changes) {
+          await env.DB.prepare(`UPDATE notifications SET slack_at = COALESCE(slack_at, ?) WHERE id = ?`)
+            .bind(Date.now(), notificationId)
+            .run();
+        }
       }
     } catch (error) {
       await finishClaimedDelivery(
         env,
         outboxId,
         "slack",
+        slackClaim.token,
         "failed",
         error instanceof Error ? error.message.slice(0, 500) : "Slack delivery failed.",
       );
@@ -590,10 +680,11 @@ export async function deliverNotification(env: Env, notificationId: string, outb
   if (deferred) throw new DeliveryInProgressError();
 }
 
-// A timezone is due for a single cron tick each day, so a fixed LIMIT would strand
-// everyone past it until the next day. Page through the candidates instead.
+// Each candidate now uses a bounded handful of D1 statements. Keep the per-run
+// ceiling below the paid invocation budget and persist a cursor so failures at the
+// front cannot permanently starve later recipients.
 const DIGEST_CANDIDATE_PAGE = 50;
-const DIGEST_CANDIDATE_MAX = 1000;
+const DIGEST_CANDIDATE_MAX = 50;
 
 // Timezone is part of the key: preferences are per event type, so one user can hold
 // two timezones and appear as two groups that a coarser cursor would skip past.
@@ -634,24 +725,66 @@ async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: n
   return rows.results.map((row) => row.timezone).filter((timezone) => digestDue(timezone, timestamp));
 }
 
-async function* pagedDigestCandidates<T extends { user_id: string; workspace_id: string; timezone: string }>(
+function digestCursor(row: { user_id: string; workspace_id: string; timezone: string }): DigestCursor {
+  return { userId: row.user_id, workspaceId: row.workspace_id, timezone: row.timezone };
+}
+
+function digestCursorKey(cursor: DigestCursor) {
+  return `${cursor.userId}\u0000${cursor.workspaceId}\u0000${cursor.timezone}`;
+}
+
+async function digestCandidates<T extends { user_id: string; workspace_id: string; timezone: string }>(
+  env: Env,
+  channel: DigestChannel,
   read: (cursor: DigestCursor) => Promise<{ results: T[] }>,
-  label: string,
 ) {
-  let cursor: DigestCursor = { userId: "", workspaceId: "", timezone: "" };
-  let seen = 0;
-  for (;;) {
+  const stored = await env.DB.prepare(
+    `SELECT user_id, workspace_id, timezone FROM digest_delivery_cursors WHERE channel = ?`,
+  )
+    .bind(channel)
+    .first<{ user_id: string; workspace_id: string; timezone: string }>();
+  let cursor = stored ? digestCursor(stored) : { userId: "", workspaceId: "", timezone: "" };
+  let wrapped = !stored;
+  const candidates: T[] = [];
+  const seen = new Set<string>();
+  while (candidates.length < DIGEST_CANDIDATE_MAX) {
     const page = await read(cursor);
-    for (const row of page.results) yield row;
-    seen += page.results.length;
-    const last = page.results.at(-1);
-    if (!last || page.results.length < DIGEST_CANDIDATE_PAGE) return;
-    if (seen >= DIGEST_CANDIDATE_MAX) {
-      console.error(`${label} reached its per-run candidate ceiling`, { candidates: seen });
-      return;
+    if (!page.results.length) {
+      if (wrapped) break;
+      cursor = { userId: "", workspaceId: "", timezone: "" };
+      wrapped = true;
+      continue;
     }
-    cursor = { userId: last.user_id, workspaceId: last.workspace_id, timezone: last.timezone };
+    for (const row of page.results) {
+      const next = digestCursor(row);
+      const key = digestCursorKey(next);
+      cursor = next;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(row);
+      if (candidates.length >= DIGEST_CANDIDATE_MAX) break;
+    }
+    if (candidates.length >= DIGEST_CANDIDATE_MAX) break;
+    if (page.results.length < DIGEST_CANDIDATE_PAGE) {
+      if (wrapped) break;
+      cursor = { userId: "", workspaceId: "", timezone: "" };
+      wrapped = true;
+    }
   }
+  if (candidates.length >= DIGEST_CANDIDATE_MAX) {
+    const last = digestCursor(candidates.at(-1)!);
+    await env.DB.prepare(
+      `INSERT INTO digest_delivery_cursors (channel, user_id, workspace_id, timezone, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(channel) DO UPDATE SET user_id = excluded.user_id, workspace_id = excluded.workspace_id,
+         timezone = excluded.timezone, updated_at = excluded.updated_at`,
+    )
+      .bind(channel, last.userId, last.workspaceId, last.timezone, Date.now())
+      .run();
+  } else {
+    await env.DB.prepare(`DELETE FROM digest_delivery_cursors WHERE channel = ?`).bind(channel).run();
+  }
+  return candidates;
 }
 
 async function sendDueEmailDigests(env: Env, timestamp: number) {
@@ -684,7 +817,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
         DIGEST_CANDIDATE_PAGE,
       )
       .all<{ user_id: string; workspace_id: string; name: string; email: string; timezone: string }>();
-  for await (const candidate of pagedDigestCandidates(readCandidates, "Email digest")) {
+  for (const candidate of await digestCandidates(env, "email", readCandidates)) {
     const ids = await env.DB.prepare(
       `SELECT n.id FROM notifications n
         LEFT JOIN notification_preferences preference
@@ -695,22 +828,24 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
     )
       .bind(candidate.user_id, candidate.workspace_id, candidate.timezone)
       .all<{ id: string }>();
-    const rows: DeliveryRow[] = [];
-    const suppressed: string[] = [];
-    for (const { id } of ids.results) {
-      const row = await notificationForDelivery(env, id);
-      if (row) rows.push(row);
-      else suppressed.push(id);
-    }
+    const { rows, suppressed } = await accessibleNotifications(
+      env,
+      candidate.user_id,
+      candidate.workspace_id,
+      ids.results.map((row) => row.id),
+    );
     if (suppressed.length) {
       await env.DB.prepare(`UPDATE notifications SET emailed_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
         .bind(timestamp, JSON.stringify(suppressed))
         .run();
     }
-    const claimed: DeliveryRow[] = [];
-    for (const row of rows) {
-      if ((await claimDelivery(env, `outbox:${row.id}`, "email")) === "claimed") claimed.push(row);
-    }
+    const claim = await claimDeliveries(
+      env,
+      rows.map((row) => `outbox:${row.id}`),
+      "email",
+    );
+    const claimedIds = new Set(claim.outboxIds);
+    const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
     if (!claimed.length) continue;
     const lines = claimed.map((row) => `• ${notificationCopy(row)}`);
     try {
@@ -723,21 +858,22 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
           .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
           .join("")}</ul>`,
       });
-      const deliveredAt = Date.now();
-      await env.DB.prepare(`UPDATE notifications SET emailed_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-        .bind(deliveredAt, JSON.stringify(claimed.map((row) => row.id)))
-        .run();
-      for (const row of claimed) await finishClaimedDelivery(env, `outbox:${row.id}`, "email", "sent");
-    } catch (error) {
-      for (const row of claimed) {
-        await finishClaimedDelivery(
-          env,
-          `outbox:${row.id}`,
-          "email",
-          "failed",
-          error instanceof Error ? error.message.slice(0, 500) : "Digest delivery failed.",
-        );
+      const finished = await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent");
+      const deliveredIds = finished.map((outboxId) => outboxId.slice("outbox:".length));
+      if (deliveredIds.length) {
+        await env.DB.prepare(`UPDATE notifications SET emailed_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
+          .bind(Date.now(), JSON.stringify(deliveredIds))
+          .run();
       }
+    } catch (error) {
+      await finishClaimedDeliveries(
+        env,
+        claim.outboxIds,
+        "email",
+        claim.token,
+        "failed",
+        error instanceof Error ? error.message.slice(0, 500) : "Digest delivery failed.",
+      );
       console.error("Notification digest email failed", { userId: candidate.user_id, error });
     }
   }
@@ -750,6 +886,10 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
     env.DB.prepare(
       `SELECT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
          FROM notifications n
+         JOIN slack_installations installation
+           ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL
+         JOIN slack_user_links link
+           ON link.installation_id = installation.id AND link.user_id = n.user_id
          LEFT JOIN notification_preferences preference
            ON preference.user_id = n.user_id AND preference.event_type = n.event_type
         WHERE n.slack_at IS NULL AND ${digestModeSql("slack")}
@@ -770,7 +910,9 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
         DIGEST_CANDIDATE_PAGE,
       )
       .all<{ user_id: string; workspace_id: string; timezone: string }>();
-  for await (const candidate of pagedDigestCandidates(readCandidates, "Slack digest")) {
+  const rateLimitedWorkspaces = new Set<string>();
+  for (const candidate of await digestCandidates(env, "slack", readCandidates)) {
+    if (rateLimitedWorkspaces.has(candidate.workspace_id)) continue;
     const ids = await env.DB.prepare(
       `SELECT n.id FROM notifications n
         LEFT JOIN notification_preferences preference
@@ -781,17 +923,25 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
     )
       .bind(candidate.user_id, candidate.workspace_id, candidate.timezone)
       .all<{ id: string }>();
-    const rows: DeliveryRow[] = [];
-    for (const { id } of ids.results) {
-      const row = await notificationForDelivery(env, id);
-      if (row) rows.push(row);
-      else await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id = ?`).bind(timestamp, id).run();
+    const { rows, suppressed } = await accessibleNotifications(
+      env,
+      candidate.user_id,
+      candidate.workspace_id,
+      ids.results.map((row) => row.id),
+    );
+    if (suppressed.length) {
+      await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
+        .bind(timestamp, JSON.stringify(suppressed))
+        .run();
     }
     if (!rows.length) continue;
-    const claimed: DeliveryRow[] = [];
-    for (const row of rows) {
-      if ((await claimDelivery(env, `outbox:${row.id}`, "slack")) === "claimed") claimed.push(row);
-    }
+    const claim = await claimDeliveries(
+      env,
+      rows.map((row) => `outbox:${row.id}`),
+      "slack",
+    );
+    const claimedIds = new Set(claim.outboxIds);
+    const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
     if (!claimed.length) continue;
     try {
       const sent = await sendPersonalSlackNotification(
@@ -801,30 +951,29 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
         `Your daily Notes digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
         claimed[0]!.page_id,
       );
-      for (const row of claimed) {
-        await finishClaimedDelivery(
-          env,
-          `outbox:${row.id}`,
-          "slack",
-          sent ? "sent" : "failed",
-          sent ? null : "unavailable",
-        );
-      }
+      const finished = await finishClaimedDeliveries(
+        env,
+        claim.outboxIds,
+        "slack",
+        claim.token,
+        sent ? "sent" : "failed",
+        sent ? null : "unavailable",
+      );
       if (sent) {
         await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-          .bind(Date.now(), JSON.stringify(claimed.map((row) => row.id)))
+          .bind(Date.now(), JSON.stringify(finished.map((outboxId) => outboxId.slice("outbox:".length))))
           .run();
       }
     } catch (error) {
-      for (const row of claimed) {
-        await finishClaimedDelivery(
-          env,
-          `outbox:${row.id}`,
-          "slack",
-          "failed",
-          error instanceof Error ? error.message.slice(0, 500) : "Slack digest failed.",
-        );
-      }
+      await finishClaimedDeliveries(
+        env,
+        claim.outboxIds,
+        "slack",
+        claim.token,
+        "failed",
+        error instanceof Error ? error.message.slice(0, 500) : "Slack digest failed.",
+      );
+      if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
       // One unreachable recipient must not starve the digests queued behind it.
       console.error("Notification digest Slack message failed", { userId: candidate.user_id, error });
     }

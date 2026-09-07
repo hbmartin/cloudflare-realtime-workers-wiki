@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Env } from "./env";
-import { processDueUploadReaps } from "./attachments";
+import { inlineImageMime, isUnsafeMime, processDueUploadReaps } from "./attachments";
 
 function cleanupEnv(
   state: "active" | "completing" | "reaping" | "aborting",
@@ -89,5 +89,17 @@ describe("multipart upload cleanup", () => {
     expect(abort).toHaveBeenCalledOnce();
     expect(queries.some(({ sql }) => /DELETE FROM attachment_uploads.*state = \?/s.test(sql))).toBe(true);
     expect(queries.some(({ sql }) => sql.includes("SET state = 'active'"))).toBe(false);
+  });
+});
+
+describe("attachment MIME policy", () => {
+  it("rejects MIME attribute breakouts while retaining legitimate parameters", () => {
+    expect(isUnsafeMime(`image/png" onerror="alert(1)`, "photo.png")).toBe(true);
+    expect(isUnsafeMime("image/png\r\n ; name=photo.png", "photo.png")).toBe(true);
+    expect(isUnsafeMime("image/png\t; name=photo.png", "photo.png")).toBe(true);
+    expect(isUnsafeMime(`image/png; name="photo.png"`, "photo.png")).toBe(false);
+    expect(inlineImageMime(`image/png; name="photo.png"`)).toBe("image/png");
+    expect(inlineImageMime(`image/png" onerror="alert(1)`)).toBeNull();
+    expect(inlineImageMime("image/png\r\n ; name=photo.png")).toBeNull();
   });
 });
