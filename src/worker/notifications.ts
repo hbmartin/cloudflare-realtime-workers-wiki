@@ -680,11 +680,21 @@ export async function deliverNotification(env: Env, notificationId: string, outb
   if (deferred) throw new DeliveryInProgressError();
 }
 
-// Each candidate now uses a bounded handful of D1 statements. Keep the per-run
-// ceiling below the paid invocation budget and persist a cursor so failures at the
-// front cannot permanently starve later recipients.
-const DIGEST_CANDIDATE_PAGE = 50;
-const DIGEST_CANDIDATE_MAX = 50;
+// A worst-case Slack candidate uses eleven D1 statements: ids, access,
+// suppression, three claim statements, installation lookup, token-refresh CAS
+// and reread, finalization, and the notification timestamp. Reserve five more
+// per channel for timezone/cursor paging and cap both channels together at 240,
+// leaving most of the paid invocation budget to the other cron tasks running
+// beside this one. The persisted cursor carries the remainder to later ticks.
+const DIGEST_STATEMENT_BUDGET = 240;
+const DIGEST_CHANNEL_COUNT = 2;
+const DIGEST_CHANNEL_OVERHEAD = 5;
+const DIGEST_STATEMENTS_PER_CANDIDATE = 11;
+const DIGEST_CANDIDATE_MAX = Math.floor(
+  (DIGEST_STATEMENT_BUDGET - DIGEST_CHANNEL_COUNT * DIGEST_CHANNEL_OVERHEAD) /
+    (DIGEST_CHANNEL_COUNT * DIGEST_STATEMENTS_PER_CANDIDATE),
+);
+const DIGEST_CANDIDATE_PAGE = DIGEST_CANDIDATE_MAX;
 
 // Timezone is part of the key: preferences are per event type, so one user can hold
 // two timezones and appear as two groups that a coarser cursor would skip past.

@@ -4,6 +4,18 @@ import * as Y from "yjs";
 import type { CommentThread, Notification, NotificationPreference, Page } from "../shared/types";
 import type { Env } from "./env";
 import { deliverNotification, sendDueNotificationDigests } from "./notifications";
+import { encryptSlackToken } from "./slack";
+
+const SLACK_SECRETS = {
+  SLACK_CLIENT_ID: "123.456",
+  SLACK_CLIENT_SECRET: "slack-client-secret",
+  SLACK_SIGNING_SECRET: "slack-signing-secret",
+  SLACK_TOKEN_ENCRYPTION_KEY: "slack-token-encryption-key-with-enough-entropy",
+};
+
+function slackEnv(): Env {
+  return { ...env, ...SLACK_SECRETS } as unknown as Env;
+}
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -462,6 +474,132 @@ describe("notification feed and subscriptions", () => {
     ).toEqual({ count: 1 });
   });
 
+  it("stops personal digest requests only for the rate-limited Slack installation", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+    const configured = slackEnv();
+    const [firstToken, secondToken] = await Promise.all([
+      encryptSlackToken(configured, "xoxb-rate-limited"),
+      encryptSlackToken(configured, "xoxb-available"),
+    ]);
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO workspaces (id, name, created_at) VALUES ('rate-workspace-two', 'Second workspace', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES
+          ('rate-user-a', 'Rate A', 'rate-a@example.test', 1, ?, ?),
+          ('rate-user-b', 'Rate B', 'rate-b@example.test', 1, ?, ?),
+          ('rate-user-c', 'Rate C', 'rate-c@example.test', 1, ?, ?)`,
+      ).bind(timestamp, timestamp, timestamp, timestamp, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES
+          (?, 'rate-user-a', 'viewer', ?),
+          (?, 'rate-user-b', 'viewer', ?),
+          ('rate-workspace-two', ?, 'owner', ?),
+          ('rate-workspace-two', 'rate-user-c', 'viewer', ?)`,
+      ).bind(
+        installed.workspaceId,
+        timestamp,
+        installed.workspaceId,
+        timestamp,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, kind, position, title, created_by, created_at, updated_at, space_id)
+         VALUES ('rate-page-two', 'rate-workspace-two', 'document', 'a0', 'Second page', ?, ?, ?,
+                 'rate-workspace-two-general')`,
+      ).bind(installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
+          (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
+           installed_by, created_at, updated_at)
+         VALUES
+          ('rate-installation-one', ?, 'TRATE1', 'Rate limited', 'BRATE1', ?, 'chat:write', ?, ?, ?),
+          ('rate-installation-two', 'rate-workspace-two', 'TRATE2', 'Available', 'BRATE2', ?, 'chat:write', ?, ?, ?)`,
+      ).bind(
+        installed.workspaceId,
+        firstToken,
+        installed.userId,
+        timestamp,
+        timestamp,
+        secondToken,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at) VALUES
+          ('rate-installation-one', 'rate-user-a', 'URATEA', ?),
+          ('rate-installation-one', 'rate-user-b', 'URATEB', ?),
+          ('rate-installation-two', 'rate-user-c', 'URATEC', ?)`,
+      ).bind(timestamp, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone) VALUES
+          ('rate-user-a', 'mention', 1, 'off', 'digest', 'UTC'),
+          ('rate-user-b', 'mention', 1, 'off', 'digest', 'UTC'),
+          ('rate-user-c', 'mention', 1, 'off', 'digest', 'UTC')`,
+      ),
+      env.DB.prepare(
+        `INSERT INTO notifications
+          (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         VALUES
+          ('rate-notification-a', ?, 'rate-user-a', 'mention', ?, ?, ?, '{}', 'rate-a', ?),
+          ('rate-notification-b', ?, 'rate-user-b', 'mention', ?, ?, ?, '{}', 'rate-b', ?),
+          ('rate-notification-c', 'rate-workspace-two', 'rate-user-c', 'mention', ?,
+           'rate-workspace-two-general', 'rate-page-two', '{}', 'rate-c', ?)`,
+      ).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp,
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp,
+        installed.userId,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
+           FROM notifications WHERE id LIKE 'rate-notification-%'`,
+      ).bind(timestamp, timestamp),
+    ]);
+    const channels: string[] = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      channels.push(JSON.parse(String(init?.body)).channel as string);
+      const authorization = new Headers(init?.headers).get("authorization");
+      return authorization === "Bearer xoxb-rate-limited"
+        ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
+        : Response.json({ ok: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await sendDueNotificationDigests(configured, timestamp);
+
+    expect(channels).toEqual(["URATEA", "URATEC"]);
+    expect(
+      await env.DB.prepare(
+        `SELECT id, slack_at IS NOT NULL delivered FROM notifications
+          WHERE id LIKE 'rate-notification-%' ORDER BY id`,
+      ).all(),
+    ).toMatchObject({
+      results: [
+        { id: "rate-notification-a", delivered: 0 },
+        { id: "rate-notification-b", delivered: 0 },
+        { id: "rate-notification-c", delivered: 1 },
+      ],
+    });
+    log.mockRestore();
+  });
+
   it("advances the persisted digest cursor past a failing leading cohort", async () => {
     const installed = await bootstrap();
     const timestamp = Date.UTC(2026, 8, 5, 9, 5);
@@ -510,7 +648,10 @@ describe("notification feed and subscriptions", () => {
 
     await sendDueNotificationDigests(bindings, timestamp);
     expect(send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")).toBe(false);
-    await sendDueNotificationDigests(bindings, timestamp);
+    for (let tick = 0; tick < 5; tick += 1) {
+      await sendDueNotificationDigests(bindings, timestamp);
+      if (send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")) break;
+    }
 
     expect(send.mock.calls.some(([message]) => message.to === "cursor-user-51@example.test")).toBe(true);
     expect(

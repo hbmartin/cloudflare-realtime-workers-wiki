@@ -72,6 +72,14 @@ function inlineBindings() {
   return bindingsWith({ WORKFLOW_INLINE: "true" });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
@@ -233,6 +241,65 @@ describe("job execution", () => {
     expect(
       await env.DB.prepare(`SELECT status, cleanup_target, cleanup_token FROM jobs WHERE id = ?`).bind(jobId).first(),
     ).toEqual({ status: "canceled", cleanup_target: null, cleanup_token: null });
+  });
+
+  it("rejects a retry while cancellation cleanup is still running", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const stagedPageId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'import', 'running', ?, ?, ?)`,
+      ).bind(jobId, installed.workspaceId, `${installed.workspaceId}-general`, installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, import_job_id, content_epoch,
+           created_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'document', 'z-pending-cleanup', 'Pending cleanup', ?, 1, ?, ?, ?)`,
+      ).bind(
+        stagedPageId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        jobId,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+    ]);
+    const purgeStarted = deferred<void>();
+    const releasePurge = deferred<void>();
+    const bindings = bindingsWith({
+      DOCUMENT: {
+        getByName: () => ({
+          fetch: async () => {
+            purgeStarted.resolve();
+            await releasePurge.promise;
+            return new Response(null, { status: 204 });
+          },
+        }),
+      },
+    });
+    const cancelContext = createExecutionContext();
+    const canceled = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}/cancel`, { method: "POST" }),
+      bindings,
+      cancelContext,
+    );
+    expect(canceled.status).toBe(200);
+    await purgeStarted.promise;
+
+    const earlyRetry = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}/retry`, { method: "POST" }),
+      bindings,
+      createExecutionContext(),
+    );
+    expect(earlyRetry.status).toBe(409);
+
+    releasePurge.resolve();
+    await waitOnExecutionContext(cancelContext);
+    expect((await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(jobId).first())?.status).toBe("canceled");
   });
 
   it("resolves legacy workflow payloads only through their stored instance identity", async () => {

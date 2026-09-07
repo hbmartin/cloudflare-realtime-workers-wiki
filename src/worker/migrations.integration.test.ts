@@ -60,7 +60,7 @@ describe("D1 migrations", () => {
     );
     const unfurlColumns = await env.DB.prepare(`PRAGMA table_info(slack_unfurls)`).all<{ name: string }>();
     expect(unfurlColumns.results.map((column) => column.name)).toEqual(
-      expect.arrayContaining(["message_ts", "claimed_at", "claim_token"]),
+      expect.arrayContaining(["message_ts", "claimed_at", "claim_token", "retired_at", "retirement_reason"]),
     );
     const deliveryColumns = await env.DB.prepare(`PRAGMA table_info(deliveries)`).all<{ name: string }>();
     expect(deliveryColumns.results.map((column) => column.name)).toContain("claim_token");
@@ -112,6 +112,51 @@ describe("D1 migrations", () => {
     expect(applied.results.map((migration) => migration.name)).toEqual(
       env.TEST_MIGRATIONS!.map((migration) => migration.name),
     );
+  });
+
+  it("explicitly retires legacy Slack unfurls that have no recoverable message timestamp", async () => {
+    const retirement = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0019_retire_legacy_slack_unfurls.sql",
+    );
+    expect(retirement).toBeTruthy();
+    const retirementIndex = env.TEST_MIGRATIONS!.indexOf(retirement!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, retirementIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', 1, ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
+          (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
+           installed_by, created_at, updated_at)
+         VALUES ('installation', 'workspace', 'T123', 'Team', 'B123', 'ciphertext', '', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_unfurls
+          (id, installation_id, workspace_id, user_id, channel_id, unfurls_json, created_at)
+         VALUES ('legacy-unfurl', 'installation', 'workspace', 'owner', 'C123', '{}', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         VALUES ('outbox:legacy-unfurl', 'workspace', 'slack_unfurl',
+                 json_object('unfurlId', 'legacy-unfurl'), ?, ?)`,
+      ).bind(timestamp, timestamp),
+    ]);
+
+    await applyD1Migrations(env.DB, [retirement!]);
+
+    expect(
+      await env.DB.prepare(
+        `SELECT delivered_at, retired_at IS NOT NULL retired, retirement_reason
+           FROM slack_unfurls WHERE id = 'legacy-unfurl'`,
+      ).first(),
+    ).toEqual({ delivered_at: null, retired: 1, retirement_reason: "legacy_missing_message_ts" });
+    expect(await env.DB.prepare(`SELECT last_error FROM outbox WHERE id = 'outbox:legacy-unfurl'`).first()).toEqual({
+      last_error: "legacy_unfurl_missing_message_ts",
+    });
   });
 
   it("applies review follow-ups through a new migration after the old history was recorded", async () => {

@@ -383,14 +383,14 @@ function assertNeverWorkspacePageAction(action: never): never {
 }
 
 // When the selected page disappears, stay in its space rather than jumping to the workspace's first root.
-function fallbackPageId(pages: Page[], previousPages: Page[], previousSelectedId: string | null) {
+export function fallbackPageId(pages: Page[], previousPages: Page[], previousSelectedId: string | null) {
   const previousSpaceId = previousSelectedId
     ? previousPages.find((page) => page.id === previousSelectedId)?.spaceId
     : undefined;
   const sameSpace = previousSpaceId
     ? pages.find((page) => page.spaceId === previousSpaceId && !page.isTemplate)
     : undefined;
-  return sameSpace?.id ?? pages[0]?.id ?? null;
+  return sameSpace?.id ?? pages.find((page) => !page.isTemplate)?.id ?? null;
 }
 
 function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAction): WorkspacePageState {
@@ -830,7 +830,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
   const pageTreeErrorRevisionRef = useRef(0);
   const organizationLoadGenerationRef = useRef(0);
-  const pageTagsLoadGenerationRef = useRef(0);
+  const pageTagsLoadGenerationRef = useRef(new Map<string, number>());
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
   const selectedSpaceIdRef = useRef<string | null>(null);
   const abortWorkspaceRequests = useCallback(() => {
     const activePageLoad = pageLoadRequest.current;
@@ -1472,14 +1474,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     return () => window.clearTimeout(timer);
   }, [loadOrganization]);
   useEffect(() => {
-    const generation = ++pageTagsLoadGenerationRef.current;
     if (!selectedId) return;
+    const generations = pageTagsLoadGenerationRef.current;
+    const generation = (generations.get(selectedId) ?? 0) + 1;
+    generations.set(selectedId, generation);
     void api<{ tags: Tag[] }>(`/api/pages/${encodeURIComponent(selectedId)}/tags`)
       .then((data) => {
-        if (generation === pageTagsLoadGenerationRef.current) setPageTags({ pageId: selectedId, tags: data.tags });
+        if (generation === generations.get(selectedId) && selectedIdRef.current === selectedId) {
+          setPageTags({ pageId: selectedId, tags: data.tags });
+        }
       })
       .catch((error: unknown) => {
-        if (generation !== pageTagsLoadGenerationRef.current) return;
+        if (generation !== generations.get(selectedId) || selectedIdRef.current !== selectedId) return;
         setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
       });
   }, [organizationRevision, selectedId]);
@@ -1568,17 +1574,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       await api(`/api/pages/${encodeURIComponent(page.id)}/tags/${encodeURIComponent(tag.id)}`, {
         method: assigned ? "PUT" : "DELETE",
       });
-      setPageTags((current) => ({
-        pageId: page.id,
-        tags:
-          current.pageId === page.id
-            ? assigned
-              ? [...current.tags.filter((candidate) => candidate.id !== tag.id), tag]
-              : current.tags.filter((item) => item.id !== tag.id)
-            : assigned
-              ? [tag]
-              : [],
-      }));
+      const generations = pageTagsLoadGenerationRef.current;
+      generations.set(page.id, (generations.get(page.id) ?? 0) + 1);
+      setPageTags((current) => {
+        if (selectedIdRef.current !== page.id) return current;
+        const currentTags = current.pageId === page.id ? current.tags : [];
+        return {
+          pageId: page.id,
+          tags: assigned
+            ? [...currentTags.filter((candidate) => candidate.id !== tag.id), tag]
+            : currentTags.filter((item) => item.id !== tag.id),
+        };
+      });
       setTags((current) =>
         current.map((candidate) =>
           candidate.id === tag.id
@@ -1604,14 +1611,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         method: "PUT",
       });
       const assignedTag = { ...data.tag, pageCount: 1 };
+      const generations = pageTagsLoadGenerationRef.current;
+      generations.set(page.id, (generations.get(page.id) ?? 0) + 1);
       setTags((current) => [...current.filter((tag) => tag.id !== assignedTag.id), assignedTag]);
-      setPageTags((current) => ({
-        pageId: page.id,
-        tags:
-          current.pageId === page.id
-            ? [...current.tags.filter((tag) => tag.id !== assignedTag.id), assignedTag]
-            : [assignedTag],
-      }));
+      setPageTags((current) => {
+        if (selectedIdRef.current !== page.id) return current;
+        const currentTags = current.pageId === page.id ? current.tags : [];
+        return {
+          pageId: page.id,
+          tags: [...currentTags.filter((tag) => tag.id !== assignedTag.id), assignedTag],
+        };
+      });
       clearWorkspaceErrors({ source: "organization" });
       return true;
     } catch (error) {

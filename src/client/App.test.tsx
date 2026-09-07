@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import type { ClientMemberContext, Page, Space, Tag, WorkspaceEvent } from "../shared/types";
 import type { EditorPageProps } from "./EditorPage";
 import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
-import { App } from "./App";
+import { App, fallbackPageId } from "./App";
 import { PAGE_NAVIGATE_EVENT } from "./mentions";
 import { PageLoadEventBuffer } from "./page-state";
 
@@ -158,6 +158,14 @@ describe("App error handling", () => {
     cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("never falls back to a template page", () => {
+    const template = { ...page, id: "template", isTemplate: true };
+    const normal = { ...page, id: "normal", position: "b0" };
+
+    expect(fallbackPageId([template, normal], [], null)).toBe(normal.id);
+    expect(fallbackPageId([template], [], null)).toBeNull();
   });
 
   it("recovers a failed initial page-tree load from the pending workspace", async () => {
@@ -4949,7 +4957,7 @@ describe("App error handling", () => {
     };
     let favorites: Page[] = [];
     let pins: Page[] = [];
-    let assignedTags: Tag[] = [];
+    const initialPageTags = deferred<{ tags: Tag[] }>();
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
@@ -4961,7 +4969,7 @@ describe("App error handling", () => {
       if (path === "/api/templates" && !init?.method) return { templates: [] };
       if (path === `/api/spaces/${generalSpace.id}/pins` && !init?.method) return { pages: pins };
       if (path === `/api/spaces/${privateSpace.id}/pins` && !init?.method) return { pages: [] };
-      if (path === `/api/pages/${page.id}/tags` && !init?.method) return { tags: assignedTags };
+      if (path === `/api/pages/${page.id}/tags` && !init?.method) return initialPageTags.promise;
       if (path === `/api/pages/${secretPage.id}/tags` && !init?.method) return { tags: [] };
       if (path === `/api/favorites/${page.id}` && init?.method === "POST") {
         favorites = [page];
@@ -4972,7 +4980,6 @@ describe("App error handling", () => {
         return { page };
       }
       if (path === `/api/pages/${page.id}/tags/${researchTag.id}` && init?.method === "PUT") {
-        assignedTags = [researchTag];
         return { ok: true };
       }
       throw new Error(`Unexpected API request: ${path}`);
@@ -4987,6 +4994,8 @@ describe("App error handling", () => {
     expect(await within(await screen.findByLabelText("Pinned")).findByText("Roadmap")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Add tag"), { target: { value: researchTag.id } });
     expect(await screen.findByRole("button", { name: "Remove Research tag" })).toBeInTheDocument();
+    await act(async () => initialPageTags.resolve({ tags: [] }));
+    expect(screen.getByRole("button", { name: "Remove Research tag" })).toBeInTheDocument();
 
     fireEvent.change(switcher, { target: { value: privateSpace.id } });
     expect((await screen.findAllByText("Secrets")).length).toBeGreaterThan(0);

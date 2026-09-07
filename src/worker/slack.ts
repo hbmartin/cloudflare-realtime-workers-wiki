@@ -948,6 +948,20 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
   return { ok: true };
 }
 
+async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_message_ts") {
+  const timestamp = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE slack_unfurls SET retired_at = ?, retirement_reason = ?
+        WHERE id = ? AND delivered_at IS NULL AND retired_at IS NULL`,
+    ).bind(timestamp, reason, unfurlId),
+    env.DB.prepare(
+      `UPDATE outbox SET last_error = ?
+        WHERE topic = 'slack_unfurl' AND json_extract(payload_json, '$.unfurlId') = ?`,
+    ).bind(`slack_unfurl_${reason}`, unfurlId),
+  ]);
+}
+
 export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
   const row = await env.DB.prepare(
     `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.message_ts, unfurl.unfurls_json,
@@ -956,7 +970,8 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
             installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at
        FROM slack_unfurls unfurl
        JOIN slack_installations installation ON installation.id = unfurl.installation_id
-      WHERE unfurl.id = ? AND unfurl.delivered_at IS NULL AND installation.disconnected_at IS NULL`,
+      WHERE unfurl.id = ? AND unfurl.delivered_at IS NULL AND unfurl.retired_at IS NULL
+        AND installation.disconnected_at IS NULL`,
   )
     .bind(unfurlId)
     .first<
@@ -969,6 +984,10 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
       }
     >();
   if (!row) return;
+  if (!row.message_ts) {
+    await retireSlackUnfurl(env, unfurlId, "missing_message_ts");
+    return;
+  }
   const stored = JSON.parse(row.unfurls_json) as Record<string, unknown>;
   const unfurls: Record<string, unknown> = {};
   for (const [url, value] of Object.entries(stored)) {
@@ -1000,8 +1019,7 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string) {
     }
     unfurls[url] = value;
   }
-  // Slack attaches previews to a specific message, so rows staged without its timestamp cannot be delivered.
-  if (Object.keys(unfurls).length && row.message_ts) {
+  if (Object.keys(unfurls).length) {
     const claim = await claimSlackRows(env, "slack_unfurls", [unfurlId]);
     if (!claim.ids.length) return;
     try {

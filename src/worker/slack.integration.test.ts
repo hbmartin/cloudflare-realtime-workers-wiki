@@ -15,6 +15,7 @@ import {
   handleSlackCommand,
   handleSlackEvent,
   sendPersonalSlackNotification,
+  sendDueSlackChannelDigests,
   SlackRateLimitError,
   verifySlackRequest,
 } from "./slack";
@@ -421,6 +422,38 @@ describe("Slack security and integration", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("retires an undeliverable unfurl without reporting it as delivered", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO slack_unfurls
+          (id, installation_id, workspace_id, user_id, channel_id, unfurls_json, created_at)
+         VALUES ('missing-ts', 'slack-installation', ?, ?, 'C0123456789', '{}', ?)`,
+      ).bind(installed.member.workspace.id, installed.member.user.id, timestamp),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         VALUES ('outbox:missing-ts', ?, 'slack_unfurl', json_object('unfurlId', 'missing-ts'), ?, ?)`,
+      ).bind(installed.member.workspace.id, timestamp, timestamp),
+    ]);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await deliverSlackUnfurl(slackEnv(), "missing-ts");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare(
+        `SELECT delivered_at, retired_at IS NOT NULL retired, retirement_reason
+           FROM slack_unfurls WHERE id = 'missing-ts'`,
+      ).first(),
+    ).toEqual({ delivered_at: null, retired: 1, retirement_reason: "missing_message_ts" });
+    expect(await env.DB.prepare(`SELECT last_error FROM outbox WHERE id = 'outbox:missing-ts'`).first()).toEqual({
+      last_error: "slack_unfurl_missing_message_ts",
+    });
+  });
+
   it("fans channel events into the outbox and preserves Slack retry-after delays", async () => {
     const installed = await bootstrap();
     await installSlack(installed.member);
@@ -434,7 +467,7 @@ describe("Slack security and integration", () => {
           channelId: "C0123456789",
           channelName: "notes",
           cadence: "immediate",
-          eventTypes: ["page_edit"],
+          eventTypes: ["page_edit", "mention"],
         }),
       }),
     );
@@ -467,13 +500,13 @@ describe("Slack security and integration", () => {
         pageId: installed.page.id,
         threadId: null,
         actorId: installed.member.user.id,
-        eventType: "page_edit",
+        eventType: "mention",
         sourceId: "suppressed-projection",
         recipientIds: [],
         emitSlackChannel: false,
-        // Keep this outside the page-edit coalescing window so the flag itself,
-        // rather than deduplication, is what prevents a second channel event.
-        createdAt: Date.now() + 2 * 60 * 60_000,
+        // A separately subscribed event type makes emitSlackChannel the only
+        // reason this fanout does not create another channel event.
+        createdAt: Date.now(),
       }),
     );
     expect(
@@ -511,5 +544,111 @@ describe("Slack security and integration", () => {
         .bind(event!.id)
         .first(),
     ).toEqual({ delivered: 1 });
+  });
+
+  it("stops channel digest requests only for the rate-limited Slack installation", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO workspaces (id, name, created_at) VALUES ('channel-workspace-two', 'Second workspace', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES ('channel-workspace-two', ?, 'owner', ?)`,
+      ).bind(installed.member.user.id, timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, kind, position, title, created_by, created_at, updated_at, space_id)
+         VALUES ('channel-page-two', 'channel-workspace-two', 'document', 'a0', 'Second page', ?, ?, ?,
+                 'channel-workspace-two-general')`,
+      ).bind(installed.member.user.id, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
+          (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
+           installed_by, created_at, updated_at)
+         VALUES ('channel-installation-two', 'channel-workspace-two', 'TCHANNEL2', 'Available', 'BCHANNEL2', ?,
+                 'chat:write', ?, ?, ?)`,
+      ).bind(
+        await encryptSlackToken(slackEnv(), "xoxb-channel-available"),
+        installed.member.user.id,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO slack_channel_subscriptions
+          (id, installation_id, space_id, page_id, channel_id, channel_name, event_types_json, cadence,
+           created_by, created_at, updated_at)
+         VALUES
+          ('channel-subscription-a', 'slack-installation', ?, ?, 'CRATEA', 'rate-a', '["page_edit"]',
+           'digest', ?, ?, ?),
+          ('channel-subscription-b', 'slack-installation', ?, ?, 'CRATEB', 'rate-b', '["page_edit"]',
+           'digest', ?, ?, ?),
+          ('channel-subscription-c', 'channel-installation-two', 'channel-workspace-two-general',
+           'channel-page-two', 'CRATEC', 'rate-c', '["page_edit"]', 'digest', ?, ?, ?)`,
+      ).bind(
+        installed.page.spaceId,
+        installed.page.id,
+        installed.member.user.id,
+        timestamp,
+        timestamp,
+        installed.page.spaceId,
+        installed.page.id,
+        installed.member.user.id,
+        timestamp + 1,
+        timestamp + 1,
+        installed.member.user.id,
+        timestamp + 2,
+        timestamp + 2,
+      ),
+      env.DB.prepare(
+        `INSERT INTO slack_channel_events
+          (id, subscription_id, workspace_id, event_type, actor_id, page_id, cadence, created_at)
+         VALUES
+          ('channel-event-a', 'channel-subscription-a', ?, 'page_edit', ?, ?, 'digest', ?),
+          ('channel-event-b', 'channel-subscription-b', ?, 'page_edit', ?, ?, 'digest', ?),
+          ('channel-event-c', 'channel-subscription-c', 'channel-workspace-two', 'page_edit', ?,
+           'channel-page-two', 'digest', ?)`,
+      ).bind(
+        installed.member.workspace.id,
+        installed.member.user.id,
+        installed.page.id,
+        timestamp,
+        installed.member.workspace.id,
+        installed.member.user.id,
+        installed.page.id,
+        timestamp + 1,
+        installed.member.user.id,
+        timestamp + 2,
+      ),
+    ]);
+    const channels: string[] = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      channels.push(JSON.parse(String(init?.body)).channel as string);
+      const authorization = new Headers(init?.headers).get("authorization");
+      return authorization === "Bearer xoxb-test-bot-token"
+        ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
+        : Response.json({ ok: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await sendDueSlackChannelDigests(slackEnv(), timestamp);
+
+    expect(channels).toEqual(["CRATEA", "CRATEC"]);
+    expect(
+      await env.DB.prepare(
+        `SELECT id, delivered_at IS NOT NULL delivered FROM slack_channel_events
+          WHERE id LIKE 'channel-event-%' ORDER BY id`,
+      ).all(),
+    ).toMatchObject({
+      results: [
+        { id: "channel-event-a", delivered: 0 },
+        { id: "channel-event-b", delivered: 0 },
+        { id: "channel-event-c", delivered: 1 },
+      ],
+    });
+    log.mockRestore();
   });
 });
