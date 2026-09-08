@@ -115,10 +115,16 @@ export async function deleteR2AttemptArtifacts(
 
 const R2_DELETE_BATCH_SIZE = 1_000;
 
-export async function deleteR2Keys(bucket: R2Bucket, keys: readonly string[]) {
+export async function deleteR2Keys(
+  bucket: R2Bucket,
+  keys: readonly string[],
+  stillOwned: () => Promise<boolean> = async () => true,
+) {
   for (let start = 0; start < keys.length; start += R2_DELETE_BATCH_SIZE) {
+    if (!(await stillOwned())) return false;
     await bucket.delete(keys.slice(start, start + R2_DELETE_BATCH_SIZE));
   }
+  return true;
 }
 
 /** Delete deterministic artifacts from completed attempts without listing each prefix. */
@@ -126,8 +132,12 @@ export async function deleteR2AttemptArtifactKeys(
   bucket: R2Bucket,
   artifacts: ReadonlyArray<{ rootPrefix: string; artifactPath: string }>,
   throughAttempt: number,
+  stillOwned: () => Promise<boolean> = async () => true,
 ) {
-  if (!artifacts.length || !Number.isInteger(throughAttempt) || throughAttempt < 1) return;
+  if (!Number.isInteger(throughAttempt) || throughAttempt < 1) {
+    throw new RangeError("throughAttempt must be a positive integer.");
+  }
+  if (!artifacts.length) return;
   let keys: string[] = [];
   for (let attempt = 1; attempt <= throughAttempt; attempt += 1) {
     for (const artifact of artifacts) {
@@ -135,10 +145,10 @@ export async function deleteR2AttemptArtifactKeys(
         `${artifact.rootPrefix.replace(/\/$/, "")}/attempts/${attempt}/${artifact.artifactPath.replace(/^\//, "")}`,
       );
       if (keys.length === R2_DELETE_BATCH_SIZE) {
-        await deleteR2Keys(bucket, keys);
+        if (!(await deleteR2Keys(bucket, keys, stillOwned))) return;
         keys = [];
       }
     }
   }
-  await deleteR2Keys(bucket, keys);
+  await deleteR2Keys(bucket, keys, stillOwned);
 }

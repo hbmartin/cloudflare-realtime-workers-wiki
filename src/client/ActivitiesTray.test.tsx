@@ -50,38 +50,42 @@ describe("ActivitiesTray", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
   });
 
-  it("renders pending cleanup as active and lets the user retry cleanup", () => {
-    const pendingCleanup: Job = {
-      ...runningJob,
-      status: "failed",
-      progress: { current: 1, total: 4, label: "Failure cleanup pending" },
-      error: { code: "job_failed", message: "Export failed" },
-      cleanupPending: true,
-    };
-    const retryCleanup = vi.fn();
-    render(
-      <ActivitiesTray
-        jobs={[pendingCleanup]}
-        loading={false}
-        error=""
-        pendingJobId={null}
-        onClose={vi.fn()}
-        onRefresh={vi.fn()}
-        onCancel={vi.fn()}
-        onCleanup={retryCleanup}
-        onRetry={vi.fn()}
-        onConfirm={vi.fn()}
-        onOpenResult={vi.fn()}
-      />,
-    );
+  it.each(["failed", "canceling"] as const)(
+    "renders %s cleanup as active and lets the user retry cleanup",
+    (status) => {
+      const pendingCleanup: Job = {
+        ...runningJob,
+        status,
+        progress: { current: 1, total: 4, label: "Failure cleanup pending" },
+        error: { code: "job_failed", message: "Export failed" },
+        cleanupPending: true,
+      };
+      const retryCleanup = vi.fn();
+      render(
+        <ActivitiesTray
+          jobs={[pendingCleanup]}
+          loading={false}
+          error=""
+          pendingJobId={null}
+          onClose={vi.fn()}
+          onRefresh={vi.fn()}
+          onCancel={vi.fn()}
+          onCleanup={retryCleanup}
+          onRetry={vi.fn()}
+          onConfirm={vi.fn()}
+          onOpenResult={vi.fn()}
+        />,
+      );
 
-    expect(screen.getByText("Export failed")).toBeInTheDocument();
-    expect(screen.getByRole("progressbar", { name: "Search reindex progress" })).toHaveValue(25);
-    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Retry cleanup" }));
-    expect(retryCleanup).toHaveBeenCalledWith(pendingCleanup);
-  });
+      expect(screen.getByText("Export failed")).toBeInTheDocument();
+      expect(screen.getByRole("progressbar", { name: "Search reindex progress" })).toHaveValue(25);
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Retry cancel" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Retry cleanup" }));
+      expect(retryCleanup).toHaveBeenCalledWith(pendingCleanup);
+    },
+  );
 
   it("closes on Escape and restores the previously focused control", async () => {
     const trigger = document.createElement("button");

@@ -2,6 +2,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import * as Y from "yjs";
 import { sha256Hex } from "../shared/import-integrity";
+import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { migrateLegacyComments, type CommentPage } from "./comments";
@@ -467,7 +468,7 @@ async function publishTemplateClone(env: Env, job: JobRow, options: TemplateClon
 
 export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: () => Promise<boolean>) {
   const current = await env.DB.prepare(
-    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN ('running', 'failed', 'canceling')`,
+    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN (${CLEANUP_JOB_STATUS_SQL})`,
   )
     .bind(job.id, job.attempt)
     .first();
@@ -502,7 +503,7 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
       [job.input_key, `jobs/${job.id}/template-content.bin`, ...attachments.map((row) => row.r2_key)].filter(Boolean),
     ),
   ] as string[];
-  if (keys.length && (await stillOwned())) await deleteR2Keys(env.BUCKET, keys);
+  if (keys.length) await deleteR2Keys(env.BUCKET, keys, stillOwned);
   if (!(await stillOwned())) return;
   await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${job.id}`, job.attempt, "template-content.bin");
   if (!(await stillOwned())) return;
@@ -513,6 +514,7 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
       artifactPath: attachment.content_sha256 ?? "clone",
     })),
     job.attempt,
+    stillOwned,
   );
   if (staged && (await stillOwned()))
     await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/epochs/${staged.content_epoch}/`);
@@ -669,7 +671,7 @@ function cleanupLeaseGuard(env: Env, job: Pick<JobRow, "id" | "attempt">, token:
     const renewed = await env.DB.prepare(
       `UPDATE jobs SET cleanup_started_at = ?, updated_at = ?
         WHERE id = ? AND attempt = ? AND cleanup_token = ?
-          AND cleanup_target IS NOT NULL AND status IN ('running', 'failed', 'canceling')`,
+          AND cleanup_target IS NOT NULL AND status IN (${CLEANUP_JOB_STATUS_SQL})`,
     )
       .bind(timestamp, timestamp, job.id, job.attempt, token)
       .run();
@@ -680,7 +682,14 @@ function cleanupLeaseGuard(env: Env, job: Pick<JobRow, "id" | "attempt">, token:
 
 function workflowErrorHasCode(error: unknown, code: string) {
   const messageHasCode = (message: string) => {
-    const normalized = message.trim();
+    let normalized = message.trim();
+    // RPC boundaries can prepend Error class names. Strip only those wrappers;
+    // the workflow code must still begin the remaining message.
+    for (let depth = 0; depth < 4; depth += 1) {
+      const wrapper = normalized.match(/^(?:[A-Za-z_$][\w.$]*Error|Error):\s*/)?.[0];
+      if (!wrapper) break;
+      normalized = normalized.slice(wrapper.length).trimStart();
+    }
     const prefix = `(${code})`;
     return normalized === code || normalized === prefix || normalized.startsWith(`${prefix} `);
   };
@@ -711,7 +720,7 @@ export async function finishPendingJobCleanup(
   const job = await env.DB.prepare(
     `UPDATE jobs SET cleanup_token = ?, cleanup_started_at = ?, updated_at = ?
       WHERE id = ? AND attempt = ? AND cleanup_target IS NOT NULL
-        AND status IN ('running', 'failed', 'canceling')
+        AND status IN (${CLEANUP_JOB_STATUS_SQL})
         AND (cleanup_token IS NULL OR cleanup_started_at IS NULL OR cleanup_started_at <= ?)
       RETURNING *`,
   )
@@ -752,7 +761,7 @@ export async function finishPendingJobCleanup(
          error_message = CASE cleanup_target WHEN 'canceled' THEN NULL ELSE error_message END,
          cleanup_token = NULL, cleanup_started_at = NULL, cleanup_target = NULL, updated_at = ?
        WHERE id = ? AND attempt = ? AND cleanup_token = ? AND cleanup_target IS NOT NULL
-         AND status IN ('running', 'failed', 'canceling')`,
+         AND status IN (${CLEANUP_JOB_STATUS_SQL})`,
     )
       .bind(completedAt, job.id, job.attempt, token)
       .run();
@@ -1071,7 +1080,7 @@ export async function recoverQueuedJobs(env: Env) {
   }
   const cleanups = await env.DB.prepare(
     `SELECT id, attempt FROM jobs WHERE cleanup_target IS NOT NULL
-      AND status IN ('running', 'failed', 'canceling') AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
+      AND status IN (${CLEANUP_JOB_STATUS_SQL}) AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
   )
     .bind(cutoff)
     .all<Pick<JobRow, "id" | "attempt">>();

@@ -178,7 +178,7 @@ export function ActivitiesTray({
                         </button>
                       ) : active ? (
                         <button className="quiet-button" disabled={pending} onClick={() => onCancel(job)}>
-                          {pending ? "Canceling…" : job.status === "canceling" ? "Retry cancel" : "Cancel"}
+                          {pending ? "Canceling…" : "Cancel"}
                         </button>
                       ) : null}
                       {(job.status === "failed" || job.status === "canceled") && !job.cleanupPending && (

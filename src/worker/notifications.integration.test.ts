@@ -574,6 +574,50 @@ describe("notification feed and subscriptions", () => {
     now.mockRestore();
   });
 
+  it("does not discover email digest windows for former workspace members", async () => {
+    const installed = await bootstrap();
+    const formerMember = await invite(installed.cookie, "former-email-digest");
+    const timestamp = Date.UTC(2026, 8, 5, 10, 5);
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
+         VALUES (?, 'mention', 1, 'digest', 'off', 'UTC')`,
+      ).bind(formerMember.userId),
+      env.DB.prepare(
+        `INSERT INTO notifications
+          (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         VALUES ('former-member-email-digest', ?, ?, 'mention', ?, ?, ?, '{}',
+                 'former-member-email-digest', ?)`,
+      ).bind(
+        installed.workspaceId,
+        formerMember.userId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 3 * 60 * 60_000,
+      ),
+      env.DB.prepare(`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?`).bind(
+        installed.workspaceId,
+        formerMember.userId,
+      ),
+    ]);
+    const send = vi.fn(async () => ({ messageId: "unexpected" }));
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "SEND_EMAIL") return { send };
+        if (property === "EMAIL_FROM") return "notes@example.test";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    await sendDueNotificationDigests(bindings, timestamp);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare(`SELECT 1 found FROM digest_delivery_cursors WHERE channel = 'email'`).first(),
+    ).toBeNull();
+  });
+
   it("does not discover Slack digest windows without a live recipient link", async () => {
     const installed = await bootstrap();
     const timestamp = Date.UTC(2026, 8, 5, 10, 5);

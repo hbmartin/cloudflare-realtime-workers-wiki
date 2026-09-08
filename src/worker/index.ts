@@ -96,6 +96,7 @@ import type {
   WorkspaceEvent,
 } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
+import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
@@ -1855,7 +1856,7 @@ app.post("/api/jobs/:id/retry", async (c) => {
 app.post("/api/jobs/:id/cleanup", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const job = await jobForMember(c.env, member, c.req.param("id"));
-  if (!job.cleanup_target || !["running", "failed", "canceling"].includes(job.status)) {
+  if (!job.cleanup_target || !isCleanupJobStatus(job.status)) {
     throw new HttpError(409, "job_cleanup_not_pending", "This job does not have cleanup pending.");
   }
   c.executionCtx.waitUntil(
@@ -1863,6 +1864,7 @@ app.post("/api/jobs/:id/cleanup", async (c) => {
       console.error("Failed to retry pending job cleanup", { jobId: job.id, error }),
     ),
   );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
   return c.json({ job: jobJson(job) }, 202);
 });
 

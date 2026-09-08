@@ -746,14 +746,19 @@ function digestModeSql(channel: DigestChannel) {
 }
 
 function digestRecipientSql(channel: DigestChannel) {
-  return channel === "slack"
-    ? `AND EXISTS (
+  const currentMember = `AND EXISTS (
+    SELECT 1 FROM workspace_members membership
+    JOIN user recipient ON recipient.id = membership.user_id
+    WHERE membership.workspace_id = n.workspace_id AND membership.user_id = n.user_id
+  )`;
+  return channel === "email"
+    ? currentMember
+    : `${currentMember} AND EXISTS (
          SELECT 1 FROM slack_installations installation
          JOIN slack_user_links link
            ON link.installation_id = installation.id AND link.user_id = n.user_id
         WHERE installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL
-       )`
-    : "";
+       )`;
 }
 
 async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: number, limit: number) {
@@ -863,6 +868,8 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
         `SELECT n.user_id, n.workspace_id, recipient.name, recipient.email,
               COALESCE(preference.timezone, 'UTC') timezone
          FROM notifications n
+         JOIN workspace_members membership
+           ON membership.workspace_id = n.workspace_id AND membership.user_id = n.user_id
          JOIN user recipient ON recipient.id = n.user_id
          LEFT JOIN notification_preferences preference
            ON preference.user_id = n.user_id AND preference.event_type = n.event_type
@@ -950,6 +957,8 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
       env.DB.prepare(
         `SELECT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
          FROM notifications n
+         JOIN workspace_members membership
+           ON membership.workspace_id = n.workspace_id AND membership.user_id = n.user_id
          JOIN slack_installations installation
            ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL
          JOIN slack_user_links link

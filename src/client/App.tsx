@@ -11,7 +11,7 @@ import {
 } from "react";
 import { PAGE_MOVE_RECEIPT_RETENTION_MS } from "../shared/page-move";
 import { errorLogFields } from "../shared/error-log";
-import { isJobActive, jobPollDelay } from "../shared/job-state";
+import { isJobActive, jobPollDelay, latestJobSnapshot } from "../shared/job-state";
 import { buildTree, compareBinaryText } from "../shared/tree-model";
 import type {
   ClientMemberContext,
@@ -1851,7 +1851,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     if (!activitiesOpen || activityPollDelay === null) return undefined;
     const timer = window.setTimeout(() => void loadJobs(), activityPollDelay);
     return () => window.clearTimeout(timer);
-  }, [activitiesOpen, activityPollDelay, jobs, loadJobs]);
+  }, [activitiesOpen, activityPollDelay, loadJobs]);
   const mutateJob = useCallback(async (job: Job, action: "cancel" | "cleanup" | "retry" | "confirm") => {
     setPendingJobId(job.id);
     try {
@@ -1860,7 +1860,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           ? `/api/imports/${encodeURIComponent(job.id)}/confirm`
           : `/api/jobs/${encodeURIComponent(job.id)}/${action}`;
       const data = await api<{ job: Job }>(path, { method: "POST" });
-      setJobs((current) => current.map((candidate) => (candidate.id === data.job.id ? data.job : candidate)));
+      setJobs((current) =>
+        current.map((candidate) => (candidate.id === data.job.id ? latestJobSnapshot(candidate, data.job) : candidate)),
+      );
       setJobsError("");
     } catch (error) {
       setJobsError(

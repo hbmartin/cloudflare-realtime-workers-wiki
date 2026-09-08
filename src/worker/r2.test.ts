@@ -43,6 +43,36 @@ describe("R2 attempt cleanup", () => {
     expect(deleteObjects.mock.calls[0]![0]).toContain("assets/workspace/attachment-0/attempts/1/hash");
     expect(deleteObjects.mock.calls[1]![0]).toContain("assets/workspace/attachment-500/attempts/2/hash");
   });
+
+  it("stops deterministic deletion when ownership is lost between batches", async () => {
+    const deleteObjects = vi.fn(async (_keys: string | string[]) => undefined);
+    const stillOwned = vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const bucket = { delete: deleteObjects } as unknown as R2Bucket;
+    const artifacts = Array.from({ length: 501 }, (_, index) => ({
+      rootPrefix: `assets/workspace/attachment-${index}`,
+      artifactPath: "hash",
+    }));
+
+    await deleteR2AttemptArtifactKeys(bucket, artifacts, 2, stillOwned);
+
+    expect(stillOwned).toHaveBeenCalledTimes(2);
+    expect(deleteObjects).toHaveBeenCalledOnce();
+    expect(deleteObjects.mock.calls[0]![0]).toHaveLength(1_000);
+  });
+
+  it.each([0, -1, 1.5, Number.NaN])("rejects invalid cleanup attempt %s", async (attempt) => {
+    const deleteObjects = vi.fn();
+    const bucket = { delete: deleteObjects } as unknown as R2Bucket;
+
+    await expect(
+      deleteR2AttemptArtifactKeys(
+        bucket,
+        [{ rootPrefix: "assets/workspace/attachment", artifactPath: "hash" }],
+        attempt,
+      ),
+    ).rejects.toThrow("throughAttempt must be a positive integer");
+    expect(deleteObjects).not.toHaveBeenCalled();
+  });
 });
 
 describe("R2 range normalization", () => {

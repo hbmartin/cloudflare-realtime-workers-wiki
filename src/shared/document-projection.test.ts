@@ -237,6 +237,7 @@ describe("structured document projection", () => {
             content: [
               { type: "tableHeader", content: [{ type: "text", text: "Code" }] },
               { type: "tableHeader", content: [{ type: "text", text: "Already escaped" }] },
+              { type: "tableHeader", content: [{ type: "text", text: "Nested code" }] },
             ],
           },
           {
@@ -244,13 +245,24 @@ describe("structured document projection", () => {
             content: [
               { type: "tableCell", content: [{ type: "text", text: "a|b", marks: [{ type: "code" }] }] },
               { type: "tableCell", content: [{ type: "text", text: "a\\|b", marks: [{ type: "code" }] }] },
+              {
+                type: "tableCell",
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "a\\|b", marks: [{ type: "code" }] }],
+                  },
+                ],
+              },
             ],
           },
         ],
       }),
     );
 
-    expect(serialized.markdown).toContain("| Code | Already escaped |\n| --- | --- |\n| `a\\|b` | `a\\\\|b` |\n");
+    expect(serialized.markdown).toContain(
+      "| Code | Already escaped | Nested code |\n| --- | --- | --- |\n| `a\\|b` | `a\\\\|b` | `a\\\\|b` |\n",
+    );
   });
 
   it("does not let backticks in inline math change table pipe escaping", () => {

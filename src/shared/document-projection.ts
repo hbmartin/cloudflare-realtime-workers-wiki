@@ -183,15 +183,21 @@ function escapeUnescapedPipes(value: string, forceEscape = false) {
   return result;
 }
 
+function serializeMarkdownTableInline(node: ProseMirrorJson): string {
+  if (typeof node.text === "string") {
+    return escapeUnescapedPipes(
+      serializeInline(node, "markdown"),
+      (node.marks ?? []).some((mark) => mark.type === "code"),
+    );
+  }
+  if (node.type === "mention" || node.type === "hardBreak" || node.type === "inlineMath") {
+    return escapeUnescapedPipes(serializeInline(node, "markdown"));
+  }
+  return (node.content ?? []).map(serializeMarkdownTableInline).join("");
+}
+
 function markdownTableCell(node: ProseMirrorJson) {
-  const rendered = (node.content ?? [])
-    .map((child) =>
-      escapeUnescapedPipes(
-        serializeInline(child, "markdown"),
-        typeof child.text === "string" && (child.marks ?? []).some((mark) => mark.type === "code"),
-      ),
-    )
-    .join("");
+  const rendered = (node.content ?? []).map(serializeMarkdownTableInline).join("");
   return normalizeText(rendered || escapeMarkdownInline(nodeText(node)));
 }
 

@@ -390,30 +390,32 @@ describe("job execution", () => {
     },
   );
 
-  it.each(["instance.not_found", "(instance.not_found) Instance does not exist"])(
-    "finishes cancellation cleanup for the Workflows binding error %s",
-    async (message) => {
-      const installed = await bootstrap();
-      const jobId = crypto.randomUUID();
-      const timestamp = Date.now();
-      await env.DB.prepare(
-        `INSERT INTO jobs
+  it.each([
+    "instance.not_found",
+    "(instance.not_found) Instance does not exist",
+    "WorkflowError: (instance.not_found) Instance does not exist",
+    "Error: WorkflowError: (instance.not_found) Instance does not exist",
+  ])("finishes cancellation cleanup for the Workflows binding error %s", async (message) => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO jobs
           (id, workspace_id, type, status, requested_by, workflow_instance_id, cleanup_target,
            progress_label, created_at, updated_at)
          VALUES (?, ?, 'import', 'canceling', ?, 'expired-workflow', 'canceled', 'Canceling', ?, ?)`,
-      )
-        .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
-        .run();
-      const get = vi.fn(async () => Promise.reject(new Error(message)));
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+      .run();
+    const get = vi.fn(async () => Promise.reject(new Error(message)));
 
-      await finishPendingJobCleanup(bindingsWith({ NOTES_WORKFLOW: { get } }), { id: jobId, attempt: 1 });
+    await finishPendingJobCleanup(bindingsWith({ NOTES_WORKFLOW: { get } }), { id: jobId, attempt: 1 });
 
-      expect(await env.DB.prepare(`SELECT status, cleanup_target FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual({
-        status: "canceled",
-        cleanup_target: null,
-      });
-    },
-  );
+    expect(await env.DB.prepare(`SELECT status, cleanup_target FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual({
+      status: "canceled",
+      cleanup_target: null,
+    });
+  });
 
   it.each(["error", "string"] as const)(
     "does not treat an unrelated %s containing a workflow code as an instance result",
