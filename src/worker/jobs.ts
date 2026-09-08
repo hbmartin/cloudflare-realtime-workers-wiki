@@ -673,17 +673,9 @@ function cleanupLeaseGuard(env: Env, job: Pick<JobRow, "id" | "attempt">, token:
 }
 
 function workflowInstanceMissing(error: unknown) {
-  const value =
-    error && typeof error === "object"
-      ? (error as { code?: unknown; status?: unknown; message?: unknown })
-      : { message: error };
-  if (value.code === 404 || value.status === 404) return true;
-  return (
-    typeof value.message === "string" &&
-    /(?:not found|does not exist|no longer exists|unknown (?:workflow )?instance|(?:workflow )?instance (?:has )?(?:expired|deleted))/i.test(
-      value.message,
-    )
-  );
+  if (!error || typeof error !== "object") return false;
+  const value = error as { code?: unknown; status?: unknown };
+  return value.code === 404 || value.status === 404;
 }
 
 /**
