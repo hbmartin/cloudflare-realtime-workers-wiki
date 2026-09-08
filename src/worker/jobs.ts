@@ -14,6 +14,7 @@ import { broadcastWorkspaceEvent } from "./workspace-events";
 import { cleanupExport, runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
 import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
+import { deliverWebhook, fanoutWebhookEvent } from "./webhooks";
 
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
@@ -1139,11 +1140,17 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
     message.ack();
     return;
   }
-  const row = await env.DB.prepare(`SELECT id, topic, payload_json FROM outbox WHERE id = ?`)
+  const row = await env.DB.prepare(`SELECT id, topic, payload_json, available_at FROM outbox WHERE id = ?`)
     .bind(outboxId)
-    .first<{ id: string; topic: string; payload_json: string }>();
+    .first<{ id: string; topic: string; payload_json: string; available_at: number }>();
   if (!row) {
     message.ack();
+    return;
+  }
+  if (row.available_at > Date.now()) {
+    message.retry({
+      delaySeconds: Math.min(12 * 60 * 60, Math.max(1, Math.ceil((row.available_at - Date.now()) / 1000))),
+    });
     return;
   }
   const payload = jsonRecord(row.payload_json);
@@ -1166,6 +1173,15 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
     const unfurlId = payload.unfurlId;
     if (typeof unfurlId !== "string") return await rejectPayload("Slack unfurl outbox payload is invalid.");
     await deliverSlackUnfurl(env, unfurlId, outboxId);
+  } else if (row.topic === "webhook_event") {
+    const eventId = payload.eventId;
+    if (typeof eventId !== "string") return await rejectPayload("Webhook event outbox payload is invalid.");
+    await fanoutWebhookEvent(env, eventId);
+    await sweepOutbox(env);
+  } else if (row.topic === "webhook_delivery") {
+    const deliveryId = payload.deliveryId;
+    if (typeof deliveryId !== "string") return await rejectPayload("Webhook delivery outbox payload is invalid.");
+    await deliverWebhook(env, deliveryId);
   } else throw new Error(`Unsupported outbox topic: ${row.topic}`);
   message.ack();
 }

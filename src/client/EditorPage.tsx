@@ -23,6 +23,7 @@ import { editorBlockFactories } from "./editor-blocks";
 import { notesSchema } from "./mentions";
 import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
+import { useEffectiveColorScheme } from "./ThemeControl";
 
 export type EditorPageProps = {
   page: Page;
@@ -341,6 +342,8 @@ export function EditorPage({
               commentsOpen={commentsVisible}
               pageId={page.id}
               commentsRevision={commentsRevision}
+              onPageCreated={onPageChanged}
+              onError={setTitleError}
             />
           ) : storageError ? (
             <div className="editor-loading">
@@ -478,6 +481,8 @@ function CollaborativeEditor({
   commentsOpen,
   pageId,
   commentsRevision,
+  onPageCreated,
+  onError,
 }: {
   bundle: CollaborationBundle;
   member: ClientMemberContext;
@@ -485,6 +490,8 @@ function CollaborativeEditor({
   commentsOpen: boolean;
   pageId: string;
   commentsRevision: number;
+  onPageCreated: (page: Page) => void;
+  onError: (message: string) => void;
 }) {
   const [commentError, setCommentError] = useState("");
   const commentsPanel = useRef<HTMLElement>(null);
@@ -516,6 +523,30 @@ function CollaborativeEditor({
     [bundle, editable, member, pageId, threadStore],
   );
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
+  const colorScheme = useEffectiveColorScheme();
+  useEffect(() => {
+    if (!editable || !Array.isArray(editor.document)) return;
+    const legacy: Array<(typeof editor.document)[number]> = [];
+    const collectLegacyColumns = (blocks: typeof editor.document) => {
+      for (const block of blocks) {
+        if (block.type === "columns") legacy.push(block);
+        if (block.children.length) collectLegacyColumns(block.children as typeof editor.document);
+      }
+    };
+    collectLegacyColumns(editor.document);
+    for (const block of legacy) {
+      const count = Number((block.props as { count?: number }).count ?? 2) === 3 ? 3 : 2;
+      const first = {
+        type: "column",
+        children: [{ type: "paragraph", content: block.content }],
+      };
+      const empty = Array.from({ length: count - 1 }, () => ({
+        type: "column",
+        children: [{ type: "paragraph" }],
+      }));
+      editor.replaceBlocks([block], [{ type: "columnList", children: [first, ...empty] }] as never);
+    }
+  }, [editable, editor]);
   const getSlashItems = async (query: string) =>
     filterSuggestionItems(
       [
@@ -526,8 +557,48 @@ function CollaborativeEditor({
           aliases: [item.type],
           group: "Notes blocks",
           icon: <span>{item.icon}</span>,
-          onItemClick: () => insertOrUpdateBlockForSlashMenu(editor, { type: item.type }),
+          onItemClick: () => {
+            if (item.type === "columnList") {
+              const current = editor.getTextCursorPosition().block;
+              editor.replaceBlocks([current], [
+                {
+                  type: "columnList",
+                  children: [
+                    { type: "column", children: [{ type: "paragraph" }] },
+                    { type: "column", children: [{ type: "paragraph" }] },
+                  ],
+                },
+              ] as never);
+              return;
+            }
+            insertOrUpdateBlockForSlashMenu(editor, { type: item.type });
+          },
         })),
+        {
+          title: "Sub-page",
+          subtext: "Create a real child page and insert a link",
+          aliases: ["child page", "page inside"],
+          group: "Notes blocks",
+          icon: <span>⊞</span>,
+          onItemClick: () => {
+            void (async () => {
+              try {
+                const result = await api<{ page: Page }>("/api/pages", {
+                  method: "POST",
+                  body: json({ kind: "document", parentId: pageId }),
+                });
+                const current = editor.getTextCursorPosition().block;
+                editor.replaceBlocks([current], [
+                  { type: "linkToPage", props: { pageId: result.page.id, title: result.page.title } },
+                  { type: "paragraph" },
+                ] as never);
+                onPageCreated(result.page);
+              } catch (error) {
+                onError(apiErrorMessage(error, "The sub-page could not be created."));
+              }
+            })();
+          },
+        },
         {
           title: "Inline math",
           subtext: "Insert a KaTeX formula in this line",
@@ -569,7 +640,7 @@ function CollaborativeEditor({
     }));
   };
   return (
-    <BlockNoteView editor={editor} editable={editable} className="notes-editor" theme="light" slashMenu={false}>
+    <BlockNoteView editor={editor} editable={editable} className="notes-editor" theme={colorScheme} slashMenu={false}>
       {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
       {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
       {commentsOpen && (

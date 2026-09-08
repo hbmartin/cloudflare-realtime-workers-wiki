@@ -2,7 +2,8 @@ import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
-import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { collectTransclusions, projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { flattenDocumentBlocks } from "../shared/notion-blocks";
 import type { DocumentContentEnvelope } from "../shared/types";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import { joinBytes, splitBytes } from "../shared/bytes";
@@ -12,6 +13,7 @@ import { sweepOutbox } from "./jobs";
 import { notificationFanoutStatements } from "./notifications";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
+import { webhookEventStatements } from "./webhooks";
 
 const COMPACTION_DELAY_MS = 30_000;
 const ALARM_RETRY_DELAY_MS = 5_000;
@@ -23,6 +25,11 @@ const VERSION_INTERVAL_MS = 15 * 60_000;
 const VERSION_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const WARN_BYTES = 16 * 1024 * 1024;
 const READ_ONLY_BYTES = 24 * 1024 * 1024;
+
+function uuidFromHash(hash: string) {
+  const value = `${hash.slice(0, 12)}5${hash.slice(13, 16)}a${hash.slice(17, 32)}`;
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20, 32)}`;
+}
 
 export interface ConnectionAuth {
   userId: string;
@@ -145,6 +152,119 @@ function removeCommentMark(document: Y.Doc, threadId: string) {
     }
   }, "comment-anchor");
   return changed;
+}
+
+type ApiBlockMutation =
+  | {
+      type: "append_children";
+      parentInternalId?: string;
+      children: ProseMirrorJson[];
+      position?: { type: "start" | "end" | "after_block"; afterInternalId?: string };
+    }
+  | { type: "update_block"; internalId: string; node: ProseMirrorJson }
+  | { type: "delete_block"; internalId: string };
+
+function childGroup(container: ProseMirrorJson) {
+  let group = container.content?.find((child) => child.type === "blockGroup");
+  if (!group) {
+    group = { type: "blockGroup", content: [] };
+    container.content = [...(container.content ?? []), group];
+  }
+  group.content ??= [];
+  return group;
+}
+
+function rootGroup(document: ProseMirrorJson) {
+  let group = document.content?.find((child) => child.type === "blockGroup");
+  if (!group) {
+    group = { type: "blockGroup", content: [] };
+    document.content = [group];
+  }
+  group.content ??= [];
+  return group;
+}
+
+function findContainer(
+  document: ProseMirrorJson,
+  id: string,
+): { container: ProseMirrorJson; group: ProseMirrorJson; index: number } | null {
+  const visit = (
+    group: ProseMirrorJson,
+  ): { container: ProseMirrorJson; group: ProseMirrorJson; index: number } | null => {
+    for (const [index, container] of (group.content ?? []).entries()) {
+      if (container.type !== "blockContainer") continue;
+      if (container.attrs?.id === id) return { container, group, index };
+      const nested = container.content?.find((child) => child.type === "blockGroup");
+      if (nested) {
+        const found = visit(nested);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  return visit(rootGroup(document));
+}
+
+function applyApiMutation(document: ProseMirrorJson, operation: ApiBlockMutation) {
+  if (operation.type === "append_children") {
+    const group = operation.parentInternalId
+      ? childGroup(
+          findContainer(document, operation.parentInternalId)?.container ??
+            (() => {
+              throw new Error("block_not_found");
+            })(),
+        )
+      : rootGroup(document);
+    const position = operation.position ?? { type: "end" as const };
+    let index = group.content?.length ?? 0;
+    if (position.type === "start") index = 0;
+    if (position.type === "after_block") {
+      if (!position.afterInternalId) throw new Error("invalid_position");
+      index = (group.content ?? []).findIndex((child) => child.attrs?.id === position.afterInternalId) + 1;
+      if (!index) throw new Error("invalid_position");
+    }
+    group.content!.splice(index, 0, ...structuredClone(operation.children));
+    return;
+  }
+  const found = findContainer(document, operation.internalId);
+  if (!found) throw new Error("block_not_found");
+  if (operation.type === "delete_block") {
+    found.group.content!.splice(found.index, 1);
+    return;
+  }
+  const group = found.container.content?.find((child) => child.type === "blockGroup");
+  found.container.content = [structuredClone(operation.node), ...(group ? [group] : [])];
+}
+
+function yNode(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {
+  if (node.type === "text") {
+    const text = new Y.XmlText();
+    text.applyDelta([
+      {
+        insert: node.text ?? "",
+        ...(node.marks?.length
+          ? {
+              attributes: Object.fromEntries(node.marks.map((mark) => [mark.type, mark.attrs ?? {}])),
+            }
+          : {}),
+      },
+    ]);
+    return text;
+  }
+  const element = new Y.XmlElement(node.type ?? "paragraph");
+  for (const [key, value] of Object.entries(node.attrs ?? {})) {
+    if (value !== null && value !== undefined && key !== "ychange") element.setAttribute(key, value as string);
+  }
+  element.insert(0, (node.content ?? []).map(yNode));
+  return element;
+}
+
+function replaceCloneDocument(clone: Y.Doc, document: ProseMirrorJson) {
+  const fragment = clone.getXmlFragment("document-store");
+  clone.transact(() => {
+    if (fragment.length) fragment.delete(0, fragment.length);
+    fragment.insert(0, (document.content ?? []).map(yNode));
+  }, "api-clone");
 }
 
 async function addCommentMark(
@@ -508,6 +628,49 @@ export class Document extends YServer {
         headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
       });
     }
+    if (request.method === "POST" && url.pathname.endsWith("/api-mutate")) {
+      let body: { actorId?: unknown; operations?: unknown };
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "Invalid mutation request." }, { status: 400 });
+      }
+      if (
+        typeof body.actorId !== "string" ||
+        !Array.isArray(body.operations) ||
+        body.operations.length < 1 ||
+        body.operations.length > 100
+      ) {
+        return Response.json({ error: "Invalid mutation request." }, { status: 400 });
+      }
+      if (this.purged || this.metadata.retired || this.metadata.restore_pending || this.transition) {
+        return Response.json({ error: "This document version has been retired." }, { status: 410 });
+      }
+      if (this.metadata.read_only) return Response.json({ error: "This document is read-only." }, { status: 409 });
+      const clone = new Y.Doc();
+      Y.applyUpdate(clone, Y.encodeStateAsUpdate(this.document));
+      const document = yXmlFragmentToProsemirrorJSON(clone.getXmlFragment("document-store")) as ProseMirrorJson;
+      try {
+        for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(document, operation);
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "invalid_mutation";
+        return Response.json({ error: code }, { status: code === "block_not_found" ? 404 : 422 });
+      }
+      const blockCount = flattenDocumentBlocks(document).length;
+      if (blockCount > 10_000) return Response.json({ error: "Document block limit exceeded." }, { status: 413 });
+      replaceCloneDocument(clone, document);
+      const snapshot = Y.encodeStateAsUpdate(clone);
+      if (snapshot.byteLength >= READ_ONLY_BYTES) {
+        return Response.json({ error: "Document size limit exceeded." }, { status: 413 });
+      }
+      const update = Y.encodeStateAsUpdate(clone, Y.encodeStateVector(this.document));
+      this.pendingAuthorId = body.actorId;
+      this.pendingNotifyEdit = false;
+      Y.applyUpdate(this.document, update, "api-mutation");
+      this.flushPendingUpdates();
+      if (this.metadata.dirty) await this.compact(true);
+      return Response.json({ document, sequence: this.metadata.snapshot_seq });
+    }
     if (request.method === "GET" && url.pathname.endsWith("/legacy-comments")) {
       return Response.json({ threads: legacyComments(this.document) });
     }
@@ -782,6 +945,7 @@ export class Document extends YServer {
     const snapshot = Y.encodeStateAsUpdate(this.document);
     const json = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
     const projection = projectDocument(json);
+    const transclusions = collectTransclusions(json);
     const envelope: DocumentContentEnvelope = {
       schemaVersion: 1,
       pageId,
@@ -822,6 +986,15 @@ export class Document extends YServer {
       // Updates received while hashing or writing R2 must remain dirty for the
       // next compaction instead of being cleared by this one.
       const structuredHash = await sha256Hex(structuredJson);
+      const blockMetadata = await Promise.all(
+        flattenDocumentBlocks(json).map(async (block) => ({
+          id: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(block.id)
+            ? block.id.toLowerCase()
+            : uuidFromHash(await sha256Hex(`${pageId}:${block.id}`)),
+          internalId: block.id,
+          contentHash: await sha256Hex(canonicalJson(block)),
+        })),
+      );
       await this.bindings.BUCKET.put(this.snapshotKey(pageId, epoch), snapshot, {
         httpMetadata: { contentType: "application/octet-stream" },
         customMetadata: { pageId, epoch: String(epoch), sequence: String(maximum) },
@@ -893,8 +1066,17 @@ export class Document extends YServer {
         const statements = [
           this.bindings.DB.prepare(
             `UPDATE pages SET plain_text = ?, indexed_seq = ?, oversized = ?, updated_at = ?
+                 , updated_by = COALESCE(?, updated_by)
               WHERE id = ? AND content_epoch = ?`,
-          ).bind(projection.plainText, maximum, readOnly ? 1 : 0, timestamp, pageId, epoch),
+          ).bind(
+            projection.plainText,
+            maximum,
+            readOnly ? 1 : 0,
+            timestamp,
+            metadataAtStart.last_editor_id,
+            pageId,
+            epoch,
+          ),
           this.bindings.DB.prepare(
             `INSERT INTO document_projections
               (page_id, content_epoch, sequence, schema_version, r2_key, content_hash, byte_size, updated_at)
@@ -965,6 +1147,84 @@ export class Document extends YServer {
             `DELETE FROM member_mentions WHERE source_page_id = ? AND projection_seq <> ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, maximum, pageId, epoch),
+          this.bindings.DB.prepare(`UPDATE transclusion_sources SET projection_seq = -1 WHERE page_id = ?`).bind(
+            pageId,
+          ),
+          this.bindings.DB.prepare(
+            `INSERT INTO transclusion_sources (page_id, block_id, content_json, projection_seq, updated_at)
+             SELECT ?, json_extract(item.value, '$.blockId'), json_extract(item.value, '$.content'), ?, ?
+               FROM json_each(?) item
+              WHERE TRUE
+             ON CONFLICT(page_id, block_id) DO UPDATE SET
+               content_json = excluded.content_json, projection_seq = excluded.projection_seq,
+               updated_at = excluded.updated_at`,
+          ).bind(
+            pageId,
+            maximum,
+            timestamp,
+            JSON.stringify(
+              transclusions.sources.map((source) => ({
+                blockId: source.blockId,
+                content: JSON.stringify(source.content),
+              })),
+            ),
+          ),
+          this.bindings.DB.prepare(`DELETE FROM transclusion_sources WHERE page_id = ? AND projection_seq <> ?`).bind(
+            pageId,
+            maximum,
+          ),
+          this.bindings.DB.prepare(
+            `UPDATE transclusion_references SET projection_seq = -1 WHERE reference_page_id = ?`,
+          ).bind(pageId),
+          this.bindings.DB.prepare(
+            `INSERT INTO transclusion_references
+              (reference_page_id, source_page_id, block_id, projection_seq)
+             SELECT ?, source_page.id, json_extract(item.value, '$.blockId'), ?
+               FROM json_each(?) item
+               JOIN pages source_page ON source_page.id = json_extract(item.value, '$.sourcePageId')
+              WHERE source_page.workspace_id = ?
+             ON CONFLICT(reference_page_id, source_page_id, block_id) DO UPDATE SET
+               projection_seq = excluded.projection_seq`,
+          ).bind(pageId, maximum, JSON.stringify(transclusions.references), page.workspace_id),
+          this.bindings.DB.prepare(
+            `DELETE FROM transclusion_references WHERE reference_page_id = ? AND projection_seq <> ?`,
+          ).bind(pageId, maximum),
+          this.bindings.DB.prepare(
+            `UPDATE api_blocks SET deleted_at = ? WHERE page_id = ? AND deleted_at IS NULL`,
+          ).bind(timestamp, pageId),
+          this.bindings.DB.prepare(
+            `INSERT INTO api_blocks
+              (id, page_id, internal_id, content_hash, created_by, updated_by, created_at, updated_at, deleted_at)
+             SELECT json_extract(item.value, '$.id'), ?, json_extract(item.value, '$.internalId'),
+                    json_extract(item.value, '$.contentHash'), ?, ?, ?, ?, NULL
+               FROM json_each(?) item
+              WHERE TRUE
+             ON CONFLICT(page_id, internal_id) DO UPDATE SET
+               content_hash = excluded.content_hash,
+               updated_by = CASE WHEN api_blocks.content_hash <> excluded.content_hash
+                                 THEN excluded.updated_by ELSE api_blocks.updated_by END,
+               updated_at = CASE WHEN api_blocks.content_hash <> excluded.content_hash
+                                 THEN excluded.updated_at ELSE api_blocks.updated_at END,
+               deleted_at = NULL`,
+          ).bind(
+            pageId,
+            metadataAtStart.last_editor_id,
+            metadataAtStart.last_editor_id,
+            timestamp,
+            timestamp,
+            JSON.stringify(blockMetadata),
+          ),
+          ...webhookEventStatements(this.bindings.DB, {
+            workspaceId: page.workspace_id,
+            type: "page.content_updated",
+            entityType: "page",
+            entityId: pageId,
+            pageId,
+            actorId: metadataAtStart.last_editor_id,
+            sourceKey: `page.content_updated:${pageId}:${epoch}:${maximum}`,
+            data: { sequence: maximum },
+            createdAt: timestamp,
+          }),
           ...notificationFanoutStatements(this.bindings.DB, {
             workspaceId: page.workspace_id,
             spaceId: page.space_id,
@@ -1055,6 +1315,9 @@ export class Document extends YServer {
         }
 
         if (pageProjected) {
+          this.state.waitUntil(
+            sweepOutbox(this.bindings).catch((error) => console.error("Failed to enqueue webhook events", error)),
+          );
           const currentPageTargets = (results[currentPageTargetsIndex]?.results as Array<{ id: string }>) ?? [];
           const currentUserTargets = (results[currentUserTargetsIndex]?.results as Array<{ id: string }>) ?? [];
           const backlinkTargetIds = [

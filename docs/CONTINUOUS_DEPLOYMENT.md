@@ -110,8 +110,9 @@ Wrangler configuration reader execute in the unit suite, rather than living as u
 inside the workflow YAML.
 
 Secrets set with `wrangler secret put --env production` — `BETTER_AUTH_SECRET`, `BOOTSTRAP_TOKEN`,
-`DO_LOCATION_HINT`, and the optional `SLACK_*` values — are not managed by the workflow. They persist across deploys and are set once,
-by hand, per [Set secrets](DEPLOYMENT.md#3-set-secrets).
+`DO_LOCATION_HINT`, `WEBHOOK_ENCRYPTION_KEY`, and the optional `SLACK_*` values — are not managed by
+the workflow. They persist across deploys and are set once, by hand, per
+[Set secrets](DEPLOYMENT.md#3-set-secrets).
 
 ## Concurrency and rapid pushes
 

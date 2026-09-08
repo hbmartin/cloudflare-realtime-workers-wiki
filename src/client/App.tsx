@@ -60,6 +60,9 @@ import { SearchView } from "./SearchView";
 import { ExportDialog } from "./ExportDialog";
 import { ImportDialog } from "./ImportDialog";
 import { SlackSettings } from "./SlackSettings";
+import { ThemeControl } from "./ThemeControl";
+import { ShareControl } from "./ShareControl";
+import { IntegrationsSettings } from "./IntegrationsSettings";
 
 type AppState =
   | { screen: "loading" }
@@ -2651,7 +2654,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             <span>◇</span> Templates
           </button>
           <button className={view === "settings" ? "active" : ""} onClick={() => showView("settings")}>
-            <span>⚙</span> Members
+            <span>⚙</span> Members &amp; settings
           </button>
         </nav>
         {favorites.length > 0 && (
@@ -2749,8 +2752,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             ))}
           </div>
           <div className="topbar-actions">
+            <ThemeControl compact />
             {view === "pages" && activeSelected && !activeSelected.isTemplate && (
               <>
+                <ShareControl pageId={activeSelected.id} owner={member.role === "owner"} />
                 <WatchControl key={activeSelected.id} resourceType="page" resourceId={activeSelected.id} />
                 <button
                   className={`organization-action ${favorites.some((page) => page.id === activeSelected.id) ? "active" : ""}`}
@@ -3285,6 +3290,7 @@ function MembersView({ member, spaces, pages }: { member: ClientMemberContext; s
     <main className="utility-view">
       <p className="eyebrow">Workspace access</p>
       <h1>Members</h1>
+      <ThemeControl />
       {member.role === "owner" && (
         <div className="invite-card">
           <div>
@@ -3341,6 +3347,7 @@ function MembersView({ member, spaces, pages }: { member: ClientMemberContext; s
         ))}
       </div>
       <SlackSettings owner={member.role === "owner"} spaces={spaces} pages={pages} />
+      <IntegrationsSettings owner={member.role === "owner"} pages={pages} />
     </main>
   );
 }

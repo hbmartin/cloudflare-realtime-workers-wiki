@@ -39,6 +39,17 @@ describe("D1 migrations", () => {
         "slack_channel_subscriptions",
         "slack_unfurls",
         "slack_request_replays",
+        "share_links",
+        "integrations",
+        "integration_tokens",
+        "integration_grants",
+        "api_page_ids",
+        "api_blocks",
+        "transclusion_sources",
+        "transclusion_references",
+        "webhook_subscriptions",
+        "webhook_events",
+        "webhook_deliveries",
       ]),
     );
 
