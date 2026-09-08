@@ -155,11 +155,7 @@ function replaceAttachmentReference(content: string, attachmentId: string, repla
   return content.replace(new RegExp(`/api/attachments/${escapedId}(?![\\w-])`, "g"), replacement);
 }
 
-export async function cleanupExport(
-  env: Env,
-  job: Pick<JobRow, "id" | "attempt">,
-  stillOwned: () => Promise<boolean> = async () => true,
-) {
+export async function cleanupExport(env: Env, job: Pick<JobRow, "id" | "attempt">, stillOwned: () => Promise<boolean>) {
   if (!(await stillOwned())) return;
   await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${job.attempt}/output/`);
 }

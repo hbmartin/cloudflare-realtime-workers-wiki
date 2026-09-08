@@ -379,8 +379,10 @@ async function cloneTemplateAttachments(env: Env, job: JobRow, options: Template
         const replay = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ?`)
           .bind(targetId)
           .first<{ r2_key: string }>();
-        if (replay?.r2_key !== key) await env.BUCKET.delete(key);
-        if (replay?.r2_key !== key) throw new Error("The cloned attachment could not be fenced to this attempt.");
+        if (replay?.r2_key !== key) {
+          await env.BUCKET.delete(key);
+          throw new Error("The cloned attachment could not be fenced to this attempt.");
+        }
       } else {
         await env.BUCKET.delete(existing.r2_key);
       }
@@ -739,7 +741,7 @@ export async function finishPendingJobCleanup(
     // recovery pass (or an explicit retry-cancel request) can claim it again.
     await env.DB.prepare(
       `UPDATE jobs SET
-         status = CASE cleanup_target WHEN 'canceled' THEN 'canceling' ELSE 'running' END,
+         status = 'canceling',
          progress_label = CASE cleanup_target WHEN 'canceled' THEN 'Cleanup pending' ELSE 'Failure cleanup pending' END,
          cleanup_token = NULL, cleanup_started_at = NULL, updated_at = ?
        WHERE id = ? AND attempt = ? AND cleanup_token = ?`,
@@ -763,7 +765,7 @@ async function failJobWithCleanup(env: Env, job: JobRow, message: string) {
     return;
   }
   const pending = await env.DB.prepare(
-    `UPDATE jobs SET cleanup_target = COALESCE(cleanup_target, 'failed'),
+    `UPDATE jobs SET status = 'canceling', cleanup_target = COALESCE(cleanup_target, 'failed'),
        progress_label = 'Cleaning up', error_code = 'job_failed', error_message = ?, updated_at = ?
      WHERE id = ? AND attempt = ? AND status = 'running'`,
   )
@@ -918,7 +920,7 @@ export async function claimJobWorkflowRun(
   const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(event.payload.jobId, attempt)
     .first<JobRow>();
-  if (!row || (row.workflow_instance_id ?? row.id) !== event.instanceId) return null;
+  if (!row || row.cleanup_target || (row.workflow_instance_id ?? row.id) !== event.instanceId) return null;
   if (row.status === "running") return row;
   if (row.status !== "queued") return null;
   const started = await updateJob(env, row, { status: "running", current: 0, label: "Preparing" });
@@ -929,7 +931,10 @@ export async function claimJobWorkflowRun(
   const current = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(event.payload.jobId, attempt)
     .first<JobRow>();
-  return current && current.status === "running" && (current.workflow_instance_id ?? current.id) === event.instanceId
+  return current &&
+    current.status === "running" &&
+    !current.cleanup_target &&
+    (current.workflow_instance_id ?? current.id) === event.instanceId
     ? current
     : null;
 }
@@ -1079,8 +1084,7 @@ async function enqueueOutbox(env: Env, outboxId: string) {
       .first<{ attempts: number; last_error: string | null }>();
     if (
       failed &&
-      (failed.attempts === OUTBOX_POISON_WARNING_ATTEMPTS ||
-        (failed.attempts > OUTBOX_POISON_WARNING_ATTEMPTS && failed.attempts % OUTBOX_POISON_WARNING_INTERVAL === 0))
+      (failed.attempts === OUTBOX_POISON_WARNING_ATTEMPTS || failed.attempts % OUTBOX_POISON_WARNING_INTERVAL === 0)
     ) {
       console.error("Outbox row has persistent enqueue failures", {
         outboxId,

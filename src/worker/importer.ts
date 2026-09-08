@@ -470,8 +470,10 @@ async function stageAttachments(env: Env, job: JobRow, page: ImportPage) {
         const replay = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ?`)
           .bind(id)
           .first<{ r2_key: string }>();
-        if (replay?.r2_key !== key) await env.BUCKET.delete(key);
-        if (replay?.r2_key !== key) throw new Error("The imported attachment could not be fenced to this attempt.");
+        if (replay?.r2_key !== key) {
+          await env.BUCKET.delete(key);
+          throw new Error("The imported attachment could not be fenced to this attempt.");
+        }
       } else {
         await env.BUCKET.delete(existing.r2_key);
       }
@@ -768,11 +770,12 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
     if (!(await stillOwned())) return;
     await deleteR2Prefix(env.BUCKET, `documents/${page.id}/epochs/${page.content_epoch}/`);
   }
-  if (!(await stillOwned())) return;
-  await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${job.attempt}/documents/`);
-  if (job.attempt === 1 && (await stillOwned())) {
-    await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/documents/`);
+  for (let attempt = 1; attempt <= job.attempt; attempt += 1) {
+    if (!(await stillOwned())) return;
+    await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${attempt}/documents/`);
   }
+  if (!(await stillOwned())) return;
+  await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/documents/`);
 }
 
 export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {

@@ -540,7 +540,8 @@ async function finishClaimedDeliveries(
 ) {
   if (!outboxIds.length) return [] as string[];
   const timestamp = Date.now();
-  const ids = JSON.stringify(uniqueIds([...outboxIds]));
+  const uniqueOutboxIds = uniqueIds([...outboxIds]);
+  const ids = JSON.stringify(uniqueOutboxIds);
   const finish = env.DB.prepare(
     `UPDATE deliveries SET status = ?, last_error = ?, delivered_at = ?, updated_at = ?
       WHERE outbox_id IN (SELECT value FROM json_each(?)) AND channel = ?
@@ -551,17 +552,20 @@ async function finishClaimedDeliveries(
     const finished = await finish.all<{ outbox_id: string }>();
     return finished.results.map((row) => row.outbox_id);
   }
+  const notificationIds = JSON.stringify(
+    uniqueOutboxIds.filter((id) => id.startsWith("outbox:")).map((id) => id.slice("outbox:".length)),
+  );
   const [finished] = await env.DB.batch<{ outbox_id: string }>([
     finish,
     env.DB.prepare(
       `UPDATE notifications SET ${notificationTimestampColumn} = COALESCE(${notificationTimestampColumn}, ?)
-        WHERE ('outbox:' || id) IN (SELECT value FROM json_each(?))
+        WHERE id IN (SELECT value FROM json_each(?))
           AND EXISTS (
             SELECT 1 FROM deliveries delivery
-             WHERE delivery.outbox_id = 'outbox:' || notifications.id
-               AND delivery.channel = ? AND delivery.status = 'sent' AND delivery.claim_token = ?
+             WHERE delivery.idempotency_key = 'outbox:' || notifications.id || ':' || ?
+               AND delivery.status = 'sent' AND delivery.claim_token = ?
           )`,
-    ).bind(timestamp, ids, channel, token),
+    ).bind(timestamp, notificationIds, channel, token),
   ]);
   return (finished?.results ?? []).map((row) => row.outbox_id);
 }
