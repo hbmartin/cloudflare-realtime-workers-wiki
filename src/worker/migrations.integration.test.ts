@@ -32,6 +32,7 @@ describe("D1 migrations", () => {
         "jobs",
         "outbox",
         "notifications",
+        "digest_delivery_cursors",
         "comment_migrations",
         "slack_installations",
         "slack_user_links",
@@ -64,6 +65,16 @@ describe("D1 migrations", () => {
     );
     const deliveryColumns = await env.DB.prepare(`PRAGMA table_info(deliveries)`).all<{ name: string }>();
     expect(deliveryColumns.results.map((column) => column.name)).toContain("claim_token");
+    const digestCursorColumns = await env.DB.prepare(`PRAGMA table_info(digest_delivery_cursors)`).all<{
+      name: string;
+      pk: number;
+    }>();
+    expect(digestCursorColumns.results.filter((column) => column.pk).map((column) => [column.name, column.pk])).toEqual(
+      [
+        ["channel", 1],
+        ["timezone", 2],
+      ],
+    );
 
     const uploadColumns = await env.DB.prepare(`PRAGMA table_info(attachment_uploads)`).all<{ name: string }>();
     expect(uploadColumns.results.map((column) => column.name)).toEqual(
@@ -114,6 +125,34 @@ describe("D1 migrations", () => {
     );
   });
 
+  it("migrates digest cursors to independent channel and timezone keys", async () => {
+    const migration = env.TEST_MIGRATIONS!.find((candidate) => candidate.name === "0020_digest_timezone_cursors.sql");
+    expect(migration).toBeTruthy();
+    const migrationIndex = env.TEST_MIGRATIONS!.indexOf(migration!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, migrationIndex));
+    await env.DB.prepare(
+      `INSERT INTO digest_delivery_cursors (channel, user_id, workspace_id, timezone, updated_at)
+       VALUES ('email', 'utc-user', 'workspace', 'UTC', 123)`,
+    ).run();
+
+    await applyD1Migrations(env.DB, [migration!]);
+    await env.DB.prepare(
+      `INSERT INTO digest_delivery_cursors (channel, user_id, workspace_id, timezone, updated_at)
+       VALUES ('email', 'la-user', 'workspace', 'America/Los_Angeles', 456)`,
+    ).run();
+
+    expect(
+      await env.DB.prepare(
+        `SELECT channel, user_id, timezone, updated_at FROM digest_delivery_cursors ORDER BY timezone`,
+      ).all(),
+    ).toMatchObject({
+      results: [
+        { channel: "email", user_id: "la-user", timezone: "America/Los_Angeles", updated_at: 456 },
+        { channel: "email", user_id: "utc-user", timezone: "UTC", updated_at: 123 },
+      ],
+    });
+  });
+
   it("explicitly retires legacy Slack unfurls that have no recoverable message timestamp", async () => {
     const retirement = env.TEST_MIGRATIONS!.find(
       (migration) => migration.name === "0019_retire_legacy_slack_unfurls.sql",
@@ -150,10 +189,15 @@ describe("D1 migrations", () => {
 
     expect(
       await env.DB.prepare(
-        `SELECT delivered_at, retired_at IS NOT NULL retired, retirement_reason
+        `SELECT delivered_at, retired_at IS NOT NULL retired, typeof(retired_at) retired_at_type, retirement_reason
            FROM slack_unfurls WHERE id = 'legacy-unfurl'`,
       ).first(),
-    ).toEqual({ delivered_at: null, retired: 1, retirement_reason: "legacy_missing_message_ts" });
+    ).toEqual({
+      delivered_at: null,
+      retired: 1,
+      retired_at_type: "integer",
+      retirement_reason: "legacy_missing_message_ts",
+    });
     expect(await env.DB.prepare(`SELECT last_error FROM outbox WHERE id = 'outbox:legacy-unfurl'`).first()).toEqual({
       last_error: "legacy_unfurl_missing_message_ts",
     });

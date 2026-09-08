@@ -67,6 +67,7 @@ const UNSAFE_FILE_EXTENSIONS = new Set([
 // separators so header-breaking CR/LF and other ASCII controls cannot slip through.
 const VALID_MIME =
   /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?: *; *[!#$%&'*+.^_`|~0-9A-Za-z-]+ *= *(?:[!#$%&'*+.^_`|~0-9A-Za-z-]+|"(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])*"))*$/;
+const INLINE_IMAGE_MIME = /^image\/(png|jpeg|gif|webp|avif)$/;
 
 function baseMime(mime: string) {
   return mime.toLowerCase().split(";", 1)[0]!.trim();
@@ -83,7 +84,7 @@ export function isUnsafeMime(mime: string, name: string) {
 export function inlineImageMime(mime: string) {
   if (!VALID_MIME.test(mime)) return null;
   const normalized = baseMime(mime);
-  return /^image\/(png|jpeg|gif|webp|avif)$/.test(normalized) ? normalized : null;
+  return INLINE_IMAGE_MIME.test(normalized) ? normalized : null;
 }
 
 /**
@@ -94,13 +95,15 @@ export function inlineImageMime(mime: string) {
  * which seeking depends on, are already handled by the download route.
  */
 export function isInlineMime(mime: string) {
+  if (!VALID_MIME.test(mime)) return false;
+  const normalizedMime = baseMime(mime);
   return (
-    /^image\/(png|jpeg|gif|webp|avif)$/.test(mime) ||
-    /^video\/(mp4|webm|ogg)$/.test(mime) ||
-    /^audio\/(mpeg|ogg|wav|webm|mp4)$/.test(mime) ||
-    mime === "application/pdf" ||
-    mime === "text/plain" ||
-    mime === "text/markdown"
+    INLINE_IMAGE_MIME.test(normalizedMime) ||
+    /^video\/(mp4|webm|ogg)$/.test(normalizedMime) ||
+    /^audio\/(mpeg|ogg|wav|webm|mp4)$/.test(normalizedMime) ||
+    normalizedMime === "application/pdf" ||
+    normalizedMime === "text/plain" ||
+    normalizedMime === "text/markdown"
   );
 }
 

@@ -74,7 +74,8 @@ function safeUrl(value: unknown) {
 }
 
 function markdownCodeSpan(value: string) {
-  const longestRun = Math.max(0, ...[...value.matchAll(/`+/g)].map((match) => match[0].length));
+  let longestRun = 0;
+  for (const match of value.matchAll(/`+/g)) longestRun = Math.max(longestRun, match[0].length);
   const delimiter = "`".repeat(longestRun + 1);
   const needsPadding =
     value.startsWith("`") ||
@@ -171,9 +172,20 @@ function serializeSequence(children: ProseMirrorJson[], format: "markdown" | "ht
 
 // A cell's text is inlined into one pipe-delimited line, so newlines are collapsed
 // and every literal pipe is escaped or it would open a new column.
+function escapeUnescapedPipes(value: string) {
+  let result = "";
+  let precedingBackslashes = 0;
+  for (const character of value) {
+    if (character === "|" && precedingBackslashes % 2 === 0) result += "\\";
+    result += character;
+    precedingBackslashes = character === "\\" ? precedingBackslashes + 1 : 0;
+  }
+  return result;
+}
+
 function markdownTableCell(node: ProseMirrorJson) {
   const rendered = (node.content ?? []).map((child) => serializeInline(child, "markdown")).join("");
-  return normalizeText(rendered || escapeMarkdownInline(nodeText(node)));
+  return escapeUnescapedPipes(normalizeText(rendered || escapeMarkdownInline(nodeText(node))));
 }
 
 function markdownTableRow(row: ProseMirrorJson) {
@@ -291,7 +303,8 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
     // and its width has to come from the header rather than any individual row.
     const headed = header.length > 0 && header.every((cell) => cell.type === "tableHeader");
     const lines = rows.map((row) => markdownTableRow(row));
-    const width = Math.max(0, ...rows.map((row) => row.content?.length ?? 0));
+    let width = 0;
+    for (const row of rows) width = Math.max(width, row.content?.length ?? 0);
     if (headed) lines.splice(1, 0, `| ${header.map(() => "---").join(" | ")} |\n`);
     else if (width) {
       lines.unshift(`| ${Array.from({ length: width }, () => "").join(" | ")} |\n`);

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Env } from "./env";
-import { inlineImageMime, isUnsafeMime, processDueUploadReaps } from "./attachments";
+import { inlineImageMime, isInlineMime, isUnsafeMime, processDueUploadReaps } from "./attachments";
 
 function cleanupEnv(
   state: "active" | "completing" | "reaping" | "aborting",
@@ -99,7 +99,10 @@ describe("attachment MIME policy", () => {
     expect(isUnsafeMime("image/png\t; name=photo.png", "photo.png")).toBe(true);
     expect(isUnsafeMime(`image/png; name="photo.png"`, "photo.png")).toBe(false);
     expect(inlineImageMime(`image/png; name="photo.png"`)).toBe("image/png");
+    expect(isInlineMime(`image/png; name="photo.png"`)).toBe(true);
+    expect(isInlineMime(`IMAGE/PNG; name="photo.png"`)).toBe(true);
     expect(inlineImageMime(`image/png" onerror="alert(1)`)).toBeNull();
+    expect(isInlineMime(`image/png" onerror="alert(1)`)).toBe(false);
     expect(inlineImageMime("image/png\r\n ; name=photo.png")).toBeNull();
   });
 });

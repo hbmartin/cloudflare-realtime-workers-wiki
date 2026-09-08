@@ -390,12 +390,21 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
       if (existing.import_job_id !== job.id) throw new Error("An imported page id is already in use.");
       if (existing.content_epoch !== job.attempt) {
         // A retry must not reuse the purged document room of the previous attempt.
-        await env.DB.prepare(
+        const updated = await env.DB.prepare(
           `UPDATE pages SET content_epoch = ? WHERE id = ? AND import_job_id = ?
             AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
         )
           .bind(job.attempt, page.id, job.id, job.id, job.attempt)
           .run();
+        if (!updated.meta.changes) {
+          await assertImportActive(env, job);
+          const current = await env.DB.prepare(`SELECT import_job_id, content_epoch FROM pages WHERE id = ?`)
+            .bind(page.id)
+            .first<{ import_job_id: string | null; content_epoch: number }>();
+          if (current?.import_job_id !== job.id || current.content_epoch !== job.attempt) {
+            throw new Error("An imported page could not be fenced to this attempt.");
+          }
+        }
       }
       continue;
     }
@@ -441,11 +450,31 @@ async function stageAttachments(env: Env, job: JobRow, page: ImportPage) {
     const id = await stableId(job.id, "attachment", `${page.source}:${asset.source}`);
     const hash = await sha256Hex(asset.bytes);
     const key = `assets/${job.workspace_id}/${id}/attempts/${job.attempt}/${hash}`;
-    const existing = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ?`)
+    const existing = await env.DB.prepare(`SELECT page_id, r2_key FROM attachments WHERE id = ?`)
       .bind(id)
-      .first<{ r2_key: string }>();
+      .first<{ page_id: string; r2_key: string }>();
     if (existing) {
-      if (existing.r2_key !== key) throw new Error("An imported attachment id is already in use.");
+      if (existing.page_id !== page.id) throw new Error("An imported attachment id is already in use.");
+      if (existing.r2_key === key) continue;
+      await env.BUCKET.put(key, asset.bytes, {
+        httpMetadata: { contentType: asset.mime },
+        customMetadata: { attachmentId: id, importJobId: job.id },
+      });
+      const moved = await env.DB.prepare(
+        `UPDATE attachments SET r2_key = ? WHERE id = ? AND page_id = ? AND r2_key = ?
+          AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
+      )
+        .bind(key, id, page.id, existing.r2_key, job.id, job.attempt)
+        .run();
+      if (!moved.meta.changes) {
+        const replay = await env.DB.prepare(`SELECT r2_key FROM attachments WHERE id = ?`)
+          .bind(id)
+          .first<{ r2_key: string }>();
+        if (replay?.r2_key !== key) await env.BUCKET.delete(key);
+        if (replay?.r2_key !== key) throw new Error("The imported attachment could not be fenced to this attempt.");
+      } else {
+        await env.BUCKET.delete(existing.r2_key);
+      }
       continue;
     }
     await env.BUCKET.put(key, asset.bytes, {
@@ -706,13 +735,13 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
     .first();
   if (!current || !(await stillOwned())) return;
   const pages = await env.DB.prepare(
-    `SELECT id, kind, content_epoch FROM pages WHERE import_job_id = ? AND content_epoch = ?`,
+    `SELECT id, kind, content_epoch FROM pages WHERE import_job_id = ? AND content_epoch <= ?`,
   )
     .bind(job.id, job.attempt)
     .all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
   const attachments = await env.DB.prepare(
     `SELECT r2_key FROM attachments WHERE page_id IN (
-      SELECT id FROM pages WHERE import_job_id = ? AND content_epoch = ?
+      SELECT id FROM pages WHERE import_job_id = ? AND content_epoch <= ?
     )`,
   )
     .bind(job.id, job.attempt)
@@ -730,14 +759,14 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
     if (!response.ok) throw new Error("A staged import document could not be purged.");
   }
   if (!(await stillOwned())) return;
-  await env.DB.prepare(`DELETE FROM pages WHERE import_job_id = ? AND content_epoch = ?`)
+  await env.DB.prepare(`DELETE FROM pages WHERE import_job_id = ? AND content_epoch <= ?`)
     .bind(job.id, job.attempt)
     .run();
   if (attachments.results.length && (await stillOwned()))
     await env.BUCKET.delete(attachments.results.map((attachment) => attachment.r2_key));
   for (const page of pages.results) {
     if (!(await stillOwned())) return;
-    await deleteR2Prefix(env.BUCKET, `documents/${page.id}/epochs/${job.attempt}/`);
+    await deleteR2Prefix(env.BUCKET, `documents/${page.id}/epochs/${page.content_epoch}/`);
   }
   if (!(await stillOwned())) return;
   await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${job.attempt}/documents/`);

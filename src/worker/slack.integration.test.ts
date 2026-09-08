@@ -2,6 +2,7 @@ import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
 import type { Env, MemberContext } from "./env";
+import { consumeDeliveryMessage } from "./jobs";
 import { notificationFanoutStatements } from "./notifications";
 import {
   consumeSlackLink,
@@ -454,6 +455,47 @@ describe("Slack security and integration", () => {
     });
   });
 
+  it("records retirement against only the exact consumed unfurl outbox row", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO slack_unfurls
+          (id, installation_id, workspace_id, user_id, channel_id, unfurls_json, created_at)
+         VALUES ('queued-missing-ts', 'slack-installation', ?, ?, 'C0123456789', '{}', ?)`,
+      ).bind(installed.member.workspace.id, installed.member.user.id, timestamp),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at) VALUES
+          ('outbox:queued-missing-ts', ?, 'slack_unfurl', json_object('unfurlId', 'queued-missing-ts'), ?, ?),
+          ('outbox:duplicate-missing-ts', ?, 'slack_unfurl', json_object('unfurlId', 'queued-missing-ts'), ?, ?)`,
+      ).bind(installed.member.workspace.id, timestamp, timestamp, installed.member.workspace.id, timestamp, timestamp),
+    ]);
+    const message = {
+      id: "unfurl-message",
+      timestamp: new Date(timestamp),
+      body: { outboxId: "outbox:queued-missing-ts" },
+      attempts: 1,
+      ack: vi.fn(),
+      retry: vi.fn(),
+    } satisfies Message<{ outboxId: string }>;
+
+    await consumeDeliveryMessage(slackEnv(), message);
+
+    expect(message.ack).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare(
+        `SELECT id, last_error FROM outbox
+          WHERE id IN ('outbox:queued-missing-ts', 'outbox:duplicate-missing-ts') ORDER BY id`,
+      ).all(),
+    ).toMatchObject({
+      results: [
+        { id: "outbox:duplicate-missing-ts", last_error: null },
+        { id: "outbox:queued-missing-ts", last_error: "slack_unfurl_missing_message_ts" },
+      ],
+    });
+  });
+
   it("fans channel events into the outbox and preserves Slack retry-after delays", async () => {
     const installed = await bootstrap();
     await installSlack(installed.member);
@@ -546,7 +588,7 @@ describe("Slack security and integration", () => {
     ).toEqual({ delivered: 1 });
   });
 
-  it("stops channel digest requests only for the rate-limited Slack installation", async () => {
+  it("defers only the rate-limited Slack installation and retries it on a later tick", async () => {
     const installed = await bootstrap();
     await installSlack(installed.member);
     const timestamp = Date.UTC(2026, 8, 5, 9, 5);
@@ -614,20 +656,21 @@ describe("Slack security and integration", () => {
         installed.member.workspace.id,
         installed.member.user.id,
         installed.page.id,
-        timestamp,
+        timestamp - 10 * 60_000,
         installed.member.workspace.id,
         installed.member.user.id,
         installed.page.id,
-        timestamp + 1,
+        timestamp - 10 * 60_000 + 1,
         installed.member.user.id,
-        timestamp + 2,
+        timestamp - 10 * 60_000 + 2,
       ),
     ]);
     const channels: string[] = [];
+    let remainingRateLimits = 1;
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       channels.push(JSON.parse(String(init?.body)).channel as string);
       const authorization = new Headers(init?.headers).get("authorization");
-      return authorization === "Bearer xoxb-test-bot-token"
+      return authorization === "Bearer xoxb-test-bot-token" && remainingRateLimits-- > 0
         ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
         : Response.json({ ok: true });
     });
@@ -649,6 +692,16 @@ describe("Slack security and integration", () => {
         { id: "channel-event-c", delivered: 1 },
       ],
     });
+
+    await sendDueSlackChannelDigests(slackEnv(), timestamp + 15 * 60_000);
+
+    expect(channels).toEqual(["CRATEA", "CRATEC", "CRATEA", "CRATEB"]);
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) delivered FROM slack_channel_events
+          WHERE id LIKE 'channel-event-%' AND delivered_at IS NOT NULL`,
+      ).first(),
+    ).toEqual({ delivered: 3 });
     log.mockRestore();
   });
 });

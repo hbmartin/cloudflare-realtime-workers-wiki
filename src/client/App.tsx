@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { PAGE_MOVE_RECEIPT_RETENTION_MS } from "../shared/page-move";
 import { errorLogFields } from "../shared/error-log";
 import { buildTree, compareBinaryText } from "../shared/tree-model";
@@ -736,6 +746,14 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
   );
 }
 
+export function useCommittedRef<T>(value: T) {
+  const ref = useRef(value);
+  useLayoutEffect(() => {
+    ref.current = value;
+  }, [value]);
+  return ref;
+}
+
 function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
   const [{ pages, pagesLoaded, selectedId, pendingSelectionId }, dispatchPageAction] = useReducer(
     workspacePageReducer,
@@ -830,9 +848,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const latestWorkspaceErrorAttemptRef = useRef(new Map<string, number>());
   const pageTreeErrorRevisionRef = useRef(0);
   const organizationLoadGenerationRef = useRef(0);
-  const pageTagsLoadGenerationRef = useRef(new Map<string, number>());
-  const selectedIdRef = useRef(selectedId);
-  selectedIdRef.current = selectedId;
+  const pageTagsLoadGenerationRef = useRef(0);
+  const selectedIdRef = useCommittedRef(selectedId);
   const selectedSpaceIdRef = useRef<string | null>(null);
   const abortWorkspaceRequests = useCallback(() => {
     const activePageLoad = pageLoadRequest.current;
@@ -1475,20 +1492,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }, [loadOrganization]);
   useEffect(() => {
     if (!selectedId) return;
-    const generations = pageTagsLoadGenerationRef.current;
-    const generation = (generations.get(selectedId) ?? 0) + 1;
-    generations.set(selectedId, generation);
+    const generation = ++pageTagsLoadGenerationRef.current;
     void api<{ tags: Tag[] }>(`/api/pages/${encodeURIComponent(selectedId)}/tags`)
       .then((data) => {
-        if (generation === generations.get(selectedId) && selectedIdRef.current === selectedId) {
+        if (generation === pageTagsLoadGenerationRef.current && selectedIdRef.current === selectedId) {
           setPageTags({ pageId: selectedId, tags: data.tags });
         }
       })
       .catch((error: unknown) => {
-        if (generation !== generations.get(selectedId) || selectedIdRef.current !== selectedId) return;
+        if (generation !== pageTagsLoadGenerationRef.current || selectedIdRef.current !== selectedId) return;
         setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
       });
-  }, [organizationRevision, selectedId]);
+  }, [organizationRevision, selectedId, selectedIdRef]);
 
   // The shell only renders a selection inside the active space, so a deep link or a fallback selection
   // that lands in another space switches the space instead of showing an empty workspace.
@@ -1574,8 +1589,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       await api(`/api/pages/${encodeURIComponent(page.id)}/tags/${encodeURIComponent(tag.id)}`, {
         method: assigned ? "PUT" : "DELETE",
       });
-      const generations = pageTagsLoadGenerationRef.current;
-      generations.set(page.id, (generations.get(page.id) ?? 0) + 1);
+      if (selectedIdRef.current === page.id) pageTagsLoadGenerationRef.current += 1;
       setPageTags((current) => {
         if (selectedIdRef.current !== page.id) return current;
         const currentTags = current.pageId === page.id ? current.tags : [];
@@ -1611,8 +1625,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         method: "PUT",
       });
       const assignedTag = { ...data.tag, pageCount: 1 };
-      const generations = pageTagsLoadGenerationRef.current;
-      generations.set(page.id, (generations.get(page.id) ?? 0) + 1);
+      if (selectedIdRef.current === page.id) pageTagsLoadGenerationRef.current += 1;
       setTags((current) => [...current.filter((tag) => tag.id !== assignedTag.id), assignedTag]);
       setPageTags((current) => {
         if (selectedIdRef.current !== page.id) return current;

@@ -6,6 +6,7 @@ import type { Env } from "./env";
 import type { JobRow } from "./jobs";
 import { inlineImageMime } from "./attachments";
 import { normalizeFilename } from "./http";
+import { deleteR2Prefix } from "./r2";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
 const EXPORT_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -150,7 +151,17 @@ function uniqueAssetName(name: string, used: Set<string>) {
 }
 
 function replaceAttachmentReference(content: string, attachmentId: string, replacement: string) {
-  return content.replace(new RegExp(`/api/attachments/${attachmentId}(?![\\w-])`, "g"), replacement);
+  const escapedId = attachmentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return content.replace(new RegExp(`/api/attachments/${escapedId}(?![\\w-])`, "g"), replacement);
+}
+
+export async function cleanupExport(
+  env: Env,
+  job: Pick<JobRow, "id" | "attempt">,
+  stillOwned: () => Promise<boolean> = async () => true,
+) {
+  if (!(await stillOwned())) return;
+  await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${job.attempt}/output/`);
 }
 
 async function portableExport(
@@ -229,6 +240,7 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
   const options = exportOptions(job);
   const artifact = await step.do("render export", async () => {
     await assertExportActive(env, job);
+    await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${job.attempt}/output/`);
     const page = await env.DB.prepare(
       `SELECT id, workspace_id, content_epoch, kind, title FROM pages
         WHERE id = ? AND workspace_id = ? AND space_id = ? AND import_job_id IS NULL AND is_template = 0`,

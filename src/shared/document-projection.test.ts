@@ -104,6 +104,21 @@ describe("structured document projection", () => {
     expect(projection.pageReferences[0]!.excerpt).toContain("Late");
   });
 
+  it("serializes inputs with more delimiter and table entries than a function call can spread", () => {
+    const code = "`x".repeat(150_000);
+    const rows = Array.from({ length: 150_000 }, () => ({ type: "tableRow", content: [] }));
+
+    const serialized = serializeDocument(
+      document(
+        { type: "paragraph", content: [{ type: "text", text: code, marks: [{ type: "code" }] }] },
+        { type: "table", content: rows },
+      ),
+    );
+
+    expect(serialized.markdown).toContain(code);
+    expect(serialized.markdown.endsWith("|  |\n")).toBe(true);
+  });
+
   it("serializes custom nodes and neutralizes unsafe links and unknown nodes", () => {
     const serialized = serializeDocument(
       document(
@@ -210,6 +225,32 @@ describe("structured document projection", () => {
     expect(serialized.markdown).toContain("\\# Not a heading and \\*\\*not bold\\*\\* and snake_case");
     expect(serialized.markdown).toContain("`a*b`");
     expect(serialized.markdown).toContain("**really bold**");
+  });
+
+  it("escapes table delimiters inside code spans without double-escaping existing escapes", () => {
+    const serialized = serializeDocument(
+      document({
+        type: "table",
+        content: [
+          {
+            type: "tableRow",
+            content: [
+              { type: "tableHeader", content: [{ type: "text", text: "Code" }] },
+              { type: "tableHeader", content: [{ type: "text", text: "Already escaped" }] },
+            ],
+          },
+          {
+            type: "tableRow",
+            content: [
+              { type: "tableCell", content: [{ type: "text", text: "a|b", marks: [{ type: "code" }] }] },
+              { type: "tableCell", content: [{ type: "text", text: "a\\|b", marks: [{ type: "code" }] }] },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(serialized.markdown).toContain("| Code | Already escaped |\n| --- | --- |\n| `a\\|b` | `a\\|b` |\n");
   });
 
   it("uses a longer code-span delimiter when inline code contains backticks", () => {
