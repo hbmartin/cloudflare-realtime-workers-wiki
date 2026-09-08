@@ -320,6 +320,15 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
       ? `<p class="linked-page"><a href="${escapeHtml(href)}">${escapeHtml(title)}</a></p>`
       : `[${escapeMarkdownInline(title)}](${markdownDestination(href)})\n\n`;
   }
+  if (type === "linkedDiagram") {
+    const pageId = stringAttr(node, "pageId") ?? "";
+    const title = stringAttr(node, "title") ?? "Linked whiteboard";
+    const href = `/?page=${encodeURIComponent(pageId)}`;
+    const thumbnail = `/api/pages/${encodeURIComponent(pageId)}/diagram-thumbnail.svg`;
+    return format === "html"
+      ? `<figure class="linked-diagram" data-linked-diagram-id="${escapeHtml(pageId)}"><a href="${escapeHtml(href)}"><img src="${escapeHtml(thumbnail)}" alt=""><figcaption>${escapeHtml(title)}</figcaption></a></figure>`
+      : `[${escapeMarkdownInline(title)}](${markdownDestination(href)})\n\n`;
+  }
   if (type === "syncedBlockSource") return blockChildren();
   if (type === "syncedBlockReference") {
     const sourcePageId = stringAttr(node, "sourcePageId") ?? "";
@@ -388,8 +397,18 @@ export function projectDocument(root: ProseMirrorJson): DocumentProjection {
       }
     }
 
+    if (node.type === "linkedDiagram") {
+      const entityId = stringAttr(node, "pageId");
+      const label = stringAttr(node, "title") ?? "Linked whiteboard";
+      if (entityId) {
+        if (!pageOffsets.has(entityId)) pageOffsets.set(entityId, textLength);
+        append(label);
+        append(" ");
+      }
+    }
+
     for (const child of node.content ?? []) visit(child);
-    if (node.type && !["text", "mention"].includes(node.type)) append(" ");
+    if (node.type && !["text", "mention", "linkedDiagram"].includes(node.type)) append(" ");
   };
 
   visit(root);

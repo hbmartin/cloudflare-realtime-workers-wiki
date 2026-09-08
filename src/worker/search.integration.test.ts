@@ -49,7 +49,12 @@ async function inviteViewer(ownerCookie: string) {
   return accepted.headers.get("set-cookie")!.split(";", 1)[0]!;
 }
 
-async function createPage(cookie: string, title: string, spaceId: string, kind: "document" | "table" = "document") {
+async function createPage(
+  cookie: string,
+  title: string,
+  spaceId: string,
+  kind: "document" | "table" | "diagram" = "document",
+) {
   const response = await SELF.fetch(
     request(cookie, "/api/pages", {
       method: "POST",
@@ -79,6 +84,22 @@ beforeEach(async () => {
 });
 
 describe("search v2", () => {
+  it("filters diagrams in full search and title suggestions", async () => {
+    const installed = await bootstrap();
+    const diagram = await createPage(installed.cookie, "Service topology", installed.generalId, "diagram");
+    await createPage(installed.cookie, "Service notes", installed.generalId);
+
+    const results = await (
+      await SELF.fetch(request(installed.cookie, "/api/search?q=Service&kind=diagram"))
+    ).json<SearchResponse>();
+    expect(results.results.map((result) => result.page.id)).toEqual([diagram.id]);
+
+    const titles = await (
+      await SELF.fetch(request(installed.cookie, "/api/search/titles?q=Service&kind=diagram"))
+    ).json<{ suggestions: SearchTitleSuggestion[] }>();
+    expect(titles.suggestions.map((suggestion) => suggestion.page.id)).toEqual([diagram.id]);
+  });
+
   it("ranks titles, reports snippet sources, filters rows, and paginates deterministically", async () => {
     const installed = await bootstrap();
     const exact = await createPage(installed.cookie, "Mars", installed.generalId);

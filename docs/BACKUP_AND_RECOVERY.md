@@ -4,23 +4,23 @@ The system has three durable data planes:
 
 - D1: accounts, sessions, workspace/page metadata, search/reference/mention projections, mention read
   cursors, deletion jobs, attachments, versions, and tables.
-- R2: current document snapshots, immutable history snapshots, and attachments.
+- R2: current document and diagram snapshots, diagram projections and thumbnails, immutable history snapshots, and attachments.
 - Durable Object SQLite: the current post-snapshot Yjs update log and room manifest; workspace event
   rooms contain no authoritative page state.
 
-Normal document recovery loads the current R2 snapshot and replays ordered Durable Object SQLite
+Normal collaborative-page recovery loads the current R2 snapshot and replays ordered Durable Object SQLite
 chunks. Incoming updates are merged and flushed after a 1–5 second debounce. Compaction clears the
 dirty flag it owns before external writes, deletes only log sequences captured by that compaction, and
 re-dirties the room after any failed R2/D1 write.
 
 ## Recovery point objective per plane
 
-| Plane                       | Worst-case loss                                           | Mitigation                                                                          |
-| --------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| D1                          | Everything since the last export                          | Export on a schedule matching your objective                                        |
-| R2 current snapshots        | Up to the 30-second compaction interval                   | The Durable Object log holds the tail                                               |
-| R2 attachments and versions | Written synchronously; no lag                             | —                                                                                   |
-| Durable Object SQLite       | Up to the 5-second save debounce, on a process crash only | Connected browsers hold local Yjs state in IndexedDB and resynchronize on reconnect |
+| Plane                       | Worst-case loss                                           | Mitigation                                                                       |
+| --------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| D1                          | Everything since the last export                          | Export on a schedule matching your objective                                     |
+| R2 current snapshots        | Up to the 30-second compaction interval                   | The Durable Object log holds the tail                                            |
+| R2 attachments and versions | Written synchronously; no lag                             | —                                                                                |
+| Durable Object SQLite       | Up to the 5-second save debounce, on a process crash only | Documents also retain local Yjs state in IndexedDB; diagrams deliberately do not |
 
 Cloudflare does not expose a bulk user-managed export of each Durable Object's SQLite database. The
 Durable Object remains the primary recovery source for its own flushed tail, and an R2 copy can lag
@@ -47,7 +47,7 @@ is ordinary, and the index is derived from `pages`, so the script exports the re
 leaves the index to be rebuilt on import. It discovers the table list from `sqlite_master` on each run,
 so a migration that adds a table needs no change here.
 
-Use Cloudflare R2 tooling or an S3-compatible client to copy both `assets/` and `documents/`. Preserve
+Use Cloudflare R2 tooling or an S3-compatible client to copy `assets/`, `documents/`, and `diagrams/`. Preserve
 object metadata.
 
 ### Maintenance-window backup
@@ -60,18 +60,18 @@ For a consistent copy rather than a best-effort one:
 2. Wait for connections to lose write access — up to the 5-minute connection grant — then one compaction
    interval of 30 seconds plus the 5-second save debounce. The alarm closes each connection when its
    grant expires; confirm no connections remain before continuing.
-3. Confirm document versions and current snapshot objects were updated, by checking `updated_at` on the
-   affected pages and the modification time of the `documents/{pageId}/epochs/{epoch}/current.bin`
-   objects.
+3. Confirm document and diagram versions and current snapshot objects were updated, by checking `updated_at` on the
+   affected pages and the modification time of the corresponding `documents/{pageId}/epochs/{epoch}/current.bin`
+   or `diagrams/{pageId}/epochs/{epoch}/current.bin` objects.
 4. Export D1 with `pnpm db:export`.
-5. Copy R2 `assets/` and `documents/`.
+5. Copy R2 `assets/`, `documents/`, and `diagrams/`.
 6. Restore write access.
 
 Skipping step 2 produces a copy that is inconsistent across planes: D1 metadata from one moment and
 Durable Object state from another.
 
-A process crash inside the five-second debounce can lose the server's in-memory copy; connected
-browsers retain local Yjs state in IndexedDB and resynchronize it.
+A process crash inside the five-second debounce can lose the server's in-memory copy. Connected document browsers
+retain local Yjs state in IndexedDB and resynchronize it; diagrams intentionally have no browser persistence.
 
 ## Recovery cases
 

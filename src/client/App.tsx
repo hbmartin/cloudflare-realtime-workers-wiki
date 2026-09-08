@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -63,6 +65,8 @@ import { SlackSettings } from "./SlackSettings";
 import { ThemeControl } from "./ThemeControl";
 import { ShareControl } from "./ShareControl";
 import { IntegrationsSettings } from "./IntegrationsSettings";
+
+const DiagramPage = lazy(() => import("./DiagramPage").then((module) => ({ default: module.DiagramPage })));
 
 type AppState =
   | { screen: "loading" }
@@ -2757,7 +2761,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             <ThemeControl compact />
             {view === "pages" && activeSelected && !activeSelected.isTemplate && (
               <>
-                <ShareControl pageId={activeSelected.id} owner={member.role === "owner"} />
+                {activeSelected.kind !== "diagram" && (
+                  <ShareControl pageId={activeSelected.id} owner={member.role === "owner"} />
+                )}
                 <WatchControl key={activeSelected.id} resourceType="page" resourceId={activeSelected.id} />
                 <button
                   className={`organization-action ${favorites.some((page) => page.id === activeSelected.id) ? "active" : ""}`}
@@ -2837,6 +2843,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                 </button>
                 <button className="quiet-button" disabled={!canCreatePage} onClick={() => void createPage("table")}>
                   + Table
+                </button>
+                <button className="quiet-button" disabled={!canCreatePage} onClick={() => void createPage("diagram")}>
+                  + Diagram
                 </button>
               </div>
             )}
@@ -2918,7 +2927,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               backlinksRevision={backlinksRevision}
               commentsRevision={commentsRevision}
             />
-          ) : (
+          ) : activeSelected.kind === "table" ? (
             <TablePage
               key={activeSelected.id}
               page={activeSelected}
@@ -2928,6 +2937,20 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               onSelectPage={navigateToPage}
               backlinksRevision={backlinksRevision}
             />
+          ) : (
+            <Suspense fallback={<div className="editor-loading">Loading the diagram editor…</div>}>
+              <DiagramPage
+                key={`${activeSelected.id}:${activeSelected.contentEpoch}`}
+                page={activeSelected}
+                member={activeMember}
+                onPageChanged={updatePage}
+                onPageUnavailable={pageUnavailable}
+                onAccessDenied={documentAccessDenied}
+                onSelectPage={navigateToPage}
+                backlinksRevision={backlinksRevision}
+                commentsRevision={commentsRevision}
+              />
+            </Suspense>
           )
         ) : (
           <EmptyWorkspace canEdit={canEditActiveSpace} onCreate={() => void createPage("document", null)} />
@@ -3074,7 +3097,7 @@ function PageTree({
           }}
           title="Alt+arrow keys move this page"
         >
-          <span>{node.icon ?? (node.kind === "table" ? "▦" : "□")}</span>
+          <span>{node.icon ?? (node.kind === "table" ? "▦" : node.kind === "diagram" ? "◇" : "□")}</span>
           <span>{node.title}</span>
         </button>
         {editable && (
@@ -3254,7 +3277,7 @@ function TrashView({
           const actionsDisabled = loading || mutationPending;
           return (
             <div key={page.id}>
-              <span>{page.kind === "table" ? "▦" : "□"}</span>
+              <span>{page.kind === "table" ? "▦" : page.kind === "diagram" ? "◇" : "□"}</span>
               <strong>{page.title}</strong>
               <button disabled={actionsDisabled} onClick={() => void onRestore(page)}>
                 Restore

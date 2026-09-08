@@ -102,6 +102,27 @@ test("bootstraps or signs in and passes critical accessibility checks", async ({
   expect(critical).toEqual([]);
 });
 
+test("creates and edits a realtime diagram", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("button", { name: "+ Diagram", exact: true }).click();
+  const title = `Architecture ${Date.now()}`;
+  const titleInput = page.getByLabel("Page title");
+  await expect(titleInput).toHaveValue("Untitled");
+  await titleInput.fill(title);
+  await titleInput.press("Enter");
+
+  const stencils = page.getByRole("navigation", { name: "Diagram stencils" });
+  await expect(stencils).toBeVisible();
+  const process = stencils.getByRole("button", { name: /Process/ });
+  await expect(process).toBeEnabled();
+  await process.click();
+
+  const nodeLabel = page.locator(".diagram-node").getByLabel("Node label");
+  await expect(nodeLabel).toHaveValue("Process");
+  await nodeLabel.fill("API gateway");
+  await expect(nodeLabel).toHaveValue("API gateway");
+});
+
 test("opens the Activities tray with keyboard-safe focus and an accessible recent state", async ({ page }) => {
   await signIn(page);
   const trigger = page.getByRole("button", { name: "Activities" });

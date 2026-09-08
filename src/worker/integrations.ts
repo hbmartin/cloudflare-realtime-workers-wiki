@@ -45,7 +45,7 @@ export type IntegrationPage = {
   workspace_id: string;
   space_id: string;
   parent_id: string | null;
-  kind: "document" | "table";
+  kind: "document" | "table" | "diagram";
   position: string;
   title: string;
   icon: string | null;

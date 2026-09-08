@@ -15,13 +15,21 @@ import * as Y from "yjs";
 import { joinBytes } from "../shared/bytes";
 import { LOG_IDENTIFIER_LIMIT, LOG_TEXT_LIMIT } from "../shared/error-log";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
+import { diagramNodeMap, diagramRoots } from "../shared/diagram";
 import {
   PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
   PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
   PAGE_MOVE_RECEIPT_VERSION,
 } from "../shared/page-move";
 import { TABLE_BULK_MAX_ROWS } from "../shared/table-limits";
-import type { Page, TableData, TableLeaseResponse, TableLeaseTiming, WorkspaceEvent } from "../shared/types";
+import type {
+  DiagramContentEnvelope,
+  Page,
+  TableData,
+  TableLeaseResponse,
+  TableLeaseTiming,
+  WorkspaceEvent,
+} from "../shared/types";
 import { processDueUploadReaps } from "./attachments";
 import { processDeletionJob } from "./cleanup";
 import type { Env } from "./env";
@@ -85,7 +93,11 @@ async function bootstrap(): Promise<InstalledWorkspace> {
   };
 }
 
-async function createPage(cookie: string, kind: "document" | "table" = "document", parentId: string | null = null) {
+async function createPage(
+  cookie: string,
+  kind: "document" | "table" | "diagram" = "document",
+  parentId: string | null = null,
+) {
   const response = await SELF.fetch(
     authenticatedRequest(cookie, "/api/pages", {
       method: "POST",
@@ -5617,6 +5629,69 @@ describe("Worker integration", () => {
       content_hash: await sha256Hex(canonicalJson(envelope)),
     });
     expect(await env.BUCKET.get(projection!.r2_key)).toBeTruthy();
+  });
+
+  it("compacts a diagram into searchable JSON and a generated SVG thumbnail", async () => {
+    const installed = await bootstrap();
+    const diagramPage = await createPage(installed.cookie, "diagram");
+    const stub = env.DOCUMENT.getByName(`${diagramPage.id}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const diagram = instance as unknown as TestDocument;
+      const roots = diagramRoots(diagram.document);
+      roots.nodes.set(
+        "service-node",
+        diagramNodeMap({
+          id: "service-node",
+          type: "service",
+          x: 40,
+          y: 60,
+          width: 160,
+          height: 80,
+          zIndex: 1,
+          parentId: null,
+          label: "Edge gateway",
+          notes: "Routes production traffic",
+          color: "blue",
+          assetId: null,
+          references: [{ id: installed.pageId, label: "Welcome" }],
+          mentions: [{ id: installed.userId, label: "Owner" }],
+        }),
+      );
+      await diagram.onSave();
+    });
+
+    const content = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${diagramPage.id}/content`));
+    expect(content.status).toBe(200);
+    const envelope = await content.json<DiagramContentEnvelope>();
+    expect(envelope.nodes[0]).toMatchObject({ id: "service-node", label: "Edge gateway" });
+
+    const projection = await env.DB.prepare(
+      `SELECT r2_key, thumbnail_r2_key, content_hash, thumbnail_hash
+         FROM diagram_projections WHERE page_id = ?`,
+    )
+      .bind(diagramPage.id)
+      .first<{
+        r2_key: string;
+        thumbnail_r2_key: string;
+        content_hash: string;
+        thumbnail_hash: string;
+      }>();
+    expect(projection).toMatchObject({ content_hash: await sha256Hex(canonicalJson(envelope)) });
+    expect(await env.BUCKET.get(projection!.r2_key)).toBeTruthy();
+    expect(await env.BUCKET.get(projection!.thumbnail_r2_key)).toBeTruthy();
+
+    const thumbnail = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${diagramPage.id}/diagram-thumbnail.svg`),
+    );
+    expect(thumbnail.status).toBe(200);
+    expect(thumbnail.headers.get("etag")).toBe(`"${projection!.thumbnail_hash}"`);
+    expect(await thumbnail.text()).toContain("Edge gateway");
+
+    const indexed = await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`)
+      .bind(diagramPage.id)
+      .first<{ plain_text: string }>();
+    expect(indexed?.plain_text).toContain("Routes production traffic");
   });
 
   it("rejects a batch that is empty, oversized, or names a missing parent", async () => {

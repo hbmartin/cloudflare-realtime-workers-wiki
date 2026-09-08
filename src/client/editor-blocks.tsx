@@ -2,7 +2,8 @@ import { renderToString } from "katex";
 import { createReactBlockSpec, createReactInlineContentSpec } from "@blocknote/react";
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from "react";
 import { notionBlockRegistry } from "../shared/notion-blocks";
-import { api, json } from "./api";
+import { api, apiErrorMessage, json } from "./api";
+import type { Page, SearchTitleSuggestion } from "../shared/types";
 import "katex/dist/katex.min.css";
 
 const CALLOUT_TONES = ["info", "success", "warning", "danger"] as const;
@@ -532,6 +533,150 @@ const linkToPage = createReactBlockSpec(
   },
 )();
 
+function LinkedDiagramView({
+  pageId,
+  title,
+  editable,
+  update,
+}: {
+  pageId: string;
+  title: string;
+  editable: boolean;
+  update?: (page: Pick<Page, "id" | "title">) => void;
+}) {
+  const [choosing, setChoosing] = useState(!pageId);
+  const [query, setQuery] = useState("");
+  const [suggestions, setSuggestions] = useState<SearchTitleSuggestion[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!choosing || !query.trim()) {
+      return undefined;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void api<{ suggestions: SearchTitleSuggestion[] }>(
+        `/api/search/titles?q=${encodeURIComponent(query.trim())}&kind=diagram&limit=8`,
+        { signal: controller.signal },
+      )
+        .then((result) => setSuggestions(result.suggestions))
+        .catch(() => {
+          if (!controller.signal.aborted) setSuggestions([]);
+        });
+    }, 150);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [choosing, query]);
+  const visibleSuggestions = choosing && query.trim() ? suggestions : [];
+
+  async function createDiagram() {
+    if (!update || busy) return;
+    setBusy(true);
+    try {
+      const result = await api<{ page: Page }>("/api/pages", {
+        method: "POST",
+        body: json({
+          kind: "diagram",
+          parentId: currentPageId() || null,
+          title: query.trim() || "Untitled diagram",
+        }),
+      });
+      update(result.page);
+      setChoosing(false);
+      setError("");
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "The linked whiteboard could not be created."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!pageId || choosing) {
+    return (
+      <div className="editor-linked-diagram-picker" contentEditable={false}>
+        <strong>Link a whiteboard</strong>
+        <input
+          aria-label="Find a diagram"
+          placeholder="Search diagrams or name a new one"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+        />
+        <div className="editor-linked-diagram-options">
+          {visibleSuggestions.map((suggestion) => (
+            <button
+              type="button"
+              key={suggestion.page.id}
+              onClick={() => {
+                update?.(suggestion.page);
+                setChoosing(false);
+              }}
+            >
+              ◇ {suggestion.page.title}
+              <small>{suggestion.space.name}</small>
+            </button>
+          ))}
+          {editable && (
+            <button type="button" disabled={busy} onClick={() => void createDiagram()}>
+              ＋ Create {query.trim() ? `“${query.trim()}”` : "child diagram"}
+            </button>
+          )}
+          {pageId && (
+            <button type="button" onClick={() => setChoosing(false)}>
+              Cancel
+            </button>
+          )}
+        </div>
+        {error ? <span className="form-error">{error}</span> : null}
+      </div>
+    );
+  }
+
+  return (
+    <figure className="editor-linked-diagram" contentEditable={false}>
+      <a href={`/?page=${encodeURIComponent(pageId)}`}>
+        <img src={`/api/pages/${encodeURIComponent(pageId)}/diagram-thumbnail.svg`} alt="" loading="lazy" />
+        <figcaption>
+          <span aria-hidden="true">◇</span> {title || "Linked whiteboard"}
+        </figcaption>
+      </a>
+      {editable && update && (
+        <button type="button" onClick={() => setChoosing(true)}>
+          Change
+        </button>
+      )}
+    </figure>
+  );
+}
+
+const linkedDiagram = createReactBlockSpec(
+  {
+    type: "linkedDiagram",
+    propSchema: { pageId: { default: "" }, title: { default: "Linked whiteboard" } },
+    content: "none",
+  },
+  {
+    render: ({ block, editor }) => (
+      <LinkedDiagramView
+        pageId={block.props.pageId}
+        title={block.props.title}
+        editable={editor.isEditable}
+        update={(page) => editor.updateBlock(block, { props: { pageId: page.id, title: page.title } })}
+      />
+    ),
+    toExternalHTML: ({ block }) => (
+      <figure data-linked-diagram-id={block.props.pageId}>
+        <a href={`/?page=${encodeURIComponent(block.props.pageId)}`}>
+          <img src={`/api/pages/${encodeURIComponent(block.props.pageId)}/diagram-thumbnail.svg`} alt="" />
+          <figcaption>{block.props.title}</figcaption>
+        </a>
+      </figure>
+    ),
+  },
+)();
+
 const pdf = createReactBlockSpec(
   { type: "pdf", propSchema: { url: { default: "" }, caption: { default: "PDF" } }, content: "none" },
   {
@@ -570,6 +715,7 @@ export const coreBlockSpecs = {
   syncedBlockReference,
   breadcrumb,
   linkToPage,
+  linkedDiagram,
   pdf,
 };
 
@@ -604,6 +750,7 @@ export const editorBlockFactories = [
   },
   { type: "breadcrumb", label: "Breadcrumb", description: "Current page ancestry", icon: "›" },
   { type: "linkToPage", label: "Link to page", description: "Linked page card", icon: "□" },
+  { type: "linkedDiagram", label: "Linked whiteboard", description: "Live diagram with a thumbnail", icon: "◇" },
   { type: "pdf", label: "PDF", description: "PDF preview and download", icon: "▤" },
 ] as const satisfies ReadonlyArray<{
   type: keyof typeof notionBlockRegistry;

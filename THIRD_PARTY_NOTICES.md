@@ -20,6 +20,13 @@ Used as dependencies under the MIT license.
 
 Copyright Yjs contributors. Source: <https://github.com/yjs/yjs>
 
+## React Flow
+
+The `@xyflow/react` package is used as a dependency under the MIT license. No
+React Flow Pro examples or packages are included.
+
+Copyright webkid GmbH and React Flow contributors. Source: <https://github.com/xyflow/xyflow>
+
 ## Docmost
 
 The pure page-tree model and fractional page ordering were adapted from Docmost’s AGPL-3.0 implementation and tests. This repository is also AGPL-3.0.

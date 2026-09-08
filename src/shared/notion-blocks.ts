@@ -42,6 +42,7 @@ export const notionBlockRegistry = {
   syncedBlockReference: { notionType: "synced_block", richText: false, writable: true },
   breadcrumb: { notionType: "breadcrumb", richText: false, writable: true },
   linkToPage: { notionType: "link_to_page", richText: false, writable: true },
+  linkedDiagram: { notionType: "link_to_page", richText: false, writable: true },
   bookmark: { notionType: "bookmark", richText: false, writable: true },
   embed: { notionType: "embed", richText: false, writable: true },
   image: { notionType: "image", richText: false, writable: true },
@@ -350,6 +351,8 @@ export function notionPayloadForBlock(block: NotionBlock): { type: string; paylo
     };
   if (type === "breadcrumb") return { type: "breadcrumb", payload: {} };
   if (type === "linkToPage")
+    return { type: "link_to_page", payload: { type: "page_id", page_id: string(properties.pageId) } };
+  if (type === "linkedDiagram")
     return { type: "link_to_page", payload: { type: "page_id", page_id: string(properties.pageId) } };
   if (type === "bookmark") return { type: "bookmark", payload: { url: string(properties.url), caption: [] } };
   if (type === "embed") return { type: "embed", payload: { url: string(properties.url) } };

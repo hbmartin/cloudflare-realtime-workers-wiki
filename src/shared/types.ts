@@ -86,6 +86,67 @@ export type DocumentContentEnvelope = {
   document: ProseMirrorJson;
 };
 
+export const DIAGRAM_NODE_TYPES = [
+  "process",
+  "service",
+  "decision",
+  "database",
+  "queue",
+  "document",
+  "cloud",
+  "actor",
+  "device",
+  "text",
+  "frame",
+  "image",
+] as const;
+
+export type DiagramNodeType = (typeof DIAGRAM_NODE_TYPES)[number];
+export type DiagramEdgePath = "straight" | "step" | "smoothstep";
+export type DiagramColor = "slate" | "blue" | "green" | "amber" | "red" | "purple";
+
+export type DiagramEntityLink = { id: string; label: string };
+
+export type DiagramNode = {
+  id: string;
+  type: DiagramNodeType;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  zIndex: number;
+  parentId: string | null;
+  label: string;
+  notes: string;
+  color: DiagramColor;
+  assetId: string | null;
+  references: DiagramEntityLink[];
+  mentions: DiagramEntityLink[];
+};
+
+export type DiagramEdge = {
+  id: string;
+  source: string;
+  target: string;
+  sourceHandle: "top" | "right" | "bottom" | "left";
+  targetHandle: "top" | "right" | "bottom" | "left";
+  path: DiagramEdgePath;
+  label: string;
+  color: DiagramColor;
+  arrow: boolean;
+};
+
+export type DiagramContentEnvelope = {
+  schemaVersion: 1;
+  pageId: string;
+  contentEpoch: number;
+  sequence: number;
+  nodes: DiagramNode[];
+  edges: DiagramEdge[];
+};
+
+export type CommentAnchor = { kind: "diagram"; target: "node" | "edge"; targetId: string };
+
 export type CommentBody = ProseMirrorJson | ProseMirrorJson[];
 
 export type Comment = {
@@ -110,6 +171,7 @@ export type CommentThread = {
   resolvedAt: number | null;
   resolvedBy: string | null;
   anchored: boolean;
+  anchor: CommentAnchor | null;
   canResolve: boolean;
   comments: Comment[];
   createdAt: number;
@@ -189,7 +251,7 @@ export type ImportPreview = {
   warnings: string[];
 };
 
-export type ExportFormat = "markdown" | "html" | "pdf";
+export type ExportFormat = "markdown" | "html" | "pdf" | "json" | "svg" | "png";
 
 export type SearchArchiveState = "active" | "archived" | "all";
 export type SearchSnippetSource = "title" | "tag" | "body" | "comment" | "attachment";

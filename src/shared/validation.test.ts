@@ -15,6 +15,7 @@ describe("request validation", () => {
   it("accepts only defined roles and column kinds", () => {
     expect(role("owner")).toBe("owner");
     expect(pageKind("document")).toBe("document");
+    expect(pageKind("diagram")).toBe("diagram");
     expect(columnType("select")).toBe("select");
     expect(() => role("admin")).toThrow(ValidationError);
     expect(() => pageKind("canvas")).toThrow(ValidationError);

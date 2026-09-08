@@ -1,4 +1,5 @@
-import type { Comment, CommentBody, CommentThread, Role } from "../shared/types";
+import type { Comment, CommentAnchor, CommentBody, CommentThread, Role } from "../shared/types";
+import { ID_PATTERN } from "../shared/validation";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { notificationFanoutStatements } from "./notifications";
@@ -152,6 +153,21 @@ function parseBody(value: string): CommentBody | null {
   }
 }
 
+function parseDiagramAnchor(value: string | null): CommentAnchor | null {
+  if (!value) return null;
+  try {
+    const anchor = JSON.parse(value) as Partial<CommentAnchor>;
+    return anchor.kind === "diagram" &&
+      (anchor.target === "node" || anchor.target === "edge") &&
+      typeof anchor.targetId === "string" &&
+      ID_PATTERN.test(anchor.targetId)
+      ? { kind: "diagram", target: anchor.target, targetId: anchor.targetId }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function commentJson(row: CommentRow): Comment {
   return {
     id: row.id,
@@ -201,6 +217,7 @@ function threadJson(row: ThreadRow, comments: Comment[], member: MemberContext, 
     resolvedAt: row.resolved_at,
     resolvedBy: row.resolved_by,
     anchored: Boolean(row.anchor_json),
+    anchor: parseDiagramAnchor(row.anchor_json),
     canResolve: canResolve(member, page, row),
     comments,
     createdAt: row.created_at,
@@ -254,7 +271,13 @@ async function threadParticipantIds(env: Env, threadId: string) {
   return rows.results.map((row) => row.user_id);
 }
 
-export async function createCommentThread(env: Env, member: MemberContext, page: CommentPage, bodyValue: unknown) {
+export async function createCommentThread(
+  env: Env,
+  member: MemberContext,
+  page: CommentPage,
+  bodyValue: unknown,
+  anchor: CommentAnchor | null = null,
+) {
   const body = validatedCommentBody(bodyValue);
   const threadId = crypto.randomUUID();
   const commentId = crypto.randomUUID();
@@ -263,9 +286,18 @@ export async function createCommentThread(env: Env, member: MemberContext, page:
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO comment_threads
-        (id, workspace_id, space_id, page_id, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(threadId, page.workspace_id, page.space_id, page.id, member.user.id, timestamp, timestamp),
+        (id, workspace_id, space_id, page_id, created_by, anchor_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      threadId,
+      page.workspace_id,
+      page.space_id,
+      page.id,
+      member.user.id,
+      anchor ? JSON.stringify(anchor) : null,
+      timestamp,
+      timestamp,
+    ),
     env.DB.prepare(
       `INSERT INTO comments
         (id, thread_id, parent_id, user_id, body_json, plain_text, created_at, updated_at)

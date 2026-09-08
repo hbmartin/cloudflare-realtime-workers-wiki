@@ -22,6 +22,7 @@ function thread(overrides: Partial<CommentThread> = {}): CommentThread {
     resolvedAt: null,
     resolvedBy: null,
     anchored: false,
+    anchor: null,
     canResolve: true,
     comments: [
       {

@@ -91,11 +91,14 @@ export async function createShare(
   options: Partial<{ includeSubpages: boolean; allowIndexing: boolean; showToc: boolean; showLastUpdated: boolean }>,
 ) {
   const page = await env.DB.prepare(
-    `SELECT id FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL AND import_job_id IS NULL`,
+    `SELECT id, kind FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL AND import_job_id IS NULL`,
   )
     .bind(pageId, member.workspace.id)
-    .first();
+    .first<{ id: string; kind: PageKind }>();
   if (!page) throw new HttpError(404, "page_not_found", "Page not found.");
+  if (page.kind === "diagram") {
+    throw new HttpError(422, "share_unavailable", "Public diagram shares are not available yet.");
+  }
   const existing = await activeShareForPage(env, member, pageId);
   if (existing) return shareJson(existing, origin);
   const timestamp = Date.now();
@@ -375,6 +378,7 @@ async function publicTableHtml(env: Env, pageId: string) {
 }
 
 export async function renderPublicShare(env: Env, share: SharedPageRow, key: string, origin: string) {
+  if (share.page_kind === "diagram") return null;
   const [tree, trail] = await Promise.all([sharedTree(env, share), breadcrumbs(env, share)]);
   let content: string;
   let toc = "";

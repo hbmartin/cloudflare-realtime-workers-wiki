@@ -99,6 +99,35 @@ afterEach(async () => {
 });
 
 describe("server-authoritative comments", () => {
+  it("stores diagram node and edge anchors without mutating the Yjs document", async () => {
+    const installed = await bootstrap();
+    const created = await SELF.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "diagram", title: "Architecture" }),
+      }),
+    );
+    expect(created.status).toBe(201);
+    const page = (await created.json<{ page: Page }>()).page;
+    const targetId = crypto.randomUUID();
+    const response = await SELF.fetch(
+      request(installed.cookie, `/api/pages/${page.id}/comments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          initialComment: { body: commentBody("Check this service") },
+          anchor: { kind: "diagram", target: "node", targetId },
+        }),
+      }),
+    );
+    expect(response.status).toBe(201);
+    expect((await response.json<{ thread: CommentThread }>()).thread).toMatchObject({
+      anchored: true,
+      anchor: { kind: "diagram", target: "node", targetId },
+    });
+  });
+
   it("lets readers comment while enforcing author and resolve permissions", async () => {
     const installed = await bootstrap();
     const viewer = await invite(installed.cookie, "viewer");

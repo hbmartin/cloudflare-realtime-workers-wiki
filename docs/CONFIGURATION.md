@@ -90,6 +90,10 @@ See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md#preview-urls-do-not-exist-f
 | ----------------------------------------------- | ------------------------------------------------ |
 | `documents/{pageId}/epochs/{epoch}/current.bin` | Current Yjs snapshot for an epoch                |
 | `documents/{pageId}/versions/{versionId}.bin`   | Immutable version snapshots                      |
+| `diagrams/{pageId}/epochs/{epoch}/current.bin`  | Current diagram Yjs snapshot for an epoch        |
+| `diagrams/{pageId}/epochs/{epoch}/projections/` | Structured diagram JSON projections              |
+| `diagrams/{pageId}/epochs/{epoch}/thumbnails/`  | Generated private SVG thumbnails                 |
+| `diagrams/{pageId}/versions/{versionId}.bin`    | Immutable diagram version snapshots              |
 | `assets/{workspaceId}/{uuid}`                   | Attachment bodies, server-generated private keys |
 
 ## Tunable constants
