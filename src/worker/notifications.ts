@@ -540,7 +540,8 @@ async function finishClaimedDeliveries(
 ) {
   if (!outboxIds.length) return [] as string[];
   const timestamp = Date.now();
-  const ids = JSON.stringify(uniqueIds([...outboxIds]));
+  const uniqueOutboxIds = uniqueIds([...outboxIds]);
+  const ids = JSON.stringify(uniqueOutboxIds);
   const finish = env.DB.prepare(
     `UPDATE deliveries SET status = ?, last_error = ?, delivered_at = ?, updated_at = ?
       WHERE outbox_id IN (SELECT value FROM json_each(?)) AND channel = ?
@@ -551,17 +552,20 @@ async function finishClaimedDeliveries(
     const finished = await finish.all<{ outbox_id: string }>();
     return finished.results.map((row) => row.outbox_id);
   }
+  const notificationIds = JSON.stringify(
+    uniqueOutboxIds.filter((id) => id.startsWith("outbox:")).map((id) => id.slice("outbox:".length)),
+  );
   const [finished] = await env.DB.batch<{ outbox_id: string }>([
     finish,
     env.DB.prepare(
       `UPDATE notifications SET ${notificationTimestampColumn} = COALESCE(${notificationTimestampColumn}, ?)
-        WHERE ('outbox:' || id) IN (SELECT value FROM json_each(?))
+        WHERE id IN (SELECT value FROM json_each(?))
           AND EXISTS (
             SELECT 1 FROM deliveries delivery
-             WHERE delivery.outbox_id = 'outbox:' || notifications.id
-               AND delivery.channel = ? AND delivery.status = 'sent' AND delivery.claim_token = ?
+             WHERE delivery.idempotency_key = 'outbox:' || notifications.id || ':' || ?
+               AND delivery.status = 'sent' AND delivery.claim_token = ?
           )`,
-    ).bind(timestamp, ids, channel, token),
+    ).bind(timestamp, notificationIds, channel, token),
   ]);
   return (finished?.results ?? []).map((row) => row.outbox_id);
 }
@@ -690,19 +694,24 @@ export async function deliverNotification(env: Env, notificationId: string, outb
 
 // A worst-case Slack candidate uses eleven D1 statements: ids, access,
 // suppression, three claim statements, installation lookup, token-refresh CAS
-// and reread, finalization, and the notification timestamp. Reserve five more
-// per channel for timezone/cursor paging and cap both channels together at 240,
-// leaving most of the paid invocation budget to the other cron tasks running
-// beside this one. The persisted cursor carries the remainder to later ticks.
+// and reread, finalization, and the notification timestamp. Each timezone uses
+// up to four more for its cursor lookup, two candidate pages, and cursor update.
+// Split the budget evenly between channels so one cannot starve the other and
+// leave most of the paid invocation budget to the other cron tasks.
 const DIGEST_STATEMENT_BUDGET = 240;
 const DIGEST_CHANNEL_COUNT = 2;
-const DIGEST_CHANNEL_OVERHEAD = 5;
 const DIGEST_STATEMENTS_PER_CANDIDATE = 11;
-const DIGEST_CANDIDATE_MAX = Math.floor(
-  (DIGEST_STATEMENT_BUDGET - DIGEST_CHANNEL_COUNT * DIGEST_CHANNEL_OVERHEAD) /
-    (DIGEST_CHANNEL_COUNT * DIGEST_STATEMENTS_PER_CANDIDATE),
+const DIGEST_STATEMENTS_PER_WINDOW = 4;
+const DIGEST_DISCOVERY_STATEMENTS = 1;
+const DIGEST_CHANNEL_STATEMENT_BUDGET = Math.floor(DIGEST_STATEMENT_BUDGET / DIGEST_CHANNEL_COUNT);
+const DIGEST_CANDIDATE_PAGE = Math.floor(
+  (DIGEST_CHANNEL_STATEMENT_BUDGET - DIGEST_DISCOVERY_STATEMENTS - DIGEST_STATEMENTS_PER_WINDOW) /
+    DIGEST_STATEMENTS_PER_CANDIDATE,
 );
-const DIGEST_CANDIDATE_PAGE = DIGEST_CANDIDATE_MAX;
+const DIGEST_WINDOW_MAX = Math.floor(
+  (DIGEST_CHANNEL_STATEMENT_BUDGET - DIGEST_DISCOVERY_STATEMENTS - DIGEST_STATEMENTS_PER_CANDIDATE) /
+    DIGEST_STATEMENTS_PER_WINDOW,
+);
 
 // Timezone is part of the key: preferences are per event type, so one user can hold
 // two timezones and appear as two groups that a coarser cursor would skip past.
@@ -736,7 +745,7 @@ function digestModeSql(channel: DigestChannel) {
     : `COALESCE(preference.slack, 'off') = 'digest'`;
 }
 
-async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: number) {
+async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: number, limit: number) {
   const deliveredColumn = channel === "email" ? "emailed_at" : "slack_at";
   const rows = await env.DB.prepare(
     `SELECT COALESCE(preference.timezone, 'UTC') timezone,
@@ -754,7 +763,8 @@ async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: n
     .all<{ timezone: string; cursor_updated_at: number }>();
   return rows.results
     .map((row) => digestWindow(row.timezone, timestamp))
-    .filter((window): window is { timezone: string; cutoff: number } => Boolean(window));
+    .filter((window): window is { timezone: string; cutoff: number } => Boolean(window))
+    .slice(0, limit);
 }
 
 function digestCursor(row: { user_id: string; workspace_id: string; timezone: string }): DigestCursor {
@@ -778,7 +788,7 @@ async function digestCandidates<T extends { user_id: string; workspace_id: strin
     .bind(channel, timezone)
     .first<{ user_id: string; workspace_id: string; timezone: string }>();
   let cursor = stored ? digestCursor(stored) : { userId: "", workspaceId: "", timezone };
-  let wrapped = !stored;
+  let wrapped = !stored || (!stored.user_id && !stored.workspace_id);
   const candidates: T[] = [];
   const seen = new Set<string>();
   while (candidates.length < limit) {
@@ -800,37 +810,39 @@ async function digestCandidates<T extends { user_id: string; workspace_id: strin
       if (candidates.length >= limit) break;
     }
     if (candidates.length >= limit) break;
+    if (wrapped) break;
     if (page.results.length < pageSize) {
-      if (wrapped) break;
       cursor = { userId: "", workspaceId: "", timezone };
       wrapped = true;
     }
   }
-  if (candidates.length) {
-    const last = digestCursor(candidates.at(-1)!);
-    await env.DB.prepare(
-      `INSERT INTO digest_delivery_cursors (channel, user_id, workspace_id, timezone, updated_at)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(channel, timezone) DO UPDATE SET user_id = excluded.user_id,
-         workspace_id = excluded.workspace_id, updated_at = excluded.updated_at`,
-    )
-      .bind(channel, last.userId, last.workspaceId, last.timezone, Date.now())
-      .run();
-  } else {
-    await env.DB.prepare(`DELETE FROM digest_delivery_cursors WHERE channel = ? AND timezone = ?`)
-      .bind(channel, timezone)
-      .run();
-  }
+  // Keep even an empty scan in the ordering so untouched timezones get a turn
+  // on later ticks instead of sorting behind the same updated_at = 0 window.
+  const next = candidates.length
+    ? digestCursor(candidates.at(-1)!)
+    : stored
+      ? digestCursor(stored)
+      : { userId: "", workspaceId: "", timezone };
+  await env.DB.prepare(
+    `INSERT INTO digest_delivery_cursors (channel, user_id, workspace_id, timezone, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(channel, timezone) DO UPDATE SET user_id = excluded.user_id,
+       workspace_id = excluded.workspace_id,
+       updated_at = MAX(digest_delivery_cursors.updated_at + 1, excluded.updated_at)`,
+  )
+    .bind(channel, next.userId, next.workspaceId, next.timezone, Date.now())
+    .run();
   return candidates;
 }
 
 async function sendDueEmailDigests(env: Env, timestamp: number) {
   if (!env.SEND_EMAIL || !env.EMAIL_FROM) return;
-  const dueTimezones = await dueDigestTimezones(env, "email", timestamp);
+  const dueTimezones = await dueDigestTimezones(env, "email", timestamp, DIGEST_WINDOW_MAX);
   if (!dueTimezones.length) return;
-  let remaining = DIGEST_CANDIDATE_MAX;
+  let remainingStatements = DIGEST_CHANNEL_STATEMENT_BUDGET - DIGEST_DISCOVERY_STATEMENTS;
   for (const window of dueTimezones) {
-    if (!remaining) break;
+    if (remainingStatements < DIGEST_STATEMENTS_PER_WINDOW + DIGEST_STATEMENTS_PER_CANDIDATE) break;
+    remainingStatements -= DIGEST_STATEMENTS_PER_WINDOW;
     const readCandidates = (cursor: DigestCursor, pageSize: number) =>
       env.DB.prepare(
         `SELECT n.user_id, n.workspace_id, recipient.name, recipient.email,
@@ -848,8 +860,12 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
       )
         .bind(window.timezone, window.cutoff, cursor.userId, cursor.userId, cursor.workspaceId, pageSize)
         .all<{ user_id: string; workspace_id: string; name: string; email: string; timezone: string }>();
-    const candidates = await digestCandidates(env, "email", window.timezone, remaining, readCandidates);
-    remaining -= candidates.length;
+    const candidateLimit = Math.min(
+      DIGEST_CANDIDATE_PAGE,
+      Math.floor(remainingStatements / DIGEST_STATEMENTS_PER_CANDIDATE),
+    );
+    const candidates = await digestCandidates(env, "email", window.timezone, candidateLimit, readCandidates);
+    remainingStatements -= candidates.length * DIGEST_STATEMENTS_PER_CANDIDATE;
     for (const candidate of candidates) {
       const ids = await env.DB.prepare(
         `SELECT n.id FROM notifications n
@@ -908,12 +924,13 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
 }
 
 async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
-  const dueTimezones = await dueDigestTimezones(env, "slack", timestamp);
+  const dueTimezones = await dueDigestTimezones(env, "slack", timestamp, DIGEST_WINDOW_MAX);
   if (!dueTimezones.length) return;
-  let remaining = DIGEST_CANDIDATE_MAX;
+  let remainingStatements = DIGEST_CHANNEL_STATEMENT_BUDGET - DIGEST_DISCOVERY_STATEMENTS;
   const rateLimitedWorkspaces = new Set<string>();
   for (const window of dueTimezones) {
-    if (!remaining) break;
+    if (remainingStatements < DIGEST_STATEMENTS_PER_WINDOW + DIGEST_STATEMENTS_PER_CANDIDATE) break;
+    remainingStatements -= DIGEST_STATEMENTS_PER_WINDOW;
     const readCandidates = (cursor: DigestCursor, pageSize: number) =>
       env.DB.prepare(
         `SELECT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone
@@ -933,8 +950,12 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
       )
         .bind(window.timezone, window.cutoff, cursor.userId, cursor.userId, cursor.workspaceId, pageSize)
         .all<{ user_id: string; workspace_id: string; timezone: string }>();
-    const candidates = await digestCandidates(env, "slack", window.timezone, remaining, readCandidates);
-    remaining -= candidates.length;
+    const candidateLimit = Math.min(
+      DIGEST_CANDIDATE_PAGE,
+      Math.floor(remainingStatements / DIGEST_STATEMENTS_PER_CANDIDATE),
+    );
+    const candidates = await digestCandidates(env, "slack", window.timezone, candidateLimit, readCandidates);
+    remainingStatements -= candidates.length * DIGEST_STATEMENTS_PER_CANDIDATE;
     for (const candidate of candidates) {
       if (rateLimitedWorkspaces.has(candidate.workspace_id)) continue;
       const ids = await env.DB.prepare(

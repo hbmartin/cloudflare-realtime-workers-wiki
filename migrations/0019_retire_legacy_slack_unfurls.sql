@@ -5,7 +5,7 @@ ALTER TABLE slack_unfurls ADD COLUMN retired_at INTEGER;
 ALTER TABLE slack_unfurls ADD COLUMN retirement_reason TEXT;
 
 UPDATE slack_unfurls
-   SET retired_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
+   SET retired_at = unixepoch('subsec') * 1000,
        retirement_reason = 'legacy_missing_message_ts'
  WHERE delivered_at IS NULL AND message_ts IS NULL;
 

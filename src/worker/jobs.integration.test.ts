@@ -342,29 +342,94 @@ describe("job execution", () => {
     expect(await claimJobWorkflowRun(env, { ...event, instanceId: "stale-workflow" }, 2)).toBeNull();
   });
 
-  it("finishes cancellation cleanup when its workflow instance has expired", async () => {
+  it("does not reclaim a running workflow attempt that is parked for cleanup", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
     const timestamp = Date.now();
     await env.DB.prepare(
       `INSERT INTO jobs
-        (id, workspace_id, type, status, requested_by, workflow_instance_id, cleanup_target,
-         progress_label, created_at, updated_at)
-       VALUES (?, ?, 'import', 'canceling', ?, 'expired-workflow', 'canceled', 'Canceling', ?, ?)`,
+        (id, workspace_id, type, status, requested_by, workflow_instance_id, attempt,
+         cleanup_target, progress_label, created_at, updated_at)
+       VALUES (?, ?, 'import', 'running', ?, 'cleanup-workflow', 2,
+               'failed', 'Failure cleanup pending', ?, ?)`,
     )
       .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
       .run();
-    const get = vi.fn(async () => {
-      throw new Error("Workflow instance expired");
-    });
 
-    await finishPendingJobCleanup(bindingsWith({ NOTES_WORKFLOW: { get } }), { id: jobId, attempt: 1 });
-
-    expect(get).toHaveBeenCalledWith("expired-workflow");
     expect(
-      await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`).bind(jobId).first(),
-    ).toEqual({ status: "canceled", cleanup_target: null, progress_label: "Canceled" });
+      await claimJobWorkflowRun(env, { payload: { jobId, attempt: 2 }, instanceId: "cleanup-workflow" }, 2),
+    ).toBeNull();
   });
+
+  it.each(["code", "status"] as const)(
+    "finishes cancellation cleanup when its missing workflow exposes a %s 404",
+    async (field) => {
+      const installed = await bootstrap();
+      const jobId = crypto.randomUUID();
+      const timestamp = Date.now();
+      await env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, type, status, requested_by, workflow_instance_id, cleanup_target,
+           progress_label, created_at, updated_at)
+         VALUES (?, ?, 'import', 'canceling', ?, 'expired-workflow', 'canceled', 'Canceling', ?, ?)`,
+      )
+        .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+        .run();
+      const get = vi.fn(async () => {
+        throw Object.assign(new Error("Workflow instance expired"), { [field]: 404 });
+      });
+
+      await finishPendingJobCleanup(bindingsWith({ NOTES_WORKFLOW: { get } }), { id: jobId, attempt: 1 });
+
+      expect(get).toHaveBeenCalledWith("expired-workflow");
+      expect(
+        await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`)
+          .bind(jobId)
+          .first(),
+      ).toEqual({ status: "canceled", cleanup_target: null, progress_label: "Canceled" });
+    },
+  );
+
+  it.each(["get", "status", "terminate"] as const)(
+    "keeps cancellation cleanup pending when workflow %s fails without a structured 404",
+    async (operation) => {
+      const installed = await bootstrap();
+      const jobId = crypto.randomUUID();
+      const timestamp = Date.now();
+      await env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, type, status, requested_by, workflow_instance_id, cleanup_target,
+           progress_label, created_at, updated_at)
+         VALUES (?, ?, 'import', 'canceling', ?, 'active-workflow', 'canceled', 'Canceling', ?, ?)`,
+      )
+        .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+        .run();
+      const failure = new Error("Workflow control-plane endpoint not found");
+      const instance = {
+        async status() {
+          if (operation === "status") throw failure;
+          return { status: "running" };
+        },
+        async terminate() {
+          if (operation === "terminate") throw failure;
+        },
+      };
+      const get = vi.fn(async () => {
+        if (operation === "get") throw failure;
+        return instance;
+      });
+
+      await expect(
+        finishPendingJobCleanup(bindingsWith({ NOTES_WORKFLOW: { get } }), { id: jobId, attempt: 1 }),
+      ).rejects.toBe(failure);
+
+      expect(
+        await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`)
+          .bind(jobId)
+          .first(),
+      ).toEqual({ status: "canceling", cleanup_target: "canceled", progress_label: "Cleanup pending" });
+    },
+  );
 
   it("keeps failed export cleanup recoverable and labeled as a failure", async () => {
     const installed = await bootstrap();
@@ -390,7 +455,7 @@ describe("job execution", () => {
     ).rejects.toThrow("R2 unavailable");
     expect(
       await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`).bind(jobId).first(),
-    ).toEqual({ status: "running", cleanup_target: "failed", progress_label: "Failure cleanup pending" });
+    ).toEqual({ status: "canceling", cleanup_target: "failed", progress_label: "Failure cleanup pending" });
 
     await finishPendingJobCleanup(inlineBindings(), { id: jobId, attempt: 1 });
 
@@ -398,6 +463,39 @@ describe("job execution", () => {
     expect(
       await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`).bind(jobId).first(),
     ).toEqual({ status: "failed", cleanup_target: null, progress_label: "Failed" });
+  });
+
+  it("cleans document staging from every completed import attempt", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const oldKey = `jobs/${jobId}/attempts/1/documents/old.bin`;
+    const currentKey = `jobs/${jobId}/attempts/2/documents/current.bin`;
+    const futureKey = `jobs/${jobId}/attempts/3/documents/future.bin`;
+    const legacyKey = `jobs/${jobId}/documents/legacy.bin`;
+    await Promise.all(
+      [oldKey, currentKey, futureKey, legacyKey].map((key) => env.BUCKET.put(key, new Uint8Array([1]))),
+    );
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, attempt, cleanup_target,
+         progress_label, error_code, error_message, created_at, updated_at)
+       VALUES (?, ?, 'import', 'canceling', ?, 2, 'failed',
+               'Failure cleanup pending', 'job_failed', 'import failed', ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+      .run();
+
+    await finishPendingJobCleanup(inlineBindings(), { id: jobId, attempt: 2 });
+
+    expect(await env.BUCKET.get(oldKey)).toBeNull();
+    expect(await env.BUCKET.get(currentKey)).toBeNull();
+    expect(await env.BUCKET.get(legacyKey)).toBeNull();
+    expect(await env.BUCKET.get(futureKey)).toBeTruthy();
+    expect(await env.DB.prepare(`SELECT status, cleanup_target FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual({
+      status: "failed",
+      cleanup_target: null,
+    });
   });
 
   it("cleans staged template clone resources after cancellation", async () => {

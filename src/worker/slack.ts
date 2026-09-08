@@ -948,23 +948,18 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
   return { ok: true };
 }
 
-async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_message_ts", outboxId?: string) {
+async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_message_ts", outboxId: string) {
   const timestamp = Date.now();
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE slack_unfurls SET retired_at = ?, retirement_reason = ?
         WHERE id = ? AND delivered_at IS NULL AND retired_at IS NULL`,
     ).bind(timestamp, reason, unfurlId),
-    outboxId
-      ? env.DB.prepare(`UPDATE outbox SET last_error = ? WHERE id = ?`).bind(`slack_unfurl_${reason}`, outboxId)
-      : env.DB.prepare(
-          `UPDATE outbox SET last_error = ?
-            WHERE topic = 'slack_unfurl' AND json_extract(payload_json, '$.unfurlId') = ?`,
-        ).bind(`slack_unfurl_${reason}`, unfurlId),
+    env.DB.prepare(`UPDATE outbox SET last_error = ? WHERE id = ?`).bind(`slack_unfurl_${reason}`, outboxId),
   ]);
 }
 
-export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId?: string) {
+export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: string) {
   const row = await env.DB.prepare(
     `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.message_ts, unfurl.unfurls_json,
             installation.id, installation.workspace_id, installation.team_id, installation.team_name,

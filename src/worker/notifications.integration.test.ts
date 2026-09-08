@@ -480,6 +480,133 @@ describe("notification feed and subscriptions", () => {
     ).toEqual({ count: 1 });
   });
 
+  it("bounds empty digest windows and rotates them so a later due timezone is eventually delivered", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 18, 5);
+    const activeTimezone = "Europe/Zurich";
+    const localHour = (timezone: string) =>
+      Number(
+        new Intl.DateTimeFormat("en-US", { timeZone: timezone, hour: "2-digit", hourCycle: "h23" }).format(timestamp),
+      );
+    const emptyTimezones = Intl.supportedValuesOf("timeZone")
+      .filter((timezone) => timezone < activeTimezone && localHour(timezone) >= 9)
+      .slice(0, 81);
+    expect(emptyTimezones).toHaveLength(81);
+    const timezonesJson = JSON.stringify(emptyTimezones);
+    await env.DB.batch([
+      env.DB.prepare(
+        `WITH zones AS (SELECT key position, value timezone FROM json_each(?))
+         INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         SELECT printf('empty-digest-user-%03d', position), printf('Empty Digest %03d', position),
+                printf('empty-digest-%03d@example.test', position), 1, ?, ? FROM zones`,
+      ).bind(timezonesJson, timestamp, timestamp),
+      env.DB.prepare(
+        `WITH zones AS (SELECT key position FROM json_each(?))
+         INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         SELECT ?, printf('empty-digest-user-%03d', position), 'viewer', ? FROM zones`,
+      ).bind(timezonesJson, installed.workspaceId, timestamp),
+      env.DB.prepare(
+        `WITH zones AS (SELECT key position, value timezone FROM json_each(?))
+         INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
+         SELECT printf('empty-digest-user-%03d', position), 'mention', 1, 'digest', 'off', timezone FROM zones`,
+      ).bind(timezonesJson),
+      env.DB.prepare(
+        `WITH zones AS (SELECT key position FROM json_each(?))
+         INSERT INTO notifications
+           (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         SELECT printf('empty-digest-notification-%03d', position), ?,
+                printf('empty-digest-user-%03d', position), 'mention', ?, ?, ?, '{}',
+                printf('empty-digest-%03d', position), ? FROM zones`,
+      ).bind(
+        timezonesJson,
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp + 60_000,
+      ),
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         VALUES ('later-digest-user', 'Later Digest', 'later-digest@example.test', 1, ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES (?, 'later-digest-user', 'viewer', ?)`,
+      ).bind(installed.workspaceId, timestamp),
+      env.DB.prepare(
+        `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
+         VALUES ('later-digest-user', 'mention', 1, 'digest', 'off', ?)`,
+      ).bind(activeTimezone),
+      env.DB.prepare(
+        `INSERT INTO notifications
+          (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         VALUES ('later-digest-notification', ?, 'later-digest-user', 'mention', ?, ?, ?, '{}',
+                 'later-digest', ?)`,
+      ).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 12 * 60 * 60_000,
+      ),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         VALUES ('outbox:later-digest-notification', ?, 'notification',
+                 '{"notificationId":"later-digest-notification"}', ?, ?)`,
+      ).bind(installed.workspaceId, timestamp, timestamp),
+    ]);
+
+    let statementCount = 0;
+    const countedDatabase = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare") {
+          return (query: string) => {
+            statementCount += 1;
+            return target.prepare(query);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const send = vi.fn(async () => ({ messageId: "later-digest" }));
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "DB") return countedDatabase;
+        if (property === "SEND_EMAIL") return { send };
+        if (property === "EMAIL_FROM") return "notes@example.test";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const statementsPerTick: number[] = [];
+    const sendTick = async (tick: number) => {
+      statementCount = 0;
+      await sendDueNotificationDigests(bindings, timestamp + tick * 15 * 60_000);
+      statementsPerTick.push(statementCount);
+    };
+
+    await sendTick(0);
+    expect(send).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM digest_delivery_cursors WHERE channel = 'email'`).first(),
+    ).toEqual({ count: 27 });
+    await sendTick(1);
+    await sendTick(2);
+    expect(send).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) count, MIN(updated_at) > 0 timestamps_set
+           FROM digest_delivery_cursors WHERE channel = 'email'`,
+      ).first(),
+    ).toEqual({ count: 81, timestamps_set: 1 });
+
+    await sendTick(3);
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ to: "later-digest@example.test" }));
+    expect(statementsPerTick.every((count) => count <= 240)).toBe(true);
+  });
+
   it("defers only the rate-limited Slack installation and retries it on a later tick", async () => {
     const installed = await bootstrap();
     const timestamp = Date.UTC(2026, 8, 5, 9, 5);

@@ -153,11 +153,15 @@ describe("D1 migrations", () => {
     });
   });
 
-  it("explicitly retires legacy Slack unfurls that have no recoverable message timestamp", async () => {
+  it("repairs legacy Slack unfurl retirement timestamps through a forward migration", async () => {
     const retirement = env.TEST_MIGRATIONS!.find(
       (migration) => migration.name === "0019_retire_legacy_slack_unfurls.sql",
     );
+    const normalization = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0021_normalize_slack_unfurl_retirement.sql",
+    );
     expect(retirement).toBeTruthy();
+    expect(normalization).toBeTruthy();
     const retirementIndex = env.TEST_MIGRATIONS!.indexOf(retirement!);
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, retirementIndex));
     const timestamp = Date.now();
@@ -189,18 +193,32 @@ describe("D1 migrations", () => {
 
     expect(
       await env.DB.prepare(
-        `SELECT delivered_at, retired_at IS NOT NULL retired, typeof(retired_at) retired_at_type, retirement_reason
+        `SELECT delivered_at, retired_at IS NOT NULL retired, retirement_reason
            FROM slack_unfurls WHERE id = 'legacy-unfurl'`,
       ).first(),
     ).toEqual({
       delivered_at: null,
       retired: 1,
-      retired_at_type: "integer",
       retirement_reason: "legacy_missing_message_ts",
     });
     expect(await env.DB.prepare(`SELECT last_error FROM outbox WHERE id = 'outbox:legacy-unfurl'`).first()).toEqual({
       last_error: "legacy_unfurl_missing_message_ts",
     });
+    // Reproduce a database where the already-recorded migration left REAL storage.
+    await env.DB.prepare(`UPDATE slack_unfurls SET retired_at = retired_at + 0.5 WHERE id = 'legacy-unfurl'`).run();
+    expect(
+      await env.DB.prepare(
+        `SELECT typeof(retired_at) retired_at_type FROM slack_unfurls WHERE id = 'legacy-unfurl'`,
+      ).first(),
+    ).toEqual({ retired_at_type: "real" });
+
+    await applyD1Migrations(env.DB, [normalization!]);
+
+    expect(
+      await env.DB.prepare(
+        `SELECT typeof(retired_at) retired_at_type FROM slack_unfurls WHERE id = 'legacy-unfurl'`,
+      ).first(),
+    ).toEqual({ retired_at_type: "integer" });
   });
 
   it("applies review follow-ups through a new migration after the old history was recorded", async () => {

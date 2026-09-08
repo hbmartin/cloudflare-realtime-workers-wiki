@@ -397,7 +397,7 @@ describe("Slack security and integration", () => {
     expect(
       await env.DB.prepare(`SELECT topic FROM outbox WHERE id = 'outbox:slack-unfurl:Ev-private-unfurl'`).first(),
     ).toEqual({ topic: "slack_unfurl" });
-    await deliverSlackUnfurl(slackEnv(), "Ev-private-unfurl");
+    await deliverSlackUnfurl(slackEnv(), "Ev-private-unfurl", "outbox:slack-unfurl:Ev-private-unfurl");
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0]![0]).toBe("https://slack.com/api/chat.unfurl");
     // chat.unfurl only attaches previews when told which message they belong to.
@@ -419,7 +419,7 @@ describe("Slack security and integration", () => {
     expect(
       (await SELF.fetch(request(installed.cookie, `/api/slack/channels/${mappingId}`, { method: "DELETE" }))).status,
     ).toBe(200);
-    await deliverSlackUnfurl(slackEnv(), "Ev-revoked-unfurl");
+    await deliverSlackUnfurl(slackEnv(), "Ev-revoked-unfurl", "outbox:slack-unfurl:Ev-revoked-unfurl");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -441,7 +441,7 @@ describe("Slack security and integration", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    await deliverSlackUnfurl(slackEnv(), "missing-ts");
+    await deliverSlackUnfurl(slackEnv(), "missing-ts", "outbox:missing-ts");
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(
