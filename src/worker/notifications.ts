@@ -749,7 +749,8 @@ async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: n
   const deliveredColumn = channel === "email" ? "emailed_at" : "slack_at";
   const rows = await env.DB.prepare(
     `SELECT COALESCE(preference.timezone, 'UTC') timezone,
-            COALESCE(cursor.updated_at, 0) cursor_updated_at
+            COALESCE(cursor.updated_at, 0) cursor_updated_at,
+            MIN(n.created_at) oldest_created_at
        FROM notifications n
        LEFT JOIN notification_preferences preference
          ON preference.user_id = n.user_id AND preference.event_type = n.event_type
@@ -760,9 +761,12 @@ async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: n
       ORDER BY 2, 1`,
   )
     .bind(channel)
-    .all<{ timezone: string; cursor_updated_at: number }>();
+    .all<{ timezone: string; cursor_updated_at: number; oldest_created_at: number }>();
   return rows.results
-    .map((row) => digestWindow(row.timezone, timestamp))
+    .map((row) => {
+      const window = digestWindow(row.timezone, timestamp);
+      return window && row.oldest_created_at < window.cutoff ? window : null;
+    })
     .filter((window): window is { timezone: string; cutoff: number } => Boolean(window))
     .slice(0, limit);
 }

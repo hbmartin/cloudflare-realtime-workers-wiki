@@ -390,6 +390,60 @@ describe("job execution", () => {
     },
   );
 
+  it.each(["instance.not_found", "(instance.not_found) Instance does not exist"])(
+    "finishes cancellation cleanup for the Workflows binding error %s",
+    async (message) => {
+      const installed = await bootstrap();
+      const jobId = crypto.randomUUID();
+      const timestamp = Date.now();
+      await env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, type, status, requested_by, workflow_instance_id, cleanup_target,
+           progress_label, created_at, updated_at)
+         VALUES (?, ?, 'import', 'canceling', ?, 'expired-workflow', 'canceled', 'Canceling', ?, ?)`,
+      )
+        .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+        .run();
+      const get = vi.fn(async () => Promise.reject(new Error(message)));
+
+      await finishPendingJobCleanup(bindingsWith({ NOTES_WORKFLOW: { get } }), { id: jobId, attempt: 1 });
+
+      expect(await env.DB.prepare(`SELECT status, cleanup_target FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual({
+        status: "canceled",
+        cleanup_target: null,
+      });
+    },
+  );
+
+  it("finishes cancellation cleanup when the workflow completes before termination", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, workflow_instance_id, cleanup_target,
+         progress_label, created_at, updated_at)
+       VALUES (?, ?, 'import', 'canceling', ?, 'finishing-workflow', 'canceled', 'Canceling', ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+      .run();
+    const terminate = vi.fn(async () => {
+      throw new Error("(instance.cannot_terminate) Cannot terminate an instance in a finite state");
+    });
+    const get = vi.fn(async () => ({
+      status: async () => ({ status: "running" }),
+      terminate,
+    }));
+
+    await finishPendingJobCleanup(bindingsWith({ NOTES_WORKFLOW: { get } }), { id: jobId, attempt: 1 });
+
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(await env.DB.prepare(`SELECT status, cleanup_target FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual({
+      status: "canceled",
+      cleanup_target: null,
+    });
+  });
+
   it.each(["get", "status", "terminate"] as const)(
     "keeps cancellation cleanup pending when workflow %s fails without a structured 404",
     async (operation) => {
@@ -431,17 +485,56 @@ describe("job execution", () => {
     },
   );
 
-  it("keeps failed export cleanup recoverable and labeled as a failure", async () => {
+  it("reports an inline job failure as failed while its cleanup remains pending", async () => {
+    const installed = await bootstrap();
+    const unavailable = new Error("R2 unavailable");
+    const bucket = { list: vi.fn(async () => Promise.reject(unavailable)) };
+    const bindings = bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: bucket });
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "markdown", portable: false }),
+      }),
+      bindings,
+      context,
+    );
+    expect(response.status).toBe(202);
+    const queued = (await response.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    const failed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${queued.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await failed.json<{ job: Job }>()).job).toMatchObject({
+      status: "failed",
+      cleanupPending: true,
+      error: { code: "job_failed", message: "R2 unavailable" },
+    });
+  });
+
+  it("keeps failed export cleanup recoverable, non-retryable, and scoped through its attempt", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
-    const outputKey = `jobs/${jobId}/attempts/1/output/export.md`;
+    const oldOutputKey = `jobs/${jobId}/attempts/1/output/old.md`;
+    const outputKey = `jobs/${jobId}/attempts/2/output/export.md`;
+    const futureOutputKey = `jobs/${jobId}/attempts/3/output/future.md`;
     const timestamp = Date.now();
-    await env.BUCKET.put(outputKey, "orphaned export");
+    await Promise.all([
+      env.BUCKET.put(oldOutputKey, "old export"),
+      env.BUCKET.put(outputKey, "orphaned export"),
+      env.BUCKET.put(futureOutputKey, "future export"),
+    ]);
     await env.DB.prepare(
       `INSERT INTO jobs
-        (id, workspace_id, type, status, requested_by, cleanup_target, progress_label,
+        (id, workspace_id, type, status, requested_by, attempt, cleanup_target, progress_label,
          error_code, error_message, created_at, updated_at)
-       VALUES (?, ?, 'export', 'running', ?, 'failed', 'Cleaning up', 'job_failed', 'render failed', ?, ?)`,
+       VALUES (?, ?, 'export', 'failed', ?, 2, 'failed', 'Failure cleanup pending',
+               'job_failed', 'render failed', ?, ?)`,
     )
       .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
       .run();
@@ -450,16 +543,44 @@ describe("job execution", () => {
     await expect(
       finishPendingJobCleanup(bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: failingBucket }), {
         id: jobId,
-        attempt: 1,
+        attempt: 2,
       }),
     ).rejects.toThrow("R2 unavailable");
     expect(
       await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`).bind(jobId).first(),
-    ).toEqual({ status: "canceling", cleanup_target: "failed", progress_label: "Failure cleanup pending" });
+    ).toEqual({ status: "failed", cleanup_target: "failed", progress_label: "Failure cleanup pending" });
 
-    await finishPendingJobCleanup(inlineBindings(), { id: jobId, attempt: 1 });
+    const read = await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext());
+    expect(read.status).toBe(200);
+    expect((await read.json<{ job: Job }>()).job).toMatchObject({
+      status: "failed",
+      cleanupPending: true,
+      error: { code: "job_failed", message: "render failed" },
+    });
+    expect(
+      (
+        await worker.fetch(
+          request(installed.cookie, `/api/jobs/${jobId}/retry`, { method: "POST" }),
+          env,
+          createExecutionContext(),
+        )
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await worker.fetch(
+          request(installed.cookie, `/api/jobs/${jobId}/cancel`, { method: "POST" }),
+          env,
+          createExecutionContext(),
+        )
+      ).status,
+    ).toBe(409);
 
+    await finishPendingJobCleanup(inlineBindings(), { id: jobId, attempt: 2 });
+
+    expect(await env.BUCKET.get(oldOutputKey)).toBeNull();
     expect(await env.BUCKET.get(outputKey)).toBeNull();
+    expect(await env.BUCKET.get(futureOutputKey)).toBeTruthy();
     expect(
       await env.DB.prepare(`SELECT status, cleanup_target, progress_label FROM jobs WHERE id = ?`).bind(jobId).first(),
     ).toEqual({ status: "failed", cleanup_target: null, progress_label: "Failed" });
@@ -503,9 +624,14 @@ describe("job execution", () => {
     const jobId = crypto.randomUUID();
     const targetPageId = crypto.randomUUID();
     const attachmentId = crypto.randomUUID();
-    const attachmentKey = `assets/${installed.workspaceId}/${attachmentId}/clone`;
-    const inputKey = `jobs/${jobId}/template-content.bin`;
-    const documentKey = `documents/${targetPageId}/epochs/1/current.bin`;
+    const oldAttachmentKey = `assets/${installed.workspaceId}/${attachmentId}/attempts/1/clone`;
+    const attachmentKey = `assets/${installed.workspaceId}/${attachmentId}/attempts/2/clone`;
+    const futureAttachmentKey = `assets/${installed.workspaceId}/${attachmentId}/attempts/3/clone`;
+    const oldInputKey = `jobs/${jobId}/attempts/1/template-content.bin`;
+    const inputKey = `jobs/${jobId}/attempts/2/template-content.bin`;
+    const futureInputKey = `jobs/${jobId}/attempts/3/template-content.bin`;
+    const legacyInputKey = `jobs/${jobId}/template-content.bin`;
+    const documentKey = `documents/${targetPageId}/epochs/2/current.bin`;
     const timestamp = Date.now();
     const options = JSON.stringify({
       sourcePageId: installed.pageId,
@@ -518,8 +644,9 @@ describe("job execution", () => {
     await env.DB.batch([
       env.DB.prepare(
         `INSERT INTO jobs
-          (id, workspace_id, space_id, type, status, requested_by, input_key, options_json, created_at, updated_at)
-         VALUES (?, ?, ?, 'template_clone', 'running', ?, ?, ?, ?, ?)`,
+          (id, workspace_id, space_id, type, status, requested_by, input_key, options_json, attempt, created_at,
+           updated_at)
+         VALUES (?, ?, ?, 'template_clone', 'running', ?, ?, ?, 2, ?, ?)`,
       ).bind(
         jobId,
         installed.workspaceId,
@@ -532,8 +659,9 @@ describe("job execution", () => {
       ),
       env.DB.prepare(
         `INSERT INTO pages
-          (id, workspace_id, space_id, kind, position, title, import_job_id, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, 'table', 'z-canceled', 'Canceled clone', ?, ?, ?, ?)`,
+          (id, workspace_id, space_id, kind, position, title, import_job_id, content_epoch, created_by, created_at,
+           updated_at)
+         VALUES (?, ?, ?, 'table', 'z-canceled', 'Canceled clone', ?, 2, ?, ?, ?)`,
       ).bind(
         targetPageId,
         installed.workspaceId,
@@ -550,8 +678,13 @@ describe("job execution", () => {
       ).bind(attachmentId, installed.workspaceId, targetPageId, attachmentKey, installed.userId, timestamp),
     ]);
     await Promise.all([
+      env.BUCKET.put(oldAttachmentKey, "old attachment"),
       env.BUCKET.put(attachmentKey, "a"),
+      env.BUCKET.put(futureAttachmentKey, "future attachment"),
+      env.BUCKET.put(oldInputKey, "old input"),
       env.BUCKET.put(inputKey, "input"),
+      env.BUCKET.put(futureInputKey, "future input"),
+      env.BUCKET.put(legacyInputKey, "legacy input"),
       env.BUCKET.put(documentKey, "document"),
     ]);
     const context = createExecutionContext();
@@ -566,10 +699,16 @@ describe("job execution", () => {
     expect(response.status).toBe(200);
     expect(await env.DB.prepare(`SELECT id FROM pages WHERE id = ?`).bind(targetPageId).first()).toBeNull();
     expect(await env.DB.prepare(`SELECT id FROM attachments WHERE id = ?`).bind(attachmentId).first()).toBeNull();
-    expect(await Promise.all([attachmentKey, inputKey, documentKey].map((key) => env.BUCKET.get(key)))).toEqual([
-      null,
-      null,
-      null,
+    expect(
+      await Promise.all(
+        [oldAttachmentKey, attachmentKey, oldInputKey, inputKey, legacyInputKey, documentKey].map((key) =>
+          env.BUCKET.get(key),
+        ),
+      ),
+    ).toEqual([null, null, null, null, null, null]);
+    expect(await Promise.all([futureAttachmentKey, futureInputKey].map((key) => env.BUCKET.get(key)))).toEqual([
+      expect.anything(),
+      expect.anything(),
     ]);
   });
 
@@ -617,7 +756,7 @@ describe("job execution", () => {
     ]);
     const current = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
 
-    await cleanupTemplateClone(env, { ...current, attempt: 1 });
+    await cleanupTemplateClone(env, { ...current, attempt: 1 }, async () => true);
 
     expect(
       await env.DB.prepare(`SELECT import_job_id, content_epoch FROM pages WHERE id = ?`).bind(targetPageId).first(),
@@ -668,7 +807,7 @@ describe("job execution", () => {
     ]);
     const current = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
 
-    await cleanupTemplateClone(env, current);
+    await cleanupTemplateClone(env, current, async () => true);
 
     expect(
       await env.DB.prepare(`SELECT import_job_id, content_epoch FROM pages WHERE id = ?`).bind(targetPageId).first(),
@@ -719,7 +858,7 @@ describe("job execution", () => {
     ]);
     const current = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
 
-    await cleanupTemplateClone(env, current);
+    await cleanupTemplateClone(env, current, async () => true);
 
     expect(await env.DB.prepare(`SELECT id FROM pages WHERE id = ?`).bind(targetPageId).first()).toBeNull();
   });
@@ -758,6 +897,36 @@ describe("job execution", () => {
     expect(
       (await env.DB.prepare(`SELECT output_key FROM jobs WHERE id = ?`).bind(jobId).first())?.output_key,
     ).toBeNull();
+  });
+
+  it("expires import staging from every completed attempt without touching a future retry", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const oldKey = `jobs/${jobId}/attempts/1/documents/old.bin`;
+    const currentKey = `jobs/${jobId}/attempts/2/documents/current.bin`;
+    const futureKey = `jobs/${jobId}/attempts/3/documents/future.bin`;
+    const legacyKey = `jobs/${jobId}/documents/legacy.bin`;
+    await Promise.all(
+      [oldKey, currentKey, futureKey, legacyKey].map((key) => env.BUCKET.put(key, new Uint8Array([1]))),
+    );
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, input_key, expires_at, attempt, created_at, updated_at)
+       VALUES (?, ?, 'import', 'succeeded', ?, ?, ?, 2, ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, currentKey, timestamp - 1, timestamp, timestamp)
+      .run();
+
+    await expireJobArtifacts(env);
+
+    expect(await Promise.all([oldKey, currentKey, legacyKey].map((key) => env.BUCKET.get(key)))).toEqual([
+      null,
+      null,
+      null,
+    ]);
+    expect(await env.BUCKET.get(futureKey)).toBeTruthy();
+    expect((await env.DB.prepare(`SELECT input_key FROM jobs WHERE id = ?`).bind(jobId).first())?.input_key).toBeNull();
   });
 
   it("exports a freshly flushed document with portable attachments", async () => {

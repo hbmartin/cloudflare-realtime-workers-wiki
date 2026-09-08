@@ -84,3 +84,31 @@ export async function deleteR2Prefix(bucket: R2Bucket, prefix: string) {
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
 }
+
+/** Delete one artifact kind from completed attempts without touching a future retry. */
+export async function deleteR2AttemptArtifacts(
+  bucket: R2Bucket,
+  rootPrefix: string,
+  throughAttempt: number,
+  artifactPath = "",
+) {
+  const prefix = `${rootPrefix.replace(/\/$/, "")}/attempts/`;
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, ...(cursor ? { cursor } : {}) });
+    const keys = page.objects
+      .filter((object) => {
+        const remainder = object.key.slice(prefix.length);
+        const separator = remainder.indexOf("/");
+        if (separator <= 0) return false;
+        const attempt = Number(remainder.slice(0, separator));
+        if (!Number.isInteger(attempt) || attempt < 1 || attempt > throughAttempt) return false;
+        const artifact = remainder.slice(separator + 1);
+        if (!artifactPath) return true;
+        return artifactPath.endsWith("/") ? artifact.startsWith(artifactPath) : artifact === artifactPath;
+      })
+      .map((object) => object.key);
+    if (keys.length) await bucket.delete(keys);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+}

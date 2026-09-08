@@ -36,6 +36,7 @@ const job = {
   result: null,
   error: null,
   hasDownload: false,
+  cleanupPending: false,
   expiresAt: null,
   createdAt: 1,
   updatedAt: 1,

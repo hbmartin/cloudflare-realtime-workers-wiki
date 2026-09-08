@@ -1841,8 +1841,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     setNotificationsOpen(true);
     setNotificationsRevision((current) => current + 1);
   }, []);
-  const activeJobCount = jobs.filter((job) =>
-    ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status),
+  const activeJobCount = jobs.filter(
+    (job) => ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status) || job.cleanupPending,
   ).length;
   useEffect(() => {
     if (!activitiesOpen || activeJobCount === 0) return undefined;
@@ -2804,9 +2804,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             >
               <span aria-hidden="true">↻</span>
               Activities
-              {jobs.some((job) => ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status)) && (
-                <i aria-label="Background work in progress" />
-              )}
+              {jobs.some(
+                (job) =>
+                  ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status) ||
+                  job.cleanupPending,
+              ) && <i aria-label="Background work in progress" />}
             </button>
             {member.role !== "viewer" && (
               <div className="new-menu">

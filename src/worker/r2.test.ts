@@ -1,5 +1,30 @@
-import { describe, expect, it } from "vitest";
-import { conditionalGetStatus, normalizeR2Range } from "./r2";
+import { describe, expect, it, vi } from "vitest";
+import { conditionalGetStatus, deleteR2AttemptArtifacts, normalizeR2Range } from "./r2";
+
+describe("R2 attempt cleanup", () => {
+  it("scans once and deletes only the requested artifacts through the current attempt", async () => {
+    const list = vi.fn(async () => ({
+      objects: [
+        { key: "jobs/job-1/attempts/1/documents/old.bin" },
+        { key: "jobs/job-1/attempts/1/output/keep.bin" },
+        { key: "jobs/job-1/attempts/2/documents/current.bin" },
+        { key: "jobs/job-1/attempts/3/documents/future.bin" },
+      ],
+      truncated: false,
+    }));
+    const deleteObjects = vi.fn(async () => undefined);
+    const bucket = { list, delete: deleteObjects } as unknown as R2Bucket;
+
+    await deleteR2AttemptArtifacts(bucket, "jobs/job-1", 2, "documents/");
+
+    expect(list).toHaveBeenCalledOnce();
+    expect(list).toHaveBeenCalledWith({ prefix: "jobs/job-1/attempts/" });
+    expect(deleteObjects).toHaveBeenCalledWith([
+      "jobs/job-1/attempts/1/documents/old.bin",
+      "jobs/job-1/attempts/2/documents/current.bin",
+    ]);
+  });
+});
 
 describe("R2 range normalization", () => {
   it("normalizes bounded ranges", () => {

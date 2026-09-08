@@ -16,6 +16,7 @@ const runningJob: Job = {
   result: null,
   error: null,
   hasDownload: false,
+  cleanupPending: false,
   expiresAt: null,
   createdAt: Date.UTC(2026, 8, 5),
   updatedAt: Date.UTC(2026, 8, 5),
@@ -46,6 +47,35 @@ describe("ActivitiesTray", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(cancel).toHaveBeenCalledWith(runningJob);
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  it("does not offer retry while failed-job cleanup is pending", () => {
+    render(
+      <ActivitiesTray
+        jobs={[
+          {
+            ...runningJob,
+            status: "failed",
+            progress: { current: 1, total: 4, label: "Failure cleanup pending" },
+            error: { code: "job_failed", message: "Export failed" },
+            cleanupPending: true,
+          },
+        ]}
+        loading={false}
+        error=""
+        pendingJobId={null}
+        onClose={vi.fn()}
+        onRefresh={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+        onConfirm={vi.fn()}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Export failed")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
   });
 
   it("closes on Escape and restores the previously focused control", async () => {

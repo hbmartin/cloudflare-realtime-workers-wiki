@@ -1786,6 +1786,9 @@ app.post("/api/jobs/:id/cancel", async (c) => {
 app.post("/api/jobs/:id/retry", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const job = await jobForMember(c.env, member, c.req.param("id"));
+  if (job.cleanup_target) {
+    throw new HttpError(409, "job_cleanup_pending", "This job is still cleaning up and cannot be retried yet.");
+  }
   if (job.status !== "failed" && job.status !== "canceled") {
     throw new HttpError(409, "job_not_retryable", "Only failed or canceled jobs can be retried.");
   }
@@ -1793,7 +1796,7 @@ app.post("/api/jobs/:id/retry", async (c) => {
   const retried = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1, progress_current = 0,
        progress_label = 'Queued', error_code = NULL, error_message = NULL, updated_at = ?
-      WHERE id = ? AND attempt = ? AND status IN ('failed', 'canceled')
+      WHERE id = ? AND attempt = ? AND status IN ('failed', 'canceled') AND cleanup_target IS NULL
       RETURNING *`,
   )
     .bind(instanceId, now(), job.id, job.attempt)
