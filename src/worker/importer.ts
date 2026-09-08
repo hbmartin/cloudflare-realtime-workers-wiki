@@ -15,7 +15,7 @@ import { readZip, type ZipEntry } from "../shared/zip";
 import { isUnsafeMime } from "./attachments";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
-import { deleteR2Prefix } from "./r2";
+import { deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { normalizeFilename } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { refreshPageSearchV2ForIdsStatements } from "./search-index";
@@ -729,9 +729,9 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
   await broadcast({ type: "jobs-invalidated" });
 }
 
-export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Promise<boolean> = async () => true) {
+export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Promise<boolean>) {
   const current = await env.DB.prepare(
-    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN ('running', 'canceling')`,
+    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN ('running', 'failed', 'canceling')`,
   )
     .bind(job.id, job.attempt)
     .first();
@@ -760,22 +760,20 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
     if (!(await stillOwned())) return;
     if (!response.ok) throw new Error("A staged import document could not be purged.");
   }
-  if (!(await stillOwned())) return;
-  await env.DB.prepare(`DELETE FROM pages WHERE import_job_id = ? AND content_epoch <= ?`)
-    .bind(job.id, job.attempt)
-    .run();
   if (attachments.results.length && (await stillOwned()))
     await env.BUCKET.delete(attachments.results.map((attachment) => attachment.r2_key));
   for (const page of pages.results) {
     if (!(await stillOwned())) return;
     await deleteR2Prefix(env.BUCKET, `documents/${page.id}/epochs/${page.content_epoch}/`);
   }
-  for (let attempt = 1; attempt <= job.attempt; attempt += 1) {
-    if (!(await stillOwned())) return;
-    await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${attempt}/documents/`);
-  }
+  if (!(await stillOwned())) return;
+  await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${job.id}`, job.attempt, "documents/");
   if (!(await stillOwned())) return;
   await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/documents/`);
+  if (!(await stillOwned())) return;
+  await env.DB.prepare(`DELETE FROM pages WHERE import_job_id = ? AND content_epoch <= ?`)
+    .bind(job.id, job.attempt)
+    .run();
 }
 
 export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {

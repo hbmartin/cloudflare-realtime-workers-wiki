@@ -8,7 +8,7 @@ import { migrateLegacyComments, type CommentPage } from "./comments";
 import { HttpError } from "./http";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
-import { deleteR2Prefix } from "./r2";
+import { deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { cleanupExport, runExport } from "./exporter";
@@ -93,6 +93,7 @@ export function jobJson(row: JobRow): Job {
         : null,
     error: row.error_code && row.error_message ? { code: row.error_code, message: row.error_message } : null,
     hasDownload: Boolean(row.output_key && (!row.expires_at || row.expires_at > Date.now())),
+    cleanupPending: row.cleanup_target !== null,
     expiresAt: row.expires_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -463,13 +464,9 @@ async function publishTemplateClone(env: Env, job: JobRow, options: TemplateClon
   }
 }
 
-export async function cleanupTemplateClone(
-  env: Env,
-  job: JobRow,
-  stillOwned: () => Promise<boolean> = async () => true,
-) {
+export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: () => Promise<boolean>) {
   const current = await env.DB.prepare(
-    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN ('running', 'canceling')`,
+    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN ('running', 'failed', 'canceling')`,
   )
     .bind(job.id, job.attempt)
     .first();
@@ -483,9 +480,9 @@ export async function cleanupTemplateClone(
     .first<{ id: string; kind: "document" | "table"; content_epoch: number }>();
   const attachments = staged
     ? (
-        await env.DB.prepare(`SELECT r2_key FROM attachments WHERE page_id = ?`)
+        await env.DB.prepare(`SELECT id, r2_key FROM attachments WHERE page_id = ?`)
           .bind(options.targetPageId)
-          .all<{ r2_key: string }>()
+          .all<{ id: string; r2_key: string }>()
       ).results
     : [];
   if (staged?.kind === "document") {
@@ -499,25 +496,27 @@ export async function cleanupTemplateClone(
     if (!(await stillOwned())) return;
     if (!purged.ok) throw new Error("The staged document could not be purged.");
   }
+  const keys = [
+    ...new Set(
+      [job.input_key, `jobs/${job.id}/template-content.bin`, ...attachments.map((row) => row.r2_key)].filter(Boolean),
+    ),
+  ] as string[];
+  if (keys.length && (await stillOwned())) await env.BUCKET.delete(keys);
+  if (!(await stillOwned())) return;
+  await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${job.id}`, job.attempt, "template-content.bin");
+  if (!(await stillOwned())) return;
+  for (const attachment of attachments) {
+    if (!(await stillOwned())) return;
+    await deleteR2AttemptArtifacts(env.BUCKET, `assets/${job.workspace_id}/${attachment.id}`, job.attempt);
+  }
+  if (staged && (await stillOwned()))
+    await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/epochs/${staged.content_epoch}/`);
   if (staged) {
     if (!(await stillOwned())) return;
     await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ? AND content_epoch = ?`)
       .bind(options.targetPageId, job.id, staged.content_epoch)
       .run();
   }
-  const keys = [
-    ...new Set(
-      [
-        job.input_key,
-        `jobs/${job.id}/attempts/${job.attempt}/template-content.bin`,
-        ...(job.attempt === 1 ? [`jobs/${job.id}/template-content.bin`] : []),
-        ...attachments.map((row) => row.r2_key),
-      ].filter(Boolean),
-    ),
-  ] as string[];
-  if (keys.length && (await stillOwned())) await env.BUCKET.delete(keys);
-  if (staged && (await stillOwned()))
-    await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/epochs/${staged.content_epoch}/`);
   if (!(await stillOwned())) return;
   await env.DB.prepare(`UPDATE jobs SET input_key = NULL, updated_at = ? WHERE id = ? AND attempt = ?`)
     .bind(Date.now(), job.id, job.attempt)
@@ -665,7 +664,7 @@ function cleanupLeaseGuard(env: Env, job: Pick<JobRow, "id" | "attempt">, token:
     const renewed = await env.DB.prepare(
       `UPDATE jobs SET cleanup_started_at = ?, updated_at = ?
         WHERE id = ? AND attempt = ? AND cleanup_token = ?
-          AND cleanup_target IS NOT NULL AND status IN ('running', 'canceling')`,
+          AND cleanup_target IS NOT NULL AND status IN ('running', 'failed', 'canceling')`,
     )
       .bind(timestamp, timestamp, job.id, job.attempt, token)
       .run();
@@ -674,7 +673,15 @@ function cleanupLeaseGuard(env: Env, job: Pick<JobRow, "id" | "attempt">, token:
   };
 }
 
+function workflowErrorHasCode(error: unknown, code: string) {
+  if (typeof error === "string") return error.includes(code);
+  if (!error || typeof error !== "object") return false;
+  const value = error as { code?: unknown; message?: unknown };
+  return value.code === code || (typeof value.message === "string" && value.message.includes(code));
+}
+
 function workflowInstanceMissing(error: unknown) {
+  if (workflowErrorHasCode(error, "instance.not_found")) return true;
   if (!error || typeof error !== "object") return false;
   const value = error as { code?: unknown; status?: unknown };
   return value.code === 404 || value.status === 404;
@@ -682,8 +689,7 @@ function workflowInstanceMissing(error: unknown) {
 
 /**
  * Finishes staged-resource cleanup under an attempt-scoped lease. The terminal
- * state remains unavailable to retry until cleanup succeeds, and a cancellation
- * arriving during failed-job cleanup wins by changing cleanup_target atomically.
+ * state remains unavailable to retry until cleanup succeeds.
  */
 export async function finishPendingJobCleanup(
   env: Env,
@@ -695,7 +701,7 @@ export async function finishPendingJobCleanup(
   const job = await env.DB.prepare(
     `UPDATE jobs SET cleanup_token = ?, cleanup_started_at = ?, updated_at = ?
       WHERE id = ? AND attempt = ? AND cleanup_target IS NOT NULL
-        AND status IN ('running', 'canceling')
+        AND status IN ('running', 'failed', 'canceling')
         AND (cleanup_token IS NULL OR cleanup_started_at IS NULL OR cleanup_started_at <= ?)
       RETURNING *`,
   )
@@ -706,14 +712,20 @@ export async function finishPendingJobCleanup(
   const stillOwned = cleanupLeaseGuard(env, identity, token, timestamp);
   try {
     if (options.terminateWorkflow !== false && job.workflow_instance_id && env.WORKFLOW_INLINE !== "true") {
+      let terminating = false;
       try {
         const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
         const status = await instance.status();
         if (["queued", "running", "paused", "waiting", "waitingForPause"].includes(status.status)) {
+          terminating = true;
           await instance.terminate();
         }
       } catch (error) {
-        if (!workflowInstanceMissing(error)) throw error;
+        if (
+          !workflowInstanceMissing(error) &&
+          !(terminating && workflowErrorHasCode(error, "instance.cannot_terminate"))
+        )
+          throw error;
       }
     }
     if (!(await stillOwned())) return false;
@@ -730,7 +742,7 @@ export async function finishPendingJobCleanup(
          error_message = CASE cleanup_target WHEN 'canceled' THEN NULL ELSE error_message END,
          cleanup_token = NULL, cleanup_started_at = NULL, cleanup_target = NULL, updated_at = ?
        WHERE id = ? AND attempt = ? AND cleanup_token = ? AND cleanup_target IS NOT NULL
-         AND status IN ('running', 'canceling')`,
+         AND status IN ('running', 'failed', 'canceling')`,
     )
       .bind(completedAt, job.id, job.attempt, token)
       .run();
@@ -738,10 +750,10 @@ export async function finishPendingJobCleanup(
     return Boolean(finished.meta.changes);
   } catch (error) {
     // Keep the job non-retryable while cleanup is incomplete. The scheduled
-    // recovery pass (or an explicit retry-cancel request) can claim it again.
+    // recovery pass can claim it again.
     await env.DB.prepare(
       `UPDATE jobs SET
-         status = 'canceling',
+         status = CASE cleanup_target WHEN 'canceled' THEN 'canceling' ELSE 'failed' END,
          progress_label = CASE cleanup_target WHEN 'canceled' THEN 'Cleanup pending' ELSE 'Failure cleanup pending' END,
          cleanup_token = NULL, cleanup_started_at = NULL, updated_at = ?
        WHERE id = ? AND attempt = ? AND cleanup_token = ?`,
@@ -765,8 +777,8 @@ async function failJobWithCleanup(env: Env, job: JobRow, message: string) {
     return;
   }
   const pending = await env.DB.prepare(
-    `UPDATE jobs SET status = 'canceling', cleanup_target = COALESCE(cleanup_target, 'failed'),
-       progress_label = 'Cleaning up', error_code = 'job_failed', error_message = ?, updated_at = ?
+    `UPDATE jobs SET status = 'failed', cleanup_target = COALESCE(cleanup_target, 'failed'),
+       progress_label = 'Failure cleanup pending', error_code = 'job_failed', error_message = ?, updated_at = ?
      WHERE id = ? AND attempt = ? AND status = 'running'`,
   )
     .bind(message, Date.now(), job.id, job.attempt)
@@ -1049,7 +1061,7 @@ export async function recoverQueuedJobs(env: Env) {
   }
   const cleanups = await env.DB.prepare(
     `SELECT id, attempt FROM jobs WHERE cleanup_target IS NOT NULL
-      AND status IN ('running', 'canceling') AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
+      AND status IN ('running', 'failed', 'canceling') AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
   )
     .bind(cutoff)
     .all<Pick<JobRow, "id" | "attempt">>();
@@ -1160,9 +1172,10 @@ export async function expireJobArtifacts(env: Env) {
     const keys = [...new Set([row.input_key, row.output_key].filter((key): key is string => Boolean(key)))];
     if (keys.length) await env.BUCKET.delete(keys);
     if (row.type === "import") {
-      await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/attempts/${row.attempt}/documents/`);
-      if (row.attempt === 1) await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/documents/`);
+      await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${row.id}`, row.attempt, "documents/");
+      await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/documents/`);
     }
+    if (row.type === "export") await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${row.id}`, row.attempt, "output/");
     await env.DB.prepare(`UPDATE jobs SET input_key = NULL, output_key = NULL, updated_at = ? WHERE id = ?`)
       .bind(Date.now(), row.id)
       .run();

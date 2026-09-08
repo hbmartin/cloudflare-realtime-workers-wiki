@@ -227,7 +227,7 @@ describe("structured document projection", () => {
     expect(serialized.markdown).toContain("**really bold**");
   });
 
-  it("escapes table delimiters inside code spans without consuming literal backslashes", () => {
+  it("escapes table delimiters inside code spans without double-escaping literal backslashes", () => {
     const serialized = serializeDocument(
       document({
         type: "table",
@@ -250,7 +250,32 @@ describe("structured document projection", () => {
       }),
     );
 
-    expect(serialized.markdown).toContain("| Code | Already escaped |\n| --- | --- |\n| `a\\|b` | `a\\\\|b` |\n");
+    expect(serialized.markdown).toContain("| Code | Already escaped |\n| --- | --- |\n| `a\\|b` | `a\\|b` |\n");
+  });
+
+  it("does not let backticks in inline math change table pipe escaping", () => {
+    const serialized = serializeDocument(
+      document({
+        type: "table",
+        content: [
+          {
+            type: "tableRow",
+            content: [{ type: "tableHeader", content: [{ type: "text", text: "Formula" }] }],
+          },
+          {
+            type: "tableRow",
+            content: [
+              {
+                type: "tableCell",
+                content: [{ type: "inlineMath", attrs: { formula: "`x\\|y" } }],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(serialized.markdown).toContain("| $`x\\|y$ |\n");
   });
 
   it("uses a longer code-span delimiter when inline code contains backticks", () => {

@@ -175,23 +175,8 @@ function serializeSequence(children: ProseMirrorJson[], format: "markdown" | "ht
 function escapeUnescapedPipes(value: string) {
   let result = "";
   let precedingBackslashes = 0;
-  let codeDelimiterLength = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    const character = value[index]!;
-    if (character === "`") {
-      let end = index + 1;
-      while (value[end] === "`") end += 1;
-      const run = value.slice(index, end);
-      if (precedingBackslashes % 2 === 0) {
-        if (!codeDelimiterLength) codeDelimiterLength = run.length;
-        else if (run.length === codeDelimiterLength) codeDelimiterLength = 0;
-      }
-      result += run;
-      precedingBackslashes = 0;
-      index = end - 1;
-      continue;
-    }
-    if (character === "|" && (codeDelimiterLength > 0 || precedingBackslashes % 2 === 0)) result += "\\";
+  for (const character of value) {
+    if (character === "|" && precedingBackslashes % 2 === 0) result += "\\";
     result += character;
     precedingBackslashes = character === "\\" ? precedingBackslashes + 1 : 0;
   }

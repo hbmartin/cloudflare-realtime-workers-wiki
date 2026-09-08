@@ -6,7 +6,7 @@ import type { Env } from "./env";
 import type { JobRow } from "./jobs";
 import { inlineImageMime } from "./attachments";
 import { normalizeFilename } from "./http";
-import { deleteR2Prefix } from "./r2";
+import { deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
 const EXPORT_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -157,7 +157,7 @@ function replaceAttachmentReference(content: string, attachmentId: string, repla
 
 export async function cleanupExport(env: Env, job: Pick<JobRow, "id" | "attempt">, stillOwned: () => Promise<boolean>) {
   if (!(await stillOwned())) return;
-  await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${job.attempt}/output/`);
+  await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${job.id}`, job.attempt, "output/");
 }
 
 async function portableExport(

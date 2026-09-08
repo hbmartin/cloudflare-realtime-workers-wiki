@@ -174,6 +174,7 @@ export type Job = {
   result: { pageId?: string; preview?: ImportPreview } | null;
   error: { code: string; message: string } | null;
   hasDownload: boolean;
+  cleanupPending: boolean;
   expiresAt: number | null;
   createdAt: number;
   updatedAt: number;
