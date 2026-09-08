@@ -415,6 +415,35 @@ describe("job execution", () => {
     },
   );
 
+  it.each(["error", "string"] as const)(
+    "does not treat an unrelated %s containing a workflow code as an instance result",
+    async (kind) => {
+      const installed = await bootstrap();
+      const jobId = crypto.randomUUID();
+      const timestamp = Date.now();
+      await env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, type, status, requested_by, workflow_instance_id, cleanup_target,
+           progress_label, created_at, updated_at)
+         VALUES (?, ?, 'import', 'canceling', ?, 'active-workflow', 'canceled', 'Canceling', ?, ?)`,
+      )
+        .bind(jobId, installed.workspaceId, installed.userId, timestamp, timestamp)
+        .run();
+      const message = "Proxy failed while decoding an instance.not_found response";
+      const failure: unknown = kind === "error" ? new Error(message) : message;
+      const get = vi.fn(async () => Promise.reject(failure));
+
+      await expect(
+        finishPendingJobCleanup(bindingsWith({ NOTES_WORKFLOW: { get } }), { id: jobId, attempt: 1 }),
+      ).rejects.toBe(failure);
+
+      expect(await env.DB.prepare(`SELECT status, cleanup_target FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual({
+        status: "canceling",
+        cleanup_target: "canceled",
+      });
+    },
+  );
+
   it("finishes cancellation cleanup when the workflow completes before termination", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
@@ -576,7 +605,14 @@ describe("job execution", () => {
       ).status,
     ).toBe(409);
 
-    await finishPendingJobCleanup(inlineBindings(), { id: jobId, attempt: 2 });
+    const cleanupContext = createExecutionContext();
+    const cleanupResponse = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}/cleanup`, { method: "POST" }),
+      inlineBindings(),
+      cleanupContext,
+    );
+    expect(cleanupResponse.status).toBe(202);
+    await waitOnExecutionContext(cleanupContext);
 
     expect(await env.BUCKET.get(oldOutputKey)).toBeNull();
     expect(await env.BUCKET.get(outputKey)).toBeNull();
@@ -617,6 +653,56 @@ describe("job execution", () => {
       status: "failed",
       cleanup_target: null,
     });
+  });
+
+  it("cleans attachment objects from every completed import attempt", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const pageId = crypto.randomUUID();
+    const attachmentId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const oldKey = `assets/${installed.workspaceId}/${attachmentId}/attempts/1/import-hash`;
+    const currentKey = `assets/${installed.workspaceId}/${attachmentId}/attempts/2/import-hash`;
+    const futureKey = `assets/${installed.workspaceId}/${attachmentId}/attempts/3/import-hash`;
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, space_id, type, status, requested_by, attempt, cleanup_target,
+           progress_label, error_code, error_message, created_at, updated_at)
+         VALUES (?, ?, ?, 'import', 'failed', ?, 2, 'failed', 'Failure cleanup pending',
+                 'job_failed', 'import failed', ?, ?)`,
+      ).bind(jobId, installed.workspaceId, `${installed.workspaceId}-general`, installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, import_job_id, content_epoch,
+           created_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'table', 'z-import-cleanup', 'Staged import', ?, 2, ?, ?, ?)`,
+      ).bind(
+        pageId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        jobId,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO attachments
+          (id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, created_at)
+         VALUES (?, ?, ?, ?, 'import.txt', 'text/plain', 1, 'import-hash', ?, ?)`,
+      ).bind(attachmentId, installed.workspaceId, pageId, currentKey, installed.userId, timestamp),
+    ]);
+    await Promise.all([
+      env.BUCKET.put(oldKey, "old attachment"),
+      env.BUCKET.put(currentKey, "current attachment"),
+      env.BUCKET.put(futureKey, "future attachment"),
+    ]);
+
+    await finishPendingJobCleanup(inlineBindings(), { id: jobId, attempt: 2 });
+
+    expect(await Promise.all([oldKey, currentKey].map((key) => env.BUCKET.get(key)))).toEqual([null, null]);
+    expect(await env.BUCKET.get(futureKey)).toBeTruthy();
+    expect(await env.DB.prepare(`SELECT id FROM pages WHERE id = ?`).bind(pageId).first()).toBeNull();
   });
 
   it("cleans staged template clone resources after cancellation", async () => {

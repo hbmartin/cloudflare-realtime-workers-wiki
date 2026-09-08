@@ -1811,6 +1811,20 @@ app.post("/api/jobs/:id/retry", async (c) => {
   return c.json({ job: jobJson(retried) }, 202);
 });
 
+app.post("/api/jobs/:id/cleanup", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const job = await jobForMember(c.env, member, c.req.param("id"));
+  if (!job.cleanup_target || !["running", "failed", "canceling"].includes(job.status)) {
+    throw new HttpError(409, "job_cleanup_not_pending", "This job does not have cleanup pending.");
+  }
+  c.executionCtx.waitUntil(
+    finishPendingJobCleanup(c.env, job).catch((error) =>
+      console.error("Failed to retry pending job cleanup", { jobId: job.id, error }),
+    ),
+  );
+  return c.json({ job: jobJson(job) }, 202);
+});
+
 app.get("/api/jobs/:id/download", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const job = await jobForMember(c.env, member, c.req.param("id"));

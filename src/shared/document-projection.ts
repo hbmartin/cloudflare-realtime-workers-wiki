@@ -172,11 +172,11 @@ function serializeSequence(children: ProseMirrorJson[], format: "markdown" | "ht
 
 // A cell's text is inlined into one pipe-delimited line, so newlines are collapsed
 // and every literal pipe is escaped or it would open a new column.
-function escapeUnescapedPipes(value: string) {
+function escapeUnescapedPipes(value: string, forceEscape = false) {
   let result = "";
   let precedingBackslashes = 0;
   for (const character of value) {
-    if (character === "|" && precedingBackslashes % 2 === 0) result += "\\";
+    if (character === "|" && (forceEscape || precedingBackslashes % 2 === 0)) result += "\\";
     result += character;
     precedingBackslashes = character === "\\" ? precedingBackslashes + 1 : 0;
   }
@@ -184,8 +184,15 @@ function escapeUnescapedPipes(value: string) {
 }
 
 function markdownTableCell(node: ProseMirrorJson) {
-  const rendered = (node.content ?? []).map((child) => serializeInline(child, "markdown")).join("");
-  return escapeUnescapedPipes(normalizeText(rendered || escapeMarkdownInline(nodeText(node))));
+  const rendered = (node.content ?? [])
+    .map((child) =>
+      escapeUnescapedPipes(
+        serializeInline(child, "markdown"),
+        typeof child.text === "string" && (child.marks ?? []).some((mark) => mark.type === "code"),
+      ),
+    )
+    .join("");
+  return normalizeText(rendered || escapeMarkdownInline(nodeText(node)));
 }
 
 function markdownTableRow(row: ProseMirrorJson) {

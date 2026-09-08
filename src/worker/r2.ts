@@ -112,3 +112,33 @@ export async function deleteR2AttemptArtifacts(
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
 }
+
+const R2_DELETE_BATCH_SIZE = 1_000;
+
+export async function deleteR2Keys(bucket: R2Bucket, keys: readonly string[]) {
+  for (let start = 0; start < keys.length; start += R2_DELETE_BATCH_SIZE) {
+    await bucket.delete(keys.slice(start, start + R2_DELETE_BATCH_SIZE));
+  }
+}
+
+/** Delete deterministic artifacts from completed attempts without listing each prefix. */
+export async function deleteR2AttemptArtifactKeys(
+  bucket: R2Bucket,
+  artifacts: ReadonlyArray<{ rootPrefix: string; artifactPath: string }>,
+  throughAttempt: number,
+) {
+  if (!artifacts.length || !Number.isInteger(throughAttempt) || throughAttempt < 1) return;
+  let keys: string[] = [];
+  for (let attempt = 1; attempt <= throughAttempt; attempt += 1) {
+    for (const artifact of artifacts) {
+      keys.push(
+        `${artifact.rootPrefix.replace(/\/$/, "")}/attempts/${attempt}/${artifact.artifactPath.replace(/^\//, "")}`,
+      );
+      if (keys.length === R2_DELETE_BATCH_SIZE) {
+        await deleteR2Keys(bucket, keys);
+        keys = [];
+      }
+    }
+  }
+  await deleteR2Keys(bucket, keys);
+}

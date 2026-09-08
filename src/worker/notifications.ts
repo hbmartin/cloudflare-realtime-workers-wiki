@@ -715,7 +715,7 @@ const DIGEST_WINDOW_MAX = Math.floor(
 
 // Timezone is part of the key: preferences are per event type, so one user can hold
 // two timezones and appear as two groups that a coarser cursor would skip past.
-type DigestCursor = { userId: string; workspaceId: string; timezone: string };
+export type DigestCursor = { userId: string; workspaceId: string; timezone: string };
 
 function digestWindow(timezone: string, timestamp: number) {
   try {
@@ -737,12 +737,23 @@ function digestWindow(timezone: string, timestamp: number) {
   }
 }
 
-type DigestChannel = "email" | "slack";
+export type DigestChannel = "email" | "slack";
 
 function digestModeSql(channel: DigestChannel) {
   return channel === "email"
     ? `COALESCE(preference.email, CASE WHEN n.event_type = 'page_edit' THEN 'digest' ELSE 'immediate' END) = 'digest'`
     : `COALESCE(preference.slack, 'off') = 'digest'`;
+}
+
+function digestRecipientSql(channel: DigestChannel) {
+  return channel === "slack"
+    ? `AND EXISTS (
+         SELECT 1 FROM slack_installations installation
+         JOIN slack_user_links link
+           ON link.installation_id = installation.id AND link.user_id = n.user_id
+        WHERE installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL
+       )`
+    : "";
 }
 
 async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: number, limit: number) {
@@ -756,7 +767,7 @@ async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: n
          ON preference.user_id = n.user_id AND preference.event_type = n.event_type
        LEFT JOIN digest_delivery_cursors cursor
          ON cursor.channel = ? AND cursor.timezone = COALESCE(preference.timezone, 'UTC')
-      WHERE n.${deliveredColumn} IS NULL AND ${digestModeSql(channel)}
+      WHERE n.${deliveredColumn} IS NULL AND ${digestModeSql(channel)} ${digestRecipientSql(channel)}
       GROUP BY COALESCE(preference.timezone, 'UTC'), COALESCE(cursor.updated_at, 0)
       ORDER BY 2, 1`,
   )
@@ -779,7 +790,7 @@ function digestCursorKey(cursor: DigestCursor) {
   return `${cursor.userId}\u0000${cursor.workspaceId}\u0000${cursor.timezone}`;
 }
 
-async function digestCandidates<T extends { user_id: string; workspace_id: string; timezone: string }>(
+export async function digestCandidates<T extends { user_id: string; workspace_id: string; timezone: string }>(
   env: Env,
   channel: DigestChannel,
   timezone: string,

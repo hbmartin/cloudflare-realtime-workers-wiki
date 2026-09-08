@@ -11,6 +11,7 @@ import {
 } from "react";
 import { PAGE_MOVE_RECEIPT_RETENTION_MS } from "../shared/page-move";
 import { errorLogFields } from "../shared/error-log";
+import { isJobActive, jobPollDelay } from "../shared/job-state";
 import { buildTree, compareBinaryText } from "../shared/tree-model";
 import type {
   ClientMemberContext,
@@ -1841,15 +1842,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     setNotificationsOpen(true);
     setNotificationsRevision((current) => current + 1);
   }, []);
-  const activeJobCount = jobs.filter(
-    (job) => ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status) || job.cleanupPending,
-  ).length;
+  const activeJobCount = jobs.filter(isJobActive).length;
+  const activityPollDelay = jobPollDelay(jobs);
   useEffect(() => {
-    if (!activitiesOpen || activeJobCount === 0) return undefined;
-    const timer = window.setTimeout(() => void loadJobs(), 1_000);
+    if (!activitiesOpen || activityPollDelay === null) return undefined;
+    const timer = window.setTimeout(() => void loadJobs(), activityPollDelay);
     return () => window.clearTimeout(timer);
-  }, [activeJobCount, activitiesOpen, jobs, loadJobs]);
-  const mutateJob = useCallback(async (job: Job, action: "cancel" | "retry" | "confirm") => {
+  }, [activitiesOpen, activityPollDelay, jobs, loadJobs]);
+  const mutateJob = useCallback(async (job: Job, action: "cancel" | "cleanup" | "retry" | "confirm") => {
     setPendingJobId(job.id);
     try {
       const path =
@@ -1863,7 +1863,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setJobsError(
         apiErrorMessage(
           error,
-          `The job could not be ${action === "cancel" ? "canceled" : action === "confirm" ? "confirmed" : "retried"}.`,
+          `The job could not be ${
+            action === "cancel"
+              ? "canceled"
+              : action === "cleanup"
+                ? "cleaned up"
+                : action === "confirm"
+                  ? "confirmed"
+                  : "retried"
+          }.`,
         ),
       );
     } finally {
@@ -2804,11 +2812,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             >
               <span aria-hidden="true">↻</span>
               Activities
-              {jobs.some(
-                (job) =>
-                  ["queued", "running", "awaiting_confirmation", "canceling"].includes(job.status) ||
-                  job.cleanupPending,
-              ) && <i aria-label="Background work in progress" />}
+              {activeJobCount > 0 && <i aria-label="Background work in progress" />}
             </button>
             {member.role !== "viewer" && (
               <div className="new-menu">
@@ -2931,6 +2935,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onClose={closeActivities}
           onRefresh={() => void loadJobs()}
           onCancel={(job) => void mutateJob(job, "cancel")}
+          onCleanup={(job) => void mutateJob(job, "cleanup")}
           onRetry={(job) => void mutateJob(job, "retry")}
           onConfirm={(job) => void mutateJob(job, "confirm")}
           onOpenResult={(job) => void openJobResult(job)}

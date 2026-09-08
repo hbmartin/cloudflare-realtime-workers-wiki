@@ -15,7 +15,7 @@ import { readZip, type ZipEntry } from "../shared/zip";
 import { isUnsafeMime } from "./attachments";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
-import { deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
+import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Keys, deleteR2Prefix } from "./r2";
 import { normalizeFilename } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { refreshPageSearchV2ForIdsStatements } from "./search-index";
@@ -742,12 +742,12 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
     .bind(job.id, job.attempt)
     .all<{ id: string; kind: "document" | "table"; content_epoch: number }>();
   const attachments = await env.DB.prepare(
-    `SELECT r2_key FROM attachments WHERE page_id IN (
+    `SELECT id, r2_key, content_sha256 FROM attachments WHERE page_id IN (
       SELECT id FROM pages WHERE import_job_id = ? AND content_epoch <= ?
     )`,
   )
     .bind(job.id, job.attempt)
-    .all<{ r2_key: string }>();
+    .all<{ id: string; r2_key: string; content_sha256: string | null }>();
   for (const page of pages.results) {
     if (page.kind !== "document") continue;
     if (!(await stillOwned())) return;
@@ -761,7 +761,19 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
     if (!response.ok) throw new Error("A staged import document could not be purged.");
   }
   if (attachments.results.length && (await stillOwned()))
-    await env.BUCKET.delete(attachments.results.map((attachment) => attachment.r2_key));
+    await deleteR2Keys(
+      env.BUCKET,
+      attachments.results.map((attachment) => attachment.r2_key),
+    );
+  if (!(await stillOwned())) return;
+  await deleteR2AttemptArtifactKeys(
+    env.BUCKET,
+    attachments.results.map((attachment) => ({
+      rootPrefix: `assets/${job.workspace_id}/${attachment.id}`,
+      artifactPath: attachment.content_sha256 ?? attachment.r2_key.split("/").at(-1)!,
+    })),
+    job.attempt,
+  );
   for (const page of pages.results) {
     if (!(await stillOwned())) return;
     await deleteR2Prefix(env.BUCKET, `documents/${page.id}/epochs/${page.content_epoch}/`);
