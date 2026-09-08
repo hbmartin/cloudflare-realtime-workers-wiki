@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
+import { isJobActive } from "../shared/job-state";
 import type { Job } from "../shared/types";
 
-const ACTIVE_STATUSES = new Set<Job["status"]>(["queued", "running", "awaiting_confirmation", "canceling"]);
 const DATE_TIME_FORMAT = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 
 function jobTitle(job: Job) {
@@ -26,6 +26,7 @@ export function ActivitiesTray({
   onClose,
   onRefresh,
   onCancel,
+  onCleanup,
   onRetry,
   onConfirm,
   onOpenResult,
@@ -37,6 +38,7 @@ export function ActivitiesTray({
   onClose: () => void;
   onRefresh: () => void;
   onCancel: (job: Job) => void;
+  onCleanup: (job: Job) => void;
   onRetry: (job: Job) => void;
   onConfirm: (job: Job) => void;
   onOpenResult: (job: Job) => void;
@@ -107,7 +109,7 @@ export function ActivitiesTray({
         ) : jobs.length ? (
           <ol className="activity-list">
             {jobs.map((job) => {
-              const active = ACTIVE_STATUSES.has(job.status);
+              const active = isJobActive(job);
               const total = Math.max(0, job.progress.total);
               const percent = total
                 ? Math.min(100, Math.round((job.progress.current / total) * 100))
@@ -170,11 +172,15 @@ export function ActivitiesTray({
                           Download
                         </a>
                       )}
-                      {active && (
+                      {job.cleanupPending ? (
+                        <button className="quiet-button" disabled={pending} onClick={() => onCleanup(job)}>
+                          {pending ? "Cleaning up…" : "Retry cleanup"}
+                        </button>
+                      ) : active ? (
                         <button className="quiet-button" disabled={pending} onClick={() => onCancel(job)}>
                           {pending ? "Canceling…" : job.status === "canceling" ? "Retry cancel" : "Cancel"}
                         </button>
-                      )}
+                      ) : null}
                       {(job.status === "failed" || job.status === "canceled") && !job.cleanupPending && (
                         <button className="quiet-button" disabled={pending} onClick={() => onRetry(job)}>
                           {pending ? "Retrying…" : "Retry"}

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import type { CommentThread, Notification, NotificationPreference, Page } from "../shared/types";
 import type { Env } from "./env";
-import { deliverNotification, sendDueNotificationDigests } from "./notifications";
+import { deliverNotification, digestCandidates, sendDueNotificationDigests } from "./notifications";
 import { encryptSlackToken } from "./slack";
 
 const SLACK_SECRETS = {
@@ -96,6 +96,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   await abortAllDurableObjects();
   await env.DB.batch([
     env.DB.prepare(`DELETE FROM install_state`),
@@ -547,6 +549,191 @@ describe("notification feed and subscriptions", () => {
         `SELECT emailed_at IS NOT NULL delivered FROM notifications WHERE id = 'future-digest-notification'`,
       ).first(),
     ).toEqual({ delivered: 0 });
+  });
+
+  it("advances the ordering timestamp for an empty digest window", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const read = vi.fn(async () => ({
+      results: [] as Array<{ user_id: string; workspace_id: string; timezone: string }>,
+    }));
+
+    await digestCandidates(env, "email", "UTC", 10, read);
+    const first = await env.DB.prepare(
+      `SELECT user_id, workspace_id, updated_at FROM digest_delivery_cursors
+        WHERE channel = 'email' AND timezone = 'UTC'`,
+    ).first();
+    await digestCandidates(env, "email", "UTC", 10, read);
+    const second = await env.DB.prepare(
+      `SELECT user_id, workspace_id, updated_at FROM digest_delivery_cursors
+        WHERE channel = 'email' AND timezone = 'UTC'`,
+    ).first();
+
+    expect(first).toEqual({ user_id: "", workspace_id: "", updated_at: 1_000 });
+    expect(second).toEqual({ user_id: "", workspace_id: "", updated_at: 1_001 });
+    expect(read).toHaveBeenCalledTimes(2);
+    now.mockRestore();
+  });
+
+  it("does not discover Slack digest windows without a live recipient link", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 10, 5);
+    const configured = slackEnv();
+    const token = await encryptSlackToken(configured, "xoxb-discovery");
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES
+          ('unlinked-digest-user', 'Unlinked Digest', 'unlinked-digest@example.test', 1, ?, ?),
+          ('linked-digest-user', 'Linked Digest', 'linked-digest@example.test', 1, ?, ?)`,
+      ).bind(timestamp, timestamp, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES
+          (?, 'unlinked-digest-user', 'viewer', ?),
+          (?, 'linked-digest-user', 'viewer', ?)`,
+      ).bind(installed.workspaceId, timestamp, installed.workspaceId, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
+          (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
+           installed_by, created_at, updated_at)
+         VALUES ('digest-discovery-installation', ?, 'TDISCOVERY', 'Discovery', 'BDISCOVERY',
+                 ?, 'chat:write', ?, ?, ?)`,
+      ).bind(installed.workspaceId, token, installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at)
+         VALUES ('digest-discovery-installation', 'linked-digest-user', 'ULINKED', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone) VALUES
+          ('unlinked-digest-user', 'mention', 1, 'off', 'digest', 'Africa/Abidjan'),
+          ('linked-digest-user', 'mention', 1, 'off', 'digest', 'UTC')`,
+      ),
+      env.DB.prepare(
+        `INSERT INTO notifications
+          (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         VALUES
+          ('unlinked-digest-notification', ?, 'unlinked-digest-user', 'mention', ?, ?, ?, '{}',
+           'unlinked-digest', ?),
+          ('linked-digest-notification', ?, 'linked-digest-user', 'mention', ?, ?, ?, '{}',
+           'linked-digest', ?)`,
+      ).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 3 * 60 * 60_000,
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 3 * 60 * 60_000,
+      ),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         VALUES ('outbox:linked-digest-notification', ?, 'notification',
+                 '{"notificationId":"linked-digest-notification"}', ?, ?)`,
+      ).bind(installed.workspaceId, timestamp, timestamp),
+    ]);
+    const fetchMock = vi.fn(async () => Response.json({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await sendDueNotificationDigests(configured, timestamp);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare(
+        `SELECT timezone FROM digest_delivery_cursors WHERE channel = 'slack' ORDER BY timezone`,
+      ).all(),
+    ).toMatchObject({ results: [{ timezone: "UTC" }] });
+    expect(
+      await env.DB.prepare(
+        `SELECT slack_at IS NOT NULL delivered FROM notifications WHERE id = 'unlinked-digest-notification'`,
+      ).first(),
+    ).toEqual({ delivered: 0 });
+  });
+
+  it("keeps a full email and Slack digest tick within the statement budget", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 11, 5);
+    const configured = slackEnv();
+    const token = await encryptSlackToken(configured, "xoxb-budget");
+    await env.DB.batch([
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+         INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         SELECT printf('budget-user-%02d', n), printf('Budget User %02d', n),
+                printf('budget-user-%02d@example.test', n), 1, ?, ? FROM sequence`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+         INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         SELECT ?, printf('budget-user-%02d', n), 'viewer', ? FROM sequence`,
+      ).bind(installed.workspaceId, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
+          (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
+           installed_by, created_at, updated_at)
+         VALUES ('digest-budget-installation', ?, 'TBUDGET', 'Budget', 'BBUDGET', ?,
+                 'chat:write', ?, ?, ?)`,
+      ).bind(installed.workspaceId, token, installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+         INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at)
+         SELECT 'digest-budget-installation', printf('budget-user-%02d', n), printf('UBUDGET%02d', n), ?
+           FROM sequence`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+         INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
+         SELECT printf('budget-user-%02d', n), 'mention', 1, 'digest', 'digest', 'UTC' FROM sequence`,
+      ),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+         INSERT INTO notifications
+           (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
+         SELECT printf('budget-notification-%02d', n), ?, printf('budget-user-%02d', n), 'mention', ?, ?, ?,
+                '{}', printf('budget-%02d', n), ? FROM sequence`,
+      ).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 3 * 60 * 60_000,
+      ),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+         SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
+           FROM notifications WHERE id LIKE 'budget-notification-%'`,
+      ).bind(timestamp, timestamp),
+    ]);
+    let statementCount = 0;
+    const countedDatabase = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare") {
+          return (query: string) => {
+            statementCount += 1;
+            return target.prepare(query);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const send = vi.fn(async () => ({ messageId: "budget-email" }));
+    const bindings = new Proxy(configured, {
+      get(target, property, receiver) {
+        if (property === "DB") return countedDatabase;
+        if (property === "SEND_EMAIL") return { send };
+        if (property === "EMAIL_FROM") return "notes@example.test";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const fetchMock = vi.fn(async () => Response.json({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await sendDueNotificationDigests(bindings, timestamp);
+
+    expect(send).toHaveBeenCalledTimes(10);
+    expect(fetchMock).toHaveBeenCalledTimes(10);
+    expect(statementCount).toBeLessThanOrEqual(240);
   });
 
   it("defers only the rate-limited Slack installation and retries it on a later tick", async () => {

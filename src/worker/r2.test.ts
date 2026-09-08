@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { conditionalGetStatus, deleteR2AttemptArtifacts, normalizeR2Range } from "./r2";
+import { conditionalGetStatus, deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, normalizeR2Range } from "./r2";
 
 describe("R2 attempt cleanup", () => {
   it("scans once and deletes only the requested artifacts through the current attempt", async () => {
@@ -12,7 +12,7 @@ describe("R2 attempt cleanup", () => {
       ],
       truncated: false,
     }));
-    const deleteObjects = vi.fn(async () => undefined);
+    const deleteObjects = vi.fn(async (_keys: string | string[]) => undefined);
     const bucket = { list, delete: deleteObjects } as unknown as R2Bucket;
 
     await deleteR2AttemptArtifacts(bucket, "jobs/job-1", 2, "documents/");
@@ -23,6 +23,25 @@ describe("R2 attempt cleanup", () => {
       "jobs/job-1/attempts/1/documents/old.bin",
       "jobs/job-1/attempts/2/documents/current.bin",
     ]);
+  });
+
+  it("batches deterministic attempt keys without listing every attachment prefix", async () => {
+    const deleteObjects = vi.fn(async (_keys: string | string[]) => undefined);
+    const list = vi.fn();
+    const bucket = { list, delete: deleteObjects } as unknown as R2Bucket;
+    const artifacts = Array.from({ length: 501 }, (_, index) => ({
+      rootPrefix: `assets/workspace/attachment-${index}`,
+      artifactPath: "hash",
+    }));
+
+    await deleteR2AttemptArtifactKeys(bucket, artifacts, 2);
+
+    expect(list).not.toHaveBeenCalled();
+    expect(deleteObjects).toHaveBeenCalledTimes(2);
+    expect(deleteObjects.mock.calls[0]![0]).toHaveLength(1_000);
+    expect(deleteObjects.mock.calls[1]![0]).toHaveLength(2);
+    expect(deleteObjects.mock.calls[0]![0]).toContain("assets/workspace/attachment-0/attempts/1/hash");
+    expect(deleteObjects.mock.calls[1]![0]).toContain("assets/workspace/attachment-500/attempts/2/hash");
   });
 });
 

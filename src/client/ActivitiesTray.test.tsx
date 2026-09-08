@@ -36,6 +36,7 @@ describe("ActivitiesTray", () => {
         onClose={vi.fn()}
         onRefresh={vi.fn()}
         onCancel={cancel}
+        onCleanup={vi.fn()}
         onRetry={vi.fn()}
         onConfirm={vi.fn()}
         onOpenResult={vi.fn()}
@@ -49,24 +50,25 @@ describe("ActivitiesTray", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
   });
 
-  it("does not offer retry while failed-job cleanup is pending", () => {
+  it("renders pending cleanup as active and lets the user retry cleanup", () => {
+    const pendingCleanup: Job = {
+      ...runningJob,
+      status: "failed",
+      progress: { current: 1, total: 4, label: "Failure cleanup pending" },
+      error: { code: "job_failed", message: "Export failed" },
+      cleanupPending: true,
+    };
+    const retryCleanup = vi.fn();
     render(
       <ActivitiesTray
-        jobs={[
-          {
-            ...runningJob,
-            status: "failed",
-            progress: { current: 1, total: 4, label: "Failure cleanup pending" },
-            error: { code: "job_failed", message: "Export failed" },
-            cleanupPending: true,
-          },
-        ]}
+        jobs={[pendingCleanup]}
         loading={false}
         error=""
         pendingJobId={null}
         onClose={vi.fn()}
         onRefresh={vi.fn()}
         onCancel={vi.fn()}
+        onCleanup={retryCleanup}
         onRetry={vi.fn()}
         onConfirm={vi.fn()}
         onOpenResult={vi.fn()}
@@ -74,8 +76,11 @@ describe("ActivitiesTray", () => {
     );
 
     expect(screen.getByText("Export failed")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Search reindex progress" })).toHaveValue(25);
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry cleanup" }));
+    expect(retryCleanup).toHaveBeenCalledWith(pendingCleanup);
   });
 
   it("closes on Escape and restores the previously focused control", async () => {
@@ -92,6 +97,7 @@ describe("ActivitiesTray", () => {
         onClose={close}
         onRefresh={vi.fn()}
         onCancel={vi.fn()}
+        onCleanup={vi.fn()}
         onRetry={vi.fn()}
         onConfirm={vi.fn()}
         onOpenResult={vi.fn()}
@@ -133,6 +139,7 @@ describe("ActivitiesTray", () => {
         onClose={vi.fn()}
         onRefresh={vi.fn()}
         onCancel={vi.fn()}
+        onCleanup={vi.fn()}
         onRetry={vi.fn()}
         onConfirm={confirm}
         onOpenResult={vi.fn()}

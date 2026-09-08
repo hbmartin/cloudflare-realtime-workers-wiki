@@ -8,7 +8,7 @@ import { migrateLegacyComments, type CommentPage } from "./comments";
 import { HttpError } from "./http";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
-import { deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
+import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Keys, deleteR2Prefix } from "./r2";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { cleanupExport, runExport } from "./exporter";
@@ -480,9 +480,9 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
     .first<{ id: string; kind: "document" | "table"; content_epoch: number }>();
   const attachments = staged
     ? (
-        await env.DB.prepare(`SELECT id, r2_key FROM attachments WHERE page_id = ?`)
+        await env.DB.prepare(`SELECT id, r2_key, content_sha256 FROM attachments WHERE page_id = ?`)
           .bind(options.targetPageId)
-          .all<{ id: string; r2_key: string }>()
+          .all<{ id: string; r2_key: string; content_sha256: string | null }>()
       ).results
     : [];
   if (staged?.kind === "document") {
@@ -501,14 +501,18 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
       [job.input_key, `jobs/${job.id}/template-content.bin`, ...attachments.map((row) => row.r2_key)].filter(Boolean),
     ),
   ] as string[];
-  if (keys.length && (await stillOwned())) await env.BUCKET.delete(keys);
+  if (keys.length && (await stillOwned())) await deleteR2Keys(env.BUCKET, keys);
   if (!(await stillOwned())) return;
   await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${job.id}`, job.attempt, "template-content.bin");
   if (!(await stillOwned())) return;
-  for (const attachment of attachments) {
-    if (!(await stillOwned())) return;
-    await deleteR2AttemptArtifacts(env.BUCKET, `assets/${job.workspace_id}/${attachment.id}`, job.attempt);
-  }
+  await deleteR2AttemptArtifactKeys(
+    env.BUCKET,
+    attachments.map((attachment) => ({
+      rootPrefix: `assets/${job.workspace_id}/${attachment.id}`,
+      artifactPath: attachment.content_sha256 ?? "clone",
+    })),
+    job.attempt,
+  );
   if (staged && (await stillOwned()))
     await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/epochs/${staged.content_epoch}/`);
   if (staged) {
@@ -674,10 +678,15 @@ function cleanupLeaseGuard(env: Env, job: Pick<JobRow, "id" | "attempt">, token:
 }
 
 function workflowErrorHasCode(error: unknown, code: string) {
-  if (typeof error === "string") return error.includes(code);
+  const messageHasCode = (message: string) => {
+    const normalized = message.trim();
+    const prefix = `(${code})`;
+    return normalized === code || normalized === prefix || normalized.startsWith(`${prefix} `);
+  };
+  if (typeof error === "string") return messageHasCode(error);
   if (!error || typeof error !== "object") return false;
   const value = error as { code?: unknown; message?: unknown };
-  return value.code === code || (typeof value.message === "string" && value.message.includes(code));
+  return value.code === code || (typeof value.message === "string" && messageHasCode(value.message));
 }
 
 function workflowInstanceMissing(error: unknown) {
