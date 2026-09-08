@@ -536,26 +536,34 @@ async function finishClaimedDeliveries(
   token: string,
   status: "sent" | "failed",
   error: string | null = null,
+  notificationTimestampColumn: "emailed_at" | "slack_at" | null = null,
 ) {
   if (!outboxIds.length) return [] as string[];
   const timestamp = Date.now();
-  const finished = await env.DB.prepare(
+  const ids = JSON.stringify(uniqueIds([...outboxIds]));
+  const finish = env.DB.prepare(
     `UPDATE deliveries SET status = ?, last_error = ?, delivered_at = ?, updated_at = ?
       WHERE outbox_id IN (SELECT value FROM json_each(?)) AND channel = ?
         AND status = 'pending' AND claim_token = ?
       RETURNING outbox_id`,
-  )
-    .bind(
-      status,
-      error,
-      status === "sent" ? timestamp : null,
-      timestamp,
-      JSON.stringify([...outboxIds]),
-      channel,
-      token,
-    )
-    .all<{ outbox_id: string }>();
-  return finished.results.map((row) => row.outbox_id);
+  ).bind(status, error, status === "sent" ? timestamp : null, timestamp, ids, channel, token);
+  if (status !== "sent" || !notificationTimestampColumn) {
+    const finished = await finish.all<{ outbox_id: string }>();
+    return finished.results.map((row) => row.outbox_id);
+  }
+  const [finished] = await env.DB.batch<{ outbox_id: string }>([
+    finish,
+    env.DB.prepare(
+      `UPDATE notifications SET ${notificationTimestampColumn} = COALESCE(${notificationTimestampColumn}, ?)
+        WHERE ('outbox:' || id) IN (SELECT value FROM json_each(?))
+          AND EXISTS (
+            SELECT 1 FROM deliveries delivery
+             WHERE delivery.outbox_id = 'outbox:' || notifications.id
+               AND delivery.channel = ? AND delivery.status = 'sent' AND delivery.claim_token = ?
+          )`,
+    ).bind(timestamp, ids, channel, token),
+  ]);
+  return (finished?.results ?? []).map((row) => row.outbox_id);
 }
 
 async function accessibleNotifications(
@@ -883,13 +891,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
             .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
             .join("")}</ul>`,
         });
-        const finished = await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent");
-        const deliveredIds = finished.map((outboxId) => outboxId.slice("outbox:".length));
-        if (deliveredIds.length) {
-          await env.DB.prepare(`UPDATE notifications SET emailed_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-            .bind(Date.now(), JSON.stringify(deliveredIds))
-            .run();
-        }
+        await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent", null, "emailed_at");
       } catch (error) {
         await finishClaimedDeliveries(
           env,
@@ -973,19 +975,15 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           `Your daily Notes digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
           claimed[0]!.page_id,
         );
-        const finished = await finishClaimedDeliveries(
+        await finishClaimedDeliveries(
           env,
           claim.outboxIds,
           "slack",
           claim.token,
           sent ? "sent" : "failed",
           sent ? null : "unavailable",
+          sent ? "slack_at" : null,
         );
-        if (sent) {
-          await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-            .bind(Date.now(), JSON.stringify(finished.map((outboxId) => outboxId.slice("outbox:".length))))
-            .run();
-        }
       } catch (error) {
         await finishClaimedDeliveries(
           env,

@@ -1148,7 +1148,7 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
   } else if (row.topic === "slack_unfurl") {
     const unfurlId = payload.unfurlId;
     if (typeof unfurlId !== "string") return await rejectPayload("Slack unfurl outbox payload is invalid.");
-    await deliverSlackUnfurl(env, unfurlId);
+    await deliverSlackUnfurl(env, unfurlId, outboxId);
   } else throw new Error(`Unsupported outbox topic: ${row.topic}`);
   message.ack();
 }

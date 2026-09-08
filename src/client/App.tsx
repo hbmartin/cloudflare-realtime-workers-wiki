@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { PAGE_MOVE_RECEIPT_RETENTION_MS } from "../shared/page-move";
 import { errorLogFields } from "../shared/error-log";
 import { buildTree, compareBinaryText } from "../shared/tree-model";
@@ -736,6 +746,14 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
   );
 }
 
+export function useCommittedRef<T>(value: T) {
+  const ref = useRef(value);
+  useLayoutEffect(() => {
+    ref.current = value;
+  }, [value]);
+  return ref;
+}
+
 function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
   const [{ pages, pagesLoaded, selectedId, pendingSelectionId }, dispatchPageAction] = useReducer(
     workspacePageReducer,
@@ -831,8 +849,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const pageTreeErrorRevisionRef = useRef(0);
   const organizationLoadGenerationRef = useRef(0);
   const pageTagsLoadGenerationRef = useRef(0);
-  const selectedIdRef = useRef(selectedId);
-  selectedIdRef.current = selectedId;
+  const selectedIdRef = useCommittedRef(selectedId);
   const selectedSpaceIdRef = useRef<string | null>(null);
   const abortWorkspaceRequests = useCallback(() => {
     const activePageLoad = pageLoadRequest.current;
@@ -1486,7 +1503,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         if (generation !== pageTagsLoadGenerationRef.current || selectedIdRef.current !== selectedId) return;
         setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
       });
-  }, [organizationRevision, selectedId]);
+  }, [organizationRevision, selectedId, selectedIdRef]);
 
   // The shell only renders a selection inside the active space, so a deep link or a fallback selection
   // that lands in another space switches the space instead of showing an empty workspace.

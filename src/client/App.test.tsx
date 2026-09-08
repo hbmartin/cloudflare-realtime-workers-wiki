@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { StrictMode } from "react";
+import { startTransition, StrictMode, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext, Page, Space, Tag, WorkspaceEvent } from "../shared/types";
 import type { EditorPageProps } from "./EditorPage";
 import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
-import { App, fallbackPageId } from "./App";
+import { App, fallbackPageId, useCommittedRef } from "./App";
 import { PAGE_NAVIGATE_EVENT } from "./mentions";
 import { PageLoadEventBuffer } from "./page-state";
 
@@ -4921,6 +4921,50 @@ describe("App error handling", () => {
         errorStack: expect.any(String),
       }),
     );
+  });
+
+  it("keeps tag responses aligned with the committed page when a selection render is interrupted", async () => {
+    const response = deferred<string[]>();
+    const interruptedRender = deferred<void>();
+    const acceptResponse = vi.fn();
+    const attemptedSelection = vi.fn();
+    let suspendSelection = true;
+
+    function SelectionHarness() {
+      const [selectedId, setSelectedId] = useState("committed-page");
+      const selectedIdRef = useCommittedRef(selectedId);
+      useEffect(() => {
+        const requestedPageId = selectedId;
+        if (requestedPageId !== "committed-page") return;
+        void response.promise.then((tags) => {
+          if (selectedIdRef.current === requestedPageId) acceptResponse(tags);
+        });
+      }, [selectedId, selectedIdRef]);
+
+      if (selectedId === "interrupted-page" && suspendSelection) {
+        attemptedSelection();
+        throw interruptedRender.promise;
+      }
+      return (
+        <button onClick={() => startTransition(() => setSelectedId("interrupted-page"))}>Select another page</button>
+      );
+    }
+
+    render(<SelectionHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "Select another page" }));
+    await waitFor(() => expect(attemptedSelection).toHaveBeenCalled());
+
+    await act(async () => {
+      response.resolve(["Research"]);
+      await response.promise;
+    });
+    expect(acceptResponse).toHaveBeenCalledWith(["Research"]);
+
+    suspendSelection = false;
+    await act(async () => {
+      interruptedRender.resolve();
+      await interruptedRender.promise;
+    });
   });
 
   it("switches spaces and manages favorites, pins, and page tags", async () => {

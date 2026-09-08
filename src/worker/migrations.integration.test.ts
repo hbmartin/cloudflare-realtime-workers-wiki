@@ -189,10 +189,15 @@ describe("D1 migrations", () => {
 
     expect(
       await env.DB.prepare(
-        `SELECT delivered_at, retired_at IS NOT NULL retired, retirement_reason
+        `SELECT delivered_at, retired_at IS NOT NULL retired, typeof(retired_at) retired_at_type, retirement_reason
            FROM slack_unfurls WHERE id = 'legacy-unfurl'`,
       ).first(),
-    ).toEqual({ delivered_at: null, retired: 1, retirement_reason: "legacy_missing_message_ts" });
+    ).toEqual({
+      delivered_at: null,
+      retired: 1,
+      retired_at_type: "integer",
+      retirement_reason: "legacy_missing_message_ts",
+    });
     expect(await env.DB.prepare(`SELECT last_error FROM outbox WHERE id = 'outbox:legacy-unfurl'`).first()).toEqual({
       last_error: "legacy_unfurl_missing_message_ts",
     });

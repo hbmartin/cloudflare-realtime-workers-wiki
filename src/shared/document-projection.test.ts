@@ -227,6 +227,32 @@ describe("structured document projection", () => {
     expect(serialized.markdown).toContain("**really bold**");
   });
 
+  it("escapes table delimiters inside code spans without double-escaping existing escapes", () => {
+    const serialized = serializeDocument(
+      document({
+        type: "table",
+        content: [
+          {
+            type: "tableRow",
+            content: [
+              { type: "tableHeader", content: [{ type: "text", text: "Code" }] },
+              { type: "tableHeader", content: [{ type: "text", text: "Already escaped" }] },
+            ],
+          },
+          {
+            type: "tableRow",
+            content: [
+              { type: "tableCell", content: [{ type: "text", text: "a|b", marks: [{ type: "code" }] }] },
+              { type: "tableCell", content: [{ type: "text", text: "a\\|b", marks: [{ type: "code" }] }] },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(serialized.markdown).toContain("| Code | Already escaped |\n| --- | --- |\n| `a\\|b` | `a\\|b` |\n");
+  });
+
   it("uses a longer code-span delimiter when inline code contains backticks", () => {
     const serialized = serializeDocument(
       document({

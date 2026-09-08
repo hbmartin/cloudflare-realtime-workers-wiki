@@ -526,6 +526,57 @@ describe("job execution", () => {
     ).toEqual({ import_job_id: jobId, content_epoch: 2 });
   });
 
+  it("does not let current cleanup delete a template page fenced to a newer epoch", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const targetPageId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const options = JSON.stringify({
+      sourcePageId: installed.pageId,
+      targetPageId,
+      targetSpaceId: `${installed.workspaceId}-general`,
+      parentId: null,
+      title: "Newer clone",
+      isTemplate: false,
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, space_id, type, status, requested_by, options_json, attempt, created_at, updated_at)
+         VALUES (?, ?, ?, 'template_clone', 'running', ?, ?, 1, ?, ?)`,
+      ).bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        options,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, kind, position, title, import_job_id, content_epoch,
+           created_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'document', 'z-newer', 'Newer clone', ?, 2, ?, ?, ?)`,
+      ).bind(
+        targetPageId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        jobId,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+    ]);
+    const current = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+
+    await cleanupTemplateClone(env, current);
+
+    expect(
+      await env.DB.prepare(`SELECT import_job_id, content_epoch FROM pages WHERE id = ?`).bind(targetPageId).first(),
+    ).toEqual({ import_job_id: jobId, content_epoch: 2 });
+  });
+
   it("cleans a staged template page left at an older epoch by the current attempt", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
