@@ -140,6 +140,45 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
     if (succeeded) await load();
   }
 
+  async function revoke(integration: Pick<Integration, "id" | "name">) {
+    if (!confirm(`Revoke ${integration.name}?`)) return;
+    const succeeded = await runWithError(async () => {
+      await api(`/api/integrations/${integration.id}`, { method: "DELETE" });
+    }, "The integration could not be revoked.");
+    if (succeeded) await load();
+  }
+
+  async function verifyWebhook(webhookId: string) {
+    const succeeded = await runWithError(async () => {
+      await api(`/api/webhooks/${webhookId}/verify`, {
+        method: "POST",
+        body: json({ token: verification[webhookId] }),
+      });
+    }, "The webhook could not be verified.");
+    if (succeeded) await load();
+  }
+
+  async function toggleWebhook(webhook: Pick<Webhook, "id" | "status">) {
+    const succeeded = await runWithError(
+      async () => {
+        await api(`/api/webhooks/${webhook.id}`, {
+          method: "PATCH",
+          body: json({ paused: webhook.status === "active" }),
+        });
+      },
+      `The webhook could not be ${webhook.status === "active" ? "paused" : "resumed"}.`,
+    );
+    if (succeeded) await load();
+  }
+
+  async function removeWebhook(webhookId: string) {
+    if (!confirm("Delete this webhook?")) return;
+    const succeeded = await runWithError(async () => {
+      await api(`/api/webhooks/${webhookId}`, { method: "DELETE" });
+    }, "The webhook could not be deleted.");
+    if (succeeded) await load();
+  }
+
   async function createWebhook(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const formElement = event.currentTarget;
@@ -213,15 +252,7 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
                 </div>
                 <div>
                   <button onClick={() => void rotate(integration.id)}>Rotate token</button>
-                  <button
-                    className="text-danger"
-                    onClick={async () => {
-                      if (confirm(`Revoke ${integration.name}?`)) {
-                        await api(`/api/integrations/${integration.id}`, { method: "DELETE" });
-                        await load();
-                      }
-                    }}
-                  >
+                  <button className="text-danger" onClick={() => void revoke(integration)}>
                     Revoke
                   </button>
                 </div>
@@ -311,17 +342,7 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
                   value={verification[webhook.id] ?? ""}
                   onChange={(event) => setVerification((current) => ({ ...current, [webhook.id]: event.target.value }))}
                 />
-                <button
-                  onClick={async () => {
-                    await api(`/api/webhooks/${webhook.id}/verify`, {
-                      method: "POST",
-                      body: json({ token: verification[webhook.id] }),
-                    });
-                    await load();
-                  }}
-                >
-                  Verify
-                </button>
+                <button onClick={() => void verifyWebhook(webhook.id)}>Verify</button>
                 <button
                   onClick={() =>
                     void runWithError(async () => {
@@ -334,27 +355,11 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
               </div>
             )}
             {webhook.status !== "pending_verification" && (
-              <button
-                onClick={async () => {
-                  await api(`/api/webhooks/${webhook.id}`, {
-                    method: "PATCH",
-                    body: json({ paused: webhook.status === "active" }),
-                  });
-                  await load();
-                }}
-              >
+              <button onClick={() => void toggleWebhook(webhook)}>
                 {webhook.status === "active" ? "Pause" : "Resume"}
               </button>
             )}
-            <button
-              className="text-danger"
-              onClick={async () => {
-                if (confirm("Delete this webhook?")) {
-                  await api(`/api/webhooks/${webhook.id}`, { method: "DELETE" });
-                  await load();
-                }
-              }}
-            >
+            <button className="text-danger" onClick={() => void removeWebhook(webhook.id)}>
               Delete
             </button>
           </article>

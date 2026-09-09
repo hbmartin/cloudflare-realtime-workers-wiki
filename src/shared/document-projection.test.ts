@@ -157,7 +157,7 @@ describe("structured document projection", () => {
     expect(inert.markdown).toBe("System & data\n");
 
     const resolved = serializeDocument(root, {
-      linkedDiagramPageHref: (pageId) => `/safe/pages/${pageId}`,
+      pageHref: (pageId) => `/safe/pages/${pageId}`,
       linkedDiagramThumbnailHref: (pageId) => `/safe/thumbnails/${pageId}.svg`,
     });
     expect(resolved.html).toContain('href="/safe/pages/diagram-one"');
@@ -165,11 +165,24 @@ describe("structured document projection", () => {
     expect(resolved.markdown).toBe("[System & data](/safe/pages/diagram-one)\n");
 
     const unsafe = serializeDocument(root, {
-      linkedDiagramPageHref: () => "javascript:alert(1)",
+      pageHref: () => "javascript:alert(1)",
       linkedDiagramThumbnailHref: () => "data:image/svg+xml,<svg onload=alert(1)>",
     });
     expect(unsafe.html).not.toContain("javascript:");
     expect(unsafe.html).not.toContain("data:image");
+  });
+
+  it("keeps page links inert unless the caller supplies the shared page resolver", () => {
+    const root = document({ type: "linkToPage", attrs: { pageId: "page-one", title: "Project plan" } });
+
+    const inert = serializeDocument(root);
+    expect(inert.html).toContain("Project plan");
+    expect(inert.html).not.toContain("href=");
+    expect(inert.markdown).toBe("Project plan\n");
+
+    const resolved = serializeDocument(root, { pageHref: (pageId) => `/safe/pages/${pageId}` });
+    expect(resolved.html).toContain('href="/safe/pages/page-one"');
+    expect(resolved.markdown).toBe("[Project plan](/safe/pages/page-one)\n");
   });
 
   it("serializes BlockNote wrapper nodes without flattening blocks or emitting unsupported wrappers", () => {

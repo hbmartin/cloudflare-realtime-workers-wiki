@@ -1,5 +1,6 @@
-import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
+import { abortAllDurableObjects, applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import * as Y from "yjs";
 
 function authenticated(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -93,10 +94,13 @@ describe("public page shares", () => {
     expect((await SELF.fetch(`http://example.test/share/${key}/pages/${child.id}`)).status).toBe(200);
     expect((await SELF.fetch(`http://example.test/share/${key}/pages/${diagram.id}`)).status).toBe(404);
     expect((await SELF.fetch(`http://example.test/share/${key}/pages/${nested.id}`)).status).toBe(200);
-    const thumbnail = await SELF.fetch(`http://example.test/share/${key}/diagram-thumbnails/${diagram.id}.svg`);
-    expect(thumbnail.status).toBe(200);
-    expect(thumbnail.headers.get("content-type")).toContain("image/svg+xml");
-    expect(await thumbnail.text()).toContain("Internal diagram");
+    expect(
+      (
+        await SELF.fetch(
+          `http://example.test/share/${key}/diagram-thumbnails/${diagram.id}.svg?source=${installed.pageId}`,
+        )
+      ).status,
+    ).toBe(404);
     const sitemap = await SELF.fetch(`http://example.test/share/${key}/sitemap.xml`);
     expect(sitemap.status).toBe(200);
     const sitemapXml = await sitemap.text();
@@ -106,6 +110,130 @@ describe("public page shares", () => {
 
     await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, { method: "DELETE" });
     expect((await SELF.fetch(`http://example.test/share/${key}`)).status).toBe(404);
+  });
+
+  it("serves only diagram thumbnails explicitly linked from a shared document", async () => {
+    const installed = await bootstrap();
+    const createDiagram = async (title: string) => {
+      const response = await authenticated(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "diagram", parentId: installed.pageId, title }),
+      });
+      return (await response.json<{ page: { id: string } }>()).page;
+    };
+    const linkedDiagram = await createDiagram("Linked system map");
+    const transcludedDiagram = await createDiagram("Transcluded system map");
+    const unrelatedDiagram = await createDiagram("Unrelated internal map");
+    const sourcePageResponse = await authenticated(installed.cookie, "/api/pages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ kind: "document", parentId: installed.pageId, title: "Synced source" }),
+    });
+    const sourcePage = (await sourcePageResponse.json<{ page: { id: string } }>()).page;
+    const diagramAttachmentId = crypto.randomUUID();
+    const diagramAttachmentKey = `assets/${installed.workspaceId}/${diagramAttachmentId}/private`;
+    const thumbnailKey = `diagrams/${linkedDiagram.id}/epochs/1/thumbnail.svg`;
+    const thumbnailSvg = '<svg xmlns="http://www.w3.org/2000/svg"><text>Projection node label</text></svg>';
+    await Promise.all([
+      env.BUCKET.put(diagramAttachmentKey, "private diagram attachment"),
+      env.BUCKET.put(thumbnailKey, thumbnailSvg),
+    ]);
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO attachments
+        (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+       VALUES (?, ?, ?, ?, 'private.txt', 'text/plain', 26, ?, ?)`,
+      ).bind(
+        diagramAttachmentId,
+        installed.workspaceId,
+        linkedDiagram.id,
+        diagramAttachmentKey,
+        installed.userId,
+        Date.now(),
+      ),
+      env.DB.prepare(
+        `INSERT INTO diagram_projections
+          (page_id, content_epoch, sequence, schema_version, r2_key, content_hash, byte_size,
+           thumbnail_r2_key, thumbnail_hash, thumbnail_byte_size, updated_at)
+         VALUES (?, 1, 1, 1, ?, 'content-hash', 1, ?, 'thumbnail-hash', ?, ?)`,
+      ).bind(
+        linkedDiagram.id,
+        `diagrams/${linkedDiagram.id}/epochs/1/projection.json`,
+        thumbnailKey,
+        thumbnailSvg.length,
+        Date.now(),
+      ),
+    ]);
+
+    const source = new Y.Doc();
+    const linked = new Y.XmlElement("linkedDiagram");
+    linked.setAttribute("pageId", linkedDiagram.id);
+    linked.setAttribute("title", "Linked system map");
+    const reference = new Y.XmlElement("syncedBlockReference");
+    reference.setAttribute("sourcePageId", sourcePage.id);
+    reference.setAttribute("blockId", "system-map-source");
+    source.getXmlFragment("document-store").insert(0, [linked, reference]);
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+
+    const transclusionSource = new Y.Doc();
+    const sourceGroup = new Y.XmlElement("blockGroup");
+    const sourceContainer = new Y.XmlElement("blockContainer");
+    sourceContainer.setAttribute("id", "system-map-container");
+    const sourceMarker = new Y.XmlElement("syncedBlockSource");
+    sourceMarker.setAttribute("blockId", "system-map-source");
+    const sourceContent = new Y.XmlElement("blockGroup");
+    const transcludedLink = new Y.XmlElement("linkedDiagram");
+    transcludedLink.setAttribute("pageId", transcludedDiagram.id);
+    transcludedLink.setAttribute("title", "Transcluded system map");
+    sourceContent.insert(0, [transcludedLink]);
+    sourceContainer.insert(0, [sourceMarker, sourceContent]);
+    sourceGroup.insert(0, [sourceContainer]);
+    transclusionSource.getXmlFragment("document-store").insert(0, [sourceGroup]);
+    await env.BUCKET.put(`documents/${sourcePage.id}/epochs/1/current.bin`, Y.encodeStateAsUpdate(transclusionSource));
+
+    const published = await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ includeSubpages: true }),
+    });
+    const share = (await published.json<{ share: { url: string } }>()).share;
+    const key = new URL(share.url).pathname.split("/").at(-1)!;
+    const linkedThumbnailUrl = `/share/${key}/diagram-thumbnails/${linkedDiagram.id}.svg?source=${installed.pageId}`;
+    const transcludedThumbnailUrl = `/share/${key}/diagram-thumbnails/${transcludedDiagram.id}.svg?source=${sourcePage.id}`;
+
+    const root = await SELF.fetch(`http://example.test/share/${key}`);
+    expect(root.status).toBe(200);
+    const rootHtml = await root.text();
+    expect(rootHtml).toContain(`src="${linkedThumbnailUrl}"`);
+    expect(rootHtml).toContain(`src="${transcludedThumbnailUrl}"`);
+
+    const thumbnail = await SELF.fetch(`http://example.test${linkedThumbnailUrl}`);
+    expect(thumbnail.status).toBe(200);
+    expect(thumbnail.headers.get("content-type")).toContain("image/svg+xml");
+    expect(thumbnail.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await thumbnail.text()).toContain("Projection node label");
+    expect((await SELF.fetch(`http://example.test${transcludedThumbnailUrl}`)).status).toBe(200);
+
+    expect(
+      (await SELF.fetch(`http://example.test/share/${key}/diagram-thumbnails/${linkedDiagram.id}.svg`)).status,
+    ).toBe(404);
+    expect(
+      (
+        await SELF.fetch(
+          `http://example.test/share/${key}/diagram-thumbnails/${unrelatedDiagram.id}.svg?source=${installed.pageId}`,
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (await SELF.fetch(`http://example.test/share/${key}/assets/${diagramAttachmentId}?page=${linkedDiagram.id}`))
+        .status,
+    ).toBe(404);
+
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(new Y.Doc()));
+    await abortAllDurableObjects();
+    expect((await SELF.fetch(`http://example.test${linkedThumbnailUrl}`)).status).toBe(404);
+    expect((await SELF.fetch(`http://example.test${transcludedThumbnailUrl}`)).status).toBe(200);
   });
 
   it("limits public tables to 500 rows and tells the reader when truncated", async () => {

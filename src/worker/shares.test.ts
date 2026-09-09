@@ -28,7 +28,7 @@ describe("public document rendering", () => {
       ],
     };
 
-    const { body } = publicDocumentHtml(document, "public-key");
+    const { body } = publicDocumentHtml(document, "public-key", "source-page");
 
     expect(body).toContain(`Visible ?page=${target}`);
     expect(body).toContain(`href="/share/public-key/pages/${target}"`);
@@ -41,9 +41,9 @@ describe("public document rendering", () => {
       content: [{ type: "linkedDiagram", attrs: { pageId: "diagram-one", title: "System map" } }],
     };
 
-    const { body } = publicDocumentHtml(document, "public-key");
+    const { body } = publicDocumentHtml(document, "public-key", "source-page");
 
-    expect(body).toContain('src="/share/public-key/diagram-thumbnails/diagram-one.svg"');
+    expect(body).toContain('src="/share/public-key/diagram-thumbnails/diagram-one.svg?source=source-page"');
     expect(body).not.toContain("/api/pages/");
     expect(body).not.toContain("?page=");
     expect(body).not.toContain("/share/public-key/pages/diagram-one");

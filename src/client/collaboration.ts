@@ -86,12 +86,16 @@ export function createCollaboration(
       barrierDeadline = undefined;
       return;
     }
-    if (!provider.synced) return;
+    if (!provider.synced) {
+      if (barrierDeadline !== undefined && barrierDeadline <= Date.now()) barrierDeadline = undefined;
+      return;
+    }
     barrierDeadline = undefined;
     provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
   };
   const scheduleDurabilityBarrier = () => {
     const now = Date.now();
+    if (barrierDeadline !== undefined && barrierDeadline <= now && !provider.synced) barrierDeadline = undefined;
     barrierDeadline ??= now + 5_000;
     if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
     barrierTimer = window.setTimeout(sendDurabilityBarrier, Math.max(0, Math.min(1_000, barrierDeadline - now)));
@@ -233,12 +237,16 @@ export function createNetworkCollaboration(
       barrierDeadline = undefined;
       return;
     }
-    if (!provider.synced) return;
+    if (!provider.synced) {
+      if (barrierDeadline !== undefined && barrierDeadline <= Date.now()) barrierDeadline = undefined;
+      return;
+    }
     barrierDeadline = undefined;
     provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
   };
   const scheduleBarrier = () => {
     const now = Date.now();
+    if (barrierDeadline !== undefined && barrierDeadline <= now && !provider.synced) barrierDeadline = undefined;
     barrierDeadline ??= now + 5_000;
     if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
     barrierTimer = window.setTimeout(sendBarrier, Math.max(0, Math.min(500, barrierDeadline - now)));
