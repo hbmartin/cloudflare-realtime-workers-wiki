@@ -9,7 +9,7 @@
   "observability": { "enabled": true },
   "assets": {
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/parties/*"],
+    "run_worker_first": ["/api/*", "/parties/*", "/v1/*", "/share/*"],
   },
   "d1_databases": [
     {
@@ -52,6 +52,10 @@
       },
     ],
   },
+  "ratelimits": [
+    { "name": "API_BURST_LIMIT", "namespace_id": "2101", "simple": { "limit": 100, "period": 10 } },
+    { "name": "API_MINUTE_LIMIT", "namespace_id": "2102", "simple": { "limit": 600, "period": 60 } },
+  ],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Document"] },
     { "tag": "v2", "new_sqlite_classes": ["WorkspaceEvents"] },
@@ -104,11 +108,16 @@
           },
         ],
       },
+      "ratelimits": [
+        { "name": "API_BURST_LIMIT", "namespace_id": "2101", "simple": { "limit": 100, "period": 10 } },
+        { "name": "API_MINUTE_LIMIT", "namespace_id": "2102", "simple": { "limit": 600, "period": 60 } },
+      ],
       "vars": {
         "BETTER_AUTH_URL": "https://cloudflare-realtime-notes.harold-martin.workers.dev",
       },
     },
     "notes-checks-e2e": {
+      "browser": { "binding": "BROWSER" },
       "d1_databases": [
         {
           "binding": "DB",
@@ -149,6 +158,10 @@
           },
         ],
       },
+      "ratelimits": [
+        { "name": "API_BURST_LIMIT", "namespace_id": "2101", "simple": { "limit": 100, "period": 10 } },
+        { "name": "API_MINUTE_LIMIT", "namespace_id": "2102", "simple": { "limit": 600, "period": 60 } },
+      ],
       "vars": {
         "BETTER_AUTH_URL": "http://127.0.0.1:4173",
         "WORKFLOW_INLINE": "true",

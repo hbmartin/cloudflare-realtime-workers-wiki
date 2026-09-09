@@ -9,13 +9,14 @@ import {
   type ImportedTable,
 } from "../shared/import-content";
 import { documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
+import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import { projectDocument } from "../shared/document-projection";
 import type { DocumentContentEnvelope, ImportPreview, ProseMirrorJson } from "../shared/types";
 import { readZip, type ZipEntry } from "../shared/zip";
 import { isUnsafeMime } from "./attachments";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
-import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Keys, deleteR2Prefix } from "./r2";
+import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { normalizeFilename } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { refreshPageSearchV2ForIdsStatements } from "./search-index";
@@ -731,7 +732,7 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
 
 export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Promise<boolean>) {
   const current = await env.DB.prepare(
-    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN ('running', 'failed', 'canceling')`,
+    `SELECT 1 active FROM jobs WHERE id = ? AND attempt = ? AND status IN (${CLEANUP_JOB_STATUS_SQL})`,
   )
     .bind(job.id, job.attempt)
     .first();
@@ -760,12 +761,6 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
     if (!(await stillOwned())) return;
     if (!response.ok) throw new Error("A staged import document could not be purged.");
   }
-  if (attachments.results.length && (await stillOwned()))
-    await deleteR2Keys(
-      env.BUCKET,
-      attachments.results.map((attachment) => attachment.r2_key),
-    );
-  if (!(await stillOwned())) return;
   await deleteR2AttemptArtifactKeys(
     env.BUCKET,
     attachments.results.map((attachment) => ({
@@ -773,6 +768,7 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
       artifactPath: attachment.content_sha256 ?? attachment.r2_key.split("/").at(-1)!,
     })),
     job.attempt,
+    stillOwned,
   );
   for (const page of pages.results) {
     if (!(await stillOwned())) return;

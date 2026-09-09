@@ -183,15 +183,21 @@ function escapeUnescapedPipes(value: string, forceEscape = false) {
   return result;
 }
 
+function serializeMarkdownTableInline(node: ProseMirrorJson): string {
+  if (typeof node.text === "string") {
+    return escapeUnescapedPipes(
+      serializeInline(node, "markdown"),
+      (node.marks ?? []).some((mark) => mark.type === "code"),
+    );
+  }
+  if (node.type === "mention" || node.type === "hardBreak" || node.type === "inlineMath") {
+    return escapeUnescapedPipes(serializeInline(node, "markdown"));
+  }
+  return (node.content ?? []).map(serializeMarkdownTableInline).join("");
+}
+
 function markdownTableCell(node: ProseMirrorJson) {
-  const rendered = (node.content ?? [])
-    .map((child) =>
-      escapeUnescapedPipes(
-        serializeInline(child, "markdown"),
-        typeof child.text === "string" && (child.marks ?? []).some((mark) => mark.type === "code"),
-      ),
-    )
-    .join("");
+  const rendered = (node.content ?? []).map(serializeMarkdownTableInline).join("");
   return normalizeText(rendered || escapeMarkdownInline(nodeText(node)));
 }
 
@@ -256,7 +262,7 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
       : `\`\`\`${language}\n${code}\n\`\`\`\n\n`;
   }
   if (type === "divider" || type === "horizontalRule") return format === "html" ? "<hr>" : "---\n\n";
-  if (["image", "audio", "video", "file"].includes(type)) {
+  if (["image", "audio", "video", "file", "pdf"].includes(type)) {
     const url = safeUrl(node.attrs?.url) ?? "";
     const caption = stringAttr(node, "caption") ?? type;
     if (format === "markdown") {
@@ -287,8 +293,9 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
       ? `<pre class="mermaid">${escapeHtml(source)}</pre>`
       : `\`\`\`mermaid\n${source}\n\`\`\`\n\n`;
   }
-  if (type === "columns" || type === "column") {
-    return format === "html" ? `<div class="${type}">${blockChildren()}</div>` : blockChildren();
+  if (type === "columns" || type === "columnList" || type === "column") {
+    const className = type === "columnList" ? "columns" : type;
+    return format === "html" ? `<div class="${className}">${blockChildren()}</div>` : blockChildren();
   }
   if (type === "bookmark" || type === "embed") {
     const url = safeUrl(node.attrs?.url) ?? "";
@@ -296,6 +303,30 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
     return format === "html"
       ? `<p class="bookmark"><a href="${escapeHtml(url)}" rel="noreferrer">${escapeHtml(title)}</a></p>`
       : `[${escapeMarkdownInline(title)}](${markdownDestination(url)})\n\n`;
+  }
+  if (type === "tableOfContents") {
+    return format === "html"
+      ? '<nav class="table-of-contents" data-derived-block="table-of-contents"></nav>'
+      : "[Table of contents]\n\n";
+  }
+  if (type === "breadcrumb") {
+    return format === "html" ? '<nav class="breadcrumb" data-derived-block="breadcrumb"></nav>' : "";
+  }
+  if (type === "linkToPage") {
+    const pageId = stringAttr(node, "pageId") ?? "";
+    const title = stringAttr(node, "title") ?? "Linked page";
+    const href = `/?page=${encodeURIComponent(pageId)}`;
+    return format === "html"
+      ? `<p class="linked-page"><a href="${escapeHtml(href)}">${escapeHtml(title)}</a></p>`
+      : `[${escapeMarkdownInline(title)}](${markdownDestination(href)})\n\n`;
+  }
+  if (type === "syncedBlockSource") return blockChildren();
+  if (type === "syncedBlockReference") {
+    const sourcePageId = stringAttr(node, "sourcePageId") ?? "";
+    const blockId = stringAttr(node, "blockId") ?? "";
+    return format === "html"
+      ? `<div class="synced-reference" data-source-page-id="${escapeHtml(sourcePageId)}" data-block-id="${escapeHtml(blockId)}">Synced content unavailable</div>`
+      : "[Synced content]\n\n";
   }
   if (type === "table" || type === "tableRow" || type === "tableCell" || type === "tableHeader") {
     if (format === "html") {
@@ -381,6 +412,41 @@ export function serializeDocument(root: ProseMirrorJson): SerializedDocument {
   return {
     ...projectDocument(root),
     markdown: serializeNode(root, "markdown").trimEnd() + "\n",
-    html: `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>body{font:16px/1.55 system-ui,sans-serif;max-width:860px;margin:40px auto;padding:0 24px;color:#171717}img{max-width:100%}pre{white-space:pre-wrap;background:#f5f5f5;padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-left:4px solid #777;background:#f7f7f7}.columns{display:flex;gap:16px}.column{flex:1}@media(max-width:700px){.columns{display:block}}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px}</style></head><body>${serializeNode(root, "html")}</body></html>`,
+    html: `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>:root{color-scheme:light dark}body{font:16px/1.55 system-ui,sans-serif;max-width:860px;margin:40px auto;padding:0 24px;background:Canvas;color:CanvasText}a{color:LinkText}img{max-width:100%}pre{white-space:pre-wrap;background:color-mix(in srgb,CanvasText 8%,Canvas);padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-left:4px solid #777;background:color-mix(in srgb,CanvasText 6%,Canvas)}.columns{display:flex;gap:16px}.column{flex:1}@media(max-width:700px){.columns{display:block}}table{border-collapse:collapse}td,th{border:1px solid color-mix(in srgb,CanvasText 25%,Canvas);padding:6px}.synced-reference{border-left:3px solid #777;padding:8px}</style></head><body>${serializeNode(root, "html")}</body></html>`,
   };
+}
+
+type TransclusionSourceProjection = { blockId: string; content: ProseMirrorJson[] };
+type TransclusionReferenceProjection = { sourcePageId: string; blockId: string };
+
+export function collectTransclusions(root: ProseMirrorJson) {
+  const sources: TransclusionSourceProjection[] = [];
+  const references: TransclusionReferenceProjection[] = [];
+  const visit = (node: ProseMirrorJson, containerId = "") => {
+    const nextContainerId =
+      node.type === "blockContainer" && typeof node.attrs?.id === "string" ? node.attrs.id : containerId;
+    if (node.type === "blockContainer") {
+      const source = (node.content ?? []).find((child) => child.type === "syncedBlockSource");
+      const group = (node.content ?? []).find((child) => child.type === "blockGroup");
+      if (source) {
+        sources.push({
+          blockId: stringAttr(source, "blockId") || nextContainerId,
+          content: group?.content ?? [],
+        });
+        return;
+      }
+    }
+    if (node.type === "syncedBlockSource") {
+      return;
+    }
+    if (node.type === "syncedBlockReference") {
+      const sourcePageId = stringAttr(node, "sourcePageId");
+      const blockId = stringAttr(node, "blockId");
+      if (sourcePageId && blockId) references.push({ sourcePageId, blockId });
+      return;
+    }
+    for (const child of node.content ?? []) visit(child, nextContainerId);
+  };
+  visit(root);
+  return { sources, references };
 }

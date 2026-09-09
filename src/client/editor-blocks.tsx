@@ -1,6 +1,8 @@
 import { renderToString } from "katex";
 import { createReactBlockSpec, createReactInlineContentSpec } from "@blocknote/react";
-import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from "react";
+import { notionBlockRegistry } from "../shared/notion-blocks";
+import { api, json } from "./api";
 import "katex/dist/katex.min.css";
 
 const CALLOUT_TONES = ["info", "success", "warning", "danger"] as const;
@@ -107,17 +109,34 @@ const math = createReactBlockSpec(
 )();
 
 export function MermaidBlock({ source, update }: { source: string; update?: (source: string) => void }) {
+  const [colorScheme, setColorScheme] = useState<"light" | "dark">(() =>
+    document.documentElement.getAttribute("data-mantine-color-scheme") === "dark" ? "dark" : "light",
+  );
   const renderBaseId = `notes-mermaid-${useId().replaceAll(":", "")}`;
   const renderSequence = useRef(0);
   const [preview, setPreview] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
+    const root = document.documentElement;
+    const updateTheme = () =>
+      setColorScheme(root.getAttribute("data-mantine-color-scheme") === "dark" ? "dark" : "light");
+    const observer = new MutationObserver(updateTheme);
+    observer.observe(root, { attributes: true, attributeFilter: ["data-mantine-color-scheme"] });
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
     let active = true;
     const renderId = `${renderBaseId}-${++renderSequence.current}`;
     void import("mermaid")
       .then(async ({ default: mermaid }) => {
-        mermaid.initialize({ startOnLoad: false, securityLevel: "strict", suppressErrorRendering: true });
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "strict",
+          suppressErrorRendering: true,
+          theme: colorScheme === "dark" ? "dark" : "default",
+        });
         const { svg } = await mermaid.render(renderId, source);
         if (!active) return;
         setPreview(`<!doctype html><html><body>${svg}</body></html>`);
@@ -131,7 +150,7 @@ export function MermaidBlock({ source, update }: { source: string; update?: (sou
     return () => {
       active = false;
     };
-  }, [renderBaseId, source]);
+  }, [colorScheme, renderBaseId, source]);
 
   return (
     <div className="editor-mermaid">
@@ -283,7 +302,276 @@ const embed = createReactBlockSpec(
   },
 )();
 
-export const coreBlockSpecs = { callout, math, mermaid, columns, embed };
+const bookmark = createReactBlockSpec(
+  {
+    type: "bookmark",
+    propSchema: { url: { default: "" }, title: { default: "Bookmark" } },
+    content: "none",
+  },
+  {
+    render: ({ block, editor }) => (
+      <div className="editor-bookmark">
+        <a href={safeBookmarkUrl(block.props.url) ?? undefined} target="_blank" rel="noreferrer">
+          <strong>{block.props.title || "Bookmark"}</strong>
+          <span>{block.props.url || "Add an HTTP, HTTPS, or mail link"}</span>
+        </a>
+        {editor.isEditable && (
+          <input
+            contentEditable={false}
+            aria-label="Bookmark URL"
+            type="url"
+            value={block.props.url}
+            onChange={(event) => editor.updateBlock(block, { props: { url: event.target.value } })}
+          />
+        )}
+      </div>
+    ),
+    toExternalHTML: ({ block }) => (
+      <a href={safeBookmarkUrl(block.props.url) ?? undefined}>{block.props.title || block.props.url}</a>
+    ),
+  },
+)();
+
+function TableOfContentsView({
+  editor,
+}: {
+  editor: { document: readonly any[]; onChange: (callback: () => void) => () => void };
+}) {
+  const [blocks, setBlocks] = useState(editor.document);
+  useEffect(() => editor.onChange(() => setBlocks(editor.document)), [editor]);
+  const headings = useMemo(() => {
+    const output: Array<{ id: string; level: number; text: string }> = [];
+    const visit = (nestedBlocks: readonly any[]) => {
+      for (const block of nestedBlocks) {
+        if (block.type === "heading" && Number(block.props?.level) <= 4) {
+          const text = Array.isArray(block.content)
+            ? block.content.map((item: any) => (typeof item.text === "string" ? item.text : "")).join("")
+            : "";
+          if (text.trim()) output.push({ id: block.id, level: Number(block.props?.level ?? 1), text });
+        }
+        if (Array.isArray(block.children)) visit(block.children);
+      }
+    };
+    visit(blocks);
+    return output;
+  }, [blocks]);
+  return (
+    <nav className="editor-toc" contentEditable={false} aria-label="Table of contents">
+      <strong>Table of contents</strong>
+      {headings.map((heading) => (
+        <button
+          type="button"
+          key={heading.id}
+          style={{ paddingInlineStart: `${(heading.level - 1) * 14}px` }}
+          onClick={() => document.querySelector<HTMLElement>(`[data-id="${CSS.escape(heading.id)}"]`)?.scrollIntoView()}
+        >
+          {heading.text}
+        </button>
+      ))}
+      {!headings.length && <span>Add headings to build this table.</span>}
+    </nav>
+  );
+}
+
+const tableOfContents = createReactBlockSpec(
+  { type: "tableOfContents", propSchema: { color: { default: "default" } }, content: "none" },
+  {
+    render: ({ editor }) => <TableOfContentsView editor={editor as never} />,
+    toExternalHTML: () => <div data-derived-block="table-of-contents" />,
+  },
+)();
+
+const columnList = createReactBlockSpec(
+  { type: "columnList", propSchema: {}, content: "none" },
+  {
+    render: () => (
+      <div className="editor-column-list-label" contentEditable={false}>
+        Columns
+      </div>
+    ),
+    toExternalHTML: () => <div className="columns" />,
+  },
+)();
+
+const column = createReactBlockSpec(
+  { type: "column", propSchema: {}, content: "none" },
+  {
+    render: () => (
+      <div className="editor-column-label" contentEditable={false}>
+        Column
+      </div>
+    ),
+    toExternalHTML: () => <div className="column" />,
+  },
+)();
+
+const syncedBlockSource = createReactBlockSpec(
+  { type: "syncedBlockSource", propSchema: { blockId: { default: "" } }, content: "none" },
+  {
+    render: () => (
+      <div className="editor-synced-label" contentEditable={false}>
+        Synced block source
+      </div>
+    ),
+    toExternalHTML: () => <div data-synced-block="source" />,
+  },
+)();
+
+type TransclusionResult =
+  | { status: "ok"; content: string; sourceTitle: string }
+  | { status: "not_found" | "no_access" };
+
+function SyncedReferenceView({
+  sourcePageId,
+  blockId,
+  onRemove,
+  onUnsync,
+}: {
+  sourcePageId: string;
+  blockId: string;
+  onRemove: () => void;
+  onUnsync: (content: string) => void;
+}) {
+  const [result, setResult] = useState<TransclusionResult | null>(null);
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    let active = true;
+    void api<{ results: TransclusionResult[] }>("/api/transclusions/lookup", {
+      method: "POST",
+      body: json({ references: [{ sourcePageId, blockId }], refresh: revision }),
+    })
+      .then((data) => {
+        if (active) setResult(data.results[0] ?? { status: "not_found" });
+      })
+      .catch(() => {
+        if (active) setResult({ status: "not_found" });
+      });
+    return () => {
+      active = false;
+    };
+  }, [blockId, revision, sourcePageId]);
+  if (!result) return <div className="editor-synced-placeholder">Loading synced content…</div>;
+  if (result.status !== "ok") return <div className="editor-synced-placeholder">Synced content is unavailable.</div>;
+  return (
+    <div className="editor-synced-reference" contentEditable={false}>
+      <div className="editor-synced-actions">
+        <a href={`/?page=${encodeURIComponent(sourcePageId)}`}>Edit source</a>
+        <button type="button" onClick={() => setRevision((value) => value + 1)}>
+          Refresh
+        </button>
+        <button
+          type="button"
+          onClick={() => onUnsync(new DOMParser().parseFromString(result.content, "text/html").body.textContent ?? "")}
+        >
+          Unsync to copy
+        </button>
+        <button type="button" onClick={onRemove}>
+          Remove
+        </button>
+      </div>
+      <div dangerouslySetInnerHTML={{ __html: result.content }} />
+    </div>
+  );
+}
+
+const syncedBlockReference = createReactBlockSpec(
+  {
+    type: "syncedBlockReference",
+    propSchema: { sourcePageId: { default: "" }, blockId: { default: "" } },
+    content: "none",
+  },
+  {
+    render: ({ block, editor }) => (
+      <SyncedReferenceView
+        sourcePageId={block.props.sourcePageId}
+        blockId={block.props.blockId}
+        onRemove={() => editor.removeBlocks([block])}
+        onUnsync={(content) => editor.replaceBlocks([block], [{ type: "paragraph", content }] as never)}
+      />
+    ),
+    toExternalHTML: ({ block }) => (
+      <div data-source-page-id={block.props.sourcePageId} data-block-id={block.props.blockId} />
+    ),
+  },
+)();
+
+function currentPageId() {
+  return new URLSearchParams(window.location.search).get("page") ?? "";
+}
+
+function BreadcrumbView() {
+  const [trail, setTrail] = useState<string[]>([]);
+  useEffect(() => {
+    const pageId = currentPageId();
+    if (!pageId) return;
+    void api<{ breadcrumbs: Array<{ title: string }> }>(`/api/pages/${pageId}/breadcrumbs`)
+      .then((data) => setTrail(data.breadcrumbs.map((item) => item.title)))
+      .catch(() => setTrail([]));
+  }, []);
+  return (
+    <div className="editor-breadcrumb" contentEditable={false}>
+      {trail.join(" / ") || "Breadcrumb"}
+    </div>
+  );
+}
+
+const breadcrumb = createReactBlockSpec(
+  { type: "breadcrumb", propSchema: {}, content: "none" },
+  { render: () => <BreadcrumbView />, toExternalHTML: () => <div data-derived-block="breadcrumb" /> },
+)();
+
+const linkToPage = createReactBlockSpec(
+  { type: "linkToPage", propSchema: { pageId: { default: "" }, title: { default: "Linked page" } }, content: "none" },
+  {
+    render: ({ block }) => (
+      <a className="editor-page-link" contentEditable={false} href={`/?page=${encodeURIComponent(block.props.pageId)}`}>
+        <span aria-hidden="true">□</span> {block.props.title}
+      </a>
+    ),
+    toExternalHTML: ({ block }) => <a href={`/?page=${encodeURIComponent(block.props.pageId)}`}>{block.props.title}</a>,
+  },
+)();
+
+const pdf = createReactBlockSpec(
+  { type: "pdf", propSchema: { url: { default: "" }, caption: { default: "PDF" } }, content: "none" },
+  {
+    render: ({ block, editor }) => (
+      <div className="editor-pdf">
+        {safeBookmarkUrl(block.props.url) ? (
+          <iframe title={block.props.caption} src={block.props.url} sandbox="" />
+        ) : (
+          <span>Add a PDF URL</span>
+        )}
+        {editor.isEditable && (
+          <input
+            aria-label="PDF URL"
+            type="url"
+            value={block.props.url}
+            onChange={(event) => editor.updateBlock(block, { props: { url: event.target.value } })}
+          />
+        )}
+      </div>
+    ),
+    toExternalHTML: ({ block }) => <a href={safeBookmarkUrl(block.props.url) ?? undefined}>{block.props.caption}</a>,
+  },
+)();
+
+export const coreBlockSpecs = {
+  callout,
+  math,
+  mermaid,
+  columns,
+  embed,
+  bookmark,
+  tableOfContents,
+  columnList,
+  column,
+  syncedBlockSource,
+  syncedBlockReference,
+  breadcrumb,
+  linkToPage,
+  pdf,
+};
 
 export const inlineMathSpec = createReactInlineContentSpec(
   { type: "inlineMath", content: "none", propSchema: { formula: { default: "x" } } } as const,
@@ -303,6 +591,23 @@ export const editorBlockFactories = [
   { type: "callout", label: "Callout", description: "Highlighted note with tone and icon", icon: "💡" },
   { type: "math", label: "Math", description: "KaTeX display formula", icon: "∑" },
   { type: "mermaid", label: "Diagram", description: "Mermaid flowchart or diagram", icon: "◇" },
-  { type: "columns", label: "Columns", description: "Responsive two-column content", icon: "▥" },
   { type: "embed", label: "Embed", description: "Allowlisted embed or safe bookmark", icon: "↗" },
-] as const;
+  { type: "bookmark", label: "Bookmark", description: "Link preview without embedded scripts", icon: "🔖" },
+  { type: "tableOfContents", label: "Table of contents", description: "Links to headings on this page", icon: "☷" },
+  { type: "columnList", label: "Columns", description: "Nested two-column layout", icon: "▥" },
+  { type: "syncedBlockSource", label: "Synced block", description: "Reusable source content", icon: "⟳" },
+  {
+    type: "syncedBlockReference",
+    label: "Synced reference",
+    description: "Reference content from another page",
+    icon: "↻",
+  },
+  { type: "breadcrumb", label: "Breadcrumb", description: "Current page ancestry", icon: "›" },
+  { type: "linkToPage", label: "Link to page", description: "Linked page card", icon: "□" },
+  { type: "pdf", label: "PDF", description: "PDF preview and download", icon: "▤" },
+] as const satisfies ReadonlyArray<{
+  type: keyof typeof notionBlockRegistry;
+  label: string;
+  description: string;
+  icon: string;
+}>;

@@ -25,6 +25,7 @@ Set for deployment with `wrangler secret put --env production`. Never place thes
 | `SLACK_CLIENT_SECRET`        | No                   | Slack OAuth v2 client secret.                                                                                                                                                                                                                |
 | `SLACK_SIGNING_SECRET`       | No                   | Verifies slash commands and Events API requests; requests older than five minutes and signature replays are rejected.                                                                                                                        |
 | `SLACK_TOKEN_ENCRYPTION_KEY` | No                   | High-entropy key used to encrypt bot access and refresh tokens with AES-GCM before D1 storage. Rotate by reinstalling Slack with the new key before removing the old deployment.                                                             |
+| `WEBHOOK_ENCRYPTION_KEY`     | For webhooks         | Independent high-entropy key used to encrypt integration webhook verification tokens with AES-GCM. Webhook subscription creation and delivery remain unavailable when it is unset.                                                           |
 
 `DO_LOCATION_HINT` is frozen into `workspaces.location_hint` at bootstrap and is **immutable in v1**.
 Changing the secret later has no effect on an existing workspace. It influences first Durable Object
@@ -37,19 +38,22 @@ For local development these live in `.dev.vars`; see `.dev.vars.example`.
 
 Declared in `wrangler.jsonc`, typed in `src/worker/env.ts`.
 
-| Binding            | Kind           | Target                                                                   |
-| ------------------ | -------------- | ------------------------------------------------------------------------ |
-| `DB`               | D1             | `cloudflare-realtime-notes`, migrations in `migrations/`                 |
-| `BUCKET`           | R2             | `cloudflare-realtime-notes`, preview `cloudflare-realtime-notes-preview` |
-| `DOCUMENT`         | Durable Object | class `Document`, SQLite-backed, hibernating                             |
-| `WORKSPACE_EVENTS` | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, audience-filtered   |
-| `NOTES_WORKFLOW`   | Workflow       | resumable imports, exports, template clones, migrations, and reindexing  |
-| `DELIVERY_QUEUE`   | Queue          | notification, email, Slack, and digest fan-out; configured with a DLQ    |
-| `BROWSER`          | Browser Run    | optional PDF generation                                                  |
-| `SEND_EMAIL`       | Email Service  | optional email delivery; the UI reports it unavailable when absent       |
+| Binding            | Kind           | Target                                                                      |
+| ------------------ | -------------- | --------------------------------------------------------------------------- |
+| `DB`               | D1             | `cloudflare-realtime-notes`, migrations in `migrations/`                    |
+| `BUCKET`           | R2             | `cloudflare-realtime-notes`, preview `cloudflare-realtime-notes-preview`    |
+| `DOCUMENT`         | Durable Object | class `Document`, SQLite-backed, hibernating                                |
+| `WORKSPACE_EVENTS` | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, audience-filtered      |
+| `NOTES_WORKFLOW`   | Workflow       | resumable imports, exports, template clones, migrations, and reindexing     |
+| `DELIVERY_QUEUE`   | Queue          | notification, email, Slack, and digest fan-out; configured with a DLQ       |
+| `BROWSER`          | Browser Run    | optional PDF generation                                                     |
+| `SEND_EMAIL`       | Email Service  | optional email delivery; the UI reports it unavailable when absent          |
+| `API_BURST_LIMIT`  | Rate Limit     | Notion-compatible API throttle: 100 requests per integration per 10 seconds |
+| `API_MINUTE_LIMIT` | Rate Limit     | Notion-compatible API throttle: 600 requests per integration per minute     |
 
 No KV, Workers AI, Vectorize, Hyperdrive, Analytics Engine, or Containers bindings are used. Slack is
-the only third-party HTTP dependency and is inactive until its four secrets are configured.
+inactive until its four secrets are configured. Verified integration webhooks can make outbound HTTPS
+requests and require `WEBHOOK_ENCRYPTION_KEY`.
 
 Durable Object class migrations are append-only:
 
@@ -64,16 +68,16 @@ Never rename or delete a class or binding without a Cloudflare Durable Object mi
 
 ## Worker settings
 
-| Setting                     | Value                      | Effect                                                                   |
-| --------------------------- | -------------------------- | ------------------------------------------------------------------------ |
-| `compatibility_date`        | `2026-08-14`               | Runtime behavior baseline                                                |
-| `compatibility_flags`       | `nodejs_compat`            | Required by Better Auth                                                  |
-| `observability.enabled`     | `true`                     | Workers Logs                                                             |
-| `upload_source_maps`        | `true`                     | Symbolicated stack traces in logs                                        |
-| `preview_urls`              | `true`                     | Per-version preview URLs; **inert here**, see below                      |
-| `assets.not_found_handling` | `single-page-application`  | SPA fallback                                                             |
-| `assets.run_worker_first`   | `["/api/*", "/parties/*"]` | Everything else is served by the asset layer without invoking the Worker |
-| `triggers.crons`            | `*/15 * * * *`             | Outbox recovery, digests, expiry, and cleanup; **required**              |
+| Setting                     | Value                                           | Effect                                                                                                                        |
+| --------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `compatibility_date`        | `2026-08-14`                                    | Runtime behavior baseline                                                                                                     |
+| `compatibility_flags`       | `nodejs_compat`                                 | Required by Better Auth                                                                                                       |
+| `observability.enabled`     | `true`                                          | Workers Logs                                                                                                                  |
+| `upload_source_maps`        | `true`                                          | Symbolicated stack traces in logs                                                                                             |
+| `preview_urls`              | `true`                                          | Per-version preview URLs; **inert here**, see below                                                                           |
+| `assets.not_found_handling` | `single-page-application`                       | SPA fallback                                                                                                                  |
+| `assets.run_worker_first`   | `["/api/*", "/parties/*", "/v1/*", "/share/*"]` | Browser APIs, collaboration sockets, Notion-compatible APIs, and public shares invoke the Worker before static-asset fallback |
+| `triggers.crons`            | `*/15 * * * *`                                  | Outbox recovery, digests, expiry, and cleanup; **required**                                                                   |
 
 Cloudflare does not generate preview URLs for Workers that implement a Durable Object, and this
 Worker exports two classes, so `preview_urls` has no effect on this deployment. It is left enabled

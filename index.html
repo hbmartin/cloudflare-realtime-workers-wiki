@@ -5,6 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f7f5f0" />
     <meta name="description" content="A self-hosted realtime team wiki on Cloudflare." />
+    <script>
+      try {
+        const saved = localStorage.getItem("notes:color-scheme") || "auto";
+        const dark = saved === "dark" || (saved === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.mantineColorScheme = dark ? "dark" : "light";
+      } catch {}
+    </script>
     <title>Notes</title>
   </head>
   <body>

@@ -11,13 +11,16 @@ export interface AppBindings {
   WORKSPACE_EVENTS: DurableObjectNamespace<WorkspaceEvents>;
   NOTES_WORKFLOW: Workflow<Readonly<JobWorkflowParams>>;
   DELIVERY_QUEUE: Queue;
+  API_BURST_LIMIT: RateLimit;
+  API_MINUTE_LIMIT: RateLimit;
   SEND_EMAIL?: SendEmail;
-  BROWSER?: BrowserRun;
+  BROWSER: BrowserRun;
   EMAIL_FROM?: string;
   SLACK_CLIENT_ID?: string;
   SLACK_CLIENT_SECRET?: string;
   SLACK_SIGNING_SECRET?: string;
   SLACK_TOKEN_ENCRYPTION_KEY?: string;
+  WEBHOOK_ENCRYPTION_KEY?: string;
   ASSETS: Fetcher;
   BETTER_AUTH_SECRET: string;
   BETTER_AUTH_URL: string;

@@ -14,6 +14,15 @@ import {
 } from "./attachments";
 import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
 import {
+  createIntegration,
+  integrationGrants,
+  listIntegrations,
+  replaceIntegrationGrants,
+  revokeIntegration,
+  rotateIntegrationToken,
+  updateIntegration,
+} from "./integrations";
+import {
   addCommentReply,
   commentThread,
   createCommentThread,
@@ -87,10 +96,23 @@ import type {
   WorkspaceEvent,
 } from "../shared/types";
 import { compareBinaryText } from "../shared/tree-model";
+import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
+import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
+import {
+  createWebhookSubscription,
+  deleteWebhookSubscription,
+  listWebhookDeliveries,
+  listWebhookSubscriptions,
+  pruneWebhookHistory,
+  resendWebhookVerification,
+  sendWebhookVerification,
+  updateWebhookSubscription,
+  verifyWebhookSubscription,
+} from "./webhooks";
 import {
   beginJobCancellation,
   consumeDeliveryMessage,
@@ -120,8 +142,19 @@ import {
   setSubscription,
   spaceWatchState,
 } from "./notifications";
+import { notionApi, notionFileResponse } from "./notion-api";
 import { parseSearchRequest, searchPages, searchTitles } from "./search";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
+import {
+  createShare,
+  getShare,
+  publicAttachment,
+  publicSitemap,
+  renderPublicShare,
+  resolveSharedPage,
+  revokeShare,
+  updateShare,
+} from "./shares";
 import {
   consumeSlackLink,
   createSlackOAuthUrl,
@@ -579,6 +612,15 @@ async function jsonBody(request: Request) {
     if (safeInstanceOf(error, HttpError)) throw error;
     throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
   }
+}
+
+function shareOptions(body: Record<string, unknown>) {
+  return {
+    ...(typeof body.includeSubpages === "boolean" ? { includeSubpages: body.includeSubpages } : {}),
+    ...(typeof body.allowIndexing === "boolean" ? { allowIndexing: body.allowIndexing } : {}),
+    ...(typeof body.showToc === "boolean" ? { showToc: body.showToc } : {}),
+    ...(typeof body.showLastUpdated === "boolean" ? { showLastUpdated: body.showLastUpdated } : {}),
+  };
 }
 
 async function limitedJsonBody(request: Request, limit: number) {
@@ -1814,7 +1856,7 @@ app.post("/api/jobs/:id/retry", async (c) => {
 app.post("/api/jobs/:id/cleanup", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const job = await jobForMember(c.env, member, c.req.param("id"));
-  if (!job.cleanup_target || !["running", "failed", "canceling"].includes(job.status)) {
+  if (!job.cleanup_target || !isCleanupJobStatus(job.status)) {
     throw new HttpError(409, "job_cleanup_not_pending", "This job does not have cleanup pending.");
   }
   c.executionCtx.waitUntil(
@@ -1822,6 +1864,7 @@ app.post("/api/jobs/:id/cleanup", async (c) => {
       console.error("Failed to retry pending job cleanup", { jobId: job.id, error }),
     ),
   );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
   return c.json({ job: jobJson(job) }, 202);
 });
 
@@ -1854,6 +1897,134 @@ app.get("/api/integrations/status", async (c) => {
     pdf: { available: Boolean(c.env.BROWSER) },
     slack: slackConfigurationStatus(c.env),
   });
+});
+
+app.get("/api/integrations", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ integrations: await listIntegrations(c.env, member) });
+});
+
+app.post("/api/integrations", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  const name = text(body.name, "name", 100).trim();
+  if (!name) throw new HttpError(422, "invalid_name", "Integration name is required.");
+  return c.json(await createIntegration(c.env, member, name), 201);
+});
+
+app.patch("/api/integrations/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  await updateIntegration(c.env, member, c.req.param("id"), {
+    ...(typeof body.name === "string" ? { name: text(body.name, "name", 100) } : {}),
+    ...(typeof body.readContent === "boolean" ? { readContent: body.readContent } : {}),
+    ...(typeof body.insertContent === "boolean" ? { insertContent: body.insertContent } : {}),
+    ...(typeof body.updateContent === "boolean" ? { updateContent: body.updateContent } : {}),
+    ...(typeof body.readComments === "boolean" ? { readComments: body.readComments } : {}),
+    ...(typeof body.insertComments === "boolean" ? { insertComments: body.insertComments } : {}),
+    ...(typeof body.userInformation === "string"
+      ? { userInformation: body.userInformation as "none" | "basic" | "email" }
+      : {}),
+  });
+  return c.json({ integrations: await listIntegrations(c.env, member) });
+});
+
+app.post("/api/integrations/:id/rotate", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ token: await rotateIntegrationToken(c.env, member, c.req.param("id")) });
+});
+
+app.delete("/api/integrations/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await revokeIntegration(c.env, member, c.req.param("id"));
+  return c.body(null, 204);
+});
+
+app.get("/api/integrations/:id/grants", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ grants: await integrationGrants(c.env, member, c.req.param("id")) });
+});
+
+app.put("/api/integrations/:id/grants", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  if (!Array.isArray(body.rootPageIds) || body.rootPageIds.some((id) => typeof id !== "string")) {
+    throw new HttpError(422, "invalid_grants", "rootPageIds must be an array of page ids.");
+  }
+  await replaceIntegrationGrants(c.env, member, c.req.param("id"), body.rootPageIds as string[]);
+  return c.json({ grants: await integrationGrants(c.env, member, c.req.param("id")) });
+});
+
+app.get("/api/webhooks", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ subscriptions: await listWebhookSubscriptions(c.env, member) });
+});
+
+app.post("/api/webhooks", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const input = await jsonBody(c.req.raw);
+  const created = await createWebhookSubscription(
+    c.env,
+    member,
+    text(input.integrationId, "integrationId", 100),
+    text(input.url, "url", 2_000),
+    input.events,
+  );
+  c.executionCtx.waitUntil(
+    sendWebhookVerification(c.env, created.subscription.id).catch((error) =>
+      console.error("Webhook verification request failed", { subscriptionId: created.subscription.id, error }),
+    ),
+  );
+  return c.json({ subscription: created.subscription }, 201);
+});
+
+app.patch("/api/webhooks/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const input = await jsonBody(c.req.raw);
+  await updateWebhookSubscription(c.env, member, c.req.param("id"), {
+    ...(typeof input.url === "string" ? { url: input.url } : {}),
+    ...(input.events !== undefined ? { events: input.events } : {}),
+    ...(typeof input.paused === "boolean" ? { paused: input.paused } : {}),
+  });
+  return c.json({ subscriptions: await listWebhookSubscriptions(c.env, member) });
+});
+
+app.post("/api/webhooks/:id/verify", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const input = await jsonBody(c.req.raw);
+  await verifyWebhookSubscription(c.env, member, c.req.param("id"), text(input.token, "token", 200));
+  return c.json({ subscriptions: await listWebhookSubscriptions(c.env, member) });
+});
+
+app.post("/api/webhooks/:id/resend", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await resendWebhookVerification(c.env, member, c.req.param("id"));
+  return c.json({ ok: true });
+});
+
+app.delete("/api/webhooks/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await deleteWebhookSubscription(c.env, member, c.req.param("id"));
+  return c.body(null, 204);
+});
+
+app.get("/api/webhook-deliveries", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ deliveries: await listWebhookDeliveries(c.env, member, c.req.query("subscriptionId")) });
 });
 
 app.get("/api/slack/status", async (c) => {
@@ -2253,6 +2424,98 @@ app.post("/api/pages/batch", async (c) => {
 app.get("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   return c.json({ page: pageJson(await pageForMember(c.env, member, c.req.param("id"), true)) });
+});
+
+app.get("/api/pages/:id/breadcrumbs", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const rows = await c.env.DB.prepare(
+    `WITH RECURSIVE trail(id, parent_id, title, depth) AS (
+       SELECT id, parent_id, title, 0 FROM pages WHERE id = ?
+       UNION ALL
+       SELECT parent.id, parent.parent_id, parent.title, trail.depth + 1
+         FROM pages parent JOIN trail ON parent.id = trail.parent_id
+        WHERE parent.workspace_id = ? AND trail.depth < 50
+     ) SELECT id, title FROM trail ORDER BY depth DESC`,
+  )
+    .bind(page.id, member.workspace.id)
+    .all<{ id: string; title: string }>();
+  return c.json({ breadcrumbs: rows.results });
+});
+
+app.post("/api/transclusions/lookup", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const body = await jsonBody(c.req.raw);
+  if (!Array.isArray(body.references) || body.references.length > 25) {
+    throw new HttpError(422, "invalid_transclusions", "Choose up to 25 synced block references.");
+  }
+  const references = body.references.map((value) => {
+    const reference = object(value);
+    return {
+      sourcePageId: text(reference.sourcePageId, "sourcePageId", 100),
+      blockId: text(reference.blockId, "blockId", 100),
+    };
+  });
+  const results = await Promise.all(
+    references.map(async (reference) => {
+      try {
+        const page = await pageForMember(c.env, member, reference.sourcePageId);
+        if (page.kind !== "document") return { ...reference, status: "not_found" as const };
+        const source = await c.env.DB.prepare(
+          `SELECT content_json FROM transclusion_sources WHERE page_id = ? AND block_id = ?`,
+        )
+          .bind(reference.sourcePageId, reference.blockId)
+          .first<{ content_json: string }>();
+        if (!source) return { ...reference, status: "not_found" as const };
+        const content = JSON.parse(source.content_json) as ProseMirrorJson[];
+        const html = serializeDocument({ type: "doc", content: [{ type: "blockGroup", content }] }).html;
+        return {
+          ...reference,
+          status: "ok" as const,
+          sourceTitle: page.title,
+          content: /<body>([\s\S]*)<\/body>/i.exec(html)?.[1] ?? html,
+        };
+      } catch (error) {
+        if (safeHttpErrorCode(error) === "page_not_found") return { ...reference, status: "no_access" as const };
+        throw error;
+      }
+    }),
+  );
+  return c.json({ results });
+});
+
+app.get("/api/pages/:pageId/share", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ share: await getShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin) });
+});
+
+app.post("/api/pages/:pageId/share", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  return c.json(
+    {
+      share: await createShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin, shareOptions(body)),
+    },
+    201,
+  );
+});
+
+app.patch("/api/pages/:pageId/share", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  return c.json({
+    share: await updateShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin, shareOptions(body)),
+  });
+});
+
+app.delete("/api/pages/:pageId/share", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await revokeShare(c.env, member, c.req.param("pageId"));
+  return c.body(null, 204);
 });
 
 app.get("/api/pages/:id/comments", async (c) => {
@@ -4797,6 +5060,49 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
   return c.json({ revision });
 });
 
+app.get("/share/:key/assets/:attachmentId", async (c) => {
+  const share = await resolveSharedPage(c.env, c.req.param("key"), c.req.query("page"));
+  if (!share) return c.text("Not found", 404);
+  return (await publicAttachment(c.env, share, c.req.param("attachmentId"))) ?? c.text("Not found", 404);
+});
+
+app.get("/share/:key/sitemap.xml", async (c) => {
+  const share = await resolveSharedPage(c.env, c.req.param("key"));
+  if (!share) return c.text("Not found", 404);
+  const sitemap = await publicSitemap(c.env, share, c.req.param("key"), new URL(c.req.url).origin);
+  return sitemap
+    ? c.body(sitemap, 200, { "content-type": "application/xml; charset=utf-8", "cache-control": "no-store" })
+    : c.text("Not found", 404);
+});
+
+async function publicPageResponse(c: Context<{ Bindings: Env }>, pageId?: string) {
+  const key = c.req.param("key");
+  if (!key) return c.text("Not found", 404);
+  const share = await resolveSharedPage(c.env, key, pageId);
+  if (!share) return c.text("Not found", 404);
+  const html = await renderPublicShare(c.env, share, key, new URL(c.req.url).origin);
+  if (!html) return c.text("Not found", 404);
+  c.executionCtx.waitUntil(
+    c.env.DB.prepare(
+      `UPDATE share_links SET views = views + 1, last_accessed_at = ? WHERE id = ? AND revoked_at IS NULL`,
+    )
+      .bind(Date.now(), share.id)
+      .run()
+      .then(() => undefined),
+  );
+  return c.html(html, 200, { "cache-control": "no-store" });
+}
+
+app.get("/share/:key/pages/:pageId", (c) => publicPageResponse(c, c.req.param("pageId")));
+app.get("/share/:key", (c) => publicPageResponse(c));
+
+app.get(
+  "/v1/files/:attachmentId",
+  async (c) => (await notionFileResponse(c.req.raw, c.env, c.req.param("attachmentId"))) ?? c.text("Not found", 404),
+);
+
+app.route("/v1", notionApi);
+
 app.notFound(async (c) => {
   if (new URL(c.req.url).pathname.startsWith("/api/")) {
     return c.json({ error: { code: "not_found", message: "API route not found." } }, 404);
@@ -5067,6 +5373,11 @@ export default {
     context.waitUntil(
       pruneSlackSecurityRecords(env).catch((error) => {
         console.error("Slack security-record pruning failed", error);
+      }),
+    );
+    context.waitUntil(
+      pruneWebhookHistory(env).catch((error) => {
+        console.error("Webhook history pruning failed", error);
       }),
     );
   },

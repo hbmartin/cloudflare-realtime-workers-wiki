@@ -80,10 +80,15 @@ attach one, `BETTER_AUTH_URL` must match it exactly, including scheme and absenc
 ```sh
 pnpm wrangler secret put BETTER_AUTH_SECRET --env production
 pnpm wrangler secret put BOOTSTRAP_TOKEN --env production
+pnpm wrangler secret put WEBHOOK_ENCRYPTION_KEY --env production
 ```
 
 Use at least 32 random bytes for `BETTER_AUTH_SECRET`. Treat `BOOTSTRAP_TOKEN` as a one-time operator
 credential and rotate or remove it after the owner is created.
+
+Use a separate high-entropy value for `WEBHOOK_ENCRYPTION_KEY`. It encrypts integration webhook
+verification secrets at rest; webhook subscription creation and delivery are disabled when it is
+absent.
 
 `BETTER_AUTH_SECRET` is not only the session signing key. It is also the shared secret the Worker sends
 as the `x-notes-internal` header when it calls a Durable Object directly, for archive, version restore,
@@ -110,9 +115,10 @@ keeps in-app notifications active and clearly reports Slack as unavailable.
 
 ## 4. Configure rate limiting
 
-The application performs no rate limiting of its own. It never returns `429`. `/api/install/bootstrap`,
-`/api/invites/accept`, and `/api/auth/*` sign-in are all unthrottled at the application layer, which
-makes the bootstrap token and member passwords brute-forceable without external protection.
+The `/v1` API uses the `API_BURST_LIMIT` and `API_MINUTE_LIMIT` Workers Rate Limiting bindings declared
+in `wrangler.jsonc`. They are keyed by integration and return a Notion-compatible `429` response at
+100 requests per 10 seconds or 600 requests per minute. Browser authentication and install routes are
+still unthrottled at the application layer, so retain external protection for them.
 
 Add Cloudflare Rate Limiting rules before exposing the origin publicly. At minimum:
 

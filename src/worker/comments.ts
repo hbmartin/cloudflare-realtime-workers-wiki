@@ -3,6 +3,7 @@ import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { notificationFanoutStatements } from "./notifications";
 import { refreshPageSearchV2Statements } from "./search-index";
+import { webhookEventStatements } from "./webhooks";
 
 const COMMENT_BODY_MAX_BYTES = 32 * 1024;
 const COMMENT_BODY_MAX_NODES = 2_000;
@@ -284,6 +285,16 @@ export async function createCommentThread(env: Env, member: MemberContext, page:
       data: { commentId },
       createdAt: timestamp,
     }),
+    ...webhookEventStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      type: "comment.created",
+      entityType: "comment",
+      entityId: commentId,
+      pageId: page.id,
+      actorId: member.user.id,
+      sourceKey: `comment:${commentId}:created`,
+      createdAt: timestamp,
+    }),
     ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
@@ -352,6 +363,16 @@ export async function addCommentReply(
       data: { commentId },
       createdAt: timestamp,
     }),
+    ...webhookEventStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      type: "comment.created",
+      entityType: "comment",
+      entityId: commentId,
+      pageId: page.id,
+      actorId: member.user.id,
+      sourceKey: `comment:${commentId}:created`,
+      createdAt: timestamp,
+    }),
     ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
@@ -401,6 +422,16 @@ export async function updateComment(
       data: { commentId },
       createdAt: timestamp,
     }),
+    ...webhookEventStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      type: "comment.updated",
+      entityType: "comment",
+      entityId: commentId,
+      pageId: page.id,
+      actorId: member.user.id,
+      sourceKey: `comment:${commentId}:updated:${timestamp}`,
+      createdAt: timestamp,
+    }),
     ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
@@ -428,6 +459,16 @@ export async function softDeleteComment(
         WHERE id = ?`,
     ).bind(timestamp, timestamp, commentId),
     env.DB.prepare(`UPDATE comment_threads SET updated_at = ? WHERE id = ?`).bind(timestamp, threadId),
+    ...webhookEventStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      type: "comment.deleted",
+      entityType: "comment",
+      entityId: commentId,
+      pageId: page.id,
+      actorId: member.user.id,
+      sourceKey: `comment:${commentId}:deleted:${timestamp}`,
+      createdAt: timestamp,
+    }),
     ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
