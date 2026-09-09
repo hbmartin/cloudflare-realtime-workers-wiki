@@ -82,9 +82,11 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
     try {
       await action();
       setError("");
+      return true;
     } catch (cause) {
       await load();
       setError(apiErrorMessage(cause, fallback));
+      return false;
     }
   }
 
@@ -106,10 +108,10 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
   }
 
   async function patchIntegration(id: string, change: Partial<Capabilities>) {
-    await runWithError(async () => {
+    const succeeded = await runWithError(async () => {
       await api(`/api/integrations/${id}`, { method: "PATCH", body: json(change) });
-      await load();
     }, "The integration could not be updated.");
+    if (succeeded) await load();
   }
 
   async function showGrants(integrationId: string) {
@@ -122,27 +124,27 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
   async function toggleGrant(integrationId: string, pageId: string, checked: boolean) {
     const current = grants[integrationId] ?? [];
     const rootPageIds = checked ? [...new Set([...current, pageId])] : current.filter((id) => id !== pageId);
-    await runWithError(async () => {
+    const succeeded = await runWithError(async () => {
       await api(`/api/integrations/${integrationId}/grants`, { method: "PUT", body: json({ rootPageIds }) });
       setGrants((value) => ({ ...value, [integrationId]: rootPageIds }));
-      await load();
     }, "Page grants could not be updated.");
+    if (succeeded) await load();
   }
 
   async function rotate(integrationId: string) {
     if (!confirm("Rotate this token? The current token will stop working immediately.")) return;
-    await runWithError(async () => {
+    const succeeded = await runWithError(async () => {
       const result = await api<{ token: string }>(`/api/integrations/${integrationId}/rotate`, { method: "POST" });
       setRevealedToken(result.token);
-      await load();
     }, "The integration token could not be rotated.");
+    if (succeeded) await load();
   }
 
   async function createWebhook(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
-    await runWithError(async () => {
+    const succeeded = await runWithError(async () => {
       await api("/api/webhooks", {
         method: "POST",
         body: json({
@@ -162,8 +164,8 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
         }),
       });
       formElement.reset();
-      await load();
     }, "The webhook could not be created.");
+    if (succeeded) await load();
   }
 
   return (
@@ -320,7 +322,13 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
                 >
                   Verify
                 </button>
-                <button onClick={() => void api(`/api/webhooks/${webhook.id}/resend`, { method: "POST" })}>
+                <button
+                  onClick={() =>
+                    void runWithError(async () => {
+                      await api(`/api/webhooks/${webhook.id}/resend`, { method: "POST" });
+                    }, "The verification request could not be resent.")
+                  }
+                >
                   Resend
                 </button>
               </div>

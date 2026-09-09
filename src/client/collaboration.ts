@@ -201,6 +201,7 @@ export function createNetworkCollaboration(
   });
   let hiddenTimer: number | undefined;
   let barrierTimer: number | undefined;
+  let barrierDeadline: number | undefined;
   let retryTimer: number | undefined;
   let retryAttempt = 0;
 
@@ -228,12 +229,19 @@ export function createNetworkCollaboration(
     if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
     barrierTimer = undefined;
     const generation = durability.barrierGeneration();
-    if (generation === null || !provider.synced) return;
+    if (generation === null) {
+      barrierDeadline = undefined;
+      return;
+    }
+    if (!provider.synced) return;
+    barrierDeadline = undefined;
     provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
   };
   const scheduleBarrier = () => {
+    const now = Date.now();
+    barrierDeadline ??= now + 5_000;
     if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
-    barrierTimer = window.setTimeout(sendBarrier, 500);
+    barrierTimer = window.setTimeout(sendBarrier, Math.max(0, Math.min(500, barrierDeadline - now)));
   };
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
     if (status === "disconnected") {

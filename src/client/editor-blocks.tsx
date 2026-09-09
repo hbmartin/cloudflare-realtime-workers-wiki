@@ -550,7 +550,7 @@ const linkToPage = createReactBlockSpec(
   },
 )();
 
-function LinkedDiagramView({
+export function LinkedDiagramView({
   pageId,
   title,
   editable,
@@ -561,7 +561,8 @@ function LinkedDiagramView({
   editable: boolean;
   update?: (page: Pick<Page, "id" | "title">) => void;
 }) {
-  const [choosing, setChoosing] = useState(!pageId);
+  const canUpdate = editable && Boolean(update);
+  const [choosing, setChoosing] = useState(!pageId && canUpdate);
   const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<SearchTitleSuggestion[]>([]);
   const [busy, setBusy] = useState(false);
@@ -611,6 +612,16 @@ function LinkedDiagramView({
     }
   }
 
+  if (!pageId && !canUpdate) {
+    return (
+      <figure className="editor-linked-diagram" contentEditable={false}>
+        <figcaption>
+          <span aria-hidden="true">◇</span> {title || "Linked whiteboard"} unavailable
+        </figcaption>
+      </figure>
+    );
+  }
+
   if (!pageId || choosing) {
     return (
       <div className="editor-linked-diagram-picker" contentEditable={false}>
@@ -635,7 +646,7 @@ function LinkedDiagramView({
               <small>{suggestion.space.name}</small>
             </button>
           ))}
-          {editable && (
+          {canUpdate && (
             <button type="button" disabled={busy} onClick={() => void createDiagram()}>
               ＋ Create {query.trim() ? `“${query.trim()}”` : "child diagram"}
             </button>
@@ -680,7 +691,11 @@ const linkedDiagram = createReactBlockSpec(
         pageId={block.props.pageId}
         title={block.props.title}
         editable={editor.isEditable}
-        update={(page) => editor.updateBlock(block, { props: { pageId: page.id, title: page.title } })}
+        update={
+          editor.isEditable
+            ? (page) => editor.updateBlock(block, { props: { pageId: page.id, title: page.title } })
+            : undefined
+        }
       />
     ),
     toExternalHTML: ({ block }) => (

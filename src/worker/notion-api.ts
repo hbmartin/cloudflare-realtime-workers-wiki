@@ -856,33 +856,115 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
     }
     const eventType: WebhookEventType =
       inTrash === true ? "page.deleted" : inTrash === false ? "page.undeleted" : "page.properties_updated";
-    const statements = [
+    const archiveTimestamp = inTrash === true ? (page.archived_at ?? timestamp) : null;
+    const archiveOperationId =
+      inTrash === true ? (page.archived_at === null ? crypto.randomUUID() : (page.archive_operation_id ?? null)) : null;
+    const archiveOwner =
+      inTrash === true
+        ? page.archived_at === null
+          ? principal.botUserId
+          : (page.archived_by ?? principal.botUserId)
+        : null;
+    const restoreOperationId = page.archive_operation_id ?? null;
+    const restoreOwnershipSql = restoreOperationId
+      ? "archive_operation_id = ?"
+      : "archive_operation_id IS NULL AND archived_at = ?";
+    const restoreOwnership = restoreOperationId ?? page.archived_at;
+    const statements: D1PreparedStatement[] = [];
+    if (inTrash === true) {
+      statements.push(
+        c.env.DB.prepare(
+          `WITH RECURSIVE tree(id) AS (
+             SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+           )
+           INSERT INTO archive_disconnect_targets
+            (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
+           SELECT id, workspace_id, content_epoch, id || '~' || content_epoch, ?, ?, ?
+             FROM pages
+            WHERE id IN (SELECT id FROM tree) AND archived_at IS NULL AND kind IN ('document', 'diagram')
+           ON CONFLICT(page_id) DO UPDATE SET
+             workspace_id = excluded.workspace_id,
+             content_epoch = excluded.content_epoch,
+             room = excluded.room,
+             attempts = 0,
+             next_attempt_at = excluded.next_attempt_at,
+             last_error = NULL,
+             updated_at = excluded.updated_at
+           RETURNING page_id, content_epoch`,
+        ).bind(page.id, timestamp, timestamp, timestamp),
+      );
+    } else if (inTrash === false) {
+      statements.push(
+        c.env.DB.prepare(
+          `DELETE FROM archive_disconnect_targets WHERE page_id IN (
+             WITH RECURSIVE tree(id) AS (
+               SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+             )
+             SELECT pages.id FROM pages JOIN tree ON tree.id = pages.id WHERE ${restoreOwnershipSql}
+           )`,
+        ).bind(page.id, restoreOwnership),
+      );
+    }
+    statements.push(
       inTrash === undefined
         ? c.env.DB.prepare(
             `UPDATE pages SET title = COALESCE(?, title), icon = CASE WHEN ? THEN ? ELSE icon END,
                 revision = revision + 1, updated_by = ?, updated_at = ? WHERE id = ?`,
           ).bind(title, icon !== undefined ? 1 : 0, icon ?? null, principal.botUserId, timestamp, page.id)
-        : c.env.DB.prepare(
-            `WITH RECURSIVE tree(id) AS (
-               SELECT id FROM pages WHERE id = ?
-               UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
-             ) UPDATE pages SET
-                 title = CASE WHEN id = ? THEN COALESCE(?, title) ELSE title END,
-                 icon = CASE WHEN id = ? AND ? THEN ? ELSE icon END,
-                 archived_at = ?, archived_by = ?, revision = revision + 1,
-                 updated_by = ?, updated_at = ? WHERE id IN (SELECT id FROM tree)`,
-          ).bind(
-            page.id,
-            page.id,
-            title,
-            page.id,
-            icon !== undefined ? 1 : 0,
-            icon ?? null,
-            inTrash ? timestamp : null,
-            inTrash ? principal.botUserId : null,
-            principal.botUserId,
-            timestamp,
-          ),
+        : inTrash
+          ? c.env.DB.prepare(
+              `WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM pages WHERE id = ?
+                 UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+               ) UPDATE pages SET
+                   title = CASE WHEN id = ? THEN COALESCE(?, title) ELSE title END,
+                   icon = CASE WHEN id = ? AND ? THEN ? ELSE icon END,
+                   archived_at = CASE WHEN archived_at IS NULL THEN ? ELSE archived_at END,
+                   archived_by = CASE WHEN archived_at IS NULL THEN ? ELSE archived_by END,
+                   archive_operation_id = CASE WHEN archived_at IS NULL THEN ? ELSE archive_operation_id END,
+                   revision = revision + 1, updated_by = ?, updated_at = ?
+                 WHERE id IN (SELECT id FROM tree) AND (id = ? OR archived_at IS NULL)`,
+            ).bind(
+              page.id,
+              page.id,
+              title,
+              page.id,
+              icon !== undefined ? 1 : 0,
+              icon ?? null,
+              archiveTimestamp,
+              archiveOwner,
+              archiveOperationId,
+              principal.botUserId,
+              timestamp,
+              page.id,
+            )
+          : c.env.DB.prepare(
+              `WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM pages WHERE id = ?
+                 UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+               ) UPDATE pages SET
+                   title = CASE WHEN id = ? THEN COALESCE(?, title) ELSE title END,
+                   icon = CASE WHEN id = ? AND ? THEN ? ELSE icon END,
+                   archived_at = CASE WHEN ${restoreOwnershipSql} THEN NULL ELSE archived_at END,
+                   archived_by = CASE WHEN ${restoreOwnershipSql} THEN NULL ELSE archived_by END,
+                   archive_operation_id = CASE WHEN ${restoreOwnershipSql} THEN NULL ELSE archive_operation_id END,
+                   revision = revision + 1, updated_by = ?, updated_at = ?
+                 WHERE id IN (SELECT id FROM tree) AND (id = ? OR ${restoreOwnershipSql})`,
+            ).bind(
+              page.id,
+              page.id,
+              title,
+              page.id,
+              icon !== undefined ? 1 : 0,
+              icon ?? null,
+              restoreOwnership,
+              restoreOwnership,
+              restoreOwnership,
+              principal.botUserId,
+              timestamp,
+              page.id,
+              restoreOwnership,
+            ),
       ...webhookEventStatements(c.env.DB, {
         workspaceId: principal.workspaceId,
         type: eventType,
@@ -893,7 +975,7 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
         sourceKey: `${eventType}:${page.id}:${timestamp}`,
         createdAt: timestamp,
       }),
-    ];
+    );
     if (inTrash === undefined) {
       statements.push(
         c.env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(page.id),
@@ -927,39 +1009,8 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
         );
       }
       statements.push(...refreshPageSearchV2SubtreeStatements(c.env.DB, page.id));
-      if (inTrash) {
-        statements.push(
-          c.env.DB.prepare(
-            `WITH RECURSIVE tree(id) AS (
-               SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
-             )
-             INSERT INTO archive_disconnect_targets
-              (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
-             SELECT id, workspace_id, content_epoch, id || '~' || content_epoch, ?, ?, ?
-               FROM pages WHERE id IN (SELECT id FROM tree) AND kind IN ('document', 'diagram')
-             ON CONFLICT(page_id) DO UPDATE SET
-               workspace_id = excluded.workspace_id,
-               content_epoch = excluded.content_epoch,
-               room = excluded.room,
-               attempts = 0,
-               next_attempt_at = excluded.next_attempt_at,
-               last_error = NULL,
-               updated_at = excluded.updated_at`,
-          ).bind(page.id, timestamp, timestamp, timestamp),
-        );
-      } else {
-        statements.push(
-          c.env.DB.prepare(
-            `DELETE FROM archive_disconnect_targets WHERE page_id IN (
-               WITH RECURSIVE tree(id) AS (
-                 SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
-               ) SELECT id FROM tree
-             )`,
-          ).bind(page.id),
-        );
-      }
     }
-    await c.env.DB.batch(statements);
+    const mutationResults = await c.env.DB.batch<{ page_id: string; content_epoch: number }>(statements);
     const subtree = await pageRowsForSubtree(c.env, principal.workspaceId, page.id);
     if (inTrash === true) {
       workspaceEvent = { type: "pages-removed", pageIds: subtree.map((item) => item.id), permanently: false };
@@ -976,12 +1027,9 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
     }
     if (inTrash === true) {
       c.executionCtx.waitUntil(
-        processArchiveDisconnectTargets(
-          c.env,
-          subtree
-            .filter((item) => item.kind === "document" || item.kind === "diagram")
-            .map((item) => ({ page_id: item.id, content_epoch: item.content_epoch })),
-        ).catch((error) => console.error("Notion API archive disconnect failed", error)),
+        processArchiveDisconnectTargets(c.env, mutationResults[0]?.results ?? []).catch((error) =>
+          console.error("Notion API archive disconnect failed", error),
+        ),
       );
     }
   }

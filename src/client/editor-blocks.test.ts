@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 
-import { render, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   allowedEmbedUrl,
   editorBlockFactories,
+  LinkedDiagramView,
   MermaidBlock,
   renderedMath,
   safeBookmarkUrl,
@@ -67,5 +68,13 @@ describe("core editor blocks", () => {
 
     expect(editor.tryParseHTMLToBlocks).toHaveBeenCalledWith(html);
     expect(editor.replaceBlocks).toHaveBeenCalledWith([reference], parsed);
+  });
+
+  it("renders an empty linked diagram inertly when the editor is read-only", () => {
+    render(createElement(LinkedDiagramView, { pageId: "", title: "System map", editable: false }));
+
+    expect(screen.getByText(/System map unavailable/)).toBeInTheDocument();
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 });

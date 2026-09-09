@@ -20,6 +20,7 @@ import { deliverWebhook, fanoutWebhookEvent } from "./webhooks";
 
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
+const OUTBOX_SWEEP_MAX_BATCHES = 5;
 const OUTBOX_POISON_WARNING_ATTEMPTS = 10;
 const OUTBOX_POISON_WARNING_INTERVAL = 24;
 const OUTBOX_RETRY_BASE_MS = 10_000;
@@ -1147,7 +1148,7 @@ async function enqueueOutbox(env: Env, outboxId: string) {
 }
 
 export async function sweepOutbox(env: Env) {
-  while (true) {
+  for (let batch = 0; batch < OUTBOX_SWEEP_MAX_BATCHES; batch += 1) {
     const rows = await env.DB.prepare(
       `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
         ORDER BY available_at, created_at, id LIMIT ?`,

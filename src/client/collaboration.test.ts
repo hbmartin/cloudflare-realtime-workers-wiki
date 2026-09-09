@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createCollaboration, createWorkspaceEvents } from "./collaboration";
+import { createCollaboration, createNetworkCollaboration, createWorkspaceEvents } from "./collaboration";
 
 const mocks = vi.hoisted(() => ({
   whenSynced: new Promise<void>(() => undefined),
@@ -70,6 +70,10 @@ vi.mock("yjs", () => ({
       this.handlers.set(event, handlers);
     }
 
+    off(event: string, handler: (...args: unknown[]) => void) {
+      this.handlers.get(event)?.delete(handler);
+    }
+
     emitUpdate(origin: unknown) {
       for (const handler of this.handlers.get("update") ?? []) handler(new Uint8Array([1]), origin);
     }
@@ -109,6 +113,28 @@ describe("collaboration durability barriers", () => {
     await vi.advanceTimersByTimeAsync(500);
 
     expect(provider.sendMessage).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
+  it("bounds diagram durability latency while retaining the quiet-period debounce", async () => {
+    const bundle = createNetworkCollaboration("page", 1, vi.fn());
+    const doc = bundle.doc as typeof bundle.doc & { emitUpdate: (origin: unknown) => void };
+    const provider = mocks.providers[0]!;
+    provider.synced = true;
+    provider.emit("sync", true);
+
+    for (let elapsed = 0; elapsed < 4_800; elapsed += 400) {
+      doc.emitUpdate(null);
+      await vi.advanceTimersByTimeAsync(400);
+    }
+    expect(provider.sendMessage).not.toHaveBeenCalled();
+
+    doc.emitUpdate(null);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(provider.sendMessage).toHaveBeenCalledOnce();
+    expect(provider.sendMessage).toHaveBeenCalledWith(
+      JSON.stringify({ type: "document-update-barrier", generation: 13 }),
+    );
     bundle.destroy();
   });
 

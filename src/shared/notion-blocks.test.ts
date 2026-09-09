@@ -62,6 +62,18 @@ describe("Notion block adapter", () => {
     expect(notionPayloadForBlock(block)).toEqual({ type: "unsupported", payload: {} });
   });
 
+  it("rejects the generic heading alias at the Notion write boundary", () => {
+    expect(() =>
+      notionInputToBlockContainer({
+        type: "heading",
+        heading: { rich_text: [{ text: { content: "Ambiguous level" } }] },
+      }),
+    ).toThrow("Unsupported block type: heading");
+    expect(() =>
+      notionInputToBlockContainer({ heading: { rich_text: [{ text: { content: "Ambiguous level" } }] } }),
+    ).toThrow("Block type is required");
+  });
+
   it("indexes synced sources and references without traversing source content twice", () => {
     const source = notionInputToBlockContainer({
       type: "synced_block",

@@ -326,38 +326,53 @@ function DiagramHistory({
   page,
   member,
   onRestored,
+  onError,
 }: {
   page: Page;
   member: ClientMemberContext;
   onRestored: (epoch: number) => void;
+  onError: (message: string) => void;
 }) {
   const [versions, setVersions] = useState<Version[]>([]);
   const [selected, setSelected] = useState<Version | null>(null);
   const [preview, setPreview] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    void api<{ versions: Version[] }>(`/api/pages/${page.id}/versions`).then((data) => setVersions(data.versions));
-  }, [page.id]);
+    void api<{ versions: Version[] }>(`/api/pages/${page.id}/versions`)
+      .then((data) => setVersions(data.versions))
+      .catch((cause) => onError(apiErrorMessage(cause, "Diagram history could not be loaded.")));
+  }, [onError, page.id]);
   async function choose(version: Version) {
-    const response = await fetch(`/api/versions/${version.id}`);
-    const snapshot = new Uint8Array(await response.arrayBuffer());
-    const document = new Y.Doc();
-    Y.applyUpdate(document, snapshot);
-    const diagram = diagramFromYDoc(document, {
-      pageId: page.id,
-      contentEpoch: version.epoch,
-      sequence: version.sequence,
-    });
-    document.destroy();
-    setSelected(version);
-    setPreview(
-      renderDiagramSvg(diagram, {
-        width: 560,
-        height: 315,
-        title: version.title,
-        assetHref: (id) => `/api/attachments/${id}`,
-      }),
-    );
+    try {
+      const response = await fetch(`/api/versions/${version.id}`);
+      if (!response.ok) {
+        throw new ApiClientError(response.status, "version_unavailable", "The diagram version could not be loaded.");
+      }
+      const snapshot = new Uint8Array(await response.arrayBuffer());
+      const document = new Y.Doc();
+      try {
+        Y.applyUpdate(document, snapshot);
+        const diagram = diagramFromYDoc(document, {
+          pageId: page.id,
+          contentEpoch: version.epoch,
+          sequence: version.sequence,
+        });
+        setSelected(version);
+        setPreview(
+          renderDiagramSvg(diagram, {
+            width: 560,
+            height: 315,
+            title: version.title,
+            assetHref: (id) => `/api/attachments/${id}`,
+          }),
+        );
+        onError("");
+      } finally {
+        document.destroy();
+      }
+    } catch (cause) {
+      onError(apiErrorMessage(cause, "The diagram version could not be loaded."));
+    }
   }
   async function restore() {
     if (!selected || !confirm(`Restore this diagram from ${new Date(selected.createdAt).toLocaleString()}?`)) return;
@@ -368,6 +383,9 @@ function DiagramHistory({
         body: json({ versionId: selected.id }),
       });
       onRestored(result.contentEpoch);
+      onError("");
+    } catch (cause) {
+      onError(apiErrorMessage(cause, "The diagram version could not be restored."));
     } finally {
       setBusy(false);
     }
@@ -594,6 +612,7 @@ function DiagramCanvas({
   synced,
   comments,
   onSelection,
+  onError,
 }: {
   bundle: NetworkCollaborationBundle;
   page: Page;
@@ -602,6 +621,7 @@ function DiagramCanvas({
   synced: boolean;
   comments: CommentThread[];
   onSelection: (anchor: CommentAnchor | null) => void;
+  onError: (message: string) => void;
 }) {
   const transactionOrigin = useMemo(() => ({ type: LOCAL_ORIGIN }), []);
   const selectedNodes = useRef(new Set<string>());
@@ -928,7 +948,14 @@ function DiagramCanvas({
           accept="image/png,image/jpeg,image/gif,image/webp,image/avif"
           onChange={(event) => {
             const file = event.target.files?.[0];
-            if (file) void uploadAttachment(page.id, file).then((attachment) => addNode("image", attachment.id));
+            if (file) {
+              void uploadAttachment(page.id, file)
+                .then((attachment) => {
+                  addNode("image", attachment.id);
+                  onError("");
+                })
+                .catch((cause) => onError(apiErrorMessage(cause, "The diagram image could not be uploaded.")));
+            }
             event.currentTarget.value = "";
           }}
         />
@@ -1141,6 +1168,7 @@ export function DiagramPage({
                 synced={connected}
                 comments={threads}
                 onSelection={setAnchor}
+                onError={setError}
               />
             </ReactFlowProvider>
           ) : (
@@ -1155,6 +1183,7 @@ export function DiagramPage({
             page={page}
             member={member}
             onRestored={(epoch) => onPageChanged({ ...page, contentEpoch: epoch, revision: page.revision + 1 })}
+            onError={setError}
           />
         ) : null}
         {panel === "backlinks" ? (

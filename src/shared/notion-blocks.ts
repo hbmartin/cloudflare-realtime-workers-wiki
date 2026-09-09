@@ -54,7 +54,7 @@ export const notionBlockRegistry = {
 
 const NOTION_WRITABLE_BLOCK_TYPES = new Set([
   ...Object.values(notionBlockRegistry)
-    .filter((entry) => entry.writable)
+    .filter((entry) => entry.writable && entry.notionType !== "heading")
     .map((entry) => entry.notionType),
   "heading_1",
   "heading_2",

@@ -45,6 +45,18 @@ describe("public page shares", () => {
       body: JSON.stringify({ kind: "document", parentId: installed.pageId, title: "Public child" }),
     });
     const child = (await childResponse.json<{ page: { id: string } }>()).page;
+    const diagramResponse = await authenticated(installed.cookie, "/api/pages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ kind: "diagram", parentId: installed.pageId, title: "Internal diagram" }),
+    });
+    const diagram = (await diagramResponse.json<{ page: { id: string } }>()).page;
+    const nestedResponse = await authenticated(installed.cookie, "/api/pages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ kind: "document", parentId: diagram.id, title: "Public nested document" }),
+    });
+    const nested = (await nestedResponse.json<{ page: { id: string } }>()).page;
     const published = await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -74,11 +86,23 @@ describe("public page shares", () => {
     expect(updated.status).toBe(200);
     const indexedRoot = await SELF.fetch(`http://example.test/share/${key}`);
     expect(indexedRoot.status).toBe(200);
-    expect(await indexedRoot.text()).toContain('<meta name="robots" content="index,follow">');
+    const indexedHtml = await indexedRoot.text();
+    expect(indexedHtml).toContain('<meta name="robots" content="index,follow">');
+    expect(indexedHtml).not.toContain("Internal diagram");
+    expect(indexedHtml).toContain("Public nested document");
     expect((await SELF.fetch(`http://example.test/share/${key}/pages/${child.id}`)).status).toBe(200);
+    expect((await SELF.fetch(`http://example.test/share/${key}/pages/${diagram.id}`)).status).toBe(404);
+    expect((await SELF.fetch(`http://example.test/share/${key}/pages/${nested.id}`)).status).toBe(200);
+    const thumbnail = await SELF.fetch(`http://example.test/share/${key}/diagram-thumbnails/${diagram.id}.svg`);
+    expect(thumbnail.status).toBe(200);
+    expect(thumbnail.headers.get("content-type")).toContain("image/svg+xml");
+    expect(await thumbnail.text()).toContain("Internal diagram");
     const sitemap = await SELF.fetch(`http://example.test/share/${key}/sitemap.xml`);
     expect(sitemap.status).toBe(200);
-    expect(await sitemap.text()).toContain(child.id);
+    const sitemapXml = await sitemap.text();
+    expect(sitemapXml).toContain(child.id);
+    expect(sitemapXml).toContain(nested.id);
+    expect(sitemapXml).not.toContain(diagram.id);
 
     await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, { method: "DELETE" });
     expect((await SELF.fetch(`http://example.test/share/${key}`)).status).toBe(404);

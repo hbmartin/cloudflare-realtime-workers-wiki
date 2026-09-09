@@ -153,6 +153,7 @@ import {
   createShare,
   getShare,
   publicAttachment,
+  publicDiagramThumbnail,
   publicSitemap,
   renderPublicShare,
   resolveSharedPage,
@@ -3208,27 +3209,20 @@ app.delete("/api/pages/:id", async (c) => {
   const requestedOperationId = c.req.header("x-notes-operation-id");
   const operationId = requestedOperationId && ID_PATTERN.test(requestedOperationId) ? requestedOperationId : undefined;
   const timestamp = now();
-  await c.env.DB.batch([
+  const archiveTimestamp = page.archived_at ?? timestamp;
+  const archiveOperationId = page.archived_at === null ? crypto.randomUUID() : (page.archive_operation_id ?? null);
+  const archiveOwner = page.archived_at === null ? member.user.id : (page.archived_by ?? member.user.id);
+  const archiveBatch = await c.env.DB.batch<{ page_id: string; content_epoch: number }>([
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       ) UPDATE pages
-           SET archived_at = ?, archived_by = ?, revision = revision + 1, updated_by = ?, updated_at = ?
-         WHERE id IN subtree`,
-    ).bind(page.id, member.workspace.id, timestamp, member.user.id, member.user.id, timestamp),
-    c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
-      WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
-      SELECT id FROM subtree
-    )`).bind(page.id),
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
-         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        )
        INSERT INTO archive_disconnect_targets
         (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
        SELECT id, workspace_id, content_epoch, id || '~' || content_epoch, ?, ?, ?
-         FROM pages WHERE id IN subtree AND kind IN ('document', 'diagram')
+         FROM pages
+        WHERE id IN subtree AND archived_at IS NULL AND kind IN ('document', 'diagram')
        ON CONFLICT(page_id) DO UPDATE SET
          workspace_id = excluded.workspace_id,
          content_epoch = excluded.content_epoch,
@@ -3236,8 +3230,22 @@ app.delete("/api/pages/:id", async (c) => {
          attempts = 0,
          next_attempt_at = excluded.next_attempt_at,
          last_error = NULL,
-         updated_at = excluded.updated_at`,
-    ).bind(page.id, timestamp, timestamp, timestamp),
+         updated_at = excluded.updated_at
+       RETURNING page_id, content_epoch`,
+    ).bind(page.id, member.workspace.id, timestamp, timestamp, timestamp),
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT id FROM pages WHERE id = ? AND workspace_id = ?
+         UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       ) UPDATE pages
+           SET archived_at = ?, archived_by = ?, archive_operation_id = ?, revision = revision + 1,
+               updated_by = ?, updated_at = ?
+         WHERE id IN subtree AND archived_at IS NULL`,
+    ).bind(page.id, member.workspace.id, archiveTimestamp, archiveOwner, archiveOperationId, member.user.id, timestamp),
+    c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
+      WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
+      SELECT id FROM subtree
+    )`).bind(page.id),
   ]);
   const archived = await c.env.DB.prepare(
     `WITH RECURSIVE subtree(id) AS (
@@ -3247,7 +3255,7 @@ app.delete("/api/pages/:id", async (c) => {
     .bind(page.id)
     .all<{ id: string; kind: PageKind; content_epoch: number }>();
   const pageIds = archived.results.map((item) => item.id);
-  const collaborativePages = archived.results.filter((item) => item.kind === "document" || item.kind === "diagram");
+  const collaborativePages = archiveBatch[0]?.results ?? [];
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
     pageIds,
@@ -3257,7 +3265,7 @@ app.delete("/api/pages/:id", async (c) => {
   const pendingPageIds = await processArchiveDisconnectTargets(
     c.env,
     collaborativePages.map((item) => ({
-      page_id: item.id,
+      page_id: item.page_id,
       content_epoch: item.content_epoch,
     })),
   );
@@ -3277,30 +3285,37 @@ app.post("/api/pages/:id/restore", async (c) => {
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
+  const archiveTimestamp = page.archived_at;
+  const archiveOperationId = page.archive_operation_id ?? null;
+  const archiveOwnershipSql = archiveOperationId
+    ? "archive_operation_id = ?"
+    : "archive_operation_id IS NULL AND archived_at = ?";
+  const archiveOwnership = archiveOperationId ?? archiveTimestamp;
   const restoredSnapshotStatement = c.env.DB.prepare(
     `SELECT * FROM pages WHERE id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
       SELECT id FROM subtree
-    )`,
+    ) AND archived_at IS NULL`,
   ).bind(page.id);
   const restored = await batchWithFinalResult<PageRow>(
     c.env.DB,
     [
       c.env.DB.prepare(
+        `DELETE FROM archive_disconnect_targets WHERE page_id IN (
+         WITH RECURSIVE subtree(id) AS (
+           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+         ) SELECT pages.id FROM pages JOIN subtree ON subtree.id = pages.id WHERE ${archiveOwnershipSql}
+       )`,
+      ).bind(page.id, archiveOwnership),
+      c.env.DB.prepare(
         `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) UPDATE pages
-           SET archived_at = NULL, archived_by = NULL, revision = revision + 1, updated_by = ?, updated_at = ?
-         WHERE id IN subtree`,
-      ).bind(page.id, member.workspace.id, member.user.id, now()),
-      c.env.DB.prepare(
-        `DELETE FROM archive_disconnect_targets WHERE page_id IN (
-         WITH RECURSIVE subtree(id) AS (
-           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-         ) SELECT id FROM subtree
-       )`,
-      ).bind(page.id),
+           SET archived_at = NULL, archived_by = NULL, archive_operation_id = NULL,
+               revision = revision + 1, updated_by = ?, updated_at = ?
+         WHERE id IN subtree AND ${archiveOwnershipSql}`,
+      ).bind(page.id, member.workspace.id, member.user.id, now(), archiveOwnership),
       c.env.DB.prepare(
         `DELETE FROM page_search WHERE page_id IN (
          WITH RECURSIVE subtree(id) AS (
@@ -3314,7 +3329,7 @@ app.post("/api/pages/:id/restore", async (c) => {
          WITH RECURSIVE subtree(id) AS (
            SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
          ) SELECT id FROM subtree
-       )`,
+       ) AND archived_at IS NULL AND import_job_id IS NULL`,
       ).bind(page.id),
       ...refreshPageSearchV2SubtreeStatements(c.env.DB, page.id),
     ],
@@ -5161,6 +5176,15 @@ app.get("/share/:key/assets/:attachmentId", async (c) => {
   const share = await resolveSharedPage(c.env, c.req.param("key"), c.req.query("page"));
   if (!share) return c.text("Not found", 404);
   return (await publicAttachment(c.env, share, c.req.param("attachmentId"))) ?? c.text("Not found", 404);
+});
+
+app.get("/share/:key/diagram-thumbnails/:fileName", async (c) => {
+  const fileName = c.req.param("fileName");
+  if (!fileName.endsWith(".svg")) return c.text("Not found", 404);
+  const pageId = fileName.slice(0, -4);
+  const share = await resolveSharedPage(c.env, c.req.param("key"), pageId);
+  if (!share) return c.text("Not found", 404);
+  return (await publicDiagramThumbnail(c.env, share)) ?? c.text("Not found", 404);
 });
 
 app.get("/share/:key/sitemap.xml", async (c) => {

@@ -1,7 +1,8 @@
 import { documentBlocks } from "../shared/notion-blocks";
 import { collectTransclusions, projectDocument, serializeDocument } from "../shared/document-projection";
+import { renderDiagramSvg } from "../shared/diagram";
 import { bytesToBase64Url } from "../shared/security";
-import type { DocumentContentEnvelope, PageKind } from "../shared/types";
+import type { DiagramContentEnvelope, DocumentContentEnvelope, PageKind } from "../shared/types";
 import { isInlineMime } from "./attachments";
 import type { Env, MemberContext } from "./env";
 import { attachmentDisposition, HttpError } from "./http";
@@ -220,14 +221,15 @@ export async function resolveSharedPage(env: Env, key: string, requestedPageId?:
 async function sharedTree(env: Env, share: SharedPageRow) {
   if (!share.include_subpages) return [] as Array<{ id: string; title: string; parentId: string | null }>;
   const rows = await env.DB.prepare(
-    `WITH RECURSIVE tree(id, parent_id, title, position, depth) AS (
-       SELECT id, parent_id, title, position, 0 FROM pages WHERE id = ? AND archived_at IS NULL
+    `WITH RECURSIVE tree(id, parent_id, title, kind, position, depth) AS (
+       SELECT id, parent_id, title, kind, position, 0 FROM pages WHERE id = ? AND archived_at IS NULL
        UNION ALL
-       SELECT child.id, child.parent_id, child.title, child.position, tree.depth + 1
+       SELECT child.id, child.parent_id, child.title, child.kind, child.position, tree.depth + 1
          FROM pages child JOIN tree ON child.parent_id = tree.id
         WHERE child.archived_at IS NULL AND child.import_job_id IS NULL AND tree.depth < 50
      )
-     SELECT id, parent_id parentId, title FROM tree ORDER BY depth, position, id LIMIT 500`,
+     SELECT id, parent_id parentId, title FROM tree WHERE kind <> 'diagram'
+      ORDER BY depth, position, id LIMIT 500`,
   )
     .bind(share.root_page_id)
     .all<{ id: string; parentId: string | null; title: string }>();
@@ -260,7 +262,12 @@ export function publicDocumentHtml(
   key: string,
   transclusions: Map<string, string> = new Map(),
 ) {
-  let body = documentBody(serializeDocument(document).html);
+  let body = documentBody(
+    serializeDocument(document, {
+      linkedDiagramThumbnailHref: (pageId) =>
+        `/share/${encodeURIComponent(key)}/diagram-thumbnails/${encodeURIComponent(pageId)}.svg`,
+    }).html,
+  );
   const headings = documentBlocks(document)
     .flatMap(function flatten(block): ReturnType<typeof documentBlocks> {
       return [block, ...block.children.flatMap(flatten)];
@@ -328,7 +335,13 @@ async function publicTransclusions(
       );
       if (!source) return null;
       let html = documentBody(
-        serializeDocument({ type: "doc", content: [{ type: "blockGroup", content: source.content }] }).html,
+        serializeDocument(
+          { type: "doc", content: [{ type: "blockGroup", content: source.content }] },
+          {
+            linkedDiagramThumbnailHref: (pageId) =>
+              `/share/${encodeURIComponent(key)}/diagram-thumbnails/${encodeURIComponent(pageId)}.svg`,
+          },
+        ).html,
       );
       html = html.replaceAll(
         /((?:href|src)=")\/api\/attachments\/([A-Za-z0-9_-]+)"/g,
@@ -454,6 +467,36 @@ export async function publicAttachment(env: Env, share: SharedPageRow, attachmen
     "x-content-type-options": "nosniff",
   });
   return new Response(object.body, { headers });
+}
+
+export async function publicDiagramThumbnail(env: Env, share: SharedPageRow) {
+  if (share.page_kind !== "diagram") return null;
+  const projection = await env.DB.prepare(
+    `SELECT thumbnail_r2_key, thumbnail_hash FROM diagram_projections
+      WHERE page_id = ? AND content_epoch = ?`,
+  )
+    .bind(share.page_id, share.content_epoch)
+    .first<{ thumbnail_r2_key: string; thumbnail_hash: string }>();
+  const etag = `"${projection?.thumbnail_hash ?? `empty-${share.content_epoch}`}"`;
+  const headers = new Headers({
+    "content-type": "image/svg+xml; charset=utf-8",
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+    etag,
+  });
+  if (projection) {
+    const thumbnail = await env.BUCKET.get(projection.thumbnail_r2_key);
+    if (thumbnail) return new Response(thumbnail.body, { headers });
+  }
+  const empty: DiagramContentEnvelope = {
+    schemaVersion: 1,
+    pageId: share.page_id,
+    contentEpoch: share.content_epoch,
+    sequence: 0,
+    nodes: [],
+    edges: [],
+  };
+  return new Response(renderDiagramSvg(empty, { width: 960, height: 540, title: share.page_title }), { headers });
 }
 
 export async function publicSitemap(env: Env, share: SharedPageRow, key: string, origin: string) {
