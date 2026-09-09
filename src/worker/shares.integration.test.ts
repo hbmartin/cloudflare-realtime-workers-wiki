@@ -114,23 +114,20 @@ describe("public page shares", () => {
 
   it("serves only diagram thumbnails explicitly linked from a shared document", async () => {
     const installed = await bootstrap();
-    const createDiagram = async (title: string) => {
+    const createPage = async (kind: "diagram" | "document", title: string, parentId: string | null) => {
       const response = await authenticated(installed.cookie, "/api/pages", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ kind: "diagram", parentId: installed.pageId, title }),
+        body: JSON.stringify({ kind, parentId, title }),
       });
       return (await response.json<{ page: { id: string } }>()).page;
     };
-    const linkedDiagram = await createDiagram("Linked system map");
-    const transcludedDiagram = await createDiagram("Transcluded system map");
-    const unrelatedDiagram = await createDiagram("Unrelated internal map");
-    const sourcePageResponse = await authenticated(installed.cookie, "/api/pages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ kind: "document", parentId: installed.pageId, title: "Synced source" }),
-    });
-    const sourcePage = (await sourcePageResponse.json<{ page: { id: string } }>()).page;
+    const linkedDiagram = await createPage("diagram", "Linked system map", installed.pageId);
+    const transcludedDiagram = await createPage("diagram", "Transcluded system map", installed.pageId);
+    const unrelatedDiagram = await createPage("diagram", "Unrelated internal map", installed.pageId);
+    const sourcePage = await createPage("document", "Synced source", installed.pageId);
+    const outsideDiagram = await createPage("diagram", "Outside system map", null);
+    const outsideSource = await createPage("document", "Outside source", null);
     const diagramAttachmentId = crypto.randomUUID();
     const diagramAttachmentKey = `assets/${installed.workspaceId}/${diagramAttachmentId}/private`;
     const thumbnailKey = `diagrams/${linkedDiagram.id}/epochs/1/thumbnail.svg`;
@@ -222,6 +219,20 @@ describe("public page shares", () => {
       (
         await SELF.fetch(
           `http://example.test/share/${key}/diagram-thumbnails/${unrelatedDiagram.id}.svg?source=${installed.pageId}`,
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await SELF.fetch(
+          `http://example.test/share/${key}/diagram-thumbnails/${outsideDiagram.id}.svg?source=${installed.pageId}`,
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await SELF.fetch(
+          `http://example.test/share/${key}/diagram-thumbnails/${linkedDiagram.id}.svg?source=${outsideSource.id}`,
         )
       ).status,
     ).toBe(404);
