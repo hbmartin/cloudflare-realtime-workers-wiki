@@ -2801,6 +2801,10 @@ button.mention-chip:focus-visible {
     600 13px/1.25 system-ui,
     sans-serif;
 }
+.diagram-node > input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
 .diagram-node-image > input {
   top: auto;
   bottom: 8px;

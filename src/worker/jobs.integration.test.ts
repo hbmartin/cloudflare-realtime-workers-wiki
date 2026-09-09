@@ -1681,6 +1681,38 @@ describe("delivery outbox", () => {
     expect(new Set(send.mock.calls.map(([body]) => (body as { outboxId: string }).outboxId))).toEqual(new Set(ids));
   });
 
+  it("caps one sweep and leaves additional available rows for the next invocation", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const ids = Array.from({ length: 251 }, () => crypto.randomUUID());
+    for (let start = 0; start < ids.length; start += 50) {
+      await env.DB.batch(
+        ids.slice(start, start + 50).map((id, offset) =>
+          env.DB.prepare(
+            `INSERT INTO outbox
+              (id, workspace_id, topic, payload_json, available_at, created_at)
+             VALUES (?, ?, 'notification', '{}', ?, ?)`,
+          ).bind(id, installed.workspaceId, timestamp - 1, timestamp + start + offset),
+        ),
+      );
+    }
+    const send = vi.fn(async (_body: unknown) => undefined);
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
+
+    await sweepOutbox(bindings);
+
+    expect(send).toHaveBeenCalledTimes(250);
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
+    ).resolves.toEqual({ count: 1 });
+
+    await sweepOutbox(bindings);
+    expect(send).toHaveBeenCalledTimes(251);
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
+    ).resolves.toEqual({ count: 0 });
+  });
+
   it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {
     const installed = await bootstrap();
     const outboxId = crypto.randomUUID();

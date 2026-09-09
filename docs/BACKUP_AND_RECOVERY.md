@@ -130,7 +130,9 @@ broken link.
 
 Permanent deletion removes page metadata and commits a D1 cleanup job before returning `202`. Each
 document epoch Durable Object has its alarm canceled and is purged with `storage.deleteAll()` before the
-job deletes exact attachment keys and complete `documents/{pageId}/` prefixes.
+job deletes exact attachment keys and complete `documents/{pageId}/` or `diagrams/{pageId}/` prefixes,
+including every `diagrams/{pageId}/epochs/{epoch}/` projection and thumbnail, according to each
+collaborative page's kind.
 
 Inspect `deletion_jobs` and unfinished `deletion_targets`; the cron retries them idempotently
 with backoff capped at 16 hours. Because only 10 jobs drain per tick and the first retry is a full hour
@@ -158,7 +160,7 @@ page to cancel its pending target.
 - Open version history and restore a disposable page.
 - Acquire, renew, release, expire, and force-release a table lease.
 - Confirm `deletion_jobs` is empty, no `deletion_targets` rows have `completed_at IS NULL`, and deleted
-  page prefixes are empty in R2.
+  `documents/{pageId}/`, `diagrams/{pageId}/`, and each `diagrams/{pageId}/epochs/{epoch}/` prefix are empty in R2.
 - Confirm `archive_disconnect_targets` is empty after archive-disconnect retries have run.
 
 ## Restore drill
@@ -178,6 +180,9 @@ Rehearse this on a disposable page before you need it. It exercises every plane.
    drains to empty.
 7. Permanently delete it, then confirm `deletion_jobs` empties, no `deletion_targets` remain with
    `completed_at IS NULL`, and the `documents/{pageId}/` prefix is gone from R2.
+
+Repeat the permanent-deletion portion with a disposable diagram and confirm its complete
+`diagrams/{pageId}/` prefix, including epoch thumbnails and versions, is gone from R2.
 
 Queries for steps 6 and 7 are in [Operations](OPERATIONS.md#inspecting-the-work-queues). Step 7 may
 take up to an hour if the first cleanup attempt fails.

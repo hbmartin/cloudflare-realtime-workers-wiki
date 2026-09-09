@@ -13,6 +13,8 @@ export type PageJsonRow = {
   content_epoch: number;
   is_template?: number;
   archived_at: number | null;
+  archived_by?: string | null;
+  archive_operation_id?: string | null;
   created_at: number;
   updated_at: number;
 };

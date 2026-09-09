@@ -62,6 +62,7 @@ describe("D1 migrations", () => {
     expect(indexes.results.map((index) => index.name)).toContain("idx_page_move_receipts_created");
     expect(indexes.results.map((index) => index.name)).toContain("idx_pages_workspace_page");
     expect(indexes.results.map((index) => index.name)).toContain("idx_slack_channels_unique");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_comment_threads_page_block");
 
     const slackColumns = await env.DB.prepare(`PRAGMA table_info(slack_installations)`).all<{ name: string }>();
     expect(slackColumns.results.map((column) => column.name)).toEqual(
@@ -140,6 +141,28 @@ describe("D1 migrations", () => {
       `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pages'`,
     ).first<{ sql: string }>();
     expect(pagesSql?.sql).toContain("'diagram'");
+    expect(pagesSql?.sql).toContain("archive_operation_id");
+  });
+
+  it("repairs a missing comment lookup index in the forward archive migration", async () => {
+    const archiveMigration = env.TEST_MIGRATIONS!.find(
+      (migration) => migration.name === "0024_archive_operation_identity.sql",
+    );
+    expect(archiveMigration).toBeTruthy();
+    const archiveIndex = env.TEST_MIGRATIONS!.indexOf(archiveMigration!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, archiveIndex));
+
+    // Simulate a database that recorded an earlier 0022 without this index.
+    await env.DB.prepare(`DROP INDEX idx_comment_threads_page_block`).run();
+
+    await applyD1Migrations(env.DB, [archiveMigration!]);
+    await expect(
+      env.DB.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_comment_threads_page_block'`,
+      ).first(),
+    ).resolves.toEqual({ name: "idx_comment_threads_page_block" });
+    const columns = await env.DB.prepare(`PRAGMA table_info(pages)`).all<{ name: string }>();
+    expect(columns.results.map((column) => column.name)).toContain("archive_operation_id");
   });
 
   it("migrates digest cursors to independent channel and timezone keys", async () => {

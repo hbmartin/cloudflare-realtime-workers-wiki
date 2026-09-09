@@ -143,6 +143,35 @@ describe("structured document projection", () => {
     expect(serialized.html).toContain("&lt;still readable&gt;");
   });
 
+  it("keeps linked diagrams inert unless a caller supplies safe URL resolvers", () => {
+    const root = document({
+      type: "linkedDiagram",
+      attrs: { pageId: "diagram-one", title: "System & data" },
+    });
+
+    const inert = serializeDocument(root);
+    expect(inert.html).toContain('data-linked-diagram-id="diagram-one"');
+    expect(inert.html).toContain("System &amp; data");
+    expect(inert.html).not.toContain("/?page=");
+    expect(inert.html).not.toContain("/api/pages/");
+    expect(inert.markdown).toBe("System & data\n");
+
+    const resolved = serializeDocument(root, {
+      linkedDiagramPageHref: (pageId) => `/safe/pages/${pageId}`,
+      linkedDiagramThumbnailHref: (pageId) => `/safe/thumbnails/${pageId}.svg`,
+    });
+    expect(resolved.html).toContain('href="/safe/pages/diagram-one"');
+    expect(resolved.html).toContain('src="/safe/thumbnails/diagram-one.svg"');
+    expect(resolved.markdown).toBe("[System & data](/safe/pages/diagram-one)\n");
+
+    const unsafe = serializeDocument(root, {
+      linkedDiagramPageHref: () => "javascript:alert(1)",
+      linkedDiagramThumbnailHref: () => "data:image/svg+xml,<svg onload=alert(1)>",
+    });
+    expect(unsafe.html).not.toContain("javascript:");
+    expect(unsafe.html).not.toContain("data:image");
+  });
+
   it("serializes BlockNote wrapper nodes without flattening blocks or emitting unsupported wrappers", () => {
     const serialized = serializeDocument(
       document({

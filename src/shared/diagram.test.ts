@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import {
+  DIAGRAM_RENDER_MAX_NODES,
+  DIAGRAM_RENDER_MAX_SVG_BYTES,
   diagramEdgeMap,
   diagramFromYDoc,
   diagramNodeMap,
@@ -71,14 +73,47 @@ describe("diagram projection", () => {
   });
 
   it("renders a deterministic, escaped SVG without executable markup", () => {
-    const diagram = { nodes: [first, second], edges: [edge] };
-    const svg = renderDiagramSvg(diagram, { width: 960, height: 540, title: "System & data" });
+    const escapedFirst = { ...first, id: 'node-"one&', type: "image" as const, assetId: "asset-one" };
+    const escapedSecond = { ...second, id: "node-two" };
+    const escapedEdge = { ...edge, source: escapedFirst.id, target: escapedSecond.id, label: 'writes & says "yes"' };
+    const diagram = { nodes: [escapedFirst, escapedSecond], edges: [escapedEdge] };
+    const options = {
+      width: 960,
+      height: 540,
+      title: 'System & "data"',
+      assetHref: () => 'https://example.test/image?a=1&label="unsafe"',
+    };
+    const svg = renderDiagramSvg(diagram, options);
     expect(svg).toContain("<svg");
-    expect(svg).toContain("System &amp; data");
+    expect(svg).toContain("System &amp; &quot;data&quot;");
     expect(svg).toContain("API &lt;gateway&gt;");
+    expect(svg).toContain('data-node-id="node-&quot;one&amp;"');
+    expect(svg).toContain('href="https://example.test/image?a=1&amp;label=&quot;unsafe&quot;"');
+    expect(svg).toContain("writes &amp; says &quot;yes&quot;");
     expect(svg).not.toContain("<script");
-    expect(renderDiagramSvg(diagram, { width: 960, height: 540 })).toBe(
-      renderDiagramSvg(diagram, { width: 960, height: 540 }),
+    expect(renderDiagramSvg(diagram, options)).toBe(renderDiagramSvg(diagram, options));
+  });
+
+  it("returns a small deterministic fallback when render work or output exceeds its bounds", () => {
+    const oversized = {
+      nodes: Array.from({ length: DIAGRAM_RENDER_MAX_NODES + 1 }, (_, index) => ({
+        ...first,
+        id: `node-${index}`,
+      })),
+      edges: [],
+    };
+
+    const firstFallback = renderDiagramSvg(oversized, { width: 960, height: 540, title: "Too large" });
+    const secondFallback = renderDiagramSvg(oversized, { width: 960, height: 540, title: "Too large" });
+    expect(firstFallback).toBe(secondFallback);
+    expect(firstFallback).toContain("Diagram preview unavailable");
+    expect(firstFallback).not.toContain("node-0");
+    expect(new TextEncoder().encode(firstFallback).byteLength).toBeLessThan(DIAGRAM_RENDER_MAX_SVG_BYTES);
+    expect(() =>
+      renderDiagramSvg({ nodes: [null] as unknown as DiagramNode[], edges: [] }, { title: "Malformed" }),
+    ).not.toThrow();
+    expect(renderDiagramSvg({ nodes: [null] as unknown as DiagramNode[], edges: [] })).toContain(
+      "Diagram preview unavailable",
     );
   });
 });

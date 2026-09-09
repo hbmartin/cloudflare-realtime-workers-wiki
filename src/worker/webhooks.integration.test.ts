@@ -344,8 +344,5 @@ describe("Notion-compatible webhooks", () => {
       env.DB.prepare(`SELECT status FROM webhook_subscriptions WHERE id = ?`).bind(subscription.id).first(),
     ).resolves.toEqual({ status: "paused" });
     expect(fetch).not.toHaveBeenCalled();
-    await expect(
-      env.DB.prepare(`SELECT status FROM webhook_subscriptions WHERE id = ?`).bind(subscription.id).first(),
-    ).resolves.toEqual({ status: "paused" });
   });
 });

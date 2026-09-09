@@ -558,6 +558,89 @@ describe("Notion-compatible API", () => {
     ).resolves.toEqual({ count: 0 });
   });
 
+  it("preserves independently archived descendants across Notion trash and restore", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    const child = await client.pages.create({
+      parent: { type: "page_id", page_id: installed.pageId },
+      properties: { title: { type: "title", title: [{ text: { content: "Archive parent" } }] } },
+    });
+    const grandchild = await client.pages.create({
+      parent: { type: "page_id", page_id: child.id },
+      properties: { title: { type: "title", title: [{ text: { content: "Independently archived" } }] } },
+    });
+    const metadata = await env.DB.prepare(`SELECT workspace_id, content_epoch FROM pages WHERE id = ?`)
+      .bind(grandchild.id)
+      .first<{ workspace_id: string; content_epoch: number }>();
+    const grandchildArchivedAt = 123;
+    const grandchildArchiveOperationId = "independent-grandchild-archive";
+    const targetUpdatedAt = 456;
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE pages SET archived_at = ?, archive_operation_id = ?, revision = revision + 1 WHERE id = ?`,
+      ).bind(grandchildArchivedAt, grandchildArchiveOperationId, grandchild.id),
+      env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(grandchild.id),
+      env.DB.prepare(
+        `INSERT INTO archive_disconnect_targets
+          (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        grandchild.id,
+        metadata!.workspace_id,
+        metadata!.content_epoch,
+        `${grandchild.id}~${metadata!.content_epoch}`,
+        Date.now() + 60_000,
+        targetUpdatedAt,
+        targetUpdatedAt,
+      ),
+    ]);
+
+    const trashContext = createExecutionContext();
+    const trashed = await worker.fetch(
+      notionRequest(createdIntegration.token, `/pages/${child.id}/trash`, { method: "POST" }),
+      env,
+      trashContext,
+    );
+    expect(trashed.status).toBe(200);
+    await waitOnExecutionContext(trashContext);
+    const parentArchive = await env.DB.prepare(`SELECT archived_at FROM pages WHERE id = ?`)
+      .bind(child.id)
+      .first<{ archived_at: number }>();
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`)
+      .bind(parentArchive!.archived_at, grandchild.id)
+      .run();
+
+    const restoreContext = createExecutionContext();
+    const restored = await worker.fetch(
+      notionRequest(createdIntegration.token, `/pages/${child.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ in_trash: false }),
+      }),
+      env,
+      restoreContext,
+    );
+    expect(restored.status).toBe(200);
+    await waitOnExecutionContext(restoreContext);
+
+    await expect(env.DB.prepare(`SELECT archived_at FROM pages WHERE id = ?`).bind(child.id).first()).resolves.toEqual({
+      archived_at: null,
+    });
+    await expect(
+      env.DB.prepare(`SELECT archived_at, archive_operation_id FROM pages WHERE id = ?`).bind(grandchild.id).first(),
+    ).resolves.toEqual({
+      archived_at: parentArchive!.archived_at,
+      archive_operation_id: grandchildArchiveOperationId,
+    });
+    await expect(
+      env.DB.prepare(`SELECT updated_at FROM archive_disconnect_targets WHERE page_id = ?`).bind(grandchild.id).first(),
+    ).resolves.toEqual({ updated_at: targetUpdatedAt });
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM page_search WHERE page_id = ?`).bind(grandchild.id).first(),
+    ).resolves.toEqual({ count: 0 });
+  });
+
   it("routes API comments through watches, notifications, search, webhooks, and realtime invalidation", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);

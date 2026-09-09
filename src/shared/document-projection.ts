@@ -151,19 +151,29 @@ function listTagFor(node: ProseMirrorJson): "ul" | "ol" | null {
   return null;
 }
 
-function serializeSequence(children: ProseMirrorJson[], format: "markdown" | "html", depth: number) {
-  if (format !== "html") return children.map((child) => serializeNode(child, format, depth)).join("");
+export type DocumentSerializationOptions = {
+  linkedDiagramPageHref?: (pageId: string) => string | null;
+  linkedDiagramThumbnailHref?: (pageId: string) => string | null;
+};
+
+function serializeSequence(
+  children: ProseMirrorJson[],
+  format: "markdown" | "html",
+  depth: number,
+  options: DocumentSerializationOptions,
+) {
+  if (format !== "html") return children.map((child) => serializeNode(child, format, depth, options)).join("");
   let output = "";
   for (let index = 0; index < children.length;) {
     const tag = listTagFor(children[index]!);
     if (!tag) {
-      output += serializeNode(children[index]!, format, depth);
+      output += serializeNode(children[index]!, format, depth, options);
       index += 1;
       continue;
     }
     let end = index;
     while (end < children.length && listTagFor(children[end]!) === tag) end += 1;
-    const items = children.slice(index, end).map((child) => serializeNode(child, format, depth));
+    const items = children.slice(index, end).map((child) => serializeNode(child, format, depth, options));
     output += `<${tag}>${items.join("")}</${tag}>`;
     index = end;
   }
@@ -205,11 +215,16 @@ function markdownTableRow(row: ProseMirrorJson) {
   return `| ${(row.content ?? []).map((cell) => markdownTableCell(cell)).join(" | ")} |\n`;
 }
 
-function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth = 0): string {
+function serializeNode(
+  node: ProseMirrorJson,
+  format: "markdown" | "html",
+  depth = 0,
+  options: DocumentSerializationOptions = {},
+): string {
   const children = node.content ?? [];
   const inline = children.map((child) => serializeInline(child, format)).join("");
-  const blockChildren = () => children.map((child) => serializeNode(child, format, depth + 1)).join("");
-  const transparentChildren = () => children.map((child) => serializeNode(child, format, depth)).join("");
+  const blockChildren = () => children.map((child) => serializeNode(child, format, depth + 1, options)).join("");
+  const transparentChildren = () => children.map((child) => serializeNode(child, format, depth, options)).join("");
   const type = node.type ?? "unknown";
 
   if (type === "blockContainer") {
@@ -218,11 +233,11 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
     const item = children.find((child) => LIST_ITEM_TYPES.has(child.type ?? ""));
     const groups = children.filter((child) => child.type === "blockGroup");
     if (item && groups.length) {
-      return serializeNode({ ...item, content: [...(item.content ?? []), ...groups] }, format, depth);
+      return serializeNode({ ...item, content: [...(item.content ?? []), ...groups] }, format, depth, options);
     }
     return transparentChildren();
   }
-  if (type === "doc" || type === "blockGroup") return serializeSequence(children, format, depth);
+  if (type === "doc" || type === "blockGroup") return serializeSequence(children, format, depth, options);
   if (type === "text" || type === "mention" || type === "inlineMath") return serializeInline(node, format);
   if (type === "paragraph") return format === "html" ? `<p>${inline}</p>` : `${inline}\n\n`;
   if (type === "heading" || /^heading[1-6]$/.test(type)) {
@@ -248,7 +263,7 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
     const nested = children.filter((child) => NESTED_BLOCK_TYPES.has(child.type ?? ""));
     const own = children.filter((child) => !NESTED_BLOCK_TYPES.has(child.type ?? ""));
     const label = own.map((child) => serializeInline(child, format)).join("");
-    const nestedOutput = nested.map((child) => serializeNode(child, format, depth + 1)).join("");
+    const nestedOutput = nested.map((child) => serializeNode(child, format, depth + 1, options)).join("");
     if (format === "html") return `<li>${label}${nestedOutput}</li>`;
     const marker =
       type === "numberedListItem" ? "1." : type === "checkListItem" ? `- [${node.attrs?.checked ? "x" : " "}]` : "-";
@@ -323,11 +338,14 @@ function serializeNode(node: ProseMirrorJson, format: "markdown" | "html", depth
   if (type === "linkedDiagram") {
     const pageId = stringAttr(node, "pageId") ?? "";
     const title = stringAttr(node, "title") ?? "Linked whiteboard";
-    const href = `/?page=${encodeURIComponent(pageId)}`;
-    const thumbnail = `/api/pages/${encodeURIComponent(pageId)}/diagram-thumbnail.svg`;
-    return format === "html"
-      ? `<figure class="linked-diagram" data-linked-diagram-id="${escapeHtml(pageId)}"><a href="${escapeHtml(href)}"><img src="${escapeHtml(thumbnail)}" alt=""><figcaption>${escapeHtml(title)}</figcaption></a></figure>`
-      : `[${escapeMarkdownInline(title)}](${markdownDestination(href)})\n\n`;
+    const href = safeUrl(options.linkedDiagramPageHref?.(pageId));
+    const thumbnail = safeUrl(options.linkedDiagramThumbnailHref?.(pageId));
+    if (format === "markdown") {
+      const label = escapeMarkdownInline(title);
+      return href ? `[${label}](${markdownDestination(href)})\n\n` : `${label}\n\n`;
+    }
+    const contents = `${thumbnail ? `<img src="${escapeHtml(thumbnail)}" alt="">` : ""}<figcaption>${escapeHtml(title)}</figcaption>`;
+    return `<figure class="linked-diagram" data-linked-diagram-id="${escapeHtml(pageId)}">${href ? `<a href="${escapeHtml(href)}">${contents}</a>` : contents}</figure>`;
   }
   if (type === "syncedBlockSource") return blockChildren();
   if (type === "syncedBlockReference") {
@@ -427,11 +445,14 @@ export function projectDocument(root: ProseMirrorJson): DocumentProjection {
   };
 }
 
-export function serializeDocument(root: ProseMirrorJson): SerializedDocument {
+export function serializeDocument(
+  root: ProseMirrorJson,
+  options: DocumentSerializationOptions = {},
+): SerializedDocument {
   return {
     ...projectDocument(root),
-    markdown: serializeNode(root, "markdown").trimEnd() + "\n",
-    html: `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>:root{color-scheme:light dark}body{font:16px/1.55 system-ui,sans-serif;max-width:860px;margin:40px auto;padding:0 24px;background:Canvas;color:CanvasText}a{color:LinkText}img{max-width:100%}pre{white-space:pre-wrap;background:color-mix(in srgb,CanvasText 8%,Canvas);padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-left:4px solid #777;background:color-mix(in srgb,CanvasText 6%,Canvas)}.columns{display:flex;gap:16px}.column{flex:1}@media(max-width:700px){.columns{display:block}}table{border-collapse:collapse}td,th{border:1px solid color-mix(in srgb,CanvasText 25%,Canvas);padding:6px}.synced-reference{border-left:3px solid #777;padding:8px}</style></head><body>${serializeNode(root, "html")}</body></html>`,
+    markdown: serializeNode(root, "markdown", 0, options).trimEnd() + "\n",
+    html: `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>:root{color-scheme:light dark}body{font:16px/1.55 system-ui,sans-serif;max-width:860px;margin:40px auto;padding:0 24px;background:Canvas;color:CanvasText}a{color:LinkText}img{max-width:100%}pre{white-space:pre-wrap;background:color-mix(in srgb,CanvasText 8%,Canvas);padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-left:4px solid #777;background:color-mix(in srgb,CanvasText 6%,Canvas)}.columns{display:flex;gap:16px}.column{flex:1}@media(max-width:700px){.columns{display:block}}table{border-collapse:collapse}td,th{border:1px solid color-mix(in srgb,CanvasText 25%,Canvas);padding:6px}.synced-reference{border-left:3px solid #777;padding:8px}</style></head><body>${serializeNode(root, "html", 0, options)}</body></html>`,
   };
 }
 

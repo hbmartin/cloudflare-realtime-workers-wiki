@@ -53,6 +53,8 @@ export type IntegrationPage = {
   content_epoch: number;
   plain_text: string;
   archived_at: number | null;
+  archived_by?: string | null;
+  archive_operation_id?: string | null;
   created_by: string;
   updated_by: string | null;
   created_at: number;

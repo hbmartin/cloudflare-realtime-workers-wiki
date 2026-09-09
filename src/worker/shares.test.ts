@@ -34,4 +34,18 @@ describe("public document rendering", () => {
     expect(body).toContain(`href="/share/public-key/pages/${target}"`);
     expect(body).toContain(`href="https://example.test/?page=${target}"`);
   });
+
+  it("uses capability-scoped public thumbnail URLs for linked diagrams", () => {
+    const document: DocumentContentEnvelope["document"] = {
+      type: "doc",
+      content: [{ type: "linkedDiagram", attrs: { pageId: "diagram-one", title: "System map" } }],
+    };
+
+    const { body } = publicDocumentHtml(document, "public-key");
+
+    expect(body).toContain('src="/share/public-key/diagram-thumbnails/diagram-one.svg"');
+    expect(body).not.toContain("/api/pages/");
+    expect(body).not.toContain("?page=");
+    expect(body).not.toContain("/share/public-key/pages/diagram-one");
+  });
 });

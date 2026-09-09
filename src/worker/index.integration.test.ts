@@ -3028,6 +3028,71 @@ describe("Worker integration", () => {
     await waitOnExecutionContext(restoreContext);
   });
 
+  it("does not restore descendants that were archived independently", async () => {
+    const installed = await bootstrap();
+    const child = await createPage(installed.cookie, "document", installed.pageId);
+    const childArchivedAt = 123;
+    const childArchiveOperationId = "independent-child-archive";
+    const targetUpdatedAt = 456;
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE pages SET archived_at = ?, archived_by = ?, archive_operation_id = ?, revision = revision + 1
+          WHERE id = ?`,
+      ).bind(childArchivedAt, installed.userId, childArchiveOperationId, child.id),
+      env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(child.id),
+      env.DB.prepare(
+        `INSERT INTO archive_disconnect_targets
+          (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, 1, ?, ?, ?, ?)`,
+      ).bind(child.id, installed.workspaceId, `${child.id}~1`, Date.now() + 60_000, targetUpdatedAt, targetUpdatedAt),
+    ]);
+
+    const archived = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }),
+    );
+    expect(archived.status).toBe(200);
+    await expect(
+      env.DB.prepare(`SELECT archived_at, archived_by, archive_operation_id FROM pages WHERE id = ?`)
+        .bind(child.id)
+        .first(),
+    ).resolves.toEqual({
+      archived_at: childArchivedAt,
+      archived_by: installed.userId,
+      archive_operation_id: childArchiveOperationId,
+    });
+    await expect(
+      env.DB.prepare(`SELECT updated_at FROM archive_disconnect_targets WHERE page_id = ?`).bind(child.id).first(),
+    ).resolves.toEqual({ updated_at: targetUpdatedAt });
+    const rootArchive = await env.DB.prepare(`SELECT archived_at FROM pages WHERE id = ?`)
+      .bind(installed.pageId)
+      .first<{ archived_at: number }>();
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`)
+      .bind(rootArchive!.archived_at, child.id)
+      .run();
+
+    const restored = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/restore`, { method: "POST" }),
+    );
+    expect(restored.status).toBe(200);
+    const result = await restored.json<{ pages: Array<{ id: string }> }>();
+    expect(result.pages.map((item) => item.id)).toEqual([installed.pageId]);
+    await expect(
+      env.DB.prepare(`SELECT archived_at, archived_by, archive_operation_id FROM pages WHERE id = ?`)
+        .bind(child.id)
+        .first(),
+    ).resolves.toEqual({
+      archived_at: rootArchive!.archived_at,
+      archived_by: installed.userId,
+      archive_operation_id: childArchiveOperationId,
+    });
+    await expect(
+      env.DB.prepare(`SELECT updated_at FROM archive_disconnect_targets WHERE page_id = ?`).bind(child.id).first(),
+    ).resolves.toEqual({ updated_at: targetUpdatedAt });
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM page_search WHERE page_id = ?`).bind(child.id).first(),
+    ).resolves.toEqual({ count: 0 });
+  });
+
   it("keeps an archived page committed and retries a failed room disconnect", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);

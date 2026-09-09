@@ -22,6 +22,12 @@ const PATHS = new Set<DiagramEdgePath>(["straight", "step", "smoothstep"]);
 const HANDLES = new Set<DiagramEdge["sourceHandle"]>(["top", "right", "bottom", "left"]);
 const MAX_TEXT = 20_000;
 const MAX_PLAIN_TEXT = 500_000;
+export const DIAGRAM_RENDER_MAX_NODES = 2_000;
+const DIAGRAM_RENDER_MAX_EDGES = 4_000;
+export const DIAGRAM_RENDER_MAX_SVG_BYTES = 2 * 1024 * 1024;
+const DIAGRAM_RENDER_MAX_IDENTIFIER = 100;
+const DIAGRAM_RENDER_MAX_TITLE = 500;
+const DIAGRAM_RENDER_MAX_ASSET_HREF = 2_048;
 
 const PALETTE: Record<DiagramColor, { fill: string; stroke: string; text: string }> = {
   slate: { fill: "#f8fafc", stroke: "#475569", text: "#0f172a" },
@@ -362,14 +368,74 @@ function nodeLabel(node: DiagramNode) {
   return `<text x="${midpoint}" y="${baseline}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="600" fill="${textColor}">${escapeXml(value)}</text>`;
 }
 
-export function renderDiagramSvg(
+export type DiagramRenderOptions = {
+  width?: number;
+  height?: number;
+  title?: string;
+  assetHref?: (assetId: string) => string | null;
+};
+
+function renderIdentifier(value: unknown) {
+  if (typeof value !== "string" || value.length === 0 || value.length > DIAGRAM_RENDER_MAX_IDENTIFIER) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return false;
+  }
+  return true;
+}
+
+function finiteDiagramNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 1_000_000;
+}
+
+function diagramDimension(value: number | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.min(4_096, value)) : undefined;
+}
+
+function renderableDiagram(diagram: Pick<DiagramContentEnvelope, "nodes" | "edges">) {
+  if (!Array.isArray(diagram.nodes) || !Array.isArray(diagram.edges)) return false;
+  if (diagram.nodes.length > DIAGRAM_RENDER_MAX_NODES || diagram.edges.length > DIAGRAM_RENDER_MAX_EDGES) return false;
+  for (const node of diagram.nodes) {
+    if (
+      !renderIdentifier(node.id) ||
+      !NODE_TYPES.has(node.type) ||
+      !COLORS.has(node.color) ||
+      !finiteDiagramNumber(node.x) ||
+      !finiteDiagramNumber(node.y) ||
+      !finiteDiagramNumber(node.width) ||
+      !finiteDiagramNumber(node.height) ||
+      !finiteDiagramNumber(node.zIndex) ||
+      node.width < 1 ||
+      node.height < 1 ||
+      typeof node.label !== "string" ||
+      node.label.length > MAX_TEXT ||
+      typeof node.notes !== "string" ||
+      node.notes.length > MAX_TEXT ||
+      (node.parentId !== null && !renderIdentifier(node.parentId)) ||
+      (node.assetId !== null && !renderIdentifier(node.assetId))
+    )
+      return false;
+  }
+  for (const edge of diagram.edges) {
+    if (
+      !renderIdentifier(edge.id) ||
+      !renderIdentifier(edge.source) ||
+      !renderIdentifier(edge.target) ||
+      !HANDLES.has(edge.sourceHandle) ||
+      !HANDLES.has(edge.targetHandle) ||
+      !PATHS.has(edge.path) ||
+      !COLORS.has(edge.color) ||
+      typeof edge.label !== "string" ||
+      edge.label.length > MAX_TEXT
+    )
+      return false;
+  }
+  return true;
+}
+
+function renderDiagramSvgUnchecked(
   diagram: Pick<DiagramContentEnvelope, "nodes" | "edges">,
-  options: {
-    width?: number;
-    height?: number;
-    title?: string;
-    assetHref?: (assetId: string) => string | null;
-  } = {},
+  options: DiagramRenderOptions,
 ) {
   const ratio = options.width && options.height ? options.width / options.height : undefined;
   const bounds = fittedBounds(diagram.nodes, ratio);
@@ -398,4 +464,41 @@ export function renderDiagramSvg(
   const width = options.width ? ` width="${Math.round(options.width)}"` : "";
   const height = options.height ? ` height="${Math.round(options.height)}"` : "";
   return `<svg xmlns="http://www.w3.org/2000/svg"${width}${height} viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" role="img" aria-label="${escapeXml(options.title ?? "Diagram")}"><title>${escapeXml(options.title ?? "Diagram")}</title><defs><marker id="diagram-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs><rect x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" fill="#fff"/>${edges}${shapes}</svg>`;
+}
+
+export function renderDiagramSvg(
+  diagram: Pick<DiagramContentEnvelope, "nodes" | "edges">,
+  options: DiagramRenderOptions = {},
+) {
+  const width = diagramDimension(options.width);
+  const height = diagramDimension(options.height);
+  const safeOptions: DiagramRenderOptions = {
+    ...(width === undefined ? {} : { width }),
+    ...(height === undefined ? {} : { height }),
+    title: (options.title ?? "Diagram").slice(0, DIAGRAM_RENDER_MAX_TITLE),
+    ...(options.assetHref
+      ? {
+          assetHref: (assetId: string) => {
+            const href = options.assetHref?.(assetId);
+            return href && href.length <= DIAGRAM_RENDER_MAX_ASSET_HREF ? href : null;
+          },
+        }
+      : {}),
+  };
+  const fallback = () =>
+    renderDiagramSvgUnchecked(
+      { nodes: [], edges: [] },
+      {
+        ...(width === undefined ? {} : { width }),
+        ...(height === undefined ? {} : { height }),
+        title: "Diagram preview unavailable",
+      },
+    );
+  try {
+    if (!renderableDiagram(diagram)) return fallback();
+    const rendered = renderDiagramSvgUnchecked(diagram, safeOptions);
+    return new TextEncoder().encode(rendered).byteLength <= DIAGRAM_RENDER_MAX_SVG_BYTES ? rendered : fallback();
+  } catch {
+    return fallback();
+  }
 }
