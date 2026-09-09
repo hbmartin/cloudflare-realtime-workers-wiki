@@ -424,8 +424,8 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
     await env.DB.prepare(
       `INSERT INTO pages
         (id, workspace_id, space_id, parent_id, kind, position, title, import_job_id, content_epoch,
-         created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         created_by, updated_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         page.id,
@@ -437,6 +437,7 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
         page.title,
         job.id,
         job.attempt,
+        job.requested_by,
         job.requested_by,
         timestamp,
         timestamp,

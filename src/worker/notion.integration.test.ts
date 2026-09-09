@@ -43,7 +43,13 @@ async function integration(cookie: string, pageId: string) {
     authenticated(cookie, `/api/integrations/${result.integration.id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ insertContent: true, updateContent: true, userInformation: "basic" }),
+      body: JSON.stringify({
+        insertContent: true,
+        updateContent: true,
+        readComments: true,
+        insertComments: true,
+        userInformation: "basic",
+      }),
     }),
   );
   expect(capabilities.status).toBe(200);
@@ -292,6 +298,124 @@ describe("Notion-compatible API", () => {
     expect(keys[0]).toBe(keys[2]);
   });
 
+  it("rejects actual request bodies over 500 KiB without relying on Content-Length", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const oversizedBody = JSON.stringify({ query: "x".repeat(500 * 1024) });
+    for (const headers of [
+      { "content-type": "application/json" },
+      { "content-type": "application/json", "content-length": "1" },
+    ]) {
+      const response = await SELF.fetch(
+        notionRequest(createdIntegration.token, "/search", {
+          method: "POST",
+          headers,
+          body: oversizedBody,
+        }),
+      );
+
+      expect(response.status).toBe(413);
+      await expect(response.json()).resolves.toMatchObject({ object: "error", code: "validation_error" });
+    }
+  });
+
+  it("validates page children before writing and removes a staged page when document initialization fails", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const invalid = await SELF.fetch(
+      notionRequest(createdIntegration.token, "/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          parent: { type: "page_id", page_id: installed.pageId },
+          properties: { title: { title: [{ text: { content: "Invalid child page" } }] } },
+          children: [{ embed: { url: "https://untrusted.example/embed" } }],
+        }),
+      }),
+    );
+    expect(invalid.status).toBe(400);
+    await expect(env.DB.prepare(`SELECT id FROM pages WHERE title = 'Invalid child page'`).first()).resolves.toBeNull();
+
+    const calls: Array<{ room: string; path: string }> = [];
+    const document = {
+      getByName(room: string) {
+        return {
+          fetch: async (request: Request) => {
+            const path = new URL(request.url).pathname;
+            calls.push({ room, path });
+            return path.endsWith("/purge")
+              ? Response.json({ purged: true })
+              : Response.json({ error: "injected failure" }, { status: 503 });
+          },
+        };
+      },
+    } as unknown as Cloudflare.Env["DOCUMENT"];
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DOCUMENT") return document;
+        return Reflect.get(target, property, receiver);
+      },
+    }) as Cloudflare.Env;
+    const context = createExecutionContext();
+    const failed = await worker.fetch(
+      notionRequest(createdIntegration.token, "/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          parent: { type: "page_id", page_id: installed.pageId },
+          properties: { title: { title: [{ text: { content: "Failed staged page" } }] } },
+          children: [{ paragraph: { rich_text: [{ text: { content: "Valid child" } }] } }],
+        }),
+      }),
+      bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+
+    expect(failed.status).toBe(400);
+    expect(calls.map((call) => call.path)).toEqual([
+      expect.stringMatching(/\/api-mutate$/),
+      expect.stringMatching(/\/purge$/),
+    ]);
+    await expect(env.DB.prepare(`SELECT id FROM pages WHERE title = 'Failed staged page'`).first()).resolves.toBeNull();
+    await expect(
+      env.DB.prepare(
+        `SELECT event.id FROM webhook_events event
+          JOIN pages page ON page.id = event.page_id WHERE page.title = 'Failed staged page'`,
+      ).first(),
+    ).resolves.toBeNull();
+  });
+
+  it("publishes a page with initialized children exactly once", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      notionRequest(createdIntegration.token, "/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          parent: { type: "page_id", page_id: installed.pageId },
+          properties: { title: { title: [{ text: { content: "Initialized page" } }] } },
+          children: [{ paragraph: { rich_text: [{ text: { content: "Initial content" } }] } }],
+        }),
+      }),
+      env,
+      context,
+    );
+    const created = await response.json<{ id: string }>();
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(200);
+    await expect(
+      env.DB.prepare(`SELECT import_job_id FROM pages WHERE id = ?`).bind(created.id).first(),
+    ).resolves.toEqual({ import_job_id: null });
+    const events = await env.DB.prepare(`SELECT event_type FROM webhook_events WHERE page_id = ? ORDER BY event_type`)
+      .bind(created.id)
+      .all<{ event_type: string }>();
+    expect(events.results).toEqual([{ event_type: "page.created" }]);
+  });
+
   it("updates only the requested page, refreshes browser search, and accepts an empty trash body", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);
@@ -377,11 +501,250 @@ describe("Notion-compatible API", () => {
       ),
     ).toContain(internalChild!.id);
 
-    const trashed = await SELF.fetch(
+    const trashContext = createExecutionContext();
+    const trashed = await worker.fetch(
       notionRequest(createdIntegration.token, `/pages/${child.id}/trash`, { method: "POST" }),
+      env,
+      trashContext,
     );
+    await waitOnExecutionContext(trashContext);
     expect(trashed.status).toBe(200);
     await expect(trashed.json()).resolves.toMatchObject({ in_trash: true });
+  });
+
+  it("disconnects every collaborative room in an archived subtree", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    const child = await client.pages.create({
+      parent: { type: "page_id", page_id: installed.pageId },
+      properties: { title: { type: "title", title: [{ text: { content: "Archive child" } }] } },
+    });
+    const grandchild = await client.pages.create({
+      parent: { type: "page_id", page_id: child.id },
+      properties: { title: { type: "title", title: [{ text: { content: "Archive grandchild" } }] } },
+    });
+    const archivedRooms: string[] = [];
+    const document = {
+      getByName(room: string) {
+        return {
+          fetch: async (request: Request) => {
+            if (new URL(request.url).pathname.endsWith("/archive")) archivedRooms.push(room);
+            return Response.json({ archived: true });
+          },
+        };
+      },
+    } as unknown as Cloudflare.Env["DOCUMENT"];
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DOCUMENT") return document;
+        return Reflect.get(target, property, receiver);
+      },
+    }) as Cloudflare.Env;
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      notionRequest(createdIntegration.token, `/pages/${child.id}/trash`, { method: "POST" }),
+      bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(200);
+    expect(new Set(archivedRooms)).toEqual(new Set([`${child.id}~1`, `${grandchild.id}~1`]));
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM archive_disconnect_targets WHERE page_id IN (?, ?)`)
+        .bind(child.id, grandchild.id)
+        .first(),
+    ).resolves.toEqual({ count: 0 });
+  });
+
+  it("routes API comments through watches, notifications, search, webhooks, and realtime invalidation", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const owner = await env.DB.prepare(`SELECT created_by FROM pages WHERE id = ?`)
+      .bind(installed.pageId)
+      .first<{ created_by: string }>();
+    const bot = await env.DB.prepare(`SELECT bot_user_id FROM integrations WHERE id = ?`)
+      .bind(createdIntegration.integration.id)
+      .first<{ bot_user_id: string }>();
+    const broadcasts: unknown[] = [];
+    const workspaceEvents = {
+      getByName() {
+        return {
+          fetch: async (request: Request) => {
+            broadcasts.push(await request.json());
+            return Response.json({ delivered: true });
+          },
+        };
+      },
+    } as unknown as Cloudflare.Env["WORKSPACE_EVENTS"];
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "WORKSPACE_EVENTS") return workspaceEvents;
+        return Reflect.get(target, property, receiver);
+      },
+    }) as Cloudflare.Env;
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      notionRequest(createdIntegration.token, "/comments", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          parent: { page_id: installed.pageId },
+          rich_text: [
+            { text: { content: "Review this" }, annotations: { bold: true } },
+            {
+              type: "mention",
+              mention: { type: "user", user: { id: owner!.created_by } },
+              plain_text: "Owner",
+            },
+          ],
+        }),
+      }),
+      bindings,
+      context,
+    );
+    const created = await response.json<{ id: string; discussion_id: string; rich_text: unknown[] }>();
+    await waitOnExecutionContext(context);
+
+    expect(response.status).toBe(200);
+    expect(created.rich_text).toEqual(
+      expect.arrayContaining([expect.objectContaining({ annotations: expect.objectContaining({ bold: true }) })]),
+    );
+    await expect(
+      env.DB.prepare(
+        `SELECT 1 watched FROM subscriptions
+          WHERE user_id = ? AND resource_type = 'page' AND resource_id = ? AND muted_at IS NULL`,
+      )
+        .bind(bot!.bot_user_id, installed.pageId)
+        .first(),
+    ).resolves.toEqual({ watched: 1 });
+    await expect(
+      env.DB.prepare(
+        `SELECT user_id, event_type, json_extract(data_json, '$.commentId') comment_id
+           FROM notifications WHERE user_id = ? AND json_extract(data_json, '$.commentId') = ?`,
+      )
+        .bind(owner!.created_by, created.id)
+        .first(),
+    ).resolves.toEqual({ user_id: owner!.created_by, event_type: "mention", comment_id: created.id });
+    await expect(
+      env.DB.prepare(`SELECT comments FROM page_search_v2 WHERE page_id = ?`).bind(installed.pageId).first(),
+    ).resolves.toEqual({ comments: expect.stringContaining("Review this") });
+    await expect(
+      env.DB.prepare(`SELECT event_type FROM webhook_events WHERE entity_id = ?`).bind(created.id).first(),
+    ).resolves.toEqual({ event_type: "comment.created" });
+    expect(broadcasts).toEqual(
+      expect.arrayContaining([
+        { type: "comments-invalidated", pageId: installed.pageId },
+        { type: "notifications-invalidated" },
+      ]),
+    );
+
+    const updateContext = createExecutionContext();
+    const update = await worker.fetch(
+      notionRequest(createdIntegration.token, `/comments/${created.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ rich_text: [{ text: { content: "Updated comment" } }] }),
+      }),
+      env,
+      updateContext,
+    );
+    await waitOnExecutionContext(updateContext);
+    expect(update.status).toBe(200);
+    await expect(
+      env.DB.prepare(
+        `SELECT thread.updated_at thread_updated_at, comment.updated_at comment_updated_at
+           FROM comment_threads thread JOIN comments comment ON comment.thread_id = thread.id
+          WHERE thread.id = ? AND comment.id = ?`,
+      )
+        .bind(created.discussion_id, created.id)
+        .first(),
+    ).resolves.toEqual(
+      expect.objectContaining({ thread_updated_at: expect.any(Number), comment_updated_at: expect.any(Number) }),
+    );
+    await expect(
+      env.DB.prepare(`SELECT comments FROM page_search_v2 WHERE page_id = ?`).bind(installed.pageId).first(),
+    ).resolves.toEqual({ comments: expect.stringContaining("Updated comment") });
+
+    const deleteContext = createExecutionContext();
+    const deleted = await worker.fetch(
+      notionRequest(createdIntegration.token, `/comments/${created.id}`, { method: "DELETE" }),
+      env,
+      deleteContext,
+    );
+    await waitOnExecutionContext(deleteContext);
+    expect(deleted.status).toBe(200);
+    await expect(deleted.json()).resolves.toMatchObject({ rich_text: [] });
+    await expect(
+      env.DB.prepare(`SELECT comments FROM page_search_v2 WHERE page_id = ?`).bind(installed.pageId).first(),
+    ).resolves.toEqual({ comments: expect.not.stringContaining("Updated comment") });
+  });
+
+  it("keeps browser editor attribution populated and applies the browser page field bounds to the API", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const owner = await env.DB.prepare(`SELECT created_by, updated_by FROM pages WHERE id = ?`)
+      .bind(installed.pageId)
+      .first<{ created_by: string; updated_by: string | null }>();
+    expect(owner!.updated_by).toBe(owner!.created_by);
+
+    const createContext = createExecutionContext();
+    const browserCreate = await worker.fetch(
+      authenticated(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Browser attribution" }),
+      }),
+      env,
+      createContext,
+    );
+    await waitOnExecutionContext(createContext);
+    const browserPage = await browserCreate.json<{ page: { id: string; revision: number } }>();
+    await expect(
+      env.DB.prepare(`SELECT updated_by FROM pages WHERE id = ?`).bind(browserPage.page.id).first(),
+    ).resolves.toEqual({ updated_by: owner!.created_by });
+    const patchContext = createExecutionContext();
+    await worker.fetch(
+      authenticated(installed.cookie, `/api/pages/${browserPage.page.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Browser renamed", revision: browserPage.page.revision }),
+      }),
+      env,
+      patchContext,
+    );
+    await waitOnExecutionContext(patchContext);
+    await expect(
+      env.DB.prepare(`SELECT updated_by FROM pages WHERE id = ?`).bind(browserPage.page.id).first(),
+    ).resolves.toEqual({ updated_by: owner!.created_by });
+
+    const oversizedTitle = await SELF.fetch(
+      notionRequest(createdIntegration.token, "/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          parent: { type: "page_id", page_id: installed.pageId },
+          properties: {
+            title: {
+              title: [{ text: { content: "x".repeat(150) } }, { text: { content: "y".repeat(51) } }],
+            },
+          },
+        }),
+      }),
+    );
+    expect(oversizedTitle.status).toBe(400);
+    await expect(oversizedTitle.json()).resolves.toMatchObject({ code: "validation_error" });
+
+    const oversizedIcon = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/pages/${installed.pageId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ icon: { type: "emoji", emoji: "x".repeat(21) } }),
+      }),
+    );
+    expect(oversizedIcon.status).toBe(400);
+    await expect(oversizedIcon.json()).resolves.toMatchObject({ code: "validation_error" });
   });
 
   it("returns validation_error for malformed rich text instead of a 500", async () => {

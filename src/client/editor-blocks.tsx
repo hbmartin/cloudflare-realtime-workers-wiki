@@ -431,6 +431,17 @@ type TransclusionResult =
   | { status: "ok"; content: string; sourceTitle: string }
   | { status: "not_found" | "no_access" };
 
+export function unsyncTransclusion<Block, ParsedBlock>(
+  editor: {
+    tryParseHTMLToBlocks: (html: string) => ParsedBlock[];
+    replaceBlocks: (blocks: Block[], replacements: ParsedBlock[]) => unknown;
+  },
+  block: Block,
+  html: string,
+) {
+  editor.replaceBlocks([block], editor.tryParseHTMLToBlocks(html));
+}
+
 function SyncedReferenceView({
   sourcePageId,
   blockId,
@@ -469,10 +480,7 @@ function SyncedReferenceView({
         <button type="button" onClick={() => setRevision((value) => value + 1)}>
           Refresh
         </button>
-        <button
-          type="button"
-          onClick={() => onUnsync(new DOMParser().parseFromString(result.content, "text/html").body.textContent ?? "")}
-        >
+        <button type="button" onClick={() => onUnsync(result.content)}>
           Unsync to copy
         </button>
         <button type="button" onClick={onRemove}>
@@ -496,7 +504,7 @@ const syncedBlockReference = createReactBlockSpec(
         sourcePageId={block.props.sourcePageId}
         blockId={block.props.blockId}
         onRemove={() => editor.removeBlocks([block])}
-        onUnsync={(content) => editor.replaceBlocks([block], [{ type: "paragraph", content }] as never)}
+        onUnsync={(content) => unsyncTransclusion(editor, block, content)}
       />
     ),
     toExternalHTML: ({ block }) => (
@@ -751,12 +759,6 @@ export const editorBlockFactories = [
   { type: "tableOfContents", label: "Table of contents", description: "Links to headings on this page", icon: "☷" },
   { type: "columnList", label: "Columns", description: "Nested two-column layout", icon: "▥" },
   { type: "syncedBlockSource", label: "Synced block", description: "Reusable source content", icon: "⟳" },
-  {
-    type: "syncedBlockReference",
-    label: "Synced reference",
-    description: "Reference content from another page",
-    icon: "↻",
-  },
   { type: "breadcrumb", label: "Breadcrumb", description: "Current page ancestry", icon: "›" },
   { type: "linkToPage", label: "Link to page", description: "Linked page card", icon: "□" },
   { type: "linkedDiagram", label: "Linked whiteboard", description: "Live diagram with a thumbnail", icon: "◇" },

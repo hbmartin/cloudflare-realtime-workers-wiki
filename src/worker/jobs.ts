@@ -267,8 +267,8 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     env.DB.prepare(
       `INSERT INTO pages
         (id, workspace_id, space_id, parent_id, kind, position, title, icon, is_template, import_job_id,
-         content_epoch, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         content_epoch, created_by, updated_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       options.targetPageId,
       job.workspace_id,
@@ -281,6 +281,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
       options.isTemplate ? 1 : 0,
       job.id,
       job.attempt,
+      job.requested_by,
       job.requested_by,
       timestamp,
       timestamp,

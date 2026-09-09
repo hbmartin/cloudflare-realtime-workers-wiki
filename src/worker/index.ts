@@ -1037,9 +1037,18 @@ app.post("/api/install/bootstrap", async (c) => {
       timestamp,
     ),
     c.env.DB.prepare(
-      `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-       VALUES (?, ?, NULL, 'document', ?, 'Welcome', ?, ?, ?)`,
-    ).bind(pageId, workspaceId, generateJitteredKeyBetween(null, null), signup.user.id, timestamp, timestamp),
+      `INSERT INTO pages
+        (id, workspace_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at)
+       VALUES (?, ?, NULL, 'document', ?, 'Welcome', ?, ?, ?, ?)`,
+    ).bind(
+      pageId,
+      workspaceId,
+      generateJitteredKeyBetween(null, null),
+      signup.user.id,
+      signup.user.id,
+      timestamp,
+      timestamp,
+    ),
     c.env.DB.prepare(
       `INSERT INTO subscriptions
         (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
@@ -2245,9 +2254,22 @@ app.post("/api/pages", async (c) => {
     const position = generateJitteredKeyBetween(last?.position ?? null, null);
     const results = await c.env.DB.batch<PageRow>([
       c.env.DB.prepare(
-        `INSERT INTO pages (id, workspace_id, space_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-      ).bind(id, member.workspace.id, spaceId, parentId, kind, position, title, member.user.id, timestamp, timestamp),
+        `INSERT INTO pages
+          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      ).bind(
+        id,
+        member.workspace.id,
+        spaceId,
+        parentId,
+        kind,
+        position,
+        title,
+        member.user.id,
+        member.user.id,
+        timestamp,
+        timestamp,
+      ),
       c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
         id,
         member.workspace.id,
@@ -2367,8 +2389,9 @@ app.post("/api/pages/batch", async (c) => {
     pageResultIndexes.push(statements.length);
     statements.push(
       c.env.DB.prepare(
-        `INSERT INTO pages (id, workspace_id, space_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        `INSERT INTO pages
+          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       ).bind(
         page.id,
         member.workspace.id,
@@ -2377,6 +2400,7 @@ app.post("/api/pages/batch", async (c) => {
         page.kind,
         positions.get(page.id),
         page.title,
+        member.user.id,
         member.user.id,
         timestamp,
         timestamp,
@@ -2885,10 +2909,10 @@ app.patch("/api/pages/:id", async (c) => {
   const titleValue = body.title === undefined ? page.title : text(body.title, "title", PAGE_TITLE_MAX);
   const iconValue = body.icon === undefined ? page.icon : body.icon === null ? null : text(body.icon, "icon", 20);
   const result = await c.env.DB.prepare(
-    `UPDATE pages SET title = ?, icon = ?, revision = revision + 1, updated_at = ?
+    `UPDATE pages SET title = ?, icon = ?, revision = revision + 1, updated_by = ?, updated_at = ?
       WHERE id = ? AND workspace_id = ? AND revision = ?`,
   )
-    .bind(titleValue, iconValue, now(), page.id, member.workspace.id, revision)
+    .bind(titleValue, iconValue, member.user.id, now(), page.id, member.workspace.id, revision)
     .run();
   if (!result.meta.changes)
     throw new HttpError(409, "stale_revision", "The page metadata changed. Reload and try again.");
@@ -2982,9 +3006,9 @@ app.post("/api/pages/:id/move", async (c) => {
     const pageStateResultIndex = 3;
     const statements = [
       c.env.DB.prepare(
-        `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ?
+        `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_by = ?, updated_at = ?
           WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
-      ).bind(parentId, position, timestamp, page.id, member.workspace.id),
+      ).bind(parentId, position, member.user.id, timestamp, page.id, member.workspace.id),
       c.env.DB.prepare(
         `INSERT INTO page_move_receipts
            (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
@@ -3164,9 +3188,10 @@ app.post("/api/pages/:id/move-space", async (c) => {
          parent_id = CASE WHEN id = ? THEN ? ELSE parent_id END,
          position = CASE WHEN id = ? THEN ? ELSE position END,
          revision = revision + 1,
+         updated_by = ?,
          updated_at = ?
        WHERE workspace_id = ? AND id IN (${subtreeSql})`,
-    ).bind(spaceId, page.id, parentId, page.id, position, timestamp, member.workspace.id, page.id),
+    ).bind(spaceId, page.id, parentId, page.id, position, member.user.id, timestamp, member.workspace.id, page.id),
     c.env.DB.prepare(`UPDATE page_search_v2 SET space_id = ? WHERE page_id IN (${subtreeSql})`).bind(spaceId, page.id),
     c.env.DB.prepare(`SELECT * FROM pages WHERE id IN (${subtreeSql}) ORDER BY position, id`).bind(page.id),
   ]);
@@ -3189,9 +3214,9 @@ app.delete("/api/pages/:id", async (c) => {
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) UPDATE pages
-           SET archived_at = ?, archived_by = ?, revision = revision + 1, updated_at = ?
+           SET archived_at = ?, archived_by = ?, revision = revision + 1, updated_by = ?, updated_at = ?
          WHERE id IN subtree`,
-    ).bind(page.id, member.workspace.id, timestamp, member.user.id, timestamp),
+    ).bind(page.id, member.workspace.id, timestamp, member.user.id, member.user.id, timestamp),
     c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
       SELECT id FROM subtree
@@ -3266,9 +3291,9 @@ app.post("/api/pages/:id/restore", async (c) => {
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) UPDATE pages
-           SET archived_at = NULL, archived_by = NULL, revision = revision + 1, updated_at = ?
+           SET archived_at = NULL, archived_by = NULL, revision = revision + 1, updated_by = ?, updated_at = ?
          WHERE id IN subtree`,
-      ).bind(page.id, member.workspace.id, now()),
+      ).bind(page.id, member.workspace.id, member.user.id, now()),
       c.env.DB.prepare(
         `DELETE FROM archive_disconnect_targets WHERE page_id IN (
          WITH RECURSIVE subtree(id) AS (

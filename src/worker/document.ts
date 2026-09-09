@@ -59,6 +59,7 @@ interface PageProjectionRow {
   space_id: string;
   title: string;
   archived_at: number | null;
+  import_job_id: string | null;
 }
 
 interface RestoreRecoveryRow extends Record<string, SqlStorageValue> {
@@ -720,7 +721,7 @@ export class Document extends YServer {
       if (this.metadata.content_kind !== "document") {
         return Response.json({ error: "Block mutations are only available for document pages." }, { status: 422 });
       }
-      let body: { actorId?: unknown; operations?: unknown };
+      let body: { actorId?: unknown; operations?: unknown; suppressExternalEffects?: unknown };
       try {
         body = await request.json();
       } catch {
@@ -767,7 +768,7 @@ export class Document extends YServer {
         for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(this.document, operation);
       }, "api-mutation");
       this.flushPendingUpdates();
-      if (this.metadata.dirty) await this.compact(true);
+      if (this.metadata.dirty) await this.compact(true, body.suppressExternalEffects === true);
       return Response.json({ document, sequence: this.metadata.snapshot_seq });
     }
     if (request.method === "GET" && url.pathname.endsWith("/legacy-comments")) {
@@ -1024,10 +1025,12 @@ export class Document extends YServer {
     if (notifyEdit) this.metadata.notify_edit = 1;
   }
 
-  private compact(forceVersion = false): Promise<void> {
+  private compact(forceVersion = false, suppressExternalEffects = false): Promise<void> {
     const active = this.compaction;
-    if (active) return active.catch(() => undefined).then(() => this.compact(forceVersion));
-    const compacting = this.compactOnce(forceVersion);
+    if (active) {
+      return active.catch(() => undefined).then(() => this.compact(forceVersion, suppressExternalEffects));
+    }
+    const compacting = this.compactOnce(forceVersion, suppressExternalEffects);
     const tracked = compacting.finally(() => {
       if (this.compaction === tracked) this.compaction = null;
     });
@@ -1035,7 +1038,7 @@ export class Document extends YServer {
     return tracked;
   }
 
-  private async compactOnce(forceVersion = false) {
+  private async compactOnce(forceVersion = false, suppressExternalEffects = false) {
     if (this.metadata.content_kind === "document") migrateLegacyColumns(this.document);
     this.flushPendingUpdates();
     const { pageId, epoch } = this.ids;
@@ -1127,7 +1130,8 @@ export class Document extends YServer {
       });
 
       const page = await this.bindings.DB.prepare(
-        `SELECT workspace_id, space_id, title, archived_at FROM pages WHERE id = ? AND content_epoch = ?`,
+        `SELECT workspace_id, space_id, title, archived_at, import_job_id
+           FROM pages WHERE id = ? AND content_epoch = ?`,
       )
         .bind(pageId, epoch)
         .first<PageProjectionRow>();
@@ -1144,6 +1148,7 @@ export class Document extends YServer {
       let pageProjected = false;
 
       if (page) {
+        const effectsSuppressed = suppressExternalEffects && page.import_job_id?.startsWith("notion-create:") === true;
         const [oldPageTargets, oldUserTargets, watcherRows] = await Promise.all([
           this.bindings.DB.prepare(`SELECT target_page_id id FROM page_references WHERE source_page_id = ?`)
             .bind(pageId)
@@ -1340,45 +1345,51 @@ export class Document extends YServer {
             pageId,
             epoch,
           ),
-          ...webhookEventStatements(this.bindings.DB, {
-            workspaceId: page.workspace_id,
-            type: "page.content_updated",
-            entityType: "page",
-            entityId: pageId,
-            pageId,
-            actorId: metadataAtStart.last_editor_id,
-            sourceKey: `page.content_updated:${pageId}:${epoch}:${maximum}`,
-            data: { sequence: maximum },
-            createdAt: timestamp,
-          }),
-          ...notificationFanoutStatements(this.bindings.DB, {
-            workspaceId: page.workspace_id,
-            spaceId: page.space_id,
-            pageId,
-            threadId: null,
-            actorId: metadataAtStart.last_editor_id ?? "",
-            eventType: "mention",
-            sourceId: `${pageId}:${epoch}:${maximum}`,
-            recipientIds: metadataAtStart.notify_edit && metadataAtStart.last_editor_id ? newMentionIds : [],
-            emitSlackChannel: Boolean(
-              metadataAtStart.notify_edit && metadataAtStart.last_editor_id && newMentionIds.length,
-            ),
-            data: { sequence: maximum },
-            createdAt: timestamp,
-          }),
-          ...notificationFanoutStatements(this.bindings.DB, {
-            workspaceId: page.workspace_id,
-            spaceId: page.space_id,
-            pageId,
-            threadId: null,
-            actorId: metadataAtStart.last_editor_id ?? "",
-            eventType: "page_edit",
-            sourceId: `${pageId}:${epoch}:${maximum}`,
-            recipientIds: metadataAtStart.notify_edit ? watcherIds : [],
-            emitSlackChannel: Boolean(metadataAtStart.notify_edit && metadataAtStart.last_editor_id),
-            data: { sequence: maximum },
-            createdAt: timestamp,
-          }),
+          ...(effectsSuppressed
+            ? []
+            : webhookEventStatements(this.bindings.DB, {
+                workspaceId: page.workspace_id,
+                type: "page.content_updated",
+                entityType: "page",
+                entityId: pageId,
+                pageId,
+                actorId: metadataAtStart.last_editor_id,
+                sourceKey: `page.content_updated:${pageId}:${epoch}:${maximum}`,
+                data: { sequence: maximum },
+                createdAt: timestamp,
+              })),
+          ...(effectsSuppressed
+            ? []
+            : notificationFanoutStatements(this.bindings.DB, {
+                workspaceId: page.workspace_id,
+                spaceId: page.space_id,
+                pageId,
+                threadId: null,
+                actorId: metadataAtStart.last_editor_id ?? "",
+                eventType: "mention",
+                sourceId: `${pageId}:${epoch}:${maximum}`,
+                recipientIds: metadataAtStart.notify_edit && metadataAtStart.last_editor_id ? newMentionIds : [],
+                emitSlackChannel: Boolean(
+                  metadataAtStart.notify_edit && metadataAtStart.last_editor_id && newMentionIds.length,
+                ),
+                data: { sequence: maximum },
+                createdAt: timestamp,
+              })),
+          ...(effectsSuppressed
+            ? []
+            : notificationFanoutStatements(this.bindings.DB, {
+                workspaceId: page.workspace_id,
+                spaceId: page.space_id,
+                pageId,
+                threadId: null,
+                actorId: metadataAtStart.last_editor_id ?? "",
+                eventType: "page_edit",
+                sourceId: `${pageId}:${epoch}:${maximum}`,
+                recipientIds: metadataAtStart.notify_edit ? watcherIds : [],
+                emitSlackChannel: Boolean(metadataAtStart.notify_edit && metadataAtStart.last_editor_id),
+                data: { sequence: maximum },
+                createdAt: timestamp,
+              })),
         ];
         const currentPageTargetsIndex = statements.length;
         statements.push(
@@ -1440,7 +1451,7 @@ export class Document extends YServer {
           versionAt = metadataAtStart.last_version_at;
         }
 
-        if (pageProjected) {
+        if (pageProjected && !effectsSuppressed) {
           this.state.waitUntil(
             sweepOutbox(this.bindings).catch((error) => console.error("Failed to enqueue webhook events", error)),
           );
@@ -1562,7 +1573,8 @@ export class Document extends YServer {
       ]);
 
       const page = await this.bindings.DB.prepare(
-        `SELECT workspace_id, space_id, title, archived_at FROM pages WHERE id = ? AND content_epoch = ?`,
+        `SELECT workspace_id, space_id, title, archived_at, import_job_id
+           FROM pages WHERE id = ? AND content_epoch = ?`,
       )
         .bind(pageId, epoch)
         .first<PageProjectionRow>();

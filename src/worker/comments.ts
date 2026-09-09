@@ -1,6 +1,6 @@
 import type { Comment, CommentAnchor, CommentBody, CommentThread, Role } from "../shared/types";
 import { ID_PATTERN } from "../shared/validation";
-import type { Env, MemberContext } from "./env";
+import type { Env } from "./env";
 import { HttpError } from "./http";
 import { notificationFanoutStatements } from "./notifications";
 import { refreshPageSearchV2Statements } from "./search-index";
@@ -17,6 +17,11 @@ export type CommentPage = {
   content_epoch: number;
   created_by: string;
   effective_role: Role;
+};
+
+export type CommentActor = {
+  role: Role;
+  user: { id: string };
 };
 
 type ThreadRow = {
@@ -183,7 +188,7 @@ function commentJson(row: CommentRow): Comment {
   };
 }
 
-function canResolve(member: MemberContext, page: CommentPage, thread: ThreadRow) {
+function canResolve(member: CommentActor, page: CommentPage, thread: ThreadRow) {
   return member.role === "owner" || page.effective_role !== "viewer" || thread.created_by === member.user.id;
 }
 
@@ -207,7 +212,7 @@ async function commentsForThreads(env: Env, threadIds: string[]) {
   return grouped;
 }
 
-function threadJson(row: ThreadRow, comments: Comment[], member: MemberContext, page: CommentPage): CommentThread {
+function threadJson(row: ThreadRow, comments: Comment[], member: CommentActor, page: CommentPage): CommentThread {
   return {
     id: row.id,
     workspaceId: row.workspace_id,
@@ -225,7 +230,7 @@ function threadJson(row: ThreadRow, comments: Comment[], member: MemberContext, 
   };
 }
 
-export async function listCommentThreads(env: Env, member: MemberContext, page: CommentPage) {
+export async function listCommentThreads(env: Env, member: CommentActor, page: CommentPage) {
   const rows = await env.DB.prepare(`SELECT * FROM comment_threads WHERE page_id = ? ORDER BY created_at, id`)
     .bind(page.id)
     .all<ThreadRow>();
@@ -244,7 +249,7 @@ async function threadRow(env: Env, page: CommentPage, threadId: string) {
   return row;
 }
 
-export async function commentThread(env: Env, member: MemberContext, page: CommentPage, threadId: string) {
+export async function commentThread(env: Env, member: CommentActor, page: CommentPage, threadId: string) {
   const row = await threadRow(env, page, threadId);
   const comments = await commentsForThreads(env, [threadId]);
   return threadJson(row, comments.get(threadId) ?? [], member, page);
@@ -273,11 +278,15 @@ async function threadParticipantIds(env: Env, threadId: string) {
 
 export async function createCommentThread(
   env: Env,
-  member: MemberContext,
+  member: CommentActor,
   page: CommentPage,
   bodyValue: unknown,
   anchor: CommentAnchor | null = null,
+  blockId: string | null = null,
 ) {
+  if (blockId !== null && !ID_PATTERN.test(blockId)) {
+    throw new HttpError(422, "invalid_comment_block", "The comment block is invalid.");
+  }
   const body = validatedCommentBody(bodyValue);
   const threadId = crypto.randomUUID();
   const commentId = crypto.randomUUID();
@@ -286,13 +295,14 @@ export async function createCommentThread(
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO comment_threads
-        (id, workspace_id, space_id, page_id, created_by, anchor_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, workspace_id, space_id, page_id, block_id, created_by, anchor_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       threadId,
       page.workspace_id,
       page.space_id,
       page.id,
+      blockId,
       member.user.id,
       anchor ? JSON.stringify(anchor) : null,
       timestamp,
@@ -334,7 +344,7 @@ export async function createCommentThread(
 
 export async function addCommentReply(
   env: Env,
-  member: MemberContext,
+  member: CommentActor,
   page: CommentPage,
   threadId: string,
   bodyValue: unknown,
@@ -412,7 +422,7 @@ export async function addCommentReply(
 
 export async function updateComment(
   env: Env,
-  member: MemberContext,
+  member: CommentActor,
   page: CommentPage,
   threadId: string,
   commentId: string,
@@ -471,7 +481,7 @@ export async function updateComment(
 
 export async function softDeleteComment(
   env: Env,
-  member: MemberContext,
+  member: CommentActor,
   page: CommentPage,
   threadId: string,
   commentId: string,
@@ -508,7 +518,7 @@ export async function softDeleteComment(
 
 export async function setThreadResolved(
   env: Env,
-  member: MemberContext,
+  member: CommentActor,
   page: CommentPage,
   threadId: string,
   resolved: boolean,
