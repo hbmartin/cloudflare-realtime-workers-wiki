@@ -392,7 +392,7 @@ export class Document extends YServer {
   private compaction: Promise<void> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
-    super(state, env);
+    super(state, env as Cloudflare.Env);
     this.state = state;
     this.bindings = env;
   }

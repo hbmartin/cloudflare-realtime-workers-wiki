@@ -12,6 +12,7 @@ import {
   type NotionBlock,
 } from "../shared/notion-blocks";
 import { sha256Hex } from "../shared/import-integrity";
+import { constantTimeEqual, hmacSha256Hex } from "../shared/security";
 import type { DocumentContentEnvelope, WorkspaceEvent } from "../shared/types";
 import {
   authenticateIntegration,
@@ -19,6 +20,7 @@ import {
   IntegrationAuthError,
   pageForIntegration,
   publicPageId,
+  publicPageIds,
   type IntegrationPage,
   type IntegrationPrincipal,
 } from "./integrations";
@@ -217,15 +219,20 @@ function pagination(input: { page_size?: unknown; start_cursor?: unknown }) {
   return { size, offset: decodeCursor(input.start_cursor as string | undefined) };
 }
 
-function listEnvelope(results: unknown[], offset: number, size: number) {
+function listEnvelope(
+  results: unknown[],
+  offset: number,
+  size: number,
+  type: "page_or_database" | "block" | "user" = "page_or_database",
+) {
   const hasMore = results.length > size;
   return {
     object: "list",
     results: hasMore ? results.slice(0, size) : results,
     next_cursor: hasMore ? encodeCursor(offset + size) : null,
     has_more: hasMore,
-    type: "page_or_database",
-    page_or_database: {},
+    type,
+    [type]: {},
   };
 }
 
@@ -254,38 +261,68 @@ function actorObject(id: string | null, name = "Unknown") {
       };
 }
 
-async function activePublicUrl(env: Env, page: IntegrationPage, origin: string) {
-  const row = await env.DB.prepare(
-    `WITH RECURSIVE ancestors(id, parent_id) AS (
-       SELECT id, parent_id FROM pages WHERE id = ?
-       UNION ALL SELECT parent.id, parent.parent_id FROM pages parent JOIN ancestors child ON parent.id = child.parent_id
-     )
-     SELECT share.url_key, share.root_page_id FROM share_links share
-      WHERE share.workspace_id = ? AND share.revoked_at IS NULL
-        AND (share.root_page_id = ? OR (share.include_subpages = 1 AND share.root_page_id IN (SELECT id FROM ancestors)))
-      LIMIT 1`,
-  )
-    .bind(page.id, page.workspace_id, page.id)
-    .first<{ url_key: string; root_page_id: string }>();
-  if (!row) return null;
-  return `${origin}/share/${row.url_key}${row.root_page_id === page.id ? "" : `/pages/${encodeURIComponent(page.id)}`}`;
-}
+type PageObjectData = {
+  publicIds: Map<string, string>;
+  userNames: Map<string, string>;
+  publicUrls: Map<string, string>;
+};
 
-async function userName(env: Env, id: string | null) {
-  if (!id) return "Unknown";
-  return (
-    (await env.DB.prepare(`SELECT name FROM user WHERE id = ?`).bind(id).first<{ name: string }>())?.name ?? "Unknown"
-  );
-}
-
-async function pageObject(env: Env, page: IntegrationPage, origin: string) {
-  const [id, parentId, creatorName, editorName, publicUrl] = await Promise.all([
-    publicPageId(env, page.id),
-    page.parent_id ? publicPageId(env, page.parent_id) : Promise.resolve(null),
-    userName(env, page.created_by),
-    userName(env, page.updated_by),
-    activePublicUrl(env, page, origin),
+async function preloadPageObjectData(env: Env, pages: IntegrationPage[], origin: string): Promise<PageObjectData> {
+  const pageIds = pages.flatMap((page) => (page.parent_id ? [page.id, page.parent_id] : [page.id]));
+  const userIds = [
+    ...new Set(pages.flatMap((page) => [page.created_by, page.updated_by]).filter((id): id is string => Boolean(id))),
+  ];
+  const [publicIds, users, shares] = await Promise.all([
+    publicPageIds(env, pageIds),
+    userIds.length
+      ? env.DB.prepare(`SELECT id, name FROM user WHERE id IN (SELECT value FROM json_each(?))`)
+          .bind(JSON.stringify(userIds))
+          .all<{ id: string; name: string }>()
+      : Promise.resolve({ results: [] as Array<{ id: string; name: string }> }),
+    pages.length
+      ? env.DB.prepare(
+          `WITH RECURSIVE ancestors(page_id, ancestor_id, parent_id, depth) AS (
+             SELECT id, id, parent_id, 0 FROM pages WHERE id IN (SELECT value FROM json_each(?))
+             UNION ALL
+             SELECT child.page_id, parent.id, parent.parent_id, child.depth + 1
+               FROM pages parent JOIN ancestors child ON parent.id = child.parent_id
+              WHERE child.depth < 50
+           )
+           SELECT ancestor.page_id, share.url_key, share.root_page_id, ancestor.depth
+             FROM ancestors ancestor JOIN share_links share ON share.root_page_id = ancestor.ancestor_id
+            WHERE share.workspace_id = ? AND share.revoked_at IS NULL
+              AND (ancestor.depth = 0 OR share.include_subpages = 1)
+            ORDER BY ancestor.page_id, ancestor.depth`,
+        )
+          .bind(JSON.stringify(pages.map((page) => page.id)), pages[0]!.workspace_id)
+          .all<{ page_id: string; url_key: string; root_page_id: string; depth: number }>()
+      : Promise.resolve({
+          results: [] as Array<{ page_id: string; url_key: string; root_page_id: string; depth: number }>,
+        }),
   ]);
+  const publicUrls = new Map<string, string>();
+  for (const share of shares.results) {
+    if (publicUrls.has(share.page_id)) continue;
+    publicUrls.set(
+      share.page_id,
+      `${origin}/share/${share.url_key}${share.root_page_id === share.page_id ? "" : `/pages/${encodeURIComponent(share.page_id)}`}`,
+    );
+  }
+  return {
+    publicIds,
+    userNames: new Map(users.results.map((user) => [user.id, user.name])),
+    publicUrls,
+  };
+}
+
+async function pageObject(env: Env, page: IntegrationPage, origin: string, preloaded?: PageObjectData) {
+  const data = preloaded ?? (await preloadPageObjectData(env, [page], origin));
+  const id = data.publicIds.get(page.id);
+  const parentId = page.parent_id ? data.publicIds.get(page.parent_id) : null;
+  if (!id || (page.parent_id && !parentId)) throw new Error("A public page id could not be assigned.");
+  const creatorName = data.userNames.get(page.created_by) ?? "Unknown";
+  const editorName = (page.updated_by && data.userNames.get(page.updated_by)) || "Unknown";
+  const publicUrl = data.publicUrls.get(page.id) ?? null;
   const title = {
     id: "title",
     type: "title",
@@ -832,7 +869,7 @@ notionApi.get("/blocks/:blockId/children", async (c) => {
       }
     }
   }
-  return c.json(listEnvelope(results, offset, size));
+  return c.json(listEnvelope(results, offset, size, "block"));
 });
 
 notionApi.patch("/blocks/:blockId/children", async (c) => {
@@ -933,7 +970,9 @@ notionApi.post("/search", async (c) => {
       offset,
     )
     .all<IntegrationPage>();
-  const results = await Promise.all(rows.results.map((page) => pageObject(c.env, page, new URL(c.req.url).origin)));
+  const origin = new URL(c.req.url).origin;
+  const pageData = await preloadPageObjectData(c.env, rows.results, origin);
+  const results = await Promise.all(rows.results.map((page) => pageObject(c.env, page, origin, pageData)));
   return c.json(listEnvelope(results, offset, size));
 });
 
@@ -988,6 +1027,7 @@ notionApi.get("/users", async (c) => {
       rows.results.map((row) => userObject(row, principal)),
       offset,
       size,
+      "user",
     ),
   );
 });
@@ -1032,9 +1072,9 @@ function commentObject(row: ApiCommentRow) {
   };
 }
 
-async function commentRows(env: Env, where: string, binds: unknown[]) {
+async function commentRows(env: Env, where: string, binds: unknown[], orderBy = "") {
   return env.DB.prepare(
-    `SELECT comment.id, comment.thread_id, thread.block_id, thread.page_id, comment.user_id, comment.plain_text, comment.deleted_at, comment.created_at, comment.updated_at FROM comments comment JOIN comment_threads thread ON thread.id = comment.thread_id WHERE ${where}`,
+    `SELECT comment.id, comment.thread_id, thread.block_id, thread.page_id, comment.user_id, comment.plain_text, comment.deleted_at, comment.created_at, comment.updated_at FROM comments comment JOIN comment_threads thread ON thread.id = comment.thread_id WHERE ${where}${orderBy ? ` ORDER BY ${orderBy}` : ""}`,
   )
     .bind(...binds)
     .all<ApiCommentRow>();
@@ -1056,8 +1096,9 @@ notionApi.get("/comments", async (c) => {
   }
   const rows = await commentRows(
     c.env,
-    `thread.page_id = ? AND thread.block_id IS ? AND comment.deleted_at IS NULL ORDER BY comment.created_at`,
+    `thread.page_id = ? AND thread.block_id IS ? AND comment.deleted_at IS NULL`,
     [internalPage.id, matchId],
+    "comment.created_at",
   );
   return c.json({
     object: "list",
@@ -1197,31 +1238,12 @@ notionApi.delete("/comments/:commentId", async (c) => {
 
 export { notionApi };
 
-async function hmacHex(secret: string, value: string) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const bytes = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 async function notionFileUrl(env: Env, attachmentId: string, expires: number) {
-  const signature = await hmacHex(env.BETTER_AUTH_SECRET, `${attachmentId}:${expires}`);
+  const signature = await hmacSha256Hex(env.BETTER_AUTH_SECRET, `${attachmentId}:${expires}`);
   return new URL(
     `/v1/files/${encodeURIComponent(attachmentId)}?expires=${expires}&signature=${signature}`,
     env.BETTER_AUTH_URL,
   ).toString();
-}
-
-function constantTimeEqual(left: string, right: string) {
-  if (left.length !== right.length) return false;
-  let mismatch = 0;
-  for (let index = 0; index < left.length; index++) mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
-  return mismatch === 0;
 }
 
 export async function notionFileResponse(request: Request, env: Env, attachmentId: string) {
@@ -1229,7 +1251,7 @@ export async function notionFileResponse(request: Request, env: Env, attachmentI
   const expires = Number(url.searchParams.get("expires"));
   const signature = url.searchParams.get("signature") ?? "";
   if (!Number.isSafeInteger(expires) || expires <= Date.now() || expires > Date.now() + 2 * 60 * 60_000) return null;
-  const expected = await hmacHex(env.BETTER_AUTH_SECRET, `${attachmentId}:${expires}`);
+  const expected = await hmacSha256Hex(env.BETTER_AUTH_SECRET, `${attachmentId}:${expires}`);
   if (!constantTimeEqual(signature, expected)) return null;
   const attachment = await env.DB.prepare(`SELECT r2_key, name, mime FROM attachments WHERE id = ?`)
     .bind(attachmentId)

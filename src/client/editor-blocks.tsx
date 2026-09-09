@@ -256,6 +256,15 @@ export function safeBookmarkUrl(value: string) {
   }
 }
 
+export function safePdfUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function EmbedBlock({ url, title, update }: { url: string; title: string; update?: (url: string) => void }) {
   const embedded = allowedEmbedUrl(url);
   const bookmark = safeBookmarkUrl(url);
@@ -680,24 +689,24 @@ const linkedDiagram = createReactBlockSpec(
 const pdf = createReactBlockSpec(
   { type: "pdf", propSchema: { url: { default: "" }, caption: { default: "PDF" } }, content: "none" },
   {
-    render: ({ block, editor }) => (
-      <div className="editor-pdf">
-        {safeBookmarkUrl(block.props.url) ? (
-          <iframe title={block.props.caption} src={block.props.url} sandbox="" />
-        ) : (
-          <span>Add a PDF URL</span>
-        )}
-        {editor.isEditable && (
-          <input
-            aria-label="PDF URL"
-            type="url"
-            value={block.props.url}
-            onChange={(event) => editor.updateBlock(block, { props: { url: event.target.value } })}
-          />
-        )}
-      </div>
-    ),
-    toExternalHTML: ({ block }) => <a href={safeBookmarkUrl(block.props.url) ?? undefined}>{block.props.caption}</a>,
+    render: ({ block, editor }) => {
+      const url = safePdfUrl(block.props.url);
+      return (
+        <div className="editor-pdf">
+          {url ? <iframe title={block.props.caption} src={url} sandbox="" /> : <span>Add a PDF URL</span>}
+          {editor.isEditable && (
+            <input
+              contentEditable={false}
+              aria-label="PDF URL"
+              type="url"
+              value={block.props.url}
+              onChange={(event) => editor.updateBlock(block, { props: { url: event.target.value } })}
+            />
+          )}
+        </div>
+      );
+    },
+    toExternalHTML: ({ block }) => <a href={safePdfUrl(block.props.url) ?? undefined}>{block.props.caption}</a>,
   },
 )();
 

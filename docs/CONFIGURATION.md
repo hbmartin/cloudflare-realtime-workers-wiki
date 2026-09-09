@@ -25,7 +25,7 @@ Set for deployment with `wrangler secret put --env production`. Never place thes
 | `SLACK_CLIENT_SECRET`        | No                   | Slack OAuth v2 client secret.                                                                                                                                                                                                                |
 | `SLACK_SIGNING_SECRET`       | No                   | Verifies slash commands and Events API requests; requests older than five minutes and signature replays are rejected.                                                                                                                        |
 | `SLACK_TOKEN_ENCRYPTION_KEY` | No                   | High-entropy key used to encrypt bot access and refresh tokens with AES-GCM before D1 storage. Rotate by reinstalling Slack with the new key before removing the old deployment.                                                             |
-| `WEBHOOK_ENCRYPTION_KEY`     | For webhooks         | Independent high-entropy key used to encrypt integration webhook verification tokens with AES-GCM. Webhook subscription creation and delivery remain unavailable when it is unset.                                                           |
+| `WEBHOOK_ENCRYPTION_KEY`     | For webhooks         | Exactly 32 random bytes encoded as 43 characters of unpadded base64url. Encrypts integration webhook verification tokens with AES-GCM; webhook subscription creation and delivery remain unavailable when it is unset or malformed.          |
 
 `DO_LOCATION_HINT` is frozen into `workspaces.location_hint` at bootstrap and is **immutable in v1**.
 Changing the secret later has no effect on an existing workspace. It influences first Durable Object

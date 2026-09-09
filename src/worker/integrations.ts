@@ -1,4 +1,5 @@
 import { sha256Hex } from "../shared/import-integrity";
+import { bytesToBase64Url } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 
@@ -85,10 +86,7 @@ function integrationJson(row: IntegrationRow) {
 }
 
 function secret(prefix: string) {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return `${prefix}${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")}`;
+  return `${prefix}${bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
 async function tokenRecord(integrationId: string, timestamp: number) {
@@ -274,7 +272,8 @@ export async function replaceIntegrationGrants(
 
 export function integrationBearerToken(request: Request) {
   const authorization = request.headers.get("authorization") ?? "";
-  return /^Bearer crn_[A-Za-z0-9_-]{43}$/.test(authorization) ? authorization.slice(7) : null;
+  const match = /^[Bb][Ee][Aa][Rr][Ee][Rr] (crn_[A-Za-z0-9_-]{43})$/.exec(authorization);
+  return match?.[1] ?? null;
 }
 
 export async function authenticateIntegration(request: Request, env: Env): Promise<IntegrationPrincipal> {
@@ -350,20 +349,39 @@ export async function pageForIntegration(
     .first<IntegrationPage>();
 }
 
-export async function publicPageId(env: Env, pageId: string) {
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(pageId)) {
-    return pageId.toLowerCase();
-  }
-  const existing = await env.DB.prepare(`SELECT id FROM api_page_ids WHERE page_id = ?`)
-    .bind(pageId)
-    .first<{ id: string }>();
-  if (existing) return existing.id;
-  const id = crypto.randomUUID();
-  await env.DB.prepare(`INSERT OR IGNORE INTO api_page_ids (id, page_id, created_at) VALUES (?, ?, ?)`)
-    .bind(id, pageId, Date.now())
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export async function publicPageIds(env: Env, pageIds: string[]) {
+  const unique = [...new Set(pageIds)];
+  const result = new Map<string, string>();
+  const aliases = unique.filter((pageId) => {
+    if (!UUID_PATTERN.test(pageId)) return true;
+    result.set(pageId, pageId.toLowerCase());
+    return false;
+  });
+  if (!aliases.length) return result;
+  const candidates = aliases.map((pageId) => ({ id: crypto.randomUUID(), pageId }));
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO api_page_ids (id, page_id, created_at)
+     SELECT json_extract(value, '$.id'), json_extract(value, '$.pageId'), ? FROM json_each(?)`,
+  )
+    .bind(Date.now(), JSON.stringify(candidates))
     .run();
-  return (await env.DB.prepare(`SELECT id FROM api_page_ids WHERE page_id = ?`).bind(pageId).first<{ id: string }>())!
-    .id;
+  const rows = await env.DB.prepare(
+    `SELECT id, page_id FROM api_page_ids WHERE page_id IN (SELECT value FROM json_each(?))`,
+  )
+    .bind(JSON.stringify(aliases))
+    .all<{ id: string; page_id: string }>();
+  for (const row of rows.results) result.set(row.page_id, row.id);
+  return result;
+}
+
+export async function publicPageId(env: Env, pageId: string) {
+  const id = (await publicPageIds(env, [pageId])).get(pageId);
+  if (!id) {
+    throw new Error("A public page id could not be assigned.");
+  }
+  return id;
 }
 
 async function internalPageId(env: Env, workspaceId: string, id: string) {

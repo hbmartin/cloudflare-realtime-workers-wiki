@@ -16,7 +16,7 @@ export interface AppBindings {
   API_BURST_LIMIT: RateLimit;
   API_MINUTE_LIMIT: RateLimit;
   SEND_EMAIL?: SendEmail;
-  BROWSER: BrowserRun;
+  BROWSER?: BrowserRun;
   EMAIL_FROM?: string;
   SLACK_CLIENT_ID?: string;
   SLACK_CLIENT_SECRET?: string;
@@ -35,6 +35,6 @@ export interface Env extends AppBindings {}
 
 declare global {
   namespace Cloudflare {
-    interface Env extends AppBindings {}
+    interface Env extends Omit<AppBindings, "BROWSER"> {}
   }
 }

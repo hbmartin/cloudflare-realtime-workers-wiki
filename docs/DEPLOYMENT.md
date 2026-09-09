@@ -86,9 +86,21 @@ pnpm wrangler secret put WEBHOOK_ENCRYPTION_KEY --env production
 Use at least 32 random bytes for `BETTER_AUTH_SECRET`. Treat `BOOTSTRAP_TOKEN` as a one-time operator
 credential and rotate or remove it after the owner is created.
 
-Use a separate high-entropy value for `WEBHOOK_ENCRYPTION_KEY`. It encrypts integration webhook
+Generate `WEBHOOK_ENCRYPTION_KEY` as exactly 32 random bytes in unpadded base64url form, for example
+with `openssl rand -base64 32 | tr '+/' '-_' | tr -d '='`. It encrypts integration webhook
 verification secrets at rest; webhook subscription creation and delivery are disabled when it is
-absent.
+absent or malformed.
+
+When upgrading an installation that already has webhook subscriptions, preserve the existing AES key
+by replacing the old arbitrary-string value with its SHA-256 digest in unpadded base64url form before
+deploying this version:
+
+```sh
+printf %s "$CURRENT_WEBHOOK_KEY" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '='
+```
+
+Changing to unrelated key material makes existing verification tokens unreadable and requires those
+subscriptions to be recreated.
 
 `BETTER_AUTH_SECRET` is not only the session signing key. It is also the shared secret the Worker sends
 as the `x-notes-internal` header when it calls a Durable Object directly, for archive, version restore,

@@ -39,20 +39,22 @@ async function integration(cookie: string, pageId: string) {
   );
   expect(created.status).toBe(201);
   const result = await created.json<{ integration: { id: string }; token: string }>();
-  await SELF.fetch(
+  const capabilities = await SELF.fetch(
     authenticated(cookie, `/api/integrations/${result.integration.id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ insertContent: true, updateContent: true, userInformation: "basic" }),
     }),
   );
-  await SELF.fetch(
+  expect(capabilities.status).toBe(200);
+  const grants = await SELF.fetch(
     authenticated(cookie, `/api/integrations/${result.integration.id}/grants`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ rootPageIds: [pageId] }),
     }),
   );
+  expect(grants.status).toBe(200);
   return result;
 }
 
@@ -163,6 +165,41 @@ describe("Notion-compatible API", () => {
     });
     expect(rejected.status).toBe(401);
     await expect(rejected.json()).resolves.toMatchObject({ object: "error", code: "unauthorized" });
+  });
+
+  it("accepts mixed-case Bearer schemes but keeps the crn_ prefix case-sensitive", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const mixedScheme = notionRequest(createdIntegration.token, "/users/me");
+    mixedScheme.headers.set("authorization", `bEaReR ${createdIntegration.token}`);
+
+    expect((await SELF.fetch(mixedScheme)).status).toBe(200);
+
+    const upperPrefix = notionRequest(createdIntegration.token, "/users/me");
+    upperPrefix.headers.set("authorization", `Bearer ${createdIntegration.token.replace(/^crn_/, "CRN_")}`);
+    expect((await SELF.fetch(upperPrefix)).status).toBe(401);
+  });
+
+  it("uses resource-specific metadata in list envelopes", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const users = await SELF.fetch(notionRequest(createdIntegration.token, "/users"));
+    const blocks = await SELF.fetch(notionRequest(createdIntegration.token, `/blocks/${installed.pageId}/children`));
+    const search = await SELF.fetch(
+      notionRequest(createdIntegration.token, "/search", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+
+    await expect(users.json()).resolves.toMatchObject({ object: "list", type: "user", user: {} });
+    await expect(blocks.json()).resolves.toMatchObject({ object: "list", type: "block", block: {} });
+    await expect(search.json()).resolves.toMatchObject({
+      object: "list",
+      type: "page_or_database",
+      page_or_database: {},
+    });
   });
 
   it("limits a well-shaped invalid token before authentication reaches D1", async () => {

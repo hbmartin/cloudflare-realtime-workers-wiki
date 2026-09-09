@@ -14,7 +14,7 @@ export default defineConfig({
           BETTER_AUTH_SECRET: "worker-test-secret-with-at-least-32-characters",
           BETTER_AUTH_URL: "http://example.test",
           BOOTSTRAP_TOKEN: "worker-bootstrap-token",
-          WEBHOOK_ENCRYPTION_KEY: "worker-test-webhook-encryption-key",
+          WEBHOOK_ENCRYPTION_KEY: "SRZZa40b_fwXNGw1ch9yJn4Zp-sUrnoNwiHJP2YGL2o",
         },
       },
     }),

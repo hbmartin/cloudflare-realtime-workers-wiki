@@ -1,4 +1,5 @@
 import type { NotificationEventType, SearchResponse } from "../shared/types";
+import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256 } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { parseSearchRequest, searchPages } from "./search";
@@ -65,41 +66,12 @@ function requireSlackConfiguration(env: Env) {
   if (!configured(env)) throw new HttpError(503, "slack_unavailable", "Slack is not configured for this installation.");
 }
 
-function bytesToBase64Url(bytes: Uint8Array) {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
-
-function base64UrlToBytes(value: string) {
-  const binary = atob(value.replaceAll("-", "+").replaceAll("_", "/"));
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
 async function sha256(value: string) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
 }
 
 async function hexDigest(value: string) {
   return Array.from(await sha256(value), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function hmac(secret: string, value: string) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  return new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
-}
-
-function constantTimeEqual(left: string, right: string) {
-  if (left.length !== right.length) return false;
-  let difference = 0;
-  for (let index = 0; index < left.length; index += 1) difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
-  return difference === 0;
 }
 
 async function encryptionKey(env: Env) {
@@ -139,7 +111,7 @@ export async function createSlackOAuthUrl(env: Env, member: MemberContext) {
   const nonce = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(24)));
   const expiresAt = Date.now() + OAUTH_STATE_TTL_MS;
   const payload = `${nonce}.${expiresAt}`;
-  const state = `${payload}.${bytesToBase64Url(await hmac(env.BETTER_AUTH_SECRET, payload))}`;
+  const state = `${payload}.${bytesToBase64Url(await hmacSha256(env.BETTER_AUTH_SECRET, payload))}`;
   await env.DB.prepare(
     `INSERT INTO slack_oauth_states (nonce_hash, workspace_id, user_id, expires_at, created_at)
      VALUES (?, ?, ?, ?, ?)`,
@@ -160,7 +132,7 @@ async function consumeOAuthState(env: Env, member: MemberContext, state: string)
   if (pieces.length !== 3) throw new HttpError(422, "invalid_slack_state", "Slack authorization state is invalid.");
   const [nonce, rawExpiry, signature] = pieces as [string, string, string];
   const expiresAt = Number(rawExpiry);
-  const expected = bytesToBase64Url(await hmac(env.BETTER_AUTH_SECRET, `${nonce}.${rawExpiry}`));
+  const expected = bytesToBase64Url(await hmacSha256(env.BETTER_AUTH_SECRET, `${nonce}.${rawExpiry}`));
   if (!Number.isSafeInteger(expiresAt) || expiresAt < Date.now() || !constantTimeEqual(signature, expected)) {
     throw new HttpError(422, "invalid_slack_state", "Slack authorization state is invalid or expired.");
   }
@@ -409,7 +381,7 @@ export async function verifySlackRequest(env: Env, request: Request, body: strin
   ) {
     throw new HttpError(401, "invalid_slack_signature", "Slack request signature is invalid.");
   }
-  const expected = `v0=${Array.from(await hmac(env.SLACK_SIGNING_SECRET!, `v0:${timestamp}:${body}`), (byte) =>
+  const expected = `v0=${Array.from(await hmacSha256(env.SLACK_SIGNING_SECRET!, `v0:${timestamp}:${body}`), (byte) =>
     byte.toString(16).padStart(2, "0"),
   ).join("")}`;
   if (!constantTimeEqual(signature.toLowerCase(), expected)) {

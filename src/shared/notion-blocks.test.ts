@@ -97,4 +97,40 @@ describe("Notion block adapter", () => {
     });
     expect(() => notionInputToBlockContainer({ paragraph: {}, quote: {} })).toThrow(/ambiguous/);
   });
+
+  it("reports nested text blocks through has_children instead of a nested payload field", () => {
+    const container = notionInputToBlockContainer({
+      paragraph: {
+        rich_text: [{ text: { content: "Parent" } }],
+        children: [{ paragraph: { rich_text: [{ text: { content: "Child" } }] } }],
+      },
+    });
+    const block = documentBlocks(document(container))[0]!;
+    expect(block.children).toHaveLength(1);
+    expect(notionPayloadForBlock(block).payload).not.toHaveProperty("children");
+  });
+
+  it("preserves Notion table header flags through table cell types", () => {
+    const container = notionInputToBlockContainer({
+      table: {
+        table_width: 2,
+        has_column_header: true,
+        has_row_header: true,
+        children: [
+          { table_row: { cells: [[{ text: { content: "Name" } }], [{ text: { content: "Role" } }]] } },
+          { table_row: { cells: [[{ text: { content: "Ada" } }], [{ text: { content: "Engineer" } }]] } },
+        ],
+      },
+    });
+    const block = documentBlocks(document(container))[0]!;
+    expect(block.children.map((row) => row.node.content?.map((cell) => cell.type))).toEqual([
+      ["tableHeader", "tableHeader"],
+      ["tableHeader", "tableCell"],
+    ]);
+    expect(notionPayloadForBlock(block).payload).toMatchObject({
+      table_width: 2,
+      has_column_header: true,
+      has_row_header: true,
+    });
+  });
 });

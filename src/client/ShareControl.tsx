@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiErrorMessage, json } from "./api";
 
 type Share = {
@@ -15,6 +15,7 @@ export function ShareControl({ pageId, owner }: { pageId: string; owner: boolean
   const [share, setShare] = useState<Share | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const dialogRef = useRef<HTMLDialogElement>(null);
   const load = useCallback(async () => {
     if (!owner) return;
     setLoading(true);
@@ -27,6 +28,18 @@ export function ShareControl({ pageId, owner }: { pageId: string; owner: boolean
       setLoading(false);
     }
   }, [owner, pageId]);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (open && !dialog.open) {
+      if (typeof dialog.showModal === "function") dialog.showModal();
+      else dialog.setAttribute("open", "");
+    }
+    if (!open && dialog.open) {
+      if (typeof dialog.close === "function") dialog.close();
+      else dialog.removeAttribute("open");
+    }
+  }, [open]);
   if (!owner) return null;
 
   async function publish() {
@@ -72,8 +85,13 @@ export function ShareControl({ pageId, owner }: { pageId: string; owner: boolean
 
   async function revoke() {
     if (!share || !confirm("Revoke this public link? It cannot be restored.")) return;
-    await api(`/api/pages/${encodeURIComponent(pageId)}/share`, { method: "DELETE" });
-    setShare(null);
+    try {
+      await api(`/api/pages/${encodeURIComponent(pageId)}/share`, { method: "DELETE" });
+      setShare(null);
+      setError("");
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "The public link could not be revoked."));
+    }
   }
 
   return (
@@ -87,79 +105,81 @@ export function ShareControl({ pageId, owner }: { pageId: string; owner: boolean
       >
         <span aria-hidden="true">↗</span> Share
       </button>
-      {open && (
-        <div className="modal-backdrop">
-          <dialog open className="share-dialog" aria-labelledby="share-title" onCancel={() => setOpen(false)}>
-            <header>
-              <div>
-                <p className="eyebrow">Public access</p>
-                <h2 id="share-title">Share this page</h2>
-              </div>
-              <button className="icon-button" aria-label="Close sharing" onClick={() => setOpen(false)}>
-                ×
-              </button>
-            </header>
-            {loading && !share ? (
-              <p>Loading…</p>
-            ) : share ? (
-              <>
-                <div className="share-link-row">
-                  <input aria-label="Public URL" readOnly value={share.url} />
-                  <button onClick={() => void navigator.clipboard.writeText(share.url)}>Copy</button>
-                </div>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={share.includeSubpages}
-                    onChange={(event) => void update("includeSubpages", event.target.checked)}
-                  />{" "}
-                  Include sub-pages
-                </label>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={share.showToc}
-                    onChange={(event) => void update("showToc", event.target.checked)}
-                  />{" "}
-                  Show table of contents
-                </label>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={share.showLastUpdated}
-                    onChange={(event) => void update("showLastUpdated", event.target.checked)}
-                  />{" "}
-                  Show last updated time
-                </label>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={share.allowIndexing}
-                    onChange={(event) => void update("allowIndexing", event.target.checked)}
-                  />{" "}
-                  Allow search-engine indexing
-                </label>
-                <p className="muted-copy">{share.views.toLocaleString()} successful page views</p>
-                <button className="text-danger" onClick={() => void revoke()}>
-                  Revoke public link
-                </button>
-              </>
-            ) : (
-              <div className="share-empty">
-                <p>Publish a live, read-only view. Comments and workspace navigation stay private.</p>
-                <button className="primary-button" disabled={loading} onClick={() => void publish()}>
-                  Publish
-                </button>
-              </div>
-            )}
-            {error && (
-              <p className="form-error" role="alert">
-                {error}
-              </p>
-            )}
-          </dialog>
-        </div>
-      )}
+      <dialog
+        ref={dialogRef}
+        className="share-dialog"
+        aria-labelledby="share-title"
+        onCancel={() => setOpen(false)}
+        onClose={() => setOpen(false)}
+      >
+        <header>
+          <div>
+            <p className="eyebrow">Public access</p>
+            <h2 id="share-title">Share this page</h2>
+          </div>
+          <button className="icon-button" aria-label="Close sharing" onClick={() => setOpen(false)}>
+            ×
+          </button>
+        </header>
+        {loading && !share ? (
+          <p>Loading…</p>
+        ) : share ? (
+          <>
+            <div className="share-link-row">
+              <input aria-label="Public URL" readOnly value={share.url} />
+              <button onClick={() => void navigator.clipboard.writeText(share.url)}>Copy</button>
+            </div>
+            <label>
+              <input
+                type="checkbox"
+                checked={share.includeSubpages}
+                onChange={(event) => void update("includeSubpages", event.target.checked)}
+              />{" "}
+              Include sub-pages
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={share.showToc}
+                onChange={(event) => void update("showToc", event.target.checked)}
+              />{" "}
+              Show table of contents
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={share.showLastUpdated}
+                onChange={(event) => void update("showLastUpdated", event.target.checked)}
+              />{" "}
+              Show last updated time
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={share.allowIndexing}
+                onChange={(event) => void update("allowIndexing", event.target.checked)}
+              />{" "}
+              Allow search-engine indexing
+            </label>
+            <p className="muted-copy">{share.views.toLocaleString()} successful page views</p>
+            <button className="text-danger" onClick={() => void revoke()}>
+              Revoke public link
+            </button>
+          </>
+        ) : (
+          <div className="share-empty">
+            <p>Publish a live, read-only view. Comments and workspace navigation stay private.</p>
+            <button className="primary-button" disabled={loading} onClick={() => void publish()}>
+              Publish
+            </button>
+          </div>
+        )}
+        {error && (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        )}
+      </dialog>
     </>
   );
 }

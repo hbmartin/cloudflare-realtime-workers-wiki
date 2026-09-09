@@ -273,7 +273,6 @@ export function notionPayloadForBlock(block: NotionBlock): { type: string; paylo
   const node = block.node;
   const type = node.type ?? "unsupported";
   const properties = attrs(node);
-  const children = block.children.length > 0;
   if (type === "heading") {
     const level = Number(properties.level ?? 1);
     if (level < 1 || level > 4) return { type: "unsupported", payload: {} };
@@ -290,17 +289,17 @@ export function notionPayloadForBlock(block: NotionBlock): { type: string; paylo
   if (type === "paragraph")
     return {
       type: "paragraph",
-      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default"), children },
+      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default") },
     };
   if (type === "bulletListItem")
     return {
       type: "bulleted_list_item",
-      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default"), children },
+      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default") },
     };
   if (type === "numberedListItem")
     return {
       type: "numbered_list_item",
-      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default"), children },
+      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default") },
     };
   if (type === "checkListItem")
     return {
@@ -309,18 +308,17 @@ export function notionPayloadForBlock(block: NotionBlock): { type: string; paylo
         rich_text: nodeRichText(node),
         checked: properties.checked === true,
         color: string(properties.textColor, "default"),
-        children,
       },
     };
   if (type === "toggleListItem")
     return {
       type: "toggle",
-      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default"), children },
+      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default") },
     };
   if (type === "quote")
     return {
       type: "quote",
-      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default"), children },
+      payload: { rich_text: nodeRichText(node), color: string(properties.textColor, "default") },
     };
   if (type === "codeBlock")
     return {
@@ -368,9 +366,20 @@ export function notionPayloadForBlock(block: NotionBlock): { type: string; paylo
   if (type === "embed") return { type: "embed", payload: { url: string(properties.url) } };
   if (["image", "video", "audio", "file", "pdf"].includes(type)) return { type, payload: mediaPayload(node) };
   if (type === "table") {
-    const rows = node.content ?? [];
+    const rows = block.children.map((child) => child.node).filter((row) => row.type === "tableRow");
     const width = Math.max(1, ...rows.map((row) => row.content?.length ?? 0));
-    return { type: "table", payload: { table_width: width, has_column_header: false, has_row_header: false } };
+    const hasColumnHeader = Boolean(
+      rows[0]?.content?.length && rows[0].content.every((cell) => cell.type === "tableHeader"),
+    );
+    const hasRowHeader = Boolean(rows.length && rows.every((row) => row.content?.[0]?.type === "tableHeader"));
+    return {
+      type: "table",
+      payload: {
+        table_width: width,
+        has_column_header: hasColumnHeader,
+        has_row_header: hasRowHeader,
+      },
+    };
   }
   if (type === "tableRow") {
     return {
@@ -492,7 +501,14 @@ function blockNode(type: string, payload: Record<string, unknown>): ProseMirrorJ
     return { type: "embed", attrs: { url: validatedEmbedUrl(string(payload.url)), title: "Embedded link" } };
   if (["image", "video", "audio", "file", "pdf"].includes(type))
     return { type, attrs: { url: notionMediaUrl(payload), caption: "", name: type, showPreview: true } };
-  if (type === "table") return { type: "table", attrs: {} };
+  if (type === "table")
+    return {
+      type: "table",
+      attrs: {
+        hasColumnHeader: payload.has_column_header === true,
+        hasRowHeader: payload.has_row_header === true,
+      },
+    };
   if (type === "table_row") {
     const cells = Array.isArray(payload.cells) ? payload.cells : [];
     return {
@@ -534,6 +550,19 @@ export function notionInputToBlockContainer(value: unknown, depth = 0): ProseMir
       children.some((child) => child.content?.find((item) => item.type !== "blockGroup")?.type !== "tableRow")
     ) {
       throw new Error("A table may contain only table_row blocks.");
+    }
+    if (node.type === "table") {
+      const hasColumnHeader = node.attrs?.hasColumnHeader === true;
+      const hasRowHeader = node.attrs?.hasRowHeader === true;
+      for (const [rowIndex, child] of children.entries()) {
+        const row = child.content?.find((item) => item.type === "tableRow");
+        if (!row?.content) continue;
+        row.content = row.content.map((cell, columnIndex) => ({
+          ...cell,
+          type:
+            (hasColumnHeader && rowIndex === 0) || (hasRowHeader && columnIndex === 0) ? "tableHeader" : "tableCell",
+        }));
+      }
     }
     content.push({
       type: "blockGroup",

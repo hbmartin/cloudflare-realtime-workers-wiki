@@ -70,7 +70,7 @@
     "@cloudflare/vite-plugin": "1.54.3",
     "@cloudflare/vitest-pool-workers": "0.22.0",
     "@cloudflare/workers-types": "5.20260902.1",
-    "@notionhq/client": "^5.26.0",
+    "@notionhq/client": "5.26.0",
     "@playwright/test": "1.62.1",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.3",

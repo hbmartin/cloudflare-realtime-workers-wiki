@@ -1660,6 +1660,27 @@ describe("job execution", () => {
 });
 
 describe("delivery outbox", () => {
+  it("enqueues every immediately available row across sweep batches", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const ids = Array.from({ length: 51 }, () => crypto.randomUUID());
+    await env.DB.batch(
+      ids.map((id, index) =>
+        env.DB.prepare(
+          `INSERT INTO outbox
+            (id, workspace_id, topic, payload_json, available_at, created_at)
+           VALUES (?, ?, 'notification', '{}', ?, ?)`,
+        ).bind(id, installed.workspaceId, timestamp - 1, timestamp + index),
+      ),
+    );
+    const send = vi.fn(async (_body: unknown) => undefined);
+
+    await sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }));
+
+    expect(send).toHaveBeenCalledTimes(51);
+    expect(new Set(send.mock.calls.map(([body]) => (body as { outboxId: string }).outboxId))).toEqual(new Set(ids));
+  });
+
   it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {
     const installed = await bootstrap();
     const outboxId = crypto.randomUUID();

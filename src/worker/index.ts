@@ -100,6 +100,7 @@ import type {
 import { compareBinaryText } from "../shared/tree-model";
 import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
+import { constantTimeEqual } from "../shared/security";
 import { renderDiagramSvg } from "../shared/diagram";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
@@ -1983,9 +1984,18 @@ app.post("/api/webhooks", async (c) => {
     input.events,
   );
   c.executionCtx.waitUntil(
-    sendWebhookVerification(c.env, created.subscription.id).catch((error) =>
-      console.error("Webhook verification request failed", { subscriptionId: created.subscription.id, error }),
-    ),
+    sendWebhookVerification(c.env, created.subscription.id)
+      .then((result) => {
+        if (!result.ok) {
+          console.error("Webhook verification request failed", {
+            subscriptionId: created.subscription.id,
+            error: result.error,
+          });
+        }
+      })
+      .catch((error) =>
+        console.error("Webhook verification request failed", { subscriptionId: created.subscription.id, error }),
+      ),
   );
   return c.json({ subscription: created.subscription }, 201);
 });
@@ -2013,8 +2023,11 @@ app.post("/api/webhooks/:id/verify", async (c) => {
 app.post("/api/webhooks/:id/resend", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
-  await resendWebhookVerification(c.env, member, c.req.param("id"));
-  return c.json({ ok: true });
+  const result = await resendWebhookVerification(c.env, member, c.req.param("id"));
+  if (!result.ok) {
+    throw new HttpError(502, "webhook_verification_failed", result.error);
+  }
+  return c.json(result);
 });
 
 app.delete("/api/webhooks/:id", async (c) => {
@@ -5179,13 +5192,6 @@ async function assertAnotherOwner(env: Env, workspaceId: string, excludedId: str
     throw new HttpError(409, "final_owner", "Promote another owner before removing or demoting the final owner.");
 }
 
-function constantTimeEqual(left: string, right: string) {
-  if (left.length !== right.length) return false;
-  let mismatch = 0;
-  for (let index = 0; index < left.length; index++) mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
-  return mismatch === 0;
-}
-
 async function currentPlainText(env: Env, pageId: string) {
   return (
     (await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`).bind(pageId).first<{ plain_text: string }>())
@@ -5348,7 +5354,7 @@ async function handlePartyRequest(request: Request, env: Env) {
     const placement = locationHint(member.workspace.locationHint ?? undefined);
     // Awaited so a rejection from the room fetch is enveloped and logged
     // below instead of escaping this handler as an unlogged runtime 500.
-    return await routePartykitRequest(request, env, {
+    return await routePartykitRequest(request, env as Cloudflare.Env, {
       ...(placement ? { locationHint: placement } : {}),
       onBeforeConnect(incoming) {
         const headers = new Headers(incoming.headers);

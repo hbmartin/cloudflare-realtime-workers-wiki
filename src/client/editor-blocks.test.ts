@@ -3,7 +3,7 @@
 import { render, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { allowedEmbedUrl, MermaidBlock, renderedMath, safeBookmarkUrl } from "./editor-blocks";
+import { allowedEmbedUrl, MermaidBlock, renderedMath, safeBookmarkUrl, safePdfUrl } from "./editor-blocks";
 
 const renderMermaid = vi.hoisted(() => vi.fn(async (id: string) => ({ svg: `<svg id="${id}"></svg>` })));
 
@@ -23,6 +23,14 @@ describe("core editor blocks", () => {
     expect(allowedEmbedUrl("https://example.com/video")).toBeNull();
     expect(safeBookmarkUrl("https://example.com/video")).toBe("https://example.com/video");
     expect(safeBookmarkUrl("javascript:alert(1)")).toBeNull();
+  });
+
+  it("accepts only canonical HTTP and HTTPS URLs for PDF frames", () => {
+    expect(safePdfUrl(" https://example.com/manual.pdf ")).toBe("https://example.com/manual.pdf");
+    expect(safePdfUrl("http://localhost/manual.pdf")).toBe("http://localhost/manual.pdf");
+    expect(safePdfUrl("mailto:owner@example.test")).toBeNull();
+    expect(safePdfUrl("javascript:alert(1)")).toBeNull();
+    expect(safePdfUrl("/api/attachments/file-id")).toBeNull();
   });
 
   it("uses a fresh Mermaid DOM id for every render invocation", async () => {

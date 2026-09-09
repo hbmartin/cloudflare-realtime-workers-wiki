@@ -8,6 +8,7 @@ ALTER TABLE pages ADD COLUMN updated_by TEXT REFERENCES user(id);
 UPDATE pages SET updated_by = created_by WHERE updated_by IS NULL;
 
 ALTER TABLE comment_threads ADD COLUMN block_id TEXT;
+CREATE INDEX idx_comment_threads_page_block ON comment_threads(page_id, block_id);
 
 CREATE TABLE share_links (
   id TEXT PRIMARY KEY,
@@ -172,5 +173,3 @@ CREATE INDEX idx_webhook_deliveries_subscription
   ON webhook_deliveries(subscription_id, created_at DESC);
 CREATE INDEX idx_webhook_deliveries_due
   ON webhook_deliveries(status, next_attempt_at);
-
-PRAGMA optimize;

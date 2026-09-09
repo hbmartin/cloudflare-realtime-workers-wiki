@@ -1146,18 +1146,21 @@ async function enqueueOutbox(env: Env, outboxId: string) {
 }
 
 export async function sweepOutbox(env: Env) {
-  const rows = await env.DB.prepare(
-    `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
-      ORDER BY available_at, created_at, id LIMIT ?`,
-  )
-    .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
-    .all<{ id: string }>();
-  for (const row of rows.results) {
-    try {
-      await enqueueOutbox(env, row.id);
-    } catch (error) {
-      console.error("Outbox enqueue failed", { outboxId: row.id, error });
+  while (true) {
+    const rows = await env.DB.prepare(
+      `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
+        ORDER BY available_at, created_at, id LIMIT ?`,
+    )
+      .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
+      .all<{ id: string }>();
+    for (const row of rows.results) {
+      try {
+        await enqueueOutbox(env, row.id);
+      } catch (error) {
+        console.error("Outbox enqueue failed", { outboxId: row.id, error });
+      }
     }
+    if (rows.results.length < OUTBOX_SWEEP_BATCH_SIZE) return;
   }
 }
 
