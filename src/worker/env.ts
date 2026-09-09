@@ -11,6 +11,8 @@ export interface AppBindings {
   WORKSPACE_EVENTS: DurableObjectNamespace<WorkspaceEvents>;
   NOTES_WORKFLOW: Workflow<Readonly<JobWorkflowParams>>;
   DELIVERY_QUEUE: Queue;
+  API_SOURCE_BURST_LIMIT: RateLimit;
+  API_SOURCE_MINUTE_LIMIT: RateLimit;
   API_BURST_LIMIT: RateLimit;
   API_MINUTE_LIMIT: RateLimit;
   SEND_EMAIL?: SendEmail;

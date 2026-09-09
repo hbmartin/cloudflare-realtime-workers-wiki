@@ -115,10 +115,13 @@ keeps in-app notifications active and clearly reports Slack as unavailable.
 
 ## 4. Configure rate limiting
 
-The `/v1` API uses the `API_BURST_LIMIT` and `API_MINUTE_LIMIT` Workers Rate Limiting bindings declared
-in `wrangler.jsonc`. They are keyed by integration and return a Notion-compatible `429` response at
-100 requests per 10 seconds or 600 requests per minute. Browser authentication and install routes are
-still unthrottled at the application layer, so retain external protection for them.
+The `/v1` API uses `API_SOURCE_BURST_LIMIT` / `API_SOURCE_MINUTE_LIMIT` bindings before token lookup, keyed
+by source IP or by caller zone for cross-zone Worker traffic. It then uses `API_BURST_LIMIT` /
+`API_MINUTE_LIMIT` bindings per authenticated integration. These are declared
+in `wrangler.jsonc`. The source limits are 300 requests per 10 seconds and 1,800 per minute; integration
+limits are 100 per 10 seconds and 600 per minute. Both return a Notion-compatible `429` response. Browser
+authentication and install routes are still unthrottled at the application layer, so retain external
+protection for them. A dashboard rule for `/v1/*` can additionally reject abuse before Worker execution.
 
 Add Cloudflare Rate Limiting rules before exposing the origin publicly. At minimum:
 
@@ -127,6 +130,7 @@ Add Cloudflare Rate Limiting rules before exposing the origin publicly. At minim
 | `/api/install/bootstrap` | 5 requests per minute per IP  |
 | `/api/auth/*`            | 20 requests per minute per IP |
 | `/api/invites/accept`    | 10 requests per minute per IP |
+| `/v1/*`                  | Tune to expected API traffic  |
 
 These are configured in the Cloudflare dashboard, not in this repository.
 

@@ -12,6 +12,7 @@ import {
 } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
+import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { joinBytes } from "../shared/bytes";
 import { LOG_IDENTIFIER_LIMIT, LOG_TEXT_LIMIT } from "../shared/error-log";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
@@ -32,6 +33,7 @@ import type {
 } from "../shared/types";
 import { processDueUploadReaps } from "./attachments";
 import { processDeletionJob } from "./cleanup";
+import { migrateLegacyColumns } from "./document";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import worker from "./index";
@@ -571,6 +573,28 @@ type TestDocument = {
   bindings: Cloudflare.Env;
   metadata: { retired: number; restore_pending: number; restore_attempts: number; restore_retry_at: number };
 };
+
+function documentBlock(id: string, value: string) {
+  const container = new Y.XmlElement("blockContainer");
+  container.setAttribute("id", id);
+  const paragraph = new Y.XmlElement("paragraph");
+  paragraph.setAttribute("backgroundColor", "default");
+  paragraph.setAttribute("textColor", "default");
+  paragraph.setAttribute("textAlignment", "left");
+  const text = new Y.XmlText();
+  text.insert(0, value);
+  paragraph.insert(0, [text]);
+  container.insert(0, [paragraph]);
+  return { container, text };
+}
+
+function installDocumentBlocks(document: Y.Doc, ...containers: Y.XmlElement[]) {
+  const fragment = document.getXmlFragment("document-store");
+  if (fragment.length) fragment.delete(0, fragment.length);
+  const group = new Y.XmlElement("blockGroup");
+  group.insert(0, containers);
+  fragment.insert(0, [group]);
+}
 
 // The reconciliation backoff is persisted and gates onAlarm, so a test that
 // drives consecutive attempts through the alarm has to stand in for the quiet
@@ -1471,6 +1495,180 @@ describe("Worker integration", () => {
       const next = state.storage.sql.exec<{ seq: number }>(`SELECT seq FROM update_events`).one().seq;
       expect(next).toBeGreaterThan(events[0]!.seq);
     });
+  });
+
+  it("applies API block mutations without replacing unaffected shared Yjs nodes", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      const first = documentBlock("first-block", "Before");
+      const second = documentBlock("second-block", "Keep this text");
+      installDocumentBlocks(document.document, first.container, second.container);
+      const relativePosition = Y.createRelativePositionFromTypeIndex(second.text, 4);
+
+      const response = await document.onRequest(
+        new Request("https://document.internal/api-mutate", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+          body: JSON.stringify({
+            actorId: installed.userId,
+            operations: [
+              {
+                type: "update_block",
+                internalId: "first-block",
+                node: {
+                  type: "paragraph",
+                  attrs: { backgroundColor: "default", textColor: "default", textAlignment: "left" },
+                  content: [{ type: "text", text: "After" }],
+                },
+              },
+            ],
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      const absolutePosition = Y.createAbsolutePositionFromRelativePosition(relativePosition, document.document);
+      expect(absolutePosition).toMatchObject({ type: second.text, index: 4 });
+      expect(second.text.toString()).toBe("Keep this text");
+    });
+  });
+
+  it("migrates legacy columns once on the server without dropping nested blocks", async () => {
+    const document = new Y.Doc();
+    const legacy = new Y.XmlElement("blockContainer");
+    legacy.setAttribute("id", "legacy-columns");
+    const columns = new Y.XmlElement("columns");
+    columns.setAttribute("count", "3");
+    const inline = new Y.XmlText();
+    inline.insert(0, "Legacy heading");
+    columns.insert(0, [inline]);
+    const nested = documentBlock("nested-child", "Nested content");
+    const nestedGroup = new Y.XmlElement("blockGroup");
+    nestedGroup.insert(0, [nested.container]);
+    legacy.insert(0, [columns, nestedGroup]);
+    installDocumentBlocks(document, legacy);
+
+    expect(migrateLegacyColumns(document)).toBe(true);
+    const migrated = yXmlFragmentToProsemirrorJSON(document.getXmlFragment("document-store"));
+    expect(JSON.stringify(migrated)).toContain('"type":"columnList"');
+    expect(JSON.stringify(migrated)).toContain('"id":"nested-child"');
+    expect(JSON.stringify(migrated)).toContain("Nested content");
+    expect(JSON.stringify(migrated).match(/"type":"column"/g)).toHaveLength(3);
+    expect(migrateLegacyColumns(document)).toBe(false);
+    document.destroy();
+  });
+
+  it("scopes public API block ids to their page even when internal ids are UUIDs", async () => {
+    const installed = await bootstrap();
+    const secondPage = await createPage(installed.cookie);
+    const sharedInternalId = crypto.randomUUID();
+
+    for (const pageId of [installed.pageId, secondPage.id]) {
+      const stub = env.DOCUMENT.getByName(`${pageId}~1`);
+      await stub.fetch(internalWarmupRequest());
+      await runInDurableObject(stub, async (instance) => {
+        const document = instance as unknown as TestDocument;
+        installDocumentBlocks(document.document, documentBlock(sharedInternalId, pageId).container);
+        await document.onSave();
+        await document.compact();
+      });
+    }
+
+    const rows = await env.DB.prepare(
+      `SELECT id, page_id, internal_id FROM api_blocks WHERE page_id IN (?, ?) ORDER BY page_id`,
+    )
+      .bind(installed.pageId, secondPage.id)
+      .all<{ id: string; page_id: string; internal_id: string }>();
+    expect(rows.results).toHaveLength(2);
+    expect(rows.results.map((row) => row.internal_id)).toEqual([sharedInternalId, sharedInternalId]);
+    expect(new Set(rows.results.map((row) => row.id)).size).toBe(2);
+  });
+
+  it("does not let a stale compaction rewrite epoch-independent projection tables", async () => {
+    const installed = await bootstrap();
+    const source = await createPage(installed.cookie);
+    const timestamp = Date.now();
+    const publicBlockId = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO transclusion_sources (page_id, block_id, content_json, projection_seq, updated_at)
+         VALUES (?, 'old-source', '{}', 777, ?)`,
+      ).bind(installed.pageId, timestamp),
+      env.DB.prepare(
+        `INSERT INTO transclusion_references (reference_page_id, source_page_id, block_id, projection_seq)
+         VALUES (?, ?, 'old-reference', 777)`,
+      ).bind(installed.pageId, source.id),
+      env.DB.prepare(
+        `INSERT INTO api_blocks
+          (id, page_id, internal_id, content_hash, created_by, updated_by, created_at, updated_at, deleted_at)
+         VALUES (?, ?, 'old-api-block', 'old-hash', ?, ?, ?, ?, NULL)`,
+      ).bind(publicBlockId, installed.pageId, installed.userId, installed.userId, timestamp, timestamp),
+    ]);
+
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const document = instance as unknown as TestDocument;
+      installDocumentBlocks(document.document, documentBlock("new-block", "Stale projection").container);
+      await document.onSave();
+      const originalBindings = document.bindings;
+      let releaseVersionPut!: () => void;
+      let versionPutStarted!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseVersionPut = resolve;
+      });
+      const started = new Promise<void>((resolve) => {
+        versionPutStarted = resolve;
+      });
+      document.bindings = new Proxy(originalBindings, {
+        get(target, property, receiver) {
+          if (property !== "BUCKET") return Reflect.get(target, property, receiver);
+          return new Proxy(target.BUCKET, {
+            get(bucket, bucketProperty) {
+              if (bucketProperty !== "put") {
+                const value = Reflect.get(bucket, bucketProperty, bucket);
+                return typeof value === "function" ? value.bind(bucket) : value;
+              }
+              return async (...args: Parameters<R2Bucket["put"]>) => {
+                if (String(args[0]).includes("/versions/")) {
+                  versionPutStarted();
+                  await gate;
+                }
+                return Reflect.apply(bucket.put, bucket, args);
+              };
+            },
+          });
+        },
+      });
+      try {
+        const compacting = document.compact(true);
+        await started;
+        await env.DB.prepare(`UPDATE pages SET content_epoch = 2 WHERE id = ?`).bind(installed.pageId).run();
+        releaseVersionPut();
+        await compacting;
+      } finally {
+        document.bindings = originalBindings;
+        releaseVersionPut();
+      }
+    });
+
+    await expect(
+      env.DB.prepare(`SELECT projection_seq FROM transclusion_sources WHERE page_id = ?`)
+        .bind(installed.pageId)
+        .first(),
+    ).resolves.toEqual({ projection_seq: 777 });
+    await expect(
+      env.DB.prepare(`SELECT projection_seq FROM transclusion_references WHERE reference_page_id = ?`)
+        .bind(installed.pageId)
+        .first(),
+    ).resolves.toEqual({ projection_seq: 777 });
+    await expect(
+      env.DB.prepare(`SELECT content_hash, deleted_at FROM api_blocks WHERE id = ?`).bind(publicBlockId).first(),
+    ).resolves.toEqual({ content_hash: "old-hash", deleted_at: null });
   });
 
   it("retires newly-created room state when its page no longer exists", async () => {

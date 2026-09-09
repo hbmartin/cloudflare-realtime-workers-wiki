@@ -82,4 +82,19 @@ describe("Notion block adapter", () => {
     expect(() => notionInputToBlockContainer({ embed: { url: "https://untrusted.example/embed" } })).toThrow(/YouTube/);
     expect(() => notionRichTextToProseMirror([{ text: { content: "x".repeat(2_001) } }])).toThrow(/2000/);
   });
+
+  it("infers only supported payload keys when type is omitted", () => {
+    const container = notionInputToBlockContainer({
+      object: "block",
+      id: "caller-id",
+      parent: { type: "page_id", page_id: "page-id" },
+      created_time: "2026-01-01T00:00:00.000Z",
+      paragraph: { rich_text: [{ text: { content: "Hello" } }] },
+    });
+    expect(container).toMatchObject({
+      attrs: { id: "caller-id" },
+      content: [{ type: "paragraph", content: [{ text: "Hello" }] }],
+    });
+    expect(() => notionInputToBlockContainer({ paragraph: {}, quote: {} })).toThrow(/ambiguous/);
+  });
 });

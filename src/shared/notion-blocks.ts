@@ -52,6 +52,16 @@ export const notionBlockRegistry = {
   pdf: { notionType: "pdf", richText: false, writable: true },
 } as const satisfies Record<string, BlockRegistryEntry>;
 
+const NOTION_WRITABLE_BLOCK_TYPES = new Set([
+  ...Object.values(notionBlockRegistry)
+    .filter((entry) => entry.writable)
+    .map((entry) => entry.notionType),
+  "heading_1",
+  "heading_2",
+  "heading_3",
+  "heading_4",
+]);
+
 const DEFAULT_BLOCK_ATTRS = {
   backgroundColor: "default",
   textColor: "default",
@@ -496,7 +506,9 @@ function blockNode(type: string, payload: Record<string, unknown>): ProseMirrorJ
 export function notionInputToBlockContainer(value: unknown, depth = 0): ProseMirrorJson {
   if (depth > 2) throw new Error("Block nesting exceeds the supported depth.");
   const input = record(value);
-  const type = string(input.type) || Object.keys(input).find((key) => key in input && key !== "object") || "";
+  const inferredTypes = Object.keys(input).filter((key) => NOTION_WRITABLE_BLOCK_TYPES.has(key));
+  if (!string(input.type) && inferredTypes.length > 1) throw new Error("Block type is ambiguous.");
+  const type = string(input.type) || inferredTypes[0] || "";
   if (!type) throw new Error("Block type is required.");
   const payload = record(input[type]);
   const id = typeof input.id === "string" && input.id ? input.id : crypto.randomUUID();

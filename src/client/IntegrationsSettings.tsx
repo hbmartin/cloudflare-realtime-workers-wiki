@@ -80,14 +80,15 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
 
   async function create(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     try {
       const result = await api<{ integration: Integration; token: string }>("/api/integrations", {
         method: "POST",
         body: json({ name: form.get("name") }),
       });
       setRevealedToken(result.token);
-      event.currentTarget.reset();
+      formElement.reset();
       await load();
     } catch (cause) {
       setError(apiErrorMessage(cause, "The integration could not be created."));

@@ -524,29 +524,6 @@ function CollaborativeEditor({
   );
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
   const colorScheme = useEffectiveColorScheme();
-  useEffect(() => {
-    if (!editable || !Array.isArray(editor.document)) return;
-    const legacy: Array<(typeof editor.document)[number]> = [];
-    const collectLegacyColumns = (blocks: typeof editor.document) => {
-      for (const block of blocks) {
-        if (block.type === "columns") legacy.push(block);
-        if (block.children.length) collectLegacyColumns(block.children as typeof editor.document);
-      }
-    };
-    collectLegacyColumns(editor.document);
-    for (const block of legacy) {
-      const count = Number((block.props as { count?: number }).count ?? 2) === 3 ? 3 : 2;
-      const first = {
-        type: "column",
-        children: [{ type: "paragraph", content: block.content }],
-      };
-      const empty = Array.from({ length: count - 1 }, () => ({
-        type: "column",
-        children: [{ type: "paragraph" }],
-      }));
-      editor.replaceBlocks([block], [{ type: "columnList", children: [first, ...empty] }] as never);
-    }
-  }, [editable, editor]);
   const getSlashItems = async (query: string) =>
     filterSuggestionItems(
       [

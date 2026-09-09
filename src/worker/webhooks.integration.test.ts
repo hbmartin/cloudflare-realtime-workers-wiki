@@ -6,6 +6,8 @@ import {
   createWebhookSubscription,
   deliverWebhook,
   fanoutWebhookEvent,
+  safeWebhookUrl,
+  sendWebhookVerification,
   verifyWebhookSubscription,
   webhookEventStatements,
 } from "./webhooks";
@@ -43,6 +45,24 @@ beforeEach(async () => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Notion-compatible webhooks", () => {
+  it("accepts public HTTPS hosts and rejects local or literal-IP destinations", () => {
+    expect(safeWebhookUrl("https://hooks.example.test/notion#ignored")).toBe("https://hooks.example.test/notion");
+    for (const url of [
+      "http://hooks.example.test/notion",
+      "https://localhost/notion",
+      "https://receiver.localhost/notion",
+      "https://receiver.local/notion",
+      "https://127.0.0.1/notion",
+      "https://2130706433/notion",
+      "https://[::1]/notion",
+      "https://[fc00::1]/notion",
+      "https://[fe80::1]/notion",
+      "https://[::ffff:7f00:1]/notion",
+    ]) {
+      expect(() => safeWebhookUrl(url)).toThrow(/public HTTPS/);
+    }
+  });
+
   it("encrypts verification tokens, signs exact bodies, and records successful delivery", async () => {
     const { me, pageId } = await bootstrap();
     const member: MemberContext = {
@@ -131,5 +151,70 @@ describe("Notion-compatible webhooks", () => {
         .bind(delivery!.id)
         .first(),
     ).resolves.toMatchObject({ status: "sent", attempts: 1, response_status: 202 });
+
+    await env.DB.batch(
+      webhookEventStatements(env.DB, {
+        workspaceId: me.workspace.id,
+        type: "page.content_updated",
+        entityType: "page",
+        entityId: pageId,
+        pageId,
+        actorId: me.user.id,
+        sourceKey: "webhook-test-queued-event",
+        data: { sequence: 2 },
+        createdAt: timestamp + 1,
+      }),
+    );
+    const queuedEvent = await env.DB.prepare(
+      `SELECT id FROM webhook_events WHERE source_key = 'webhook-test-queued-event'`,
+    ).first<{ id: string }>();
+    await fanoutWebhookEvent(env, queuedEvent!.id);
+    const queuedDelivery = await env.DB.prepare(`SELECT id FROM webhook_deliveries WHERE event_id = ?`)
+      .bind(queuedEvent!.id)
+      .first<{ id: string }>();
+    const retryRowsBefore = await env.DB.prepare(
+      `SELECT COUNT(*) count FROM outbox
+        WHERE topic = 'webhook_delivery' AND json_extract(payload_json, '$.deliveryId') = ?`,
+    )
+      .bind(queuedDelivery!.id)
+      .first<{ count: number }>();
+    await env.DB.prepare(
+      `UPDATE webhook_subscriptions SET url = 'https://[::1]/notion', status = 'active' WHERE id = ?`,
+    )
+      .bind(subscription.id)
+      .run();
+    vi.mocked(fetch).mockClear();
+    await deliverWebhook(env, queuedDelivery!.id);
+    await expect(
+      env.DB.prepare(`SELECT status, attempts, next_attempt_at FROM webhook_deliveries WHERE id = ?`)
+        .bind(queuedDelivery!.id)
+        .first(),
+    ).resolves.toEqual({ status: "failed", attempts: 1, next_attempt_at: null });
+    await expect(
+      env.DB.prepare(`SELECT status FROM webhook_subscriptions WHERE id = ?`).bind(subscription.id).first(),
+    ).resolves.toEqual({ status: "paused" });
+    await expect(
+      env.DB.prepare(
+        `SELECT COUNT(*) count FROM outbox
+          WHERE topic = 'webhook_delivery' AND json_extract(payload_json, '$.deliveryId') = ?`,
+      )
+        .bind(queuedDelivery!.id)
+        .first(),
+    ).resolves.toEqual(retryRowsBefore);
+    expect(fetch).not.toHaveBeenCalled();
+
+    await env.DB.prepare(`UPDATE webhook_subscriptions SET status = 'pending_verification' WHERE id = ?`)
+      .bind(subscription.id)
+      .run();
+    await expect(sendWebhookVerification(env, subscription.id)).rejects.toMatchObject({
+      code: "invalid_webhook_url",
+    });
+    await expect(
+      env.DB.prepare(`SELECT status FROM webhook_subscriptions WHERE id = ?`).bind(subscription.id).first(),
+    ).resolves.toEqual({ status: "paused" });
+    expect(fetch).not.toHaveBeenCalled();
+    await expect(
+      env.DB.prepare(`SELECT status FROM webhook_subscriptions WHERE id = ?`).bind(subscription.id).first(),
+    ).resolves.toEqual({ status: "paused" });
   });
 });

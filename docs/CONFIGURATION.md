@@ -38,18 +38,20 @@ For local development these live in `.dev.vars`; see `.dev.vars.example`.
 
 Declared in `wrangler.jsonc`, typed in `src/worker/env.ts`.
 
-| Binding            | Kind           | Target                                                                      |
-| ------------------ | -------------- | --------------------------------------------------------------------------- |
-| `DB`               | D1             | `cloudflare-realtime-notes`, migrations in `migrations/`                    |
-| `BUCKET`           | R2             | `cloudflare-realtime-notes`, preview `cloudflare-realtime-notes-preview`    |
-| `DOCUMENT`         | Durable Object | class `Document`, SQLite-backed, hibernating                                |
-| `WORKSPACE_EVENTS` | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, audience-filtered      |
-| `NOTES_WORKFLOW`   | Workflow       | resumable imports, exports, template clones, migrations, and reindexing     |
-| `DELIVERY_QUEUE`   | Queue          | notification, email, Slack, and digest fan-out; configured with a DLQ       |
-| `BROWSER`          | Browser Run    | optional PDF generation                                                     |
-| `SEND_EMAIL`       | Email Service  | optional email delivery; the UI reports it unavailable when absent          |
-| `API_BURST_LIMIT`  | Rate Limit     | Notion-compatible API throttle: 100 requests per integration per 10 seconds |
-| `API_MINUTE_LIMIT` | Rate Limit     | Notion-compatible API throttle: 600 requests per integration per minute     |
+| Binding                   | Kind           | Target                                                                    |
+| ------------------------- | -------------- | ------------------------------------------------------------------------- |
+| `DB`                      | D1             | `cloudflare-realtime-notes`, migrations in `migrations/`                  |
+| `BUCKET`                  | R2             | `cloudflare-realtime-notes`, preview `cloudflare-realtime-notes-preview`  |
+| `DOCUMENT`                | Durable Object | class `Document`, SQLite-backed, hibernating                              |
+| `WORKSPACE_EVENTS`        | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, audience-filtered    |
+| `NOTES_WORKFLOW`          | Workflow       | resumable imports, exports, template clones, migrations, and reindexing   |
+| `DELIVERY_QUEUE`          | Queue          | notification, email, Slack, and digest fan-out; configured with a DLQ     |
+| `BROWSER`                 | Browser Run    | optional PDF generation                                                   |
+| `SEND_EMAIL`              | Email Service  | optional email delivery; the UI reports it unavailable when absent        |
+| `API_SOURCE_BURST_LIMIT`  | Rate Limit     | Pre-authentication `/v1` throttle: 300 requests per source per 10 seconds |
+| `API_SOURCE_MINUTE_LIMIT` | Rate Limit     | Pre-authentication `/v1` throttle: 1,800 requests per source per minute   |
+| `API_BURST_LIMIT`         | Rate Limit     | Authenticated `/v1` throttle: 100 requests per integration per 10 seconds |
+| `API_MINUTE_LIMIT`        | Rate Limit     | Authenticated `/v1` throttle: 600 requests per integration per minute     |
 
 No KV, Workers AI, Vectorize, Hyperdrive, Analytics Engine, or Containers bindings are used. Slack is
 inactive until its four secrets are configured. Verified integration webhooks can make outbound HTTPS
@@ -71,7 +73,7 @@ Never rename or delete a class or binding without a Cloudflare Durable Object mi
 | Setting                     | Value                                           | Effect                                                                                                                        |
 | --------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `compatibility_date`        | `2026-08-14`                                    | Runtime behavior baseline                                                                                                     |
-| `compatibility_flags`       | `nodejs_compat`                                 | Required by Better Auth                                                                                                       |
+| `compatibility_flags`       | `nodejs_compat`, `global_fetch_strictly_public` | Required by Better Auth and to keep outbound webhook fetches on public network destinations                                   |
 | `observability.enabled`     | `true`                                          | Workers Logs                                                                                                                  |
 | `upload_source_maps`        | `true`                                          | Symbolicated stack traces in logs                                                                                             |
 | `preview_urls`              | `true`                                          | Per-version preview URLs; **inert here**, see below                                                                           |

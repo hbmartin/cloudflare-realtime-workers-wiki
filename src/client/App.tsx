@@ -1426,14 +1426,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       .then((data) => setUnreadNotifications(data.unreadCount))
       .catch(() => undefined);
   }, []);
-  const loadJobs = useCallback(async () => {
+  const loadJobs = useCallback(async (): Promise<Job[] | null> => {
     setJobsLoading(true);
     try {
       const data = await api<{ jobs: Job[] }>("/api/jobs");
       setJobs(data.jobs);
       setJobsError("");
+      return data.jobs;
     } catch (error) {
       setJobsError(apiErrorMessage(error, "Activities could not be refreshed."));
+      return null;
     } finally {
       setJobsLoading(false);
     }
@@ -1853,8 +1855,19 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const activityPollDelay = jobPollDelay(jobs);
   useEffect(() => {
     if (!activitiesOpen || activityPollDelay === null) return undefined;
-    const timer = window.setTimeout(() => void loadJobs(), activityPollDelay);
-    return () => window.clearTimeout(timer);
+    let canceled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      const refreshed = await loadJobs();
+      if (canceled) return;
+      const nextDelay = refreshed ? jobPollDelay(refreshed) : activityPollDelay;
+      if (nextDelay !== null) timer = window.setTimeout(poll, nextDelay);
+    };
+    timer = window.setTimeout(poll, activityPollDelay);
+    return () => {
+      canceled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [activitiesOpen, activityPollDelay, loadJobs]);
   const mutateJob = useCallback(async (job: Job, action: "cancel" | "cleanup" | "retry" | "confirm") => {
     setPendingJobId(job.id);
@@ -2762,9 +2775,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             {view === "pages" && activeSelected && !activeSelected.isTemplate && (
               <>
                 {activeSelected.kind !== "diagram" && (
-                  <ShareControl pageId={activeSelected.id} owner={member.role === "owner"} />
+                  <ShareControl
+                    key={`share:${activeSelected.id}`}
+                    pageId={activeSelected.id}
+                    owner={member.role === "owner"}
+                  />
                 )}
-                <WatchControl key={activeSelected.id} resourceType="page" resourceId={activeSelected.id} />
+                <WatchControl key={`watch:${activeSelected.id}`} resourceType="page" resourceId={activeSelected.id} />
                 <button
                   className={`organization-action ${favorites.some((page) => page.id === activeSelected.id) ? "active" : ""}`}
                   disabled={pendingOrganizationAction === `favorite:${activeSelected.id}`}

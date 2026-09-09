@@ -112,7 +112,7 @@ async function decryptToken(env: Env, encrypted: string) {
   return new TextDecoder().decode(plain);
 }
 
-function safeUrl(value: string) {
+export function safeWebhookUrl(value: string) {
   let url: URL;
   try {
     url = new URL(value);
@@ -120,19 +120,38 @@ function safeUrl(value: string) {
     throw new HttpError(422, "invalid_webhook_url", "Enter a valid HTTPS webhook URL.");
   }
   const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  // Workers global fetch does not support IP-address URLs and mediates DNS so
+  // resolved destinations cannot reach Cloudflare's internal network. Rejecting
+  // every literal here also keeps local and alternate runtimes from having to
+  // duplicate an ever-growing list of private IPv4 and IPv6 ranges.
+  const isIpLiteral = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) || /^\[[0-9a-f:.]+\]$/.test(hostname);
   if (
     url.protocol !== "https:" ||
     url.username ||
     url.password ||
     hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
     hostname.endsWith(".local") ||
-    /^(127\.|10\.|192\.168\.|169\.254\.|0\.|::1$|\[::1\]$)/.test(hostname) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(hostname)
+    isIpLiteral
   ) {
     throw new HttpError(422, "invalid_webhook_url", "Webhook URLs must be public HTTPS endpoints.");
   }
   url.hash = "";
   return url.toString();
+}
+
+async function storedWebhookUrl(env: Env, subscriptionId: string, value: string) {
+  try {
+    return safeWebhookUrl(value);
+  } catch (error) {
+    await env.DB.prepare(
+      `UPDATE webhook_subscriptions SET status = 'paused', updated_at = ?
+        WHERE id = ? AND status <> 'deleted'`,
+    )
+      .bind(Date.now(), subscriptionId)
+      .run();
+    throw error;
+  }
 }
 
 function events(value: unknown) {
@@ -197,7 +216,7 @@ export async function createWebhookSubscription(
   const row: SubscriptionRow = {
     id,
     integration_id: integrationId,
-    url: safeUrl(url),
+    url: safeWebhookUrl(url),
     events_json: JSON.stringify(events(requestedEvents)),
     status: "pending_verification",
     encrypted_verification_token: await encryptToken(env, token),
@@ -246,11 +265,12 @@ export async function sendWebhookVerification(env: Env, subscriptionId: string) 
     .bind(subscriptionId)
     .first<SubscriptionRow>();
   if (!row) return;
+  const destination = await storedWebhookUrl(env, row.id, row.url);
   const token = await decryptToken(env, row.encrypted_verification_token);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5_000);
   try {
-    await fetch(row.url, {
+    await fetch(destination, {
       method: "POST",
       headers: { "content-type": "application/json", "user-agent": "Realtime-Notes-Webhook/1.0" },
       body: JSON.stringify({ verification_token: token }),
@@ -298,7 +318,7 @@ export async function updateWebhookSubscription(
   if (input.url !== undefined && row.status !== "pending_verification") {
     throw new HttpError(409, "webhook_url_locked", "A verified webhook URL cannot be changed.");
   }
-  const url = input.url === undefined ? row.url : safeUrl(input.url);
+  const url = input.url === undefined ? row.url : safeWebhookUrl(input.url);
   const selected = input.events === undefined ? row.events_json : JSON.stringify(events(input.events));
   const status =
     input.paused === undefined
@@ -419,6 +439,11 @@ export async function fanoutWebhookEvent(env: Env, eventId: string) {
   const timestamp = Date.now();
   const statements: D1PreparedStatement[] = [];
   for (const subscription of subscriptions.results) {
+    try {
+      await storedWebhookUrl(env, subscription.id, subscription.url);
+    } catch {
+      continue;
+    }
     if (!(await deliveryAllowed(env, event, subscription))) continue;
     const deliveryId = crypto.randomUUID();
     const outboxId = crypto.randomUUID();
@@ -520,6 +545,24 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
     return;
   }
   const attempt = row.attempts + 1;
+  let destination: string;
+  try {
+    destination = await storedWebhookUrl(env, subscription.id, subscription.url);
+  } catch (error) {
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `UPDATE webhook_deliveries SET status = 'failed', attempts = ?, next_attempt_at = NULL,
+       last_error = ?, updated_at = ? WHERE id = ?`,
+    )
+      .bind(
+        attempt,
+        error instanceof Error ? error.message.slice(0, 500) : "Webhook URL is invalid",
+        timestamp,
+        deliveryId,
+      )
+      .run();
+    return;
+  }
   const entityId = row.entity_type === "page" ? await publicPageId(env, row.entity_id) : row.entity_id;
   const payload = JSON.stringify({
     id: row.id,
@@ -542,7 +585,7 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
   let received = "";
   let failure: string | null = null;
   try {
-    const response = await fetch(subscription.url, {
+    const response = await fetch(destination, {
       method: "POST",
       headers: {
         "content-type": "application/json",

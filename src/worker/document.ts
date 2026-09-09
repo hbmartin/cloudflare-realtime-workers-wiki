@@ -166,78 +166,6 @@ type ApiBlockMutation =
   | { type: "update_block"; internalId: string; node: ProseMirrorJson }
   | { type: "delete_block"; internalId: string };
 
-function childGroup(container: ProseMirrorJson) {
-  let group = container.content?.find((child) => child.type === "blockGroup");
-  if (!group) {
-    group = { type: "blockGroup", content: [] };
-    container.content = [...(container.content ?? []), group];
-  }
-  group.content ??= [];
-  return group;
-}
-
-function rootGroup(document: ProseMirrorJson) {
-  let group = document.content?.find((child) => child.type === "blockGroup");
-  if (!group) {
-    group = { type: "blockGroup", content: [] };
-    document.content = [group];
-  }
-  group.content ??= [];
-  return group;
-}
-
-function findContainer(
-  document: ProseMirrorJson,
-  id: string,
-): { container: ProseMirrorJson; group: ProseMirrorJson; index: number } | null {
-  const visit = (
-    group: ProseMirrorJson,
-  ): { container: ProseMirrorJson; group: ProseMirrorJson; index: number } | null => {
-    for (const [index, container] of (group.content ?? []).entries()) {
-      if (container.type !== "blockContainer") continue;
-      if (container.attrs?.id === id) return { container, group, index };
-      const nested = container.content?.find((child) => child.type === "blockGroup");
-      if (nested) {
-        const found = visit(nested);
-        if (found) return found;
-      }
-    }
-    return null;
-  };
-  return visit(rootGroup(document));
-}
-
-function applyApiMutation(document: ProseMirrorJson, operation: ApiBlockMutation) {
-  if (operation.type === "append_children") {
-    const group = operation.parentInternalId
-      ? childGroup(
-          findContainer(document, operation.parentInternalId)?.container ??
-            (() => {
-              throw new Error("block_not_found");
-            })(),
-        )
-      : rootGroup(document);
-    const position = operation.position ?? { type: "end" as const };
-    let index = group.content?.length ?? 0;
-    if (position.type === "start") index = 0;
-    if (position.type === "after_block") {
-      if (!position.afterInternalId) throw new Error("invalid_position");
-      index = (group.content ?? []).findIndex((child) => child.attrs?.id === position.afterInternalId) + 1;
-      if (!index) throw new Error("invalid_position");
-    }
-    group.content!.splice(index, 0, ...structuredClone(operation.children));
-    return;
-  }
-  const found = findContainer(document, operation.internalId);
-  if (!found) throw new Error("block_not_found");
-  if (operation.type === "delete_block") {
-    found.group.content!.splice(found.index, 1);
-    return;
-  }
-  const group = found.container.content?.find((child) => child.type === "blockGroup");
-  found.container.content = [structuredClone(operation.node), ...(group ? [group] : [])];
-}
-
 function yNode(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {
   if (node.type === "text") {
     const text = new Y.XmlText();
@@ -261,12 +189,142 @@ function yNode(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {
   return element;
 }
 
-function replaceCloneDocument(clone: Y.Doc, document: ProseMirrorJson) {
-  const fragment = clone.getXmlFragment("document-store");
-  clone.transact(() => {
-    if (fragment.length) fragment.delete(0, fragment.length);
-    fragment.insert(0, (document.content ?? []).map(yNode));
-  }, "api-clone");
+type YBlockParent = Y.XmlFragment | Y.XmlElement;
+
+function blockGroup(parent: YBlockParent, create: boolean) {
+  const existing = parent
+    .toArray()
+    .find((child): child is Y.XmlElement => child instanceof Y.XmlElement && child.nodeName === "blockGroup");
+  if (existing || !create) return existing ?? null;
+  const group = new Y.XmlElement("blockGroup");
+  parent.insert(parent.length, [group]);
+  return group;
+}
+
+function findYContainer(
+  document: Y.Doc,
+  id: string,
+): { container: Y.XmlElement; group: Y.XmlElement; index: number } | null {
+  const root = blockGroup(document.getXmlFragment("document-store"), false);
+  if (!root) return null;
+  const visit = (group: Y.XmlElement): { container: Y.XmlElement; group: Y.XmlElement; index: number } | null => {
+    for (const [index, child] of group.toArray().entries()) {
+      if (!(child instanceof Y.XmlElement) || child.nodeName !== "blockContainer") continue;
+      if (child.getAttribute("id") === id) return { container: child, group, index };
+      const nested = blockGroup(child, false);
+      if (nested) {
+        const found = visit(nested);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  return visit(root);
+}
+
+function applyApiMutation(document: Y.Doc, operation: ApiBlockMutation) {
+  if (operation.type === "append_children") {
+    const parent = operation.parentInternalId ? findYContainer(document, operation.parentInternalId)?.container : null;
+    if (operation.parentInternalId && !parent) throw new Error("block_not_found");
+    const group = blockGroup(parent ?? document.getXmlFragment("document-store"), true)!;
+    const position = operation.position ?? { type: "end" as const };
+    let index = group.length;
+    if (position.type === "start") index = 0;
+    if (position.type === "after_block") {
+      if (!position.afterInternalId) throw new Error("invalid_position");
+      index =
+        group
+          .toArray()
+          .findIndex(
+            (child) => child instanceof Y.XmlElement && child.getAttribute("id") === position.afterInternalId,
+          ) + 1;
+      if (!index) throw new Error("invalid_position");
+    }
+    group.insert(index, operation.children.map(yNode));
+    return;
+  }
+  const found = findYContainer(document, operation.internalId);
+  if (!found) throw new Error("block_not_found");
+  if (operation.type === "delete_block") {
+    found.group.delete(found.index, 1);
+    return;
+  }
+  const children = found.container.toArray();
+  for (let index = children.length - 1; index >= 0; index -= 1) {
+    const child = children[index];
+    if (!(child instanceof Y.XmlElement) || child.nodeName !== "blockGroup") found.container.delete(index, 1);
+  }
+  found.container.insert(0, [yNode(operation.node)]);
+}
+
+function collectLegacyColumns(document: ProseMirrorJson) {
+  const legacy: ProseMirrorJson[] = [];
+  const visit = (node: ProseMirrorJson) => {
+    if (
+      node.type === "blockContainer" &&
+      node.content?.some((child) => child.type !== "blockGroup" && child.type === "columns")
+    ) {
+      legacy.push(node);
+    }
+    for (const child of node.content ?? []) visit(child);
+  };
+  visit(document);
+  return legacy;
+}
+
+function paragraphContainer(content: ProseMirrorJson[] = []) {
+  return {
+    type: "blockContainer",
+    attrs: { id: crypto.randomUUID() },
+    content: [
+      {
+        type: "paragraph",
+        attrs: { backgroundColor: "default", textColor: "default", textAlignment: "left" },
+        ...(content.length ? { content: structuredClone(content) } : {}),
+      },
+    ],
+  } satisfies ProseMirrorJson;
+}
+
+function legacyColumnsReplacement(container: ProseMirrorJson) {
+  const legacy = container.content?.find((child) => child.type === "columns");
+  if (!legacy) throw new Error("Legacy columns block is missing.");
+  const nested = container.content?.find((child) => child.type === "blockGroup")?.content ?? [];
+  const count = Number(legacy.attrs?.count ?? 2) === 3 ? 3 : 2;
+  const columns = Array.from({ length: count }, (_, index) => ({
+    type: "blockContainer",
+    attrs: { id: crypto.randomUUID() },
+    content: [
+      { type: "column" },
+      {
+        type: "blockGroup",
+        content:
+          index === 0 ? [paragraphContainer(legacy.content), ...structuredClone(nested)] : [paragraphContainer()],
+      },
+    ],
+  }));
+  return {
+    type: "blockContainer",
+    attrs: structuredClone(container.attrs ?? {}),
+    content: [{ type: "columnList" }, { type: "blockGroup", content: columns }],
+  } satisfies ProseMirrorJson;
+}
+
+export function migrateLegacyColumns(document: Y.Doc) {
+  const json = yXmlFragmentToProsemirrorJSON(document.getXmlFragment("document-store")) as ProseMirrorJson;
+  const legacy = collectLegacyColumns(json);
+  if (!legacy.length) return false;
+  document.transact(() => {
+    for (const container of legacy) {
+      const id = container.attrs?.id;
+      if (typeof id !== "string") continue;
+      const found = findYContainer(document, id);
+      if (!found) continue;
+      found.group.delete(found.index, 1);
+      found.group.insert(found.index, [yNode(legacyColumnsReplacement(container))]);
+    }
+  }, "legacy-columns-migration");
+  return true;
 }
 
 async function addCommentMark(
@@ -440,6 +498,9 @@ export class Document extends YServer {
     // references, thumbnails, and the epoch-scoped current projection.
     if (!hadMetadata && !this.metadata.retired && this.loadedSnapshot) {
       this.bufferUpdate(Y.encodeStateAsUpdate(this.document), null);
+      this.flushPendingUpdates();
+    }
+    if (!this.metadata.retired && this.metadata.content_kind === "document" && migrateLegacyColumns(this.document)) {
       this.flushPendingUpdates();
     }
     const pendingLog = sql
@@ -679,24 +740,32 @@ export class Document extends YServer {
       if (this.metadata.read_only) return Response.json({ error: "This document is read-only." }, { status: 409 });
       const clone = new Y.Doc();
       Y.applyUpdate(clone, Y.encodeStateAsUpdate(this.document));
-      const document = yXmlFragmentToProsemirrorJSON(clone.getXmlFragment("document-store")) as ProseMirrorJson;
       try {
-        for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(document, operation);
+        clone.transact(() => {
+          for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(clone, operation);
+        }, "api-validation");
       } catch (error) {
         const code = error instanceof Error ? error.message : "invalid_mutation";
+        clone.destroy();
         return Response.json({ error: code }, { status: code === "block_not_found" ? 404 : 422 });
       }
+      const document = yXmlFragmentToProsemirrorJSON(clone.getXmlFragment("document-store")) as ProseMirrorJson;
       const blockCount = flattenDocumentBlocks(document).length;
-      if (blockCount > 10_000) return Response.json({ error: "Document block limit exceeded." }, { status: 413 });
-      replaceCloneDocument(clone, document);
+      if (blockCount > 10_000) {
+        clone.destroy();
+        return Response.json({ error: "Document block limit exceeded." }, { status: 413 });
+      }
       const snapshot = Y.encodeStateAsUpdate(clone);
       if (snapshot.byteLength >= READ_ONLY_BYTES) {
+        clone.destroy();
         return Response.json({ error: "Document size limit exceeded." }, { status: 413 });
       }
-      const update = Y.encodeStateAsUpdate(clone, Y.encodeStateVector(this.document));
+      clone.destroy();
       this.pendingAuthorId = body.actorId;
       this.pendingNotifyEdit = false;
-      Y.applyUpdate(this.document, update, "api-mutation");
+      this.document.transact(() => {
+        for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(this.document, operation);
+      }, "api-mutation");
       this.flushPendingUpdates();
       if (this.metadata.dirty) await this.compact(true);
       return Response.json({ document, sequence: this.metadata.snapshot_seq });
@@ -815,6 +884,7 @@ export class Document extends YServer {
       const update = new Uint8Array(await input.arrayBuffer());
       this.pendingAuthorId = staged.requested_by;
       Y.applyUpdate(this.document, update);
+      if (this.metadata.content_kind === "document") migrateLegacyColumns(this.document);
       this.flushPendingUpdates();
       // An empty update produces no Yjs event, but still needs a sequence so
       // compaction persists the canonical empty projection for the staged page.
@@ -966,6 +1036,7 @@ export class Document extends YServer {
   }
 
   private async compactOnce(forceVersion = false) {
+    if (this.metadata.content_kind === "document") migrateLegacyColumns(this.document);
     this.flushPendingUpdates();
     const { pageId, epoch } = this.ids;
     const maximum = this.state.storage.sql
@@ -1027,11 +1098,16 @@ export class Document extends YServer {
       // Updates received while hashing or writing R2 must remain dirty for the
       // next compaction instead of being cleared by this one.
       const structuredHash = await sha256Hex(structuredJson);
+      const existingBlockIds = new Map(
+        (
+          await this.bindings.DB.prepare(`SELECT id, internal_id FROM api_blocks WHERE page_id = ?`)
+            .bind(pageId)
+            .all<{ id: string; internal_id: string }>()
+        ).results.map((row) => [row.internal_id, row.id]),
+      );
       const blockMetadata = await Promise.all(
         flattenDocumentBlocks(json).map(async (block) => ({
-          id: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(block.id)
-            ? block.id.toLowerCase()
-            : uuidFromHash(await sha256Hex(`${pageId}:${block.id}`)),
+          id: existingBlockIds.get(block.id) ?? uuidFromHash(await sha256Hex(`${pageId}:${block.id}`)),
           internalId: block.id,
           contentHash: await sha256Hex(canonicalJson(block)),
         })),
@@ -1188,14 +1264,15 @@ export class Document extends YServer {
             `DELETE FROM member_mentions WHERE source_page_id = ? AND projection_seq <> ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, maximum, pageId, epoch),
-          this.bindings.DB.prepare(`UPDATE transclusion_sources SET projection_seq = -1 WHERE page_id = ?`).bind(
-            pageId,
-          ),
+          this.bindings.DB.prepare(
+            `UPDATE transclusion_sources SET projection_seq = -1 WHERE page_id = ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
             `INSERT INTO transclusion_sources (page_id, block_id, content_json, projection_seq, updated_at)
              SELECT ?, json_extract(item.value, '$.blockId'), json_extract(item.value, '$.content'), ?, ?
                FROM json_each(?) item
-              WHERE TRUE
+              WHERE EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)
              ON CONFLICT(page_id, block_id) DO UPDATE SET
                content_json = excluded.content_json, projection_seq = excluded.projection_seq,
                updated_at = excluded.updated_at`,
@@ -1209,14 +1286,17 @@ export class Document extends YServer {
                 content: JSON.stringify(source.content),
               })),
             ),
-          ),
-          this.bindings.DB.prepare(`DELETE FROM transclusion_sources WHERE page_id = ? AND projection_seq <> ?`).bind(
             pageId,
-            maximum,
+            epoch,
           ),
           this.bindings.DB.prepare(
-            `UPDATE transclusion_references SET projection_seq = -1 WHERE reference_page_id = ?`,
-          ).bind(pageId),
+            `DELETE FROM transclusion_sources WHERE page_id = ? AND projection_seq <> ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, maximum, pageId, epoch),
+          this.bindings.DB.prepare(
+            `UPDATE transclusion_references SET projection_seq = -1 WHERE reference_page_id = ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
             `INSERT INTO transclusion_references
               (reference_page_id, source_page_id, block_id, projection_seq)
@@ -1224,22 +1304,25 @@ export class Document extends YServer {
                FROM json_each(?) item
                JOIN pages source_page ON source_page.id = json_extract(item.value, '$.sourcePageId')
               WHERE source_page.workspace_id = ?
+                AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)
              ON CONFLICT(reference_page_id, source_page_id, block_id) DO UPDATE SET
                projection_seq = excluded.projection_seq`,
-          ).bind(pageId, maximum, JSON.stringify(transclusions.references), page.workspace_id),
+          ).bind(pageId, maximum, JSON.stringify(transclusions.references), page.workspace_id, pageId, epoch),
           this.bindings.DB.prepare(
-            `DELETE FROM transclusion_references WHERE reference_page_id = ? AND projection_seq <> ?`,
-          ).bind(pageId, maximum),
+            `DELETE FROM transclusion_references WHERE reference_page_id = ? AND projection_seq <> ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, maximum, pageId, epoch),
           this.bindings.DB.prepare(
-            `UPDATE api_blocks SET deleted_at = ? WHERE page_id = ? AND deleted_at IS NULL`,
-          ).bind(timestamp, pageId),
+            `UPDATE api_blocks SET deleted_at = ? WHERE page_id = ? AND deleted_at IS NULL
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(timestamp, pageId, pageId, epoch),
           this.bindings.DB.prepare(
             `INSERT INTO api_blocks
               (id, page_id, internal_id, content_hash, created_by, updated_by, created_at, updated_at, deleted_at)
              SELECT json_extract(item.value, '$.id'), ?, json_extract(item.value, '$.internalId'),
                     json_extract(item.value, '$.contentHash'), ?, ?, ?, ?, NULL
                FROM json_each(?) item
-              WHERE TRUE
+              WHERE EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)
              ON CONFLICT(page_id, internal_id) DO UPDATE SET
                content_hash = excluded.content_hash,
                updated_by = CASE WHEN api_blocks.content_hash <> excluded.content_hash
@@ -1254,6 +1337,8 @@ export class Document extends YServer {
             timestamp,
             timestamp,
             JSON.stringify(blockMetadata),
+            pageId,
+            epoch,
           ),
           ...webhookEventStatements(this.bindings.DB, {
             workspaceId: page.workspace_id,
@@ -1628,11 +1713,18 @@ export class Document extends YServer {
             `DELETE FROM member_mentions WHERE source_page_id = ? AND projection_seq <> ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, maximum, pageId, epoch),
-          this.bindings.DB.prepare(`DELETE FROM transclusion_sources WHERE page_id = ?`).bind(pageId),
-          this.bindings.DB.prepare(`DELETE FROM transclusion_references WHERE reference_page_id = ?`).bind(pageId),
           this.bindings.DB.prepare(
-            `UPDATE api_blocks SET deleted_at = ? WHERE page_id = ? AND deleted_at IS NULL`,
-          ).bind(timestamp, pageId),
+            `DELETE FROM transclusion_sources WHERE page_id = ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, pageId, epoch),
+          this.bindings.DB.prepare(
+            `DELETE FROM transclusion_references WHERE reference_page_id = ?
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(pageId, pageId, epoch),
+          this.bindings.DB.prepare(
+            `UPDATE api_blocks SET deleted_at = ? WHERE page_id = ? AND deleted_at IS NULL
+              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
+          ).bind(timestamp, pageId, pageId, epoch),
           ...webhookEventStatements(this.bindings.DB, {
             workspaceId: page.workspace_id,
             type: "page.content_updated",

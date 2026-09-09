@@ -272,10 +272,15 @@ export async function replaceIntegrationGrants(
   ]);
 }
 
-export async function authenticateIntegration(request: Request, env: Env): Promise<IntegrationPrincipal> {
+export function integrationBearerToken(request: Request) {
   const authorization = request.headers.get("authorization") ?? "";
-  if (!/^Bearer crn_[A-Za-z0-9_-]{43}$/.test(authorization)) throw new IntegrationAuthError();
-  const tokenHash = await sha256Hex(authorization.slice(7));
+  return /^Bearer crn_[A-Za-z0-9_-]{43}$/.test(authorization) ? authorization.slice(7) : null;
+}
+
+export async function authenticateIntegration(request: Request, env: Env): Promise<IntegrationPrincipal> {
+  const token = integrationBearerToken(request);
+  if (!token) throw new IntegrationAuthError();
+  const tokenHash = await sha256Hex(token);
   const row = await env.DB.prepare(
     `SELECT integration.*, workspace.name workspace_name, bot.name bot_name
        FROM integration_tokens token
