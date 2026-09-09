@@ -86,9 +86,21 @@ pnpm wrangler secret put WEBHOOK_ENCRYPTION_KEY --env production
 Use at least 32 random bytes for `BETTER_AUTH_SECRET`. Treat `BOOTSTRAP_TOKEN` as a one-time operator
 credential and rotate or remove it after the owner is created.
 
-Use a separate high-entropy value for `WEBHOOK_ENCRYPTION_KEY`. It encrypts integration webhook
+Generate `WEBHOOK_ENCRYPTION_KEY` as exactly 32 random bytes in unpadded base64url form, for example
+with `openssl rand -base64 32 | tr '+/' '-_' | tr -d '='`. It encrypts integration webhook
 verification secrets at rest; webhook subscription creation and delivery are disabled when it is
-absent.
+absent or malformed.
+
+When upgrading an installation that already has webhook subscriptions, preserve the existing AES key
+by replacing the old arbitrary-string value with its SHA-256 digest in unpadded base64url form before
+deploying this version:
+
+```sh
+printf %s "$CURRENT_WEBHOOK_KEY" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '='
+```
+
+Changing to unrelated key material makes existing verification tokens unreadable and requires those
+subscriptions to be recreated.
 
 `BETTER_AUTH_SECRET` is not only the session signing key. It is also the shared secret the Worker sends
 as the `x-notes-internal` header when it calls a Durable Object directly, for archive, version restore,
@@ -115,10 +127,13 @@ keeps in-app notifications active and clearly reports Slack as unavailable.
 
 ## 4. Configure rate limiting
 
-The `/v1` API uses the `API_BURST_LIMIT` and `API_MINUTE_LIMIT` Workers Rate Limiting bindings declared
-in `wrangler.jsonc`. They are keyed by integration and return a Notion-compatible `429` response at
-100 requests per 10 seconds or 600 requests per minute. Browser authentication and install routes are
-still unthrottled at the application layer, so retain external protection for them.
+The `/v1` API uses `API_SOURCE_BURST_LIMIT` / `API_SOURCE_MINUTE_LIMIT` bindings before token lookup, keyed
+by source IP or by caller zone for cross-zone Worker traffic. It then uses `API_BURST_LIMIT` /
+`API_MINUTE_LIMIT` bindings per authenticated integration. These are declared
+in `wrangler.jsonc`. The source limits are 300 requests per 10 seconds and 1,800 per minute; integration
+limits are 100 per 10 seconds and 600 per minute. Both return a Notion-compatible `429` response. Browser
+authentication and install routes are still unthrottled at the application layer, so retain external
+protection for them. A dashboard rule for `/v1/*` can additionally reject abuse before Worker execution.
 
 Add Cloudflare Rate Limiting rules before exposing the origin publicly. At minimum:
 
@@ -127,6 +142,7 @@ Add Cloudflare Rate Limiting rules before exposing the origin publicly. At minim
 | `/api/install/bootstrap` | 5 requests per minute per IP  |
 | `/api/auth/*`            | 20 requests per minute per IP |
 | `/api/invites/accept`    | 10 requests per minute per IP |
+| `/v1/*`                  | Tune to expected API traffic  |
 
 These are configured in the Cloudflare dashboard, not in this repository.
 

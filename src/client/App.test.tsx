@@ -3,7 +3,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { startTransition, StrictMode, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import type { ClientMemberContext, Page, Space, Tag, WorkspaceEvent } from "../shared/types";
+import type { ClientMemberContext, Job, Page, Space, Tag, WorkspaceEvent } from "../shared/types";
 import type { EditorPageProps } from "./EditorPage";
 import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
 import { App, fallbackPageId, useCommittedRef } from "./App";
@@ -80,6 +80,46 @@ const page: Page = {
   createdAt: 1,
   updatedAt: 1,
 };
+
+const shellGeneralSpace: Space = {
+  id: `${member.workspace.id}-general`,
+  workspaceId: member.workspace.id,
+  name: "General",
+  slug: "general",
+  description: "",
+  icon: null,
+  position: "a0",
+  visibility: "workspace",
+  effectiveRole: "editor",
+  createdAt: 1,
+  updatedAt: 1,
+};
+
+function mockShellApi(options: { member?: ClientMemberContext; pages?: Page[]; jobs?: () => Job[] } = {}) {
+  const currentMember = options.member ?? member;
+  const pages = options.pages ?? [page];
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (path === "/api/install") return { initialized: true };
+    if (path === "/api/me") return currentMember;
+    if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+    if (path === "/api/notifications?limit=1&unread=true") return { unreadCount: 0 };
+    if (path === "/api/pages/tree") return { pages };
+    if (path === "/api/spaces") return { spaces: [{ ...shellGeneralSpace, effectiveRole: currentMember.role }] };
+    if (path === "/api/favorites") return { pages: [] };
+    if (path === "/api/tags") return { tags: [] };
+    if (path === "/api/templates") return { templates: [] };
+    if (path === `/api/spaces/${shellGeneralSpace.id}/pins`) return { pages: [] };
+    if (/^\/api\/pages\/[^/]+\/tags$/.test(path)) return { tags: [] };
+    if (/^\/api\/pages\/[^/]+\/watch$/.test(path)) {
+      return { watch: { state: "none", source: null } };
+    }
+    if (/^\/api\/spaces\/[^/]+\/watch$/.test(path)) {
+      return { watch: { state: "none", source: null } };
+    }
+    if (path === "/api/jobs" && options.jobs) return { jobs: options.jobs() };
+    throw new Error(`Unexpected API request: ${path}`);
+  });
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -166,6 +206,77 @@ describe("App error handling", () => {
 
     expect(fallbackPageId([template, normal], [], null)).toBe(normal.id);
     expect(fallbackPageId([template], [], null)).toBeNull();
+  });
+
+  it("continues polling an active job when its polling delay remains unchanged", async () => {
+    const running: Job = {
+      id: "job-1",
+      workspaceId: member.workspace.id,
+      spaceId: null,
+      type: "search_reindex",
+      status: "running",
+      progress: { current: 1, total: 3, label: "Indexing" },
+      warnings: [],
+      result: null,
+      error: null,
+      hasDownload: false,
+      cleanupPending: false,
+      expiresAt: null,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    let jobLoads = 0;
+    mockShellApi({
+      jobs: () => {
+        jobLoads += 1;
+        return [{ ...running }];
+      },
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByRole("button", { name: /Activities/ }));
+    await act(async () => Promise.resolve());
+    expect(jobLoads).toBe(1);
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(jobLoads).toBe(2);
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(jobLoads).toBe(3);
+  });
+
+  it("closes and resets sharing state when the selected page changes", async () => {
+    const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
+    const owner = { ...member, role: "owner" as const };
+    mockShellApi({ member: owner, pages: [page, secondPage] });
+    const shellImplementation = vi.mocked(api).getMockImplementation();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${page.id}/share` && !init?.method) {
+        return {
+          share: {
+            url: "https://public.example.test/roadmap",
+            includeSubpages: false,
+            allowIndexing: false,
+            showToc: true,
+            showLastUpdated: true,
+            views: 0,
+          },
+        };
+      }
+      if (!shellImplementation) throw new Error(`Unexpected API request: ${path}`);
+      return shellImplementation(path, init);
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    fireEvent.click(screen.getByRole("button", { name: "Share" }));
+    expect(await screen.findByDisplayValue("https://public.example.test/roadmap")).toBeInTheDocument();
+
+    const secondLink = screen.getByText("Second").closest("button");
+    if (!secondLink) throw new Error("The second page link was not rendered.");
+    fireEvent.click(secondLink);
+    expect(screen.queryByRole("dialog", { name: "Share this page" })).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("https://public.example.test/roadmap")).not.toBeInTheDocument();
   });
 
   it("recovers a failed initial page-tree load from the pending workspace", async () => {

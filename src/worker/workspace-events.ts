@@ -69,7 +69,7 @@ export class WorkspaceEvents extends YServer {
   private resyncRequired = false;
 
   constructor(state: DurableObjectState, env: Env) {
-    super(state, env);
+    super(state, env as Cloudflare.Env);
     this.state = state;
     this.bindings = env;
   }

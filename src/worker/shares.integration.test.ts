@@ -21,8 +21,14 @@ async function bootstrap() {
     }),
   });
   const cookie = response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  const me = await (
+    await authenticated(cookie, "/api/me")
+  ).json<{
+    user: { id: string };
+    workspace: { id: string };
+  }>();
   const tree = await (await authenticated(cookie, "/api/pages/tree")).json<{ pages: Array<{ id: string }> }>();
-  return { cookie, pageId: tree.pages[0]!.id };
+  return { cookie, pageId: tree.pages[0]!.id, userId: me.user.id, workspaceId: me.workspace.id };
 }
 
 beforeEach(async () => {
@@ -60,11 +66,15 @@ describe("public page shares", () => {
       body: "{}",
     });
     expect((await second.json<{ share: { url: string } }>()).share.url).toBe(share.url);
-    await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, {
+    const updated = await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ includeSubpages: true, allowIndexing: true }),
     });
+    expect(updated.status).toBe(200);
+    const indexedRoot = await SELF.fetch(`http://example.test/share/${key}`);
+    expect(indexedRoot.status).toBe(200);
+    expect(await indexedRoot.text()).toContain('<meta name="robots" content="index,follow">');
     expect((await SELF.fetch(`http://example.test/share/${key}/pages/${child.id}`)).status).toBe(200);
     const sitemap = await SELF.fetch(`http://example.test/share/${key}/sitemap.xml`);
     expect(sitemap.status).toBe(200);
@@ -72,5 +82,84 @@ describe("public page shares", () => {
 
     await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, { method: "DELETE" });
     expect((await SELF.fetch(`http://example.test/share/${key}`)).status).toBe(404);
+  });
+
+  it("limits public tables to 500 rows and tells the reader when truncated", async () => {
+    const installed = await bootstrap();
+    const pageResponse = await authenticated(installed.cookie, "/api/pages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ kind: "table", parentId: null, title: "Large table" }),
+    });
+    expect(pageResponse.status).toBe(201);
+    const page = (await pageResponse.json<{ page: { id: string } }>()).page;
+    const columnId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Name', 'text', 0)`,
+    )
+      .bind(columnId, page.id)
+      .run();
+    const timestamp = Date.now();
+    for (let start = 0; start < 501; start += 50) {
+      await env.DB.batch(
+        Array.from({ length: Math.min(50, 501 - start) }, (_, offset) => {
+          const index = start + offset;
+          return env.DB.prepare(
+            `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          ).bind(crypto.randomUUID(), page.id, index, installed.userId, timestamp, timestamp);
+        }),
+      );
+    }
+    const published = await authenticated(installed.cookie, `/api/pages/${page.id}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const key = new URL((await published.json<{ share: { url: string } }>()).share.url).pathname.split("/").at(-1)!;
+
+    const response = await SELF.fetch(`http://example.test/share/${key}`);
+    const html = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(html.match(/<tr>/g) ?? []).toHaveLength(501);
+    expect(html).toContain("limited to the first 500 rows");
+  });
+
+  it("forces non-inline public attachments to download with a safe filename", async () => {
+    const installed = await bootstrap();
+    const attachmentId = crypto.randomUUID();
+    const key = `assets/${installed.workspaceId}/${attachmentId}/test`;
+    await env.BUCKET.put(key, new Uint8Array([1, 2, 3]));
+    await env.DB.prepare(
+      `INSERT INTO attachments
+        (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, 'application/x-custom', 3, ?, ?)`,
+    )
+      .bind(
+        attachmentId,
+        installed.workspaceId,
+        installed.pageId,
+        key,
+        'unsafe"\r\nname.bin',
+        installed.userId,
+        Date.now(),
+      )
+      .run();
+    const published = await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const shareKey = new URL((await published.json<{ share: { url: string } }>()).share.url).pathname
+      .split("/")
+      .at(-1)!;
+
+    const response = await SELF.fetch(`http://example.test/share/${shareKey}/assets/${attachmentId}`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/octet-stream");
+    expect(response.headers.get("content-disposition")).toContain("attachment;");
+    expect(response.headers.get("content-disposition")).not.toMatch(/[\r\n]/);
   });
 });

@@ -25,6 +25,15 @@ export type WorkspaceEventsBundle = {
   destroy: () => void;
 };
 
+export type NetworkCollaborationBundle = {
+  doc: Y.Doc;
+  provider: YProvider;
+  ready: Promise<void>;
+  readonly synced: boolean;
+  readonly hasUnsyncedChanges: boolean;
+  destroy: () => void;
+};
+
 export function createCollaboration(
   workspaceId: string,
   pageId: string,
@@ -165,6 +174,149 @@ export function createCollaboration(
       provider.awareness.setLocalState(null);
       provider.destroy();
       void indexeddb.destroy().catch((error) => console.error("Failed to close offline document storage", error));
+      doc.destroy();
+    },
+  };
+}
+
+/** A reconnecting Yjs room with no browser persistence. Used by diagrams, which
+ * deliberately become read-only whenever the authoritative server is absent. */
+export function createNetworkCollaboration(
+  pageId: string,
+  epoch: number,
+  onStatus: (status: "offline" | "connecting" | "connected") => void,
+): NetworkCollaborationBundle {
+  const doc = new Y.Doc();
+  const provider = new YProvider(window.location.host, `${pageId}~${epoch}`, doc, {
+    party: "document",
+    connect: false,
+  });
+  const durability = new CollaborationDurability();
+  let destroyed = false;
+  let synced = false;
+  let readyResolved = false;
+  let resolveReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    resolveReady = resolve;
+  });
+  let hiddenTimer: number | undefined;
+  let barrierTimer: number | undefined;
+  let retryTimer: number | undefined;
+  let retryAttempt = 0;
+
+  const connect = () => {
+    if (destroyed) return;
+    if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    retryTimer = undefined;
+    onStatus("connecting");
+    void provider.connect().then(
+      () => {
+        retryAttempt = 0;
+      },
+      (error) => {
+        if (destroyed) return;
+        onStatus("offline");
+        console.error("Failed to connect diagram collaboration", error);
+        if (document.visibilityState !== "hidden") {
+          retryTimer = window.setTimeout(connect, connectionRetryDelay(retryAttempt++));
+        }
+      },
+    );
+  };
+
+  const sendBarrier = () => {
+    if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
+    barrierTimer = undefined;
+    const generation = durability.barrierGeneration();
+    if (generation === null || !provider.synced) return;
+    provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
+  };
+  const scheduleBarrier = () => {
+    if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
+    barrierTimer = window.setTimeout(sendBarrier, 500);
+  };
+  const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
+    if (status === "disconnected") {
+      synced = false;
+      if (!destroyed && document.visibilityState !== "hidden" && retryTimer === undefined) {
+        retryTimer = window.setTimeout(connect, connectionRetryDelay(retryAttempt++));
+      }
+    } else if (retryTimer !== undefined) {
+      window.clearTimeout(retryTimer);
+      retryTimer = undefined;
+    }
+    onStatus(status === "disconnected" ? "offline" : status === "connected" && !synced ? "connecting" : status);
+  };
+  const handleSync = (next: boolean) => {
+    synced = next;
+    if (next) {
+      onStatus("connected");
+      sendBarrier();
+      if (!readyResolved) {
+        readyResolved = true;
+        resolveReady();
+      }
+    } else onStatus("connecting");
+  };
+  const handleCustomMessage = (message: string) => {
+    try {
+      const value = JSON.parse(message) as { type?: unknown; generation?: unknown };
+      if (value.type === "document-update-ack" && Number.isInteger(value.generation)) {
+        durability.acknowledge(Number(value.generation));
+      }
+    } catch {
+      // Ignore custom messages from future server versions.
+    }
+  };
+  const handleUpdate = (_update: Uint8Array, origin: unknown) => {
+    if (origin === provider) return;
+    durability.markChanged();
+    scheduleBarrier();
+  };
+  const visibility = () => {
+    if (document.visibilityState === "hidden") {
+      sendBarrier();
+      hiddenTimer = window.setTimeout(() => {
+        hiddenTimer = undefined;
+        synced = false;
+        provider.disconnect();
+      }, 30_000);
+    } else {
+      if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
+      hiddenTimer = undefined;
+      connect();
+    }
+  };
+
+  provider.on("status", handleStatus);
+  provider.on("sync", handleSync);
+  provider.on("custom-message", handleCustomMessage);
+  doc.on("update", handleUpdate);
+  document.addEventListener("visibilitychange", visibility);
+  connect();
+
+  return {
+    doc,
+    provider,
+    ready,
+    get synced() {
+      return synced;
+    },
+    get hasUnsyncedChanges() {
+      return durability.hasUnsyncedChanges;
+    },
+    destroy() {
+      destroyed = true;
+      if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
+      if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      document.removeEventListener("visibilitychange", visibility);
+      provider.off("status", handleStatus);
+      provider.off("sync", handleSync);
+      provider.off("custom-message", handleCustomMessage);
+      doc.off("update", handleUpdate);
+      provider.awareness.setLocalState(null);
+      provider.destroy();
       doc.destroy();
     },
   };

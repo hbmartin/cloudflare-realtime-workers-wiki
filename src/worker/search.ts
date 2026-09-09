@@ -6,6 +6,7 @@ import type {
   SearchSnippetSource,
   SearchTitleSuggestion,
 } from "../shared/types";
+import { PAGE_KINDS } from "../shared/page-kind";
 import { ID_PATTERN } from "../shared/validation";
 import type { MemberContext } from "./env";
 import { HttpError } from "./http";
@@ -80,7 +81,7 @@ export function parseSearchRequest(url: string) {
   const hasCommentsValue = oneOf(parameters.get("hasComments"), "hasComments", ["true", "false"] as const);
   const spaceId = optionalId(parameters.get("space"), "space");
   const creatorId = optionalId(parameters.get("creator"), "creator");
-  const kind = oneOf<PageKind>(parameters.get("kind"), "kind", ["document", "table"]);
+  const kind = oneOf<PageKind>(parameters.get("kind"), "kind", PAGE_KINDS);
   const archive = oneOf<SearchArchiveState>(parameters.get("archive"), "archive", ["active", "archived", "all"]);
   const filters: SearchFilters = {
     ...(spaceId ? { spaceId } : {}),
@@ -220,6 +221,7 @@ export async function searchTitles(database: D1Database, member: MemberContext, 
   const parameters = new URL(url).searchParams;
   const query = (parameters.get("q") ?? "").trim().slice(0, 100);
   const limit = integerParameter(parameters.get("limit"), "limit", 10, 1, 20);
+  const kind = oneOf<PageKind>(parameters.get("kind"), "kind", PAGE_KINDS);
   if (!query) return { suggestions: [] as SearchTitleSuggestion[] };
   const escaped = escapeLike(query);
   const rows = await database
@@ -229,13 +231,24 @@ export async function searchTitles(database: D1Database, member: MemberContext, 
          LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
         WHERE p.workspace_id = ? AND p.import_job_id IS NULL AND p.is_template = 0
           AND p.archived_at IS NULL AND p.title LIKE ? ESCAPE '\\'
+          AND (? IS NULL OR p.kind = ?)
           AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
         ORDER BY CASE WHEN lower(trim(p.title)) = lower(?) THEN 0
                       WHEN p.title LIKE ? ESCAPE '\\' THEN 1 ELSE 2 END,
                  p.updated_at DESC, p.id
         LIMIT ?`,
     )
-    .bind(member.user.id, member.workspace.id, `%${escaped}%`, member.role, query, `${escaped}%`, limit)
+    .bind(
+      member.user.id,
+      member.workspace.id,
+      `%${escaped}%`,
+      kind ?? null,
+      kind ?? null,
+      member.role,
+      query,
+      `${escaped}%`,
+      limit,
+    )
     .all<TitleRow>();
   return {
     suggestions: rows.results.map((row) => ({

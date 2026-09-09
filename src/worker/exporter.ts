@@ -1,6 +1,7 @@
 import type { WorkflowStep } from "cloudflare:workers";
-import type { DocumentContentEnvelope, ExportFormat } from "../shared/types";
+import type { DiagramContentEnvelope, DocumentContentEnvelope, ExportFormat } from "../shared/types";
 import { serializeDocument } from "../shared/document-projection";
+import { renderDiagramSvg } from "../shared/diagram";
 import { createZip, type ZipEntry } from "../shared/zip";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
@@ -18,7 +19,7 @@ type ExportPage = {
   id: string;
   workspace_id: string;
   content_epoch: number;
-  kind: "document" | "table";
+  kind: "document" | "table" | "diagram";
   title: string;
 };
 type ExportColumn = { id: string; name: string };
@@ -35,7 +36,7 @@ function exportOptions(job: JobRow): ExportOptions {
   const options = jsonRecord(job.options_json);
   if (
     typeof options.pageId !== "string" ||
-    !["markdown", "html", "pdf"].includes(String(options.format)) ||
+    !["markdown", "html", "json", "svg", "png", "pdf"].includes(String(options.format)) ||
     typeof options.portable !== "boolean"
   ) {
     throw new Error("Export options are invalid.");
@@ -53,7 +54,7 @@ function escapeMarkdownCell(value: string) {
 
 function fileStem(title: string) {
   const normalized = normalizeFilename(title)
-    .replace(/\.(md|html|pdf|zip)$/i, "")
+    .replace(/\.(md|html|json|svg|png|pdf|zip)$/i, "")
     .trim();
   return normalized || "Untitled";
 }
@@ -132,6 +133,31 @@ async function tableExport(env: Env, page: ExportPage) {
   return { markdown: markdown.join(""), html: html.join("") };
 }
 
+async function diagramExport(env: Env, page: ExportPage) {
+  const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
+    new Request("https://document.internal/content", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }),
+  );
+  if (!response.ok) throw new Error(`The latest diagram content could not be flushed (${response.status}).`);
+  const envelope = await response.json<DiagramContentEnvelope>();
+  if (envelope.pageId !== page.id || envelope.contentEpoch !== page.content_epoch) {
+    throw new Error("The diagram projection did not match the requested page.");
+  }
+  const svg = renderDiagramSvg(envelope, {
+    width: 1920,
+    height: 1080,
+    title: page.title,
+    assetHref: (assetId) => `/api/attachments/${assetId}`,
+  });
+  return {
+    json: JSON.stringify(envelope, null, 2),
+    svg,
+    html: `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(page.title)}</title><style>html,body{margin:0;background:#fff}svg{display:block;width:100%;height:auto}</style></head><body>${svg}</body></html>`,
+    assetIds: new Set(envelope.nodes.flatMap((node) => (node.assetId ? [node.assetId] : []))),
+  };
+}
+
 function uniqueAssetName(name: string, used: Set<string>) {
   const safe = normalizeFilename(name) || "attachment";
   if (!used.has(safe)) {
@@ -164,30 +190,41 @@ async function portableExport(
   env: Env,
   job: JobRow,
   page: ExportPage,
-  format: Exclude<ExportFormat, "pdf">,
+  format: "markdown" | "html" | "json" | "svg",
   content: string,
+  referencedAssetIds?: ReadonlySet<string>,
 ) {
   const attachments = await env.DB.prepare(`SELECT id, r2_key, name, mime FROM attachments WHERE page_id = ?`)
     .bind(page.id)
     .all<ExportAttachment>();
   const entries: ZipEntry[] = [];
+  const assetManifest: Array<{ id: string; path: string; name: string; mime: string }> = [];
   const used = new Set<string>();
   let rewritten = content;
   for (const attachment of attachments.results) {
+    if (referencedAssetIds && !referencedAssetIds.has(attachment.id)) continue;
     await assertExportActive(env, job);
     const object = await env.BUCKET.get(attachment.r2_key);
     if (!object) throw new Error(`Attachment ${attachment.name} is missing.`);
     const name = uniqueAssetName(attachment.name, used);
-    const relative = `assets/${name}`;
+    const relative = format === "json" ? `assets/${attachment.id}/${name}` : `assets/${name}`;
     rewritten = replaceAttachmentReference(
       rewritten,
       attachment.id,
       relative.split("/").map(encodeURIComponent).join("/"),
     );
     entries.push({ path: relative, bytes: new Uint8Array(await object.arrayBuffer()) });
+    if (format === "json")
+      assetManifest.push({ id: attachment.id, path: relative, name: attachment.name, mime: attachment.mime });
+  }
+  if (assetManifest.length) {
+    entries.push({
+      path: "assets/manifest.json",
+      bytes: new TextEncoder().encode(JSON.stringify(assetManifest, null, 2)),
+    });
   }
   entries.unshift({
-    path: `${fileStem(page.title)}.${format === "markdown" ? "md" : "html"}`,
+    path: `${fileStem(page.title)}.${format === "markdown" ? "md" : format}`,
     bytes: new TextEncoder().encode(rewritten),
   });
   return createZip(entries);
@@ -204,7 +241,7 @@ function base64(bytes: Uint8Array) {
   return btoa(binary);
 }
 
-async function pdfExportHtml(env: Env, job: JobRow, page: ExportPage, html: string) {
+async function browserExportHtml(env: Env, job: JobRow, page: ExportPage, html: string) {
   const attachments = await env.DB.prepare(`SELECT id, r2_key, name, mime FROM attachments WHERE page_id = ?`)
     .bind(page.id)
     .all<ExportAttachment>();
@@ -244,7 +281,12 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
       .bind(options.pageId, job.workspace_id, job.space_id)
       .first<ExportPage>();
     if (!page) throw new Error("The page is no longer available for export.");
-    const serialized = page.kind === "document" ? await documentExport(env, page) : await tableExport(env, page);
+    const serialized =
+      page.kind === "document"
+        ? await documentExport(env, page)
+        : page.kind === "diagram"
+          ? await diagramExport(env, page)
+          : await tableExport(env, page);
     await assertExportActive(env, job);
     let bytes: Uint8Array;
     let contentType: string;
@@ -252,9 +294,10 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
     if (options.format === "pdf") {
       if (!env.BROWSER) throw new Error("PDF export is not configured.");
       const response = await env.BROWSER.quickAction("pdf", {
-        html: await pdfExportHtml(env, job, page, serialized.html),
+        html: await browserExportHtml(env, job, page, serialized.html),
         pdfOptions: {
           format: "a4",
+          landscape: page.kind === "diagram",
           printBackground: true,
           margin: { top: "24mm", right: "18mm", bottom: "24mm", left: "18mm" },
         },
@@ -263,16 +306,52 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
       bytes = new Uint8Array(await response.arrayBuffer());
       contentType = "application/pdf";
       filename = `${fileStem(page.title)}.pdf`;
+    } else if (options.format === "png") {
+      if (!env.BROWSER || page.kind !== "diagram") throw new Error("PNG export is not configured.");
+      const response = await env.BROWSER.quickAction("screenshot", {
+        html: await browserExportHtml(env, job, page, serialized.html),
+        screenshotOptions: { type: "png", fullPage: true },
+      });
+      if (!response.ok) throw new Error(`PNG rendering failed (${response.status}).`);
+      bytes = new Uint8Array(await response.arrayBuffer());
+      contentType = "image/png";
+      filename = `${fileStem(page.title)}.png`;
     } else {
-      const content = options.format === "markdown" ? serialized.markdown : serialized.html;
+      const content =
+        options.format === "markdown"
+          ? "markdown" in serialized
+            ? serialized.markdown
+            : ""
+          : options.format === "html"
+            ? serialized.html
+            : options.format === "json" && "json" in serialized
+              ? serialized.json
+              : options.format === "svg" && "svg" in serialized
+                ? serialized.svg
+                : "";
+      if (!content) throw new Error("That format is not available for this page kind.");
       if (options.portable) {
-        bytes = await portableExport(env, job, page, options.format, content);
+        bytes = await portableExport(
+          env,
+          job,
+          page,
+          options.format,
+          content,
+          "assetIds" in serialized ? serialized.assetIds : undefined,
+        );
         contentType = "application/zip";
         filename = `${fileStem(page.title)}-${options.format}.zip`;
       } else {
         bytes = new TextEncoder().encode(content);
-        contentType = options.format === "markdown" ? "text/markdown; charset=utf-8" : "text/html; charset=utf-8";
-        filename = `${fileStem(page.title)}.${options.format === "markdown" ? "md" : "html"}`;
+        contentType =
+          options.format === "markdown"
+            ? "text/markdown; charset=utf-8"
+            : options.format === "html"
+              ? "text/html; charset=utf-8"
+              : options.format === "json"
+                ? "application/json; charset=utf-8"
+                : "image/svg+xml; charset=utf-8";
+        filename = `${fileStem(page.title)}.${options.format === "markdown" ? "md" : options.format}`;
       }
     }
     if (!bytes.byteLength) throw new Error("The export produced an empty file.");

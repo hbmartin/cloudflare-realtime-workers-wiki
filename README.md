@@ -2,20 +2,21 @@
 
 A private, self-hosted collaborative wiki built entirely on Cloudflare Workers, Durable Objects, D1, and R2.
 
-The editor is BlockNote backed by Yjs. Each document epoch has one hibernating `YServer` Durable Object, a debounced and chunked SQLite update log, an R2 snapshot, browser IndexedDB persistence, presence, and Yjs-backed comments. A second read-only Durable Object distributes workspace metadata events. Page metadata, membership, lean content projections, deletion jobs, search, and structured tables live in D1. Files and immutable versions live in R2.
+Documents use BlockNote backed by Yjs, while diagrams use React Flow backed by the same Yjs room model. Each collaborative page epoch has one hibernating `YServer` Durable Object, a debounced and chunked SQLite update log, an R2 snapshot, presence, and Yjs-backed comments. Documents additionally persist an offline copy in browser IndexedDB; diagrams require a live authoritative connection for changes. A second read-only Durable Object distributes workspace metadata events. Page metadata, membership, lean content projections, deletion jobs, search, and structured tables live in D1. Files and immutable versions live in R2.
 
 ## What works
 
 - Operator-token bootstrap, Better Auth email/password sessions, one-use invites, and owner/editor/viewer roles.
 - Workspace and private spaces, nested pages, favorites, pins, tags, templates, archive/restore, queued deletion, and scoped weighted FTS5 search.
 - Realtime BlockNote editing, awareness, local undo, offline IndexedDB, hidden-tab disconnects, server-enforced viewer read-only access, and five-minute connection reauthorization.
+- First-class realtime diagrams with React Flow stencils, connectors, frames, page links, member mentions, presence, node/edge comments, local undo, generated SVG thumbnails, and reconnectable network-required editing.
 - Merged update chunks, 30-second R2 compaction, structured D1 search/reference projection, 16/24 MiB warnings and limits, automatic versions, comparison, and epoch-safe restore.
 - Realtime page-tree metadata, unified page/member mentions, backlinks, authorized hover previews, and a cursor-based mention inbox.
 - Server-authoritative anchored comment threads, watches, in-app notifications, channel preferences, and timezone-aware digests.
 - Private R2 attachments with authorization, all HTTP range forms, conditional ETags, safe disposition, `nosniff`, MIME rejection, inline editor media, and chunked direct-to-R2 uploads for large files.
 - Full-page typed tables with 60-second single-editor leases, revision conflicts, owner force unlock, server-side paging and sorting, replayable bulk writes, and a 20,000-row limit.
 - In-app Markdown, sanitized HTML, and nested Notion ZIP import with staged verification and atomic publication.
-- Per-page Markdown, HTML, portable ZIP, and PDF export through resumable Cloudflare Workflows.
+- Document Markdown/HTML/portable ZIP/PDF export and diagram JSON/SVG/PNG/PDF export through resumable Cloudflare Workflows.
 - Optional native Slack OAuth, private slash search, access-filtered unfurls, channel mappings, and queued personal/channel notifications.
 
 This is an early v1 implementation. Production billing-grade hibernation verification and high-concurrency load tests still require a deployed Workers Paid account.
@@ -69,8 +70,9 @@ deployed staging target in that load check.
 
 ```text
 Browser
-  ├─ React + BlockNote + Yjs
-  ├─ IndexedDB (workspace:page:epoch:schema)
+  ├─ React + BlockNote or React Flow + Yjs
+  ├─ IndexedDB for documents (workspace:page:epoch:schema)
+  ├─ network-authoritative diagram state (no offline mutation queue)
   └─ YPartyKitProvider connections
           ├─ authenticated /parties/document/:page~:epoch
           └─ authenticated /parties/workspace-events/:workspace
@@ -81,7 +83,7 @@ Hono Worker
   ├─ optional Email, Browser Rendering, and Slack integrations
   └─ PartyServer router
           ├────────────────────────────────────┐
-Document Durable Object (hibernating YServer)
+Collaborative Page Durable Object (hibernating YServer)
   ├─ 1–5 second merged ~1 MiB SQLite update chunks
   ├─ 30-second R2 current snapshot
   ├─ automatic immutable R2 versions
@@ -105,10 +107,12 @@ day-to-day operations, troubleshooting, observability, and backup and recovery. 
 - Workers Paid is the supported production target.
 - 30 live connections per document epoch.
 - Document warning at 16 MiB; server read-only at 24 MiB.
+- Diagrams keep their last in-memory view while disconnected but require a completed server sync before edits resume.
+- Diagram public-share rendering and diagram import are not included in v1; diagrams export as JSON, SVG, PNG, or PDF.
 - 10 MiB single-request file uploads; larger files upload in parts.
 - 20,000 table rows, read 500 at a time and sorted by the server.
 - Server durability has a crash-only in-memory window of at most the configured five-second save debounce; IndexedDB resynchronizes surviving client edits.
-- Search, backlinks, mentions, and previews follow document compaction rather than every keystroke.
+- Search, backlinks, mentions, and previews follow collaborative-page compaction rather than every keystroke.
 - A workspace location hint affects only first Durable Object placement and is not a residency guarantee.
 
 ## License

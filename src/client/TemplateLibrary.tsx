@@ -28,11 +28,17 @@ export function TemplateLibrary({
           return (
             <article key={template.id}>
               <span className="template-kind" aria-hidden="true">
-                {template.kind === "table" ? "▦" : "□"}
+                {template.kind === "table" ? "▦" : template.kind === "diagram" ? "◇" : "□"}
               </span>
               <div>
                 <h2>{template.title}</h2>
-                <p>{template.kind === "table" ? "Structured table" : "Document"}</p>
+                <p>
+                  {template.kind === "table"
+                    ? "Structured table"
+                    : template.kind === "diagram"
+                      ? "Collaborative diagram"
+                      : "Document"}
+                </p>
               </div>
               <div className="template-actions">
                 <button className="quiet-button" onClick={() => onEdit(template)}>

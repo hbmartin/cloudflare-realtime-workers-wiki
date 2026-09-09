@@ -3,7 +3,7 @@
   "name": "cloudflare-realtime-notes",
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-08-14",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "upload_source_maps": true,
   "preview_urls": true,
   "observability": { "enabled": true },
@@ -53,6 +53,8 @@
     ],
   },
   "ratelimits": [
+    { "name": "API_SOURCE_BURST_LIMIT", "namespace_id": "2103", "simple": { "limit": 300, "period": 10 } },
+    { "name": "API_SOURCE_MINUTE_LIMIT", "namespace_id": "2104", "simple": { "limit": 1800, "period": 60 } },
     { "name": "API_BURST_LIMIT", "namespace_id": "2101", "simple": { "limit": 100, "period": 10 } },
     { "name": "API_MINUTE_LIMIT", "namespace_id": "2102", "simple": { "limit": 600, "period": 60 } },
   ],
@@ -109,6 +111,8 @@
         ],
       },
       "ratelimits": [
+        { "name": "API_SOURCE_BURST_LIMIT", "namespace_id": "2103", "simple": { "limit": 300, "period": 10 } },
+        { "name": "API_SOURCE_MINUTE_LIMIT", "namespace_id": "2104", "simple": { "limit": 1800, "period": 60 } },
         { "name": "API_BURST_LIMIT", "namespace_id": "2101", "simple": { "limit": 100, "period": 10 } },
         { "name": "API_MINUTE_LIMIT", "namespace_id": "2102", "simple": { "limit": 600, "period": 60 } },
       ],
@@ -159,6 +163,8 @@
         ],
       },
       "ratelimits": [
+        { "name": "API_SOURCE_BURST_LIMIT", "namespace_id": "2203", "simple": { "limit": 300, "period": 10 } },
+        { "name": "API_SOURCE_MINUTE_LIMIT", "namespace_id": "2204", "simple": { "limit": 1800, "period": 60 } },
         { "name": "API_BURST_LIMIT", "namespace_id": "2101", "simple": { "limit": 100, "period": 10 } },
         { "name": "API_MINUTE_LIMIT", "namespace_id": "2102", "simple": { "limit": 600, "period": 60 } },
       ],

@@ -1,4 +1,5 @@
 import { sha256Hex } from "../shared/import-integrity";
+import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256Hex } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { publicPageId } from "./integrations";
 import { HttpError } from "./http";
@@ -54,41 +55,37 @@ const RETRY_DELAYS = [
   24 * 60 * 60_000,
 ];
 
-function bytesToBase64(bytes: Uint8Array) {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-}
-
-function base64ToBytes(value: string) {
-  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
-  const binary = atob(normalized);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
 function verificationToken() {
-  return `secret_${bytesToBase64(crypto.getRandomValues(new Uint8Array(32)))}`;
+  return `secret_${bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
-function constantTimeEqual(left: string, right: string) {
-  if (left.length !== right.length) return false;
-  let difference = 0;
-  for (let index = 0; index < left.length; index += 1) {
-    difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
-  }
-  return difference === 0;
-}
-
-async function encryptionKey(env: Env) {
-  if (!env.WEBHOOK_ENCRYPTION_KEY) {
+function encryptionMaterial(env: Env) {
+  const encoded = env.WEBHOOK_ENCRYPTION_KEY;
+  let key: Uint8Array;
+  try {
+    if (!encoded || !/^[A-Za-z0-9_-]{43}$/.test(encoded)) throw new Error("invalid key");
+    key = base64UrlToBytes(encoded);
+    if (key.byteLength !== 32 || bytesToBase64Url(key) !== encoded) throw new Error("invalid key");
+  } catch {
     throw new HttpError(
       503,
       "webhook_encryption_unavailable",
-      "Configure WEBHOOK_ENCRYPTION_KEY before using webhooks.",
+      "Configure WEBHOOK_ENCRYPTION_KEY as 32 random bytes encoded with unpadded base64url.",
     );
   }
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(env.WEBHOOK_ENCRYPTION_KEY));
-  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+  return { encoded, key: Uint8Array.from(key) };
+}
+
+async function encryptionKey(env: Env) {
+  return crypto.subtle.importKey("raw", encryptionMaterial(env).key, { name: "AES-GCM" }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
+}
+
+async function legacyEncryptionKey(env: Env) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(encryptionMaterial(env).encoded));
+  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["decrypt"]);
 }
 
 async function encryptToken(env: Env, token: string) {
@@ -99,20 +96,24 @@ async function encryptToken(env: Env, token: string) {
   const output = new Uint8Array(iv.length + encrypted.length);
   output.set(iv);
   output.set(encrypted, iv.length);
-  return bytesToBase64(output);
+  return bytesToBase64Url(output);
 }
 
 async function decryptToken(env: Env, encrypted: string) {
-  const input = base64ToBytes(encrypted);
-  const plain = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: input.slice(0, 12) },
-    await encryptionKey(env),
-    input.slice(12),
-  );
+  const input = base64UrlToBytes(encrypted);
+  const algorithm = { name: "AES-GCM", iv: input.slice(0, 12) };
+  let plain: ArrayBuffer;
+  try {
+    plain = await crypto.subtle.decrypt(algorithm, await encryptionKey(env), input.slice(12));
+  } catch {
+    // Before the key format was made explicit, configured strings were hashed.
+    // Keep valid, already-formatted deployments able to read their stored tokens.
+    plain = await crypto.subtle.decrypt(algorithm, await legacyEncryptionKey(env), input.slice(12));
+  }
   return new TextDecoder().decode(plain);
 }
 
-function safeUrl(value: string) {
+export function safeWebhookUrl(value: string) {
   let url: URL;
   try {
     url = new URL(value);
@@ -120,19 +121,38 @@ function safeUrl(value: string) {
     throw new HttpError(422, "invalid_webhook_url", "Enter a valid HTTPS webhook URL.");
   }
   const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  // Workers global fetch does not support IP-address URLs and mediates DNS so
+  // resolved destinations cannot reach Cloudflare's internal network. Rejecting
+  // every literal here also keeps local and alternate runtimes from having to
+  // duplicate an ever-growing list of private IPv4 and IPv6 ranges.
+  const isIpLiteral = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) || /^\[[0-9a-f:.]+\]$/.test(hostname);
   if (
     url.protocol !== "https:" ||
     url.username ||
     url.password ||
     hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
     hostname.endsWith(".local") ||
-    /^(127\.|10\.|192\.168\.|169\.254\.|0\.|::1$|\[::1\]$)/.test(hostname) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(hostname)
+    isIpLiteral
   ) {
     throw new HttpError(422, "invalid_webhook_url", "Webhook URLs must be public HTTPS endpoints.");
   }
   url.hash = "";
   return url.toString();
+}
+
+async function storedWebhookUrl(env: Env, subscriptionId: string, value: string) {
+  try {
+    return safeWebhookUrl(value);
+  } catch (error) {
+    await env.DB.prepare(
+      `UPDATE webhook_subscriptions SET status = 'paused', updated_at = ?
+        WHERE id = ? AND status <> 'deleted'`,
+    )
+      .bind(Date.now(), subscriptionId)
+      .run();
+    throw error;
+  }
 }
 
 function events(value: unknown) {
@@ -197,7 +217,7 @@ export async function createWebhookSubscription(
   const row: SubscriptionRow = {
     id,
     integration_id: integrationId,
-    url: safeUrl(url),
+    url: safeWebhookUrl(url),
     events_json: JSON.stringify(events(requestedEvents)),
     status: "pending_verification",
     encrypted_verification_token: await encryptToken(env, token),
@@ -245,18 +265,26 @@ export async function sendWebhookVerification(env: Env, subscriptionId: string) 
   )
     .bind(subscriptionId)
     .first<SubscriptionRow>();
-  if (!row) return;
+  if (!row) return { ok: false as const, error: "Webhook subscription is no longer pending verification." };
+  const destination = await storedWebhookUrl(env, row.id, row.url);
   const token = await decryptToken(env, row.encrypted_verification_token);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5_000);
   try {
-    await fetch(row.url, {
+    const response = await fetch(destination, {
       method: "POST",
       headers: { "content-type": "application/json", "user-agent": "Realtime-Notes-Webhook/1.0" },
       body: JSON.stringify({ verification_token: token }),
       redirect: "manual",
       signal: controller.signal,
     });
+    if (!response.ok) return { ok: false as const, error: `Webhook endpoint returned HTTP ${response.status}.` };
+    return { ok: true as const };
+  } catch (error) {
+    return {
+      ok: false as const,
+      error: error instanceof Error ? error.message.slice(0, 500) : "Webhook verification request failed.",
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -298,7 +326,7 @@ export async function updateWebhookSubscription(
   if (input.url !== undefined && row.status !== "pending_verification") {
     throw new HttpError(409, "webhook_url_locked", "A verified webhook URL cannot be changed.");
   }
-  const url = input.url === undefined ? row.url : safeUrl(input.url);
+  const url = input.url === undefined ? row.url : safeWebhookUrl(input.url);
   const selected = input.events === undefined ? row.events_json : JSON.stringify(events(input.events));
   const status =
     input.paused === undefined
@@ -419,6 +447,11 @@ export async function fanoutWebhookEvent(env: Env, eventId: string) {
   const timestamp = Date.now();
   const statements: D1PreparedStatement[] = [];
   for (const subscription of subscriptions.results) {
+    try {
+      await storedWebhookUrl(env, subscription.id, subscription.url);
+    } catch {
+      continue;
+    }
     if (!(await deliveryAllowed(env, event, subscription))) continue;
     const deliveryId = crypto.randomUUID();
     const outboxId = crypto.randomUUID();
@@ -435,18 +468,6 @@ export async function fanoutWebhookEvent(env: Env, eventId: string) {
     );
   }
   if (statements.length) await env.DB.batch(statements);
-}
-
-async function hmac(secret: string, value: string) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const bytes = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function responseBody(response: Response) {
@@ -520,6 +541,24 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
     return;
   }
   const attempt = row.attempts + 1;
+  let destination: string;
+  try {
+    destination = await storedWebhookUrl(env, subscription.id, subscription.url);
+  } catch (error) {
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `UPDATE webhook_deliveries SET status = 'failed', attempts = ?, next_attempt_at = NULL,
+       last_error = ?, updated_at = ? WHERE id = ?`,
+    )
+      .bind(
+        attempt,
+        error instanceof Error ? error.message.slice(0, 500) : "Webhook URL is invalid",
+        timestamp,
+        deliveryId,
+      )
+      .run();
+    return;
+  }
   const entityId = row.entity_type === "page" ? await publicPageId(env, row.entity_id) : row.entity_id;
   const payload = JSON.stringify({
     id: row.id,
@@ -533,8 +572,6 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
     data: JSON.parse(row.data_json),
     attempt_number: attempt,
   });
-  const token = await decryptToken(env, subscription.encrypted_verification_token);
-  const signature = `sha256=${await hmac(token, payload)}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5_000);
   let status: number | null = null;
@@ -542,7 +579,9 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
   let received = "";
   let failure: string | null = null;
   try {
-    const response = await fetch(subscription.url, {
+    const token = await decryptToken(env, subscription.encrypted_verification_token);
+    const signature = `sha256=${await hmacSha256Hex(token, payload)}`;
+    const response = await fetch(destination, {
       method: "POST",
       headers: {
         "content-type": "application/json",

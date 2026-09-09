@@ -137,7 +137,7 @@ export async function deleteR2AttemptArtifactKeys(
   if (!Number.isInteger(throughAttempt) || throughAttempt < 1) {
     throw new RangeError("throughAttempt must be a positive integer.");
   }
-  if (!artifacts.length) return;
+  if (!artifacts.length) return true;
   let keys: string[] = [];
   for (let attempt = 1; attempt <= throughAttempt; attempt += 1) {
     for (const artifact of artifacts) {
@@ -145,10 +145,10 @@ export async function deleteR2AttemptArtifactKeys(
         `${artifact.rootPrefix.replace(/\/$/, "")}/attempts/${attempt}/${artifact.artifactPath.replace(/^\//, "")}`,
       );
       if (keys.length === R2_DELETE_BATCH_SIZE) {
-        if (!(await deleteR2Keys(bucket, keys, stillOwned))) return;
+        if (!(await deleteR2Keys(bucket, keys, stillOwned))) return false;
         keys = [];
       }
     }
   }
-  await deleteR2Keys(bucket, keys, stillOwned);
+  return deleteR2Keys(bucket, keys, stillOwned);
 }

@@ -11,10 +11,12 @@ export interface AppBindings {
   WORKSPACE_EVENTS: DurableObjectNamespace<WorkspaceEvents>;
   NOTES_WORKFLOW: Workflow<Readonly<JobWorkflowParams>>;
   DELIVERY_QUEUE: Queue;
+  API_SOURCE_BURST_LIMIT: RateLimit;
+  API_SOURCE_MINUTE_LIMIT: RateLimit;
   API_BURST_LIMIT: RateLimit;
   API_MINUTE_LIMIT: RateLimit;
   SEND_EMAIL?: SendEmail;
-  BROWSER: BrowserRun;
+  BROWSER?: BrowserRun;
   EMAIL_FROM?: string;
   SLACK_CLIENT_ID?: string;
   SLACK_CLIENT_SECRET?: string;
@@ -33,6 +35,6 @@ export interface Env extends AppBindings {}
 
 declare global {
   namespace Cloudflare {
-    interface Env extends AppBindings {}
+    interface Env extends Omit<AppBindings, "BROWSER"> {}
   }
 }

@@ -1,8 +1,10 @@
 import { documentBlocks } from "../shared/notion-blocks";
 import { collectTransclusions, projectDocument, serializeDocument } from "../shared/document-projection";
+import { bytesToBase64Url } from "../shared/security";
 import type { DocumentContentEnvelope, PageKind } from "../shared/types";
+import { isInlineMime } from "./attachments";
 import type { Env, MemberContext } from "./env";
-import { HttpError } from "./http";
+import { attachmentDisposition, HttpError } from "./http";
 
 export type ShareRow = {
   id: string;
@@ -40,10 +42,7 @@ function escapeHtml(value: string) {
 }
 
 function randomUrlKey() {
-  const bytes = crypto.getRandomValues(new Uint8Array(24));
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+  return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(24)));
 }
 
 function shareJson(row: ShareRow, origin: string) {
@@ -91,11 +90,14 @@ export async function createShare(
   options: Partial<{ includeSubpages: boolean; allowIndexing: boolean; showToc: boolean; showLastUpdated: boolean }>,
 ) {
   const page = await env.DB.prepare(
-    `SELECT id FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL AND import_job_id IS NULL`,
+    `SELECT id, kind FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL AND import_job_id IS NULL`,
   )
     .bind(pageId, member.workspace.id)
-    .first();
+    .first<{ id: string; kind: PageKind }>();
   if (!page) throw new HttpError(404, "page_not_found", "Page not found.");
+  if (page.kind === "diagram") {
+    throw new HttpError(422, "share_unavailable", "Public diagram shares are not available yet.");
+  }
   const existing = await activeShareForPage(env, member, pageId);
   if (existing) return shareJson(existing, origin);
   const timestamp = Date.now();
@@ -253,7 +255,7 @@ function documentBody(html: string) {
   return match?.[1] ?? html;
 }
 
-function publicDocumentHtml(
+export function publicDocumentHtml(
   document: DocumentContentEnvelope["document"],
   key: string,
   transclusions: Map<string, string> = new Map(),
@@ -278,8 +280,14 @@ function publicDocumentHtml(
         .join("")}</nav>`
     : "";
   body = body.replace('<nav class="table-of-contents" data-derived-block="table-of-contents"></nav>', toc);
-  body = body.replaceAll(/\/api\/attachments\/([A-Za-z0-9_-]+)/g, `/share/${encodeURIComponent(key)}/assets/$1`);
-  body = body.replaceAll(/\/?\?page=([A-Za-z0-9_-]+)/g, `/share/${encodeURIComponent(key)}/pages/$1`);
+  body = body.replaceAll(
+    /((?:href|src)=")\/api\/attachments\/([A-Za-z0-9_-]+)"/g,
+    `$1/share/${encodeURIComponent(key)}/assets/$2"`,
+  );
+  body = body.replaceAll(
+    /href="\/?\?page=([A-Za-z0-9_-]+)"/g,
+    (_match, pageId: string) => `href="/share/${encodeURIComponent(key)}/pages/${encodeURIComponent(pageId)}"`,
+  );
   body = body.replace(
     /<div class="synced-reference" data-source-page-id="([^"]*)" data-block-id="([^"]*)">[\s\S]*?<\/div>/g,
     (_match, sourcePageId: string, blockId: string) =>
@@ -295,10 +303,14 @@ async function publicTransclusions(
   key: string,
   document: DocumentContentEnvelope["document"],
 ) {
-  const references = collectTransclusions(document).references.slice(0, 25);
   const unique = [
-    ...new Map(references.map((reference) => [`${reference.sourcePageId}:${reference.blockId}`, reference])).values(),
-  ];
+    ...new Map(
+      collectTransclusions(document).references.map((reference) => [
+        `${reference.sourcePageId}:${reference.blockId}`,
+        reference,
+      ]),
+    ).values(),
+  ].slice(0, 25);
   const entries = await Promise.all(
     unique.map(async (reference) => {
       const sourcePage = await resolveSharedPage(env, key, reference.sourcePageId);
@@ -319,8 +331,8 @@ async function publicTransclusions(
         serializeDocument({ type: "doc", content: [{ type: "blockGroup", content: source.content }] }).html,
       );
       html = html.replaceAll(
-        /\/api\/attachments\/([A-Za-z0-9_-]+)/g,
-        `/share/${encodeURIComponent(key)}/assets/$1?page=${encodeURIComponent(sourcePage.page_id)}`,
+        /((?:href|src)=")\/api\/attachments\/([A-Za-z0-9_-]+)"/g,
+        `$1/share/${encodeURIComponent(key)}/assets/$2?page=${encodeURIComponent(sourcePage.page_id)}"`,
       );
       html = html.replace(
         /<div class="synced-reference"[^>]*>[\s\S]*?<\/div>/g,
@@ -344,9 +356,11 @@ async function publicTableHtml(env: Env, pageId: string) {
     env.DB.prepare(
       `SELECT row.id row_id, cell.column_id, cell.text_value, cell.number_value, cell.boolean_value,
               cell.date_value, option.label select_label
-         FROM table_rows row LEFT JOIN table_cells cell ON cell.row_id = row.id
+         FROM (
+           SELECT id, position FROM table_rows WHERE page_id = ? ORDER BY position, id LIMIT 501
+         ) row LEFT JOIN table_cells cell ON cell.row_id = row.id
          LEFT JOIN table_select_options option ON option.id = cell.select_value
-        WHERE row.page_id = ? ORDER BY row.position, row.id, cell.column_id`,
+        ORDER BY row.position, row.id, cell.column_id`,
     )
       .bind(pageId)
       .all<Record<string, unknown>>(),
@@ -364,20 +378,25 @@ async function publicTableHtml(env: Env, pageId: string) {
     if (raw.column_id) values.set(String(raw.column_id), String(value ?? ""));
     rows.set(rowId, values);
   }
-  return `<table><thead><tr>${columns.results.map((column) => `<th>${escapeHtml(column.name)}</th>`).join("")}</tr></thead><tbody>${[
-    ...rows.values(),
-  ]
+  const rowIds = [...rows.keys()];
+  const truncated = rowIds.length > 500;
+  const html = `<table><thead><tr>${columns.results.map((column) => `<th>${escapeHtml(column.name)}</th>`).join("")}</tr></thead><tbody>${rowIds
+    .slice(0, 500)
+    .map((rowId) => rows.get(rowId)!)
     .map(
       (row) =>
         `<tr>${columns.results.map((column) => `<td>${escapeHtml(row.get(column.id) ?? "")}</td>`).join("")}</tr>`,
     )
     .join("")}</tbody></table>`;
+  return { html, truncated };
 }
 
 export async function renderPublicShare(env: Env, share: SharedPageRow, key: string, origin: string) {
+  if (share.page_kind === "diagram") return null;
   const [tree, trail] = await Promise.all([sharedTree(env, share), breadcrumbs(env, share)]);
   let content: string;
   let toc = "";
+  let tableTruncated = false;
   if (share.page_kind === "document") {
     const response = await env.DOCUMENT.getByName(`${share.page_id}~${share.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
@@ -393,7 +412,11 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
     );
     content = rendered.body;
     toc = rendered.toc;
-  } else content = await publicTableHtml(env, share.page_id);
+  } else {
+    const table = await publicTableHtml(env, share.page_id);
+    content = table.html;
+    tableTruncated = table.truncated;
+  }
   const nav =
     tree.length > 1
       ? `<nav class="public-tree">${tree.map((item) => `<a class="${item.id === share.page_id ? "active" : ""}" href="${item.id === share.root_page_id ? `/share/${encodeURIComponent(key)}` : `/share/${encodeURIComponent(key)}/pages/${encodeURIComponent(item.id)}`}">${escapeHtml(item.title)}</a>`).join("")}</nav>`
@@ -409,7 +432,9 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
     '<nav class="breadcrumb" data-derived-block="breadcrumb"></nav>',
     `<nav class="public-breadcrumb">${breadcrumbHtml}</nav>`,
   );
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="robots" content="${robots}"><link rel="canonical" href="${canonical}"><title>${escapeHtml(share.page_title)}</title><style>:root{color-scheme:light dark;--page:#fff;--ink:#25231f;--muted:#625f57;--line:#dfddd5;--card:#f7f5ef;--accent:#5b5bd6}html[data-theme=dark]{--page:#191a19;--ink:#f0f1ed;--muted:#a7aaa4;--line:#3a3c39;--card:#242624;--accent:#9a98ff}*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:16px/1.6 system-ui,sans-serif}.public-shell{display:grid;grid-template-columns:${nav ? "240px" : "0"} minmax(0,860px) ${share.show_toc && toc ? "210px" : "0"};justify-content:center;gap:30px;padding:32px 24px}.public-tree,.public-toc{position:sticky;top:24px;align-self:start;display:grid;gap:5px;max-height:calc(100vh - 48px);overflow:auto}.public-tree a,.public-toc a{padding:5px 8px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:13px}.public-tree a:hover,.public-tree a.active{background:var(--card);color:var(--ink)}main{min-width:0}header{margin-bottom:34px}.public-breadcrumb{color:var(--muted);font-size:12px}.public-breadcrumb span{padding:0 5px}h1{font:700 clamp(34px,6vw,54px)/1.1 Georgia,serif;margin:16px 0 8px}header small{color:var(--muted)}a{color:var(--accent)}img,video,iframe{max-width:100%}pre{white-space:pre-wrap;background:var(--card);padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-left:4px solid var(--accent);background:var(--card)}.columns{display:flex;gap:16px}.column{flex:1}table{width:100%;border-collapse:collapse}td,th{border:1px solid var(--line);padding:7px;text-align:left}.theme-switch{position:fixed;right:14px;top:14px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);padding:7px 10px;cursor:pointer}@media(max-width:900px){.public-shell{display:block}.public-tree,.public-toc{position:static;margin-bottom:24px}.columns{display:block}}</style><script>try{const media=matchMedia('(prefers-color-scheme:dark)');const values=['auto','light','dark'];const apply=()=>{const preference=localStorage.getItem('notes:public-theme')||'auto';document.documentElement.dataset.theme=preference==='dark'||(preference==='auto'&&media.matches)?'dark':'light';document.documentElement.dataset.themePreference=preference};apply();media.addEventListener('change',()=>{if((localStorage.getItem('notes:public-theme')||'auto')==='auto')apply()});window.cyclePublicTheme=()=>{const current=localStorage.getItem('notes:public-theme')||'auto';const next=values[(values.indexOf(current)+1)%values.length];localStorage.setItem('notes:public-theme',next);apply()}}catch{}</script></head><body><button class="theme-switch" aria-label="Change theme: system, light, or dark" title="Theme: system → light → dark" onclick="cyclePublicTheme()">◐</button><div class="public-shell">${nav}<main><header><nav class="public-breadcrumb">${breadcrumbHtml}</nav><h1>${escapeHtml(share.page_icon ? `${share.page_icon} ${share.page_title}` : share.page_title)}</h1>${share.show_last_updated ? `<small>Updated ${escapeHtml(new Date(share.page_updated_at).toLocaleString())}</small>` : ""}</header>${content}</main>${share.show_toc ? toc : ""}</div></body></html>`;
+  if (tableTruncated) content += "<p><small>This public view is limited to the first 500 rows.</small></p>";
+  const updatedAt = new Date(share.page_updated_at).toISOString();
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="robots" content="${robots}"><link rel="canonical" href="${canonical}"><title>${escapeHtml(share.page_title)}</title><style>:root{color-scheme:light dark;--page:#fff;--ink:#25231f;--muted:#625f57;--line:#dfddd5;--card:#f7f5ef;--accent:#5b5bd6}html[data-theme=dark]{--page:#191a19;--ink:#f0f1ed;--muted:#a7aaa4;--line:#3a3c39;--card:#242624;--accent:#9a98ff}*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:16px/1.6 system-ui,sans-serif}.public-shell{display:grid;grid-template-columns:${nav ? "240px" : "0"} minmax(0,860px) ${share.show_toc && toc ? "210px" : "0"};justify-content:center;gap:30px;padding:32px 24px}.public-tree,.public-toc{position:sticky;top:24px;align-self:start;display:grid;gap:5px;max-height:calc(100vh - 48px);overflow:auto}.public-tree a,.public-toc a{padding:5px 8px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:13px}.public-tree a:hover,.public-tree a.active{background:var(--card);color:var(--ink)}main{min-width:0}header{margin-bottom:34px}.public-breadcrumb{color:var(--muted);font-size:12px}.public-breadcrumb span{padding:0 5px}h1{font:700 clamp(34px,6vw,54px)/1.1 Georgia,serif;margin:16px 0 8px}header small{color:var(--muted)}a{color:var(--accent)}img,video,iframe{max-width:100%}pre{white-space:pre-wrap;background:var(--card);padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-left:4px solid var(--accent);background:var(--card)}.columns{display:flex;gap:16px}.column{flex:1}table{width:100%;border-collapse:collapse}td,th{border:1px solid var(--line);padding:7px;text-align:left}.theme-switch{position:fixed;right:14px;top:14px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);padding:7px 10px;cursor:pointer}@media(max-width:900px){.public-shell{display:block}.public-tree,.public-toc{position:static;margin-bottom:24px}.columns{display:block}}</style><script>try{const media=matchMedia('(prefers-color-scheme:dark)');const values=['auto','light','dark'];const apply=()=>{const preference=localStorage.getItem('notes:public-theme')||'auto';document.documentElement.dataset.theme=preference==='dark'||(preference==='auto'&&media.matches)?'dark':'light';document.documentElement.dataset.themePreference=preference};apply();media.addEventListener('change',()=>{if((localStorage.getItem('notes:public-theme')||'auto')==='auto')apply()});window.cyclePublicTheme=()=>{const current=localStorage.getItem('notes:public-theme')||'auto';const next=values[(values.indexOf(current)+1)%values.length];localStorage.setItem('notes:public-theme',next);apply()}}catch{}</script></head><body><button class="theme-switch" aria-label="Change theme: system, light, or dark" title="Theme: system → light → dark" onclick="cyclePublicTheme()">◐</button><div class="public-shell">${nav}<main><header><nav class="public-breadcrumb">${breadcrumbHtml}</nav><h1>${escapeHtml(share.page_icon ? `${share.page_icon} ${share.page_title}` : share.page_title)}</h1>${share.show_last_updated ? `<small>Updated <time datetime="${updatedAt}">${updatedAt}</time></small>` : ""}</header>${content}</main>${share.show_toc ? toc : ""}</div></body></html>`;
 }
 
 export async function publicAttachment(env: Env, share: SharedPageRow, attachmentId: string) {
@@ -421,9 +446,10 @@ export async function publicAttachment(env: Env, share: SharedPageRow, attachmen
   if (!attachment) return null;
   const object = await env.BUCKET.get(attachment.r2_key);
   if (!object) return null;
+  const inline = isInlineMime(attachment.mime);
   const headers = new Headers({
-    "content-type": attachment.mime,
-    "content-disposition": `inline; filename="${attachment.name.replaceAll(/["\\]/g, "_")}"`,
+    "content-type": inline ? attachment.mime : "application/octet-stream",
+    "content-disposition": attachmentDisposition(attachment.name, inline),
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
   });

@@ -34,7 +34,7 @@ describe("R2 attempt cleanup", () => {
       artifactPath: "hash",
     }));
 
-    await deleteR2AttemptArtifactKeys(bucket, artifacts, 2);
+    await expect(deleteR2AttemptArtifactKeys(bucket, artifacts, 2)).resolves.toBe(true);
 
     expect(list).not.toHaveBeenCalled();
     expect(deleteObjects).toHaveBeenCalledTimes(2);
@@ -53,11 +53,19 @@ describe("R2 attempt cleanup", () => {
       artifactPath: "hash",
     }));
 
-    await deleteR2AttemptArtifactKeys(bucket, artifacts, 2, stillOwned);
+    await expect(deleteR2AttemptArtifactKeys(bucket, artifacts, 2, stillOwned)).resolves.toBe(false);
 
     expect(stillOwned).toHaveBeenCalledTimes(2);
     expect(deleteObjects).toHaveBeenCalledOnce();
     expect(deleteObjects.mock.calls[0]![0]).toHaveLength(1_000);
+  });
+
+  it("reports an empty deterministic cleanup as successful", async () => {
+    const bucket = { delete: vi.fn() } as unknown as R2Bucket;
+
+    await expect(deleteR2AttemptArtifactKeys(bucket, [], 1)).resolves.toBe(true);
+
+    expect(bucket.delete).not.toHaveBeenCalled();
   });
 
   it.each([0, -1, 1.5, Number.NaN])("rejects invalid cleanup attempt %s", async (attempt) => {

@@ -1,6 +1,7 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import * as Y from "yjs";
+import { DIAGRAM_EDGES_ROOT, DIAGRAM_META_ROOT, DIAGRAM_NODES_ROOT } from "../shared/diagram";
 import { sha256Hex } from "../shared/import-integrity";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
@@ -141,6 +142,8 @@ function templateCloneOptions(row: JobRow): TemplateCloneOptions {
 
 function replaceAttachmentReferences(value: unknown, ids: ReadonlyMap<string, string>): unknown {
   if (typeof value === "string") {
+    const direct = ids.get(value);
+    if (direct) return direct;
     let rewritten = value;
     for (const [sourceId, targetId] of ids) {
       rewritten = rewritten.replaceAll(`/api/attachments/${sourceId}`, `/api/attachments/${targetId}`);
@@ -156,7 +159,11 @@ function replaceAttachmentReferences(value: unknown, ids: ReadonlyMap<string, st
   return value;
 }
 
-function rewriteSnapshotAttachments(update: Uint8Array, ids: ReadonlyMap<string, string>) {
+function rewriteSnapshotAttachments(
+  update: Uint8Array,
+  ids: ReadonlyMap<string, string>,
+  kind: "document" | "diagram",
+) {
   const document = new Y.Doc();
   Y.applyUpdate(document, update);
   const visit = (type: Y.XmlFragment | Y.XmlElement | Y.Map<unknown>) => {
@@ -169,6 +176,7 @@ function rewriteSnapshotAttachments(update: Uint8Array, ids: ReadonlyMap<string,
     if (type instanceof Y.Map) {
       for (const [name, value] of type.entries()) {
         if (value instanceof Y.Map || value instanceof Y.XmlFragment || value instanceof Y.XmlElement) visit(value);
+        else if (value instanceof Y.Text || value instanceof Y.XmlText || value instanceof Y.Array) continue;
         else {
           const rewritten = replaceAttachmentReferences(value, ids);
           if (rewritten !== value) type.set(name, rewritten);
@@ -181,7 +189,12 @@ function rewriteSnapshotAttachments(update: Uint8Array, ids: ReadonlyMap<string,
       }
     }
   };
-  visit(document.getXmlFragment("document-store"));
+  if (kind === "document") visit(document.getXmlFragment("document-store"));
+  else {
+    visit(document.getMap(DIAGRAM_META_ROOT));
+    visit(document.getMap(DIAGRAM_NODES_ROOT));
+    visit(document.getMap(DIAGRAM_EDGES_ROOT));
+  }
   return Y.encodeStateAsUpdate(document);
 }
 
@@ -226,7 +239,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     .bind(options.sourcePageId, job.workspace_id, options.targetSpaceId)
     .first<TemplateSourceRow>();
   if (!source) throw new Error("The template source is no longer available.");
-  if (source.kind === "document") {
+  if (source.kind === "document" || source.kind === "diagram") {
     const response = await env.DOCUMENT.getByName(`${source.id}~${source.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
         headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
@@ -254,8 +267,8 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     env.DB.prepare(
       `INSERT INTO pages
         (id, workspace_id, space_id, parent_id, kind, position, title, icon, is_template, import_job_id,
-         content_epoch, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         content_epoch, created_by, updated_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       options.targetPageId,
       job.workspace_id,
@@ -268,6 +281,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
       options.isTemplate ? 1 : 0,
       job.id,
       job.attempt,
+      job.requested_by,
       job.requested_by,
       timestamp,
       timestamp,
@@ -403,15 +417,16 @@ async function initializeTemplateDocument(
   page: TemplateSourceRow,
   ids: ReadonlyMap<string, string>,
 ) {
-  if (page.kind !== "document") return;
+  if (page.kind === "table") return;
   await assertJobActive(env, job);
   const source = await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ? AND workspace_id = ?`)
     .bind(options.sourcePageId, job.workspace_id)
     .first<{ content_epoch: number }>();
   if (!source) throw new Error("The template source is no longer available.");
-  const snapshot = await env.BUCKET.get(`documents/${options.sourcePageId}/epochs/${source.content_epoch}/current.bin`);
+  const prefix = page.kind === "diagram" ? "diagrams" : "documents";
+  const snapshot = await env.BUCKET.get(`${prefix}/${options.sourcePageId}/epochs/${source.content_epoch}/current.bin`);
   const sourceUpdate = snapshot ? new Uint8Array(await snapshot.arrayBuffer()) : Y.encodeStateAsUpdate(new Y.Doc());
-  const update = rewriteSnapshotAttachments(sourceUpdate, ids);
+  const update = rewriteSnapshotAttachments(sourceUpdate, ids, page.kind);
   const inputKey = `jobs/${job.id}/attempts/${job.attempt}/template-content.bin`;
   await env.BUCKET.put(inputKey, update, {
     httpMetadata: { contentType: "application/octet-stream" },
@@ -479,7 +494,7 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
       WHERE id = ? AND import_job_id = ? AND content_epoch <= ?`,
   )
     .bind(options.targetPageId, job.id, job.attempt)
-    .first<{ id: string; kind: "document" | "table"; content_epoch: number }>();
+    .first<{ id: string; kind: "document" | "table" | "diagram"; content_epoch: number }>();
   const attachments = staged
     ? (
         await env.DB.prepare(`SELECT id, r2_key, content_sha256 FROM attachments WHERE page_id = ?`)
@@ -487,7 +502,7 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
           .all<{ id: string; r2_key: string; content_sha256: string | null }>()
       ).results
     : [];
-  if (staged?.kind === "document") {
+  if (staged?.kind === "document" || staged?.kind === "diagram") {
     if (!(await stillOwned())) return;
     const purged = await env.DOCUMENT.getByName(`${staged.id}~${staged.content_epoch}`).fetch(
       new Request("https://document.internal/purge", {
@@ -516,8 +531,12 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
     job.attempt,
     stillOwned,
   );
-  if (staged && (await stillOwned()))
+  if (staged && (await stillOwned())) {
     await deleteR2Prefix(env.BUCKET, `documents/${options.targetPageId}/epochs/${staged.content_epoch}/`);
+    if (staged.kind === "diagram" && (await stillOwned())) {
+      await deleteR2Prefix(env.BUCKET, `diagrams/${options.targetPageId}/epochs/${staged.content_epoch}/`);
+    }
+  }
   if (staged) {
     if (!(await stillOwned())) return;
     await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ? AND content_epoch = ?`)
@@ -1128,18 +1147,21 @@ async function enqueueOutbox(env: Env, outboxId: string) {
 }
 
 export async function sweepOutbox(env: Env) {
-  const rows = await env.DB.prepare(
-    `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
-      ORDER BY available_at, created_at, id LIMIT ?`,
-  )
-    .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
-    .all<{ id: string }>();
-  for (const row of rows.results) {
-    try {
-      await enqueueOutbox(env, row.id);
-    } catch (error) {
-      console.error("Outbox enqueue failed", { outboxId: row.id, error });
+  while (true) {
+    const rows = await env.DB.prepare(
+      `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
+        ORDER BY available_at, created_at, id LIMIT ?`,
+    )
+      .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
+      .all<{ id: string }>();
+    for (const row of rows.results) {
+      try {
+        await enqueueOutbox(env, row.id);
+      } catch (error) {
+        console.error("Outbox enqueue failed", { outboxId: row.id, error });
+      }
     }
+    if (rows.results.length < OUTBOX_SWEEP_BATCH_SIZE) return;
   }
 }
 

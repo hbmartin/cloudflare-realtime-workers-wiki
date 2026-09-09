@@ -65,6 +65,7 @@ export function EditorPage({
   const [recoveryPreview, setRecoveryPreview] = useState("");
   const [title, setTitle] = useState(page.title);
   const [titleError, setTitleError] = useState("");
+  const [editorError, setEditorError] = useState("");
   const titleRef = useRef<HTMLInputElement>(null);
   const titlePageIdRef = useRef(page.id);
   const titleRevisionRef = useRef(page.revision);
@@ -79,6 +80,7 @@ export function EditorPage({
       titleRevisionRef.current = page.revision;
       setTitle(page.title);
       setTitleError("");
+      setEditorError("");
       return;
     }
     if (!titleDirtyRef.current && document.activeElement !== titleRef.current) {
@@ -334,6 +336,11 @@ export function EditorPage({
             aria-label="Page title"
           />
           {titleError && <p className="form-error">{titleError}</p>}
+          {editorError && (
+            <p className="form-error" role="alert">
+              {editorError}
+            </p>
+          )}
           {bundle ? (
             <CollaborativeEditor
               bundle={bundle}
@@ -343,7 +350,7 @@ export function EditorPage({
               pageId={page.id}
               commentsRevision={commentsRevision}
               onPageCreated={onPageChanged}
-              onError={setTitleError}
+              onError={setEditorError}
             />
           ) : storageError ? (
             <div className="editor-loading">
@@ -524,29 +531,6 @@ function CollaborativeEditor({
   );
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
   const colorScheme = useEffectiveColorScheme();
-  useEffect(() => {
-    if (!editable || !Array.isArray(editor.document)) return;
-    const legacy: Array<(typeof editor.document)[number]> = [];
-    const collectLegacyColumns = (blocks: typeof editor.document) => {
-      for (const block of blocks) {
-        if (block.type === "columns") legacy.push(block);
-        if (block.children.length) collectLegacyColumns(block.children as typeof editor.document);
-      }
-    };
-    collectLegacyColumns(editor.document);
-    for (const block of legacy) {
-      const count = Number((block.props as { count?: number }).count ?? 2) === 3 ? 3 : 2;
-      const first = {
-        type: "column",
-        children: [{ type: "paragraph", content: block.content }],
-      };
-      const empty = Array.from({ length: count - 1 }, () => ({
-        type: "column",
-        children: [{ type: "paragraph" }],
-      }));
-      editor.replaceBlocks([block], [{ type: "columnList", children: [first, ...empty] }] as never);
-    }
-  }, [editable, editor]);
   const getSlashItems = async (query: string) =>
     filterSuggestionItems(
       [
@@ -559,16 +543,13 @@ function CollaborativeEditor({
           icon: <span>{item.icon}</span>,
           onItemClick: () => {
             if (item.type === "columnList") {
-              const current = editor.getTextCursorPosition().block;
-              editor.replaceBlocks([current], [
-                {
-                  type: "columnList",
-                  children: [
-                    { type: "column", children: [{ type: "paragraph" }] },
-                    { type: "column", children: [{ type: "paragraph" }] },
-                  ],
-                },
-              ] as never);
+              insertOrUpdateBlockForSlashMenu(editor, {
+                type: "columnList",
+                children: [
+                  { type: "column", children: [{ type: "paragraph" }] },
+                  { type: "column", children: [{ type: "paragraph" }] },
+                ],
+              } as never);
               return;
             }
             insertOrUpdateBlockForSlashMenu(editor, { type: item.type });
@@ -582,20 +563,32 @@ function CollaborativeEditor({
           icon: <span>⊞</span>,
           onItemClick: () => {
             void (async () => {
+              let createdPage: Page;
               try {
                 const result = await api<{ page: Page }>("/api/pages", {
                   method: "POST",
                   body: json({ kind: "document", parentId: pageId }),
                 });
-                const current = editor.getTextCursorPosition().block;
-                editor.replaceBlocks([current], [
-                  { type: "linkToPage", props: { pageId: result.page.id, title: result.page.title } },
-                  { type: "paragraph" },
-                ] as never);
-                onPageCreated(result.page);
+                createdPage = result.page;
               } catch (error) {
                 onError(apiErrorMessage(error, "The sub-page could not be created."));
+                return;
               }
+              try {
+                const current = editor.getTextCursorPosition().block;
+                editor.replaceBlocks([current], [
+                  { type: "linkToPage", props: { pageId: createdPage.id, title: createdPage.title } },
+                  { type: "paragraph" },
+                ] as never);
+              } catch (error) {
+                onError(
+                  `${apiErrorMessage(error, "The sub-page link could not be inserted.")} ` +
+                    `The created page is “${createdPage.title}” (ID: ${createdPage.id}); remove it from the sidebar if it is not needed.`,
+                );
+                return;
+              }
+              onError("");
+              onPageCreated(createdPage);
             })();
           },
         },

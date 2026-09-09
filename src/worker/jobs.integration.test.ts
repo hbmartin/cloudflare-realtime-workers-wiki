@@ -1,7 +1,8 @@
 import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
-import type { Job } from "../shared/types";
+import { diagramNodeMap, diagramRoots } from "../shared/diagram";
+import type { DiagramContentEnvelope, Job, Page } from "../shared/types";
 import { createZip, readZip } from "../shared/zip";
 import type { Env } from "./env";
 import { runImport } from "./importer";
@@ -1062,6 +1063,64 @@ describe("job execution", () => {
     expect(new TextDecoder().decode(entries[1]!.bytes)).toBe("portable bytes");
   });
 
+  it("exports a diagram as structured JSON", async () => {
+    const installed = await bootstrap();
+    const created = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "diagram", title: "Service map" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const page = (await created.json<{ page: Page }>()).page;
+    const diagram = new Y.Doc();
+    diagramRoots(diagram).nodes.set(
+      "service-node",
+      diagramNodeMap({
+        id: "service-node",
+        type: "service",
+        x: 10,
+        y: 20,
+        width: 160,
+        height: 80,
+        zIndex: 1,
+        parentId: null,
+        label: "API",
+        notes: "",
+        color: "blue",
+        assetId: null,
+        references: [],
+        mentions: [],
+      }),
+    );
+    await env.BUCKET.put(`diagrams/${page.id}/epochs/1/current.bin`, Y.encodeStateAsUpdate(diagram));
+
+    const context = createExecutionContext();
+    const queued = await worker.fetch(
+      request(installed.cookie, `/api/pages/${page.id}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "json", portable: false }),
+      }),
+      inlineBindings(),
+      context,
+    );
+    expect(queued.status).toBe(202);
+    const job = (await queued.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    const download = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}/download`),
+      env,
+      createExecutionContext(),
+    );
+    expect(download.headers.get("content-type")).toContain("application/json");
+    const exported = await download.json<DiagramContentEnvelope>();
+    expect(exported).toMatchObject({ pageId: page.id, nodes: [{ id: "service-node", label: "API" }] });
+  });
+
   it("reports PDF configuration and renders through the Browser Run binding", async () => {
     const installed = await bootstrap();
     const unavailableBindings = bindingsWith({ BROWSER: undefined });
@@ -1222,6 +1281,109 @@ describe("job execution", () => {
     const envelope = await content.json<{ document: unknown }>();
     expect(JSON.stringify(envelope.document)).toContain(`/api/attachments/${clonedAttachment!.id}`);
     expect(JSON.stringify(envelope.document)).not.toContain(`/api/attachments/${sourceAttachmentId}`);
+  });
+
+  it("publishes a diagram template and rewrites image node attachments", async () => {
+    const installed = await bootstrap();
+    const created = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "diagram", title: "Architecture template source" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const sourcePage = (await created.json<{ page: Page }>()).page;
+    const sourceAttachmentId = crypto.randomUUID();
+    const sourceKey = `assets/${installed.workspaceId}/${sourceAttachmentId}/source`;
+    await env.BUCKET.put(sourceKey, "image bytes", { httpMetadata: { contentType: "image/png" } });
+    await env.DB.prepare(
+      `INSERT INTO attachments
+        (id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, created_at)
+       VALUES (?, ?, ?, ?, 'architecture.png', 'image/png', 11, ?, ?, ?)`,
+    )
+      .bind(
+        sourceAttachmentId,
+        installed.workspaceId,
+        sourcePage.id,
+        sourceKey,
+        "b".repeat(64),
+        installed.userId,
+        Date.now(),
+      )
+      .run();
+    const source = new Y.Doc();
+    diagramRoots(source).nodes.set(
+      "image-node",
+      diagramNodeMap({
+        id: "image-node",
+        type: "image",
+        x: 20,
+        y: 30,
+        width: 240,
+        height: 160,
+        zIndex: 1,
+        parentId: null,
+        label: "Architecture",
+        notes: "",
+        color: "slate",
+        assetId: sourceAttachmentId,
+        references: [],
+        mentions: [],
+      }),
+    );
+    await env.BUCKET.put(`diagrams/${sourcePage.id}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+
+    const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
+    const context = createExecutionContext();
+    const queued = await worker.fetch(
+      request(installed.cookie, "/api/templates", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pageId: sourcePage.id, title: "Architecture starter" }),
+      }),
+      bindings,
+      context,
+    );
+    expect(queued.status).toBe(202);
+    const queuedJob = (await queued.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+    await env.DB.prepare(`UPDATE jobs SET status = 'running' WHERE id = ?`).bind(queuedJob.id).run();
+    const row = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(queuedJob.id).first<JobRow>())!;
+    await runTemplateClone(env, row, {
+      async do<T>(_name: string, callback: () => Promise<T>) {
+        return callback();
+      },
+    } as Parameters<typeof runTemplateClone>[2]);
+
+    const completed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${queuedJob.id}`),
+      env,
+      createExecutionContext(),
+    );
+    const completedJob = (await completed.json<{ job: Job }>()).job;
+    const templateId = completedJob.result!.pageId!;
+    expect(completedJob).toMatchObject({ status: "succeeded", result: { pageId: templateId } });
+    const template = await env.DB.prepare(`SELECT kind, is_template FROM pages WHERE id = ?`)
+      .bind(templateId)
+      .first<{ kind: string; is_template: number }>();
+    expect(template).toEqual({ kind: "diagram", is_template: 1 });
+    const clonedAttachment = await env.DB.prepare(`SELECT id, r2_key FROM attachments WHERE page_id = ?`)
+      .bind(templateId)
+      .first<{ id: string; r2_key: string }>();
+    expect(clonedAttachment?.id).not.toBe(sourceAttachmentId);
+    expect(await env.BUCKET.get(clonedAttachment!.r2_key)).toBeTruthy();
+    const content = await worker.fetch(
+      request(installed.cookie, `/api/pages/${templateId}/content`),
+      env,
+      createExecutionContext(),
+    );
+    expect(content.status).toBe(200);
+    expect((await content.json<DiagramContentEnvelope>()).nodes).toContainEqual(
+      expect.objectContaining({ id: "image-node", assetId: clonedAttachment!.id }),
+    );
   });
 
   it("clones typed table state into a staged template", async () => {
@@ -1498,6 +1660,27 @@ describe("job execution", () => {
 });
 
 describe("delivery outbox", () => {
+  it("enqueues every immediately available row across sweep batches", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const ids = Array.from({ length: 51 }, () => crypto.randomUUID());
+    await env.DB.batch(
+      ids.map((id, index) =>
+        env.DB.prepare(
+          `INSERT INTO outbox
+            (id, workspace_id, topic, payload_json, available_at, created_at)
+           VALUES (?, ?, 'notification', '{}', ?, ?)`,
+        ).bind(id, installed.workspaceId, timestamp - 1, timestamp + index),
+      ),
+    );
+    const send = vi.fn(async (_body: unknown) => undefined);
+
+    await sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }));
+
+    expect(send).toHaveBeenCalledTimes(51);
+    expect(new Set(send.mock.calls.map(([body]) => (body as { outboxId: string }).outboxId))).toEqual(new Set(ids));
+  });
+
   it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {
     const installed = await bootstrap();
     const outboxId = crypto.randomUUID();

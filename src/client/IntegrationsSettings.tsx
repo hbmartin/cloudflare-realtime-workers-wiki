@@ -78,16 +78,27 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
   }, [load]);
   if (!owner) return null;
 
+  async function runWithError(action: () => Promise<void>, fallback: string) {
+    try {
+      await action();
+      setError("");
+    } catch (cause) {
+      await load();
+      setError(apiErrorMessage(cause, fallback));
+    }
+  }
+
   async function create(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     try {
       const result = await api<{ integration: Integration; token: string }>("/api/integrations", {
         method: "POST",
         body: json({ name: form.get("name") }),
       });
       setRevealedToken(result.token);
-      event.currentTarget.reset();
+      formElement.reset();
       await load();
     } catch (cause) {
       setError(apiErrorMessage(cause, "The integration could not be created."));
@@ -95,53 +106,64 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
   }
 
   async function patchIntegration(id: string, change: Partial<Capabilities>) {
-    await api(`/api/integrations/${id}`, { method: "PATCH", body: json(change) });
-    await load();
+    await runWithError(async () => {
+      await api(`/api/integrations/${id}`, { method: "PATCH", body: json(change) });
+      await load();
+    }, "The integration could not be updated.");
   }
 
   async function showGrants(integrationId: string) {
-    const data = await api<{ grants: Array<{ id: string }> }>(`/api/integrations/${integrationId}/grants`);
-    setGrants((current) => ({ ...current, [integrationId]: data.grants.map((grant) => grant.id) }));
+    await runWithError(async () => {
+      const data = await api<{ grants: Array<{ id: string }> }>(`/api/integrations/${integrationId}/grants`);
+      setGrants((current) => ({ ...current, [integrationId]: data.grants.map((grant) => grant.id) }));
+    }, "Page grants could not be loaded.");
   }
 
   async function toggleGrant(integrationId: string, pageId: string, checked: boolean) {
     const current = grants[integrationId] ?? [];
     const rootPageIds = checked ? [...new Set([...current, pageId])] : current.filter((id) => id !== pageId);
-    await api(`/api/integrations/${integrationId}/grants`, { method: "PUT", body: json({ rootPageIds }) });
-    setGrants((value) => ({ ...value, [integrationId]: rootPageIds }));
-    await load();
+    await runWithError(async () => {
+      await api(`/api/integrations/${integrationId}/grants`, { method: "PUT", body: json({ rootPageIds }) });
+      setGrants((value) => ({ ...value, [integrationId]: rootPageIds }));
+      await load();
+    }, "Page grants could not be updated.");
   }
 
   async function rotate(integrationId: string) {
     if (!confirm("Rotate this token? The current token will stop working immediately.")) return;
-    const result = await api<{ token: string }>(`/api/integrations/${integrationId}/rotate`, { method: "POST" });
-    setRevealedToken(result.token);
-    await load();
+    await runWithError(async () => {
+      const result = await api<{ token: string }>(`/api/integrations/${integrationId}/rotate`, { method: "POST" });
+      setRevealedToken(result.token);
+      await load();
+    }, "The integration token could not be rotated.");
   }
 
   async function createWebhook(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    await api("/api/webhooks", {
-      method: "POST",
-      body: json({
-        integrationId: form.get("integrationId"),
-        url: form.get("url"),
-        events: [
-          "page.created",
-          "page.content_updated",
-          "page.properties_updated",
-          "page.moved",
-          "page.deleted",
-          "page.undeleted",
-          "comment.created",
-          "comment.updated",
-          "comment.deleted",
-        ],
-      }),
-    });
-    event.currentTarget.reset();
-    await load();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    await runWithError(async () => {
+      await api("/api/webhooks", {
+        method: "POST",
+        body: json({
+          integrationId: form.get("integrationId"),
+          url: form.get("url"),
+          events: [
+            "page.created",
+            "page.content_updated",
+            "page.properties_updated",
+            "page.moved",
+            "page.deleted",
+            "page.undeleted",
+            "comment.created",
+            "comment.updated",
+            "comment.deleted",
+          ],
+        }),
+      });
+      formElement.reset();
+      await load();
+    }, "The webhook could not be created.");
   }
 
   return (
@@ -257,7 +279,7 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
       <div className="webhook-settings">
         <h3>Webhook subscriptions</h3>
         <form onSubmit={(event) => void createWebhook(event)}>
-          <select name="integrationId" required defaultValue="">
+          <select name="integrationId" required defaultValue="" aria-label="Integration">
             <option value="" disabled>
               Choose integration
             </option>
@@ -333,7 +355,7 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
       {deliveries.length > 0 && (
         <details className="delivery-history">
           <summary>Recent webhook deliveries</summary>
-          <table>
+          <table aria-label="Recent webhook deliveries">
             <thead>
               <tr>
                 <th>Event</th>

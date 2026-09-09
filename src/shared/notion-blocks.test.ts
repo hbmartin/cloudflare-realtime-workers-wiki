@@ -82,4 +82,55 @@ describe("Notion block adapter", () => {
     expect(() => notionInputToBlockContainer({ embed: { url: "https://untrusted.example/embed" } })).toThrow(/YouTube/);
     expect(() => notionRichTextToProseMirror([{ text: { content: "x".repeat(2_001) } }])).toThrow(/2000/);
   });
+
+  it("infers only supported payload keys when type is omitted", () => {
+    const container = notionInputToBlockContainer({
+      object: "block",
+      id: "caller-id",
+      parent: { type: "page_id", page_id: "page-id" },
+      created_time: "2026-01-01T00:00:00.000Z",
+      paragraph: { rich_text: [{ text: { content: "Hello" } }] },
+    });
+    expect(container).toMatchObject({
+      attrs: { id: "caller-id" },
+      content: [{ type: "paragraph", content: [{ text: "Hello" }] }],
+    });
+    expect(() => notionInputToBlockContainer({ paragraph: {}, quote: {} })).toThrow(/ambiguous/);
+  });
+
+  it("reports nested text blocks through has_children instead of a nested payload field", () => {
+    const container = notionInputToBlockContainer({
+      paragraph: {
+        rich_text: [{ text: { content: "Parent" } }],
+        children: [{ paragraph: { rich_text: [{ text: { content: "Child" } }] } }],
+      },
+    });
+    const block = documentBlocks(document(container))[0]!;
+    expect(block.children).toHaveLength(1);
+    expect(notionPayloadForBlock(block).payload).not.toHaveProperty("children");
+  });
+
+  it("preserves Notion table header flags through table cell types", () => {
+    const container = notionInputToBlockContainer({
+      table: {
+        table_width: 2,
+        has_column_header: true,
+        has_row_header: true,
+        children: [
+          { table_row: { cells: [[{ text: { content: "Name" } }], [{ text: { content: "Role" } }]] } },
+          { table_row: { cells: [[{ text: { content: "Ada" } }], [{ text: { content: "Engineer" } }]] } },
+        ],
+      },
+    });
+    const block = documentBlocks(document(container))[0]!;
+    expect(block.children.map((row) => row.node.content?.map((cell) => cell.type))).toEqual([
+      ["tableHeader", "tableHeader"],
+      ["tableHeader", "tableCell"],
+    ]);
+    expect(notionPayloadForBlock(block).payload).toMatchObject({
+      table_width: 2,
+      has_column_header: true,
+      has_row_header: true,
+    });
+  });
 });

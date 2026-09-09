@@ -81,6 +81,8 @@ import {
 } from "../shared/validation";
 import type {
   ClientMemberContext,
+  CommentAnchor,
+  DiagramContentEnvelope,
   ExportFormat,
   NotificationChannelMode,
   NotificationEventType,
@@ -98,6 +100,8 @@ import type {
 import { compareBinaryText } from "../shared/tree-model";
 import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
+import { constantTimeEqual } from "../shared/security";
+import { renderDiagramSvg } from "../shared/diagram";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { pageJson, type PageJsonRow } from "./page-row";
@@ -1033,9 +1037,18 @@ app.post("/api/install/bootstrap", async (c) => {
       timestamp,
     ),
     c.env.DB.prepare(
-      `INSERT INTO pages (id, workspace_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-       VALUES (?, ?, NULL, 'document', ?, 'Welcome', ?, ?, ?)`,
-    ).bind(pageId, workspaceId, generateJitteredKeyBetween(null, null), signup.user.id, timestamp, timestamp),
+      `INSERT INTO pages
+        (id, workspace_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at)
+       VALUES (?, ?, NULL, 'document', ?, 'Welcome', ?, ?, ?, ?)`,
+    ).bind(
+      pageId,
+      workspaceId,
+      generateJitteredKeyBetween(null, null),
+      signup.user.id,
+      signup.user.id,
+      timestamp,
+      timestamp,
+    ),
     c.env.DB.prepare(
       `INSERT INTO subscriptions
         (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
@@ -1980,9 +1993,18 @@ app.post("/api/webhooks", async (c) => {
     input.events,
   );
   c.executionCtx.waitUntil(
-    sendWebhookVerification(c.env, created.subscription.id).catch((error) =>
-      console.error("Webhook verification request failed", { subscriptionId: created.subscription.id, error }),
-    ),
+    sendWebhookVerification(c.env, created.subscription.id)
+      .then((result) => {
+        if (!result.ok) {
+          console.error("Webhook verification request failed", {
+            subscriptionId: created.subscription.id,
+            error: result.error,
+          });
+        }
+      })
+      .catch((error) =>
+        console.error("Webhook verification request failed", { subscriptionId: created.subscription.id, error }),
+      ),
   );
   return c.json({ subscription: created.subscription }, 201);
 });
@@ -2010,8 +2032,11 @@ app.post("/api/webhooks/:id/verify", async (c) => {
 app.post("/api/webhooks/:id/resend", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
-  await resendWebhookVerification(c.env, member, c.req.param("id"));
-  return c.json({ ok: true });
+  const result = await resendWebhookVerification(c.env, member, c.req.param("id"));
+  if (!result.ok) {
+    throw new HttpError(502, "webhook_verification_failed", result.error);
+  }
+  return c.json(result);
 });
 
 app.delete("/api/webhooks/:id", async (c) => {
@@ -2146,15 +2171,17 @@ app.post("/api/pages/:id/exports", async (c) => {
   const page = await pageForMember(c.env, member, c.req.param("id"));
   const body = await jsonBody(c.req.raw);
   const format = text(body.format, "format", 20) as ExportFormat;
-  if (!["markdown", "html", "pdf"].includes(format)) {
-    throw new HttpError(422, "invalid_export_format", "Choose Markdown, HTML, or PDF.");
+  const allowedFormats: ExportFormat[] =
+    page.kind === "diagram" ? ["json", "svg", "png", "pdf"] : ["markdown", "html", "pdf"];
+  if (!allowedFormats.includes(format)) {
+    throw new HttpError(422, "invalid_export_format", `Choose ${allowedFormats.join(", ")}.`);
   }
   const portable = body.portable === true;
-  if (format === "pdf" && portable) {
-    throw new HttpError(422, "invalid_export_options", "PDF exports are always a single file.");
+  if ((format === "pdf" || format === "png") && portable) {
+    throw new HttpError(422, "invalid_export_options", "PDF and PNG exports are always a single file.");
   }
-  if (format === "pdf" && !c.env.BROWSER) {
-    throw new HttpError(503, "pdf_unavailable", "PDF export is not configured for this installation.");
+  if ((format === "pdf" || format === "png") && !c.env.BROWSER) {
+    throw new HttpError(503, "browser_export_unavailable", "Browser exports are not configured for this installation.");
   }
   const job = await createJob(c.env, {
     member,
@@ -2227,9 +2254,22 @@ app.post("/api/pages", async (c) => {
     const position = generateJitteredKeyBetween(last?.position ?? null, null);
     const results = await c.env.DB.batch<PageRow>([
       c.env.DB.prepare(
-        `INSERT INTO pages (id, workspace_id, space_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-      ).bind(id, member.workspace.id, spaceId, parentId, kind, position, title, member.user.id, timestamp, timestamp),
+        `INSERT INTO pages
+          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      ).bind(
+        id,
+        member.workspace.id,
+        spaceId,
+        parentId,
+        kind,
+        position,
+        title,
+        member.user.id,
+        member.user.id,
+        timestamp,
+        timestamp,
+      ),
       c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
         id,
         member.workspace.id,
@@ -2349,8 +2389,9 @@ app.post("/api/pages/batch", async (c) => {
     pageResultIndexes.push(statements.length);
     statements.push(
       c.env.DB.prepare(
-        `INSERT INTO pages (id, workspace_id, space_id, parent_id, kind, position, title, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        `INSERT INTO pages
+          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       ).bind(
         page.id,
         member.workspace.id,
@@ -2359,6 +2400,7 @@ app.post("/api/pages/batch", async (c) => {
         page.kind,
         positions.get(page.id),
         page.title,
+        member.user.id,
         member.user.id,
         timestamp,
         timestamp,
@@ -2533,7 +2575,23 @@ app.post("/api/pages/:id/comments", async (c) => {
   await migrateLegacyComments(c.env, scopedPage);
   const body = await jsonBody(c.req.raw);
   const initialComment = object(body.initialComment);
-  const thread = await createCommentThread(c.env, member, scopedPage, initialComment.body);
+  let anchor: CommentAnchor | null = null;
+  if (body.anchor !== undefined && body.anchor !== null) {
+    if (page.kind !== "diagram") {
+      throw new HttpError(422, "invalid_comment_anchor", "Diagram anchors are only available on diagram pages.");
+    }
+    const value = object(body.anchor);
+    if (
+      value.kind !== "diagram" ||
+      (value.target !== "node" && value.target !== "edge") ||
+      typeof value.targetId !== "string" ||
+      !ID_PATTERN.test(value.targetId)
+    ) {
+      throw new HttpError(422, "invalid_comment_anchor", "Choose a valid diagram node or edge.");
+    }
+    anchor = { kind: "diagram", target: value.target, targetId: value.targetId };
+  }
+  const thread = await createCommentThread(c.env, member, scopedPage, initialComment.body, anchor);
   sendCommentMutationEvents(c, member.workspace.id, page.id);
   return c.json({ thread }, 201);
 });
@@ -2783,8 +2841,8 @@ app.put("/api/spaces/:id/watch", async (c) => {
 app.get("/api/pages/:id/content", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
-  if (page.kind !== "document") {
-    throw new HttpError(422, "document_required", "Structured content is available for document pages.");
+  if (page.kind === "table") {
+    throw new HttpError(422, "collaborative_page_required", "Structured content is available for collaborative pages.");
   }
   const room = `${page.id}~${page.content_epoch}`;
   const projectionLocation = locationHint(member.workspace.locationHint ?? undefined);
@@ -2796,7 +2854,7 @@ app.get("/api/pages/:id/content", async (c) => {
       headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET },
     }),
   );
-  if (!response.ok) throw new HttpError(503, "content_unavailable", "Document content is temporarily unavailable.");
+  if (!response.ok) throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
   const headers = new Headers({
     "content-type": "application/json; charset=utf-8",
     "cache-control": "private, no-store",
@@ -2804,6 +2862,41 @@ app.get("/api/pages/:id/content", async (c) => {
   const etag = response.headers.get("etag");
   if (etag) headers.set("etag", etag);
   return new Response(response.body, { status: response.status, headers });
+});
+
+app.get("/api/pages/:id/diagram-thumbnail.svg", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"), true);
+  if (page.kind !== "diagram") {
+    throw new HttpError(422, "diagram_required", "Thumbnails are only available for diagram pages.");
+  }
+  const projection = await c.env.DB.prepare(
+    `SELECT thumbnail_r2_key, thumbnail_hash FROM diagram_projections
+      WHERE page_id = ? AND content_epoch = ?`,
+  )
+    .bind(page.id, page.content_epoch)
+    .first<{ thumbnail_r2_key: string; thumbnail_hash: string }>();
+  const etag = `"${projection?.thumbnail_hash ?? `empty-${page.content_epoch}`}"`;
+  const headers = new Headers({
+    "content-type": "image/svg+xml; charset=utf-8",
+    "cache-control": "private, max-age=0, must-revalidate",
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+    etag,
+  });
+  if (c.req.header("if-none-match") === etag) return new Response(null, { status: 304, headers });
+  if (projection) {
+    const thumbnail = await c.env.BUCKET.get(projection.thumbnail_r2_key);
+    if (thumbnail) return new Response(thumbnail.body, { headers });
+  }
+  const empty: DiagramContentEnvelope = {
+    schemaVersion: 1,
+    pageId: page.id,
+    contentEpoch: page.content_epoch,
+    sequence: 0,
+    nodes: [],
+    edges: [],
+  };
+  return new Response(renderDiagramSvg(empty, { width: 960, height: 540, title: page.title }), { headers });
 });
 
 app.patch("/api/pages/:id", async (c) => {
@@ -2816,10 +2909,10 @@ app.patch("/api/pages/:id", async (c) => {
   const titleValue = body.title === undefined ? page.title : text(body.title, "title", PAGE_TITLE_MAX);
   const iconValue = body.icon === undefined ? page.icon : body.icon === null ? null : text(body.icon, "icon", 20);
   const result = await c.env.DB.prepare(
-    `UPDATE pages SET title = ?, icon = ?, revision = revision + 1, updated_at = ?
+    `UPDATE pages SET title = ?, icon = ?, revision = revision + 1, updated_by = ?, updated_at = ?
       WHERE id = ? AND workspace_id = ? AND revision = ?`,
   )
-    .bind(titleValue, iconValue, now(), page.id, member.workspace.id, revision)
+    .bind(titleValue, iconValue, member.user.id, now(), page.id, member.workspace.id, revision)
     .run();
   if (!result.meta.changes)
     throw new HttpError(409, "stale_revision", "The page metadata changed. Reload and try again.");
@@ -2913,9 +3006,9 @@ app.post("/api/pages/:id/move", async (c) => {
     const pageStateResultIndex = 3;
     const statements = [
       c.env.DB.prepare(
-        `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_at = ?
+        `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_by = ?, updated_at = ?
           WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
-      ).bind(parentId, position, timestamp, page.id, member.workspace.id),
+      ).bind(parentId, position, member.user.id, timestamp, page.id, member.workspace.id),
       c.env.DB.prepare(
         `INSERT INTO page_move_receipts
            (workspace_id, operation_id, page_id, request_hash, response_json, created_at)
@@ -3095,9 +3188,10 @@ app.post("/api/pages/:id/move-space", async (c) => {
          parent_id = CASE WHEN id = ? THEN ? ELSE parent_id END,
          position = CASE WHEN id = ? THEN ? ELSE position END,
          revision = revision + 1,
+         updated_by = ?,
          updated_at = ?
        WHERE workspace_id = ? AND id IN (${subtreeSql})`,
-    ).bind(spaceId, page.id, parentId, page.id, position, timestamp, member.workspace.id, page.id),
+    ).bind(spaceId, page.id, parentId, page.id, position, member.user.id, timestamp, member.workspace.id, page.id),
     c.env.DB.prepare(`UPDATE page_search_v2 SET space_id = ? WHERE page_id IN (${subtreeSql})`).bind(spaceId, page.id),
     c.env.DB.prepare(`SELECT * FROM pages WHERE id IN (${subtreeSql}) ORDER BY position, id`).bind(page.id),
   ]);
@@ -3120,9 +3214,9 @@ app.delete("/api/pages/:id", async (c) => {
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) UPDATE pages
-           SET archived_at = ?, archived_by = ?, revision = revision + 1, updated_at = ?
+           SET archived_at = ?, archived_by = ?, revision = revision + 1, updated_by = ?, updated_at = ?
          WHERE id IN subtree`,
-    ).bind(page.id, member.workspace.id, timestamp, member.user.id, timestamp),
+    ).bind(page.id, member.workspace.id, timestamp, member.user.id, member.user.id, timestamp),
     c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
       SELECT id FROM subtree
@@ -3134,7 +3228,7 @@ app.delete("/api/pages/:id", async (c) => {
        INSERT INTO archive_disconnect_targets
         (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
        SELECT id, workspace_id, content_epoch, id || '~' || content_epoch, ?, ?, ?
-         FROM pages WHERE id IN subtree AND kind = 'document'
+         FROM pages WHERE id IN subtree AND kind IN ('document', 'diagram')
        ON CONFLICT(page_id) DO UPDATE SET
          workspace_id = excluded.workspace_id,
          content_epoch = excluded.content_epoch,
@@ -3153,7 +3247,7 @@ app.delete("/api/pages/:id", async (c) => {
     .bind(page.id)
     .all<{ id: string; kind: PageKind; content_epoch: number }>();
   const pageIds = archived.results.map((item) => item.id);
-  const documents = archived.results.filter((item) => item.kind === "document");
+  const collaborativePages = archived.results.filter((item) => item.kind === "document" || item.kind === "diagram");
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
     pageIds,
@@ -3162,7 +3256,7 @@ app.delete("/api/pages/:id", async (c) => {
   });
   const pendingPageIds = await processArchiveDisconnectTargets(
     c.env,
-    documents.map((item) => ({
+    collaborativePages.map((item) => ({
       page_id: item.id,
       content_epoch: item.content_epoch,
     })),
@@ -3197,9 +3291,9 @@ app.post("/api/pages/:id/restore", async (c) => {
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) UPDATE pages
-           SET archived_at = NULL, archived_by = NULL, revision = revision + 1, updated_at = ?
+           SET archived_at = NULL, archived_by = NULL, revision = revision + 1, updated_by = ?, updated_at = ?
          WHERE id IN subtree`,
-      ).bind(page.id, member.workspace.id, now()),
+      ).bind(page.id, member.workspace.id, member.user.id, now()),
       c.env.DB.prepare(
         `DELETE FROM archive_disconnect_targets WHERE page_id IN (
          WITH RECURSIVE subtree(id) AS (
@@ -3273,8 +3367,9 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   const timestamp = now();
   const targets = new Map<string, { kind: "document_do" | "r2_object" | "r2_prefix"; target: string }>();
   for (const item of subtree.results) {
-    if (item.kind !== "document") continue;
-    targets.set(`r2_prefix:documents/${item.id}/`, { kind: "r2_prefix", target: `documents/${item.id}/` });
+    if (item.kind !== "document" && item.kind !== "diagram") continue;
+    const prefix = `${item.kind === "diagram" ? "diagrams" : "documents"}/${item.id}/`;
+    targets.set(`r2_prefix:${prefix}`, { kind: "r2_prefix", target: prefix });
     for (let epoch = 1; epoch <= item.content_epoch; epoch++) {
       targets.set(`document_do:${item.id}~${epoch}`, { kind: "document_do", target: `${item.id}~${epoch}` });
     }
@@ -4172,8 +4267,8 @@ app.delete("/api/uploads/:uploadId", async (c) => {
 app.get("/api/pages/:id/versions", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
-  if (page.kind !== "document")
-    throw new HttpError(422, "document_required", "Tables do not have version history in v1.");
+  if (page.kind === "table")
+    throw new HttpError(422, "collaborative_page_required", "Tables do not have version history in v1.");
   const versions = await c.env.DB.prepare(
     `SELECT id, page_id pageId, epoch, sequence, title, byte_size byteSize,
             last_editor_id lastEditorId, created_at createdAt
@@ -4218,7 +4313,9 @@ app.post("/api/pages/:id/restore-version", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   const page = await pageForMember(c.env, member, c.req.param("id"));
-  if (page.kind !== "document") throw new HttpError(422, "document_required", "Only documents can be restored.");
+  if (page.kind === "table") {
+    throw new HttpError(422, "collaborative_page_required", "Only collaborative pages can be restored.");
+  }
   const body = await jsonBody(c.req.raw);
   const versionId = text(body.versionId, "versionId", 100);
   const hint = locationHint(member.workspace.locationHint ?? undefined);
@@ -5120,13 +5217,6 @@ async function assertAnotherOwner(env: Env, workspaceId: string, excludedId: str
     throw new HttpError(409, "final_owner", "Promote another owner before removing or demoting the final owner.");
 }
 
-function constantTimeEqual(left: string, right: string) {
-  if (left.length !== right.length) return false;
-  let mismatch = 0;
-  for (let index = 0; index < left.length; index++) mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
-  return mismatch === 0;
-}
-
 async function currentPlainText(env: Env, pageId: string) {
   return (
     (await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`).bind(pageId).first<{ plain_text: string }>())
@@ -5276,7 +5366,7 @@ async function handlePartyRequest(request: Request, env: Env) {
       if (!ids) throw roomNotFound();
       room = candidate;
       const page = await pageForMember(env, member, ids.pageId);
-      if (page.kind !== "document" || page.content_epoch !== ids.epoch) {
+      if ((page.kind !== "document" && page.kind !== "diagram") || page.content_epoch !== ids.epoch) {
         throw new HttpError(409, "stale_epoch", "Reload this page to connect to its current document version.");
       }
       connectionRole = page.effective_role ?? member.role;
@@ -5289,7 +5379,7 @@ async function handlePartyRequest(request: Request, env: Env) {
     const placement = locationHint(member.workspace.locationHint ?? undefined);
     // Awaited so a rejection from the room fetch is enveloped and logged
     // below instead of escaping this handler as an unlogged runtime 500.
-    return await routePartykitRequest(request, env, {
+    return await routePartykitRequest(request, env as Cloudflare.Env, {
       ...(placement ? { locationHint: placement } : {}),
       onBeforeConnect(incoming) {
         const headers = new Headers(incoming.headers);

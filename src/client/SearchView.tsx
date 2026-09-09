@@ -179,7 +179,7 @@ export function SearchView({
       ? [
           {
             key: "kind",
-            label: filters.kind === "document" ? "Documents" : "Tables",
+            label: filters.kind === "document" ? "Documents" : filters.kind === "table" ? "Tables" : "Diagrams",
             remove: () => updateFilters((current) => ({ ...current, kind: "" })),
           },
         ]
@@ -284,9 +284,10 @@ export function SearchView({
                 updateFilters((current) => ({ ...current, kind: event.target.value as UiFilters["kind"] }))
               }
             >
-              <option value="">Documents and tables</option>
+              <option value="">All page kinds</option>
               <option value="document">Documents</option>
               <option value="table">Tables</option>
+              <option value="diagram">Diagrams</option>
             </select>
           </label>
           <label>
@@ -349,7 +350,8 @@ export function SearchView({
         {results.map((result) => (
           <button key={result.page.id} onClick={() => onSelect(result.page.id)}>
             <span className="search-result-breadcrumb">
-              {result.space.icon ?? "◫"} {result.space.name} / {result.page.kind === "table" ? "Table" : "Page"}
+              {result.space.icon ?? "◫"} {result.space.name} /{" "}
+              {result.page.kind === "table" ? "Table" : result.page.kind === "diagram" ? "Diagram" : "Page"}
               {result.page.archivedAt ? " / Archived" : ""}
             </span>
             <strong>

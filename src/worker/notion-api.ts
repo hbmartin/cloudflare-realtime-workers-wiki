@@ -11,18 +11,31 @@ import {
   proseMirrorInlineToNotion,
   type NotionBlock,
 } from "../shared/notion-blocks";
-import type { DocumentContentEnvelope } from "../shared/types";
+import { sha256Hex } from "../shared/import-integrity";
+import { constantTimeEqual, hmacSha256Hex } from "../shared/security";
+import type { Comment, CommentThread, DocumentContentEnvelope, WorkspaceEvent } from "../shared/types";
+import { PAGE_TITLE_MAX } from "../shared/validation";
+import { processArchiveDisconnectTargets } from "./archive";
+import { createCommentThread, softDeleteComment, updateComment, type CommentActor, type CommentPage } from "./comments";
 import {
   authenticateIntegration,
+  integrationBearerToken,
   IntegrationAuthError,
   pageForIntegration,
   publicPageId,
+  publicPageIds,
   type IntegrationPage,
   type IntegrationPrincipal,
 } from "./integrations";
 import type { Env } from "./env";
+import { isInlineMime } from "./attachments";
+import { attachmentDisposition, HttpError } from "./http";
 import { sweepOutbox } from "./jobs";
+import { pageJson, type PageJsonRow } from "./page-row";
+import { deleteR2Prefix } from "./r2";
+import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import { webhookEventStatements, type WebhookEventType } from "./webhooks";
+import { broadcastWorkspaceEvent } from "./workspace-events";
 
 type ApiContext = { Bindings: Env; Variables: { principal: IntegrationPrincipal; requestId: string } };
 
@@ -51,6 +64,8 @@ class NotionError extends Error {
 }
 
 const notionApi = new Hono<ApiContext>();
+const NOTION_BODY_MAX_BYTES = 500 * 1024;
+const PAGE_ICON_MAX = 20;
 
 function notionErrorResponse(requestId: string, error: NotionError) {
   return Response.json(
@@ -72,6 +87,28 @@ notionApi.onError((error, c) => {
     return notionErrorResponse(requestId, new NotionError(401, "unauthorized", "API token is invalid."));
   }
   if (error instanceof NotionError) return notionErrorResponse(requestId, error);
+  if (error instanceof HttpError) {
+    const status = error.status === 415 || error.status === 422 ? 400 : error.status === 502 ? 503 : error.status;
+    const code =
+      status === 401
+        ? "unauthorized"
+        : status === 403
+          ? "restricted_resource"
+          : status === 404
+            ? "object_not_found"
+            : status === 409
+              ? "conflict_error"
+              : status === 413
+                ? "validation_error"
+                : status === 429
+                  ? "rate_limited"
+                  : status === 503
+                    ? "service_unavailable"
+                    : status === 500
+                      ? "internal_server_error"
+                      : "validation_error";
+    return notionErrorResponse(requestId, new NotionError(status, code, error.message));
+  }
   console.error("Notion API request failed", {
     requestId,
     error: error instanceof Error ? error.message : String(error),
@@ -86,6 +123,29 @@ notionApi.notFound((c) =>
   ),
 );
 
+async function enforceApiRateLimits(burst: RateLimit | undefined, minute: RateLimit | undefined, key: string) {
+  if (burst) {
+    const { success } = await burst.limit({ key });
+    if (!success) throw new NotionError(429, "rate_limited", "Rate limit exceeded.", 10);
+  }
+  if (minute) {
+    const { success } = await minute.limit({ key });
+    if (!success) throw new NotionError(429, "rate_limited", "Rate limit exceeded.", 60);
+  }
+}
+
+// Cloudflare gives all cross-zone Worker subrequests this source IP. Add the
+// platform-provided originating zone so one Worker cannot drain every other
+// Worker client's pre-authentication bucket at the same colo.
+const CROSS_ZONE_WORKER_IP = "2a06:98c0:3600::103";
+
+async function sourceRateLimitKey(request: Request) {
+  const ip = request.headers.get("cf-connecting-ip")?.trim().toLowerCase() || "unattributed";
+  const workerZone =
+    ip === CROSS_ZONE_WORKER_IP ? request.headers.get("cf-worker")?.trim().toLowerCase() || "unknown" : null;
+  return sha256Hex(workerZone ? `worker:${workerZone}` : `ip:${ip}`);
+}
+
 notionApi.use("*", async (c, next) => {
   const requestId = crypto.randomUUID();
   c.set("requestId", requestId);
@@ -95,16 +155,15 @@ notionApi.use("*", async (c, next) => {
   if (version !== NOTION_VERSION) {
     throw new NotionError(400, "validation_error", `This API supports exactly Notion-Version ${NOTION_VERSION}.`);
   }
+  if (!integrationBearerToken(c.req.raw)) throw new IntegrationAuthError();
+  await enforceApiRateLimits(
+    c.env.API_SOURCE_BURST_LIMIT,
+    c.env.API_SOURCE_MINUTE_LIMIT,
+    await sourceRateLimitKey(c.req.raw),
+  );
   const principal = await authenticateIntegration(c.req.raw, c.env);
   c.set("principal", principal);
-  if (c.env.API_BURST_LIMIT) {
-    const { success } = await c.env.API_BURST_LIMIT.limit({ key: principal.integrationId });
-    if (!success) throw new NotionError(429, "rate_limited", "Rate limit exceeded.", 10);
-  }
-  if (c.env.API_MINUTE_LIMIT) {
-    const { success } = await c.env.API_MINUTE_LIMIT.limit({ key: principal.integrationId });
-    if (!success) throw new NotionError(429, "rate_limited", "Rate limit exceeded.", 60);
-  }
+  await enforceApiRateLimits(c.env.API_BURST_LIMIT, c.env.API_MINUTE_LIMIT, principal.integrationId);
   await next();
 });
 
@@ -117,13 +176,64 @@ function enqueueWebhooks(c: Context<ApiContext>) {
   c.executionCtx.waitUntil(sweepOutbox(c.env).catch((error) => console.error("Webhook enqueue failed", error)));
 }
 
-async function body(request: Request) {
+function enqueueWorkspaceEvent(c: Context<ApiContext>, workspaceId: string, event: WorkspaceEvent) {
+  c.executionCtx.waitUntil(
+    broadcastWorkspaceEvent(c.env, workspaceId, event).catch((error) =>
+      console.error("Notion API workspace broadcast failed", error),
+    ),
+  );
+}
+
+async function pageRowsForSubtree(env: Env, workspaceId: string, rootPageId: string) {
+  return (
+    await env.DB.prepare(
+      `WITH RECURSIVE tree(id) AS (
+         SELECT id FROM pages WHERE id = ? AND workspace_id = ?
+         UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+       ) SELECT id, workspace_id, space_id, parent_id, kind, position, title, icon, revision,
+                content_epoch, is_template, archived_at, created_at, updated_at
+           FROM pages WHERE id IN (SELECT id FROM tree) ORDER BY position, id`,
+    )
+      .bind(rootPageId, workspaceId)
+      .all<PageJsonRow>()
+  ).results;
+}
+
+async function body(request: Request, allowEmpty = false) {
   const declared = Number(request.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > 500 * 1024) {
+  if (Number.isFinite(declared) && declared > NOTION_BODY_MAX_BYTES) {
     throw new NotionError(413, "validation_error", "Request body exceeds 500 KiB.");
   }
   try {
-    const value: unknown = await request.json();
+    const reader = request.body?.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > NOTION_BODY_MAX_BYTES) {
+          try {
+            await reader.cancel();
+          } catch {
+            // The payload is already rejected; a source that cannot be canceled
+            // must not turn the size error into an invalid-JSON response.
+          }
+          throw new NotionError(413, "validation_error", "Request body exceeds 500 KiB.");
+        }
+        chunks.push(value);
+      }
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const source = new TextDecoder().decode(bytes);
+    if (allowEmpty && !source.trim()) return {};
+    const value: unknown = JSON.parse(source);
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
     return value as Record<string, unknown>;
   } catch (error) {
@@ -163,24 +273,64 @@ function pagination(input: { page_size?: unknown; start_cursor?: unknown }) {
   return { size, offset: decodeCursor(input.start_cursor as string | undefined) };
 }
 
-function listEnvelope(results: unknown[], offset: number, size: number) {
+function listEnvelope(
+  results: unknown[],
+  offset: number,
+  size: number,
+  type: "page_or_database" | "block" | "user" = "page_or_database",
+) {
   const hasMore = results.length > size;
   return {
     object: "list",
     results: hasMore ? results.slice(0, size) : results,
     next_cursor: hasMore ? encodeCursor(offset + size) : null,
     has_more: hasMore,
-    type: "page_or_database",
-    page_or_database: {},
+    type,
+    [type]: {},
   };
 }
 
 function plainTitle(value: unknown) {
-  const nodes = notionRichTextToProseMirror(value);
-  return nodes
-    .map((node) => node.text ?? String(node.attrs?.label ?? node.attrs?.formula ?? ""))
-    .join("")
-    .trim();
+  try {
+    const nodes = notionRichTextToProseMirror(value);
+    return nodes
+      .map((node) => node.text ?? String(node.attrs?.label ?? node.attrs?.formula ?? ""))
+      .join("")
+      .trim();
+  } catch (error) {
+    throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid rich text.");
+  }
+}
+
+function pageTitle(value: unknown, allowEmpty: boolean) {
+  const title = plainTitle(value);
+  if ((!allowEmpty && !title) || title.length > PAGE_TITLE_MAX) {
+    throw new NotionError(400, "validation_error", `Page title must be between 1 and ${PAGE_TITLE_MAX} characters.`);
+  }
+  return title;
+}
+
+function pageIcon(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new NotionError(400, "validation_error", "Only emoji page icons are supported.");
+  }
+  const requested = value as Record<string, unknown>;
+  if (requested.type !== "emoji" || typeof requested.emoji !== "string") {
+    throw new NotionError(400, "validation_error", "Only emoji page icons are supported.");
+  }
+  const emoji = requested.emoji.trim();
+  if (!emoji || emoji.length > PAGE_ICON_MAX) {
+    throw new NotionError(400, "validation_error", `Page icon must be between 1 and ${PAGE_ICON_MAX} characters.`);
+  }
+  return emoji;
+}
+
+function commentBody(value: unknown) {
+  try {
+    return notionRichTextToProseMirror(value);
+  } catch (error) {
+    throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid rich text.");
+  }
 }
 
 function actorObject(id: string | null, name = "Unknown") {
@@ -196,38 +346,68 @@ function actorObject(id: string | null, name = "Unknown") {
       };
 }
 
-async function activePublicUrl(env: Env, page: IntegrationPage, origin: string) {
-  const row = await env.DB.prepare(
-    `WITH RECURSIVE ancestors(id, parent_id) AS (
-       SELECT id, parent_id FROM pages WHERE id = ?
-       UNION ALL SELECT parent.id, parent.parent_id FROM pages parent JOIN ancestors child ON parent.id = child.parent_id
-     )
-     SELECT share.url_key, share.root_page_id FROM share_links share
-      WHERE share.workspace_id = ? AND share.revoked_at IS NULL
-        AND (share.root_page_id = ? OR (share.include_subpages = 1 AND share.root_page_id IN (SELECT id FROM ancestors)))
-      LIMIT 1`,
-  )
-    .bind(page.id, page.workspace_id, page.id)
-    .first<{ url_key: string; root_page_id: string }>();
-  if (!row) return null;
-  return `${origin}/share/${row.url_key}${row.root_page_id === page.id ? "" : `/pages/${encodeURIComponent(page.id)}`}`;
-}
+type PageObjectData = {
+  publicIds: Map<string, string>;
+  userNames: Map<string, string>;
+  publicUrls: Map<string, string>;
+};
 
-async function userName(env: Env, id: string | null) {
-  if (!id) return "Unknown";
-  return (
-    (await env.DB.prepare(`SELECT name FROM user WHERE id = ?`).bind(id).first<{ name: string }>())?.name ?? "Unknown"
-  );
-}
-
-async function pageObject(env: Env, page: IntegrationPage, origin: string) {
-  const [id, parentId, creatorName, editorName, publicUrl] = await Promise.all([
-    publicPageId(env, page.id),
-    page.parent_id ? publicPageId(env, page.parent_id) : Promise.resolve(null),
-    userName(env, page.created_by),
-    userName(env, page.updated_by),
-    activePublicUrl(env, page, origin),
+async function preloadPageObjectData(env: Env, pages: IntegrationPage[], origin: string): Promise<PageObjectData> {
+  const pageIds = pages.flatMap((page) => (page.parent_id ? [page.id, page.parent_id] : [page.id]));
+  const userIds = [
+    ...new Set(pages.flatMap((page) => [page.created_by, page.updated_by]).filter((id): id is string => Boolean(id))),
+  ];
+  const [publicIds, users, shares] = await Promise.all([
+    publicPageIds(env, pageIds),
+    userIds.length
+      ? env.DB.prepare(`SELECT id, name FROM user WHERE id IN (SELECT value FROM json_each(?))`)
+          .bind(JSON.stringify(userIds))
+          .all<{ id: string; name: string }>()
+      : Promise.resolve({ results: [] as Array<{ id: string; name: string }> }),
+    pages.length
+      ? env.DB.prepare(
+          `WITH RECURSIVE ancestors(page_id, ancestor_id, parent_id, depth) AS (
+             SELECT id, id, parent_id, 0 FROM pages WHERE id IN (SELECT value FROM json_each(?))
+             UNION ALL
+             SELECT child.page_id, parent.id, parent.parent_id, child.depth + 1
+               FROM pages parent JOIN ancestors child ON parent.id = child.parent_id
+              WHERE child.depth < 50
+           )
+           SELECT ancestor.page_id, share.url_key, share.root_page_id, ancestor.depth
+             FROM ancestors ancestor JOIN share_links share ON share.root_page_id = ancestor.ancestor_id
+            WHERE share.workspace_id = ? AND share.revoked_at IS NULL
+              AND (ancestor.depth = 0 OR share.include_subpages = 1)
+            ORDER BY ancestor.page_id, ancestor.depth`,
+        )
+          .bind(JSON.stringify(pages.map((page) => page.id)), pages[0]!.workspace_id)
+          .all<{ page_id: string; url_key: string; root_page_id: string; depth: number }>()
+      : Promise.resolve({
+          results: [] as Array<{ page_id: string; url_key: string; root_page_id: string; depth: number }>,
+        }),
   ]);
+  const publicUrls = new Map<string, string>();
+  for (const share of shares.results) {
+    if (publicUrls.has(share.page_id)) continue;
+    publicUrls.set(
+      share.page_id,
+      `${origin}/share/${share.url_key}${share.root_page_id === share.page_id ? "" : `/pages/${encodeURIComponent(share.page_id)}`}`,
+    );
+  }
+  return {
+    publicIds,
+    userNames: new Map(users.results.map((user) => [user.id, user.name])),
+    publicUrls,
+  };
+}
+
+async function pageObject(env: Env, page: IntegrationPage, origin: string, preloaded?: PageObjectData) {
+  const data = preloaded ?? (await preloadPageObjectData(env, [page], origin));
+  const id = data.publicIds.get(page.id);
+  const parentId = page.parent_id ? data.publicIds.get(page.parent_id) : null;
+  if (!id || (page.parent_id && !parentId)) throw new Error("A public page id could not be assigned.");
+  const creatorName = data.userNames.get(page.created_by) ?? "Unknown";
+  const editorName = (page.updated_by && data.userNames.get(page.updated_by)) || "Unknown";
+  const publicUrl = data.publicUrls.get(page.id) ?? null;
   const title = {
     id: "title",
     type: "title",
@@ -358,12 +538,18 @@ async function locatedBlock(env: Env, principal: IntegrationPrincipal, id: strin
   return { page, block, internalId: row.internal_id, metadata: await metadataForPage(env, page.id) };
 }
 
-async function mutateDocument(env: Env, page: IntegrationPage, principal: IntegrationPrincipal, operations: unknown[]) {
+async function mutateDocument(
+  env: Env,
+  page: IntegrationPage,
+  principal: IntegrationPrincipal,
+  operations: unknown[],
+  suppressExternalEffects = false,
+) {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/api-mutate", {
       method: "POST",
       headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
-      body: JSON.stringify({ actorId: principal.botUserId, operations }),
+      body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects }),
     }),
   );
   if (response.status === 404) throw new NotionError(404, "object_not_found", "Block not found.");
@@ -371,6 +557,29 @@ async function mutateDocument(env: Env, page: IntegrationPage, principal: Integr
   if (response.status === 413) throw new NotionError(413, "validation_error", "The mutation exceeds document limits.");
   if (!response.ok) throw new NotionError(400, "validation_error", "The block mutation is invalid.");
   return response.json<{ document: DocumentContentEnvelope["document"] }>();
+}
+
+async function cleanupStagedPage(env: Env, pageId: string, contentEpoch: number, stageId: string) {
+  try {
+    await env.DOCUMENT.getByName(`${pageId}~${contentEpoch}`).fetch(
+      new Request("https://document.internal/purge", {
+        method: "POST",
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+  } catch (error) {
+    console.error("Failed to purge a staged Notion API page", { pageId, error });
+  }
+  try {
+    await deleteR2Prefix(env.BUCKET, `documents/${pageId}/`);
+  } catch (error) {
+    console.error("Failed to delete staged Notion API page objects", { pageId, error });
+  }
+  try {
+    await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ?`).bind(pageId, stageId).run();
+  } catch (error) {
+    console.error("Failed to delete a staged Notion API page", { pageId, error });
+  }
 }
 
 function notionChildren(value: unknown) {
@@ -447,62 +656,113 @@ notionApi.post("/pages", async (c) => {
   }
   const properties = (input.properties ?? {}) as Record<string, unknown>;
   const titleProperty = (properties.title ?? {}) as Record<string, unknown>;
-  const title = plainTitle(titleProperty.title ?? titleProperty.rich_text ?? []);
+  const title = pageTitle(titleProperty.title ?? titleProperty.rich_text ?? [], true) || "Untitled";
+  const iconValue = input.icon === undefined || input.icon === null ? null : pageIcon(input.icon);
+  const children = input.children === undefined ? [] : notionChildren(input.children);
   const pageId = crypto.randomUUID();
+  const stageId = children.length ? `notion-create:${pageId}` : null;
   const previous = await c.env.DB.prepare(
-    `SELECT position FROM pages WHERE workspace_id = ? AND space_id = ? AND parent_id IS ? ORDER BY position DESC LIMIT 1`,
+    `SELECT position FROM pages
+      WHERE workspace_id = ? AND space_id = ? AND parent_id IS ? AND import_job_id IS NULL
+      ORDER BY position DESC LIMIT 1`,
   )
     .bind(principal.workspaceId, spaceId, parentId)
     .first<{ position: string }>();
   const timestamp = Date.now();
-  const icon = (input.icon ?? null) as Record<string, unknown> | null;
-  const iconValue = icon?.type === "emoji" && typeof icon.emoji === "string" ? icon.emoji : null;
-  const statements = [
+  const publicationStatements = () => {
+    const statements: D1PreparedStatement[] = [
+      c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
+        pageId,
+        principal.workspaceId,
+        title,
+      ),
+      ...refreshPageSearchV2Statements(c.env.DB, pageId),
+      ...webhookEventStatements(c.env.DB, {
+        workspaceId: principal.workspaceId,
+        type: "page.created",
+        entityType: "page",
+        entityId: pageId,
+        pageId,
+        actorId: principal.botUserId,
+        sourceKey: `page.created:${pageId}`,
+        createdAt: timestamp,
+      }),
+    ];
+    if (!parentPage) {
+      statements.push(
+        c.env.DB.prepare(
+          `INSERT INTO integration_grants (integration_id, root_page_id, created_by, created_at) VALUES (?, ?, ?, ?)`,
+        ).bind(principal.integrationId, pageId, principal.botUserId, timestamp),
+      );
+    }
+    return statements;
+  };
+  const statements: D1PreparedStatement[] = [
     c.env.DB.prepare(
       `INSERT INTO pages
-        (id, workspace_id, space_id, parent_id, kind, position, title, icon, created_by, updated_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?)`,
+        (id, workspace_id, space_id, parent_id, kind, position, title, icon, import_job_id,
+         created_by, updated_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       pageId,
       principal.workspaceId,
       spaceId,
       parentId,
       generateJitteredKeyBetween(previous?.position ?? null, null),
-      title || "Untitled",
+      title,
       iconValue,
+      stageId,
       principal.botUserId,
       principal.botUserId,
       timestamp,
       timestamp,
     ),
-    ...webhookEventStatements(c.env.DB, {
-      workspaceId: principal.workspaceId,
-      type: "page.created",
-      entityType: "page",
-      entityId: pageId,
-      pageId,
-      actorId: principal.botUserId,
-      sourceKey: `page.created:${pageId}`,
-      createdAt: timestamp,
-    }),
   ];
-  if (!parentPage) {
-    statements.push(
-      c.env.DB.prepare(
-        `INSERT INTO integration_grants (integration_id, root_page_id, created_by, created_at) VALUES (?, ?, ?, ?)`,
-      ).bind(principal.integrationId, pageId, principal.botUserId, timestamp),
-    );
+  if (!stageId) statements.push(...publicationStatements());
+  try {
+    await c.env.DB.batch(statements);
+  } catch (error) {
+    if (stageId) await cleanupStagedPage(c.env, pageId, 1, stageId);
+    throw error;
   }
-  await c.env.DB.batch(statements);
+  if (stageId) {
+    const staged = await c.env.DB.prepare(`SELECT * FROM pages WHERE id = ? AND import_job_id = ?`)
+      .bind(pageId, stageId)
+      .first<IntegrationPage>();
+    if (!staged) throw new NotionError(500, "internal_server_error", "The page could not be initialized.");
+    try {
+      await mutateDocument(
+        c.env,
+        staged,
+        principal,
+        [{ type: "append_children", children, position: { type: "end" } }],
+        true,
+      );
+      const published = await c.env.DB.batch([
+        c.env.DB.prepare(`UPDATE pages SET import_job_id = NULL WHERE id = ? AND import_job_id = ?`).bind(
+          pageId,
+          stageId,
+        ),
+        ...publicationStatements(),
+      ]);
+      if (!published[0]?.meta.changes) throw new Error("The staged page was not published.");
+    } catch (error) {
+      const state = await c.env.DB.prepare(`SELECT import_job_id FROM pages WHERE id = ?`)
+        .bind(pageId)
+        .first<{ import_job_id: string | null }>();
+      if (state?.import_job_id !== null) {
+        await cleanupStagedPage(c.env, pageId, staged.content_epoch, stageId);
+        throw error;
+      }
+    }
+  }
   enqueueWebhooks(c);
-  const children = input.children === undefined ? [] : notionChildren(input.children);
-  if (children.length) {
-    await mutateDocument(c.env, (await accessiblePage(c.env, principal, pageId))!, principal, [
-      { type: "append_children", children, position: { type: "end" } },
-    ]);
+  const createdPage = (await pageRowsForSubtree(c.env, principal.workspaceId, pageId))[0];
+  if (createdPage) {
+    enqueueWorkspaceEvent(c, principal.workspaceId, { type: "pages-upserted", pages: [pageJson(createdPage)] });
   }
   return c.json(
-    await pageObject(c.env, (await accessiblePage(c.env, principal, pageId))!, new URL(c.req.url).origin),
+    await pageObject(c.env, await accessiblePage(c.env, principal, pageId), new URL(c.req.url).origin),
     200,
   );
 });
@@ -511,8 +771,9 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
   const principal = c.get("principal") as IntegrationPrincipal;
   capability(principal, "updateContent");
   const page = await accessiblePage(c.env, principal, c.req.param("pageId")!, true);
-  const input = await body(c.req.raw);
+  const input = await body(c.req.raw, mode === "trash");
   const timestamp = Date.now();
+  let workspaceEvent: WorkspaceEvent | null = null;
   if (mode === "move") {
     const parent = (input.parent ?? input) as Record<string, unknown>;
     let parentId: string | null = null;
@@ -540,15 +801,34 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
       .first<{ position: string }>();
     await c.env.DB.batch([
       c.env.DB.prepare(
-        `UPDATE pages SET parent_id = ?, space_id = ?, position = ?, updated_by = ?, updated_at = ? WHERE id = ?`,
+        `WITH RECURSIVE tree(id) AS (
+           SELECT id FROM pages WHERE id = ?
+           UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+         ) UPDATE pages SET
+             parent_id = CASE WHEN id = ? THEN ? ELSE parent_id END,
+             space_id = ?,
+             position = CASE WHEN id = ? THEN ? ELSE position END,
+             revision = revision + 1,
+             updated_by = CASE WHEN id = ? THEN ? ELSE updated_by END,
+             updated_at = CASE WHEN id = ? THEN ? ELSE updated_at END
+           WHERE id IN (SELECT id FROM tree)`,
       ).bind(
+        page.id,
+        page.id,
         parentId,
         spaceId,
-        generateJitteredKeyBetween(previous?.position ?? null, null),
-        principal.botUserId,
-        timestamp,
         page.id,
+        generateJitteredKeyBetween(previous?.position ?? null, null),
+        page.id,
+        principal.botUserId,
+        page.id,
+        timestamp,
       ),
+      c.env.DB.prepare(
+        `WITH RECURSIVE tree(id) AS (
+           SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+         ) UPDATE page_search_v2 SET space_id = ? WHERE page_id IN (SELECT id FROM tree)`,
+      ).bind(page.id, spaceId),
       ...webhookEventStatements(c.env.DB, {
         workspaceId: principal.workspaceId,
         type: "page.moved",
@@ -561,48 +841,48 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
         createdAt: timestamp,
       }),
     ]);
+    workspaceEvent = { type: "workspace-invalidated" };
   } else {
     const inTrash = mode === "trash" ? true : input.in_trash;
     const titleProperty = ((input.properties ?? {}) as Record<string, unknown>).title as
       | Record<string, unknown>
       | undefined;
-    const title = titleProperty ? plainTitle(titleProperty.title ?? titleProperty.rich_text ?? []) : null;
+    const title = titleProperty ? pageTitle(titleProperty.title ?? titleProperty.rich_text ?? [], false) : null;
     let icon: string | null | undefined;
     if (input.icon === null) icon = null;
-    else if (input.icon && typeof input.icon === "object") {
-      const requested = input.icon as Record<string, unknown>;
-      if (requested.type !== "emoji" || typeof requested.emoji !== "string") {
-        throw new NotionError(400, "validation_error", "Only emoji page icons are supported.");
-      }
-      icon = requested.emoji;
-    }
+    else if (input.icon !== undefined) icon = pageIcon(input.icon);
     if (inTrash !== undefined && typeof inTrash !== "boolean") {
       throw new NotionError(400, "validation_error", "in_trash must be true or false.");
     }
     const eventType: WebhookEventType =
       inTrash === true ? "page.deleted" : inTrash === false ? "page.undeleted" : "page.properties_updated";
-    await c.env.DB.batch([
-      c.env.DB.prepare(
-        `WITH RECURSIVE tree(id) AS (
-         SELECT id FROM pages WHERE id = ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
-       ) UPDATE pages SET title = COALESCE(?, title), icon = CASE WHEN ? THEN ? ELSE icon END,
-           archived_at = CASE WHEN ? IS NULL THEN archived_at WHEN ? THEN ? ELSE NULL END,
-           archived_by = CASE WHEN ? IS NULL THEN archived_by WHEN ? THEN ? ELSE NULL END,
-           updated_by = ?, updated_at = ? WHERE id IN (SELECT id FROM tree)`,
-      ).bind(
-        page.id,
-        title,
-        icon !== undefined ? 1 : 0,
-        icon ?? null,
-        inTrash === undefined ? null : 1,
-        inTrash ? 1 : 0,
-        timestamp,
-        inTrash === undefined ? null : 1,
-        inTrash ? 1 : 0,
-        principal.botUserId,
-        principal.botUserId,
-        timestamp,
-      ),
+    const statements = [
+      inTrash === undefined
+        ? c.env.DB.prepare(
+            `UPDATE pages SET title = COALESCE(?, title), icon = CASE WHEN ? THEN ? ELSE icon END,
+                revision = revision + 1, updated_by = ?, updated_at = ? WHERE id = ?`,
+          ).bind(title, icon !== undefined ? 1 : 0, icon ?? null, principal.botUserId, timestamp, page.id)
+        : c.env.DB.prepare(
+            `WITH RECURSIVE tree(id) AS (
+               SELECT id FROM pages WHERE id = ?
+               UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+             ) UPDATE pages SET
+                 title = CASE WHEN id = ? THEN COALESCE(?, title) ELSE title END,
+                 icon = CASE WHEN id = ? AND ? THEN ? ELSE icon END,
+                 archived_at = ?, archived_by = ?, revision = revision + 1,
+                 updated_by = ?, updated_at = ? WHERE id IN (SELECT id FROM tree)`,
+          ).bind(
+            page.id,
+            page.id,
+            title,
+            page.id,
+            icon !== undefined ? 1 : 0,
+            icon ?? null,
+            inTrash ? timestamp : null,
+            inTrash ? principal.botUserId : null,
+            principal.botUserId,
+            timestamp,
+          ),
       ...webhookEventStatements(c.env.DB, {
         workspaceId: principal.workspaceId,
         type: eventType,
@@ -613,17 +893,100 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
         sourceKey: `${eventType}:${page.id}:${timestamp}`,
         createdAt: timestamp,
       }),
-    ]);
+    ];
+    if (inTrash === undefined) {
+      statements.push(
+        c.env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(page.id),
+        c.env.DB.prepare(
+          `INSERT INTO page_search (page_id, workspace_id, title, body)
+           SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages
+            WHERE id = ? AND archived_at IS NULL AND import_job_id IS NULL`,
+        ).bind(page.id),
+        ...refreshPageSearchV2Statements(c.env.DB, page.id),
+      );
+    } else {
+      statements.push(
+        c.env.DB.prepare(
+          `DELETE FROM page_search WHERE page_id IN (
+             WITH RECURSIVE tree(id) AS (
+               SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+             ) SELECT id FROM tree
+           )`,
+        ).bind(page.id),
+      );
+      if (!inTrash) {
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO page_search (page_id, workspace_id, title, body)
+             SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages WHERE id IN (
+               WITH RECURSIVE tree(id) AS (
+                 SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+               ) SELECT id FROM tree
+             ) AND archived_at IS NULL AND import_job_id IS NULL`,
+          ).bind(page.id),
+        );
+      }
+      statements.push(...refreshPageSearchV2SubtreeStatements(c.env.DB, page.id));
+      if (inTrash) {
+        statements.push(
+          c.env.DB.prepare(
+            `WITH RECURSIVE tree(id) AS (
+               SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+             )
+             INSERT INTO archive_disconnect_targets
+              (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
+             SELECT id, workspace_id, content_epoch, id || '~' || content_epoch, ?, ?, ?
+               FROM pages WHERE id IN (SELECT id FROM tree) AND kind IN ('document', 'diagram')
+             ON CONFLICT(page_id) DO UPDATE SET
+               workspace_id = excluded.workspace_id,
+               content_epoch = excluded.content_epoch,
+               room = excluded.room,
+               attempts = 0,
+               next_attempt_at = excluded.next_attempt_at,
+               last_error = NULL,
+               updated_at = excluded.updated_at`,
+          ).bind(page.id, timestamp, timestamp, timestamp),
+        );
+      } else {
+        statements.push(
+          c.env.DB.prepare(
+            `DELETE FROM archive_disconnect_targets WHERE page_id IN (
+               WITH RECURSIVE tree(id) AS (
+                 SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
+               ) SELECT id FROM tree
+             )`,
+          ).bind(page.id),
+        );
+      }
+    }
+    await c.env.DB.batch(statements);
+    const subtree = await pageRowsForSubtree(c.env, principal.workspaceId, page.id);
     if (inTrash === true) {
-      await c.env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
-        new Request("https://document.internal/archive", {
-          method: "POST",
-          headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET },
-        }),
+      workspaceEvent = { type: "pages-removed", pageIds: subtree.map((item) => item.id), permanently: false };
+    } else if (inTrash === false) {
+      workspaceEvent = {
+        type: "pages-upserted",
+        pages: subtree.filter((item) => item.archived_at === null).map(pageJson),
+        restored: true,
+        restoredRootId: page.id,
+      };
+    } else {
+      const root = subtree.find((item) => item.id === page.id);
+      if (root) workspaceEvent = { type: "pages-upserted", pages: [pageJson(root)] };
+    }
+    if (inTrash === true) {
+      c.executionCtx.waitUntil(
+        processArchiveDisconnectTargets(
+          c.env,
+          subtree
+            .filter((item) => item.kind === "document" || item.kind === "diagram")
+            .map((item) => ({ page_id: item.id, content_epoch: item.content_epoch })),
+        ).catch((error) => console.error("Notion API archive disconnect failed", error)),
       );
     }
   }
   enqueueWebhooks(c);
+  if (workspaceEvent) enqueueWorkspaceEvent(c, principal.workspaceId, workspaceEvent);
   const updated = await c.env.DB.prepare(`SELECT * FROM pages WHERE id = ? AND workspace_id = ?`)
     .bind(page.id, principal.workspaceId)
     .first<IntegrationPage>();
@@ -688,7 +1051,7 @@ notionApi.get("/blocks/:blockId/children", async (c) => {
       }
     }
   }
-  return c.json(listEnvelope(results, offset, size));
+  return c.json(listEnvelope(results, offset, size, "block"));
 });
 
 notionApi.patch("/blocks/:blockId/children", async (c) => {
@@ -789,7 +1152,9 @@ notionApi.post("/search", async (c) => {
       offset,
     )
     .all<IntegrationPage>();
-  const results = await Promise.all(rows.results.map((page) => pageObject(c.env, page, new URL(c.req.url).origin)));
+  const origin = new URL(c.req.url).origin;
+  const pageData = await preloadPageObjectData(c.env, rows.results, origin);
+  const results = await Promise.all(rows.results.map((page) => pageObject(c.env, page, origin, pageData)));
   return c.json(listEnvelope(results, offset, size));
 });
 
@@ -844,6 +1209,7 @@ notionApi.get("/users", async (c) => {
       rows.results.map((row) => userObject(row, principal)),
       offset,
       size,
+      "user",
     ),
   );
 });
@@ -870,11 +1236,26 @@ type ApiCommentRow = {
   block_id: string | null;
   page_id: string;
   user_id: string;
+  body_json: string;
   plain_text: string;
   deleted_at: number | null;
   created_at: number;
   updated_at: number;
 };
+
+function storedCommentRichText(row: ApiCommentRow) {
+  if (row.deleted_at) return [];
+  try {
+    const parsed = JSON.parse(row.body_json) as unknown;
+    if (Array.isArray(parsed)) {
+      return proseMirrorInlineToNotion(parsed as Parameters<typeof proseMirrorInlineToNotion>[0]);
+    }
+  } catch {
+    // Fall back to the indexed plain text for legacy or malformed rows.
+  }
+  return proseMirrorInlineToNotion([{ type: "text", text: row.plain_text }]);
+}
+
 function commentObject(row: ApiCommentRow) {
   return {
     object: "comment",
@@ -884,13 +1265,53 @@ function commentObject(row: ApiCommentRow) {
     created_time: iso(row.created_at),
     last_edited_time: iso(row.updated_at),
     created_by: actorObject(row.user_id),
-    rich_text: row.deleted_at ? [] : proseMirrorInlineToNotion([{ type: "text", text: row.plain_text }]),
+    rich_text: storedCommentRichText(row),
   };
 }
 
-async function commentRows(env: Env, where: string, binds: unknown[]) {
+function integrationCommentActor(principal: IntegrationPrincipal): CommentActor {
+  return { role: "editor", user: { id: principal.botUserId } };
+}
+
+function integrationCommentPage(page: IntegrationPage): CommentPage {
+  return {
+    id: page.id,
+    workspace_id: page.workspace_id,
+    space_id: page.space_id,
+    content_epoch: page.content_epoch,
+    created_by: page.created_by,
+    effective_role: "editor",
+  };
+}
+
+function apiCommentRow(thread: CommentThread, comment: Comment, blockId: string | null): ApiCommentRow {
+  return {
+    id: comment.id,
+    thread_id: thread.id,
+    block_id: blockId,
+    page_id: thread.pageId,
+    user_id: comment.userId,
+    body_json: JSON.stringify(comment.body),
+    plain_text: comment.plainText,
+    deleted_at: comment.deletedAt,
+    created_at: comment.createdAt,
+    updated_at: comment.updatedAt,
+  };
+}
+
+function enqueueCommentMutation(c: Context<ApiContext>, pageId: string) {
+  const workspaceId = c.get("principal").workspaceId;
+  enqueueWorkspaceEvent(c, workspaceId, { type: "comments-invalidated", pageId });
+  enqueueWorkspaceEvent(c, workspaceId, { type: "notifications-invalidated" });
+  enqueueWebhooks(c);
+}
+
+async function commentRows(env: Env, where: string, binds: unknown[], orderBy = "") {
   return env.DB.prepare(
-    `SELECT comment.id, comment.thread_id, thread.block_id, thread.page_id, comment.user_id, comment.plain_text, comment.deleted_at, comment.created_at, comment.updated_at FROM comments comment JOIN comment_threads thread ON thread.id = comment.thread_id WHERE ${where}`,
+    `SELECT comment.id, comment.thread_id, thread.block_id, thread.page_id, comment.user_id, comment.body_json,
+            comment.plain_text, comment.deleted_at, comment.created_at, comment.updated_at
+       FROM comments comment JOIN comment_threads thread ON thread.id = comment.thread_id
+      WHERE ${where}${orderBy ? ` ORDER BY ${orderBy}` : ""}`,
   )
     .bind(...binds)
     .all<ApiCommentRow>();
@@ -912,8 +1333,9 @@ notionApi.get("/comments", async (c) => {
   }
   const rows = await commentRows(
     c.env,
-    `thread.page_id = ? AND thread.block_id IS ? AND comment.deleted_at IS NULL ORDER BY comment.created_at`,
+    `thread.page_id = ? AND thread.block_id IS ? AND comment.deleted_at IS NULL`,
     [internalPage.id, matchId],
+    "comment.created_at",
   );
   return c.json({
     object: "list",
@@ -940,144 +1362,74 @@ notionApi.post("/comments", async (c) => {
     page = block.page;
     blockId = suppliedId;
   }
-  const content = plainTitle(input.rich_text ?? []);
-  if (!content) throw new NotionError(400, "validation_error", "Comment rich_text is required.");
-  const timestamp = Date.now();
-  const threadId = crypto.randomUUID();
-  const commentId = crypto.randomUUID();
-  await c.env.DB.batch([
-    c.env.DB.prepare(
-      `INSERT INTO comment_threads (id, workspace_id, space_id, page_id, block_id, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(threadId, principal.workspaceId, page.space_id, page.id, blockId, principal.botUserId, timestamp, timestamp),
-    c.env.DB.prepare(
-      `INSERT INTO comments (id, thread_id, user_id, body_json, plain_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(
-      commentId,
-      threadId,
-      principal.botUserId,
-      JSON.stringify([{ type: "text", text: content }]),
-      content,
-      timestamp,
-      timestamp,
-    ),
-    ...webhookEventStatements(c.env.DB, {
-      workspaceId: principal.workspaceId,
-      type: "comment.created",
-      entityType: "comment",
-      entityId: commentId,
-      pageId: page.id,
-      actorId: principal.botUserId,
-      sourceKey: `comment.created:${commentId}`,
-      createdAt: timestamp,
-    }),
-  ]);
-  enqueueWebhooks(c);
-  return c.json(
-    commentObject({
-      id: commentId,
-      thread_id: threadId,
-      block_id: blockId,
-      page_id: page.id,
-      user_id: principal.botUserId,
-      plain_text: content,
-      deleted_at: null,
-      created_at: timestamp,
-      updated_at: timestamp,
-    }),
-    200,
+  const thread = await createCommentThread(
+    c.env,
+    integrationCommentActor(principal),
+    integrationCommentPage(page),
+    commentBody(input.rich_text ?? []),
+    null,
+    blockId,
   );
+  const created = thread.comments[0];
+  if (!created) throw new NotionError(500, "internal_server_error", "The comment could not be created.");
+  enqueueCommentMutation(c, page.id);
+  return c.json(commentObject(apiCommentRow(thread, created, blockId)), 200);
 });
 
 async function existingComment(env: Env, principal: IntegrationPrincipal, id: string) {
   const rows = await commentRows(env, `comment.id = ?`, [id]);
   const row = rows.results[0];
-  if (!row || !(await pageForIntegration(env, principal, row.page_id)) || row.user_id !== principal.botUserId) {
+  const page = row ? await pageForIntegration(env, principal, row.page_id) : null;
+  if (!row || !page || row.user_id !== principal.botUserId) {
     throw new NotionError(404, "object_not_found", "Comment not found.");
   }
-  return row;
+  return { row, page };
 }
 
 notionApi.patch("/comments/:commentId", async (c) => {
   const principal = c.get("principal");
   capability(principal, "insertComments");
-  const existing = await existingComment(c.env, principal, c.req.param("commentId"));
+  const { row: existing, page } = await existingComment(c.env, principal, c.req.param("commentId"));
   const input = await body(c.req.raw);
-  const content = plainTitle(input.rich_text ?? []);
-  if (!content) throw new NotionError(400, "validation_error", "Comment rich_text is required.");
-  const timestamp = Date.now();
-  await c.env.DB.batch([
-    c.env.DB.prepare(`UPDATE comments SET plain_text = ?, body_json = ?, updated_at = ? WHERE id = ?`).bind(
-      content,
-      JSON.stringify([{ type: "text", text: content }]),
-      timestamp,
-      existing.id,
-    ),
-    ...webhookEventStatements(c.env.DB, {
-      workspaceId: principal.workspaceId,
-      type: "comment.updated",
-      entityType: "comment",
-      entityId: existing.id,
-      pageId: existing.page_id,
-      actorId: principal.botUserId,
-      sourceKey: `comment.updated:${existing.id}:${timestamp}`,
-      createdAt: timestamp,
-    }),
-  ]);
-  enqueueWebhooks(c);
-  return c.json(commentObject({ ...existing, plain_text: content, updated_at: timestamp }));
+  const thread = await updateComment(
+    c.env,
+    integrationCommentActor(principal),
+    integrationCommentPage(page),
+    existing.thread_id,
+    existing.id,
+    commentBody(input.rich_text ?? []),
+  );
+  const updated = thread.comments.find((comment) => comment.id === existing.id);
+  if (!updated) throw new NotionError(500, "internal_server_error", "The comment could not be updated.");
+  enqueueCommentMutation(c, page.id);
+  return c.json(commentObject(apiCommentRow(thread, updated, existing.block_id)));
 });
 
 notionApi.delete("/comments/:commentId", async (c) => {
   const principal = c.get("principal");
   capability(principal, "insertComments");
-  const existing = await existingComment(c.env, principal, c.req.param("commentId"));
-  const timestamp = Date.now();
-  await c.env.DB.batch([
-    c.env.DB.prepare(
-      `UPDATE comments SET deleted_at = ?, updated_at = ?, plain_text = '', body_json = 'null' WHERE id = ?`,
-    ).bind(timestamp, timestamp, existing.id),
-    ...webhookEventStatements(c.env.DB, {
-      workspaceId: principal.workspaceId,
-      type: "comment.deleted",
-      entityType: "comment",
-      entityId: existing.id,
-      pageId: existing.page_id,
-      actorId: principal.botUserId,
-      sourceKey: `comment.deleted:${existing.id}`,
-      createdAt: timestamp,
-    }),
-  ]);
-  enqueueWebhooks(c);
-  return c.json(commentObject({ ...existing, deleted_at: timestamp, updated_at: timestamp, plain_text: "" }));
+  const { row: existing, page } = await existingComment(c.env, principal, c.req.param("commentId"));
+  const thread = await softDeleteComment(
+    c.env,
+    integrationCommentActor(principal),
+    integrationCommentPage(page),
+    existing.thread_id,
+    existing.id,
+  );
+  const deleted = thread.comments.find((comment) => comment.id === existing.id);
+  if (!deleted) throw new NotionError(500, "internal_server_error", "The comment could not be deleted.");
+  enqueueCommentMutation(c, page.id);
+  return c.json(commentObject(apiCommentRow(thread, deleted, existing.block_id)));
 });
 
 export { notionApi };
 
-async function hmacHex(secret: string, value: string) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const bytes = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 async function notionFileUrl(env: Env, attachmentId: string, expires: number) {
-  const signature = await hmacHex(env.BETTER_AUTH_SECRET, `${attachmentId}:${expires}`);
+  const signature = await hmacSha256Hex(env.BETTER_AUTH_SECRET, `${attachmentId}:${expires}`);
   return new URL(
     `/v1/files/${encodeURIComponent(attachmentId)}?expires=${expires}&signature=${signature}`,
     env.BETTER_AUTH_URL,
   ).toString();
-}
-
-function constantTimeEqual(left: string, right: string) {
-  if (left.length !== right.length) return false;
-  let mismatch = 0;
-  for (let index = 0; index < left.length; index++) mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
-  return mismatch === 0;
 }
 
 export async function notionFileResponse(request: Request, env: Env, attachmentId: string) {
@@ -1085,7 +1437,7 @@ export async function notionFileResponse(request: Request, env: Env, attachmentI
   const expires = Number(url.searchParams.get("expires"));
   const signature = url.searchParams.get("signature") ?? "";
   if (!Number.isSafeInteger(expires) || expires <= Date.now() || expires > Date.now() + 2 * 60 * 60_000) return null;
-  const expected = await hmacHex(env.BETTER_AUTH_SECRET, `${attachmentId}:${expires}`);
+  const expected = await hmacSha256Hex(env.BETTER_AUTH_SECRET, `${attachmentId}:${expires}`);
   if (!constantTimeEqual(signature, expected)) return null;
   const attachment = await env.DB.prepare(`SELECT r2_key, name, mime FROM attachments WHERE id = ?`)
     .bind(attachmentId)
@@ -1096,7 +1448,7 @@ export async function notionFileResponse(request: Request, env: Env, attachmentI
   return new Response(object.body, {
     headers: {
       "content-type": attachment.mime,
-      "content-disposition": `inline; filename="${attachment.name.replaceAll(/["\\]/g, "_")}"`,
+      "content-disposition": attachmentDisposition(attachment.name, isInlineMime(attachment.mime)),
       "cache-control": "private, max-age=3600",
       "x-content-type-options": "nosniff",
     },

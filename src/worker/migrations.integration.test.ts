@@ -28,6 +28,7 @@ describe("D1 migrations", () => {
         "spaces",
         "space_members",
         "document_projections",
+        "diagram_projections",
         "page_search_v2",
         "jobs",
         "outbox",
@@ -134,6 +135,11 @@ describe("D1 migrations", () => {
     expect(applied.results.map((migration) => migration.name)).toEqual(
       env.TEST_MIGRATIONS!.map((migration) => migration.name),
     );
+
+    const pagesSql = await env.DB.prepare(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pages'`,
+    ).first<{ sql: string }>();
+    expect(pagesSql?.sql).toContain("'diagram'");
   });
 
   it("migrates digest cursors to independent channel and timezone keys", async () => {
