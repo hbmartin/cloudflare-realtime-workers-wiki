@@ -435,7 +435,7 @@ function renderableDiagram(diagram: Pick<DiagramContentEnvelope, "nodes" | "edge
 
 function renderDiagramSvgUnchecked(
   diagram: Pick<DiagramContentEnvelope, "nodes" | "edges">,
-  options: DiagramRenderOptions,
+  options: DiagramRenderOptions & { message?: string },
 ) {
   const ratio = options.width && options.height ? options.width / options.height : undefined;
   const bounds = fittedBounds(diagram.nodes, ratio);
@@ -463,7 +463,10 @@ function renderDiagramSvgUnchecked(
     .join("");
   const width = options.width ? ` width="${Math.round(options.width)}"` : "";
   const height = options.height ? ` height="${Math.round(options.height)}"` : "";
-  return `<svg xmlns="http://www.w3.org/2000/svg"${width}${height} viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" role="img" aria-label="${escapeXml(options.title ?? "Diagram")}"><title>${escapeXml(options.title ?? "Diagram")}</title><defs><marker id="diagram-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs><rect x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" fill="#fff"/>${edges}${shapes}</svg>`;
+  const message = options.message
+    ? `<text x="${compact(bounds.x + bounds.width / 2)}" y="${compact(bounds.y + bounds.height / 2)}" text-anchor="middle" dominant-baseline="middle" font-family="system-ui, sans-serif" font-size="18" fill="#475569">${escapeXml(options.message)}</text>`
+    : "";
+  return `<svg xmlns="http://www.w3.org/2000/svg"${width}${height} viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" role="img" aria-label="${escapeXml(options.title ?? "Diagram")}"><title>${escapeXml(options.title ?? "Diagram")}</title><defs><marker id="diagram-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs><rect x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" fill="#fff"/>${message}${edges}${shapes}</svg>`;
 }
 
 export function renderDiagramSvg(
@@ -492,6 +495,7 @@ export function renderDiagramSvg(
         ...(width === undefined ? {} : { width }),
         ...(height === undefined ? {} : { height }),
         title: "Diagram preview unavailable",
+        message: "Diagram preview unavailable",
       },
     );
   try {

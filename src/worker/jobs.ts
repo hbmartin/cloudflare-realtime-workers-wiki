@@ -30,7 +30,7 @@ const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
 
 export type JobWorkflowParams = { jobId: string; attempt?: number };
-export type DeliveryQueueMessage = { outboxId: string };
+export type DeliveryQueueMessage = { outboxId: string } | { sweep: true };
 
 export type JobRow = {
   id: string;
@@ -1164,10 +1164,29 @@ export async function sweepOutbox(env: Env) {
     }
     if (rows.results.length < OUTBOX_SWEEP_BATCH_SIZE) return;
   }
+  const remaining = await env.DB.prepare(
+    `SELECT 1 pending FROM outbox WHERE enqueued_at IS NULL AND available_at <= ? LIMIT 1`,
+  )
+    .bind(Date.now())
+    .first<{ pending: number }>();
+  if (!remaining) return;
+  console.warn("Outbox sweep cap reached; scheduling continuation", {
+    maxRows: OUTBOX_SWEEP_BATCH_SIZE * OUTBOX_SWEEP_MAX_BATCHES,
+  });
+  try {
+    await env.DELIVERY_QUEUE.send({ sweep: true });
+  } catch (error) {
+    console.error("Outbox sweep continuation enqueue failed", { error });
+  }
 }
 
 export async function consumeDeliveryMessage(env: Env, message: Message<DeliveryQueueMessage>) {
-  const outboxId = message.body?.outboxId;
+  if (message.body && "sweep" in message.body && message.body.sweep) {
+    await sweepOutbox(env);
+    message.ack();
+    return;
+  }
+  const outboxId = message.body && "outboxId" in message.body ? message.body.outboxId : undefined;
   if (typeof outboxId !== "string") {
     message.ack();
     return;

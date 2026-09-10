@@ -22,7 +22,7 @@ type BlockRegistryEntry = {
 
 export const notionBlockRegistry = {
   paragraph: { notionType: "paragraph", richText: true, writable: true },
-  heading: { notionType: "heading", richText: true, writable: true },
+  heading: { notionType: "heading", richText: true, writable: false },
   bulletListItem: { notionType: "bulleted_list_item", richText: true, writable: true },
   numberedListItem: { notionType: "numbered_list_item", richText: true, writable: true },
   checkListItem: { notionType: "to_do", richText: true, writable: true },
@@ -54,7 +54,7 @@ export const notionBlockRegistry = {
 
 const NOTION_WRITABLE_BLOCK_TYPES = new Set([
   ...Object.values(notionBlockRegistry)
-    .filter((entry) => entry.writable && entry.notionType !== "heading")
+    .filter((entry) => entry.writable)
     .map((entry) => entry.notionType),
   "heading_1",
   "heading_2",

@@ -107,6 +107,7 @@ describe("diagram projection", () => {
     const secondFallback = renderDiagramSvg(oversized, { width: 960, height: 540, title: "Too large" });
     expect(firstFallback).toBe(secondFallback);
     expect(firstFallback).toContain("Diagram preview unavailable");
+    expect(firstFallback).toMatch(/<text[^>]*>Diagram preview unavailable<\/text>/);
     expect(firstFallback).not.toContain("node-0");
     expect(new TextEncoder().encode(firstFallback).byteLength).toBeLessThan(DIAGRAM_RENDER_MAX_SVG_BYTES);
     expect(() =>

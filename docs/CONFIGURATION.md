@@ -183,6 +183,9 @@ Two consequences worth internalising:
 
 Archive disconnects are far more forgiving: 50 per tick with a 10-second initial backoff.
 
+An outbox sweep is bounded to five batches of 50 rows. If immediately available rows remain, it logs
+the cap and enqueues a sweep continuation; the cron remains the recovery path if that queue send fails.
+
 Expired move receipts are retention cleanup, not retry work. Each pass deletes up to ten batches of
 1000 rows. Reaching that catch-up limit emits a warning because expired rows may remain; a sustained
 expiration rate above 40000 receipts per hour (10000 per tick, four ticks) will outgrow the configured

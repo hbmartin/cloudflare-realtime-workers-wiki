@@ -138,6 +138,25 @@ describe("collaboration durability barriers", () => {
     bundle.destroy();
   });
 
+  it("starts a fresh diagram quiet period after an offline deadline expires", async () => {
+    const bundle = createNetworkCollaboration("page", 1, vi.fn());
+    const doc = bundle.doc as typeof bundle.doc & { emitUpdate: (origin: unknown) => void };
+    const provider = mocks.providers[0]!;
+
+    doc.emitUpdate(null);
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(4_600);
+
+    doc.emitUpdate(null);
+    provider.synced = true;
+    await vi.advanceTimersByTimeAsync(499);
+    expect(provider.sendMessage).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(provider.sendMessage).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
   it("handles collaboration connection failures after IndexedDB sync", async () => {
     mocks.whenSynced = Promise.resolve();
     const onStatus = vi.fn();

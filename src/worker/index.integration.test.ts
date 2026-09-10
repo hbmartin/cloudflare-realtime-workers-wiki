@@ -1671,6 +1671,37 @@ describe("Worker integration", () => {
     ).resolves.toEqual({ content_hash: "old-hash", deleted_at: null });
   });
 
+  it("renders linked diagrams in synced-block previews with private resolvers", async () => {
+    const installed = await bootstrap();
+    const diagram = await createPage(installed.cookie, "diagram");
+    await env.DB.prepare(
+      `INSERT INTO transclusion_sources (page_id, block_id, content_json, projection_seq, updated_at)
+       VALUES (?, 'linked-diagram-block', ?, 1, ?)`,
+    )
+      .bind(
+        installed.pageId,
+        JSON.stringify([{ type: "linkedDiagram", attrs: { pageId: diagram.id, title: "System map" } }]),
+        Date.now(),
+      )
+      .run();
+
+    const response = await SELF.fetch(
+      authenticatedRequest(installed.cookie, "/api/transclusions/lookup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          references: [{ sourcePageId: installed.pageId, blockId: "linked-diagram-block" }],
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json<{ results: Array<{ status: string; content: string }> }>();
+    expect(body.results[0]).toMatchObject({ status: "ok" });
+    expect(body.results[0]?.content).toContain(`href="/?page=${diagram.id}"`);
+    expect(body.results[0]?.content).toContain(`src="/api/pages/${diagram.id}/diagram-thumbnail.svg"`);
+  });
+
   it("retires newly-created room state when its page no longer exists", async () => {
     const stub = env.DOCUMENT.getByName(`${crypto.randomUUID()}~1`);
     await stub.fetch(internalWarmupRequest());
@@ -3028,6 +3059,20 @@ describe("Worker integration", () => {
     await waitOnExecutionContext(restoreContext);
   });
 
+  it("rejects restoring a page that is not archived", async () => {
+    const installed = await bootstrap();
+
+    const restored = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/restore`, { method: "POST" }),
+    );
+
+    expect(restored.status).toBe(409);
+    expect(await restored.json()).toMatchObject({ error: { code: "page_not_archived" } });
+    await expect(
+      env.DB.prepare(`SELECT archived_at, revision FROM pages WHERE id = ?`).bind(installed.pageId).first(),
+    ).resolves.toEqual({ archived_at: null, revision: 1 });
+  });
+
   it("does not restore descendants that were archived independently", async () => {
     const installed = await bootstrap();
     const child = await createPage(installed.cookie, "document", installed.pageId);
@@ -3050,7 +3095,7 @@ describe("Worker integration", () => {
     const archived = await SELF.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }),
     );
-    expect(archived.status).toBe(200);
+    expect(archived.status).toBe(202);
     await expect(
       env.DB.prepare(`SELECT archived_at, archived_by, archive_operation_id FROM pages WHERE id = ?`)
         .bind(child.id)
@@ -3147,6 +3192,17 @@ describe("Worker integration", () => {
           .bind(installed.pageId)
           .first(),
       ).not.toBeNull();
+
+      const repeated = await SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }),
+      );
+      expect(repeated.status).toBe(202);
+      expect(await repeated.json()).toEqual({
+        ok: true,
+        pageIds: [installed.pageId],
+        cleanupPending: true,
+        pendingPageIds: [installed.pageId],
+      });
     } finally {
       await runInDurableObject(stub, async (instance) => {
         const document = instance as unknown as TestDocument;
@@ -5949,7 +6005,16 @@ describe("Worker integration", () => {
     );
     expect(thumbnail.status).toBe(200);
     expect(thumbnail.headers.get("etag")).toBe(`"${projection!.thumbnail_hash}"`);
+    expect(thumbnail.headers.get("x-content-type-options")).toBe("nosniff");
     expect(await thumbnail.text()).toContain("Edge gateway");
+
+    const notModified = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${diagramPage.id}/diagram-thumbnail.svg`, {
+        headers: { "if-none-match": `"${projection!.thumbnail_hash}"` },
+      }),
+    );
+    expect(notModified.status).toBe(304);
+    expect(notModified.headers.get("x-content-type-options")).toBe("nosniff");
 
     const indexed = await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`)
       .bind(diagramPage.id)

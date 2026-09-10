@@ -553,23 +553,21 @@ const linkToPage = createReactBlockSpec(
 export function LinkedDiagramView({
   pageId,
   title,
-  editable,
   update,
 }: {
   pageId: string;
   title: string;
-  editable: boolean;
   update?: (page: Pick<Page, "id" | "title">) => void;
 }) {
-  const canUpdate = editable && Boolean(update);
-  const [choosing, setChoosing] = useState(!pageId && canUpdate);
+  const [choosing, setChoosing] = useState(!pageId && Boolean(update));
   const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<SearchTitleSuggestion[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  const showPicker = Boolean(update) && (!pageId || choosing);
   useEffect(() => {
-    if (!choosing || !query.trim()) {
+    if (!showPicker || !query.trim()) {
       return undefined;
     }
     const controller = new AbortController();
@@ -587,8 +585,8 @@ export function LinkedDiagramView({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [choosing, query]);
-  const visibleSuggestions = choosing && query.trim() ? suggestions : [];
+  }, [showPicker, query]);
+  const visibleSuggestions = showPicker && query.trim() ? suggestions : [];
 
   async function createDiagram() {
     if (!update || busy) return;
@@ -612,7 +610,7 @@ export function LinkedDiagramView({
     }
   }
 
-  if (!pageId && !canUpdate) {
+  if (!pageId && !update) {
     return (
       <figure className="editor-linked-diagram" contentEditable={false}>
         <figcaption>
@@ -622,7 +620,7 @@ export function LinkedDiagramView({
     );
   }
 
-  if (!pageId || choosing) {
+  if (showPicker) {
     return (
       <div className="editor-linked-diagram-picker" contentEditable={false}>
         <strong>Link a whiteboard</strong>
@@ -646,11 +644,9 @@ export function LinkedDiagramView({
               <small>{suggestion.space.name}</small>
             </button>
           ))}
-          {canUpdate && (
-            <button type="button" disabled={busy} onClick={() => void createDiagram()}>
-              ＋ Create {query.trim() ? `“${query.trim()}”` : "child diagram"}
-            </button>
-          )}
+          <button type="button" disabled={busy} onClick={() => void createDiagram()}>
+            ＋ Create {query.trim() ? `“${query.trim()}”` : "child diagram"}
+          </button>
           {pageId && (
             <button type="button" onClick={() => setChoosing(false)}>
               Cancel
@@ -670,7 +666,7 @@ export function LinkedDiagramView({
           <span aria-hidden="true">◇</span> {title || "Linked whiteboard"}
         </figcaption>
       </a>
-      {editable && update && (
+      {update && (
         <button type="button" onClick={() => setChoosing(true)}>
           Change
         </button>
@@ -690,7 +686,6 @@ const linkedDiagram = createReactBlockSpec(
       <LinkedDiagramView
         pageId={block.props.pageId}
         title={block.props.title}
-        editable={editor.isEditable}
         update={
           editor.isEditable
             ? (page) => editor.updateBlock(block, { props: { pageId: page.id, title: page.title } })

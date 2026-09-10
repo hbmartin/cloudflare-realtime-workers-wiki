@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -71,10 +71,27 @@ describe("core editor blocks", () => {
   });
 
   it("renders an empty linked diagram inertly when the editor is read-only", () => {
-    render(createElement(LinkedDiagramView, { pageId: "", title: "System map", editable: false }));
+    render(createElement(LinkedDiagramView, { pageId: "", title: "System map" }));
 
     expect(screen.getByText(/System map unavailable/)).toBeInTheDocument();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("does not leave an open linked-diagram picker interactive after becoming read-only", () => {
+    const view = render(
+      createElement(LinkedDiagramView, {
+        pageId: "diagram-one",
+        title: "System map",
+        update: vi.fn(),
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    expect(screen.getByRole("textbox", { name: "Find a diagram" })).toBeInTheDocument();
+
+    view.rerender(createElement(LinkedDiagramView, { pageId: "diagram-one", title: "System map" }));
+
+    expect(screen.queryByRole("textbox", { name: "Find a diagram" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 });

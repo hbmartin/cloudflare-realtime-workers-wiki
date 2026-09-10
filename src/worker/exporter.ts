@@ -1,5 +1,5 @@
 import type { WorkflowStep } from "cloudflare:workers";
-import type { DiagramContentEnvelope, DocumentContentEnvelope, ExportFormat } from "../shared/types";
+import type { DiagramContentEnvelope, DocumentContentEnvelope, ExportFormat, ProseMirrorJson } from "../shared/types";
 import { serializeDocument } from "../shared/document-projection";
 import { renderDiagramSvg } from "../shared/diagram";
 import { createZip, type ZipEntry } from "../shared/zip";
@@ -25,6 +25,12 @@ type ExportPage = {
 type ExportColumn = { id: string; name: string };
 type ExportTableRow = { id: string; cells: string };
 type ExportAttachment = { id: string; r2_key: string; name: string; mime: string };
+type LinkedDiagramAsset = {
+  pageId: string;
+  path: string;
+  sourceHref: string;
+  bytes?: Uint8Array;
+};
 
 function jsonRecord(value: string) {
   const parsed: unknown = JSON.parse(value);
@@ -68,7 +74,67 @@ async function assertExportActive(env: Env, job: Pick<JobRow, "id" | "attempt">)
   }
 }
 
-async function documentExport(env: Env, page: ExportPage) {
+function collectLinkedDiagramIds(node: ProseMirrorJson, ids = new Set<string>()) {
+  if (node.type === "linkedDiagram" && typeof node.attrs?.pageId === "string" && node.attrs.pageId) {
+    ids.add(node.attrs.pageId);
+  }
+  for (const child of node.content ?? []) collectLinkedDiagramIds(child, ids);
+  return ids;
+}
+
+async function linkedDiagramAssets(
+  env: Env,
+  page: ExportPage,
+  document: ProseMirrorJson,
+  includeBytes: boolean,
+  requestedBy: string,
+) {
+  const ids = [...collectLinkedDiagramIds(document)];
+  if (!ids.length) return [];
+  const diagrams = await env.DB.prepare(
+    `SELECT page.id, page.content_epoch, page.title, projection.thumbnail_r2_key
+       FROM pages page
+       JOIN spaces space ON space.id = page.space_id AND space.workspace_id = page.workspace_id
+       JOIN workspace_members member ON member.workspace_id = page.workspace_id AND member.user_id = ?
+       LEFT JOIN space_members space_member ON space_member.space_id = space.id AND space_member.user_id = ?
+       LEFT JOIN diagram_projections projection
+         ON projection.page_id = page.id AND projection.content_epoch = page.content_epoch
+      WHERE page.id IN (SELECT value FROM json_each(?))
+        AND page.workspace_id = ? AND page.kind = 'diagram'
+        AND page.archived_at IS NULL AND page.import_job_id IS NULL
+        AND (member.role = 'owner' OR space.visibility = 'workspace' OR space_member.user_id IS NOT NULL)`,
+  )
+    .bind(requestedBy, requestedBy, JSON.stringify(ids), page.workspace_id)
+    .all<{ id: string; content_epoch: number; title: string; thumbnail_r2_key: string | null }>();
+  const baseUrl = env.BETTER_AUTH_URL.replace(/\/$/, "");
+  return Promise.all(
+    diagrams.results.map(async (diagram): Promise<LinkedDiagramAsset> => {
+      let bytes: Uint8Array | undefined;
+      if (includeBytes) {
+        const object = diagram.thumbnail_r2_key ? await env.BUCKET.get(diagram.thumbnail_r2_key) : null;
+        bytes = object
+          ? new Uint8Array(await object.arrayBuffer())
+          : new TextEncoder().encode(
+              renderDiagramSvg(
+                {
+                  nodes: [],
+                  edges: [],
+                },
+                { width: 960, height: 540, title: diagram.title },
+              ),
+            );
+      }
+      return {
+        pageId: diagram.id,
+        path: `linked-diagrams/${diagram.id}.svg`,
+        sourceHref: `${baseUrl}/api/pages/${encodeURIComponent(diagram.id)}/diagram-thumbnail.svg`,
+        ...(bytes ? { bytes } : {}),
+      };
+    }),
+  );
+}
+
+async function documentExport(env: Env, page: ExportPage, includeThumbnailBytes: boolean, requestedBy: string) {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/content", {
       headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
@@ -79,12 +145,23 @@ async function documentExport(env: Env, page: ExportPage) {
   if (envelope.pageId !== page.id || envelope.contentEpoch !== page.content_epoch) {
     throw new Error("The document projection did not match the requested page.");
   }
-  const serialized = serializeDocument(envelope.document);
+  const diagramAssets = await linkedDiagramAssets(env, page, envelope.document, includeThumbnailBytes, requestedBy);
+  const diagramAssetsById = new Map(diagramAssets.map((asset) => [asset.pageId, asset]));
+  const baseUrl = env.BETTER_AUTH_URL.replace(/\/$/, "");
+  const serialized = serializeDocument(envelope.document, {
+    pageHref: (pageId) => `${baseUrl}/?page=${encodeURIComponent(pageId)}`,
+    linkedDiagramThumbnailHref: (pageId) => {
+      const asset = diagramAssetsById.get(pageId);
+      if (!asset) return null;
+      return includeThumbnailBytes ? asset.path : asset.sourceHref;
+    },
+  });
   return {
     markdown: `# ${page.title.replaceAll("\n", " ")}\n\n${serialized.markdown}`,
     html: serialized.html
       .replace("<head>", `<head><title>${escapeHtml(page.title)}</title>`)
       .replace("<body>", `<body><h1>${escapeHtml(page.title)}</h1>`),
+    linkedDiagramAssets: diagramAssets,
   };
 }
 
@@ -193,11 +270,12 @@ async function portableExport(
   format: "markdown" | "html" | "json" | "svg",
   content: string,
   referencedAssetIds?: ReadonlySet<string>,
+  extraEntries: ZipEntry[] = [],
 ) {
   const attachments = await env.DB.prepare(`SELECT id, r2_key, name, mime FROM attachments WHERE page_id = ?`)
     .bind(page.id)
     .all<ExportAttachment>();
-  const entries: ZipEntry[] = [];
+  const entries: ZipEntry[] = [...extraEntries];
   const assetManifest: Array<{ id: string; path: string; name: string; mime: string }> = [];
   const used = new Set<string>();
   let rewritten = content;
@@ -241,13 +319,25 @@ function base64(bytes: Uint8Array) {
   return btoa(binary);
 }
 
-async function browserExportHtml(env: Env, job: JobRow, page: ExportPage, html: string) {
+async function browserExportHtml(
+  env: Env,
+  job: JobRow,
+  page: ExportPage,
+  html: string,
+  linkedDiagrams: LinkedDiagramAsset[] = [],
+) {
   const attachments = await env.DB.prepare(`SELECT id, r2_key, name, mime FROM attachments WHERE page_id = ?`)
     .bind(page.id)
     .all<ExportAttachment>();
   const referenced = new Set([...html.matchAll(/\b(?:src|href)="([^"]*)"/g)].map((match) => match[1]!));
   const replacements = new Map<string, string>();
   let inlined = 0;
+  for (const diagram of linkedDiagrams) {
+    if (!diagram.bytes || !referenced.has(diagram.path) || inlined + diagram.bytes.byteLength > PDF_INLINE_ASSET_LIMIT)
+      continue;
+    inlined += diagram.bytes.byteLength;
+    replacements.set(diagram.path, `data:image/svg+xml;base64,${base64(diagram.bytes)}`);
+  }
   for (const attachment of attachments.results) {
     const relative = `/api/attachments/${attachment.id}`;
     if (!referenced.has(relative)) continue;
@@ -283,10 +373,19 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
     if (!page) throw new Error("The page is no longer available for export.");
     const serialized =
       page.kind === "document"
-        ? await documentExport(env, page)
+        ? await documentExport(
+            env,
+            page,
+            options.format === "pdf" || (options.portable && options.format === "html"),
+            job.requested_by,
+          )
         : page.kind === "diagram"
           ? await diagramExport(env, page)
           : await tableExport(env, page);
+    const diagramAssets =
+      "linkedDiagramAssets" in serialized && Array.isArray(serialized.linkedDiagramAssets)
+        ? (serialized.linkedDiagramAssets as LinkedDiagramAsset[])
+        : [];
     await assertExportActive(env, job);
     let bytes: Uint8Array;
     let contentType: string;
@@ -294,7 +393,7 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
     if (options.format === "pdf") {
       if (!env.BROWSER) throw new Error("PDF export is not configured.");
       const response = await env.BROWSER.quickAction("pdf", {
-        html: await browserExportHtml(env, job, page, serialized.html),
+        html: await browserExportHtml(env, job, page, serialized.html, diagramAssets),
         pdfOptions: {
           format: "a4",
           landscape: page.kind === "diagram",
@@ -338,6 +437,7 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
           options.format,
           content,
           "assetIds" in serialized ? serialized.assetIds : undefined,
+          diagramAssets.flatMap((asset) => (asset.bytes ? [{ path: asset.path, bytes: asset.bytes }] : [])),
         );
         contentType = "application/zip";
         filename = `${fileStem(page.title)}-${options.format}.zip`;

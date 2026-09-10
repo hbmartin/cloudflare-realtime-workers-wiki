@@ -29,7 +29,10 @@ const integration = {
   lastUsedAt: null,
 };
 
-function loadResponse(path: string) {
+function loadResponse(
+  path: string,
+  webhookStatus: "pending_verification" | "active" | "paused" = "pending_verification",
+) {
   if (path === "/api/integrations") return { integrations: [integration] };
   if (path === "/api/webhooks")
     return {
@@ -40,7 +43,7 @@ function loadResponse(path: string) {
           integrationName: integration.name,
           url: "https://example.test/hook",
           events: [],
-          status: "pending_verification",
+          status: webhookStatus,
         },
       ],
     };
@@ -86,5 +89,51 @@ describe("integration settings errors", () => {
     await waitFor(() =>
       expect(screen.getByRole("alert")).toHaveTextContent("The verification request could not be resent."),
     );
+  });
+
+  it.each([
+    {
+      name: "verification",
+      status: "pending_verification" as const,
+      button: "Verify",
+      path: "/api/webhooks/webhook-one/verify",
+      method: "POST",
+      message: "The webhook could not be verified.",
+    },
+    {
+      name: "revocation",
+      status: "pending_verification" as const,
+      button: "Revoke",
+      path: "/api/integrations/integration-one",
+      method: "DELETE",
+      message: "The integration could not be revoked.",
+    },
+    {
+      name: "pause",
+      status: "active" as const,
+      button: "Pause",
+      path: "/api/webhooks/webhook-one",
+      method: "PATCH",
+      message: "The webhook could not be paused.",
+    },
+    {
+      name: "deletion",
+      status: "pending_verification" as const,
+      button: "Delete",
+      path: "/api/webhooks/webhook-one",
+      method: "DELETE",
+      message: "The webhook could not be deleted.",
+    },
+  ])("reports $name failures through the shared mutation error path", async (testCase) => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    mocks.api.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === testCase.path && init?.method === testCase.method) throw new Error(`${testCase.name} failed`);
+      return loadResponse(path, testCase.status);
+    });
+    render(<IntegrationsSettings owner pages={[]} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: testCase.button }));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(testCase.message));
   });
 });

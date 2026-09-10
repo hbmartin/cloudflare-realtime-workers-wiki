@@ -82,7 +82,6 @@ import {
 import type {
   ClientMemberContext,
   CommentAnchor,
-  DiagramContentEnvelope,
   ExportFormat,
   NotificationChannelMode,
   NotificationEventType,
@@ -101,7 +100,6 @@ import { compareBinaryText } from "../shared/tree-model";
 import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { constantTimeEqual } from "../shared/security";
-import { renderDiagramSvg } from "../shared/diagram";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { pageJson, type PageJsonRow } from "./page-row";
@@ -156,6 +154,7 @@ import {
   publicDiagramThumbnail,
   publicSitemap,
   renderPublicShare,
+  resolveSharedDiagram,
   resolveSharedPage,
   revokeShare,
   updateShare,
@@ -178,6 +177,7 @@ import {
   verifySlackRequest,
   type SlackEventPayload,
 } from "./slack";
+import { diagramThumbnailResponse } from "./diagram-thumbnail";
 
 const app = new Hono<{ Bindings: Env }>();
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -2511,7 +2511,13 @@ app.post("/api/transclusions/lookup", async (c) => {
           .first<{ content_json: string }>();
         if (!source) return { ...reference, status: "not_found" as const };
         const content = JSON.parse(source.content_json) as ProseMirrorJson[];
-        const html = serializeDocument({ type: "doc", content: [{ type: "blockGroup", content }] }).html;
+        const html = serializeDocument(
+          { type: "doc", content: [{ type: "blockGroup", content }] },
+          {
+            pageHref: (pageId) => `/?page=${encodeURIComponent(pageId)}`,
+            linkedDiagramThumbnailHref: (pageId) => `/api/pages/${encodeURIComponent(pageId)}/diagram-thumbnail.svg`,
+          },
+        ).html;
         return {
           ...reference,
           status: "ok" as const,
@@ -2871,33 +2877,15 @@ app.get("/api/pages/:id/diagram-thumbnail.svg", async (c) => {
   if (page.kind !== "diagram") {
     throw new HttpError(422, "diagram_required", "Thumbnails are only available for diagram pages.");
   }
-  const projection = await c.env.DB.prepare(
-    `SELECT thumbnail_r2_key, thumbnail_hash FROM diagram_projections
-      WHERE page_id = ? AND content_epoch = ?`,
-  )
-    .bind(page.id, page.content_epoch)
-    .first<{ thumbnail_r2_key: string; thumbnail_hash: string }>();
-  const etag = `"${projection?.thumbnail_hash ?? `empty-${page.content_epoch}`}"`;
-  const headers = new Headers({
-    "content-type": "image/svg+xml; charset=utf-8",
-    "cache-control": "private, max-age=0, must-revalidate",
-    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
-    etag,
-  });
-  if (c.req.header("if-none-match") === etag) return new Response(null, { status: 304, headers });
-  if (projection) {
-    const thumbnail = await c.env.BUCKET.get(projection.thumbnail_r2_key);
-    if (thumbnail) return new Response(thumbnail.body, { headers });
-  }
-  const empty: DiagramContentEnvelope = {
-    schemaVersion: 1,
-    pageId: page.id,
-    contentEpoch: page.content_epoch,
-    sequence: 0,
-    nodes: [],
-    edges: [],
-  };
-  return new Response(renderDiagramSvg(empty, { width: 960, height: 540, title: page.title }), { headers });
+  const ifNoneMatch = c.req.header("if-none-match");
+  return diagramThumbnailResponse(
+    c.env,
+    { id: page.id, content_epoch: page.content_epoch, title: page.title },
+    {
+      cacheControl: "private, max-age=0, must-revalidate",
+      ...(ifNoneMatch ? { ifNoneMatch } : {}),
+    },
+  );
 });
 
 app.patch("/api/pages/:id", async (c) => {
@@ -3212,7 +3200,7 @@ app.delete("/api/pages/:id", async (c) => {
   const archiveTimestamp = page.archived_at ?? timestamp;
   const archiveOperationId = page.archived_at === null ? crypto.randomUUID() : (page.archive_operation_id ?? null);
   const archiveOwner = page.archived_at === null ? member.user.id : (page.archived_by ?? member.user.id);
-  const archiveBatch = await c.env.DB.batch<{ page_id: string; content_epoch: number }>([
+  await c.env.DB.batch([
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
@@ -3247,15 +3235,26 @@ app.delete("/api/pages/:id", async (c) => {
       SELECT id FROM subtree
     )`).bind(page.id),
   ]);
-  const archived = await c.env.DB.prepare(
-    `WITH RECURSIVE subtree(id) AS (
-       SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-     ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
-  )
-    .bind(page.id)
-    .all<{ id: string; kind: PageKind; content_epoch: number }>();
+  const [archived, pendingTargets] = await Promise.all([
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
+    )
+      .bind(page.id)
+      .all<{ id: string; kind: PageKind; content_epoch: number }>(),
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       )
+       SELECT target.page_id, target.content_epoch
+         FROM archive_disconnect_targets target JOIN subtree ON subtree.id = target.page_id
+        ORDER BY target.created_at, target.page_id`,
+    )
+      .bind(page.id)
+      .all<{ page_id: string; content_epoch: number }>(),
+  ]);
   const pageIds = archived.results.map((item) => item.id);
-  const collaborativePages = archiveBatch[0]?.results ?? [];
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
     pageIds,
@@ -3264,7 +3263,7 @@ app.delete("/api/pages/:id", async (c) => {
   });
   const pendingPageIds = await processArchiveDisconnectTargets(
     c.env,
-    collaborativePages.map((item) => ({
+    pendingTargets.results.map((item) => ({
       page_id: item.page_id,
       content_epoch: item.content_epoch,
     })),
@@ -3285,6 +3284,9 @@ app.post("/api/pages/:id/restore", async (c) => {
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
+  if (page.archived_at === null) {
+    throw new HttpError(409, "page_not_archived", "The page is not archived.");
+  }
   const archiveTimestamp = page.archived_at;
   const archiveOperationId = page.archive_operation_id ?? null;
   const archiveOwnershipSql = archiveOperationId
@@ -3336,11 +3338,7 @@ app.post("/api/pages/:id/restore", async (c) => {
     // Read the restored snapshot in the same transaction as the update.
     restoredSnapshotStatement,
   );
-  if (
-    !restored ||
-    !restored.results.some((item) => item.id === page.id) ||
-    restored.results.some((item) => item.archived_at !== null)
-  ) {
+  if (!restored || !restored.results.some((item) => item.id === page.id)) {
     throw new Error("The restore batch did not return its authoritative page snapshot.");
   }
   const restoredPages = restored.results.map(pageJson);
@@ -5182,9 +5180,14 @@ app.get("/share/:key/diagram-thumbnails/:fileName", async (c) => {
   const fileName = c.req.param("fileName");
   if (!fileName.endsWith(".svg")) return c.text("Not found", 404);
   const pageId = fileName.slice(0, -4);
-  const share = await resolveSharedPage(c.env, c.req.param("key"), pageId);
-  if (!share) return c.text("Not found", 404);
-  return (await publicDiagramThumbnail(c.env, share)) ?? c.text("Not found", 404);
+  const sourcePageId = c.req.query("source");
+  if (!sourcePageId) return c.text("Not found", 404);
+  const [diagram, source] = await Promise.all([
+    resolveSharedDiagram(c.env, c.req.param("key"), pageId),
+    resolveSharedPage(c.env, c.req.param("key"), sourcePageId),
+  ]);
+  if (!diagram || !source) return c.text("Not found", 404);
+  return (await publicDiagramThumbnail(c.env, diagram, source)) ?? c.text("Not found", 404);
 });
 
 app.get("/share/:key/sitemap.xml", async (c) => {

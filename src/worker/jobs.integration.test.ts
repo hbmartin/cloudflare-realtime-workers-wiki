@@ -17,6 +17,7 @@ import {
   runCommentMigration,
   runTemplateClone,
   sweepOutbox,
+  type DeliveryQueueMessage,
   type JobRow,
 } from "./jobs";
 import worker from "./index";
@@ -1063,6 +1064,52 @@ describe("job execution", () => {
     expect(new TextDecoder().decode(entries[1]!.bytes)).toBe("portable bytes");
   });
 
+  it("exports linked diagrams with page links and portable HTML thumbnails", async () => {
+    const installed = await bootstrap();
+    const created = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "diagram", title: "Service map" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const diagram = (await created.json<{ page: Page }>()).page;
+    const source = new Y.Doc();
+    const linked = new Y.XmlElement("linkedDiagram");
+    linked.setAttribute("pageId", diagram.id);
+    linked.setAttribute("title", diagram.title);
+    source.getXmlFragment("document-store").insert(0, [linked]);
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+
+    const context = createExecutionContext();
+    const queued = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "html", portable: true }),
+      }),
+      inlineBindings(),
+      context,
+    );
+    expect(queued.status).toBe(202);
+    const job = (await queued.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    const download = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}/download`),
+      env,
+      createExecutionContext(),
+    );
+    const entries = await readZip(new Uint8Array(await download.arrayBuffer()));
+    expect(entries.map((entry) => entry.path)).toEqual(["Welcome.html", `linked-diagrams/${diagram.id}.svg`]);
+    const html = new TextDecoder().decode(entries[0]!.bytes);
+    expect(html).toContain(`href="http://example.test/?page=${diagram.id}"`);
+    expect(html).toContain(`src="linked-diagrams/${diagram.id}.svg"`);
+    expect(new TextDecoder().decode(entries[1]!.bytes)).toContain("Service map");
+  });
+
   it("exports a diagram as structured JSON", async () => {
     const installed = await bootstrap();
     const created = await worker.fetch(
@@ -1681,7 +1728,7 @@ describe("delivery outbox", () => {
     expect(new Set(send.mock.calls.map(([body]) => (body as { outboxId: string }).outboxId))).toEqual(new Set(ids));
   });
 
-  it("caps one sweep and leaves additional available rows for the next invocation", async () => {
+  it("continues a capped sweep through the delivery queue", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();
     const ids = Array.from({ length: 251 }, () => crypto.randomUUID());
@@ -1698,19 +1745,34 @@ describe("delivery outbox", () => {
     }
     const send = vi.fn(async (_body: unknown) => undefined);
     const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     await sweepOutbox(bindings);
 
-    expect(send).toHaveBeenCalledTimes(250);
+    expect(send).toHaveBeenCalledTimes(251);
+    expect(send).toHaveBeenLastCalledWith({ sweep: true });
+    expect(warning).toHaveBeenCalledWith("Outbox sweep cap reached; scheduling continuation", { maxRows: 250 });
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 1 });
 
-    await sweepOutbox(bindings);
-    expect(send).toHaveBeenCalledTimes(251);
+    const ack = vi.fn();
+    await consumeDeliveryMessage(bindings, {
+      id: "sweep-continuation",
+      timestamp: new Date(),
+      body: { sweep: true },
+      attempts: 1,
+      ack,
+      retry: vi.fn(),
+    } satisfies Message<DeliveryQueueMessage>);
+
+    expect(send).toHaveBeenCalledTimes(252);
+    expect(send).toHaveBeenLastCalledWith({ outboxId: ids[250] });
+    expect(ack).toHaveBeenCalledOnce();
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 0 });
+    warning.mockRestore();
   });
 
   it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {

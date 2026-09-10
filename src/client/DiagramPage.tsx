@@ -22,7 +22,7 @@ import {
   type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import * as Y from "yjs";
 import {
   DEFAULT_NODE_SIZE,
@@ -635,6 +635,7 @@ function DiagramCanvas({
   const [remote, setRemote] = useState<RemotePresence[]>([]);
   const imageInput = useRef<HTMLInputElement>(null);
   const clipboard = useRef<{ nodes: DiagramNode[]; edges: DiagramEdge[] } | null>(null);
+  const canInsertNode = useRef(editable && synced);
   const roots = useMemo(() => diagramRoots(bundle.doc), [bundle.doc]);
   const undo = useMemo(
     () =>
@@ -774,10 +775,16 @@ function DiagramCanvas({
   }, [bundle.provider.awareness, member.user.id, member.user.name]);
 
   useEffect(() => () => undo.destroy(), [undo]);
+  useLayoutEffect(() => {
+    canInsertNode.current = editable && synced;
+    return () => {
+      canInsertNode.current = false;
+    };
+  }, [editable, synced]);
 
   const addNode = useCallback(
-    (type: DiagramNodeType, assetId: string | null = null) => {
-      if (!editable || !synced) return;
+    (type: DiagramNodeType, assetId: string | null = null): boolean => {
+      if (!canInsertNode.current) return false;
       const node = newNode(type, records.nodes.length, assetId);
       const center = instance?.screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
       if (center) {
@@ -785,8 +792,9 @@ function DiagramCanvas({
         node.y = center.y - node.height / 2;
       }
       bundle.doc.transact(() => roots.nodes.set(node.id, diagramNodeMap(node)), transactionOrigin);
+      return true;
     },
-    [bundle.doc, editable, instance, records.nodes.length, roots.nodes, synced, transactionOrigin],
+    [bundle.doc, instance, records.nodes.length, roots.nodes, transactionOrigin],
   );
 
   const updateNode = useCallback(
@@ -951,8 +959,7 @@ function DiagramCanvas({
             if (file) {
               void uploadAttachment(page.id, file)
                 .then((attachment) => {
-                  addNode("image", attachment.id);
-                  onError("");
+                  if (addNode("image", attachment.id)) onError("");
                 })
                 .catch((cause) => onError(apiErrorMessage(cause, "The diagram image could not be uploaded.")));
             }

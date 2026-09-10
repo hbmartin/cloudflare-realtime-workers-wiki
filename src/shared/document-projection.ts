@@ -152,7 +152,7 @@ function listTagFor(node: ProseMirrorJson): "ul" | "ol" | null {
 }
 
 export type DocumentSerializationOptions = {
-  linkedDiagramPageHref?: (pageId: string) => string | null;
+  pageHref?: (pageId: string, nodeType: "linkToPage" | "linkedDiagram") => string | null;
   linkedDiagramThumbnailHref?: (pageId: string) => string | null;
 };
 
@@ -330,15 +330,18 @@ function serializeNode(
   if (type === "linkToPage") {
     const pageId = stringAttr(node, "pageId") ?? "";
     const title = stringAttr(node, "title") ?? "Linked page";
-    const href = `/?page=${encodeURIComponent(pageId)}`;
+    const href = safeUrl(options.pageHref?.(pageId, "linkToPage"));
+    const label = escapeMarkdownInline(title);
     return format === "html"
-      ? `<p class="linked-page"><a href="${escapeHtml(href)}">${escapeHtml(title)}</a></p>`
-      : `[${escapeMarkdownInline(title)}](${markdownDestination(href)})\n\n`;
+      ? `<p class="linked-page">${href ? `<a href="${escapeHtml(href)}">${escapeHtml(title)}</a>` : escapeHtml(title)}</p>`
+      : href
+        ? `[${label}](${markdownDestination(href)})\n\n`
+        : `${label}\n\n`;
   }
   if (type === "linkedDiagram") {
     const pageId = stringAttr(node, "pageId") ?? "";
     const title = stringAttr(node, "title") ?? "Linked whiteboard";
-    const href = safeUrl(options.linkedDiagramPageHref?.(pageId));
+    const href = safeUrl(options.pageHref?.(pageId, "linkedDiagram"));
     const thumbnail = safeUrl(options.linkedDiagramThumbnailHref?.(pageId));
     if (format === "markdown") {
       const label = escapeMarkdownInline(title);
