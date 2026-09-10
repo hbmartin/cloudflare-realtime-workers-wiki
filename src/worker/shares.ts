@@ -212,10 +212,12 @@ async function resolveSharedTarget(
   if (!share) return null;
   const pageId = requestedPageId ?? share.root_page_id;
   const page = await env.DB.prepare(
-    `WITH RECURSIVE ancestors(id, parent_id) AS (
-       SELECT id, parent_id FROM pages WHERE id = ?
+    `WITH RECURSIVE ancestors(id, parent_id, depth) AS (
+       SELECT id, parent_id, 0 FROM pages WHERE id = ? AND archived_at IS NULL AND import_job_id IS NULL
        UNION ALL
-       SELECT parent.id, parent.parent_id FROM pages parent JOIN ancestors child ON parent.id = child.parent_id
+       SELECT parent.id, parent.parent_id, child.depth + 1
+         FROM pages parent JOIN ancestors child ON parent.id = child.parent_id
+        WHERE parent.archived_at IS NULL AND parent.import_job_id IS NULL AND child.depth < 50
      )
      SELECT share.*, page.id page_id, page.parent_id, page.title page_title, page.icon page_icon,
             page.kind page_kind, page.content_epoch, page.updated_at page_updated_at
@@ -223,7 +225,10 @@ async function resolveSharedTarget(
       WHERE share.id = ? AND share.revoked_at IS NULL
         AND page.workspace_id = share.workspace_id AND page.archived_at IS NULL AND page.import_job_id IS NULL
         AND page.kind ${target === "diagram" ? "=" : "<>"} 'diagram'
-        AND EXISTS (SELECT 1 FROM pages root WHERE root.id = share.root_page_id AND root.archived_at IS NULL)
+        AND EXISTS (
+          SELECT 1 FROM pages root
+           WHERE root.id = share.root_page_id AND root.archived_at IS NULL AND root.import_job_id IS NULL
+        )
         AND (page.id = share.root_page_id OR
              (share.include_subpages = 1 AND EXISTS (SELECT 1 FROM ancestors WHERE id = share.root_page_id)))`,
   )
@@ -339,7 +344,7 @@ async function eligibleSharedDiagramIds(env: Env, share: SharedPageRow, requeste
        SELECT ?, 0
        UNION ALL
        SELECT child.id, subtree.depth + 1 FROM pages child JOIN subtree ON child.parent_id = subtree.id
-        WHERE subtree.depth < 50
+        WHERE child.archived_at IS NULL AND child.import_job_id IS NULL AND subtree.depth < 50
      )
      SELECT page.id
        FROM pages page JOIN subtree ON subtree.id = page.id
@@ -533,7 +538,6 @@ export async function publicAttachment(env: Env, share: SharedPageRow, attachmen
 
 export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, source: SharedPageRow) {
   if (diagram.page_kind !== "diagram" || source.page_kind !== "document") return null;
-  let envelope: DocumentContentEnvelope;
   try {
     const response = await env.DOCUMENT.getByName(`${source.page_id}~${source.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
@@ -542,16 +546,24 @@ export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, s
       }),
     );
     if (!response.ok) return null;
-    envelope = await response.json<DocumentContentEnvelope>();
+    const envelope: unknown = await response.json();
+    if (
+      typeof envelope !== "object" ||
+      envelope === null ||
+      !("pageId" in envelope) ||
+      envelope.pageId !== source.page_id ||
+      !("contentEpoch" in envelope) ||
+      envelope.contentEpoch !== source.content_epoch ||
+      !("document" in envelope) ||
+      typeof envelope.document !== "object" ||
+      envelope.document === null ||
+      Array.isArray(envelope.document) ||
+      !collectLinkedDiagramIds(envelope.document as ProseMirrorJson).has(diagram.page_id)
+    )
+      return null;
   } catch {
     return null;
   }
-  if (
-    envelope.pageId !== source.page_id ||
-    envelope.contentEpoch !== source.content_epoch ||
-    !collectLinkedDiagramIds(envelope.document).has(diagram.page_id)
-  )
-    return null;
   return diagramThumbnailResponse(
     env,
     { id: diagram.page_id, content_epoch: diagram.content_epoch, title: diagram.page_title },

@@ -1187,9 +1187,22 @@ export async function sweepOutbox(env: Env, continuation = false) {
         .bind(Date.now(), claimToken)
         .first<{ id: number }>(),
     );
+  const renewLease = async () => {
+    const renewedAt = Date.now();
+    return Boolean(
+      await env.DB.prepare(
+        `UPDATE outbox_sweep_state SET lease_until = ?, updated_at = ?
+          WHERE id = 1 AND lease_token = ? AND lease_until > ?
+          RETURNING id`,
+      )
+        .bind(renewedAt + OUTBOX_SWEEP_LEASE_MS, renewedAt, claimToken, renewedAt)
+        .first<{ id: number }>(),
+    );
+  };
 
   try {
     for (let batch = 0; batch < OUTBOX_SWEEP_MAX_BATCHES; batch += 1) {
+      if (!(await renewLease())) return false;
       const rows = await env.DB.prepare(
         `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
           ORDER BY available_at, created_at, id LIMIT ?`,
@@ -1197,6 +1210,7 @@ export async function sweepOutbox(env: Env, continuation = false) {
         .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
         .all<{ id: string }>();
       for (const row of rows.results) {
+        if (!(await renewLease())) return false;
         try {
           await enqueueOutbox(env, row.id);
         } catch (error) {
@@ -1222,6 +1236,7 @@ export async function sweepOutbox(env: Env, continuation = false) {
     console.warn("Outbox sweep cap reached; scheduling continuation", {
       maxRows: OUTBOX_SWEEP_BATCH_SIZE * OUTBOX_SWEEP_MAX_BATCHES,
     });
+    if (!(await renewLease())) return false;
     try {
       await env.DELIVERY_QUEUE.send({ sweep: true });
     } catch (error) {

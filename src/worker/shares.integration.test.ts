@@ -108,6 +108,9 @@ describe("public page shares", () => {
     expect(sitemapXml).toContain(nested.id);
     expect(sitemapXml).not.toContain(diagram.id);
 
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), diagram.id).run();
+    expect((await SELF.fetch(`http://example.test/share/${key}/pages/${nested.id}`)).status).toBe(404);
+
     await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, { method: "DELETE" });
     expect((await SELF.fetch(`http://example.test/share/${key}`)).status).toBe(404);
   });
@@ -167,10 +170,13 @@ describe("public page shares", () => {
     const linked = new Y.XmlElement("linkedDiagram");
     linked.setAttribute("pageId", linkedDiagram.id);
     linked.setAttribute("title", "Linked system map");
+    const outsideLink = new Y.XmlElement("linkedDiagram");
+    outsideLink.setAttribute("pageId", outsideDiagram.id);
+    outsideLink.setAttribute("title", "Outside system map");
     const reference = new Y.XmlElement("syncedBlockReference");
     reference.setAttribute("sourcePageId", sourcePage.id);
     reference.setAttribute("blockId", "system-map-source");
-    source.getXmlFragment("document-store").insert(0, [linked, reference]);
+    source.getXmlFragment("document-store").insert(0, [linked, outsideLink, reference]);
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
 
     const transclusionSource = new Y.Doc();
@@ -198,6 +204,7 @@ describe("public page shares", () => {
     const key = new URL(share.url).pathname.split("/").at(-1)!;
     const linkedThumbnailUrl = `/share/${key}/diagram-thumbnails/${linkedDiagram.id}.svg?source=${installed.pageId}`;
     const transcludedThumbnailUrl = `/share/${key}/diagram-thumbnails/${transcludedDiagram.id}.svg?source=${sourcePage.id}`;
+    const outsideThumbnailUrl = `/share/${key}/diagram-thumbnails/${outsideDiagram.id}.svg?source=${installed.pageId}`;
 
     const rootOnly = await SELF.fetch(`http://example.test/share/${key}`);
     expect(rootOnly.status).toBe(200);
@@ -214,6 +221,7 @@ describe("public page shares", () => {
     const rootHtml = await root.text();
     expect(rootHtml).toContain(`src="${linkedThumbnailUrl}"`);
     expect(rootHtml).toContain(`src="${transcludedThumbnailUrl}"`);
+    expect(rootHtml).not.toContain(`src="${outsideThumbnailUrl}"`);
 
     const thumbnail = await SELF.fetch(`http://example.test${linkedThumbnailUrl}`);
     expect(thumbnail.status).toBe(200);
@@ -232,13 +240,9 @@ describe("public page shares", () => {
         )
       ).status,
     ).toBe(404);
-    expect(
-      (
-        await SELF.fetch(
-          `http://example.test/share/${key}/diagram-thumbnails/${outsideDiagram.id}.svg?source=${installed.pageId}`,
-        )
-      ).status,
-    ).toBe(404);
+    const outsideThumbnail = await SELF.fetch(`http://example.test${outsideThumbnailUrl}`);
+    expect(outsideThumbnail.status).toBe(404);
+    expect(outsideThumbnail.headers.get("cache-control")).toBe("no-store");
     expect(
       (
         await SELF.fetch(

@@ -1195,16 +1195,24 @@ describe("job execution", () => {
     expect((await portableResult.json<{ job: Job }>()).job.status).toBe("succeeded");
   });
 
-  it("allows non-portable exports with more than 64 dangling linked-diagram ids", async () => {
+  it("rejects an export when a referenced diagram is archived", async () => {
     const installed = await bootstrap();
+    const created = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "diagram", title: "Archived map" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const diagram = (await created.json<{ page: Page }>()).page;
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), diagram.id).run();
     const source = new Y.Doc();
-    const fragment = source.getXmlFragment("document-store");
-    for (let index = 0; index < 65; index += 1) {
-      const linked = new Y.XmlElement("linkedDiagram");
-      linked.setAttribute("pageId", `diagram-${index}`);
-      linked.setAttribute("title", `Diagram ${index}`);
-      fragment.push([linked]);
-    }
+    const linked = new Y.XmlElement("linkedDiagram");
+    linked.setAttribute("pageId", diagram.id);
+    linked.setAttribute("title", diagram.title);
+    source.getXmlFragment("document-store").push([linked]);
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
     const context = createExecutionContext();
 
@@ -1226,7 +1234,10 @@ describe("job execution", () => {
       env,
       createExecutionContext(),
     );
-    expect((await completed.json<{ job: Job }>()).job.status).toBe("succeeded");
+    expect((await completed.json<{ job: Job }>()).job).toMatchObject({
+      status: "failed",
+      error: { code: "job_failed", message: "A linked diagram is unavailable for export." },
+    });
   });
 
   it("rejects byte-bearing exports with more than 64 accessible linked diagrams", async () => {
@@ -1942,6 +1953,33 @@ describe("delivery outbox", () => {
     expect(new Set(send.mock.calls.map(([body]) => (body as { outboxId: string }).outboxId))).toEqual(
       new Set([firstId, secondId]),
     );
+  });
+
+  it("stops enqueueing immediately when the sweep lease is lost", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const ids = [crypto.randomUUID(), crypto.randomUUID()];
+    await env.DB.batch(
+      ids.map((id, index) =>
+        env.DB.prepare(
+          `INSERT INTO outbox
+            (id, workspace_id, topic, payload_json, available_at, created_at)
+           VALUES (?, ?, 'notification', '{}', ?, ?)`,
+        ).bind(id, installed.workspaceId, timestamp - 1, timestamp + index),
+      ),
+    );
+    const send = vi.fn(async (_body: unknown) => {
+      await env.DB.prepare(`UPDATE outbox_sweep_state SET lease_token = 'replacement', lease_until = ? WHERE id = 1`)
+        .bind(Date.now() + 60_000)
+        .run();
+    });
+
+    await expect(sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }))).resolves.toBe(false);
+
+    expect(send).toHaveBeenCalledOnce();
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
+    ).resolves.toEqual({ count: 1 });
   });
 
   it("enqueues every immediately available row across sweep batches", async () => {

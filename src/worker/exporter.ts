@@ -126,6 +126,9 @@ async function linkedDiagramAssets(
       .all<DiagramRow>();
     for (const diagram of rows.results) diagramById.set(diagram.id, diagram);
   }
+  if (ids.some((id) => !diagramById.has(id))) {
+    throw new Error("A linked diagram is unavailable for export.");
+  }
   const diagrams = ids.flatMap((id) => {
     const diagram = diagramById.get(id);
     return diagram ? [diagram] : [];

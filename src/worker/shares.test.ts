@@ -79,4 +79,16 @@ describe("public document rendering", () => {
     expect(env.DOCUMENT.getByName).toHaveBeenCalledWith("source~3");
     expect(fetch).toHaveBeenCalledOnce();
   });
+
+  it("fails closed when live linked-diagram verification returns a malformed envelope", async () => {
+    const fetch = vi.fn(async () => Response.json({ pageId: "source", contentEpoch: 3 }));
+    const env = {
+      BETTER_AUTH_SECRET: "internal-secret",
+      DOCUMENT: { getByName: vi.fn(() => ({ fetch })) },
+    } as unknown as Env;
+    const diagram = { page_id: "diagram", page_kind: "diagram" } as SharedPageRow;
+    const source = { page_id: "source", page_kind: "document", content_epoch: 3 } as SharedPageRow;
+
+    await expect(publicDiagramThumbnail(env, diagram, source)).resolves.toBeNull();
+  });
 });
