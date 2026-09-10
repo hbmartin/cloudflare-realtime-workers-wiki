@@ -87,12 +87,16 @@ async function assertExportActive(env: Env, job: Pick<JobRow, "id" | "attempt">)
 
 async function linkedDiagramAssets(
   env: Env,
+  job: Pick<JobRow, "id" | "attempt">,
   page: ExportPage,
   document: ProseMirrorJson,
   includeBytes: boolean,
   requestedBy: string,
 ): Promise<LinkedDiagramAsset[]> {
-  const ids = [...collectLinkedDiagramIds(document)].slice(0, LINKED_DIAGRAM_ASSET_LIMIT);
+  const ids = [...collectLinkedDiagramIds(document)];
+  if (ids.length > LINKED_DIAGRAM_ASSET_LIMIT) {
+    throw new Error(`The export contains more than ${LINKED_DIAGRAM_ASSET_LIMIT} linked diagrams.`);
+  }
   if (!ids.length) return [];
   const diagrams = await env.DB.prepare(
     `SELECT page.id, page.content_epoch, page.title, projection.thumbnail_r2_key, projection.thumbnail_byte_size
@@ -120,21 +124,40 @@ async function linkedDiagramAssets(
   let loadedBytes = 0;
   for (const diagram of diagrams.results) {
     let bytes: Uint8Array | undefined;
-    if (includeBytes && loadedBytes < PDF_INLINE_ASSET_LIMIT) {
+    if (includeBytes) {
       const remaining = PDF_INLINE_ASSET_LIMIT - loadedBytes;
-      const object =
-        diagram.thumbnail_r2_key && (diagram.thumbnail_byte_size ?? Number.POSITIVE_INFINITY) <= remaining
-          ? await env.BUCKET.get(diagram.thumbnail_r2_key)
-          : null;
-      if (object && object.size <= remaining) {
+      let object: R2ObjectBody | null = null;
+      if (diagram.thumbnail_r2_key) {
+        if (
+          diagram.thumbnail_byte_size === null ||
+          !Number.isSafeInteger(diagram.thumbnail_byte_size) ||
+          diagram.thumbnail_byte_size < 0
+        ) {
+          throw new Error("A linked diagram thumbnail has invalid size metadata.");
+        }
+        if (diagram.thumbnail_byte_size > remaining) {
+          throw new Error("Linked diagram thumbnails exceed the 24 MiB export asset limit.");
+        }
+        await assertExportActive(env, job);
+        object = await env.BUCKET.get(diagram.thumbnail_r2_key);
+      }
+      if (object) {
+        if (object.size > remaining) {
+          throw new Error("Linked diagram thumbnails exceed the 24 MiB export asset limit.");
+        }
         bytes = new Uint8Array(await object.arrayBuffer());
-      } else if (!diagram.thumbnail_r2_key || (diagram.thumbnail_byte_size ?? 0) <= remaining) {
-        const placeholder = new TextEncoder().encode(
+        if (bytes.byteLength > remaining) {
+          throw new Error("Linked diagram thumbnails exceed the 24 MiB export asset limit.");
+        }
+      } else {
+        bytes = new TextEncoder().encode(
           renderDiagramSvg({ nodes: [], edges: [] }, { width: 960, height: 540, title: diagram.title }),
         );
-        if (placeholder.byteLength <= remaining) bytes = placeholder;
+        if (bytes.byteLength > remaining) {
+          throw new Error("Linked diagram thumbnails exceed the 24 MiB export asset limit.");
+        }
       }
-      loadedBytes += bytes?.byteLength ?? 0;
+      loadedBytes += bytes.byteLength;
     }
     assets.push({
       pageId: diagram.id,
@@ -148,6 +171,7 @@ async function linkedDiagramAssets(
 
 async function documentExport(
   env: Env,
+  job: Pick<JobRow, "id" | "attempt">,
   page: ExportPage,
   includeThumbnailBytes: boolean,
   requestedBy: string,
@@ -162,7 +186,14 @@ async function documentExport(
   if (envelope.pageId !== page.id || envelope.contentEpoch !== page.content_epoch) {
     throw new Error("The document projection did not match the requested page.");
   }
-  const diagramAssets = await linkedDiagramAssets(env, page, envelope.document, includeThumbnailBytes, requestedBy);
+  const diagramAssets = await linkedDiagramAssets(
+    env,
+    job,
+    page,
+    envelope.document,
+    includeThumbnailBytes,
+    requestedBy,
+  );
   const diagramAssetsById = new Map(diagramAssets.map((asset) => [asset.pageId, asset]));
   const baseUrl = env.BETTER_AUTH_URL.replace(/\/$/, "");
   const serialized = serializeDocument(envelope.document, {
@@ -348,8 +379,11 @@ async function browserExportHtml(
   const replacements = new Map<string, string>();
   let inlined = 0;
   for (const diagram of linkedDiagrams) {
-    if (!diagram.bytes || !referenced.has(diagram.path) || inlined + diagram.bytes.byteLength > PDF_INLINE_ASSET_LIMIT)
-      continue;
+    if (!referenced.has(diagram.path)) continue;
+    if (!diagram.bytes) throw new Error("A linked diagram thumbnail is unavailable for PDF export.");
+    if (inlined + diagram.bytes.byteLength > PDF_INLINE_ASSET_LIMIT) {
+      throw new Error("Linked diagram thumbnails exceed the 24 MiB export asset limit.");
+    }
     inlined += diagram.bytes.byteLength;
     replacements.set(diagram.path, `data:image/svg+xml;base64,${base64(diagram.bytes)}`);
   }
@@ -390,6 +424,7 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
       page.kind === "document"
         ? await documentExport(
             env,
+            job,
             page,
             options.format === "pdf" || (options.portable && options.format === "html"),
             job.requested_by,

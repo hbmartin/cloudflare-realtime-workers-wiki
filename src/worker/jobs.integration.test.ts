@@ -1,5 +1,5 @@
 import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionContext } from "cloudflare:test";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
 import type { DiagramContentEnvelope, Job, Page } from "../shared/types";
@@ -1110,7 +1110,7 @@ describe("job execution", () => {
     expect(new TextDecoder().decode(entries[1]!.bytes)).toContain("Service map");
   });
 
-  it("omits unresolved relative thumbnails from PDF browser HTML when the inline budget skips them", async () => {
+  it("rejects PDF export before loading a linked-diagram thumbnail that exceeds the inline budget", async () => {
     const installed = await bootstrap();
     const created = await worker.fetch(
       request(installed.cookie, "/api/pages", {
@@ -1160,9 +1160,56 @@ describe("job execution", () => {
       context,
     );
     expect(queued.status).toBe(202);
+    const job = (await queued.json<{ job: Job }>()).job;
     await waitOnExecutionContext(context);
 
-    expect(quickAction).toHaveBeenCalledOnce();
+    expect(quickAction).not.toHaveBeenCalled();
+    const completed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await completed.json<{ job: Job }>()).job).toMatchObject({
+      status: "failed",
+      error: { code: "job_failed", message: "Linked diagram thumbnails exceed the 24 MiB export asset limit." },
+    });
+  });
+
+  it("rejects an export instead of silently omitting linked diagrams beyond the asset-count limit", async () => {
+    const installed = await bootstrap();
+    const source = new Y.Doc();
+    const fragment = source.getXmlFragment("document-store");
+    for (let index = 0; index < 65; index += 1) {
+      const linked = new Y.XmlElement("linkedDiagram");
+      linked.setAttribute("pageId", `diagram-${index}`);
+      linked.setAttribute("title", `Diagram ${index}`);
+      fragment.push([linked]);
+    }
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    const context = createExecutionContext();
+
+    const queued = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "html", portable: false }),
+      }),
+      inlineBindings(),
+      context,
+    );
+    expect(queued.status).toBe(202);
+    const job = (await queued.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    const completed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await completed.json<{ job: Job }>()).job).toMatchObject({
+      status: "failed",
+      error: { code: "job_failed", message: "The export contains more than 64 linked diagrams." },
+    });
   });
 
   it("exports a diagram as structured JSON", async () => {
@@ -1824,6 +1871,7 @@ describe("delivery outbox", () => {
     const send = vi.fn(async (_body: unknown) => undefined);
     const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    onTestFinished(() => warning.mockRestore());
 
     await sweepOutbox(bindings);
 
@@ -1850,7 +1898,6 @@ describe("delivery outbox", () => {
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 0 });
-    warning.mockRestore();
   });
 
   it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {
@@ -1865,6 +1912,7 @@ describe("delivery outbox", () => {
       .bind(outboxId, installed.workspaceId, timestamp - 1, timestamp - 10_000)
       .run();
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => log.mockRestore());
 
     await sweepOutbox(
       bindingsWith({ DELIVERY_QUEUE: { send: vi.fn(async () => Promise.reject(new Error("poison"))) } }),
@@ -1881,7 +1929,6 @@ describe("delivery outbox", () => {
         last_error: "poison",
       },
     );
-    log.mockRestore();
   });
 
   it("keeps retrying an outbox row after ten transient enqueue failures", async () => {

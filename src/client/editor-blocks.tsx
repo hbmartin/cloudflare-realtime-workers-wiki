@@ -1,6 +1,6 @@
 import { renderToString } from "katex";
 import { createReactBlockSpec, createReactInlineContentSpec } from "@blocknote/react";
-import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { notionBlockRegistry } from "../shared/notion-blocks";
 import { api, apiErrorMessage, json } from "./api";
 import type { Page, SearchTitleSuggestion } from "../shared/types";
@@ -564,6 +564,10 @@ export function LinkedDiagramView({
   const [suggestions, setSuggestions] = useState<SearchTitleSuggestion[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const updateRef = useRef(update);
+  useLayoutEffect(() => {
+    updateRef.current = update;
+  }, [update]);
 
   const showPicker = Boolean(update) && (!pageId || choosing);
   useEffect(() => {
@@ -589,7 +593,7 @@ export function LinkedDiagramView({
   const visibleSuggestions = showPicker && query.trim() ? suggestions : [];
 
   async function createDiagram() {
-    if (!update || busy) return;
+    if (!updateRef.current || busy) return;
     setBusy(true);
     try {
       const result = await api<{ page: Page }>("/api/pages", {
@@ -600,7 +604,9 @@ export function LinkedDiagramView({
           title: query.trim() || "Untitled diagram",
         }),
       });
-      update(result.page);
+      const currentUpdate = updateRef.current;
+      if (!currentUpdate) return;
+      currentUpdate(result.page);
       setChoosing(false);
       setError("");
     } catch (cause) {

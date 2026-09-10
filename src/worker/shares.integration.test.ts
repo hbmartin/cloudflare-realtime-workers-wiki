@@ -220,16 +220,6 @@ describe("public page shares", () => {
     expect(thumbnail.headers.get("content-type")).toContain("image/svg+xml");
     expect(thumbnail.headers.get("x-content-type-options")).toBe("nosniff");
     expect(await thumbnail.text()).toContain("Projection node label");
-    await expect(
-      env.DB.prepare(
-        `SELECT 1 linked
-           FROM linked_diagram_references reference JOIN pages page ON page.id = reference.source_page_id
-          WHERE reference.source_page_id = ? AND reference.target_page_id = ?
-            AND reference.projection_seq = page.indexed_seq`,
-      )
-        .bind(installed.pageId, linkedDiagram.id)
-        .first(),
-    ).resolves.toEqual({ linked: 1 });
     expect((await SELF.fetch(`http://example.test${transcludedThumbnailUrl}`)).status).toBe(200);
 
     expect(
@@ -262,9 +252,10 @@ describe("public page shares", () => {
     ).toBe(404);
 
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(new Y.Doc()));
-    await env.DB.prepare(`DELETE FROM linked_diagram_references WHERE source_page_id = ?`).bind(installed.pageId).run();
     await abortAllDurableObjects();
-    expect((await SELF.fetch(`http://example.test${linkedThumbnailUrl}`)).status).toBe(404);
+    const unlinkedThumbnail = await SELF.fetch(`http://example.test${linkedThumbnailUrl}`);
+    expect(unlinkedThumbnail.status).toBe(404);
+    expect(unlinkedThumbnail.headers.get("cache-control")).toBe("no-store");
     expect((await SELF.fetch(`http://example.test${transcludedThumbnailUrl}`)).status).toBe(200);
   });
 

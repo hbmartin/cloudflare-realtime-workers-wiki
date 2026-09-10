@@ -12,6 +12,8 @@ import { diagramThumbnailResponse } from "./diagram-thumbnail";
 import type { Env, MemberContext } from "./env";
 import { attachmentDisposition, HttpError } from "./http";
 
+const PUBLIC_DOCUMENT_FETCH_TIMEOUT_MS = 5_000;
+
 export type ShareRow = {
   id: string;
   workspace_id: string;
@@ -35,7 +37,6 @@ export type SharedPageRow = ShareRow & {
   page_icon: string | null;
   page_kind: PageKind;
   content_epoch: number;
-  page_indexed_seq: number;
   page_updated_at: number;
 };
 
@@ -216,8 +217,7 @@ async function resolveSharedTarget(
        SELECT parent.id, parent.parent_id FROM pages parent JOIN ancestors child ON parent.id = child.parent_id
      )
      SELECT share.*, page.id page_id, page.parent_id, page.title page_title, page.icon page_icon,
-            page.kind page_kind, page.content_epoch, page.indexed_seq page_indexed_seq,
-            page.updated_at page_updated_at
+            page.kind page_kind, page.content_epoch, page.updated_at page_updated_at
        FROM share_links share JOIN pages page ON page.id = ?
       WHERE share.id = ? AND share.revoked_at IS NULL
         AND page.workspace_id = share.workspace_id AND page.archived_at IS NULL AND page.import_job_id IS NULL
@@ -530,42 +530,25 @@ export async function publicAttachment(env: Env, share: SharedPageRow, attachmen
 
 export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, source: SharedPageRow) {
   if (diagram.page_kind !== "diagram" || source.page_kind !== "document") return null;
-  const indexedReference = await env.DB.prepare(
-    `SELECT 1 linked FROM linked_diagram_references
-      WHERE source_page_id = ? AND target_page_id = ? AND projection_seq = ?`,
-  )
-    .bind(source.page_id, diagram.page_id, source.page_indexed_seq)
-    .first<{ linked: number }>();
-  if (indexedReference) {
-    return diagramThumbnailResponse(
-      env,
-      { id: diagram.page_id, content_epoch: diagram.content_epoch, title: diagram.page_title },
-      { cacheControl: "no-store" },
+  let envelope: DocumentContentEnvelope;
+  try {
+    const response = await env.DOCUMENT.getByName(`${source.page_id}~${source.content_epoch}`).fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        signal: AbortSignal.timeout(PUBLIC_DOCUMENT_FETCH_TIMEOUT_MS),
+      }),
     );
+    if (!response.ok) return null;
+    envelope = await response.json<DocumentContentEnvelope>();
+  } catch {
+    return null;
   }
-  const response = await env.DOCUMENT.getByName(`${source.page_id}~${source.content_epoch}`).fetch(
-    new Request("https://document.internal/content", {
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-    }),
-  );
-  if (!response.ok) return null;
-  const envelope = await response.json<DocumentContentEnvelope>();
   if (
     envelope.pageId !== source.page_id ||
     envelope.contentEpoch !== source.content_epoch ||
     !collectLinkedDiagramIds(envelope.document).has(diagram.page_id)
   )
     return null;
-  await env.DB.prepare(
-    `INSERT INTO linked_diagram_references (source_page_id, target_page_id, projection_seq)
-       SELECT ?, ?, ? WHERE EXISTS (
-         SELECT 1 FROM pages WHERE id = ? AND content_epoch = ? AND indexed_seq = ?
-       )
-       ON CONFLICT(source_page_id, target_page_id) DO UPDATE SET projection_seq = excluded.projection_seq
-         WHERE linked_diagram_references.projection_seq <= excluded.projection_seq`,
-  )
-    .bind(source.page_id, diagram.page_id, envelope.sequence, source.page_id, source.content_epoch, envelope.sequence)
-    .run();
   return diagramThumbnailResponse(
     env,
     { id: diagram.page_id, content_epoch: diagram.content_epoch, title: diagram.page_title },

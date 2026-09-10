@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Page } from "../shared/types";
 import {
   allowedEmbedUrl,
   editorBlockFactories,
@@ -15,11 +16,28 @@ import {
 } from "./editor-blocks";
 
 const renderMermaid = vi.hoisted(() => vi.fn(async (id: string) => ({ svg: `<svg id="${id}"></svg>` })));
+const mocks = vi.hoisted(() => ({ api: vi.fn() }));
 
 vi.mock("mermaid", () => ({ default: { initialize: vi.fn(), render: renderMermaid } }));
+vi.mock("./api", () => ({
+  api: mocks.api,
+  apiErrorMessage: (_cause: unknown, fallback: string) => fallback,
+  json: (value: unknown) => JSON.stringify(value),
+}));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
 
 describe("core editor blocks", () => {
-  beforeEach(() => renderMermaid.mockClear());
+  beforeEach(() => {
+    renderMermaid.mockClear();
+    mocks.api.mockReset();
+  });
 
   it("renders untrusted math without enabling dangerous commands", () => {
     const html = renderedMath(String.raw`\href{javascript:alert(1)}{bad}`, false);
@@ -93,5 +111,22 @@ describe("core editor blocks", () => {
 
     expect(screen.queryByRole("textbox", { name: "Find a diagram" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("does not link a newly created diagram after the block becomes read-only", async () => {
+    const request = deferred<{ page: Page }>();
+    const update = vi.fn();
+    mocks.api.mockReturnValue(request.promise);
+    const view = render(createElement(LinkedDiagramView, { pageId: "", title: "", update }));
+
+    fireEvent.click(screen.getByRole("button", { name: /Create child diagram/ }));
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledOnce());
+    view.rerender(createElement(LinkedDiagramView, { pageId: "", title: "" }));
+    await act(async () => {
+      request.resolve({ page: { id: "diagram-one", title: "System map" } as Page });
+      await request.promise;
+    });
+
+    expect(update).not.toHaveBeenCalled();
   });
 });

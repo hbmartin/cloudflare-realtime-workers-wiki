@@ -187,9 +187,9 @@ An outbox sweep is bounded to five batches of 50 rows and protected by a five-mi
 If immediately available rows remain, it logs the cap and records at most one pending queue continuation;
 the cron remains the recovery path if that queue send fails.
 
-Document exports consider at most 64 linked-diagram thumbnails. Portable HTML and PDF export load them
-sequentially and stop adding thumbnail bytes at the shared 24 MiB inline-asset budget; skipped thumbnails
-are rendered as linked cards without an unresolved relative image URL.
+Document exports accept at most 64 linked diagrams. Portable HTML and PDF export load their thumbnails
+sequentially and reject the job if their cumulative bytes exceed the shared 24 MiB inline-asset budget,
+so successful exports remain complete and never retain unresolved relative image URLs.
 
 Expired move receipts are retention cleanup, not retry work. Each pass deletes up to ten batches of
 1000 rows. Reaching that catch-up limit emits a warning because expired rows may remain; a sustained

@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DocumentContentEnvelope } from "../shared/types";
-import { publicDocumentHtml } from "./shares";
+import type { Env } from "./env";
+import { publicDiagramThumbnail, publicDocumentHtml, type SharedPageRow } from "./shares";
 
 describe("public document rendering", () => {
   it("rewrites only internal link attributes", () => {
@@ -60,5 +61,22 @@ describe("public document rendering", () => {
     expect(body).toContain("Private map");
     expect(body).not.toContain("<img");
     expect(body).not.toContain("diagram-thumbnails");
+  });
+
+  it("fails closed when live linked-diagram verification cannot reach the document", async () => {
+    const fetch = vi.fn(async (request: Request) => {
+      expect(request.signal).toBeInstanceOf(AbortSignal);
+      throw new DOMException("The operation timed out.", "TimeoutError");
+    });
+    const env = {
+      BETTER_AUTH_SECRET: "internal-secret",
+      DOCUMENT: { getByName: vi.fn(() => ({ fetch })) },
+    } as unknown as Env;
+    const diagram = { page_id: "diagram", page_kind: "diagram" } as SharedPageRow;
+    const source = { page_id: "source", page_kind: "document", content_epoch: 3 } as SharedPageRow;
+
+    await expect(publicDiagramThumbnail(env, diagram, source)).resolves.toBeNull();
+    expect(env.DOCUMENT.getByName).toHaveBeenCalledWith("source~3");
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });

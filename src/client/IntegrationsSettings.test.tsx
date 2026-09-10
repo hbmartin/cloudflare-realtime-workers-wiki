@@ -93,6 +93,26 @@ describe("integration settings errors", () => {
     );
   });
 
+  it("reloads without reporting an error when integration revocation returns no content", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    let revoked = false;
+    mocks.api.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === `/api/integrations/${integration.id}` && init?.method === "DELETE") {
+        revoked = true;
+        return undefined;
+      }
+      if (path === "/api/integrations") return { integrations: revoked ? [] : [integration] };
+      return loadResponse(path);
+    });
+    render(<IntegrationsSettings owner pages={[]} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument());
+    expect(mocks.api).toHaveBeenCalledWith(`/api/integrations/${integration.id}`, { method: "DELETE" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it.each([
     {
       name: "verification",

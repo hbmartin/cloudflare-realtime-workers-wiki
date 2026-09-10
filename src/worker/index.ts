@@ -5204,17 +5204,18 @@ app.get("/share/:key/assets/:attachmentId", async (c) => {
 });
 
 app.get("/share/:key/diagram-thumbnails/:fileName", async (c) => {
+  const notFound = () => c.text("Not found", 404, { "cache-control": "no-store" });
   const fileName = c.req.param("fileName");
-  if (!fileName.endsWith(".svg")) return c.text("Not found", 404);
+  if (!fileName.endsWith(".svg")) return notFound();
   const pageId = fileName.slice(0, -4);
   const sourcePageId = c.req.query("source");
-  if (!sourcePageId) return c.text("Not found", 404);
+  if (!sourcePageId) return notFound();
   const [diagram, source] = await Promise.all([
     resolveSharedDiagram(c.env, c.req.param("key"), pageId),
     resolveSharedPage(c.env, c.req.param("key"), sourcePageId),
   ]);
-  if (!diagram || !source) return c.text("Not found", 404);
-  return (await publicDiagramThumbnail(c.env, diagram, source)) ?? c.text("Not found", 404);
+  if (!diagram || !source) return notFound();
+  return (await publicDiagramThumbnail(c.env, diagram, source)) ?? notFound();
 });
 
 app.get("/share/:key/sitemap.xml", async (c) => {

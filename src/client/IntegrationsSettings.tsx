@@ -143,7 +143,7 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
   async function revoke(integration: Pick<Integration, "id" | "name">) {
     if (!confirm(`Revoke ${integration.name}?`)) return;
     const succeeded = await runWithError(async () => {
-      await api(`/api/integrations/${integration.id}`, { method: "DELETE" });
+      await api<void>(`/api/integrations/${integration.id}`, { method: "DELETE" });
     }, "The integration could not be revoked.");
     if (succeeded) await load();
   }
@@ -174,7 +174,7 @@ export function IntegrationsSettings({ owner, pages }: { owner: boolean; pages: 
   async function removeWebhook(webhookId: string) {
     if (!confirm("Delete this webhook?")) return;
     const succeeded = await runWithError(async () => {
-      await api(`/api/webhooks/${webhookId}`, { method: "DELETE" });
+      await api<void>(`/api/webhooks/${webhookId}`, { method: "DELETE" });
     }, "The webhook could not be deleted.");
     if (succeeded) await load();
   }
