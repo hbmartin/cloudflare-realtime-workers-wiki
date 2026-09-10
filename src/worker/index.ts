@@ -2,7 +2,7 @@ import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fracti
 import { Hono, type Context } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
-import { processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
+import { ARCHIVE_DISCONNECT_RUN_LIMIT, processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
 import {
   isInlineMime,
   isUnsafeMime,
@@ -3235,7 +3235,7 @@ app.delete("/api/pages/:id", async (c) => {
       SELECT id FROM subtree
     )`).bind(page.id),
   ]);
-  const [archived, pendingTargets] = await Promise.all([
+  const [archived, dueTargets] = await Promise.all([
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
@@ -3248,10 +3248,13 @@ app.delete("/api/pages/:id", async (c) => {
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        )
        SELECT target.page_id, target.content_epoch
-         FROM archive_disconnect_targets target JOIN subtree ON subtree.id = target.page_id
-        ORDER BY target.created_at, target.page_id`,
+         FROM archive_disconnect_targets target
+         JOIN subtree ON subtree.id = target.page_id
+         JOIN pages archived_page ON archived_page.id = target.page_id
+        WHERE ? IS NOT NULL AND archived_page.archive_operation_id = ? AND target.next_attempt_at <= ?
+        ORDER BY target.created_at, target.page_id LIMIT ?`,
     )
-      .bind(page.id)
+      .bind(page.id, archiveOperationId, archiveOperationId, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT)
       .all<{ page_id: string; content_epoch: number }>(),
   ]);
   const pageIds = archived.results.map((item) => item.id);
@@ -3261,13 +3264,27 @@ app.delete("/api/pages/:id", async (c) => {
     permanently: false,
     ...(operationId ? { operationId } : {}),
   });
-  const pendingPageIds = await processArchiveDisconnectTargets(
+  await processArchiveDisconnectTargets(
     c.env,
-    pendingTargets.results.map((item) => ({
+    dueTargets.results.map((item) => ({
       page_id: item.page_id,
       content_epoch: item.content_epoch,
     })),
   );
+  const pendingTargets = await c.env.DB.prepare(
+    `WITH RECURSIVE subtree(id) AS (
+       SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+     )
+     SELECT target.page_id
+       FROM archive_disconnect_targets target
+       JOIN subtree ON subtree.id = target.page_id
+       JOIN pages archived_page ON archived_page.id = target.page_id
+      WHERE ? IS NOT NULL AND archived_page.archive_operation_id = ?
+      ORDER BY target.created_at, target.page_id`,
+  )
+    .bind(page.id, archiveOperationId, archiveOperationId)
+    .all<{ page_id: string }>();
+  const pendingPageIds = pendingTargets.results.map((target) => target.page_id);
   return c.json(
     {
       ok: true,
@@ -3285,7 +3302,17 @@ app.post("/api/pages/:id/restore", async (c) => {
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
   if (page.archived_at === null) {
-    throw new HttpError(409, "page_not_archived", "The page is not archived.");
+    const active = await c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT child.id FROM pages child JOIN subtree ON child.parent_id = subtree.id
+       )
+       SELECT pages.* FROM pages JOIN subtree ON subtree.id = pages.id
+        WHERE pages.workspace_id = ? AND pages.archived_at IS NULL
+        ORDER BY pages.position, pages.id`,
+    )
+      .bind(page.id, member.workspace.id)
+      .all<PageRow>();
+    return c.json({ pages: active.results.map(pageJson) });
   }
   const archiveTimestamp = page.archived_at;
   const archiveOperationId = page.archive_operation_id ?? null;

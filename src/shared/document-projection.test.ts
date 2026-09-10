@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { projectDocument, serializeDocument, type ProseMirrorJson } from "./document-projection";
+import {
+  collectLinkedDiagramIds,
+  projectDocument,
+  serializeDocument,
+  type ProseMirrorJson,
+} from "./document-projection";
 
 function document(...content: ProseMirrorJson[]): ProseMirrorJson {
   return { type: "doc", content };
@@ -170,6 +175,22 @@ describe("structured document projection", () => {
     });
     expect(unsafe.html).not.toContain("javascript:");
     expect(unsafe.html).not.toContain("data:image");
+  });
+
+  it("collects distinct linked diagrams from nested document content", () => {
+    const ids = collectLinkedDiagramIds(
+      document({
+        type: "blockGroup",
+        content: [
+          { type: "linkedDiagram", attrs: { pageId: "diagram-one" } },
+          { type: "linkedDiagram", attrs: { pageId: "diagram-one" } },
+          { type: "linkedDiagram", attrs: { pageId: "diagram-two" } },
+          { type: "linkedDiagram", attrs: {} },
+        ],
+      }),
+    );
+
+    expect([...ids]).toEqual(["diagram-one", "diagram-two"]);
   });
 
   it("keeps page links inert unless the caller supplies the shared page resolver", () => {

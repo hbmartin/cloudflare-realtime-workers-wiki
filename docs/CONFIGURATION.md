@@ -183,8 +183,13 @@ Two consequences worth internalising:
 
 Archive disconnects are far more forgiving: 50 per tick with a 10-second initial backoff.
 
-An outbox sweep is bounded to five batches of 50 rows. If immediately available rows remain, it logs
-the cap and enqueues a sweep continuation; the cron remains the recovery path if that queue send fails.
+An outbox sweep is bounded to five batches of 50 rows and protected by a five-minute singleton lease.
+If immediately available rows remain, it logs the cap and records at most one pending queue continuation;
+the cron remains the recovery path if that queue send fails.
+
+Document exports consider at most 64 linked-diagram thumbnails. Portable HTML and PDF export load them
+sequentially and stop adding thumbnail bytes at the shared 24 MiB inline-asset budget; skipped thumbnails
+are rendered as linked cards without an unresolved relative image URL.
 
 Expired move receipts are retention cleanup, not retry work. Each pass deletes up to ten batches of
 1000 rows. Reaching that catch-up limit emits a warning because expired rows may remain; a sustained

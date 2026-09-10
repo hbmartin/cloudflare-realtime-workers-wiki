@@ -8,6 +8,7 @@ export interface ArchiveDisconnectTarget {
 }
 
 const ARCHIVE_DISCONNECT_BATCH_SIZE = 25;
+export const ARCHIVE_DISCONNECT_RUN_LIMIT = 50;
 const ARCHIVE_DISCONNECT_TIMEOUT_MS = 30_000;
 const ARCHIVE_DISCONNECT_LEASE_MS = 60_000;
 
@@ -107,7 +108,7 @@ export async function processArchiveDisconnectTargets(env: Env, targets: Archive
   return pendingPageIds;
 }
 
-export async function processDueArchiveDisconnects(env: Env, limit = 50) {
+export async function processDueArchiveDisconnects(env: Env, limit = ARCHIVE_DISCONNECT_RUN_LIMIT) {
   const targets = await env.DB.prepare(
     `SELECT page_id, content_epoch
        FROM archive_disconnect_targets

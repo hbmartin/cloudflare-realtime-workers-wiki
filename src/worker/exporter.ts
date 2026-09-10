@@ -1,6 +1,6 @@
 import type { WorkflowStep } from "cloudflare:workers";
 import type { DiagramContentEnvelope, DocumentContentEnvelope, ExportFormat, ProseMirrorJson } from "../shared/types";
-import { serializeDocument } from "../shared/document-projection";
+import { collectLinkedDiagramIds, serializeDocument } from "../shared/document-projection";
 import { renderDiagramSvg } from "../shared/diagram";
 import { createZip, type ZipEntry } from "../shared/zip";
 import type { Env } from "./env";
@@ -13,6 +13,9 @@ import { broadcastWorkspaceEvent } from "./workspace-events";
 const EXPORT_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const EXPORT_MAX_BYTES = 64 * 1024 * 1024;
 const TABLE_EXPORT_BATCH = 500;
+const LINKED_DIAGRAM_ASSET_LIMIT = 64;
+// Browser Rendering loads the HTML from about:blank, so session-gated attachment URLs never resolve there.
+const PDF_INLINE_ASSET_LIMIT = 24 * 1024 * 1024;
 
 type ExportOptions = { pageId: string; format: ExportFormat; portable: boolean };
 type ExportPage = {
@@ -30,6 +33,14 @@ type LinkedDiagramAsset = {
   path: string;
   sourceHref: string;
   bytes?: Uint8Array;
+};
+type SerializedExport = {
+  html: string;
+  markdown?: string;
+  json?: string;
+  svg?: string;
+  assetIds?: ReadonlySet<string>;
+  linkedDiagramAssets: LinkedDiagramAsset[];
 };
 
 function jsonRecord(value: string) {
@@ -74,25 +85,17 @@ async function assertExportActive(env: Env, job: Pick<JobRow, "id" | "attempt">)
   }
 }
 
-function collectLinkedDiagramIds(node: ProseMirrorJson, ids = new Set<string>()) {
-  if (node.type === "linkedDiagram" && typeof node.attrs?.pageId === "string" && node.attrs.pageId) {
-    ids.add(node.attrs.pageId);
-  }
-  for (const child of node.content ?? []) collectLinkedDiagramIds(child, ids);
-  return ids;
-}
-
 async function linkedDiagramAssets(
   env: Env,
   page: ExportPage,
   document: ProseMirrorJson,
   includeBytes: boolean,
   requestedBy: string,
-) {
-  const ids = [...collectLinkedDiagramIds(document)];
+): Promise<LinkedDiagramAsset[]> {
+  const ids = [...collectLinkedDiagramIds(document)].slice(0, LINKED_DIAGRAM_ASSET_LIMIT);
   if (!ids.length) return [];
   const diagrams = await env.DB.prepare(
-    `SELECT page.id, page.content_epoch, page.title, projection.thumbnail_r2_key
+    `SELECT page.id, page.content_epoch, page.title, projection.thumbnail_r2_key, projection.thumbnail_byte_size
        FROM pages page
        JOIN spaces space ON space.id = page.space_id AND space.workspace_id = page.workspace_id
        JOIN workspace_members member ON member.workspace_id = page.workspace_id AND member.user_id = ?
@@ -105,36 +108,50 @@ async function linkedDiagramAssets(
         AND (member.role = 'owner' OR space.visibility = 'workspace' OR space_member.user_id IS NOT NULL)`,
   )
     .bind(requestedBy, requestedBy, JSON.stringify(ids), page.workspace_id)
-    .all<{ id: string; content_epoch: number; title: string; thumbnail_r2_key: string | null }>();
+    .all<{
+      id: string;
+      content_epoch: number;
+      title: string;
+      thumbnail_r2_key: string | null;
+      thumbnail_byte_size: number | null;
+    }>();
   const baseUrl = env.BETTER_AUTH_URL.replace(/\/$/, "");
-  return Promise.all(
-    diagrams.results.map(async (diagram): Promise<LinkedDiagramAsset> => {
-      let bytes: Uint8Array | undefined;
-      if (includeBytes) {
-        const object = diagram.thumbnail_r2_key ? await env.BUCKET.get(diagram.thumbnail_r2_key) : null;
-        bytes = object
-          ? new Uint8Array(await object.arrayBuffer())
-          : new TextEncoder().encode(
-              renderDiagramSvg(
-                {
-                  nodes: [],
-                  edges: [],
-                },
-                { width: 960, height: 540, title: diagram.title },
-              ),
-            );
+  const assets: LinkedDiagramAsset[] = [];
+  let loadedBytes = 0;
+  for (const diagram of diagrams.results) {
+    let bytes: Uint8Array | undefined;
+    if (includeBytes && loadedBytes < PDF_INLINE_ASSET_LIMIT) {
+      const remaining = PDF_INLINE_ASSET_LIMIT - loadedBytes;
+      const object =
+        diagram.thumbnail_r2_key && (diagram.thumbnail_byte_size ?? Number.POSITIVE_INFINITY) <= remaining
+          ? await env.BUCKET.get(diagram.thumbnail_r2_key)
+          : null;
+      if (object && object.size <= remaining) {
+        bytes = new Uint8Array(await object.arrayBuffer());
+      } else if (!diagram.thumbnail_r2_key || (diagram.thumbnail_byte_size ?? 0) <= remaining) {
+        const placeholder = new TextEncoder().encode(
+          renderDiagramSvg({ nodes: [], edges: [] }, { width: 960, height: 540, title: diagram.title }),
+        );
+        if (placeholder.byteLength <= remaining) bytes = placeholder;
       }
-      return {
-        pageId: diagram.id,
-        path: `linked-diagrams/${diagram.id}.svg`,
-        sourceHref: `${baseUrl}/api/pages/${encodeURIComponent(diagram.id)}/diagram-thumbnail.svg`,
-        ...(bytes ? { bytes } : {}),
-      };
-    }),
-  );
+      loadedBytes += bytes?.byteLength ?? 0;
+    }
+    assets.push({
+      pageId: diagram.id,
+      path: `linked-diagrams/${diagram.id}.svg`,
+      sourceHref: `${baseUrl}/api/pages/${encodeURIComponent(diagram.id)}/diagram-thumbnail.svg`,
+      ...(bytes ? { bytes } : {}),
+    });
+  }
+  return assets;
 }
 
-async function documentExport(env: Env, page: ExportPage, includeThumbnailBytes: boolean, requestedBy: string) {
+async function documentExport(
+  env: Env,
+  page: ExportPage,
+  includeThumbnailBytes: boolean,
+  requestedBy: string,
+): Promise<SerializedExport> {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/content", {
       headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
@@ -153,7 +170,7 @@ async function documentExport(env: Env, page: ExportPage, includeThumbnailBytes:
     linkedDiagramThumbnailHref: (pageId) => {
       const asset = diagramAssetsById.get(pageId);
       if (!asset) return null;
-      return includeThumbnailBytes ? asset.path : asset.sourceHref;
+      return includeThumbnailBytes ? (asset.bytes ? asset.path : null) : asset.sourceHref;
     },
   });
   return {
@@ -165,7 +182,7 @@ async function documentExport(env: Env, page: ExportPage, includeThumbnailBytes:
   };
 }
 
-async function tableExport(env: Env, page: ExportPage) {
+async function tableExport(env: Env, page: ExportPage): Promise<SerializedExport> {
   const columns = await env.DB.prepare(`SELECT id, name FROM table_columns WHERE page_id = ? ORDER BY position, id`)
     .bind(page.id)
     .all<ExportColumn>();
@@ -207,10 +224,10 @@ async function tableExport(env: Env, page: ExportPage) {
     if (rows.results.length < TABLE_EXPORT_BATCH) break;
   }
   html.push("</tbody></table></body></html>");
-  return { markdown: markdown.join(""), html: html.join("") };
+  return { markdown: markdown.join(""), html: html.join(""), linkedDiagramAssets: [] };
 }
 
-async function diagramExport(env: Env, page: ExportPage) {
+async function diagramExport(env: Env, page: ExportPage): Promise<SerializedExport> {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/content", {
       headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
@@ -232,6 +249,7 @@ async function diagramExport(env: Env, page: ExportPage) {
     svg,
     html: `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(page.title)}</title><style>html,body{margin:0;background:#fff}svg{display:block;width:100%;height:auto}</style></head><body>${svg}</body></html>`,
     assetIds: new Set(envelope.nodes.flatMap((node) => (node.assetId ? [node.assetId] : []))),
+    linkedDiagramAssets: [],
   };
 }
 
@@ -308,9 +326,6 @@ async function portableExport(
   return createZip(entries);
 }
 
-// Browser Rendering loads the HTML from about:blank, so session-gated attachment URLs never resolve there.
-const PDF_INLINE_ASSET_LIMIT = 24 * 1024 * 1024;
-
 function base64(bytes: Uint8Array) {
   let binary = "";
   for (let offset = 0; offset < bytes.length; offset += 0x8000) {
@@ -382,10 +397,7 @@ export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
         : page.kind === "diagram"
           ? await diagramExport(env, page)
           : await tableExport(env, page);
-    const diagramAssets =
-      "linkedDiagramAssets" in serialized && Array.isArray(serialized.linkedDiagramAssets)
-        ? (serialized.linkedDiagramAssets as LinkedDiagramAsset[])
-        : [];
+    const diagramAssets = serialized.linkedDiagramAssets;
     await assertExportActive(env, job);
     let bytes: Uint8Array;
     let contentType: string;

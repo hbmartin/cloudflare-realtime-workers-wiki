@@ -941,12 +941,12 @@ function DiagramCanvas({
     <div className="diagram-workspace">
       <nav className="diagram-stencils" aria-label="Diagram stencils">
         {STENCILS.map((stencil) => (
-          <button key={stencil.type} disabled={!editable} onClick={() => addNode(stencil.type)}>
+          <button key={stencil.type} disabled={!editable || !synced} onClick={() => addNode(stencil.type)}>
             <span>{stencil.icon}</span>
             {stencil.label}
           </button>
         ))}
-        <button disabled={!editable} onClick={() => imageInput.current?.click()}>
+        <button disabled={!editable || !synced} onClick={() => imageInput.current?.click()}>
           <span>▧</span>Image
         </button>
         <input
@@ -958,8 +958,18 @@ function DiagramCanvas({
             const file = event.target.files?.[0];
             if (file) {
               void uploadAttachment(page.id, file)
-                .then((attachment) => {
-                  if (addNode("image", attachment.id)) onError("");
+                .then(async (attachment) => {
+                  if (addNode("image", attachment.id)) {
+                    onError("");
+                    return;
+                  }
+                  try {
+                    await api(`/api/attachments/${encodeURIComponent(attachment.id)}`, { method: "DELETE" });
+                    onError("The diagram image could not be added because collaboration is unavailable.");
+                  } catch (cleanupError) {
+                    console.error("Failed to remove an unused diagram image", cleanupError);
+                    onError("The uploaded diagram image could not be added, and automatic cleanup failed.");
+                  }
                 })
                 .catch((cause) => onError(apiErrorMessage(cause, "The diagram image could not be uploaded.")));
             }

@@ -41,11 +41,24 @@ describe("public document rendering", () => {
       content: [{ type: "linkedDiagram", attrs: { pageId: "diagram-one", title: "System map" } }],
     };
 
-    const { body } = publicDocumentHtml(document, "public-key", "source-page");
+    const { body } = publicDocumentHtml(document, "public-key", "source-page", new Map(), new Set(["diagram-one"]));
 
     expect(body).toContain('src="/share/public-key/diagram-thumbnails/diagram-one.svg?source=source-page"');
     expect(body).not.toContain("/api/pages/");
     expect(body).not.toContain("?page=");
     expect(body).not.toContain("/share/public-key/pages/diagram-one");
+  });
+
+  it("does not emit a thumbnail URL for a diagram outside the shared subtree", () => {
+    const document: DocumentContentEnvelope["document"] = {
+      type: "doc",
+      content: [{ type: "linkedDiagram", attrs: { pageId: "private-diagram", title: "Private map" } }],
+    };
+
+    const { body } = publicDocumentHtml(document, "public-key", "source-page");
+
+    expect(body).toContain("Private map");
+    expect(body).not.toContain("<img");
+    expect(body).not.toContain("diagram-thumbnails");
   });
 });

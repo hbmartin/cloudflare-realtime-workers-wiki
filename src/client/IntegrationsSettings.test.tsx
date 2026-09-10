@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IntegrationsSettings } from "./IntegrationsSettings";
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
@@ -56,6 +56,8 @@ describe("integration settings errors", () => {
     vi.useRealTimers();
     mocks.api.mockReset();
   });
+
+  afterEach(() => vi.restoreAllMocks());
 
   it("does not clear a reload failure after a successful mutation", async () => {
     let reloadFailure = false;

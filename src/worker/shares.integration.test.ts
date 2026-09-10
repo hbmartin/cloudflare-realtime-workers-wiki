@@ -192,12 +192,22 @@ describe("public page shares", () => {
     const published = await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ includeSubpages: true }),
+      body: "{}",
     });
     const share = (await published.json<{ share: { url: string } }>()).share;
     const key = new URL(share.url).pathname.split("/").at(-1)!;
     const linkedThumbnailUrl = `/share/${key}/diagram-thumbnails/${linkedDiagram.id}.svg?source=${installed.pageId}`;
     const transcludedThumbnailUrl = `/share/${key}/diagram-thumbnails/${transcludedDiagram.id}.svg?source=${sourcePage.id}`;
+
+    const rootOnly = await SELF.fetch(`http://example.test/share/${key}`);
+    expect(rootOnly.status).toBe(200);
+    expect(await rootOnly.text()).not.toContain("diagram-thumbnails");
+    const expanded = await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ includeSubpages: true }),
+    });
+    expect(expanded.status).toBe(200);
 
     const root = await SELF.fetch(`http://example.test/share/${key}`);
     expect(root.status).toBe(200);
@@ -210,6 +220,16 @@ describe("public page shares", () => {
     expect(thumbnail.headers.get("content-type")).toContain("image/svg+xml");
     expect(thumbnail.headers.get("x-content-type-options")).toBe("nosniff");
     expect(await thumbnail.text()).toContain("Projection node label");
+    await expect(
+      env.DB.prepare(
+        `SELECT 1 linked
+           FROM linked_diagram_references reference JOIN pages page ON page.id = reference.source_page_id
+          WHERE reference.source_page_id = ? AND reference.target_page_id = ?
+            AND reference.projection_seq = page.indexed_seq`,
+      )
+        .bind(installed.pageId, linkedDiagram.id)
+        .first(),
+    ).resolves.toEqual({ linked: 1 });
     expect((await SELF.fetch(`http://example.test${transcludedThumbnailUrl}`)).status).toBe(200);
 
     expect(
@@ -242,6 +262,7 @@ describe("public page shares", () => {
     ).toBe(404);
 
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(new Y.Doc()));
+    await env.DB.prepare(`DELETE FROM linked_diagram_references WHERE source_page_id = ?`).bind(installed.pageId).run();
     await abortAllDurableObjects();
     expect((await SELF.fetch(`http://example.test${linkedThumbnailUrl}`)).status).toBe(404);
     expect((await SELF.fetch(`http://example.test${transcludedThumbnailUrl}`)).status).toBe(200);

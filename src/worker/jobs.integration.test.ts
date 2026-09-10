@@ -1110,6 +1110,61 @@ describe("job execution", () => {
     expect(new TextDecoder().decode(entries[1]!.bytes)).toContain("Service map");
   });
 
+  it("omits unresolved relative thumbnails from PDF browser HTML when the inline budget skips them", async () => {
+    const installed = await bootstrap();
+    const created = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "diagram", title: "Oversized map" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const diagram = (await created.json<{ page: Page }>()).page;
+    await env.DB.prepare(
+      `INSERT INTO diagram_projections
+        (page_id, content_epoch, sequence, schema_version, r2_key, content_hash, byte_size,
+         thumbnail_r2_key, thumbnail_hash, thumbnail_byte_size, updated_at)
+       VALUES (?, 1, 1, 1, ?, 'content-hash', 1, ?, 'thumbnail-hash', ?, ?)`,
+    )
+      .bind(
+        diagram.id,
+        `diagrams/${diagram.id}/epochs/1/projection.json`,
+        `diagrams/${diagram.id}/epochs/1/oversized.svg`,
+        24 * 1024 * 1024 + 1,
+        Date.now(),
+      )
+      .run();
+    const source = new Y.Doc();
+    const linked = new Y.XmlElement("linkedDiagram");
+    linked.setAttribute("pageId", diagram.id);
+    linked.setAttribute("title", diagram.title);
+    source.getXmlFragment("document-store").insert(0, [linked]);
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    const quickAction = vi.fn(async (_action: string, options: { html?: string }) => {
+      expect(options.html).toContain("Oversized map");
+      expect(options.html).not.toContain(`linked-diagrams/${diagram.id}.svg`);
+      return new Response("%PDF-test", { headers: { "content-type": "application/pdf" } });
+    });
+    const bindings = bindingsWith({ WORKFLOW_INLINE: "true", BROWSER: { quickAction } as unknown as BrowserRun });
+    const context = createExecutionContext();
+
+    const queued = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "pdf" }),
+      }),
+      bindings,
+      context,
+    );
+    expect(queued.status).toBe(202);
+    await waitOnExecutionContext(context);
+
+    expect(quickAction).toHaveBeenCalledOnce();
+  });
+
   it("exports a diagram as structured JSON", async () => {
     const installed = await bootstrap();
     const created = await worker.fetch(
@@ -1707,6 +1762,29 @@ describe("job execution", () => {
 });
 
 describe("delivery outbox", () => {
+  it("allows only one sweep to run while the singleton lease is held", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO outbox
+        (id, workspace_id, topic, payload_json, available_at, created_at)
+       VALUES (?, ?, 'notification', '{}', ?, ?)`,
+    )
+      .bind(crypto.randomUUID(), installed.workspaceId, timestamp - 1, timestamp)
+      .run();
+    const gate = deferred<void>();
+    const send = vi.fn(async () => gate.promise);
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
+
+    const first = sweepOutbox(bindings);
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+
+    await expect(sweepOutbox(bindings)).resolves.toBe(false);
+    gate.resolve();
+    await expect(first).resolves.toBe(true);
+    expect(send).toHaveBeenCalledOnce();
+  });
+
   it("enqueues every immediately available row across sweep batches", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();

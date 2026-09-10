@@ -26,6 +26,13 @@ function stringAttr(node: ProseMirrorJson, name: string) {
   return typeof value === "string" ? value : null;
 }
 
+export function collectLinkedDiagramIds(node: ProseMirrorJson, ids = new Set<string>()): Set<string> {
+  const pageId = node.type === "linkedDiagram" ? stringAttr(node, "pageId") : null;
+  if (pageId) ids.add(pageId);
+  for (const child of node.content ?? []) collectLinkedDiagramIds(child, ids);
+  return ids;
+}
+
 function normalizeText(text: string) {
   return text.replace(/\s+/g, " ").trim();
 }

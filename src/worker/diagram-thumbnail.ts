@@ -1,4 +1,5 @@
 import { renderDiagramSvg } from "../shared/diagram";
+import { sha256Hex } from "../shared/import-integrity";
 import type { DiagramContentEnvelope } from "../shared/types";
 import type { Env } from "./env";
 
@@ -19,18 +20,14 @@ export async function diagramThumbnailResponse(
   )
     .bind(page.id, page.content_epoch)
     .first<{ thumbnail_r2_key: string; thumbnail_hash: string }>();
-  const etag = `"${projection?.thumbnail_hash ?? `empty-${page.content_epoch}`}"`;
-  const headers = new Headers({
-    "content-type": "image/svg+xml; charset=utf-8",
-    "cache-control": options.cacheControl,
-    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
-    "x-content-type-options": "nosniff",
-    etag,
-  });
-  if (options.ifNoneMatch === etag) return new Response(null, { status: 304, headers });
   if (projection) {
     const thumbnail = await env.BUCKET.get(projection.thumbnail_r2_key);
-    if (thumbnail) return new Response(thumbnail.body, { headers });
+    if (thumbnail) {
+      const etag = `"${projection.thumbnail_hash}"`;
+      const headers = thumbnailHeaders(options.cacheControl, etag);
+      if (options.ifNoneMatch === etag) return new Response(null, { status: 304, headers });
+      return new Response(thumbnail.body, { headers });
+    }
   }
   const empty: DiagramContentEnvelope = {
     schemaVersion: 1,
@@ -40,5 +37,19 @@ export async function diagramThumbnailResponse(
     nodes: [],
     edges: [],
   };
-  return new Response(renderDiagramSvg(empty, { width: 960, height: 540, title: page.title }), { headers });
+  const placeholder = renderDiagramSvg(empty, { width: 960, height: 540, title: page.title });
+  const etag = `"empty-${await sha256Hex(placeholder)}"`;
+  const headers = thumbnailHeaders(options.cacheControl, etag);
+  if (options.ifNoneMatch === etag) return new Response(null, { status: 304, headers });
+  return new Response(placeholder, { headers });
+}
+
+function thumbnailHeaders(cacheControl: string, etag: string) {
+  return new Headers({
+    "content-type": "image/svg+xml; charset=utf-8",
+    "cache-control": cacheControl,
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+    "x-content-type-options": "nosniff",
+    etag,
+  });
 }
