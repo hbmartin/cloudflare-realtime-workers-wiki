@@ -18,7 +18,6 @@ describe("D1 migrations", () => {
         "deletion_jobs",
         "member_mentions",
         "page_references",
-        "linked_diagram_references",
         "page_create_receipts",
         "page_move_receipts",
         "prevent_final_owner_demotion",
@@ -148,7 +147,7 @@ describe("D1 migrations", () => {
       id: 1,
       lease_token: null,
       lease_until: 0,
-      continuation_pending: 0,
+      rescan_requested: 0,
     });
   });
 

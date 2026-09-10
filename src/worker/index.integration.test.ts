@@ -2994,6 +2994,36 @@ describe("Worker integration", () => {
     });
   });
 
+  it("reports pending disconnect cleanup for pages archived before operation ids existed", async () => {
+    const installed = await bootstrap();
+    const archivedAt = Date.now() - 1_000;
+    const retryAt = Date.now() + 60_000;
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE pages
+            SET archived_at = ?, archived_by = ?, archive_operation_id = NULL
+          WHERE id = ?`,
+      ).bind(archivedAt, installed.userId, installed.pageId),
+      env.DB.prepare(
+        `INSERT INTO archive_disconnect_targets
+          (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, 1, ?, ?, ?, ?)`,
+      ).bind(installed.pageId, installed.workspaceId, `${installed.pageId}~1`, retryAt, archivedAt, archivedAt),
+    ]);
+
+    const repeated = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }),
+    );
+
+    expect(repeated.status).toBe(202);
+    expect(await repeated.json()).toEqual({
+      ok: true,
+      pageIds: [installed.pageId],
+      cleanupPending: true,
+      pendingPageIds: [installed.pageId],
+    });
+  });
+
   it("copies the archive operation id into the workspace event", async () => {
     const installed = await bootstrap();
     const operationId = "archive-operation";

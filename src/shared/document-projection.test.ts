@@ -193,6 +193,21 @@ describe("structured document projection", () => {
     expect([...ids]).toEqual(["diagram-one", "diagram-two"]);
   });
 
+  it("stops collecting linked diagrams at a caller-provided limit", () => {
+    const ids = collectLinkedDiagramIds(
+      document(
+        ...Array.from({ length: 5 }, (_, index) => ({
+          type: "linkedDiagram",
+          attrs: { pageId: `diagram-${index}` },
+        })),
+      ),
+      new Set<string>(),
+      3,
+    );
+
+    expect([...ids]).toEqual(["diagram-0", "diagram-1", "diagram-2"]);
+  });
+
   it("keeps page links inert unless the caller supplies the shared page resolver", () => {
     const root = document({ type: "linkToPage", attrs: { pageId: "page-one", title: "Project plan" } });
 

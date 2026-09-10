@@ -26,10 +26,18 @@ function stringAttr(node: ProseMirrorJson, name: string) {
   return typeof value === "string" ? value : null;
 }
 
-export function collectLinkedDiagramIds(node: ProseMirrorJson, ids = new Set<string>()): Set<string> {
+export function collectLinkedDiagramIds(
+  node: ProseMirrorJson,
+  ids = new Set<string>(),
+  limit = Number.POSITIVE_INFINITY,
+): Set<string> {
+  if (ids.size >= limit) return ids;
   const pageId = node.type === "linkedDiagram" ? stringAttr(node, "pageId") : null;
   if (pageId) ids.add(pageId);
-  for (const child of node.content ?? []) collectLinkedDiagramIds(child, ids);
+  for (const child of node.content ?? []) {
+    if (ids.size >= limit) break;
+    collectLinkedDiagramIds(child, ids, limit);
+  }
   return ids;
 }
 

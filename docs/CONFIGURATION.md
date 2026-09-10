@@ -184,12 +184,13 @@ Two consequences worth internalising:
 Archive disconnects are far more forgiving: 50 per tick with a 10-second initial backoff.
 
 An outbox sweep is bounded to five batches of 50 rows and protected by a five-minute singleton lease.
-If immediately available rows remain, it logs the cap and records at most one pending queue continuation;
-the cron remains the recovery path if that queue send fails.
+Producers that encounter the lease request an atomic rescan from its owner. If immediately available rows
+remain at the cap, the owner queues a continuation; contended continuation deliveries back off, and the cron
+remains the recovery path if that queue send fails.
 
-Document exports accept at most 64 linked diagrams. Portable HTML and PDF export load their thumbnails
-sequentially and reject the job if their cumulative bytes exceed the shared 24 MiB inline-asset budget,
-so successful exports remain complete and never retain unresolved relative image URLs.
+PDF and portable HTML exports accept at most 64 accessible linked-diagram thumbnails and load them
+sequentially. PDF rejects more than 24 MiB of thumbnail bytes; portable HTML uses the export's 64 MiB
+artifact limit. Non-portable exports resolve diagram links in bounded query batches without loading thumbnails.
 
 Expired move receipts are retention cleanup, not retry work. Each pass deletes up to ten batches of
 1000 rows. Reaching that catch-up limit emits a warning because expired rows may remain; a sustained

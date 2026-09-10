@@ -21,11 +21,13 @@ export async function diagramThumbnailResponse(
     .bind(page.id, page.content_epoch)
     .first<{ thumbnail_r2_key: string; thumbnail_hash: string }>();
   if (projection) {
+    const etag = `"${projection.thumbnail_hash}"`;
+    const headers = thumbnailHeaders(options.cacheControl, etag);
+    if (options.ifNoneMatch === etag && (await env.BUCKET.head(projection.thumbnail_r2_key))) {
+      return new Response(null, { status: 304, headers });
+    }
     const thumbnail = await env.BUCKET.get(projection.thumbnail_r2_key);
     if (thumbnail) {
-      const etag = `"${projection.thumbnail_hash}"`;
-      const headers = thumbnailHeaders(options.cacheControl, etag);
-      if (options.ifNoneMatch === etag) return new Response(null, { status: 304, headers });
       return new Response(thumbnail.body, { headers });
     }
   }

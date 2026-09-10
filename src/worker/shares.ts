@@ -13,6 +13,7 @@ import type { Env, MemberContext } from "./env";
 import { attachmentDisposition, HttpError } from "./http";
 
 const PUBLIC_DOCUMENT_FETCH_TIMEOUT_MS = 5_000;
+const PUBLIC_LINKED_DIAGRAM_LIMIT = 64;
 
 export type ShareRow = {
   id: string;
@@ -334,9 +335,11 @@ export function publicDocumentHtml(
 async function eligibleSharedDiagramIds(env: Env, share: SharedPageRow, requested: ReadonlySet<string>) {
   if (!share.include_subpages || !requested.size) return new Set<string>();
   const rows = await env.DB.prepare(
-    `WITH RECURSIVE subtree(id) AS (
-       SELECT ?
-       UNION ALL SELECT child.id FROM pages child JOIN subtree ON child.parent_id = subtree.id
+    `WITH RECURSIVE subtree(id, depth) AS (
+       SELECT ?, 0
+       UNION ALL
+       SELECT child.id, subtree.depth + 1 FROM pages child JOIN subtree ON child.parent_id = subtree.id
+        WHERE subtree.depth < 50
      )
      SELECT page.id
        FROM pages page JOIN subtree ON subtree.id = page.id
@@ -386,9 +389,9 @@ async function publicTransclusions(
       };
     }),
   );
-  const requestedDiagramIds = collectLinkedDiagramIds(document);
+  const requestedDiagramIds = collectLinkedDiagramIds(document, new Set<string>(), PUBLIC_LINKED_DIAGRAM_LIMIT);
   for (const entry of entries) {
-    if (entry) collectLinkedDiagramIds(entry.document, requestedDiagramIds);
+    if (entry) collectLinkedDiagramIds(entry.document, requestedDiagramIds, PUBLIC_LINKED_DIAGRAM_LIMIT);
   }
   const availableDiagramIds = await eligibleSharedDiagramIds(env, share, requestedDiagramIds);
   const available = new Map<string, string>();

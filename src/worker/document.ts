@@ -2,12 +2,7 @@ import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
-import {
-  collectLinkedDiagramIds,
-  collectTransclusions,
-  projectDocument,
-  type ProseMirrorJson,
-} from "../shared/document-projection";
+import { collectTransclusions, projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { diagramFromYDoc, projectDiagram, renderDiagramSvg } from "../shared/diagram";
 import { flattenDocumentBlocks } from "../shared/notion-blocks";
 import type { DocumentContentEnvelope } from "../shared/types";
@@ -1065,7 +1060,6 @@ export class Document extends YServer {
     const snapshot = Y.encodeStateAsUpdate(this.document);
     const json = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
     const projection = projectDocument(json);
-    const linkedDiagramIds = [...collectLinkedDiagramIds(json)];
     const transclusions = collectTransclusions(json);
     const envelope: DocumentContentEnvelope = {
       schemaVersion: 1,
@@ -1245,24 +1239,6 @@ export class Document extends YServer {
           ).bind(pageId, maximum, JSON.stringify(projection.pageReferences), page.workspace_id, pageId, pageId, epoch),
           this.bindings.DB.prepare(
             `DELETE FROM page_references WHERE source_page_id = ? AND projection_seq <> ?
-              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
-          ).bind(pageId, maximum, pageId, epoch),
-          this.bindings.DB.prepare(
-            `UPDATE linked_diagram_references SET projection_seq = -1 WHERE source_page_id = ?
-              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
-          ).bind(pageId, pageId, epoch),
-          this.bindings.DB.prepare(
-            `INSERT INTO linked_diagram_references (source_page_id, target_page_id, projection_seq)
-              SELECT ?, target.id, ?
-                FROM json_each(?) item JOIN pages target ON target.id = item.value
-               WHERE target.workspace_id = ? AND target.kind = 'diagram'
-                 AND target.archived_at IS NULL AND target.import_job_id IS NULL AND target.id <> ?
-                 AND EXISTS (SELECT 1 FROM pages source WHERE source.id = ? AND source.content_epoch = ?)
-              ON CONFLICT(source_page_id, target_page_id) DO UPDATE SET
-                projection_seq = excluded.projection_seq`,
-          ).bind(pageId, maximum, JSON.stringify(linkedDiagramIds), page.workspace_id, pageId, pageId, epoch),
-          this.bindings.DB.prepare(
-            `DELETE FROM linked_diagram_references WHERE source_page_id = ? AND projection_seq <> ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, maximum, pageId, epoch),
           this.bindings.DB.prepare(

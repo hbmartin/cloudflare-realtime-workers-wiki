@@ -116,7 +116,9 @@ describe("core editor blocks", () => {
   it("does not link a newly created diagram after the block becomes read-only", async () => {
     const request = deferred<{ page: Page }>();
     const update = vi.fn();
-    mocks.api.mockReturnValue(request.promise);
+    mocks.api.mockImplementation((_path: string, init?: RequestInit) =>
+      init?.method === "POST" ? request.promise : Promise.resolve({}),
+    );
     const view = render(createElement(LinkedDiagramView, { pageId: "", title: "", update }));
 
     fireEvent.click(screen.getByRole("button", { name: /Create child diagram/ }));
@@ -128,5 +130,7 @@ describe("core editor blocks", () => {
     });
 
     expect(update).not.toHaveBeenCalled();
+    expect(mocks.api).toHaveBeenLastCalledWith("/api/pages/diagram-one", { method: "DELETE" });
+    expect(await screen.findByRole("alert")).toHaveTextContent("discarded because this block became read-only");
   });
 });

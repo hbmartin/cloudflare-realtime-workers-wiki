@@ -1154,14 +1154,39 @@ export async function sweepOutbox(env: Env, continuation = false) {
   const claimed = await env.DB.prepare(
     `UPDATE outbox_sweep_state
         SET lease_token = ?, lease_until = ?,
-            continuation_pending = CASE WHEN ? = 1 THEN 0 ELSE continuation_pending END,
-            updated_at = ?
+            rescan_requested = 0, updated_at = ?
       WHERE id = 1 AND lease_until <= ?
-      RETURNING continuation_pending`,
+      RETURNING id`,
   )
-    .bind(claimToken, claimedAt + OUTBOX_SWEEP_LEASE_MS, continuation ? 1 : 0, claimedAt, claimedAt)
-    .first<{ continuation_pending: number }>();
-  if (!claimed) return false;
+    .bind(claimToken, claimedAt + OUTBOX_SWEEP_LEASE_MS, claimedAt, claimedAt)
+    .first<{ id: number }>();
+  if (!claimed) {
+    if (!continuation) {
+      const requested = await env.DB.prepare(
+        `UPDATE outbox_sweep_state SET rescan_requested = 1, updated_at = ?
+          WHERE id = 1 AND lease_until > ?
+          RETURNING id`,
+      )
+        .bind(Date.now(), claimedAt)
+        .first<{ id: number }>();
+      // The owner released between our failed claim and rescan request. Retry the
+      // claim so the row that prompted this sweep cannot be stranded.
+      if (!requested) return sweepOutbox(env);
+    }
+    return false;
+  }
+
+  const releaseIfIdle = async () =>
+    Boolean(
+      await env.DB.prepare(
+        `UPDATE outbox_sweep_state
+            SET lease_token = NULL, lease_until = 0, updated_at = ?
+          WHERE id = 1 AND lease_token = ? AND rescan_requested = 0
+          RETURNING id`,
+      )
+        .bind(Date.now(), claimToken)
+        .first<{ id: number }>(),
+    );
 
   try {
     for (let batch = 0; batch < OUTBOX_SWEEP_MAX_BATCHES; batch += 1) {
@@ -1178,29 +1203,29 @@ export async function sweepOutbox(env: Env, continuation = false) {
           console.error("Outbox enqueue failed", { outboxId: row.id, error });
         }
       }
-      if (rows.results.length < OUTBOX_SWEEP_BATCH_SIZE) return true;
+      if (rows.results.length < OUTBOX_SWEEP_BATCH_SIZE) {
+        if (await releaseIfIdle()) return true;
+        await env.DB.prepare(
+          `UPDATE outbox_sweep_state SET rescan_requested = 0, updated_at = ?
+            WHERE id = 1 AND lease_token = ?`,
+        )
+          .bind(Date.now(), claimToken)
+          .run();
+      }
     }
     const remaining = await env.DB.prepare(
       `SELECT 1 pending FROM outbox WHERE enqueued_at IS NULL AND available_at <= ? LIMIT 1`,
     )
       .bind(Date.now())
       .first<{ pending: number }>();
-    if (!remaining) return true;
+    if (!remaining && (await releaseIfIdle())) return true;
     console.warn("Outbox sweep cap reached; scheduling continuation", {
       maxRows: OUTBOX_SWEEP_BATCH_SIZE * OUTBOX_SWEEP_MAX_BATCHES,
     });
-    if (!claimed.continuation_pending) {
-      try {
-        await env.DELIVERY_QUEUE.send({ sweep: true });
-        await env.DB.prepare(
-          `UPDATE outbox_sweep_state SET continuation_pending = 1, updated_at = ?
-            WHERE id = 1 AND lease_token = ?`,
-        )
-          .bind(Date.now(), claimToken)
-          .run();
-      } catch (error) {
-        console.error("Outbox sweep continuation enqueue failed", { error });
-      }
+    try {
+      await env.DELIVERY_QUEUE.send({ sweep: true });
+    } catch (error) {
+      console.error("Outbox sweep continuation enqueue failed", { error });
     }
     return true;
   } finally {
@@ -1216,7 +1241,7 @@ export async function sweepOutbox(env: Env, continuation = false) {
 export async function consumeDeliveryMessage(env: Env, message: Message<DeliveryQueueMessage>) {
   if (message.body && "sweep" in message.body && message.body.sweep) {
     if (await sweepOutbox(env, true)) message.ack();
-    else message.retry({ delaySeconds: 1 });
+    else message.retry({ delaySeconds: Math.min(60, 2 ** Math.min(message.attempts, 6)) });
     return;
   }
   const outboxId = message.body && "outboxId" in message.body ? message.body.outboxId : undefined;

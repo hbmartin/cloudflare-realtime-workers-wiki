@@ -1173,9 +1173,29 @@ describe("job execution", () => {
       status: "failed",
       error: { code: "job_failed", message: "Linked diagram thumbnails exceed the 24 MiB export asset limit." },
     });
+
+    await env.BUCKET.put(`diagrams/${diagram.id}/epochs/1/oversized.svg`, "<svg>portable thumbnail</svg>");
+    const portableContext = createExecutionContext();
+    const portable = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "html", portable: true }),
+      }),
+      inlineBindings(),
+      portableContext,
+    );
+    const portableJob = (await portable.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(portableContext);
+    const portableResult = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${portableJob.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await portableResult.json<{ job: Job }>()).job.status).toBe("succeeded");
   });
 
-  it("rejects an export instead of silently omitting linked diagrams beyond the asset-count limit", async () => {
+  it("allows non-portable exports with more than 64 dangling linked-diagram ids", async () => {
     const installed = await bootstrap();
     const source = new Y.Doc();
     const fragment = source.getXmlFragment("document-store");
@@ -1198,6 +1218,61 @@ describe("job execution", () => {
       context,
     );
     expect(queued.status).toBe(202);
+    const job = (await queued.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    const completed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await completed.json<{ job: Job }>()).job.status).toBe("succeeded");
+  });
+
+  it("rejects byte-bearing exports with more than 64 accessible linked diagrams", async () => {
+    const installed = await bootstrap();
+    const diagramIds = Array.from({ length: 65 }, (_, index) => `diagram-${index}`);
+    const timestamp = Date.now();
+    for (let start = 0; start < diagramIds.length; start += 50) {
+      await env.DB.batch(
+        diagramIds.slice(start, start + 50).map((id, offset) =>
+          env.DB.prepare(
+            `INSERT INTO pages
+              (id, workspace_id, space_id, kind, position, title, created_by, created_at, updated_at)
+             VALUES (?, ?, ?, 'diagram', ?, ?, ?, ?, ?)`,
+          ).bind(
+            id,
+            installed.workspaceId,
+            `${installed.workspaceId}-general`,
+            `z-${start + offset}`,
+            `Diagram ${start + offset}`,
+            installed.userId,
+            timestamp,
+            timestamp,
+          ),
+        ),
+      );
+    }
+    const source = new Y.Doc();
+    const fragment = source.getXmlFragment("document-store");
+    for (const [index, id] of diagramIds.entries()) {
+      const linked = new Y.XmlElement("linkedDiagram");
+      linked.setAttribute("pageId", id);
+      linked.setAttribute("title", `Diagram ${index}`);
+      fragment.push([linked]);
+    }
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    const context = createExecutionContext();
+
+    const queued = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "html", portable: true }),
+      }),
+      inlineBindings(),
+      context,
+    );
     const job = (await queued.json<{ job: Job }>()).job;
     await waitOnExecutionContext(context);
 
@@ -1832,6 +1907,43 @@ describe("delivery outbox", () => {
     expect(send).toHaveBeenCalledOnce();
   });
 
+  it("rescans rows written while another producer holds the sweep lease", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const firstId = crypto.randomUUID();
+    const secondId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO outbox
+        (id, workspace_id, topic, payload_json, available_at, created_at)
+       VALUES (?, ?, 'notification', '{}', ?, ?)`,
+    )
+      .bind(firstId, installed.workspaceId, timestamp - 1, timestamp)
+      .run();
+    const gate = deferred<void>();
+    const send = vi.fn(async (_body: unknown) => {
+      if (send.mock.calls.length === 1) await gate.promise;
+    });
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
+
+    const first = sweepOutbox(bindings);
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    await env.DB.prepare(
+      `INSERT INTO outbox
+        (id, workspace_id, topic, payload_json, available_at, created_at)
+       VALUES (?, ?, 'notification', '{}', ?, ?)`,
+    )
+      .bind(secondId, installed.workspaceId, timestamp - 1, timestamp + 1)
+      .run();
+
+    await expect(sweepOutbox(bindings)).resolves.toBe(false);
+    gate.resolve();
+    await expect(first).resolves.toBe(true);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(new Set(send.mock.calls.map(([body]) => (body as { outboxId: string }).outboxId))).toEqual(
+      new Set([firstId, secondId]),
+    );
+  });
+
   it("enqueues every immediately available row across sweep batches", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();
@@ -1898,6 +2010,29 @@ describe("delivery outbox", () => {
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 0 });
+  });
+
+  it("backs off a sweep continuation while another owner holds the lease", async () => {
+    await bootstrap();
+    await env.DB.prepare(
+      `UPDATE outbox_sweep_state SET lease_token = 'active', lease_until = ?, updated_at = ? WHERE id = 1`,
+    )
+      .bind(Date.now() + 60_000, Date.now())
+      .run();
+    const ack = vi.fn();
+    const retry = vi.fn();
+
+    await consumeDeliveryMessage(env, {
+      id: "sweep-continuation",
+      timestamp: new Date(),
+      body: { sweep: true },
+      attempts: 3,
+      ack,
+      retry,
+    } satisfies Message<DeliveryQueueMessage>);
+
+    expect(ack).not.toHaveBeenCalled();
+    expect(retry).toHaveBeenCalledWith({ delaySeconds: 8 });
   });
 
   it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {

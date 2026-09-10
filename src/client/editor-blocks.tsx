@@ -567,6 +567,9 @@ export function LinkedDiagramView({
   const updateRef = useRef(update);
   useLayoutEffect(() => {
     updateRef.current = update;
+    return () => {
+      updateRef.current = undefined;
+    };
   }, [update]);
 
   const showPicker = Boolean(update) && (!pageId || choosing);
@@ -605,7 +608,16 @@ export function LinkedDiagramView({
         }),
       });
       const currentUpdate = updateRef.current;
-      if (!currentUpdate) return;
+      if (!currentUpdate) {
+        try {
+          await api(`/api/pages/${encodeURIComponent(result.page.id)}`, { method: "DELETE" });
+          setError("The new whiteboard was discarded because this block became read-only.");
+        } catch (cleanupError) {
+          console.error("Failed to archive an unlinked whiteboard", cleanupError);
+          setError("A new whiteboard was created but could not be linked after this block became read-only.");
+        }
+        return;
+      }
       currentUpdate(result.page);
       setChoosing(false);
       setError("");
@@ -622,6 +634,7 @@ export function LinkedDiagramView({
         <figcaption>
           <span aria-hidden="true">◇</span> {title || "Linked whiteboard"} unavailable
         </figcaption>
+        {error ? <small role="alert">{error}</small> : null}
       </figure>
     );
   }
