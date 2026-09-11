@@ -506,3 +506,7 @@ export function renderDiagramSvg(
     return fallback();
   }
 }
+
+export function renderEmptyDiagramSvg(options: DiagramRenderOptions = {}) {
+  return renderDiagramSvg({ nodes: [], edges: [] }, options);
+}

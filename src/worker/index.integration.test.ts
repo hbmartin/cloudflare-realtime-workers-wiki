@@ -2926,7 +2926,9 @@ describe("Worker integration", () => {
       ok: true,
       pageIds: [installed.pageId],
       cleanupPending: false,
+      pendingPageCount: 0,
       pendingPageIds: [],
+      pendingPageIdsTruncated: false,
     });
     expect(
       (
@@ -2969,13 +2971,17 @@ describe("Worker integration", () => {
       ok: boolean;
       pageIds: string[];
       cleanupPending: boolean;
+      pendingPageCount: number;
       pendingPageIds: string[];
+      pendingPageIdsTruncated: boolean;
     }>();
     expect({ ...firstBody, pageIds: [...firstBody.pageIds].sort() }).toEqual({
       ok: true,
       pageIds: [installed.pageId, child.id].sort(),
       cleanupPending: false,
+      pendingPageCount: 0,
       pendingPageIds: [],
+      pendingPageIdsTruncated: false,
     });
 
     const repeated = await archive();
@@ -2984,13 +2990,17 @@ describe("Worker integration", () => {
       ok: boolean;
       pageIds: string[];
       cleanupPending: boolean;
+      pendingPageCount: number;
       pendingPageIds: string[];
+      pendingPageIdsTruncated: boolean;
     }>();
     expect({ ...repeatedBody, pageIds: [...repeatedBody.pageIds].sort() }).toEqual({
       ok: true,
       pageIds: [installed.pageId, child.id].sort(),
       cleanupPending: false,
+      pendingPageCount: 0,
       pendingPageIds: [],
+      pendingPageIdsTruncated: false,
     });
   });
 
@@ -3020,8 +3030,73 @@ describe("Worker integration", () => {
       ok: true,
       pageIds: [installed.pageId],
       cleanupPending: true,
+      pendingPageCount: 1,
       pendingPageIds: [installed.pageId],
+      pendingPageIdsTruncated: false,
     });
+  });
+
+  it("reports when the pending disconnect id list is only a bounded sample", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const operationId = "large-archive-operation";
+    const childIds = Array.from({ length: 55 }, (_, index) => `pending-child-${index}`);
+    await env.DB.prepare(`UPDATE pages SET archived_at = ?, archived_by = ?, archive_operation_id = ? WHERE id = ?`)
+      .bind(timestamp, installed.userId, operationId, installed.pageId)
+      .run();
+    for (let offset = 0; offset < childIds.length; offset += 25) {
+      await env.DB.batch(
+        childIds.slice(offset, offset + 25).map((id, index) =>
+          env.DB.prepare(
+            `INSERT INTO pages
+              (id, workspace_id, space_id, parent_id, kind, position, title, archived_at, archived_by,
+               archive_operation_id, created_by, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).bind(
+            id,
+            installed.workspaceId,
+            `${installed.workspaceId}-general`,
+            installed.pageId,
+            `pending-${offset + index}`,
+            `Pending ${offset + index}`,
+            timestamp,
+            installed.userId,
+            operationId,
+            installed.userId,
+            timestamp,
+            timestamp,
+          ),
+        ),
+      );
+    }
+    const targetIds = [installed.pageId, ...childIds];
+    for (let offset = 0; offset < targetIds.length; offset += 25) {
+      await env.DB.batch(
+        targetIds.slice(offset, offset + 25).map((id, index) =>
+          env.DB.prepare(
+            `INSERT INTO archive_disconnect_targets
+              (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
+             VALUES (?, ?, 1, ?, ?, ?, ?)`,
+          ).bind(id, installed.workspaceId, `${id}~1`, timestamp + 60_000, timestamp + offset + index, timestamp),
+        ),
+      );
+    }
+
+    const repeated = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }),
+    );
+
+    expect(repeated.status).toBe(202);
+    const result = await repeated.json<{
+      pageIds: string[];
+      pendingPageCount: number;
+      pendingPageIds: string[];
+      pendingPageIdsTruncated: boolean;
+    }>();
+    expect(result.pageIds).toHaveLength(56);
+    expect(result.pendingPageCount).toBe(56);
+    expect(result.pendingPageIds).toHaveLength(50);
+    expect(result.pendingPageIdsTruncated).toBe(true);
   });
 
   it("copies the archive operation id into the workspace event", async () => {
@@ -3089,7 +3164,7 @@ describe("Worker integration", () => {
     await waitOnExecutionContext(restoreContext);
   });
 
-  it("returns the current state when an already completed restore is retried", async () => {
+  it("treats restoring an active page as an idempotent no-op", async () => {
     const installed = await bootstrap();
 
     const restored = await SELF.fetch(
@@ -3211,7 +3286,9 @@ describe("Worker integration", () => {
         ok: true,
         pageIds: [installed.pageId],
         cleanupPending: true,
+        pendingPageCount: 1,
         pendingPageIds: [installed.pageId],
+        pendingPageIdsTruncated: false,
       });
       expect(
         (
@@ -3234,7 +3311,9 @@ describe("Worker integration", () => {
         ok: true,
         pageIds: [installed.pageId],
         cleanupPending: true,
+        pendingPageCount: 1,
         pendingPageIds: [installed.pageId],
+        pendingPageIdsTruncated: false,
       });
     } finally {
       await runInDurableObject(stub, async (instance) => {

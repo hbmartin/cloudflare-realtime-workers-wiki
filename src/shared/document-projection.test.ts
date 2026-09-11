@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   collectLinkedDiagramIds,
+  containsLinkedDiagramId,
   projectDocument,
   serializeDocument,
   type ProseMirrorJson,
@@ -178,7 +179,7 @@ describe("structured document projection", () => {
   });
 
   it("collects distinct linked diagrams from nested document content", () => {
-    const ids = collectLinkedDiagramIds(
+    const collected = collectLinkedDiagramIds(
       document({
         type: "blockGroup",
         content: [
@@ -190,11 +191,12 @@ describe("structured document projection", () => {
       }),
     );
 
-    expect([...ids]).toEqual(["diagram-one", "diagram-two"]);
+    expect([...collected.ids]).toEqual(["diagram-one", "diagram-two"]);
+    expect(collected.truncated).toBe(false);
   });
 
   it("stops collecting linked diagrams at a caller-provided limit", () => {
-    const ids = collectLinkedDiagramIds(
+    const collected = collectLinkedDiagramIds(
       document(
         ...Array.from({ length: 5 }, (_, index) => ({
           type: "linkedDiagram",
@@ -205,7 +207,18 @@ describe("structured document projection", () => {
       3,
     );
 
-    expect([...ids]).toEqual(["diagram-0", "diagram-1", "diagram-2"]);
+    expect([...collected.ids]).toEqual(["diagram-0", "diagram-1", "diagram-2"]);
+    expect(collected.truncated).toBe(true);
+  });
+
+  it("finds one linked diagram without collecting every id", () => {
+    const root = document(
+      { type: "linkedDiagram", attrs: { pageId: "diagram-one" } },
+      { type: "linkedDiagram", attrs: { pageId: "diagram-two" } },
+    );
+
+    expect(containsLinkedDiagramId(root, "diagram-one")).toBe(true);
+    expect(containsLinkedDiagramId(root, "missing")).toBe(false);
   });
 
   it("keeps page links inert unless the caller supplies the shared page resolver", () => {

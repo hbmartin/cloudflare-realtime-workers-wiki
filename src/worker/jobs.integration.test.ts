@@ -1195,7 +1195,7 @@ describe("job execution", () => {
     expect((await portableResult.json<{ job: Job }>()).job.status).toBe("succeeded");
   });
 
-  it("rejects an export when a referenced diagram is archived", async () => {
+  it("allows an archived diagram in Markdown but rejects thumbnail-bearing exports", async () => {
     const installed = await bootstrap();
     const created = await worker.fetch(
       request(installed.cookie, "/api/pages", {
@@ -1214,6 +1214,26 @@ describe("job execution", () => {
     linked.setAttribute("title", diagram.title);
     source.getXmlFragment("document-store").push([linked]);
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+
+    const markdownContext = createExecutionContext();
+    const markdown = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "markdown", portable: false }),
+      }),
+      inlineBindings(),
+      markdownContext,
+    );
+    const markdownJob = (await markdown.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(markdownContext);
+    const markdownResult = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${markdownJob.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await markdownResult.json<{ job: Job }>()).job.status).toBe("succeeded");
+
     const context = createExecutionContext();
 
     const queued = await worker.fetch(
@@ -1240,7 +1260,7 @@ describe("job execution", () => {
     });
   });
 
-  it("rejects byte-bearing exports with more than 64 accessible linked diagrams", async () => {
+  it("rejects metadata-only HTML exports with more than 64 linked diagrams", async () => {
     const installed = await bootstrap();
     const diagramIds = Array.from({ length: 65 }, (_, index) => `diagram-${index}`);
     const timestamp = Date.now();
@@ -1279,7 +1299,7 @@ describe("job execution", () => {
       request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ format: "html", portable: true }),
+        body: JSON.stringify({ format: "html", portable: false }),
       }),
       inlineBindings(),
       context,
@@ -1912,9 +1932,9 @@ describe("delivery outbox", () => {
     const first = sweepOutbox(bindings);
     await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
 
-    await expect(sweepOutbox(bindings)).resolves.toBe(false);
+    await expect(sweepOutbox(bindings)).resolves.toBe("contended");
     gate.resolve();
-    await expect(first).resolves.toBe(true);
+    await expect(first).resolves.toBe("completed");
     expect(send).toHaveBeenCalledOnce();
   });
 
@@ -1946,16 +1966,16 @@ describe("delivery outbox", () => {
       .bind(secondId, installed.workspaceId, timestamp - 1, timestamp + 1)
       .run();
 
-    await expect(sweepOutbox(bindings)).resolves.toBe(false);
+    await expect(sweepOutbox(bindings)).resolves.toBe("contended");
     gate.resolve();
-    await expect(first).resolves.toBe(true);
+    await expect(first).resolves.toBe("completed");
     expect(send).toHaveBeenCalledTimes(2);
     expect(new Set(send.mock.calls.map(([body]) => (body as { outboxId: string }).outboxId))).toEqual(
       new Set([firstId, secondId]),
     );
   });
 
-  it("stops enqueueing immediately when the sweep lease is lost", async () => {
+  it("reports lease loss before enqueueing another row after the lease expires", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();
     const ids = [crypto.randomUUID(), crypto.randomUUID()];
@@ -1968,15 +1988,20 @@ describe("delivery outbox", () => {
         ).bind(id, installed.workspaceId, timestamp - 1, timestamp + index),
       ),
     );
+    const clock = vi.spyOn(Date, "now").mockReturnValue(timestamp);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => {
+      clock.mockRestore();
+      log.mockRestore();
+    });
     const send = vi.fn(async (_body: unknown) => {
-      await env.DB.prepare(`UPDATE outbox_sweep_state SET lease_token = 'replacement', lease_until = ? WHERE id = 1`)
-        .bind(Date.now() + 60_000)
-        .run();
+      clock.mockReturnValue(timestamp + 5 * 60_000);
     });
 
-    await expect(sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }))).resolves.toBe(false);
+    await expect(sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }))).resolves.toBe("lease-lost");
 
     expect(send).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith("Outbox sweep lease lost", { stage: "before-row" });
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 1 });

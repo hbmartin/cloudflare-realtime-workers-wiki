@@ -72,8 +72,19 @@ describe("public document rendering", () => {
       BETTER_AUTH_SECRET: "internal-secret",
       DOCUMENT: { getByName: vi.fn(() => ({ fetch })) },
     } as unknown as Env;
-    const diagram = { page_id: "diagram", page_kind: "diagram" } as SharedPageRow;
-    const source = { page_id: "source", page_kind: "document", content_epoch: 3 } as SharedPageRow;
+    const diagram = {
+      id: "share",
+      workspace_id: "workspace",
+      page_id: "diagram",
+      page_kind: "diagram",
+    } as SharedPageRow;
+    const source = {
+      id: "share",
+      workspace_id: "workspace",
+      page_id: "source",
+      page_kind: "document",
+      content_epoch: 3,
+    } as SharedPageRow;
 
     await expect(publicDiagramThumbnail(env, diagram, source)).resolves.toBeNull();
     expect(env.DOCUMENT.getByName).toHaveBeenCalledWith("source~3");
@@ -86,9 +97,40 @@ describe("public document rendering", () => {
       BETTER_AUTH_SECRET: "internal-secret",
       DOCUMENT: { getByName: vi.fn(() => ({ fetch })) },
     } as unknown as Env;
-    const diagram = { page_id: "diagram", page_kind: "diagram" } as SharedPageRow;
-    const source = { page_id: "source", page_kind: "document", content_epoch: 3 } as SharedPageRow;
+    const diagram = {
+      id: "share",
+      workspace_id: "workspace",
+      page_id: "diagram",
+      page_kind: "diagram",
+    } as SharedPageRow;
+    const source = {
+      id: "share",
+      workspace_id: "workspace",
+      page_id: "source",
+      page_kind: "document",
+      content_epoch: 3,
+    } as SharedPageRow;
 
     await expect(publicDiagramThumbnail(env, diagram, source)).resolves.toBeNull();
+  });
+
+  it("rejects thumbnail records resolved from different shares before loading content", async () => {
+    const getByName = vi.fn();
+    const env = { DOCUMENT: { getByName } } as unknown as Env;
+    const diagram = {
+      id: "share-one",
+      workspace_id: "workspace",
+      page_id: "diagram",
+      page_kind: "diagram",
+    } as SharedPageRow;
+    const source = {
+      id: "share-two",
+      workspace_id: "workspace",
+      page_id: "source",
+      page_kind: "document",
+    } as SharedPageRow;
+
+    await expect(publicDiagramThumbnail(env, diagram, source)).resolves.toBeNull();
+    expect(getByName).not.toHaveBeenCalled();
   });
 });
