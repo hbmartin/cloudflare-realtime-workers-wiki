@@ -34,7 +34,7 @@ function splitEntityTags(condition: string) {
   return tags;
 }
 
-function weakEtagMatches(condition: string, etag: string) {
+export function weakEtagMatches(condition: string, etag: string) {
   return (
     condition.trim() === "*" ||
     splitEntityTags(condition).some((candidate) => normalizeWeakEtag(candidate) === normalizeWeakEtag(etag))

@@ -3,8 +3,15 @@ import { sha256Hex } from "../shared/import-integrity";
 import type { Env } from "./env";
 import { diagramThumbnailResponse } from "./diagram-thumbnail";
 
-function thumbnailEnv(objectExists: boolean) {
-  const get = vi.fn();
+vi.mock("../shared/import-integrity", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../shared/import-integrity")>();
+  return { ...original, sha256Hex: vi.fn(original.sha256Hex) };
+});
+
+function thumbnailEnv(objectExists: boolean, thumbnailBody?: string) {
+  const get = vi.fn(async () =>
+    thumbnailBody === undefined ? null : ({ body: thumbnailBody } as unknown as R2ObjectBody),
+  );
   const head = vi.fn(async () => (objectExists ? ({} as R2Object) : null));
   const first = vi.fn(async () => ({ thumbnail_r2_key: "diagrams/page/thumbnail.svg", thumbnail_hash: "hash" }));
   const env = {
@@ -21,7 +28,7 @@ describe("diagram thumbnail responses", () => {
     const response = await diagramThumbnailResponse(
       env,
       { id: "page", content_epoch: 1, title: "Diagram" },
-      { cacheControl: "private", ifNoneMatch: '"hash"' },
+      { cacheControl: "private", validators: true, ifNoneMatch: '"stale", W/"hash"' },
     );
 
     expect(response.status).toBe(304);
@@ -35,7 +42,7 @@ describe("diagram thumbnail responses", () => {
     const response = await diagramThumbnailResponse(
       env,
       { id: "page", content_epoch: 1, title: "Diagram" },
-      { cacheControl: "private", ifNoneMatch: '"hash"' },
+      { cacheControl: "private", validators: true, ifNoneMatch: '"hash"' },
     );
 
     expect(response.status).toBe(200);
@@ -44,17 +51,51 @@ describe("diagram thumbnail responses", () => {
     expect(get).toHaveBeenCalledWith("diagrams/page/thumbnail.svg");
   });
 
-  it("does not hash or attach a validator to a no-store placeholder", async () => {
+  it("uses weak comparison for a placeholder validator list", async () => {
     const { env } = thumbnailEnv(false);
+    const page = { id: "page", content_epoch: 1, title: "Diagram" };
+    const first = await diagramThumbnailResponse(env, page, { cacheControl: "private", validators: true });
+    const etag = first.headers.get("etag");
+
+    const response = await diagramThumbnailResponse(env, page, {
+      cacheControl: "private",
+      validators: true,
+      ifNoneMatch: `"stale", W/${etag}`,
+    });
+
+    expect(response.status).toBe(304);
+  });
+
+  it("does not attach a validator to a cached no-store thumbnail", async () => {
+    const { env, get, head } = thumbnailEnv(false, "<svg>cached</svg>");
 
     const response = await diagramThumbnailResponse(
       env,
       { id: "page", content_epoch: 1, title: "Diagram" },
-      { cacheControl: "no-store" },
+      { cacheControl: "no-store", validators: false, ifNoneMatch: '"hash"' },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("etag")).toBeNull();
+    expect(await response.text()).toBe("<svg>cached</svg>");
+    expect(head).not.toHaveBeenCalled();
+    expect(get).toHaveBeenCalledWith("diagrams/page/thumbnail.svg");
+  });
+
+  it("does not hash or attach a validator to a no-store placeholder", async () => {
+    const { env } = thumbnailEnv(false);
+    const hash = vi.mocked(sha256Hex);
+    hash.mockClear();
+
+    const response = await diagramThumbnailResponse(
+      env,
+      { id: "page", content_epoch: 1, title: "Diagram" },
+      { cacheControl: "no-store", validators: false },
     );
 
     expect(response.status).toBe(200);
     expect(response.headers.get("etag")).toBeNull();
     expect(await response.text()).toContain("<svg");
+    expect(hash).not.toHaveBeenCalled();
   });
 });

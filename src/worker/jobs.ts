@@ -1210,7 +1210,16 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
         .bind(renewedAt + OUTBOX_SWEEP_LEASE_MS, renewedAt, claimToken, renewedAt)
         .first<{ id: number }>(),
     );
-    if (!renewed) console.error("Outbox sweep lease lost", { stage });
+    if (!renewed) {
+      console.error("Outbox sweep lease lost", { stage });
+      if (!continuation) {
+        try {
+          await env.DELIVERY_QUEUE.send({ sweep: true });
+        } catch (error) {
+          console.error("Outbox sweep lease-loss continuation enqueue failed", { error });
+        }
+      }
+    }
     return renewed;
   };
 

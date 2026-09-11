@@ -2042,7 +2042,8 @@ describe("delivery outbox", () => {
     );
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => log.mockRestore());
-    const send = vi.fn(async (_body: unknown) => {
+    const send = vi.fn(async (body: unknown) => {
+      if (!(body as { outboxId?: string }).outboxId) return;
       await env.DB.prepare(`UPDATE outbox_sweep_state SET lease_token = 'replacement', lease_until = ? WHERE id = 1`)
         .bind(Date.now() + 60_000)
         .run();
@@ -2050,7 +2051,9 @@ describe("delivery outbox", () => {
 
     await expect(sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }))).resolves.toBe("lease-lost");
 
-    expect(send).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenNthCalledWith(1, { outboxId: ids[0] });
+    expect(send).toHaveBeenNthCalledWith(2, { sweep: true });
     expect(log).toHaveBeenCalledWith("Outbox sweep lease lost", { stage: "before-row" });
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
@@ -2076,13 +2079,19 @@ describe("delivery outbox", () => {
       clock.mockRestore();
       log.mockRestore();
     });
-    const send = vi.fn(async (_body: unknown) => {
-      clock.mockReturnValue(timestamp + 5 * 60_000);
+    const send = vi.fn(async (body: unknown) => {
+      if (!(body as { outboxId?: string }).outboxId) return;
+      const state = await env.DB.prepare(`SELECT lease_until FROM outbox_sweep_state WHERE id = 1`).first<{
+        lease_until: number;
+      }>();
+      clock.mockReturnValue(state!.lease_until + 1);
     });
 
     await expect(sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }))).resolves.toBe("lease-lost");
 
-    expect(send).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenNthCalledWith(1, { outboxId: ids[0] });
+    expect(send).toHaveBeenNthCalledWith(2, { sweep: true });
     expect(log).toHaveBeenCalledWith("Outbox sweep lease lost", { stage: "before-row" });
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
