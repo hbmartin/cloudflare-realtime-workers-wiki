@@ -2057,6 +2057,38 @@ describe("delivery outbox", () => {
     ).resolves.toEqual({ count: 1 });
   });
 
+  it("stops enqueueing when the sweep lease expires", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const ids = [crypto.randomUUID(), crypto.randomUUID()];
+    await env.DB.batch(
+      ids.map((id, index) =>
+        env.DB.prepare(
+          `INSERT INTO outbox
+            (id, workspace_id, topic, payload_json, available_at, created_at)
+           VALUES (?, ?, 'notification', '{}', ?, ?)`,
+        ).bind(id, installed.workspaceId, timestamp - 1, timestamp + index),
+      ),
+    );
+    const clock = vi.spyOn(Date, "now").mockReturnValue(timestamp);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => {
+      clock.mockRestore();
+      log.mockRestore();
+    });
+    const send = vi.fn(async (_body: unknown) => {
+      clock.mockReturnValue(timestamp + 5 * 60_000);
+    });
+
+    await expect(sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }))).resolves.toBe("lease-lost");
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith("Outbox sweep lease lost", { stage: "before-row" });
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
+    ).resolves.toEqual({ count: 1 });
+  });
+
   it("enqueues every immediately available row across sweep batches", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();

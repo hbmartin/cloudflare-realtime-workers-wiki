@@ -35,18 +35,20 @@ export async function diagramThumbnailResponse(
     height: DIAGRAM_THUMBNAIL_HEIGHT,
     title: page.title,
   });
-  const etag = `"empty-${await sha256Hex(placeholder)}"`;
+  const noStore = options.cacheControl.split(",").some((directive) => directive.trim().toLowerCase() === "no-store");
+  const etag = noStore ? undefined : `"empty-${await sha256Hex(placeholder)}"`;
   const headers = thumbnailHeaders(options.cacheControl, etag);
-  if (options.ifNoneMatch === etag) return new Response(null, { status: 304, headers });
+  if (etag && options.ifNoneMatch === etag) return new Response(null, { status: 304, headers });
   return new Response(placeholder, { headers });
 }
 
-function thumbnailHeaders(cacheControl: string, etag: string) {
-  return new Headers({
+function thumbnailHeaders(cacheControl: string, etag?: string) {
+  const headers = new Headers({
     "content-type": "image/svg+xml; charset=utf-8",
     "cache-control": cacheControl,
     "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
     "x-content-type-options": "nosniff",
-    etag,
   });
+  if (etag) headers.set("etag", etag);
+  return headers;
 }
