@@ -3239,7 +3239,7 @@ app.delete("/api/pages/:id", async (c) => {
       SELECT id FROM subtree
     )`).bind(page.id),
   ]);
-  const [archived, operationTargets] = await Promise.all([
+  const [archived, dueTargets] = await Promise.all([
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
@@ -3251,15 +3251,15 @@ app.delete("/api/pages/:id", async (c) => {
       `WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        )
-       SELECT target.page_id, target.content_epoch, target.next_attempt_at, COUNT(*) OVER() target_count
+       SELECT target.page_id, target.content_epoch
          FROM archive_disconnect_targets target
          JOIN subtree ON subtree.id = target.page_id
          JOIN pages archived_page ON archived_page.id = target.page_id
-        WHERE ${archiveOwnershipSql}
-        ORDER BY target.next_attempt_at > ?, target.created_at, target.page_id LIMIT ?`,
+        WHERE ${archiveOwnershipSql} AND target.next_attempt_at <= ?
+        ORDER BY target.created_at, target.page_id LIMIT ?`,
     )
-      .bind(page.id, archiveOwnership, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT + 1)
-      .all<{ page_id: string; content_epoch: number; next_attempt_at: number; target_count: number }>(),
+      .bind(page.id, archiveOwnership, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT)
+      .all<{ page_id: string; content_epoch: number }>(),
   ]);
   const pageIds = archived.results.map((item) => item.id);
   sendWorkspaceEvent(c, member.workspace.id, {
@@ -3268,22 +3268,38 @@ app.delete("/api/pages/:id", async (c) => {
     permanently: false,
     ...(operationId ? { operationId } : {}),
   });
-  const dueTargets = operationTargets.results
-    .filter((target) => target.next_attempt_at <= timestamp)
-    .slice(0, ARCHIVE_DISCONNECT_RUN_LIMIT);
-  const attemptedPageIds = new Set(dueTargets.map((target) => target.page_id));
-  const failedPageIds = new Set(
-    await processArchiveDisconnectTargets(
-      c.env,
-      dueTargets.map((target) => ({ page_id: target.page_id, content_epoch: target.content_epoch })),
-    ),
+  await processArchiveDisconnectTargets(
+    c.env,
+    dueTargets.results.map((target) => ({ page_id: target.page_id, content_epoch: target.content_epoch })),
   );
-  const pendingTargets = operationTargets.results.filter(
-    (target) => !attemptedPageIds.has(target.page_id) || failedPageIds.has(target.page_id),
+  type PendingArchiveTargetResult = { page_id?: string; target_count?: number };
+  const [pendingCount, pendingTargets] = await c.env.DB.batch<PendingArchiveTargetResult>([
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       )
+       SELECT COUNT(*) target_count
+         FROM archive_disconnect_targets target
+         JOIN subtree ON subtree.id = target.page_id
+         JOIN pages archived_page ON archived_page.id = target.page_id
+        WHERE ${archiveOwnershipSql}`,
+    ).bind(page.id, archiveOwnership),
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       )
+       SELECT target.page_id
+         FROM archive_disconnect_targets target
+         JOIN subtree ON subtree.id = target.page_id
+         JOIN pages archived_page ON archived_page.id = target.page_id
+        WHERE ${archiveOwnershipSql}
+        ORDER BY target.next_attempt_at > ?, target.created_at, target.page_id LIMIT ?`,
+    ).bind(page.id, archiveOwnership, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT),
+  ]);
+  const pendingPageCount = pendingCount?.results[0]?.target_count ?? 0;
+  const pendingPageIds = (pendingTargets?.results ?? []).flatMap((target) =>
+    target.page_id === undefined ? [] : [target.page_id],
   );
-  const completedTargetCount = attemptedPageIds.size - failedPageIds.size;
-  const pendingPageCount = Math.max(0, (operationTargets.results[0]?.target_count ?? 0) - completedTargetCount);
-  const pendingPageIds = pendingTargets.slice(0, ARCHIVE_DISCONNECT_RUN_LIMIT).map((target) => target.page_id);
   const pendingPageIdsTruncated = pendingPageCount > pendingPageIds.length;
   return c.json(
     {

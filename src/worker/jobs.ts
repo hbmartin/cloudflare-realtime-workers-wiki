@@ -22,7 +22,6 @@ const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
 const OUTBOX_SWEEP_MAX_BATCHES = 5;
 const OUTBOX_SWEEP_LEASE_MS = 5 * 60_000;
-const OUTBOX_SWEEP_RENEW_MARGIN_MS = 60_000;
 const OUTBOX_SWEEP_CLAIM_ATTEMPTS = 2;
 const OUTBOX_POISON_WARNING_ATTEMPTS = 10;
 const OUTBOX_POISON_WARNING_INTERVAL = 24;
@@ -1189,8 +1188,6 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
     }
     return "contended";
   }
-  let leaseUntil = claimedAt + OUTBOX_SWEEP_LEASE_MS;
-
   const releaseIfIdle = async () =>
     Boolean(
       await env.DB.prepare(
@@ -1202,9 +1199,8 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
         .bind(Date.now(), claimToken)
         .first<{ id: number }>(),
     );
-  const renewLeaseIfNeeded = async (stage: string) => {
+  const renewLease = async (stage: string) => {
     const renewedAt = Date.now();
-    if (renewedAt < leaseUntil - OUTBOX_SWEEP_RENEW_MARGIN_MS) return true;
     const renewed = Boolean(
       await env.DB.prepare(
         `UPDATE outbox_sweep_state SET lease_until = ?, updated_at = ?
@@ -1214,14 +1210,13 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
         .bind(renewedAt + OUTBOX_SWEEP_LEASE_MS, renewedAt, claimToken, renewedAt)
         .first<{ id: number }>(),
     );
-    if (renewed) leaseUntil = renewedAt + OUTBOX_SWEEP_LEASE_MS;
-    else console.error("Outbox sweep lease lost", { stage });
+    if (!renewed) console.error("Outbox sweep lease lost", { stage });
     return renewed;
   };
 
   try {
     for (let batch = 0; batch < OUTBOX_SWEEP_MAX_BATCHES; batch += 1) {
-      if (!(await renewLeaseIfNeeded("before-batch"))) return "lease-lost";
+      if (!(await renewLease("before-batch"))) return "lease-lost";
       const rows = await env.DB.prepare(
         `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
           ORDER BY available_at, created_at, id LIMIT ?`,
@@ -1229,14 +1224,14 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
         .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
         .all<{ id: string }>();
       for (const row of rows.results) {
-        if (!(await renewLeaseIfNeeded("before-row"))) return "lease-lost";
+        if (!(await renewLease("before-row"))) return "lease-lost";
         try {
           await enqueueOutbox(env, row.id);
         } catch (error) {
           console.error("Outbox enqueue failed", { outboxId: row.id, error });
         }
       }
-      if (!(await renewLeaseIfNeeded("after-batch"))) return "lease-lost";
+      if (!(await renewLease("after-batch"))) return "lease-lost";
       if (rows.results.length < OUTBOX_SWEEP_BATCH_SIZE) {
         if (await releaseIfIdle()) return "completed";
         await env.DB.prepare(
@@ -1256,7 +1251,7 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
     console.warn("Outbox sweep cap reached; scheduling continuation", {
       maxRows: OUTBOX_SWEEP_BATCH_SIZE * OUTBOX_SWEEP_MAX_BATCHES,
     });
-    if (!(await renewLeaseIfNeeded("before-continuation"))) return "lease-lost";
+    if (!(await renewLease("before-continuation"))) return "lease-lost";
     try {
       await env.DELIVERY_QUEUE.send({ sweep: true });
     } catch (error) {

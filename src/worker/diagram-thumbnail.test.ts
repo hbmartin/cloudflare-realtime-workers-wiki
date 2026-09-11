@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { sha256Hex } from "../shared/import-integrity";
 import type { Env } from "./env";
 import { diagramThumbnailResponse } from "./diagram-thumbnail";
 
@@ -38,7 +39,8 @@ describe("diagram thumbnail responses", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("etag")).toMatch(/^"empty-[a-f0-9]{64}"$/);
+    const placeholder = await response.text();
+    expect(response.headers.get("etag")).toBe(`"empty-${await sha256Hex(placeholder)}"`);
     expect(get).toHaveBeenCalledWith("diagrams/page/thumbnail.svg");
   });
 });

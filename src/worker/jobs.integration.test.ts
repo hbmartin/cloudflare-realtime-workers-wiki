@@ -1110,7 +1110,7 @@ describe("job execution", () => {
     expect(new TextDecoder().decode(entries[1]!.bytes)).toContain("Service map");
   });
 
-  it("rejects PDF export before loading a linked-diagram thumbnail that exceeds the inline budget", async () => {
+  it("rejects oversized and invalid linked-diagram thumbnail metadata before loading bytes", async () => {
     const installed = await bootstrap();
     const created = await worker.fetch(
       request(installed.cookie, "/api/pages", {
@@ -1193,6 +1193,31 @@ describe("job execution", () => {
       createExecutionContext(),
     );
     expect((await portableResult.json<{ job: Job }>()).job.status).toBe("succeeded");
+
+    await env.DB.prepare(`UPDATE diagram_projections SET thumbnail_byte_size = -1 WHERE page_id = ?`)
+      .bind(diagram.id)
+      .run();
+    const invalidContext = createExecutionContext();
+    const invalid = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "html", portable: true }),
+      }),
+      inlineBindings(),
+      invalidContext,
+    );
+    const invalidJob = (await invalid.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(invalidContext);
+    const invalidResult = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${invalidJob.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await invalidResult.json<{ job: Job }>()).job).toMatchObject({
+      status: "failed",
+      error: { code: "job_failed", message: "A linked diagram thumbnail has invalid size metadata." },
+    });
   });
 
   it("allows an archived diagram in Markdown but rejects thumbnail-bearing exports", async () => {
@@ -1260,7 +1285,7 @@ describe("job execution", () => {
     });
   });
 
-  it("rejects metadata-only HTML exports with more than 64 linked diagrams", async () => {
+  it("allows metadata-only HTML exports with more than 64 linked diagrams but still bounds portable exports", async () => {
     const installed = await bootstrap();
     const diagramIds = Array.from({ length: 65 }, (_, index) => `diagram-${index}`);
     const timestamp = Date.now();
@@ -1312,7 +1337,34 @@ describe("job execution", () => {
       env,
       createExecutionContext(),
     );
-    expect((await completed.json<{ job: Job }>()).job).toMatchObject({
+    expect((await completed.json<{ job: Job }>()).job).toMatchObject({ status: "succeeded", hasDownload: true });
+    const download = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}/download`),
+      env,
+      createExecutionContext(),
+    );
+    expect(download.headers.get("content-type")).toContain("text/html");
+    const html = await download.text();
+    expect(html.match(/data-linked-diagram-id=/g)).toHaveLength(65);
+
+    const portableContext = createExecutionContext();
+    const portable = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "html", portable: true }),
+      }),
+      inlineBindings(),
+      portableContext,
+    );
+    const portableJob = (await portable.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(portableContext);
+    const portableResult = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${portableJob.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await portableResult.json<{ job: Job }>()).job).toMatchObject({
       status: "failed",
       error: { code: "job_failed", message: "The export contains more than 64 linked diagrams." },
     });
@@ -1975,7 +2027,7 @@ describe("delivery outbox", () => {
     );
   });
 
-  it("reports lease loss before enqueueing another row after the lease expires", async () => {
+  it("stops enqueueing when the sweep lease token is replaced", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();
     const ids = [crypto.randomUUID(), crypto.randomUUID()];
@@ -1988,14 +2040,12 @@ describe("delivery outbox", () => {
         ).bind(id, installed.workspaceId, timestamp - 1, timestamp + index),
       ),
     );
-    const clock = vi.spyOn(Date, "now").mockReturnValue(timestamp);
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    onTestFinished(() => {
-      clock.mockRestore();
-      log.mockRestore();
-    });
+    onTestFinished(() => log.mockRestore());
     const send = vi.fn(async (_body: unknown) => {
-      clock.mockReturnValue(timestamp + 5 * 60_000);
+      await env.DB.prepare(`UPDATE outbox_sweep_state SET lease_token = 'replacement', lease_until = ? WHERE id = 1`)
+        .bind(Date.now() + 60_000)
+        .run();
     });
 
     await expect(sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }))).resolves.toBe("lease-lost");

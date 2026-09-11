@@ -407,6 +407,7 @@ async function publicTransclusions(
     ).truncated;
   }
   const availableDiagramIds = await eligibleSharedDiagramIds(env, share, requestedDiagramIds);
+  const diagramsOmitted = diagramsTruncated || availableDiagramIds.size < requestedDiagramIds.size;
   const available = new Map<string, string>();
   for (const entry of entries) {
     if (!entry) continue;
@@ -430,7 +431,7 @@ async function publicTransclusions(
     );
     available.set(entry.key, html);
   }
-  return { html: available, diagramIds: availableDiagramIds, diagramsTruncated };
+  return { html: available, diagramIds: availableDiagramIds, diagramsOmitted };
 }
 
 async function publicTableHtml(env: Env, pageId: string) {
@@ -500,7 +501,7 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
     );
     content = rendered.body;
     toc = rendered.toc;
-    if (transclusions.diagramsTruncated) {
+    if (transclusions.diagramsOmitted) {
       content += "<p><small>Some linked whiteboard previews were omitted from this public view.</small></p>";
     }
   } else {

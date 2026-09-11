@@ -208,7 +208,9 @@ describe("public page shares", () => {
 
     const rootOnly = await SELF.fetch(`http://example.test/share/${key}`);
     expect(rootOnly.status).toBe(200);
-    expect(await rootOnly.text()).not.toContain("diagram-thumbnails");
+    const rootOnlyHtml = await rootOnly.text();
+    expect(rootOnlyHtml).not.toContain("diagram-thumbnails");
+    expect(rootOnlyHtml).toContain("Some linked whiteboard previews were omitted");
     const expanded = await authenticated(installed.cookie, `/api/pages/${installed.pageId}/share`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -222,6 +224,7 @@ describe("public page shares", () => {
     expect(rootHtml).toContain(`src="${linkedThumbnailUrl}"`);
     expect(rootHtml).toContain(`src="${transcludedThumbnailUrl}"`);
     expect(rootHtml).not.toContain(`src="${outsideThumbnailUrl}"`);
+    expect(rootHtml).toContain("Some linked whiteboard previews were omitted");
 
     const thumbnail = await SELF.fetch(`http://example.test${linkedThumbnailUrl}`);
     expect(thumbnail.status).toBe(200);

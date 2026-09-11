@@ -13,11 +13,13 @@ describe("archive disconnect processing", () => {
     });
     const prepare = vi.fn((query: string) => ({
       bind: vi.fn(() => ({
-        first: vi.fn(async () =>
-          query.includes("RETURNING workspace_id")
-            ? { workspace_id: "workspace", room: "page~1", attempts: 0 }
-            : { content_epoch: 1, archived_at: Date.now(), location_hint: "weur" },
-        ),
+        first: vi.fn(async () => {
+          if (query.includes("RETURNING workspace_id")) {
+            return { workspace_id: "workspace", room: "page~1", attempts: 0 };
+          }
+          if (query.includes("RETURNING page_id")) return { page_id: "page" };
+          return { content_epoch: 1, archived_at: Date.now(), location_hint: "weur" };
+        }),
         run: vi.fn(async () => undefined),
       })),
     }));
@@ -57,6 +59,7 @@ describe("archive disconnect processing", () => {
             claims += 1;
             return claims === 1 ? { workspace_id: "workspace", room: "page~1", attempts: 0 } : null;
           }
+          if (query.includes("RETURNING page_id")) return { page_id: "page" };
           return { content_epoch: 1, archived_at: Date.now(), location_hint: null };
         }),
         run: vi.fn(async () => undefined),
@@ -90,11 +93,13 @@ describe("archive disconnect processing", () => {
         binds.push({ query, args });
         if (query.includes("RETURNING workspace_id")) lease = args[0] as number;
         return {
-          first: vi.fn(async () =>
-            query.includes("RETURNING workspace_id")
-              ? { workspace_id: "workspace", room: "page~1", attempts: 1 }
-              : { content_epoch: 1, archived_at: Date.now(), location_hint: null },
-          ),
+          first: vi.fn(async () => {
+            if (query.includes("RETURNING workspace_id")) {
+              return { workspace_id: "workspace", room: "page~1", attempts: 1 };
+            }
+            if (query.includes("RETURNING page_id")) return { page_id: "page" };
+            return { content_epoch: 1, archived_at: Date.now(), location_hint: null };
+          }),
           run,
         };
       }),
@@ -115,8 +120,34 @@ describe("archive disconnect processing", () => {
     expect(pending).toEqual([]);
     const deletion = binds.find(({ query }) => query.includes("DELETE FROM archive_disconnect_targets"));
     expect(deletion?.query).toMatch(/next_attempt_at = \?/);
+    expect(deletion?.query).toMatch(/RETURNING page_id/);
     expect(deletion?.args.at(-1)).toBe(lease);
-    expect(run).toHaveBeenCalledOnce();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("keeps a target pending when its completion lease no longer matches", async () => {
+    const fetch = vi.fn(async () => new Response(null, { status: 200 }));
+    const prepare = vi.fn((query: string) => ({
+      bind: vi.fn(() => ({
+        first: vi.fn(async () => {
+          if (query.includes("RETURNING workspace_id")) {
+            return { workspace_id: "workspace", room: "page~1", attempts: 1 };
+          }
+          if (query.includes("RETURNING page_id")) return null;
+          return { content_epoch: 1, archived_at: Date.now(), location_hint: null };
+        }),
+      })),
+    }));
+    const env = {
+      BETTER_AUTH_SECRET: "test-secret",
+      DB: { prepare },
+      DOCUMENT: { getByName: vi.fn(() => ({ fetch })) },
+    } as unknown as Env;
+
+    const pending = await processArchiveDisconnectTargets(env, [{ page_id: "page", content_epoch: 1 }]);
+
+    expect(pending).toEqual(["page"]);
+    expect(fetch).toHaveBeenCalledOnce();
   });
 
   it("keeps transient room conflicts in the retry queue", async () => {
