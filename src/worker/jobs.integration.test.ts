@@ -2027,6 +2027,27 @@ describe("delivery outbox", () => {
     );
   });
 
+  it("propagates a failed claim-race fallback enqueue", async () => {
+    const failure = new Error("queue unavailable");
+    const send = vi.fn(async () => Promise.reject(failure));
+    const first = vi.fn(async () => null);
+    const database = {
+      prepare: vi.fn(() => ({ bind: vi.fn(() => ({ first })) })),
+    } as unknown as D1Database;
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => {
+      warning.mockRestore();
+      log.mockRestore();
+    });
+
+    await expect(sweepOutbox(bindingsWith({ DB: database, DELIVERY_QUEUE: { send } }))).rejects.toBe(failure);
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledWith({ sweep: true });
+    expect(log).toHaveBeenCalledWith("Outbox sweep fallback enqueue failed", { error: failure });
+  });
+
   it("stops enqueueing when the sweep lease token is replaced", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();
@@ -2098,6 +2119,46 @@ describe("delivery outbox", () => {
     ).resolves.toEqual({ count: 1 });
   });
 
+  it("propagates a failed lease-loss continuation enqueue", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const ids = [crypto.randomUUID(), crypto.randomUUID()];
+    await env.DB.batch(
+      ids.map((id, index) =>
+        env.DB.prepare(
+          `INSERT INTO outbox
+            (id, workspace_id, topic, payload_json, available_at, created_at)
+           VALUES (?, ?, 'notification', '{}', ?, ?)`,
+        ).bind(id, installed.workspaceId, timestamp - 1, timestamp + index),
+      ),
+    );
+    const failure = new Error("queue unavailable");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(timestamp);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => {
+      clock.mockRestore();
+      log.mockRestore();
+    });
+    const send = vi.fn(async (body: unknown) => {
+      if ((body as { sweep?: boolean }).sweep) throw failure;
+      const state = await env.DB.prepare(`SELECT lease_until FROM outbox_sweep_state WHERE id = 1`).first<{
+        lease_until: number;
+      }>();
+      clock.mockReturnValue(state!.lease_until + 1);
+    });
+
+    await expect(sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }))).rejects.toBe(failure);
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenNthCalledWith(1, { outboxId: ids[0] });
+    expect(send).toHaveBeenNthCalledWith(2, { sweep: true });
+    expect(log).toHaveBeenCalledWith("Outbox sweep lease lost", { stage: "before-row" });
+    expect(log).toHaveBeenCalledWith("Outbox sweep lease-loss continuation enqueue failed", { error: failure });
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
+    ).resolves.toEqual({ count: 1 });
+  });
+
   it("enqueues every immediately available row across sweep batches", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();
@@ -2164,6 +2225,64 @@ describe("delivery outbox", () => {
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 0 });
+  });
+
+  it("retries a sweep message when its capped continuation cannot be enqueued", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const ids = Array.from({ length: 251 }, () => crypto.randomUUID());
+    for (let start = 0; start < ids.length; start += 50) {
+      await env.DB.batch(
+        ids.slice(start, start + 50).map((id, offset) =>
+          env.DB.prepare(
+            `INSERT INTO outbox
+              (id, workspace_id, topic, payload_json, available_at, created_at)
+             VALUES (?, ?, 'notification', '{}', ?, ?)`,
+          ).bind(id, installed.workspaceId, timestamp - 1, timestamp + start + offset),
+        ),
+      );
+    }
+    const failure = new Error("queue unavailable");
+    const send = vi.fn(async (body: unknown) => {
+      if ((body as { sweep?: boolean }).sweep) throw failure;
+    });
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
+    const ack = vi.fn();
+    const retry = vi.fn();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    onTestFinished(() => {
+      log.mockRestore();
+      warning.mockRestore();
+    });
+    const message = {
+      id: "failed-sweep-continuation",
+      timestamp: new Date(),
+      body: { sweep: true },
+      attempts: 1,
+      ack,
+      retry,
+    } satisfies Message<DeliveryQueueMessage>;
+
+    await worker.queue(
+      {
+        queue: "delivery",
+        messages: [message],
+        metadata: { metrics: { backlogCount: 1, backlogBytes: 0 } },
+        ackAll: vi.fn(),
+        retryAll: vi.fn(),
+      } satisfies MessageBatch<DeliveryQueueMessage>,
+      bindings,
+    );
+
+    expect(send).toHaveBeenCalledTimes(251);
+    expect(send).toHaveBeenLastCalledWith({ sweep: true });
+    expect(ack).not.toHaveBeenCalled();
+    expect(retry).toHaveBeenCalledWith({ delaySeconds: 2 });
+    expect(log).toHaveBeenCalledWith("Outbox sweep continuation enqueue failed", { error: failure });
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
+    ).resolves.toEqual({ count: 1 });
   });
 
   it("backs off a sweep continuation while another owner holds the lease", async () => {

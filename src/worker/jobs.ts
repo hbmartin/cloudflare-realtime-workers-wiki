@@ -1150,6 +1150,15 @@ async function enqueueOutbox(env: Env, outboxId: string) {
   }
 }
 
+async function enqueueSweepContinuation(env: Env, failureMessage: string) {
+  try {
+    await env.DELIVERY_QUEUE.send({ sweep: true });
+  } catch (error) {
+    console.error(failureMessage, { error });
+    throw error;
+  }
+}
+
 export async function sweepOutbox(env: Env, continuation = false): Promise<OutboxSweepResult> {
   const claimToken = crypto.randomUUID();
   let claimedAt = 0;
@@ -1181,11 +1190,7 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
   }
   if (!claimed) {
     console.warn("Outbox sweep claim race retry exhausted", { attempts: OUTBOX_SWEEP_CLAIM_ATTEMPTS });
-    try {
-      await env.DELIVERY_QUEUE.send({ sweep: true });
-    } catch (error) {
-      console.error("Outbox sweep fallback enqueue failed", { error });
-    }
+    await enqueueSweepContinuation(env, "Outbox sweep fallback enqueue failed");
     return "contended";
   }
   const releaseIfIdle = async () =>
@@ -1213,11 +1218,7 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
     if (!renewed) {
       console.error("Outbox sweep lease lost", { stage });
       if (!continuation) {
-        try {
-          await env.DELIVERY_QUEUE.send({ sweep: true });
-        } catch (error) {
-          console.error("Outbox sweep lease-loss continuation enqueue failed", { error });
-        }
+        await enqueueSweepContinuation(env, "Outbox sweep lease-loss continuation enqueue failed");
       }
     }
     return renewed;
@@ -1261,11 +1262,7 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
       maxRows: OUTBOX_SWEEP_BATCH_SIZE * OUTBOX_SWEEP_MAX_BATCHES,
     });
     if (!(await renewLease("before-continuation"))) return "lease-lost";
-    try {
-      await env.DELIVERY_QUEUE.send({ sweep: true });
-    } catch (error) {
-      console.error("Outbox sweep continuation enqueue failed", { error });
-    }
+    await enqueueSweepContinuation(env, "Outbox sweep continuation enqueue failed");
     return "completed";
   } finally {
     await env.DB.prepare(
