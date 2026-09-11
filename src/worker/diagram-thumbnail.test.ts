@@ -43,4 +43,18 @@ describe("diagram thumbnail responses", () => {
     expect(response.headers.get("etag")).toBe(`"empty-${await sha256Hex(placeholder)}"`);
     expect(get).toHaveBeenCalledWith("diagrams/page/thumbnail.svg");
   });
+
+  it("does not hash or attach a validator to a no-store placeholder", async () => {
+    const { env } = thumbnailEnv(false);
+
+    const response = await diagramThumbnailResponse(
+      env,
+      { id: "page", content_epoch: 1, title: "Diagram" },
+      { cacheControl: "no-store" },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("etag")).toBeNull();
+    expect(await response.text()).toContain("<svg");
+  });
 });
