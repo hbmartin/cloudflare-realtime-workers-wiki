@@ -1,6 +1,5 @@
-import { renderDiagramSvg } from "../shared/diagram";
+import { renderEmptyDiagramSvg } from "../shared/diagram";
 import { sha256Hex } from "../shared/import-integrity";
-import type { DiagramContentEnvelope } from "../shared/types";
 import type { Env } from "./env";
 
 export type DiagramThumbnailPage = {
@@ -31,18 +30,10 @@ export async function diagramThumbnailResponse(
       return new Response(thumbnail.body, { headers });
     }
   }
-  const empty: DiagramContentEnvelope = {
-    schemaVersion: 1,
-    pageId: page.id,
-    contentEpoch: page.content_epoch,
-    sequence: 0,
-    nodes: [],
-    edges: [],
-  };
-  const placeholder = renderDiagramSvg(empty, { width: 960, height: 540, title: page.title });
-  const etag = `"empty-${await sha256Hex(placeholder)}"`;
+  const etag = `"empty-${await sha256Hex(JSON.stringify([page.id, page.content_epoch, page.title]))}"`;
   const headers = thumbnailHeaders(options.cacheControl, etag);
   if (options.ifNoneMatch === etag) return new Response(null, { status: 304, headers });
+  const placeholder = renderEmptyDiagramSvg({ width: 960, height: 540, title: page.title });
   return new Response(placeholder, { headers });
 }
 

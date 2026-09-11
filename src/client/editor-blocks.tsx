@@ -565,11 +565,15 @@ export function LinkedDiagramView({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const updateRef = useRef(update);
+  const mountedRef = useRef(true);
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   useLayoutEffect(() => {
     updateRef.current = update;
-    return () => {
-      updateRef.current = undefined;
-    };
   }, [update]);
 
   const showPicker = Boolean(update) && (!pageId || choosing);
@@ -607,24 +611,30 @@ export function LinkedDiagramView({
           title: query.trim() || "Untitled diagram",
         }),
       });
+      if (!mountedRef.current) return;
       const currentUpdate = updateRef.current;
       if (!currentUpdate) {
         try {
           await api(`/api/pages/${encodeURIComponent(result.page.id)}`, { method: "DELETE" });
-          setError("The new whiteboard was discarded because this block became read-only.");
+          if (mountedRef.current) {
+            setError("The new whiteboard was discarded because this block became read-only.");
+          }
         } catch (cleanupError) {
           console.error("Failed to archive an unlinked whiteboard", cleanupError);
-          setError("A new whiteboard was created but could not be linked after this block became read-only.");
+          if (mountedRef.current) {
+            setError("A new whiteboard was created but could not be linked after this block became read-only.");
+          }
         }
         return;
       }
       currentUpdate(result.page);
+      if (!mountedRef.current) return;
       setChoosing(false);
       setError("");
     } catch (cause) {
-      setError(apiErrorMessage(cause, "The linked whiteboard could not be created."));
+      if (mountedRef.current) setError(apiErrorMessage(cause, "The linked whiteboard could not be created."));
     } finally {
-      setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   }
 

@@ -133,4 +133,22 @@ describe("core editor blocks", () => {
     expect(mocks.api).toHaveBeenLastCalledWith("/api/pages/diagram-one", { method: "DELETE" });
     expect(await screen.findByRole("alert")).toHaveTextContent("discarded because this block became read-only");
   });
+
+  it("does not archive a newly created diagram merely because the block unmounted", async () => {
+    const request = deferred<{ page: Page }>();
+    const update = vi.fn();
+    mocks.api.mockImplementation(() => request.promise);
+    const view = render(createElement(LinkedDiagramView, { pageId: "", title: "", update }));
+
+    fireEvent.click(screen.getByRole("button", { name: /Create child diagram/ }));
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledOnce());
+    view.unmount();
+    await act(async () => {
+      request.resolve({ page: { id: "diagram-one", title: "System map" } as Page });
+      await request.promise;
+    });
+
+    expect(update).not.toHaveBeenCalled();
+    expect(mocks.api).toHaveBeenCalledOnce();
+  });
 });

@@ -2,6 +2,7 @@ import { documentBlocks } from "../shared/notion-blocks";
 import {
   collectLinkedDiagramIds,
   collectTransclusions,
+  containsLinkedDiagramId,
   projectDocument,
   serializeDocument,
 } from "../shared/document-projection";
@@ -394,9 +395,16 @@ async function publicTransclusions(
       };
     }),
   );
-  const requestedDiagramIds = collectLinkedDiagramIds(document, new Set<string>(), PUBLIC_LINKED_DIAGRAM_LIMIT);
+  const collected = collectLinkedDiagramIds(document, new Set<string>(), PUBLIC_LINKED_DIAGRAM_LIMIT);
+  const requestedDiagramIds = collected.ids;
+  let diagramsTruncated = collected.truncated;
   for (const entry of entries) {
-    if (entry) collectLinkedDiagramIds(entry.document, requestedDiagramIds, PUBLIC_LINKED_DIAGRAM_LIMIT);
+    if (!entry || diagramsTruncated) continue;
+    diagramsTruncated = collectLinkedDiagramIds(
+      entry.document,
+      requestedDiagramIds,
+      PUBLIC_LINKED_DIAGRAM_LIMIT,
+    ).truncated;
   }
   const availableDiagramIds = await eligibleSharedDiagramIds(env, share, requestedDiagramIds);
   const available = new Map<string, string>();
@@ -422,7 +430,7 @@ async function publicTransclusions(
     );
     available.set(entry.key, html);
   }
-  return { html: available, diagramIds: availableDiagramIds };
+  return { html: available, diagramIds: availableDiagramIds, diagramsTruncated };
 }
 
 async function publicTableHtml(env: Env, pageId: string) {
@@ -492,6 +500,9 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
     );
     content = rendered.body;
     toc = rendered.toc;
+    if (transclusions.diagramsTruncated) {
+      content += "<p><small>Some linked whiteboard previews were omitted from this public view.</small></p>";
+    }
   } else {
     const table = await publicTableHtml(env, share.page_id);
     content = table.html;
@@ -537,7 +548,13 @@ export async function publicAttachment(env: Env, share: SharedPageRow, attachmen
 }
 
 export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, source: SharedPageRow) {
-  if (diagram.page_kind !== "diagram" || source.page_kind !== "document") return null;
+  if (
+    diagram.page_kind !== "diagram" ||
+    source.page_kind !== "document" ||
+    diagram.id !== source.id ||
+    diagram.workspace_id !== source.workspace_id
+  )
+    return null;
   try {
     const response = await env.DOCUMENT.getByName(`${source.page_id}~${source.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
@@ -558,7 +575,7 @@ export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, s
       typeof envelope.document !== "object" ||
       envelope.document === null ||
       Array.isArray(envelope.document) ||
-      !collectLinkedDiagramIds(envelope.document as ProseMirrorJson).has(diagram.page_id)
+      !containsLinkedDiagramId(envelope.document as ProseMirrorJson, diagram.page_id)
     )
       return null;
   } catch {

@@ -18,6 +18,11 @@ export type SerializedDocument = DocumentProjection & {
   html: string;
 };
 
+export type LinkedDiagramIds = {
+  ids: Set<string>;
+  truncated: boolean;
+};
+
 const MAX_PLAIN_TEXT = 500_000;
 const EXCERPT_CHARS = 240;
 
@@ -30,15 +35,29 @@ export function collectLinkedDiagramIds(
   node: ProseMirrorJson,
   ids = new Set<string>(),
   limit = Number.POSITIVE_INFINITY,
-): Set<string> {
-  if (ids.size >= limit) return ids;
-  const pageId = node.type === "linkedDiagram" ? stringAttr(node, "pageId") : null;
-  if (pageId) ids.add(pageId);
-  for (const child of node.content ?? []) {
-    if (ids.size >= limit) break;
-    collectLinkedDiagramIds(child, ids, limit);
-  }
-  return ids;
+): LinkedDiagramIds {
+  let truncated = false;
+  const visit = (current: ProseMirrorJson) => {
+    const pageId = current.type === "linkedDiagram" ? stringAttr(current, "pageId") : null;
+    if (pageId && !ids.has(pageId)) {
+      if (ids.size >= limit) {
+        truncated = true;
+        return;
+      }
+      ids.add(pageId);
+    }
+    for (const child of current.content ?? []) {
+      visit(child);
+      if (truncated) return;
+    }
+  };
+  visit(node);
+  return { ids, truncated };
+}
+
+export function containsLinkedDiagramId(node: ProseMirrorJson, pageId: string): boolean {
+  if (node.type === "linkedDiagram" && stringAttr(node, "pageId") === pageId) return true;
+  return (node.content ?? []).some((child) => containsLinkedDiagramId(child, pageId));
 }
 
 function normalizeText(text: string) {

@@ -3251,7 +3251,7 @@ app.delete("/api/pages/:id", async (c) => {
       `WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        )
-       SELECT target.page_id, target.content_epoch, target.next_attempt_at
+       SELECT target.page_id, target.content_epoch, target.next_attempt_at, COUNT(*) OVER() target_count
          FROM archive_disconnect_targets target
          JOIN subtree ON subtree.id = target.page_id
          JOIN pages archived_page ON archived_page.id = target.page_id
@@ -3259,7 +3259,7 @@ app.delete("/api/pages/:id", async (c) => {
         ORDER BY target.next_attempt_at > ?, target.created_at, target.page_id LIMIT ?`,
     )
       .bind(page.id, archiveOwnership, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT + 1)
-      .all<{ page_id: string; content_epoch: number; next_attempt_at: number }>(),
+      .all<{ page_id: string; content_epoch: number; next_attempt_at: number; target_count: number }>(),
   ]);
   const pageIds = archived.results.map((item) => item.id);
   sendWorkspaceEvent(c, member.workspace.id, {
@@ -3278,18 +3278,23 @@ app.delete("/api/pages/:id", async (c) => {
       dueTargets.map((target) => ({ page_id: target.page_id, content_epoch: target.content_epoch })),
     ),
   );
-  const pendingPageIds = operationTargets.results
-    .filter((target) => !attemptedPageIds.has(target.page_id) || failedPageIds.has(target.page_id))
-    .slice(0, ARCHIVE_DISCONNECT_RUN_LIMIT)
-    .map((target) => target.page_id);
+  const pendingTargets = operationTargets.results.filter(
+    (target) => !attemptedPageIds.has(target.page_id) || failedPageIds.has(target.page_id),
+  );
+  const completedTargetCount = attemptedPageIds.size - failedPageIds.size;
+  const pendingPageCount = Math.max(0, (operationTargets.results[0]?.target_count ?? 0) - completedTargetCount);
+  const pendingPageIds = pendingTargets.slice(0, ARCHIVE_DISCONNECT_RUN_LIMIT).map((target) => target.page_id);
+  const pendingPageIdsTruncated = pendingPageCount > pendingPageIds.length;
   return c.json(
     {
       ok: true,
       pageIds,
-      cleanupPending: pendingPageIds.length > 0,
+      cleanupPending: pendingPageCount > 0,
+      pendingPageCount,
       pendingPageIds,
+      pendingPageIdsTruncated,
     },
-    pendingPageIds.length ? 202 : 200,
+    pendingPageCount ? 202 : 200,
   );
 });
 
