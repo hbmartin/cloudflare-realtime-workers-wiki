@@ -3,7 +3,13 @@ import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
 import { collectTransclusions, projectDocument, type ProseMirrorJson } from "../shared/document-projection";
-import { diagramFromYDoc, projectDiagram, renderDiagramSvg } from "../shared/diagram";
+import {
+  diagramFromYDoc,
+  DIAGRAM_THUMBNAIL_HEIGHT,
+  DIAGRAM_THUMBNAIL_WIDTH,
+  projectDiagram,
+  renderDiagramSvg,
+} from "../shared/diagram";
 import { flattenDocumentBlocks } from "../shared/notion-blocks";
 import type { DocumentContentEnvelope } from "../shared/types";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
@@ -1532,7 +1538,10 @@ export class Document extends YServer {
     const structuredJson = canonicalJson(envelope);
     const structuredBytes = new TextEncoder().encode(structuredJson);
     const structuredKey = this.projectionKey(pageId, epoch, maximum);
-    const thumbnailSvg = renderDiagramSvg(envelope, { width: 960, height: 540 });
+    const thumbnailSvg = renderDiagramSvg(envelope, {
+      width: DIAGRAM_THUMBNAIL_WIDTH,
+      height: DIAGRAM_THUMBNAIL_HEIGHT,
+    });
     const thumbnailBytes = new TextEncoder().encode(thumbnailSvg);
     const thumbnailKey = this.thumbnailKey(pageId, epoch, maximum);
     const readOnly = snapshot.byteLength >= READ_ONLY_BYTES;

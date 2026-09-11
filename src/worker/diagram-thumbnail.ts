@@ -1,4 +1,4 @@
-import { renderEmptyDiagramSvg } from "../shared/diagram";
+import { DIAGRAM_THUMBNAIL_HEIGHT, DIAGRAM_THUMBNAIL_WIDTH, renderEmptyDiagramSvg } from "../shared/diagram";
 import { sha256Hex } from "../shared/import-integrity";
 import type { Env } from "./env";
 
@@ -30,10 +30,14 @@ export async function diagramThumbnailResponse(
       return new Response(thumbnail.body, { headers });
     }
   }
-  const etag = `"empty-${await sha256Hex(JSON.stringify([page.id, page.content_epoch, page.title]))}"`;
+  const placeholder = renderEmptyDiagramSvg({
+    width: DIAGRAM_THUMBNAIL_WIDTH,
+    height: DIAGRAM_THUMBNAIL_HEIGHT,
+    title: page.title,
+  });
+  const etag = `"empty-${await sha256Hex(placeholder)}"`;
   const headers = thumbnailHeaders(options.cacheControl, etag);
   if (options.ifNoneMatch === etag) return new Response(null, { status: 304, headers });
-  const placeholder = renderEmptyDiagramSvg({ width: 960, height: 540, title: page.title });
   return new Response(placeholder, { headers });
 }
 

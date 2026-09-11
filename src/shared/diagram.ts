@@ -15,6 +15,8 @@ const DIAGRAM_SCHEMA_VERSION = 1 as const;
 export const DIAGRAM_META_ROOT = "diagram:meta";
 export const DIAGRAM_NODES_ROOT = "diagram:nodes";
 export const DIAGRAM_EDGES_ROOT = "diagram:edges";
+export const DIAGRAM_THUMBNAIL_WIDTH = 960;
+export const DIAGRAM_THUMBNAIL_HEIGHT = 540;
 
 const NODE_TYPES = new Set<string>(DIAGRAM_NODE_TYPES);
 const COLORS = new Set<DiagramColor>(["slate", "blue", "green", "amber", "red", "purple"]);

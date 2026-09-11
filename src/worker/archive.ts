@@ -32,13 +32,14 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
     if (!claimed) return false;
     attempts = claimed.attempts;
     const completeClaim = async () => {
-      await env.DB.prepare(
+      const deleted = await env.DB.prepare(
         `DELETE FROM archive_disconnect_targets
-          WHERE page_id = ? AND content_epoch = ? AND next_attempt_at = ?`,
+          WHERE page_id = ? AND content_epoch = ? AND next_attempt_at = ?
+          RETURNING page_id`,
       )
         .bind(target.page_id, target.content_epoch, leaseUntil)
-        .run();
-      return true;
+        .first<{ page_id: string }>();
+      return Boolean(deleted);
     };
 
     const page = await env.DB.prepare(

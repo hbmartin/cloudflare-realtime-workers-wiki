@@ -1,7 +1,12 @@
 import type { WorkflowStep } from "cloudflare:workers";
 import type { DiagramContentEnvelope, DocumentContentEnvelope, ExportFormat, ProseMirrorJson } from "../shared/types";
 import { collectLinkedDiagramIds, serializeDocument } from "../shared/document-projection";
-import { renderDiagramSvg, renderEmptyDiagramSvg } from "../shared/diagram";
+import {
+  DIAGRAM_THUMBNAIL_HEIGHT,
+  DIAGRAM_THUMBNAIL_WIDTH,
+  renderDiagramSvg,
+  renderEmptyDiagramSvg,
+} from "../shared/diagram";
 import { createZip, type ZipEntry } from "../shared/zip";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
@@ -93,8 +98,12 @@ async function linkedDiagramAssets(
   thumbnailByteLimit: number | null,
   requestedBy: string,
 ): Promise<LinkedDiagramAsset[]> {
-  const collected = collectLinkedDiagramIds(document, new Set<string>(), LINKED_DIAGRAM_ASSET_LIMIT);
-  if (collected.truncated) {
+  const collected = collectLinkedDiagramIds(
+    document,
+    new Set<string>(),
+    thumbnailByteLimit === null ? Number.POSITIVE_INFINITY : LINKED_DIAGRAM_ASSET_LIMIT,
+  );
+  if (thumbnailByteLimit !== null && collected.truncated) {
     throw new Error(`The export contains more than ${LINKED_DIAGRAM_ASSET_LIMIT} linked diagrams.`);
   }
   const ids = [...collected.ids];
@@ -103,25 +112,32 @@ async function linkedDiagramAssets(
     id: string;
     title: string;
     thumbnail_r2_key: string | null;
-    thumbnail_byte_size: number;
+    thumbnail_byte_size: number | null;
   };
   const diagramById = new Map<string, DiagramRow>();
-  const rows = await env.DB.prepare(
-    `SELECT page.id, page.title, projection.thumbnail_r2_key, projection.thumbnail_byte_size
-       FROM pages page
-       JOIN spaces space ON space.id = page.space_id AND space.workspace_id = page.workspace_id
-       JOIN workspace_members member ON member.workspace_id = page.workspace_id AND member.user_id = ?
-       LEFT JOIN space_members space_member ON space_member.space_id = space.id AND space_member.user_id = ?
-       LEFT JOIN diagram_projections projection
-         ON projection.page_id = page.id AND projection.content_epoch = page.content_epoch
-      WHERE page.id IN (SELECT value FROM json_each(?))
-        AND page.workspace_id = ? AND page.kind = 'diagram'
-        AND page.archived_at IS NULL AND page.import_job_id IS NULL
-        AND (member.role = 'owner' OR space.visibility = 'workspace' OR space_member.user_id IS NOT NULL)`,
-  )
-    .bind(requestedBy, requestedBy, JSON.stringify(ids), page.workspace_id)
-    .all<DiagramRow>();
-  for (const diagram of rows.results) diagramById.set(diagram.id, diagram);
+  for (let offset = 0; offset < ids.length; offset += LINKED_DIAGRAM_ASSET_LIMIT) {
+    const rows = await env.DB.prepare(
+      `SELECT page.id, page.title, projection.thumbnail_r2_key, projection.thumbnail_byte_size
+         FROM pages page
+         JOIN spaces space ON space.id = page.space_id AND space.workspace_id = page.workspace_id
+         JOIN workspace_members member ON member.workspace_id = page.workspace_id AND member.user_id = ?
+         LEFT JOIN space_members space_member ON space_member.space_id = space.id AND space_member.user_id = ?
+         LEFT JOIN diagram_projections projection
+           ON projection.page_id = page.id AND projection.content_epoch = page.content_epoch
+        WHERE page.id IN (SELECT value FROM json_each(?))
+          AND page.workspace_id = ? AND page.kind = 'diagram'
+          AND page.archived_at IS NULL AND page.import_job_id IS NULL
+          AND (member.role = 'owner' OR space.visibility = 'workspace' OR space_member.user_id IS NOT NULL)`,
+    )
+      .bind(
+        requestedBy,
+        requestedBy,
+        JSON.stringify(ids.slice(offset, offset + LINKED_DIAGRAM_ASSET_LIMIT)),
+        page.workspace_id,
+      )
+      .all<DiagramRow>();
+    for (const diagram of rows.results) diagramById.set(diagram.id, diagram);
+  }
   if (ids.some((id) => !diagramById.has(id))) {
     throw new Error("A linked diagram is unavailable for export.");
   }
@@ -135,10 +151,21 @@ async function linkedDiagramAssets(
     let plannedBytes = 0;
     for (const diagram of diagrams) {
       if (diagram.thumbnail_r2_key) {
+        if (
+          diagram.thumbnail_byte_size === null ||
+          !Number.isSafeInteger(diagram.thumbnail_byte_size) ||
+          diagram.thumbnail_byte_size < 0
+        ) {
+          throw new Error("A linked diagram thumbnail has invalid size metadata.");
+        }
         plannedBytes += diagram.thumbnail_byte_size;
       } else {
         const placeholder = new TextEncoder().encode(
-          renderEmptyDiagramSvg({ width: 960, height: 540, title: diagram.title }),
+          renderEmptyDiagramSvg({
+            width: DIAGRAM_THUMBNAIL_WIDTH,
+            height: DIAGRAM_THUMBNAIL_HEIGHT,
+            title: diagram.title,
+          }),
         );
         placeholderBytes.set(diagram.id, placeholder);
         plannedBytes += placeholder.byteLength;
@@ -155,7 +182,13 @@ async function linkedDiagramAssets(
         const object = await env.BUCKET.get(diagram.thumbnail_r2_key);
         bytes = object
           ? new Uint8Array(await object.arrayBuffer())
-          : new TextEncoder().encode(renderEmptyDiagramSvg({ width: 960, height: 540, title: diagram.title }));
+          : new TextEncoder().encode(
+              renderEmptyDiagramSvg({
+                width: DIAGRAM_THUMBNAIL_WIDTH,
+                height: DIAGRAM_THUMBNAIL_HEIGHT,
+                title: diagram.title,
+              }),
+            );
       } else {
         bytes = placeholderBytes.get(diagram.id)!;
       }
@@ -197,15 +230,11 @@ async function documentExport(
   const baseUrl = env.BETTER_AUTH_URL.replace(/\/$/, "");
   const serialized = serializeDocument(envelope.document, {
     pageHref: (pageId) => `${baseUrl}/?page=${encodeURIComponent(pageId)}`,
-    ...(includeLinkedDiagramThumbnails
-      ? {
-          linkedDiagramThumbnailHref: (pageId: string) => {
-            const asset = diagramAssetsById.get(pageId);
-            if (!asset) return null;
-            return thumbnailByteLimit === null ? asset.sourceHref : asset.path;
-          },
-        }
-      : {}),
+    linkedDiagramThumbnailHref: (pageId) => {
+      const asset = diagramAssetsById.get(pageId);
+      if (!asset) return null;
+      return thumbnailByteLimit === null ? asset.sourceHref : asset.path;
+    },
   });
   return {
     markdown: `# ${page.title.replaceAll("\n", " ")}\n\n${serialized.markdown}`,
