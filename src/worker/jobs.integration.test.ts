@@ -1,5 +1,5 @@
 import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionContext } from "cloudflare:test";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
 import type { DiagramContentEnvelope, Job, Page } from "../shared/types";
@@ -1110,6 +1110,194 @@ describe("job execution", () => {
     expect(new TextDecoder().decode(entries[1]!.bytes)).toContain("Service map");
   });
 
+  it("rejects PDF export before loading a linked-diagram thumbnail that exceeds the inline budget", async () => {
+    const installed = await bootstrap();
+    const created = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "diagram", title: "Oversized map" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const diagram = (await created.json<{ page: Page }>()).page;
+    await env.DB.prepare(
+      `INSERT INTO diagram_projections
+        (page_id, content_epoch, sequence, schema_version, r2_key, content_hash, byte_size,
+         thumbnail_r2_key, thumbnail_hash, thumbnail_byte_size, updated_at)
+       VALUES (?, 1, 1, 1, ?, 'content-hash', 1, ?, 'thumbnail-hash', ?, ?)`,
+    )
+      .bind(
+        diagram.id,
+        `diagrams/${diagram.id}/epochs/1/projection.json`,
+        `diagrams/${diagram.id}/epochs/1/oversized.svg`,
+        24 * 1024 * 1024 + 1,
+        Date.now(),
+      )
+      .run();
+    const source = new Y.Doc();
+    const linked = new Y.XmlElement("linkedDiagram");
+    linked.setAttribute("pageId", diagram.id);
+    linked.setAttribute("title", diagram.title);
+    source.getXmlFragment("document-store").insert(0, [linked]);
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    const quickAction = vi.fn(async (_action: string, options: { html?: string }) => {
+      expect(options.html).toContain("Oversized map");
+      expect(options.html).not.toContain(`linked-diagrams/${diagram.id}.svg`);
+      return new Response("%PDF-test", { headers: { "content-type": "application/pdf" } });
+    });
+    const bindings = bindingsWith({ WORKFLOW_INLINE: "true", BROWSER: { quickAction } as unknown as BrowserRun });
+    const context = createExecutionContext();
+
+    const queued = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "pdf" }),
+      }),
+      bindings,
+      context,
+    );
+    expect(queued.status).toBe(202);
+    const job = (await queued.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    expect(quickAction).not.toHaveBeenCalled();
+    const completed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await completed.json<{ job: Job }>()).job).toMatchObject({
+      status: "failed",
+      error: { code: "job_failed", message: "Linked diagram thumbnails exceed the 24 MiB export asset limit." },
+    });
+
+    await env.BUCKET.put(`diagrams/${diagram.id}/epochs/1/oversized.svg`, "<svg>portable thumbnail</svg>");
+    const portableContext = createExecutionContext();
+    const portable = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "html", portable: true }),
+      }),
+      inlineBindings(),
+      portableContext,
+    );
+    const portableJob = (await portable.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(portableContext);
+    const portableResult = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${portableJob.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await portableResult.json<{ job: Job }>()).job.status).toBe("succeeded");
+  });
+
+  it("rejects an export when a referenced diagram is archived", async () => {
+    const installed = await bootstrap();
+    const created = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "diagram", title: "Archived map" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const diagram = (await created.json<{ page: Page }>()).page;
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), diagram.id).run();
+    const source = new Y.Doc();
+    const linked = new Y.XmlElement("linkedDiagram");
+    linked.setAttribute("pageId", diagram.id);
+    linked.setAttribute("title", diagram.title);
+    source.getXmlFragment("document-store").push([linked]);
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    const context = createExecutionContext();
+
+    const queued = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "html", portable: false }),
+      }),
+      inlineBindings(),
+      context,
+    );
+    expect(queued.status).toBe(202);
+    const job = (await queued.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    const completed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await completed.json<{ job: Job }>()).job).toMatchObject({
+      status: "failed",
+      error: { code: "job_failed", message: "A linked diagram is unavailable for export." },
+    });
+  });
+
+  it("rejects byte-bearing exports with more than 64 accessible linked diagrams", async () => {
+    const installed = await bootstrap();
+    const diagramIds = Array.from({ length: 65 }, (_, index) => `diagram-${index}`);
+    const timestamp = Date.now();
+    for (let start = 0; start < diagramIds.length; start += 50) {
+      await env.DB.batch(
+        diagramIds.slice(start, start + 50).map((id, offset) =>
+          env.DB.prepare(
+            `INSERT INTO pages
+              (id, workspace_id, space_id, kind, position, title, created_by, created_at, updated_at)
+             VALUES (?, ?, ?, 'diagram', ?, ?, ?, ?, ?)`,
+          ).bind(
+            id,
+            installed.workspaceId,
+            `${installed.workspaceId}-general`,
+            `z-${start + offset}`,
+            `Diagram ${start + offset}`,
+            installed.userId,
+            timestamp,
+            timestamp,
+          ),
+        ),
+      );
+    }
+    const source = new Y.Doc();
+    const fragment = source.getXmlFragment("document-store");
+    for (const [index, id] of diagramIds.entries()) {
+      const linked = new Y.XmlElement("linkedDiagram");
+      linked.setAttribute("pageId", id);
+      linked.setAttribute("title", `Diagram ${index}`);
+      fragment.push([linked]);
+    }
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    const context = createExecutionContext();
+
+    const queued = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "html", portable: true }),
+      }),
+      inlineBindings(),
+      context,
+    );
+    const job = (await queued.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    const completed = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${job.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await completed.json<{ job: Job }>()).job).toMatchObject({
+      status: "failed",
+      error: { code: "job_failed", message: "The export contains more than 64 linked diagrams." },
+    });
+  });
+
   it("exports a diagram as structured JSON", async () => {
     const installed = await bootstrap();
     const created = await worker.fetch(
@@ -1707,6 +1895,93 @@ describe("job execution", () => {
 });
 
 describe("delivery outbox", () => {
+  it("allows only one sweep to run while the singleton lease is held", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO outbox
+        (id, workspace_id, topic, payload_json, available_at, created_at)
+       VALUES (?, ?, 'notification', '{}', ?, ?)`,
+    )
+      .bind(crypto.randomUUID(), installed.workspaceId, timestamp - 1, timestamp)
+      .run();
+    const gate = deferred<void>();
+    const send = vi.fn(async () => gate.promise);
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
+
+    const first = sweepOutbox(bindings);
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+
+    await expect(sweepOutbox(bindings)).resolves.toBe(false);
+    gate.resolve();
+    await expect(first).resolves.toBe(true);
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it("rescans rows written while another producer holds the sweep lease", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const firstId = crypto.randomUUID();
+    const secondId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO outbox
+        (id, workspace_id, topic, payload_json, available_at, created_at)
+       VALUES (?, ?, 'notification', '{}', ?, ?)`,
+    )
+      .bind(firstId, installed.workspaceId, timestamp - 1, timestamp)
+      .run();
+    const gate = deferred<void>();
+    const send = vi.fn(async (_body: unknown) => {
+      if (send.mock.calls.length === 1) await gate.promise;
+    });
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
+
+    const first = sweepOutbox(bindings);
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    await env.DB.prepare(
+      `INSERT INTO outbox
+        (id, workspace_id, topic, payload_json, available_at, created_at)
+       VALUES (?, ?, 'notification', '{}', ?, ?)`,
+    )
+      .bind(secondId, installed.workspaceId, timestamp - 1, timestamp + 1)
+      .run();
+
+    await expect(sweepOutbox(bindings)).resolves.toBe(false);
+    gate.resolve();
+    await expect(first).resolves.toBe(true);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(new Set(send.mock.calls.map(([body]) => (body as { outboxId: string }).outboxId))).toEqual(
+      new Set([firstId, secondId]),
+    );
+  });
+
+  it("stops enqueueing immediately when the sweep lease is lost", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    const ids = [crypto.randomUUID(), crypto.randomUUID()];
+    await env.DB.batch(
+      ids.map((id, index) =>
+        env.DB.prepare(
+          `INSERT INTO outbox
+            (id, workspace_id, topic, payload_json, available_at, created_at)
+           VALUES (?, ?, 'notification', '{}', ?, ?)`,
+        ).bind(id, installed.workspaceId, timestamp - 1, timestamp + index),
+      ),
+    );
+    const send = vi.fn(async (_body: unknown) => {
+      await env.DB.prepare(`UPDATE outbox_sweep_state SET lease_token = 'replacement', lease_until = ? WHERE id = 1`)
+        .bind(Date.now() + 60_000)
+        .run();
+    });
+
+    await expect(sweepOutbox(bindingsWith({ DELIVERY_QUEUE: { send } }))).resolves.toBe(false);
+
+    expect(send).toHaveBeenCalledOnce();
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
+    ).resolves.toEqual({ count: 1 });
+  });
+
   it("enqueues every immediately available row across sweep batches", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();
@@ -1746,6 +2021,7 @@ describe("delivery outbox", () => {
     const send = vi.fn(async (_body: unknown) => undefined);
     const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    onTestFinished(() => warning.mockRestore());
 
     await sweepOutbox(bindings);
 
@@ -1772,7 +2048,29 @@ describe("delivery outbox", () => {
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 0 });
-    warning.mockRestore();
+  });
+
+  it("backs off a sweep continuation while another owner holds the lease", async () => {
+    await bootstrap();
+    await env.DB.prepare(
+      `UPDATE outbox_sweep_state SET lease_token = 'active', lease_until = ?, updated_at = ? WHERE id = 1`,
+    )
+      .bind(Date.now() + 60_000, Date.now())
+      .run();
+    const ack = vi.fn();
+    const retry = vi.fn();
+
+    await consumeDeliveryMessage(env, {
+      id: "sweep-continuation",
+      timestamp: new Date(),
+      body: { sweep: true },
+      attempts: 3,
+      ack,
+      retry,
+    } satisfies Message<DeliveryQueueMessage>);
+
+    expect(ack).not.toHaveBeenCalled();
+    expect(retry).toHaveBeenCalledWith({ delaySeconds: 8 });
   });
 
   it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {
@@ -1787,6 +2085,7 @@ describe("delivery outbox", () => {
       .bind(outboxId, installed.workspaceId, timestamp - 1, timestamp - 10_000)
       .run();
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => log.mockRestore());
 
     await sweepOutbox(
       bindingsWith({ DELIVERY_QUEUE: { send: vi.fn(async () => Promise.reject(new Error("poison"))) } }),
@@ -1803,7 +2102,6 @@ describe("delivery outbox", () => {
         last_error: "poison",
       },
     );
-    log.mockRestore();
   });
 
   it("keeps retrying an outbox row after ten transient enqueue failures", async () => {

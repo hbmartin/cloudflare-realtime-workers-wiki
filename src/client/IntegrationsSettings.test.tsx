@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IntegrationsSettings } from "./IntegrationsSettings";
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
@@ -57,6 +57,8 @@ describe("integration settings errors", () => {
     mocks.api.mockReset();
   });
 
+  afterEach(() => vi.restoreAllMocks());
+
   it("does not clear a reload failure after a successful mutation", async () => {
     let reloadFailure = false;
     mocks.api.mockImplementation(async (path: string, init?: RequestInit) => {
@@ -89,6 +91,26 @@ describe("integration settings errors", () => {
     await waitFor(() =>
       expect(screen.getByRole("alert")).toHaveTextContent("The verification request could not be resent."),
     );
+  });
+
+  it("reloads without reporting an error when integration revocation returns no content", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    let revoked = false;
+    mocks.api.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === `/api/integrations/${integration.id}` && init?.method === "DELETE") {
+        revoked = true;
+        return undefined;
+      }
+      if (path === "/api/integrations") return { integrations: revoked ? [] : [integration] };
+      return loadResponse(path);
+    });
+    render(<IntegrationsSettings owner pages={[]} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument());
+    expect(mocks.api).toHaveBeenCalledWith(`/api/integrations/${integration.id}`, { method: "DELETE" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it.each([

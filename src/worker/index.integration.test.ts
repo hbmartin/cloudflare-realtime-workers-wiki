@@ -2994,6 +2994,36 @@ describe("Worker integration", () => {
     });
   });
 
+  it("reports pending disconnect cleanup for pages archived before operation ids existed", async () => {
+    const installed = await bootstrap();
+    const archivedAt = Date.now() - 1_000;
+    const retryAt = Date.now() + 60_000;
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE pages
+            SET archived_at = ?, archived_by = ?, archive_operation_id = NULL
+          WHERE id = ?`,
+      ).bind(archivedAt, installed.userId, installed.pageId),
+      env.DB.prepare(
+        `INSERT INTO archive_disconnect_targets
+          (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, 1, ?, ?, ?, ?)`,
+      ).bind(installed.pageId, installed.workspaceId, `${installed.pageId}~1`, retryAt, archivedAt, archivedAt),
+    ]);
+
+    const repeated = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }),
+    );
+
+    expect(repeated.status).toBe(202);
+    expect(await repeated.json()).toEqual({
+      ok: true,
+      pageIds: [installed.pageId],
+      cleanupPending: true,
+      pendingPageIds: [installed.pageId],
+    });
+  });
+
   it("copies the archive operation id into the workspace event", async () => {
     const installed = await bootstrap();
     const operationId = "archive-operation";
@@ -3059,15 +3089,17 @@ describe("Worker integration", () => {
     await waitOnExecutionContext(restoreContext);
   });
 
-  it("rejects restoring a page that is not archived", async () => {
+  it("returns the current state when an already completed restore is retried", async () => {
     const installed = await bootstrap();
 
     const restored = await SELF.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/restore`, { method: "POST" }),
     );
 
-    expect(restored.status).toBe(409);
-    expect(await restored.json()).toMatchObject({ error: { code: "page_not_archived" } });
+    expect(restored.status).toBe(200);
+    expect(await restored.json()).toMatchObject({
+      pages: [expect.objectContaining({ id: installed.pageId, archivedAt: null, revision: 1 })],
+    });
     await expect(
       env.DB.prepare(`SELECT archived_at, revision FROM pages WHERE id = ?`).bind(installed.pageId).first(),
     ).resolves.toEqual({ archived_at: null, revision: 1 });
@@ -3095,7 +3127,8 @@ describe("Worker integration", () => {
     const archived = await SELF.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }),
     );
-    expect(archived.status).toBe(202);
+    expect(archived.status).toBe(200);
+    await expect(archived.json()).resolves.toMatchObject({ cleanupPending: false, pendingPageIds: [] });
     await expect(
       env.DB.prepare(`SELECT archived_at, archived_by, archive_operation_id FROM pages WHERE id = ?`)
         .bind(child.id)
@@ -6015,6 +6048,17 @@ describe("Worker integration", () => {
     );
     expect(notModified.status).toBe(304);
     expect(notModified.headers.get("x-content-type-options")).toBe("nosniff");
+
+    await env.BUCKET.delete(projection!.thumbnail_r2_key);
+    const missingProjectionObject = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${diagramPage.id}/diagram-thumbnail.svg`, {
+        headers: { "if-none-match": `"${projection!.thumbnail_hash}"` },
+      }),
+    );
+    expect(missingProjectionObject.status).toBe(200);
+    expect(missingProjectionObject.headers.get("etag")).toMatch(/^"empty-[a-f0-9]{64}"$/);
+    expect(missingProjectionObject.headers.get("etag")).not.toBe(`"${projection!.thumbnail_hash}"`);
+    expect(await missingProjectionObject.text()).toContain("Untitled");
 
     const indexed = await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`)
       .bind(diagramPage.id)

@@ -21,6 +21,7 @@ import { deliverWebhook, fanoutWebhookEvent } from "./webhooks";
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
 const OUTBOX_SWEEP_MAX_BATCHES = 5;
+const OUTBOX_SWEEP_LEASE_MS = 5 * 60_000;
 const OUTBOX_POISON_WARNING_ATTEMPTS = 10;
 const OUTBOX_POISON_WARNING_INTERVAL = 24;
 const OUTBOX_RETRY_BASE_MS = 10_000;
@@ -1147,43 +1148,115 @@ async function enqueueOutbox(env: Env, outboxId: string) {
   }
 }
 
-export async function sweepOutbox(env: Env) {
-  for (let batch = 0; batch < OUTBOX_SWEEP_MAX_BATCHES; batch += 1) {
-    const rows = await env.DB.prepare(
-      `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
-        ORDER BY available_at, created_at, id LIMIT ?`,
-    )
-      .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
-      .all<{ id: string }>();
-    for (const row of rows.results) {
-      try {
-        await enqueueOutbox(env, row.id);
-      } catch (error) {
-        console.error("Outbox enqueue failed", { outboxId: row.id, error });
+export async function sweepOutbox(env: Env, continuation = false) {
+  const claimedAt = Date.now();
+  const claimToken = crypto.randomUUID();
+  const claimed = await env.DB.prepare(
+    `UPDATE outbox_sweep_state
+        SET lease_token = ?, lease_until = ?,
+            rescan_requested = 0, updated_at = ?
+      WHERE id = 1 AND lease_until <= ?
+      RETURNING id`,
+  )
+    .bind(claimToken, claimedAt + OUTBOX_SWEEP_LEASE_MS, claimedAt, claimedAt)
+    .first<{ id: number }>();
+  if (!claimed) {
+    if (!continuation) {
+      const requested = await env.DB.prepare(
+        `UPDATE outbox_sweep_state SET rescan_requested = 1, updated_at = ?
+          WHERE id = 1 AND lease_until > ?
+          RETURNING id`,
+      )
+        .bind(Date.now(), claimedAt)
+        .first<{ id: number }>();
+      // The owner released between our failed claim and rescan request. Retry the
+      // claim so the row that prompted this sweep cannot be stranded.
+      if (!requested) return sweepOutbox(env);
+    }
+    return false;
+  }
+
+  const releaseIfIdle = async () =>
+    Boolean(
+      await env.DB.prepare(
+        `UPDATE outbox_sweep_state
+            SET lease_token = NULL, lease_until = 0, updated_at = ?
+          WHERE id = 1 AND lease_token = ? AND rescan_requested = 0
+          RETURNING id`,
+      )
+        .bind(Date.now(), claimToken)
+        .first<{ id: number }>(),
+    );
+  const renewLease = async () => {
+    const renewedAt = Date.now();
+    return Boolean(
+      await env.DB.prepare(
+        `UPDATE outbox_sweep_state SET lease_until = ?, updated_at = ?
+          WHERE id = 1 AND lease_token = ? AND lease_until > ?
+          RETURNING id`,
+      )
+        .bind(renewedAt + OUTBOX_SWEEP_LEASE_MS, renewedAt, claimToken, renewedAt)
+        .first<{ id: number }>(),
+    );
+  };
+
+  try {
+    for (let batch = 0; batch < OUTBOX_SWEEP_MAX_BATCHES; batch += 1) {
+      if (!(await renewLease())) return false;
+      const rows = await env.DB.prepare(
+        `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
+          ORDER BY available_at, created_at, id LIMIT ?`,
+      )
+        .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
+        .all<{ id: string }>();
+      for (const row of rows.results) {
+        if (!(await renewLease())) return false;
+        try {
+          await enqueueOutbox(env, row.id);
+        } catch (error) {
+          console.error("Outbox enqueue failed", { outboxId: row.id, error });
+        }
+      }
+      if (rows.results.length < OUTBOX_SWEEP_BATCH_SIZE) {
+        if (await releaseIfIdle()) return true;
+        await env.DB.prepare(
+          `UPDATE outbox_sweep_state SET rescan_requested = 0, updated_at = ?
+            WHERE id = 1 AND lease_token = ?`,
+        )
+          .bind(Date.now(), claimToken)
+          .run();
       }
     }
-    if (rows.results.length < OUTBOX_SWEEP_BATCH_SIZE) return;
-  }
-  const remaining = await env.DB.prepare(
-    `SELECT 1 pending FROM outbox WHERE enqueued_at IS NULL AND available_at <= ? LIMIT 1`,
-  )
-    .bind(Date.now())
-    .first<{ pending: number }>();
-  if (!remaining) return;
-  console.warn("Outbox sweep cap reached; scheduling continuation", {
-    maxRows: OUTBOX_SWEEP_BATCH_SIZE * OUTBOX_SWEEP_MAX_BATCHES,
-  });
-  try {
-    await env.DELIVERY_QUEUE.send({ sweep: true });
-  } catch (error) {
-    console.error("Outbox sweep continuation enqueue failed", { error });
+    const remaining = await env.DB.prepare(
+      `SELECT 1 pending FROM outbox WHERE enqueued_at IS NULL AND available_at <= ? LIMIT 1`,
+    )
+      .bind(Date.now())
+      .first<{ pending: number }>();
+    if (!remaining && (await releaseIfIdle())) return true;
+    console.warn("Outbox sweep cap reached; scheduling continuation", {
+      maxRows: OUTBOX_SWEEP_BATCH_SIZE * OUTBOX_SWEEP_MAX_BATCHES,
+    });
+    if (!(await renewLease())) return false;
+    try {
+      await env.DELIVERY_QUEUE.send({ sweep: true });
+    } catch (error) {
+      console.error("Outbox sweep continuation enqueue failed", { error });
+    }
+    return true;
+  } finally {
+    await env.DB.prepare(
+      `UPDATE outbox_sweep_state SET lease_token = NULL, lease_until = 0, updated_at = ?
+        WHERE id = 1 AND lease_token = ?`,
+    )
+      .bind(Date.now(), claimToken)
+      .run();
   }
 }
 
 export async function consumeDeliveryMessage(env: Env, message: Message<DeliveryQueueMessage>) {
   if (message.body && "sweep" in message.body && message.body.sweep) {
-    await sweepOutbox(env);
-    message.ack();
+    if (await sweepOutbox(env, true)) message.ack();
+    else message.retry({ delaySeconds: Math.min(60, 2 ** Math.min(message.attempts, 6)) });
     return;
   }
   const outboxId = message.body && "outboxId" in message.body ? message.body.outboxId : undefined;

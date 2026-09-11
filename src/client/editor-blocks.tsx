@@ -1,6 +1,6 @@
 import { renderToString } from "katex";
 import { createReactBlockSpec, createReactInlineContentSpec } from "@blocknote/react";
-import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { notionBlockRegistry } from "../shared/notion-blocks";
 import { api, apiErrorMessage, json } from "./api";
 import type { Page, SearchTitleSuggestion } from "../shared/types";
@@ -564,6 +564,13 @@ export function LinkedDiagramView({
   const [suggestions, setSuggestions] = useState<SearchTitleSuggestion[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const updateRef = useRef(update);
+  useLayoutEffect(() => {
+    updateRef.current = update;
+    return () => {
+      updateRef.current = undefined;
+    };
+  }, [update]);
 
   const showPicker = Boolean(update) && (!pageId || choosing);
   useEffect(() => {
@@ -589,7 +596,7 @@ export function LinkedDiagramView({
   const visibleSuggestions = showPicker && query.trim() ? suggestions : [];
 
   async function createDiagram() {
-    if (!update || busy) return;
+    if (!updateRef.current || busy) return;
     setBusy(true);
     try {
       const result = await api<{ page: Page }>("/api/pages", {
@@ -600,7 +607,18 @@ export function LinkedDiagramView({
           title: query.trim() || "Untitled diagram",
         }),
       });
-      update(result.page);
+      const currentUpdate = updateRef.current;
+      if (!currentUpdate) {
+        try {
+          await api(`/api/pages/${encodeURIComponent(result.page.id)}`, { method: "DELETE" });
+          setError("The new whiteboard was discarded because this block became read-only.");
+        } catch (cleanupError) {
+          console.error("Failed to archive an unlinked whiteboard", cleanupError);
+          setError("A new whiteboard was created but could not be linked after this block became read-only.");
+        }
+        return;
+      }
+      currentUpdate(result.page);
       setChoosing(false);
       setError("");
     } catch (cause) {
@@ -616,6 +634,7 @@ export function LinkedDiagramView({
         <figcaption>
           <span aria-hidden="true">◇</span> {title || "Linked whiteboard"} unavailable
         </figcaption>
+        {error ? <small role="alert">{error}</small> : null}
       </figure>
     );
   }

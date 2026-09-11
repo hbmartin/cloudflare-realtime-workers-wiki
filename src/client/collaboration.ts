@@ -34,6 +34,43 @@ export type NetworkCollaborationBundle = {
   destroy: () => void;
 };
 
+function createDurabilityBarrier(
+  provider: Pick<YProvider, "synced" | "sendMessage">,
+  durability: CollaborationDurability,
+  timerClampMs: number,
+) {
+  let timer: number | undefined;
+  let deadline: number | undefined;
+  const send = () => {
+    if (timer !== undefined) window.clearTimeout(timer);
+    timer = undefined;
+    const generation = durability.barrierGeneration();
+    if (generation === null) {
+      deadline = undefined;
+      return;
+    }
+    if (!provider.synced) {
+      if (deadline !== undefined && deadline <= Date.now()) deadline = undefined;
+      return;
+    }
+    deadline = undefined;
+    provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
+  };
+  return {
+    send,
+    schedule() {
+      const now = Date.now();
+      if (deadline !== undefined && deadline <= now && !provider.synced) deadline = undefined;
+      deadline ??= now + 5_000;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(send, Math.max(0, Math.min(timerClampMs, deadline - now)));
+    },
+    destroy() {
+      if (timer !== undefined) window.clearTimeout(timer);
+    },
+  };
+}
+
 export function createCollaboration(
   workspaceId: string,
   pageId: string,
@@ -48,13 +85,12 @@ export function createCollaboration(
     connect: false,
   });
   let hiddenTimer: number | undefined;
-  let barrierTimer: number | undefined;
-  let barrierDeadline: number | undefined;
   let connectionTimer: number | undefined;
   let connectionAttempt = 0;
   let destroyed = false;
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
+  const barrier = createDurabilityBarrier(provider, durability, 1_000);
   const connect = () => {
     if (destroyed) return;
     if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
@@ -78,35 +114,12 @@ export function createCollaboration(
     );
   };
 
-  const sendDurabilityBarrier = () => {
-    if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
-    barrierTimer = undefined;
-    const generation = durability.barrierGeneration();
-    if (generation === null) {
-      barrierDeadline = undefined;
-      return;
-    }
-    if (!provider.synced) {
-      if (barrierDeadline !== undefined && barrierDeadline <= Date.now()) barrierDeadline = undefined;
-      return;
-    }
-    barrierDeadline = undefined;
-    provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
-  };
-  const scheduleDurabilityBarrier = () => {
-    const now = Date.now();
-    if (barrierDeadline !== undefined && barrierDeadline <= now && !provider.synced) barrierDeadline = undefined;
-    barrierDeadline ??= now + 5_000;
-    if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
-    barrierTimer = window.setTimeout(sendDurabilityBarrier, Math.max(0, Math.min(1_000, barrierDeadline - now)));
-  };
-
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
     onStatus(status === "disconnected" ? "offline" : status);
   };
   provider.on("status", handleStatus);
   const handleSync = (synced: boolean) => {
-    if (synced) sendDurabilityBarrier();
+    if (synced) barrier.send();
   };
   const handleCustomMessage = (message: string) => {
     try {
@@ -122,7 +135,7 @@ export function createCollaboration(
   doc.on("update", (_update: Uint8Array, origin: unknown) => {
     if (origin === provider || origin === indexeddb) return;
     durability.markChanged();
-    scheduleDurabilityBarrier();
+    barrier.schedule();
   });
   const ready = indexeddb.whenSynced
     .then(() => {
@@ -145,7 +158,7 @@ export function createCollaboration(
     if (document.visibilityState === "hidden") {
       if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
       connectionTimer = undefined;
-      sendDurabilityBarrier();
+      barrier.send();
       hiddenTimer = window.setTimeout(() => {
         hiddenTimer = undefined;
         provider.disconnect();
@@ -169,7 +182,7 @@ export function createCollaboration(
     destroy() {
       destroyed = true;
       if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
-      if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
+      barrier.destroy();
       if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
       document.removeEventListener("visibilitychange", visibility);
       provider.off("status", handleStatus);
@@ -204,10 +217,9 @@ export function createNetworkCollaboration(
     resolveReady = resolve;
   });
   let hiddenTimer: number | undefined;
-  let barrierTimer: number | undefined;
-  let barrierDeadline: number | undefined;
   let retryTimer: number | undefined;
   let retryAttempt = 0;
+  const barrier = createDurabilityBarrier(provider, durability, 500);
 
   const connect = () => {
     if (destroyed) return;
@@ -229,28 +241,6 @@ export function createNetworkCollaboration(
     );
   };
 
-  const sendBarrier = () => {
-    if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
-    barrierTimer = undefined;
-    const generation = durability.barrierGeneration();
-    if (generation === null) {
-      barrierDeadline = undefined;
-      return;
-    }
-    if (!provider.synced) {
-      if (barrierDeadline !== undefined && barrierDeadline <= Date.now()) barrierDeadline = undefined;
-      return;
-    }
-    barrierDeadline = undefined;
-    provider.sendMessage(JSON.stringify({ type: "document-update-barrier", generation }));
-  };
-  const scheduleBarrier = () => {
-    const now = Date.now();
-    if (barrierDeadline !== undefined && barrierDeadline <= now && !provider.synced) barrierDeadline = undefined;
-    barrierDeadline ??= now + 5_000;
-    if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
-    barrierTimer = window.setTimeout(sendBarrier, Math.max(0, Math.min(500, barrierDeadline - now)));
-  };
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
     if (status === "disconnected") {
       synced = false;
@@ -267,7 +257,7 @@ export function createNetworkCollaboration(
     synced = next;
     if (next) {
       onStatus("connected");
-      sendBarrier();
+      barrier.send();
       if (!readyResolved) {
         readyResolved = true;
         resolveReady();
@@ -287,11 +277,11 @@ export function createNetworkCollaboration(
   const handleUpdate = (_update: Uint8Array, origin: unknown) => {
     if (origin === provider) return;
     durability.markChanged();
-    scheduleBarrier();
+    barrier.schedule();
   };
   const visibility = () => {
     if (document.visibilityState === "hidden") {
-      sendBarrier();
+      barrier.send();
       hiddenTimer = window.setTimeout(() => {
         hiddenTimer = undefined;
         synced = false;
@@ -324,7 +314,7 @@ export function createNetworkCollaboration(
     destroy() {
       destroyed = true;
       if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
-      if (barrierTimer !== undefined) window.clearTimeout(barrierTimer);
+      barrier.destroy();
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       document.removeEventListener("visibilitychange", visibility);
       provider.off("status", handleStatus);

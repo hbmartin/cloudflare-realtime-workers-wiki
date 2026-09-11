@@ -32,6 +32,7 @@ describe("D1 migrations", () => {
         "page_search_v2",
         "jobs",
         "outbox",
+        "outbox_sweep_state",
         "notifications",
         "digest_delivery_cursors",
         "comment_migrations",
@@ -142,6 +143,12 @@ describe("D1 migrations", () => {
     ).first<{ sql: string }>();
     expect(pagesSql?.sql).toContain("'diagram'");
     expect(pagesSql?.sql).toContain("archive_operation_id");
+    await expect(env.DB.prepare(`SELECT * FROM outbox_sweep_state WHERE id = 1`).first()).resolves.toMatchObject({
+      id: 1,
+      lease_token: null,
+      lease_until: 0,
+      rescan_requested: 0,
+    });
   });
 
   it("repairs a missing comment lookup index in the forward archive migration", async () => {

@@ -68,7 +68,6 @@ explicitly and listed under [Log triage](#log-triage).
 | `move_not_found`            | 404    | No committed move receipt exists for that workspace, page, and operation id, including because its seven-day recovery window expired                      |
 | `page_move_unresolved`      | 503    | D1 could not determine whether an operation-id-keyed move committed. Retry with the same operation id; do not generate a replacement id                   |
 | `archive_first`             | 409    | Permanent deletion attempted on a page that is not archived                                                                                               |
-| `page_not_archived`         | 409    | Restore was requested for an active page; reload instead of retrying the restore                                                                          |
 | `page_archived`             | 409    | A receipt-backed page-create replay or concurrent page move targeted an archived page; restore it, permanently delete it, or retry against an active page |
 | `upload_too_large`          | 413    | Over 10 MiB on the single-shot form route, or over 10 GiB on a multipart upload                                                                           |
 | `upload_session_not_found`  | 404    | The multipart session was aborted, completed, reaped, or its page archived                                                                                |

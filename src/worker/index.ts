@@ -2,7 +2,7 @@ import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fracti
 import { Hono, type Context } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
-import { processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
+import { ARCHIVE_DISCONNECT_RUN_LIMIT, processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
 import {
   isInlineMime,
   isUnsafeMime,
@@ -3200,6 +3200,10 @@ app.delete("/api/pages/:id", async (c) => {
   const archiveTimestamp = page.archived_at ?? timestamp;
   const archiveOperationId = page.archived_at === null ? crypto.randomUUID() : (page.archive_operation_id ?? null);
   const archiveOwner = page.archived_at === null ? member.user.id : (page.archived_by ?? member.user.id);
+  const archiveOwnershipSql = archiveOperationId
+    ? "archived_page.archive_operation_id = ?"
+    : "archived_page.archive_operation_id IS NULL AND archived_page.archived_at = ?";
+  const archiveOwnership = archiveOperationId ?? archiveTimestamp;
   await c.env.DB.batch([
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
@@ -3235,7 +3239,7 @@ app.delete("/api/pages/:id", async (c) => {
       SELECT id FROM subtree
     )`).bind(page.id),
   ]);
-  const [archived, pendingTargets] = await Promise.all([
+  const [archived, operationTargets] = await Promise.all([
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
@@ -3247,12 +3251,15 @@ app.delete("/api/pages/:id", async (c) => {
       `WITH RECURSIVE subtree(id) AS (
          SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        )
-       SELECT target.page_id, target.content_epoch
-         FROM archive_disconnect_targets target JOIN subtree ON subtree.id = target.page_id
-        ORDER BY target.created_at, target.page_id`,
+       SELECT target.page_id, target.content_epoch, target.next_attempt_at
+         FROM archive_disconnect_targets target
+         JOIN subtree ON subtree.id = target.page_id
+         JOIN pages archived_page ON archived_page.id = target.page_id
+        WHERE ${archiveOwnershipSql}
+        ORDER BY target.next_attempt_at > ?, target.created_at, target.page_id LIMIT ?`,
     )
-      .bind(page.id)
-      .all<{ page_id: string; content_epoch: number }>(),
+      .bind(page.id, archiveOwnership, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT + 1)
+      .all<{ page_id: string; content_epoch: number; next_attempt_at: number }>(),
   ]);
   const pageIds = archived.results.map((item) => item.id);
   sendWorkspaceEvent(c, member.workspace.id, {
@@ -3261,13 +3268,20 @@ app.delete("/api/pages/:id", async (c) => {
     permanently: false,
     ...(operationId ? { operationId } : {}),
   });
-  const pendingPageIds = await processArchiveDisconnectTargets(
-    c.env,
-    pendingTargets.results.map((item) => ({
-      page_id: item.page_id,
-      content_epoch: item.content_epoch,
-    })),
+  const dueTargets = operationTargets.results
+    .filter((target) => target.next_attempt_at <= timestamp)
+    .slice(0, ARCHIVE_DISCONNECT_RUN_LIMIT);
+  const attemptedPageIds = new Set(dueTargets.map((target) => target.page_id));
+  const failedPageIds = new Set(
+    await processArchiveDisconnectTargets(
+      c.env,
+      dueTargets.map((target) => ({ page_id: target.page_id, content_epoch: target.content_epoch })),
+    ),
   );
+  const pendingPageIds = operationTargets.results
+    .filter((target) => !attemptedPageIds.has(target.page_id) || failedPageIds.has(target.page_id))
+    .slice(0, ARCHIVE_DISCONNECT_RUN_LIMIT)
+    .map((target) => target.page_id);
   return c.json(
     {
       ok: true,
@@ -3285,7 +3299,17 @@ app.post("/api/pages/:id/restore", async (c) => {
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
   if (page.archived_at === null) {
-    throw new HttpError(409, "page_not_archived", "The page is not archived.");
+    const active = await c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT child.id FROM pages child JOIN subtree ON child.parent_id = subtree.id
+       )
+       SELECT pages.* FROM pages JOIN subtree ON subtree.id = pages.id
+        WHERE pages.workspace_id = ? AND pages.archived_at IS NULL
+        ORDER BY pages.position, pages.id`,
+    )
+      .bind(page.id, member.workspace.id)
+      .all<PageRow>();
+    return c.json({ pages: active.results.map(pageJson) });
   }
   const archiveTimestamp = page.archived_at;
   const archiveOperationId = page.archive_operation_id ?? null;
@@ -5177,17 +5201,18 @@ app.get("/share/:key/assets/:attachmentId", async (c) => {
 });
 
 app.get("/share/:key/diagram-thumbnails/:fileName", async (c) => {
+  const notFound = () => c.text("Not found", 404, { "cache-control": "no-store" });
   const fileName = c.req.param("fileName");
-  if (!fileName.endsWith(".svg")) return c.text("Not found", 404);
+  if (!fileName.endsWith(".svg")) return notFound();
   const pageId = fileName.slice(0, -4);
   const sourcePageId = c.req.query("source");
-  if (!sourcePageId) return c.text("Not found", 404);
+  if (!sourcePageId) return notFound();
   const [diagram, source] = await Promise.all([
     resolveSharedDiagram(c.env, c.req.param("key"), pageId),
     resolveSharedPage(c.env, c.req.param("key"), sourcePageId),
   ]);
-  if (!diagram || !source) return c.text("Not found", 404);
-  return (await publicDiagramThumbnail(c.env, diagram, source)) ?? c.text("Not found", 404);
+  if (!diagram || !source) return notFound();
+  return (await publicDiagramThumbnail(c.env, diagram, source)) ?? notFound();
 });
 
 app.get("/share/:key/sitemap.xml", async (c) => {

@@ -1,11 +1,19 @@
 import { documentBlocks } from "../shared/notion-blocks";
-import { collectTransclusions, projectDocument, serializeDocument } from "../shared/document-projection";
+import {
+  collectLinkedDiagramIds,
+  collectTransclusions,
+  projectDocument,
+  serializeDocument,
+} from "../shared/document-projection";
 import { bytesToBase64Url } from "../shared/security";
 import type { DocumentContentEnvelope, PageKind, ProseMirrorJson } from "../shared/types";
 import { isInlineMime } from "./attachments";
 import { diagramThumbnailResponse } from "./diagram-thumbnail";
 import type { Env, MemberContext } from "./env";
 import { attachmentDisposition, HttpError } from "./http";
+
+const PUBLIC_DOCUMENT_FETCH_TIMEOUT_MS = 5_000;
+const PUBLIC_LINKED_DIAGRAM_LIMIT = 64;
 
 export type ShareRow = {
   id: string;
@@ -204,10 +212,12 @@ async function resolveSharedTarget(
   if (!share) return null;
   const pageId = requestedPageId ?? share.root_page_id;
   const page = await env.DB.prepare(
-    `WITH RECURSIVE ancestors(id, parent_id) AS (
-       SELECT id, parent_id FROM pages WHERE id = ?
+    `WITH RECURSIVE ancestors(id, parent_id, depth) AS (
+       SELECT id, parent_id, 0 FROM pages WHERE id = ? AND archived_at IS NULL AND import_job_id IS NULL
        UNION ALL
-       SELECT parent.id, parent.parent_id FROM pages parent JOIN ancestors child ON parent.id = child.parent_id
+       SELECT parent.id, parent.parent_id, child.depth + 1
+         FROM pages parent JOIN ancestors child ON parent.id = child.parent_id
+        WHERE parent.archived_at IS NULL AND parent.import_job_id IS NULL AND child.depth < 50
      )
      SELECT share.*, page.id page_id, page.parent_id, page.title page_title, page.icon page_icon,
             page.kind page_kind, page.content_epoch, page.updated_at page_updated_at
@@ -215,7 +225,10 @@ async function resolveSharedTarget(
       WHERE share.id = ? AND share.revoked_at IS NULL
         AND page.workspace_id = share.workspace_id AND page.archived_at IS NULL AND page.import_job_id IS NULL
         AND page.kind ${target === "diagram" ? "=" : "<>"} 'diagram'
-        AND EXISTS (SELECT 1 FROM pages root WHERE root.id = share.root_page_id AND root.archived_at IS NULL)
+        AND EXISTS (
+          SELECT 1 FROM pages root
+           WHERE root.id = share.root_page_id AND root.archived_at IS NULL AND root.import_job_id IS NULL
+        )
         AND (page.id = share.root_page_id OR
              (share.include_subpages = 1 AND EXISTS (SELECT 1 FROM ancestors WHERE id = share.root_page_id)))`,
   )
@@ -276,13 +289,16 @@ export function publicDocumentHtml(
   key: string,
   sourcePageId: string,
   transclusions: Map<string, string> = new Map(),
+  sharedDiagramIds: ReadonlySet<string> = new Set(),
 ) {
   let body = documentBody(
     serializeDocument(document, {
       pageHref: (pageId, nodeType) =>
         nodeType === "linkToPage" ? `/share/${encodeURIComponent(key)}/pages/${encodeURIComponent(pageId)}` : null,
       linkedDiagramThumbnailHref: (pageId) =>
-        `/share/${encodeURIComponent(key)}/diagram-thumbnails/${encodeURIComponent(pageId)}.svg?source=${encodeURIComponent(sourcePageId)}`,
+        sharedDiagramIds.has(pageId)
+          ? `/share/${encodeURIComponent(key)}/diagram-thumbnails/${encodeURIComponent(pageId)}.svg?source=${encodeURIComponent(sourcePageId)}`
+          : null,
     }).html,
   );
   const headings = documentBlocks(document)
@@ -321,6 +337,26 @@ export function publicDocumentHtml(
   return { body, toc };
 }
 
+async function eligibleSharedDiagramIds(env: Env, share: SharedPageRow, requested: ReadonlySet<string>) {
+  if (!share.include_subpages || !requested.size) return new Set<string>();
+  const rows = await env.DB.prepare(
+    `WITH RECURSIVE subtree(id, depth) AS (
+       SELECT ?, 0
+       UNION ALL
+       SELECT child.id, subtree.depth + 1 FROM pages child JOIN subtree ON child.parent_id = subtree.id
+        WHERE child.archived_at IS NULL AND child.import_job_id IS NULL AND subtree.depth < 50
+     )
+     SELECT page.id
+       FROM pages page JOIN subtree ON subtree.id = page.id
+       JOIN json_each(?) requested ON requested.value = page.id
+      WHERE page.workspace_id = ? AND page.kind = 'diagram'
+        AND page.archived_at IS NULL AND page.import_job_id IS NULL`,
+  )
+    .bind(share.root_page_id, JSON.stringify([...requested]), share.workspace_id)
+    .all<{ id: string }>();
+  return new Set(rows.results.map((row) => row.id));
+}
+
 async function publicTransclusions(
   env: Env,
   share: SharedPageRow,
@@ -351,35 +387,42 @@ async function publicTransclusions(
         (item) => item.blockId === reference.blockId,
       );
       if (!source) return null;
-      let html = documentBody(
-        serializeDocument(
-          { type: "doc", content: [{ type: "blockGroup", content: source.content }] },
-          {
-            pageHref: (pageId, nodeType) =>
-              nodeType === "linkToPage"
-                ? `/share/${encodeURIComponent(key)}/pages/${encodeURIComponent(pageId)}`
-                : null,
-            linkedDiagramThumbnailHref: (pageId) =>
-              `/share/${encodeURIComponent(key)}/diagram-thumbnails/${encodeURIComponent(pageId)}.svg?source=${encodeURIComponent(sourcePage.page_id)}`,
-          },
-        ).html,
-      );
-      html = html.replaceAll(
-        /((?:href|src)=")\/api\/attachments\/([A-Za-z0-9_-]+)"/g,
-        `$1/share/${encodeURIComponent(key)}/assets/$2?page=${encodeURIComponent(sourcePage.page_id)}"`,
-      );
-      html = html.replace(
-        /<div class="synced-reference"[^>]*>[\s\S]*?<\/div>/g,
-        '<div class="synced-reference">Synced content unavailable</div>',
-      );
-      return [`${reference.sourcePageId}:${reference.blockId}`, html] as const;
+      return {
+        key: `${reference.sourcePageId}:${reference.blockId}`,
+        sourcePageId: sourcePage.page_id,
+        document: { type: "doc", content: [{ type: "blockGroup", content: source.content }] } as ProseMirrorJson,
+      };
     }),
   );
+  const requestedDiagramIds = collectLinkedDiagramIds(document, new Set<string>(), PUBLIC_LINKED_DIAGRAM_LIMIT);
+  for (const entry of entries) {
+    if (entry) collectLinkedDiagramIds(entry.document, requestedDiagramIds, PUBLIC_LINKED_DIAGRAM_LIMIT);
+  }
+  const availableDiagramIds = await eligibleSharedDiagramIds(env, share, requestedDiagramIds);
   const available = new Map<string, string>();
   for (const entry of entries) {
-    if (entry) available.set(entry[0], entry[1]);
+    if (!entry) continue;
+    let html = documentBody(
+      serializeDocument(entry.document, {
+        pageHref: (pageId, nodeType) =>
+          nodeType === "linkToPage" ? `/share/${encodeURIComponent(key)}/pages/${encodeURIComponent(pageId)}` : null,
+        linkedDiagramThumbnailHref: (pageId) =>
+          availableDiagramIds.has(pageId)
+            ? `/share/${encodeURIComponent(key)}/diagram-thumbnails/${encodeURIComponent(pageId)}.svg?source=${encodeURIComponent(entry.sourcePageId)}`
+            : null,
+      }).html,
+    );
+    html = html.replaceAll(
+      /((?:href|src)=")\/api\/attachments\/([A-Za-z0-9_-]+)"/g,
+      `$1/share/${encodeURIComponent(key)}/assets/$2?page=${encodeURIComponent(entry.sourcePageId)}"`,
+    );
+    html = html.replace(
+      /<div class="synced-reference"[^>]*>[\s\S]*?<\/div>/g,
+      '<div class="synced-reference">Synced content unavailable</div>',
+    );
+    available.set(entry.key, html);
   }
-  return available;
+  return { html: available, diagramIds: availableDiagramIds };
 }
 
 async function publicTableHtml(env: Env, pageId: string) {
@@ -439,11 +482,13 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
     );
     if (!response.ok) return null;
     const envelope = await response.json<DocumentContentEnvelope>();
+    const transclusions = await publicTransclusions(env, share, key, envelope.document);
     const rendered = publicDocumentHtml(
       envelope.document,
       key,
       share.page_id,
-      await publicTransclusions(env, share, key, envelope.document),
+      transclusions.html,
+      transclusions.diagramIds,
     );
     content = rendered.body;
     toc = rendered.toc;
@@ -491,32 +536,34 @@ export async function publicAttachment(env: Env, share: SharedPageRow, attachmen
   return new Response(object.body, { headers });
 }
 
-function containsLinkedDiagram(node: ProseMirrorJson, pageId: string): boolean {
-  if (node.type === "linkedDiagram" && node.attrs?.pageId === pageId) return true;
-  return node.content?.some((child) => containsLinkedDiagram(child, pageId)) ?? false;
-}
-
 export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, source: SharedPageRow) {
-  if (
-    diagram.page_kind !== "diagram" ||
-    source.page_kind !== "document" ||
-    diagram.id !== source.id ||
-    diagram.workspace_id !== source.workspace_id
-  )
+  if (diagram.page_kind !== "diagram" || source.page_kind !== "document") return null;
+  try {
+    const response = await env.DOCUMENT.getByName(`${source.page_id}~${source.content_epoch}`).fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        signal: AbortSignal.timeout(PUBLIC_DOCUMENT_FETCH_TIMEOUT_MS),
+      }),
+    );
+    if (!response.ok) return null;
+    const envelope: unknown = await response.json();
+    if (
+      typeof envelope !== "object" ||
+      envelope === null ||
+      !("pageId" in envelope) ||
+      envelope.pageId !== source.page_id ||
+      !("contentEpoch" in envelope) ||
+      envelope.contentEpoch !== source.content_epoch ||
+      !("document" in envelope) ||
+      typeof envelope.document !== "object" ||
+      envelope.document === null ||
+      Array.isArray(envelope.document) ||
+      !collectLinkedDiagramIds(envelope.document as ProseMirrorJson).has(diagram.page_id)
+    )
+      return null;
+  } catch {
     return null;
-  const response = await env.DOCUMENT.getByName(`${source.page_id}~${source.content_epoch}`).fetch(
-    new Request("https://document.internal/content", {
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
-    }),
-  );
-  if (!response.ok) return null;
-  const envelope = await response.json<DocumentContentEnvelope>();
-  if (
-    envelope.pageId !== source.page_id ||
-    envelope.contentEpoch !== source.content_epoch ||
-    !containsLinkedDiagram(envelope.document, diagram.page_id)
-  )
-    return null;
+  }
   return diagramThumbnailResponse(
     env,
     { id: diagram.page_id, content_epoch: diagram.content_epoch, title: diagram.page_title },

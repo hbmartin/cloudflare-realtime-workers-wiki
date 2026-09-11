@@ -286,6 +286,15 @@ describe("api", () => {
     expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
   });
 
+  it("accepts an empty 204 response without weakening other successful response contracts", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(responseAt("https://example.test/api/example", null, { status: 204 })),
+    );
+
+    await expect(api<void>("/api/example", { method: "DELETE" })).resolves.toBeUndefined();
+  });
+
   it("classifies malformed successful responses by media type", async () => {
     const reported = silenceApiResponseReport();
     const fetchMock = vi

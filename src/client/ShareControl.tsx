@@ -86,7 +86,7 @@ export function ShareControl({ pageId, owner }: { pageId: string; owner: boolean
   async function revoke() {
     if (!share || !confirm("Revoke this public link? It cannot be restored.")) return;
     try {
-      await api(`/api/pages/${encodeURIComponent(pageId)}/share`, { method: "DELETE" });
+      await api<void>(`/api/pages/${encodeURIComponent(pageId)}/share`, { method: "DELETE" });
       setShare(null);
       setError("");
     } catch (cause) {
