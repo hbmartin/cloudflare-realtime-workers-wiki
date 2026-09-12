@@ -3525,88 +3525,42 @@ describe("App error handling", () => {
     await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(otherPage.id));
   });
 
-  it("preserves navigation to a page until its workspace event reaches the loaded tree", async () => {
-    const otherPage = { ...page, id: "other-page", position: "b0", title: "Other" };
-    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
+  it("loads a hidden navigation target directly without adding it to the sidebar", async () => {
+    const hiddenPage = { ...page, id: "hidden-page", position: "c0", title: "Hidden detail" };
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") return { pages: [page, otherPage] };
-      if (path === "/api/pages/tree?archived=true") return { pages: [] };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === `/api/pages/${hiddenPage.id}`) return { page: hiddenPage, sidebarHidden: true };
       throw new Error(`Unexpected API request: ${path}`);
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    await screen.findByRole("button", { name: "Archive Roadmap" });
     act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
 
-    expect(screen.getByRole("heading", { name: "Opening page…" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Refresh the page tree" })).toBeInTheDocument();
-    expect(screen.queryByText("A quiet workspace.")).not.toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
-    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [missingPage] }));
-
-    await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(missingPage.id));
-    expect(screen.getByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
+    expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(
+      [...document.querySelectorAll(".page-link")].some((link) => link.textContent?.includes("Hidden detail")),
+    ).toBe(false);
+    expect(localStorage.getItem("notes:last-page")).toBe(hiddenPage.id);
   });
 
-  it("makes pending-navigation retries single-flight and keeps waiting when the target remains absent", async () => {
-    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
-    const retry = deferred<{ pages: Page[] }>();
-    let treeLoads = 0;
+  it("reports a failed direct page load and retries the same endpoint", async () => {
+    const hiddenPage = { ...page, id: "hidden-page", position: "c0", title: "Hidden detail" };
+    let pageLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return treeLoads === 1 ? { pages: [page] } : retry.promise;
-      }
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
-    });
-    expect(screen.getByRole("button", { name: "+ Page" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Create a root page" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Add child to Roadmap" })).toBeDisabled();
-
-    const refresh = screen.getByRole("button", { name: "Refresh the page tree" });
-    fireEvent.click(refresh);
-    fireEvent.click(refresh);
-    await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.getByRole("button", { name: "Refreshing…" })).toBeDisabled();
-
-    await act(async () => {
-      retry.resolve({ pages: [page] });
-      await retry.promise;
-    });
-
-    expect(screen.getByRole("heading", { name: "Opening page…" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Return to current page" })).toBeEnabled();
-    expect(treeLoads).toBe(2);
-
-    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [missingPage] }));
-    expect(await screen.findByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
-  });
-
-  it("keeps the in-flight retry attached when the same pending page is selected again", async () => {
-    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
-    const retry = deferred<{ pages: Page[] }>();
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return treeLoads === 1 ? { pages: [page] } : retry.promise;
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === `/api/pages/${hiddenPage.id}`) {
+        pageLoads += 1;
+        if (pageLoads === 1) throw new ApiClientError(503, "page_unavailable", "Page lookup failed.");
+        return { page: hiddenPage, sidebarHidden: true };
       }
       throw new Error(`Unexpected API request: ${path}`);
     });
@@ -3614,186 +3568,74 @@ describe("App error handling", () => {
 
     await screen.findByRole("button", { name: "Archive Roadmap" });
     act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
-    await waitFor(() => expect(treeLoads).toBe(2));
-
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
 
-    expect(screen.getByRole("button", { name: "Refreshing…" })).toBeDisabled();
-    expect(treeLoads).toBe(2);
+    expect(await screen.findByRole("heading", { name: "Page unavailable" })).toBeInTheDocument();
+    expect(screen.getAllByText("Page lookup failed.").length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: "Try loading page again" }));
 
-    await act(async () => {
-      retry.resolve({ pages: [page] });
-      await retry.promise;
-    });
-    expect(screen.getByRole("button", { name: "Refresh the page tree" })).toBeEnabled();
+    expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(pageLoads).toBe(2);
   });
 
-  it("invalidates a failed retry when a workspace event resolves its pending page", async () => {
+  it("aborts a direct page load when pending navigation is canceled", async () => {
     const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
-    const retry = deferred<{ pages: Page[] }>();
-    const staleFailure = new ApiClientError(503, "tree_unavailable", "Stale tree failure.");
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return treeLoads === 1 ? { pages: [page] } : retry.promise;
-      }
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    await screen.findByRole("button", { name: "Archive Roadmap" });
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
-    await waitFor(() => expect(treeLoads).toBe(2));
-
-    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [missingPage] }));
-    expect(await screen.findByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
-
-    await act(async () => {
-      retry.reject(staleFailure);
-      await retry.promise.catch(() => undefined);
-    });
-    expect(screen.queryByText("Stale tree failure.")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
-  });
-
-  it("cancels only the retry observer when navigation changes target while reconnect shares its page load", async () => {
-    const firstMissingPage = { ...page, id: "first-missing-page", position: "c0", title: "First missing" };
-    const secondMissingPage = { ...page, id: "second-missing-page", position: "d0", title: "Second missing" };
-    const sharedTree = deferred<{ pages: Page[] }>();
-    let sharedRequestInit: RequestInit | undefined;
-    let treeLoads = 0;
+    let pageSignal: AbortSignal | undefined;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        if (treeLoads === 1) return { pages: [page] };
-        if (treeLoads === 2) {
-          sharedRequestInit = init;
-          return sharedTree.promise;
-        }
-        return { pages: [page] };
-      }
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    await screen.findByRole("button", { name: "Archive Roadmap" });
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: firstMissingPage.id }));
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
-    await waitFor(() => expect(treeLoads).toBe(2));
-
-    reconnectWorkspace();
-    const sharedRequestSignal = sharedRequestInit?.signal;
-    expect(sharedRequestSignal).toBeInstanceOf(AbortSignal);
-    if (!(sharedRequestSignal instanceof AbortSignal))
-      throw new Error("The shared page load did not receive a signal.");
-
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: secondMissingPage.id }));
-    });
-    expect(sharedRequestSignal.aborted).toBe(false);
-    const replacementRetry = screen.getByRole("button", { name: "Refresh the page tree" });
-    expect(replacementRetry).toBeEnabled();
-    fireEvent.click(replacementRetry);
-    expect(treeLoads).toBe(2);
-
-    await act(async () => {
-      sharedTree.resolve({ pages: [page] });
-      await sharedTree.promise;
-    });
-    await waitFor(() => expect(treeLoads).toBe(3));
-    expect(screen.getByRole("heading", { name: "Opening page…" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Refresh the page tree" })).toBeEnabled();
-    expect(screen.queryByText(/page tree could not be refreshed/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/could not be loaded/i)).not.toBeInTheDocument();
-  });
-
-  it("does not start a queued fresh page load after its retry observer is cancelled", async () => {
-    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
-    const sharedTree = deferred<{ pages: Page[] }>();
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return treeLoads === 1 ? { pages: [page] } : sharedTree.promise;
-      }
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    await screen.findByRole("button", { name: "Archive Roadmap" });
-    reconnectWorkspace();
-    await waitFor(() => expect(treeLoads).toBe(2));
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
-    fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
-
-    await act(async () => {
-      sharedTree.resolve({ pages: [page] });
-      await sharedTree.promise;
-    });
-
-    expect(treeLoads).toBe(2);
-    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-  });
-
-  it("aborts the shared page-tree request when the workspace unmounts", async () => {
-    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
-    let sharedRequestSignal: AbortSignal | undefined;
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        if (treeLoads === 1) return { pages: [page] };
-        const signal = init?.signal;
-        sharedRequestSignal = signal ?? undefined;
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === `/api/pages/${missingPage.id}`) {
+        pageSignal = init?.signal ?? undefined;
         return new Promise<never>((_resolve, reject) => {
-          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          pageSignal?.addEventListener("abort", () => reject(pageSignal?.reason), { once: true });
         });
       }
       throw new Error(`Unexpected API request: ${path}`);
     });
-    const app = render(<App />);
+    render(<App />);
 
     await screen.findByRole("button", { name: "Archive Roadmap" });
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
     });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
-    await waitFor(() => expect(treeLoads).toBe(2));
-    const signal = sharedRequestSignal;
-    expect(signal).toBeInstanceOf(AbortSignal);
-    if (!(signal instanceof AbortSignal)) throw new Error("The shared page load did not receive a signal.");
-    expect(signal.aborted).toBe(false);
+    await waitFor(() => expect(pageSignal).toBeInstanceOf(AbortSignal));
+    fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
 
-    app.unmount();
+    expect(pageSignal?.aborted).toBe(true);
+    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+  });
 
-    expect(signal.aborted).toBe(true);
-    await act(async () => Promise.resolve());
+  it("ignores a stale direct page response after navigation changes target", async () => {
+    const firstPage = { ...page, id: "first-page", position: "c0", title: "First" };
+    const secondPage = { ...page, id: "second-page", position: "d0", title: "Second" };
+    const firstLoad = deferred<{ page: Page; sidebarHidden: boolean }>();
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === `/api/pages/${firstPage.id}`) return firstLoad.promise;
+      if (path === `/api/pages/${secondPage.id}`) return { page: secondPage, sidebarHidden: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: firstPage.id }));
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: secondPage.id }));
+    });
+    expect(await screen.findByText("Second", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+
+    await act(async () => {
+      firstLoad.resolve({ page: firstPage, sidebarHidden: true });
+      await firstLoad.promise;
+    });
+    expect(screen.getByText("Second", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(localStorage.getItem("notes:last-page")).toBe(secondPage.id);
   });
 
   it("aborts the archived page-tree request when the workspace unmounts", async () => {
@@ -3826,137 +3668,6 @@ describe("App error handling", () => {
 
     expect(signal.aborted).toBe(true);
     await act(async () => Promise.resolve());
-  });
-
-  it("times out a stalled shared page-tree request and permits another retry", async () => {
-    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        if (treeLoads === 1) return { pages: [page] };
-        if (treeLoads === 2) {
-          const signal = init?.signal;
-          if (!signal) throw new Error("The shared page load did not receive a signal.");
-          return new Promise<never>((_resolve, reject) => {
-            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-          });
-        }
-        return { pages: [page, missingPage] };
-      }
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    await screen.findByRole("button", { name: "Archive Roadmap" });
-    vi.useFakeTimers();
-    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
-      const controller = new AbortController();
-      window.setTimeout(
-        () => controller.abort(new DOMException("The page tree request timed out.", "TimeoutError")),
-        milliseconds,
-      );
-      return controller.signal;
-    });
-    onTestFinished(() => timeout.mockRestore());
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
-    expect(treeLoads).toBe(2);
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(15_000);
-    });
-    const retry = screen.getByRole("button", { name: "Refresh the page tree" });
-    expect(retry).toBeEnabled();
-    fireEvent.click(retry);
-    await act(async () => Promise.resolve());
-
-    expect(treeLoads).toBe(3);
-    expect(screen.getByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
-  });
-
-  it("keeps the pending-navigation escape available while a retry is in flight", async () => {
-    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
-    const retry = deferred<{ pages: Page[] }>();
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return treeLoads === 1 ? { pages: [page] } : retry.promise;
-      }
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    await screen.findByRole("button", { name: "Archive Roadmap" });
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
-    await waitFor(() => expect(treeLoads).toBe(2));
-
-    const cancel = screen.getByRole("button", { name: "Return to current page" });
-    expect(cancel).toBeEnabled();
-    fireEvent.click(cancel);
-    expect(screen.queryByRole("heading", { name: "Opening page…" })).not.toBeInTheDocument();
-
-    await act(async () => {
-      retry.resolve({ pages: [page] });
-      await retry.promise;
-    });
-    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-  });
-
-  it("ignores a failed pending-navigation retry after cancellation and permits a new retry", async () => {
-    const firstMissingPage = { ...page, id: "first-missing-page", position: "c0", title: "First missing" };
-    const secondMissingPage = { ...page, id: "second-missing-page", position: "d0", title: "Second missing" };
-    const firstRetry = deferred<{ pages: Page[] }>();
-    const staleFailure = new ApiClientError(503, "tree_unavailable", "Stale tree failure.");
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        if (treeLoads === 1) return { pages: [page] };
-        if (treeLoads === 2) return firstRetry.promise;
-        return { pages: [page, secondMissingPage] };
-      }
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    await screen.findByRole("button", { name: "Archive Roadmap" });
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: firstMissingPage.id }));
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
-    await waitFor(() => expect(treeLoads).toBe(2));
-    fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
-
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: secondMissingPage.id }));
-    });
-    expect(screen.getByRole("button", { name: "Refresh the page tree" })).toBeEnabled();
-    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
-
-    await act(async () => {
-      firstRetry.reject(staleFailure);
-      await firstRetry.promise.catch(() => undefined);
-    });
-
-    expect(await screen.findByRole("button", { name: "Archive Second missing" })).toBeInTheDocument();
-    expect(treeLoads).toBe(3);
-    expect(screen.queryByText("Stale tree failure.")).not.toBeInTheDocument();
   });
 
   it("lets the user abandon a pending navigation target", async () => {
@@ -4000,41 +3711,6 @@ describe("App error handling", () => {
     expect(screen.getByRole("heading", { name: "Find anything" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "+ Page" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Return to current page" })).not.toBeInTheDocument();
-  });
-
-  it("keeps a pending navigation target through a stale tree response", async () => {
-    const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
-    const staleTree = deferred<{ pages: Page[] }>();
-    let treeLoads = 0;
-    vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") {
-        treeLoads += 1;
-        return treeLoads === 1 ? { pages: [page] } : staleTree.promise;
-      }
-      throw new Error(`Unexpected API request: ${path}`);
-    });
-    render(<App />);
-
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-    reconnectWorkspace();
-    await waitFor(() => expect(treeLoads).toBe(2));
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
-    });
-    expect(screen.getByRole("heading", { name: "Opening page…" })).toBeInTheDocument();
-
-    await act(async () => {
-      staleTree.resolve({ pages: [page] });
-      await staleTree.promise;
-    });
-
-    expect(screen.getByRole("heading", { name: "Opening page…" })).toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
-    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [missingPage] }));
-    expect(await screen.findByRole("button", { name: "Archive Missing" })).toBeInTheDocument();
   });
 
   it("does not let an older restore preference overwrite a newer restored selection", async () => {

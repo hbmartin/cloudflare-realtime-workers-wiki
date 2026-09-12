@@ -1683,7 +1683,7 @@ button.mention-chip:focus-visible {
 .invite-card button,
 .invite-link button {
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--surface);
   border-radius: 7px;
   padding: 8px;
   cursor: pointer;

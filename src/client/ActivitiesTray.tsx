@@ -1,8 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import { isJobActive } from "../shared/job-state";
-import type { Job, Space } from "../shared/types";
+import type { ImportPreview, Job, Space } from "../shared/types";
 
 const DATE_TIME_FORMAT = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+type ImportGroup = NonNullable<ImportPreview["groups"]>[number];
+
+function defaultGroupSpace(group: ImportGroup, spaces: Space[], jobSpaceId: string | null) {
+  const exact = spaces.find(
+    (space) =>
+      space.name.toLocaleLowerCase() === group.name.toLocaleLowerCase() &&
+      space.visibility === group.suggestedVisibility,
+  );
+  if (exact) return exact.id;
+  if (group.suggestedVisibility !== "workspace") return "";
+  return spaces.find((space) => space.id === jobSpaceId && space.visibility === "workspace")?.id ?? "";
+}
 
 function jobTitle(job: Job) {
   return {
@@ -32,23 +44,11 @@ function ImportConfirmation({
   const preview = job.result?.preview;
   const [mapping, setMapping] = useState<Record<string, string>>(() =>
     Object.fromEntries(
-      (preview?.groups ?? []).map((group) => [
-        group.key,
-        spaces.find(
-          (space) =>
-            space.name.toLocaleLowerCase() === group.name.toLocaleLowerCase() &&
-            space.visibility === group.suggestedVisibility,
-        )?.id ??
-          job.spaceId ??
-          spaces[0]?.id ??
-          "",
-      ]),
+      (preview?.groups ?? []).map((group) => [group.key, defaultGroupSpace(group, spaces, job.spaceId)]),
     ),
   );
   if (!preview) return null;
   const groups = preview.groups ?? [];
-  const blockingIssues = preview.blockingIssues ?? [];
-  const blocked = blockingIssues.length > 0;
   const incomplete = groups.some((group) => !mapping[group.key]);
   return (
     <div className="import-confirmation">
@@ -99,22 +99,13 @@ function ImportConfirmation({
             <option value="">Choose a space</option>
             {spaces.map((space) => (
               <option value={space.id} key={space.id}>
-                {space.name}
+                {space.name} ({space.visibility === "private" ? "Private" : "Workspace"})
               </option>
             ))}
           </select>
         </label>
       ))}
-      {blockingIssues.map((issue) => (
-        <p className="activity-job-error" key={issue}>
-          {issue}
-        </p>
-      ))}
-      <button
-        className="primary-small"
-        disabled={pending || blocked || incomplete}
-        onClick={() => onConfirm(job, mapping)}
-      >
+      <button className="primary-small" disabled={pending || incomplete} onClick={() => onConfirm(job, mapping)}>
         {pending ? "Starting…" : "Confirm import"}
       </button>
     </div>

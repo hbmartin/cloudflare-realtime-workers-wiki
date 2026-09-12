@@ -620,6 +620,17 @@ async function jsonBody(request: Request) {
   }
 }
 
+async function optionalJsonBody(request: Request) {
+  const source = await request.text();
+  if (!source.trim()) return {};
+  try {
+    return object(JSON.parse(source));
+  } catch (error) {
+    if (safeInstanceOf(error, HttpError)) throw error;
+    throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
+  }
+}
+
 function shareOptions(body: Record<string, unknown>) {
   return {
     ...(typeof body.includeSubpages === "boolean" ? { includeSubpages: body.includeSubpages } : {}),
@@ -794,6 +805,14 @@ async function spaceForMember(env: Env, member: MemberContext, spaceId: string) 
     .first<SpaceRow>();
   if (!row) throw new HttpError(404, "space_not_found", "Space not found.");
   return row;
+}
+
+async function editableSpaceForMember(env: Env, member: MemberContext, spaceId: string) {
+  const space = await spaceForMember(env, member, spaceId);
+  if (effectiveSpaceRole(member.role, space.visibility, space.space_role ?? null) === "viewer") {
+    throw new HttpError(403, "space_forbidden", "You cannot write to this space.");
+  }
+  return space;
 }
 
 type TagRow = {
@@ -1724,7 +1743,7 @@ app.post("/api/import-uploads", async (c) => {
 async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string) {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const body = routeJobId && !c.req.header("content-type") ? {} : await jsonBody(c.req.raw);
+  const body = routeJobId ? await optionalJsonBody(c.req.raw) : await jsonBody(c.req.raw);
   const jobId = routeJobId ?? text(body.jobId, "jobId", 100);
   const job = await jobForMember(c.env, member, jobId);
   if (job.type !== "import") throw new HttpError(404, "import_not_found", "Import job not found.");
@@ -1733,27 +1752,33 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
   }
   const options = JSON.parse(job.options_json) as Record<string, unknown>;
   const storedResult = JSON.parse(job.result_json) as { preview?: ImportPreview };
-  if (storedResult.preview?.blockingIssues?.length) {
-    throw new HttpError(422, "import_preview_blocked", "Resolve the blocking import preview issues before confirming.");
-  }
+  const groups = storedResult.preview?.groups ?? [];
   const rawMappings = body.groupSpaceIds;
   let groupSpaceIds: Record<string, string> | undefined;
+  const groupedImport = groups.length > 1 || groups.some((group) => group.key !== "Imported");
+  if (groupedImport && rawMappings === undefined) {
+    throw new HttpError(422, "invalid_space_mapping", "Choose a destination space for every import group.");
+  }
   if (rawMappings !== undefined) {
     if (!rawMappings || typeof rawMappings !== "object" || Array.isArray(rawMappings)) {
       throw new HttpError(422, "invalid_space_mapping", "groupSpaceIds must map import groups to space ids.");
     }
     groupSpaceIds = {};
-    const validGroups = new Set(storedResult.preview?.groups.map((group) => group.key) ?? []);
+    const validGroups = new Set(groups.map((group) => group.key));
     for (const [group, value] of Object.entries(rawMappings)) {
       if (!validGroups.has(group) || typeof value !== "string") {
         throw new HttpError(422, "invalid_space_mapping", "The import contains an invalid group-to-space mapping.");
       }
-      const space = await spaceForMember(c.env, member, value);
-      if (effectiveSpaceRole(member.role, space.visibility, space.space_role ?? null) === "viewer") {
-        throw new HttpError(403, "space_forbidden", "You cannot import into one of the selected spaces.");
-      }
+      await editableSpaceForMember(c.env, member, value);
       groupSpaceIds[group] = value;
     }
+    if (groupedImport && groups.some((group) => !Object.hasOwn(groupSpaceIds!, group.key))) {
+      throw new HttpError(422, "invalid_space_mapping", "Choose a destination space for every import group.");
+    }
+  }
+  if (!groupedImport && (!groupSpaceIds || !Object.hasOwn(groupSpaceIds, "Imported"))) {
+    if (!job.space_id) throw new HttpError(409, "space_required", "The import destination space is missing.");
+    await editableSpaceForMember(c.env, member, job.space_id);
   }
   const instanceId = crypto.randomUUID();
   const queued = await c.env.DB.prepare(
@@ -1869,6 +1894,51 @@ app.post("/api/jobs/:id/cancel", async (c) => {
   });
 });
 
+function storedJobOptions(job: JobRow) {
+  try {
+    return object(JSON.parse(job.options_json));
+  } catch {
+    throw new HttpError(409, "job_options_invalid", "This job's saved options are invalid.");
+  }
+}
+
+async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow) {
+  const options = storedJobOptions(job);
+  if (job.type === "import") {
+    requireEditor(member);
+    const destinations = new Set<string>();
+    if (job.space_id) destinations.add(job.space_id);
+    const mappings = options.groupSpaceIds;
+    if (mappings !== undefined) {
+      if (!mappings || typeof mappings !== "object" || Array.isArray(mappings)) {
+        throw new HttpError(409, "job_options_invalid", "This import's saved space mappings are invalid.");
+      }
+      for (const value of Object.values(mappings)) {
+        if (typeof value !== "string") {
+          throw new HttpError(409, "job_options_invalid", "This import's saved space mappings are invalid.");
+        }
+        destinations.add(value);
+      }
+    }
+    for (const spaceId of destinations) await editableSpaceForMember(env, member, spaceId);
+    return;
+  }
+  if (job.type === "template_clone") {
+    requireEditor(member);
+    const source = await pageForMember(env, member, text(options.sourcePageId, "sourcePageId", 100));
+    requirePageEditor(source);
+    await editableSpaceForMember(env, member, text(options.targetSpaceId, "targetSpaceId", 100));
+    const parentId = nullableId(options.parentId, "parentId");
+    if (parentId) requirePageEditor(await pageForMember(env, member, parentId));
+    return;
+  }
+  if (job.type === "search_reindex" || job.type === "comment_migration") {
+    requireOwner(member);
+    return;
+  }
+  await pageForMember(env, member, text(options.pageId, "pageId", 100));
+}
+
 app.post("/api/jobs/:id/retry", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const job = await jobForMember(c.env, member, c.req.param("id"));
@@ -1878,6 +1948,7 @@ app.post("/api/jobs/:id/retry", async (c) => {
   if (job.status !== "failed" && job.status !== "canceled") {
     throw new HttpError(409, "job_not_retryable", "Only failed or canceled jobs can be retried.");
   }
+  await authorizeJobRetry(c.env, member, job);
   const instanceId = crypto.randomUUID();
   const retried = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1, progress_current = 0,

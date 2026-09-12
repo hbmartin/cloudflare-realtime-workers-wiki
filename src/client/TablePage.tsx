@@ -2042,6 +2042,7 @@ export function TablePage({
     });
 
   const editingReady = Boolean(leaseToken && revisionKnown);
+  const showRowActions = editingReady || visibleRows.some((row) => row.detailPageId);
   const notices = uniqueTableNotices([
     leaseError ? { message: leaseError, danger: false } : null,
     saveError ? { message: saveError, danger: true } : null,
@@ -2151,9 +2152,7 @@ export function TablePage({
                       )}
                     </th>
                   ))}
-                  {(editingReady || visibleRows.some((row) => row.detailPageId)) && (
-                    <th className="row-actions" aria-label="Row actions" />
-                  )}
+                  {showRowActions && <th className="row-actions" aria-label="Row actions" />}
                 </tr>
               </thead>
               <tbody>
@@ -2170,7 +2169,7 @@ export function TablePage({
                         />
                       </td>
                     ))}
-                    {(editingReady || row.detailPageId) && (
+                    {showRowActions && (
                       <td className="row-actions">
                         {row.detailPageId && (
                           <button onClick={() => onSelectPage(row.detailPageId!)} aria-label="Open row details">
