@@ -83,6 +83,7 @@ import type {
   ClientMemberContext,
   CommentAnchor,
   ExportFormat,
+  ImportPreview,
   NotificationChannelMode,
   NotificationEventType,
   NotificationPreference,
@@ -1723,7 +1724,7 @@ app.post("/api/import-uploads", async (c) => {
 async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string) {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
-  const body = routeJobId ? {} : await jsonBody(c.req.raw);
+  const body = routeJobId && !c.req.header("content-type") ? {} : await jsonBody(c.req.raw);
   const jobId = routeJobId ?? text(body.jobId, "jobId", 100);
   const job = await jobForMember(c.env, member, jobId);
   if (job.type !== "import") throw new HttpError(404, "import_not_found", "Import job not found.");
@@ -1731,13 +1732,42 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
     throw new HttpError(409, "import_not_confirmable", "This import is not awaiting confirmation.");
   }
   const options = JSON.parse(job.options_json) as Record<string, unknown>;
+  const storedResult = JSON.parse(job.result_json) as { preview?: ImportPreview };
+  if (storedResult.preview?.blockingIssues?.length) {
+    throw new HttpError(422, "import_preview_blocked", "Resolve the blocking import preview issues before confirming.");
+  }
+  const rawMappings = body.groupSpaceIds;
+  let groupSpaceIds: Record<string, string> | undefined;
+  if (rawMappings !== undefined) {
+    if (!rawMappings || typeof rawMappings !== "object" || Array.isArray(rawMappings)) {
+      throw new HttpError(422, "invalid_space_mapping", "groupSpaceIds must map import groups to space ids.");
+    }
+    groupSpaceIds = {};
+    const validGroups = new Set(storedResult.preview?.groups.map((group) => group.key) ?? []);
+    for (const [group, value] of Object.entries(rawMappings)) {
+      if (!validGroups.has(group) || typeof value !== "string") {
+        throw new HttpError(422, "invalid_space_mapping", "The import contains an invalid group-to-space mapping.");
+      }
+      const space = await spaceForMember(c.env, member, value);
+      if (effectiveSpaceRole(member.role, space.visibility, space.space_role ?? null) === "viewer") {
+        throw new HttpError(403, "space_forbidden", "You cannot import into one of the selected spaces.");
+      }
+      groupSpaceIds[group] = value;
+    }
+  }
   const instanceId = crypto.randomUUID();
   const queued = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, options_json = ?, progress_label = 'Queued',
       error_code = NULL, error_message = NULL, updated_at = ?
       WHERE id = ? AND attempt = ? AND status = 'awaiting_confirmation'`,
   )
-    .bind(instanceId, JSON.stringify({ ...options, confirmed: true }), now(), job.id, job.attempt)
+    .bind(
+      instanceId,
+      JSON.stringify({ ...options, confirmed: true, ...(groupSpaceIds ? { groupSpaceIds } : {}) }),
+      now(),
+      job.id,
+      job.attempt,
+    )
     .run();
   if (!queued.meta.changes) {
     throw new HttpError(409, "import_not_confirmable", "This import is no longer awaiting confirmation.");
@@ -2208,6 +2238,10 @@ app.get("/api/pages/tree", async (c) => {
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE p.workspace_id = ? AND p.archived_at IS ${archived ? "NOT " : ""}NULL
        AND p.is_template = 0 AND p.import_job_id IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM page_import_sources source
+          WHERE source.page_id = p.id AND source.source_role = 'table_row_detail'
+       )
        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
      ORDER BY p.position, p.id`,
   )
@@ -2466,7 +2500,13 @@ app.post("/api/pages/batch", async (c) => {
 
 app.get("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  return c.json({ page: pageJson(await pageForMember(c.env, member, c.req.param("id"), true)) });
+  const page = await pageForMember(c.env, member, c.req.param("id"), true);
+  const hidden = await c.env.DB.prepare(
+    `SELECT 1 hidden FROM page_import_sources WHERE page_id = ? AND source_role = 'table_row_detail'`,
+  )
+    .bind(page.id)
+    .first();
+  return c.json({ page: pageJson(page), sidebarHidden: Boolean(hidden) });
 });
 
 app.get("/api/pages/:id/breadcrumbs", async (c) => {
@@ -4440,11 +4480,21 @@ async function stableTableSnapshot<T>(
 function collectRowCells(results: Record<string, unknown>[]) {
   const rows = new Map<
     string,
-    { id: string; position: number; cells: Record<string, string | number | boolean | null> }
+    {
+      id: string;
+      position: number;
+      cells: Record<string, string | number | boolean | null>;
+      detailPageId: string | null;
+    }
   >();
   for (const item of results) {
     const rowId = String(item.row_id);
-    const row = rows.get(rowId) ?? { id: rowId, position: Number(item.row_position), cells: {} };
+    const row = rows.get(rowId) ?? {
+      id: rowId,
+      position: Number(item.row_position),
+      cells: {},
+      detailPageId: typeof item.detail_page_id === "string" ? item.detail_page_id : null,
+    };
     if (typeof item.column_id === "string") row.cells[item.column_id] = cellValue(item);
     rows.set(rowId, row);
   }
@@ -4473,9 +4523,12 @@ app.get("/api/tables/:pageId", async (c) => {
     const rows = await c.env.DB.prepare(
       `WITH page_rows AS (${rowQuery.sql})
        SELECT page_rows.id row_id, page_rows.position row_position,
+              row_page.page_id detail_page_id,
               cell.column_id, cell.text_value, cell.number_value, cell.boolean_value,
               cell.date_value, cell.select_value
-         FROM page_rows LEFT JOIN table_cells cell ON cell.row_id = page_rows.id
+         FROM page_rows
+         LEFT JOIN table_row_pages row_page ON row_page.row_id = page_rows.id
+         LEFT JOIN table_cells cell ON cell.row_id = page_rows.id
         ORDER BY ${rowQuery.orderSql}, cell.column_id`,
     )
       .bind(...tableRowBinds(rowQuery, rowQuery.limit + 1))

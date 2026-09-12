@@ -120,6 +120,7 @@ describe("ActivitiesTray", () => {
     const importJob: Job = {
       ...runningJob,
       id: "import-1",
+      spaceId: "space-1",
       type: "import",
       status: "awaiting_confirmation",
       progress: { current: 2, total: 7, label: "Ready to import" },
@@ -130,6 +131,15 @@ describe("ActivitiesTray", () => {
           pages: 8,
           tables: 2,
           assets: 5,
+          roots: 3,
+          nested: 5,
+          maxDepth: 2,
+          resolvedLinks: 4,
+          unresolvedLinks: 1,
+          duplicateTitles: 0,
+          unresolvedParents: 0,
+          blockingIssues: [],
+          groups: [{ key: "Workspace", name: "Workspace", pages: 8, roots: 3, suggestedVisibility: "workspace" }],
           warnings: [],
         },
       },
@@ -149,10 +159,10 @@ describe("ActivitiesTray", () => {
         onOpenResult={vi.fn()}
       />,
     );
-    expect(screen.getByText("8")).toBeInTheDocument();
-    expect(screen.getByText("2")).toBeInTheDocument();
-    expect(screen.getByText("5")).toBeInTheDocument();
+    expect(screen.getByText("Pages").parentElement).toHaveTextContent("8");
+    expect(screen.getByText("Tables").parentElement).toHaveTextContent("2");
+    expect(screen.getByText("Assets").parentElement).toHaveTextContent("5");
     fireEvent.click(screen.getByRole("button", { name: "Confirm import" }));
-    expect(confirm).toHaveBeenCalledWith(importJob);
+    expect(confirm).toHaveBeenCalledWith(importJob, { Workspace: "space-1" });
   });
 });

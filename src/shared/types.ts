@@ -248,6 +248,21 @@ export type ImportPreview = {
   pages: number;
   tables: number;
   assets: number;
+  roots: number;
+  nested: number;
+  maxDepth: number;
+  resolvedLinks: number;
+  unresolvedLinks: number;
+  duplicateTitles: number;
+  unresolvedParents: number;
+  blockingIssues: string[];
+  groups: Array<{
+    key: string;
+    name: string;
+    pages: number;
+    roots: number;
+    suggestedVisibility: "workspace" | "private";
+  }>;
   warnings: string[];
 };
 
@@ -342,6 +357,7 @@ export type TableRow = {
   id: string;
   position: number;
   cells: Record<string, string | number | boolean | null>;
+  detailPageId?: string | null;
 };
 
 export type TableCursor = { position: number; rowId: string };

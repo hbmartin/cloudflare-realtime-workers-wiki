@@ -1499,8 +1499,8 @@ button.mention-chip:focus-visible {
   margin: 0 12px;
 }
 .row-actions {
-  min-width: 36px !important;
-  width: 36px;
+  min-width: 48px !important;
+  width: auto;
   text-align: center !important;
 }
 .row-actions button {
@@ -1931,6 +1931,24 @@ button.mention-chip:focus-visible {
 .import-preview dd {
   margin: 2px 0 0;
   font-weight: 700;
+}
+.import-confirmation {
+  margin: 10px 0;
+}
+.import-space-mapping {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.import-space-mapping select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  padding: 8px;
+  color: var(--ink);
 }
 .sidebar-scrim {
   display: none;

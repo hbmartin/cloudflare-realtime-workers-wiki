@@ -2151,7 +2151,9 @@ export function TablePage({
                       )}
                     </th>
                   ))}
-                  {editingReady && <th className="row-actions" aria-label="Row actions" />}
+                  {(editingReady || visibleRows.some((row) => row.detailPageId)) && (
+                    <th className="row-actions" aria-label="Row actions" />
+                  )}
                 </tr>
               </thead>
               <tbody>
@@ -2168,11 +2170,18 @@ export function TablePage({
                         />
                       </td>
                     ))}
-                    {editingReady && (
+                    {(editingReady || row.detailPageId) && (
                       <td className="row-actions">
-                        <button onClick={() => void removeRow(row)} aria-label="Delete row">
-                          ×
-                        </button>
+                        {row.detailPageId && (
+                          <button onClick={() => onSelectPage(row.detailPageId!)} aria-label="Open row details">
+                            ↗
+                          </button>
+                        )}
+                        {editingReady && (
+                          <button onClick={() => void removeRow(row)} aria-label="Delete row">
+                            ×
+                          </button>
+                        )}
                       </td>
                     )}
                   </tr>
