@@ -800,6 +800,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [jobsLoading, setJobsLoading] = useState(false);
   const [jobsError, setJobsError] = useState("");
   const [pendingJobId, setPendingJobId] = useState<string | null>(null);
+  const [sidebarHiddenPageIds, setSidebarHiddenPageIds] = useState<ReadonlySet<string>>(() => new Set());
   const [spaces, setSpaces] = useState<Space[]>([]);
   const [activeSpaceId, setActiveSpaceId] = useState(
     () => localStorage.getItem(`notes:active-space:${member.workspace.id}`) ?? "",
@@ -996,6 +997,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (page) {
         setActiveSpaceId(page.spaceId);
         localStorage.setItem(`notes:active-space:${member.workspace.id}`, page.spaceId);
+      } else {
+        void api<{ page: Page; sidebarHidden?: boolean }>(`/api/pages/${encodeURIComponent(pageId)}`)
+          .then(({ page: loaded, sidebarHidden }) => {
+            dispatchPageAction({ type: "merge", pages: [loaded] });
+            if (sidebarHidden) {
+              setSidebarHiddenPageIds((current) => new Set(current).add(loaded.id));
+            }
+            setActiveSpaceId(loaded.spaceId);
+            localStorage.setItem(`notes:active-space:${member.workspace.id}`, loaded.spaceId);
+          })
+          .catch(() => undefined);
       }
       dispatchPageAction({ type: "select", pageId });
       history.replaceState(null, "", `/?page=${encodeURIComponent(pageId)}`);
@@ -1869,37 +1881,45 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [activitiesOpen, activityPollDelay, loadJobs]);
-  const mutateJob = useCallback(async (job: Job, action: "cancel" | "cleanup" | "retry" | "confirm") => {
-    setPendingJobId(job.id);
-    try {
-      const path =
-        action === "confirm"
-          ? `/api/imports/${encodeURIComponent(job.id)}/confirm`
-          : `/api/jobs/${encodeURIComponent(job.id)}/${action}`;
-      const data = await api<{ job: Job }>(path, { method: "POST" });
-      setJobs((current) =>
-        current.map((candidate) => (candidate.id === data.job.id ? latestJobSnapshot(candidate, data.job) : candidate)),
-      );
-      setJobsError("");
-    } catch (error) {
-      setJobsError(
-        apiErrorMessage(
-          error,
-          `The job could not be ${
-            action === "cancel"
-              ? "canceled"
-              : action === "cleanup"
-                ? "cleaned up"
-                : action === "confirm"
-                  ? "confirmed"
-                  : "retried"
-          }.`,
-        ),
-      );
-    } finally {
-      setPendingJobId(null);
-    }
-  }, []);
+  const mutateJob = useCallback(
+    async (job: Job, action: "cancel" | "cleanup" | "retry" | "confirm", groupSpaceIds?: Record<string, string>) => {
+      setPendingJobId(job.id);
+      try {
+        const path =
+          action === "confirm"
+            ? `/api/imports/${encodeURIComponent(job.id)}/confirm`
+            : `/api/jobs/${encodeURIComponent(job.id)}/${action}`;
+        const data = await api<{ job: Job }>(path, {
+          method: "POST",
+          ...(action === "confirm" ? { body: json({ groupSpaceIds: groupSpaceIds ?? {} }) } : {}),
+        });
+        setJobs((current) =>
+          current.map((candidate) =>
+            candidate.id === data.job.id ? latestJobSnapshot(candidate, data.job) : candidate,
+          ),
+        );
+        setJobsError("");
+      } catch (error) {
+        setJobsError(
+          apiErrorMessage(
+            error,
+            `The job could not be ${
+              action === "cancel"
+                ? "canceled"
+                : action === "cleanup"
+                  ? "cleaned up"
+                  : action === "confirm"
+                    ? "confirmed"
+                    : "retried"
+            }.`,
+          ),
+        );
+      } finally {
+        setPendingJobId(null);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     const navigate = (event: Event) => {
@@ -1915,8 +1935,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const currentSpaceId = activeSpaceId || selected?.spaceId || pages[0]?.spaceId || "";
   const activeSpace = spaces.find((space) => space.id === currentSpaceId) ?? null;
   const activePages = useMemo(
-    () => pages.filter((page) => !page.isTemplate && (!currentSpaceId || page.spaceId === currentSpaceId)),
-    [currentSpaceId, pages],
+    () =>
+      pages.filter(
+        (page) =>
+          !page.isTemplate &&
+          !sidebarHiddenPageIds.has(page.id) &&
+          (!currentSpaceId || page.spaceId === currentSpaceId),
+      ),
+    [currentSpaceId, pages, sidebarHiddenPageIds],
   );
   const activeSelected = selected && (!currentSpaceId || selected.spaceId === currentSpaceId) ? selected : null;
   const resolvedSelectedId = pendingSelectionId ? null : pagesLoaded ? (activeSelected?.id ?? null) : selectedId;
@@ -2976,6 +3002,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       {activitiesOpen && (
         <ActivitiesTray
           jobs={jobs}
+          spaces={spaces.filter((space) => space.effectiveRole !== "viewer")}
           loading={jobsLoading}
           error={jobsError}
           pendingJobId={pendingJobId}
@@ -2984,7 +3011,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onCancel={(job) => void mutateJob(job, "cancel")}
           onCleanup={(job) => void mutateJob(job, "cleanup")}
           onRetry={(job) => void mutateJob(job, "retry")}
-          onConfirm={(job) => void mutateJob(job, "confirm")}
+          onConfirm={(job, groupSpaceIds) => void mutateJob(job, "confirm", groupSpaceIds)}
           onOpenResult={(job) => void openJobResult(job)}
         />
       )}

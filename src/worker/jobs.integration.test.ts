@@ -1897,6 +1897,93 @@ describe("job execution", () => {
     ).toMatchObject({ name: "photo.png" });
   });
 
+  it("maps Notion groups to spaces and links row detail pages without duplicating them in the tree", async () => {
+    const installed = await bootstrap();
+    const privateResponse = await worker.fetch(
+      request(installed.cookie, "/api/spaces", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "Private & Shared", visibility: "private" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const privateSpace = (await privateResponse.json<{ space: { id: string } }>()).space;
+    const encoder = new TextEncoder();
+    const tableId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const zip = createZip([
+      {
+        path: `Export-demo/SparkedAI HQ/Tasks ${tableId}.md`,
+        bytes: encoder.encode("# Tech Tasks\n\nDatabase overview\n"),
+      },
+      {
+        path: `Export-demo/SparkedAI HQ/Tasks ${tableId}_all.csv`,
+        bytes: encoder.encode("Task,Done\nShip,yes\n"),
+      },
+      {
+        path: `Export-demo/SparkedAI HQ/Tasks aaaa-aaaa/Ship bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md`,
+        bytes: encoder.encode("# Ship\n\nDetailed acceptance criteria\n"),
+      },
+      {
+        path: "Export-demo/Private & Shared/Home cccccccccccccccccccccccccccccccc.md",
+        bytes: encoder.encode("# Personal Home\n\nPrivate notes\n"),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "notion.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const preview = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job.result!.preview!;
+    expect(preview).toMatchObject({ pages: 3, tables: 1, roots: 2, nested: 1, unresolvedParents: 0 });
+    expect(preview.groups.map((group) => group.name)).toEqual(["SparkedAI HQ", "Private & Shared"]);
+
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          groupSpaceIds: {
+            "SparkedAI HQ": `${installed.workspaceId}-general`,
+            "Private & Shared": privateSpace.id,
+          },
+        }),
+      }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+
+    const tree = await (
+      await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext())
+    ).json<{ pages: Array<{ id: string; title: string; parentId: string | null; spaceId: string }> }>();
+    expect(tree.pages.map((page) => page.title)).toEqual(expect.arrayContaining(["Tech Tasks", "Personal Home"]));
+    expect(tree.pages.map((page) => page.title)).not.toContain("Ship");
+    expect(tree.pages.find((page) => page.title === "Personal Home")?.spaceId).toBe(privateSpace.id);
+    const tablePage = tree.pages.find((page) => page.title === "Tech Tasks")!;
+    const table = await (
+      await worker.fetch(request(installed.cookie, `/api/tables/${tablePage.id}`), env, createExecutionContext())
+    ).json<{ table: { rows: Array<{ detailPageId: string | null }> } }>();
+    expect(table.table.rows[0]?.detailPageId).toEqual(expect.any(String));
+    expect(
+      await env.DB.prepare(`SELECT source_role FROM page_import_sources WHERE page_id = ?`)
+        .bind(table.table.rows[0]!.detailPageId)
+        .first(),
+    ).toMatchObject({ source_role: "table_row_detail" });
+  });
+
   it("re-fences staged pages and attachments that survive into an import retry", async () => {
     const installed = await bootstrap();
     const sourcePath = "Project 0123456789abcdef0123456789abcdef";

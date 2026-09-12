@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { isJobActive } from "../shared/job-state";
-import type { Job } from "../shared/types";
+import type { Job, Space } from "../shared/types";
 
 const DATE_TIME_FORMAT = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 
@@ -18,8 +18,112 @@ function timestamp(value: number) {
   return DATE_TIME_FORMAT.format(value);
 }
 
+function ImportConfirmation({
+  job,
+  spaces = [],
+  pending,
+  onConfirm,
+}: {
+  job: Job;
+  spaces?: Space[];
+  pending: boolean;
+  onConfirm: (job: Job, groupSpaceIds: Record<string, string>) => void;
+}) {
+  const preview = job.result?.preview;
+  const [mapping, setMapping] = useState<Record<string, string>>(() =>
+    Object.fromEntries(
+      (preview?.groups ?? []).map((group) => [
+        group.key,
+        spaces.find(
+          (space) =>
+            space.name.toLocaleLowerCase() === group.name.toLocaleLowerCase() &&
+            space.visibility === group.suggestedVisibility,
+        )?.id ??
+          job.spaceId ??
+          spaces[0]?.id ??
+          "",
+      ]),
+    ),
+  );
+  if (!preview) return null;
+  const groups = preview.groups ?? [];
+  const blockingIssues = preview.blockingIssues ?? [];
+  const blocked = blockingIssues.length > 0;
+  const incomplete = groups.some((group) => !mapping[group.key]);
+  return (
+    <div className="import-confirmation">
+      <dl className="import-preview">
+        <div>
+          <dt>Pages</dt>
+          <dd>{preview.pages}</dd>
+        </div>
+        <div>
+          <dt>Roots</dt>
+          <dd>{preview.roots ?? preview.pages}</dd>
+        </div>
+        <div>
+          <dt>Nested</dt>
+          <dd>{preview.nested ?? 0}</dd>
+        </div>
+        <div>
+          <dt>Tables</dt>
+          <dd>{preview.tables}</dd>
+        </div>
+        <div>
+          <dt>Assets</dt>
+          <dd>{preview.assets}</dd>
+        </div>
+        <div>
+          <dt>Links fixed</dt>
+          <dd>{preview.resolvedLinks ?? 0}</dd>
+        </div>
+        <div>
+          <dt>Links missing</dt>
+          <dd>{preview.unresolvedLinks ?? 0}</dd>
+        </div>
+        <div>
+          <dt>Max depth</dt>
+          <dd>{preview.maxDepth ?? 0}</dd>
+        </div>
+      </dl>
+      {groups.map((group) => (
+        <label className="import-space-mapping" key={group.key}>
+          <span>
+            {group.name} ({group.pages} pages, {group.roots} roots)
+          </span>
+          <select
+            aria-label={`Destination space for ${group.name}`}
+            value={mapping[group.key] ?? ""}
+            onChange={(event) => setMapping((current) => ({ ...current, [group.key]: event.target.value }))}
+          >
+            <option value="">Choose a space</option>
+            {spaces.map((space) => (
+              <option value={space.id} key={space.id}>
+                {space.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      ))}
+      {blockingIssues.map((issue) => (
+        <p className="activity-job-error" key={issue}>
+          {issue}
+        </p>
+      ))}
+      <button
+        className="primary-small"
+        disabled={pending || blocked || incomplete}
+        onClick={() => onConfirm(job, mapping)}
+      >
+        {pending ? "Starting…" : "Confirm import"}
+      </button>
+    </div>
+  );
+}
+
 export function ActivitiesTray({
   jobs,
+  spaces = [],
   loading,
   error,
   pendingJobId,
@@ -32,6 +136,7 @@ export function ActivitiesTray({
   onOpenResult,
 }: {
   jobs: Job[];
+  spaces?: Space[];
   loading: boolean;
   error: string;
   pendingJobId: string | null;
@@ -40,7 +145,7 @@ export function ActivitiesTray({
   onCancel: (job: Job) => void;
   onCleanup: (job: Job) => void;
   onRetry: (job: Job) => void;
-  onConfirm: (job: Job) => void;
+  onConfirm: (job: Job, groupSpaceIds: Record<string, string>) => void;
   onOpenResult: (job: Job) => void;
 }) {
   const closeButton = useRef<HTMLButtonElement>(null);
@@ -134,20 +239,7 @@ export function ActivitiesTray({
                   )}
                   {job.error && <p className="activity-job-error">{job.error.message}</p>}
                   {job.status === "awaiting_confirmation" && job.result?.preview && (
-                    <dl className="import-preview">
-                      <div>
-                        <dt>Pages</dt>
-                        <dd>{job.result.preview.pages}</dd>
-                      </div>
-                      <div>
-                        <dt>Tables</dt>
-                        <dd>{job.result.preview.tables}</dd>
-                      </div>
-                      <div>
-                        <dt>Assets</dt>
-                        <dd>{job.result.preview.assets}</dd>
-                      </div>
-                    </dl>
+                    <ImportConfirmation job={job} spaces={spaces} pending={pending} onConfirm={onConfirm} />
                   )}
                   {job.warnings.map((warning) => (
                     <p className="activity-warning" key={warning}>
@@ -157,11 +249,6 @@ export function ActivitiesTray({
                   <div className="activity-meta">
                     <time dateTime={new Date(job.createdAt).toISOString()}>{timestamp(job.createdAt)}</time>
                     <span className="activity-actions">
-                      {job.status === "awaiting_confirmation" && (
-                        <button className="primary-small" disabled={pending} onClick={() => onConfirm(job)}>
-                          {pending ? "Starting…" : "Confirm import"}
-                        </button>
-                      )}
                       {job.status === "succeeded" && job.result?.pageId && (
                         <button className="quiet-button" disabled={pending} onClick={() => onOpenResult(job)}>
                           Open page
