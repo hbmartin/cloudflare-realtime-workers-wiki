@@ -2883,6 +2883,7 @@ app.get("/api/pages/:id/diagram-thumbnail.svg", async (c) => {
     { id: page.id, content_epoch: page.content_epoch, title: page.title },
     {
       cacheControl: "private, max-age=0, must-revalidate",
+      validators: true,
       ...(ifNoneMatch ? { ifNoneMatch } : {}),
     },
   );

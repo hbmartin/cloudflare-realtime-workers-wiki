@@ -585,7 +585,7 @@ export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, s
   return diagramThumbnailResponse(
     env,
     { id: diagram.page_id, content_epoch: diagram.content_epoch, title: diagram.page_title },
-    { cacheControl: "no-store" },
+    { cacheControl: "no-store", validators: false },
   );
 }
 
