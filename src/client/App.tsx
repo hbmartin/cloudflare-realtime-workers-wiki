@@ -987,6 +987,53 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [clearWorkspaceErrors, startWorkspaceErrorAttempt],
   );
+  const loadPageForNavigation = useCallback(
+    async (pageId: string) => {
+      const current = activePageTreeRetryRef.current;
+      if (current?.target.source === "page-access" && current.pendingPageId === pageId) return;
+      if (current) cancelPageTreeRetry(current.target);
+      const target = { source: "page-access" } as const;
+      const errorAttempt = startWorkspaceErrorAttempt(target);
+      const activeRequest = {
+        target,
+        errorAttempt,
+        pendingPageId: pageId,
+        controller: new AbortController(),
+      };
+      activePageTreeRetryRef.current = activeRequest;
+      setPageTreeRetrying(true);
+      clearWorkspaceErrors(errorAttempt);
+      try {
+        const { page, sidebarHidden } = await api<{ page: Page; sidebarHidden?: boolean }>(
+          `/api/pages/${encodeURIComponent(pageId)}`,
+          { signal: activeRequest.controller.signal },
+        );
+        if (activePageTreeRetryRef.current !== activeRequest) return;
+        dispatchPageAction({ type: "merge", pages: [page] });
+        if (sidebarHidden) setSidebarHiddenPageIds((currentIds) => new Set(currentIds).add(page.id));
+        setActiveSpaceId(page.spaceId);
+        localStorage.setItem(`notes:active-space:${member.workspace.id}`, page.spaceId);
+      } catch (error) {
+        if (!activeRequest.controller.signal.aborted) {
+          reportWorkspaceError(errorAttempt, apiErrorMessage(error, "The page could not be loaded."));
+        }
+      } finally {
+        finishWorkspaceErrorAttempt(errorAttempt);
+        if (activePageTreeRetryRef.current === activeRequest) {
+          activePageTreeRetryRef.current = null;
+          setPageTreeRetrying(false);
+        }
+      }
+    },
+    [
+      cancelPageTreeRetry,
+      clearWorkspaceErrors,
+      finishWorkspaceErrorAttempt,
+      member.workspace.id,
+      reportWorkspaceError,
+      startWorkspaceErrorAttempt,
+    ],
+  );
   const navigateToPage = useCallback(
     (pageId: string) => {
       const activeRetry = activePageTreeRetryRef.current;
@@ -998,23 +1045,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         setActiveSpaceId(page.spaceId);
         localStorage.setItem(`notes:active-space:${member.workspace.id}`, page.spaceId);
       } else {
-        void api<{ page: Page; sidebarHidden?: boolean }>(`/api/pages/${encodeURIComponent(pageId)}`)
-          .then(({ page: loaded, sidebarHidden }) => {
-            dispatchPageAction({ type: "merge", pages: [loaded] });
-            if (sidebarHidden) {
-              setSidebarHiddenPageIds((current) => new Set(current).add(loaded.id));
-            }
-            setActiveSpaceId(loaded.spaceId);
-            localStorage.setItem(`notes:active-space:${member.workspace.id}`, loaded.spaceId);
-          })
-          .catch(() => undefined);
+        void loadPageForNavigation(pageId);
       }
       dispatchPageAction({ type: "select", pageId });
       history.replaceState(null, "", `/?page=${encodeURIComponent(pageId)}`);
       setView("pages");
       closeSidebar(true);
     },
-    [cancelPageTreeRetry, closeSidebar, member.workspace.id, pages],
+    [cancelPageTreeRetry, closeSidebar, loadPageForNavigation, member.workspace.id, pages],
   );
 
   useEffect(() => {
@@ -2440,7 +2478,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }
   function retryPendingSelection() {
     if (!pendingSelectionId) return;
-    void retryPageTree({ source: "page-access" }, "The page could not be loaded.");
+    void loadPageForNavigation(pendingSelectionId);
   }
   function cancelPendingSelection() {
     cancelPageTreeRetry({ source: "page-access" });
@@ -2602,6 +2640,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const workspaceError = formatErrorMessages(workspaceErrors);
   const trashLoadFailed = workspaceErrors.some((error) => error.source === "trash-load");
   const initialPageLoadFailed = !pagesLoaded && workspaceErrors.some((error) => error.source === "page-tree");
+  const pendingPageError = workspaceErrors.find((error) => error.source === "page-access")?.message;
 
   return (
     <div className="workspace-shell">
@@ -2951,11 +2990,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           />
         ) : pendingSelectionId ? (
           <PendingPage
-            title="Opening page…"
-            message="This page has not reached the workspace tree yet. It may still be syncing."
+            title={pendingPageError ? "Page unavailable" : "Opening page…"}
+            message={pendingPageError ?? "This page has not reached the workspace tree yet. It may still be syncing."}
             onCancel={cancelPendingSelection}
             onRetry={retryPendingSelection}
             retrying={pageTreeRetrying}
+            retryLabel="Try loading page again"
+            retryingLabel="Loading…"
           />
         ) : activeSelected ? (
           activeSelected.kind === "document" ? (
@@ -3442,12 +3483,16 @@ function PendingPage({
   onRetry,
   onCancel,
   retrying = false,
+  retryLabel = "Refresh the page tree",
+  retryingLabel = "Refreshing…",
 }: {
   title: string;
   message: string;
   onRetry?: () => void;
   onCancel?: () => void;
   retrying?: boolean;
+  retryLabel?: string;
+  retryingLabel?: string;
 }) {
   return (
     <main className="empty-workspace" aria-live="polite">
@@ -3457,7 +3502,7 @@ function PendingPage({
       {onRetry && (
         <div className="pending-page-actions">
           <button className="primary-button" disabled={retrying} onClick={onRetry}>
-            {retrying ? "Refreshing…" : "Refresh the page tree"}
+            {retrying ? retryingLabel : retryLabel}
           </button>
           {onCancel && (
             <button className="quiet-button" onClick={onCancel}>

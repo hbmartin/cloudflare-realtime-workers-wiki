@@ -248,15 +248,13 @@ export type ImportPreview = {
   pages: number;
   tables: number;
   assets: number;
-  roots: number;
-  nested: number;
-  maxDepth: number;
-  resolvedLinks: number;
-  unresolvedLinks: number;
-  duplicateTitles: number;
-  unresolvedParents: number;
-  blockingIssues: string[];
-  groups: Array<{
+  roots?: number;
+  nested?: number;
+  maxDepth?: number;
+  resolvedLinks?: number;
+  unresolvedLinks?: number;
+  unresolvedParents?: number;
+  groups?: Array<{
     key: string;
     name: string;
     pages: number;

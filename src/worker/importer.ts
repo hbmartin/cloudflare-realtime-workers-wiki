@@ -53,6 +53,14 @@ type ImportPage = {
   assets: ImportAsset[];
 };
 type ImportBundle = { pages: ImportPage[]; issues: ImportIssue[]; preview: ImportPreview };
+type NotionPageEntry = ZipEntry & {
+  text: string;
+  directory: string;
+  rawStem: string;
+  title: string;
+  notionId: string | null;
+};
+type NotionGrouping = { teamspace: boolean };
 
 function record(value: string) {
   const parsed: unknown = JSON.parse(value);
@@ -146,16 +154,26 @@ function notionRelativeSegments(source: string) {
   return segments.slice(archive + 1);
 }
 
-function groupKeyFor(source: string) {
-  const segments = notionRelativeSegments(source);
-  return segments.length > 2 && /^Export-/i.test(segments[0]!) ? segments[1]! : "Imported";
+function groupingFor(sources: string[]): NotionGrouping {
+  const relative = sources.map(notionRelativeSegments);
+  return {
+    teamspace:
+      relative.length > 0 && relative.every((segments) => segments.length >= 3 && /^Export-/i.test(segments[0]!)),
+  };
 }
 
-function groupRootFor(source: string) {
+function groupKeyFor(source: string, grouping: NotionGrouping) {
+  const segments = notionRelativeSegments(source);
+  return grouping.teamspace ? segments[1]! : "Imported";
+}
+
+function groupRootFor(source: string, grouping: NotionGrouping) {
   const segments = source.split("/");
   const relative = notionRelativeSegments(source);
-  const group = groupKeyFor(source);
-  if (group === "Imported") return segments.slice(0, segments.length - relative.length).join("/");
+  if (!grouping.teamspace) {
+    const wrapperLength = /^Export-/i.test(relative[0] ?? "") ? 1 : 0;
+    return segments.slice(0, segments.length - relative.length + wrapperLength).join("/");
+  }
   const groupIndex = segments.length - relative.length + 1;
   return segments.slice(0, groupIndex + 1).join("/");
 }
@@ -322,16 +340,8 @@ function markdownHrefs(source: string) {
   return [...source.matchAll(/\]\(([^)]+)\)/g)].map((match) => match[1]!);
 }
 
-function directoryOwners(entries: ZipEntry[]) {
-  const pages = entries.map((entry) => ({
-    entry,
-    directory: parentPath(entry.path),
-    rawStem: stem(entry.path),
-    title: stripNotionId(stem(entry.path)),
-    notionId: notionId(stem(entry.path)),
-    text: new TextDecoder().decode(entry.bytes),
-  }));
-  const byPath = new Map(pages.map((page) => [page.entry.path, page]));
+function directoryOwners(pages: NotionPageEntry[]) {
+  const byPath = new Map(pages.map((page) => [page.path, page]));
   const directories = new Set<string>();
   for (const page of pages) {
     let directory = page.directory;
@@ -342,24 +352,27 @@ function directoryOwners(entries: ZipEntry[]) {
   }
   const claimed = new Set<string>();
   const owners = new Map<string, string>();
-  const ordered = [...directories].sort((left, right) => {
-    const leftPartial = / [\da-f]{4}-[\da-f]{4}$/i.test(left) ? 0 : 1;
-    const rightPartial = / [\da-f]{4}-[\da-f]{4}$/i.test(right) ? 0 : 1;
-    return leftPartial - rightPartial || left.localeCompare(right);
-  });
-  for (const directory of ordered) {
+  for (const directory of [...directories].sort()) {
     for (const suffix of [".html", ".htm", ".md", ".markdown"]) {
       const exact = byPath.get(`${directory}${suffix}`);
-      if (exact && !claimed.has(exact.entry.path)) {
-        owners.set(directory, exact.entry.path);
-        claimed.add(exact.entry.path);
+      if (exact) {
+        owners.set(directory, exact.path);
+        claimed.add(exact.path);
         break;
       }
     }
-    if (owners.has(directory)) continue;
+  }
+  const ordered = [...directories]
+    .filter((directory) => !owners.has(directory))
+    .sort((left, right) => {
+      const leftPartial = / [\da-f]{4}-[\da-f]{4}$/i.test(left) ? 0 : 1;
+      const rightPartial = / [\da-f]{4}-[\da-f]{4}$/i.test(right) ? 0 : 1;
+      return leftPartial - rightPartial || left.localeCompare(right);
+    });
+  for (const directory of ordered) {
     const directoryParent = parentPath(directory);
     const name = directory.split("/").at(-1) ?? directory;
-    const siblings = pages.filter((page) => page.directory === directoryParent && !claimed.has(page.entry.path));
+    const siblings = pages.filter((page) => page.directory === directoryParent && !claimed.has(page.path));
     const partial = / ([\da-f]{4})-([\da-f]{4})$/i.exec(name);
     if (partial) {
       const matches = siblings.filter(
@@ -367,35 +380,35 @@ function directoryOwners(entries: ZipEntry[]) {
           page.notionId?.startsWith(partial[1]!.toLowerCase()) && page.notionId.endsWith(partial[2]!.toLowerCase()),
       );
       if (matches.length === 1) {
-        owners.set(directory, matches[0]!.entry.path);
-        claimed.add(matches[0]!.entry.path);
+        owners.set(directory, matches[0]!.path);
+        claimed.add(matches[0]!.path);
         continue;
       }
     }
     const titled = siblings.filter((page) => page.title === stripNotionId(name));
     if (titled.length === 1) {
-      owners.set(directory, titled[0]!.entry.path);
-      claimed.add(titled[0]!.entry.path);
+      owners.set(directory, titled[0]!.path);
+      claimed.add(titled[0]!.path);
       continue;
     }
     if (titled.length > 1) {
       const linked = titled.filter((page) =>
         markdownHrefs(page.text).some((href) => {
-          const target = normalizedRelativePath(page.entry.path, href);
+          const target = normalizedRelativePath(page.path, href);
           return target === directory || target?.startsWith(`${directory}/`);
         }),
       );
       if (linked.length === 1) {
-        owners.set(directory, linked[0]!.entry.path);
-        claimed.add(linked[0]!.entry.path);
+        owners.set(directory, linked[0]!.path);
+        claimed.add(linked[0]!.path);
       }
     }
   }
   return { owners, directories };
 }
 
-function ownerFor(source: string, owners: ReadonlyMap<string, string>) {
-  const groupRoot = groupRootFor(source);
+function ownerFor(source: string, owners: ReadonlyMap<string, string>, grouping: NotionGrouping) {
+  const groupRoot = groupRootFor(source, grouping);
   let directory = parentPath(source);
   while (directory && directory !== groupRoot) {
     const owner = owners.get(directory);
@@ -408,17 +421,29 @@ function ownerFor(source: string, owners: ReadonlyMap<string, string>) {
 async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Array): Promise<ImportBundle> {
   const entries = await nestedEntries(bytes);
   const byPath = new Map(entries.map((entry) => [entry.path, entry]));
-  const pageEntries = entries.filter((entry) => {
-    const ext = extension(entry.path);
-    const parent = parentPath(entry.path);
-    // Nested Part-N.zip entries are prefixed by their archive, so "root" means the top
-    // level of whichever archive the entry came out of.
-    const atArchiveRoot = parent === "" || /\.zip$/i.test(parent);
-    return (
-      [".html", ".htm", ".md", ".markdown"].includes(ext) &&
-      !(atArchiveRoot && /^index\.html?$/i.test(entry.path.split("/").at(-1) ?? ""))
-    );
-  });
+  const pageEntries = entries
+    .filter((entry) => {
+      const ext = extension(entry.path);
+      const parent = parentPath(entry.path);
+      // Nested Part-N.zip entries are prefixed by their archive, so "root" means the top
+      // level of whichever archive the entry came out of.
+      const atArchiveRoot = parent === "" || /\.zip$/i.test(parent);
+      return (
+        [".html", ".htm", ".md", ".markdown"].includes(ext) &&
+        !(atArchiveRoot && /^index\.html?$/i.test(entry.path.split("/").at(-1) ?? ""))
+      );
+    })
+    .map<NotionPageEntry>((entry) => {
+      const rawStem = stem(entry.path);
+      return {
+        ...entry,
+        text: new TextDecoder().decode(entry.bytes),
+        directory: parentPath(entry.path),
+        rawStem,
+        title: stripNotionId(rawStem),
+        notionId: notionId(rawStem),
+      };
+    });
   // Notion writes both a view CSV and an `_all` CSV per database; the latter ignores view filters.
   const csvByDatabase = new Map<string, (typeof entries)[number]>();
   for (const entry of entries) {
@@ -436,6 +461,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   for (const entry of pageEntries) pageIds.set(entry.path, await stableId(job.id, "page", entry.path));
   const fallbackSpaceId = job.space_id;
   if (!fallbackSpaceId) throw new Error("The import destination space is missing.");
+  const grouping = groupingFor([...pageEntries.map((entry) => entry.path), ...csvEntries.map((entry) => entry.path)]);
   const { owners, directories } = directoryOwners(pageEntries);
   const archiveOrder = new Map(entries.map((entry, index) => [entry.path, index]));
   const matchedCsv = new Set<string>();
@@ -443,11 +469,11 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   const issues: ImportIssue[] = [];
   const pages: ImportPage[] = [];
   for (const entry of pageEntries) {
-    const rawStem = stem(entry.path);
+    const rawStem = entry.rawStem;
     const csv = csvByDatabase.get(`${parentPath(entry.path)}/${rawStem}`);
-    const parentSource = ownerFor(entry.path, owners);
-    const groupKey = groupKeyFor(entry.path);
-    const sourceText = new TextDecoder().decode(entry.bytes);
+    const parentSource = ownerFor(entry.path, owners, grouping);
+    const groupKey = groupKeyFor(entry.path, grouping);
+    const sourceText = entry.text;
     const html = extension(entry.path).startsWith(".htm") ? htmlToDocument(sourceText) : null;
     const parsed = html ?? markdownToDocument(sourceText);
     issues.push(...parsed.issues);
@@ -460,7 +486,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
       parentSource,
       spaceId: options.groupSpaceIds?.[groupKey] ?? fallbackSpaceId,
       groupKey,
-      notionId: notionId(rawStem),
+      notionId: entry.notionId,
       sourceRole: "page",
       tableRowId: null,
       order: archiveOrder.get(entry.path) ?? Number.MAX_SAFE_INTEGER,
@@ -475,8 +501,8 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   for (const entry of csvEntries.filter((candidate) => !matchedCsv.has(candidate.path))) {
     const id = await stableId(job.id, "page", entry.path);
     pageIds.set(entry.path, id);
-    const parentSource = ownerFor(entry.path, owners);
-    const groupKey = groupKeyFor(entry.path);
+    const parentSource = ownerFor(entry.path, owners, grouping);
+    const groupKey = groupKeyFor(entry.path, grouping);
     pages.push({
       source: entry.path,
       id,
@@ -540,19 +566,17 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     }
     return value;
   };
-  const siblingTitles = new Map<string, number>();
-  for (const page of pages) {
-    const key = `${page.spaceId}:${page.parentId ?? "root"}:${page.title.toLocaleLowerCase()}`;
-    siblingTitles.set(key, (siblingTitles.get(key) ?? 0) + 1);
-  }
-  const unresolvedParents = pages.filter((page) => {
+  const unresolved = pages.filter((page) => {
     if (page.parentSource) return !page.parentId;
     const directory = parentPath(page.source);
-    return directory !== groupRootFor(page.source) && directories.has(directory) && !/\/[\da-f]{32}$/i.test(directory);
-  }).length;
-  const blockingIssues = unresolvedParents
-    ? [`${unresolvedParents} parent folder mappings could not be resolved.`]
-    : [];
+    return (
+      directory !== groupRootFor(page.source, grouping) &&
+      directories.has(directory) &&
+      !/\/[\da-f]{32}$/i.test(directory)
+    );
+  });
+  for (const page of unresolved) issues.push({ code: "unresolved_parent", detail: page.source });
+  const unresolvedParents = unresolved.length;
   const groups = [...new Set(pages.map((page) => page.groupKey))].map((key) => ({
     key,
     name: stripNotionId(key),
@@ -571,11 +595,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     maxDepth: Math.max(0, ...pages.map(depth)),
     resolvedLinks: linkStats.resolved,
     unresolvedLinks: linkStats.unresolved,
-    duplicateTitles: [...siblingTitles.values()]
-      .filter((count) => count > 1)
-      .reduce((total, count) => total + count, 0),
     unresolvedParents,
-    blockingIssues,
     groups,
     warnings: issueMessages(issues),
   };
@@ -622,9 +642,7 @@ async function singlePageBundle(job: JobRow, options: ImportOptions, bytes: Uint
     maxDepth: 0,
     resolvedLinks: linkStats.resolved,
     unresolvedLinks: linkStats.unresolved,
-    duplicateTitles: 0,
     unresolvedParents: 0,
-    blockingIssues: [],
     groups: [{ key: "Imported", name: "Imported", pages: 1, roots: 1, suggestedVisibility: "workspace" }],
     warnings: issueMessages(issues),
   };
@@ -1067,7 +1085,11 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
       console.error("Failed to broadcast a published import", { jobId: job.id, type: event.type, error });
     }
   };
-  await broadcast({ type: "pages-upserted", pages: published.results.map(pageJson) });
+  const hiddenPageIds = new Set(
+    bundle.pages.filter((page) => page.sourceRole === "table_row_detail").map((page) => page.id),
+  );
+  const sidebarPages = published.results.filter((page) => !hiddenPageIds.has(page.id));
+  if (sidebarPages.length) await broadcast({ type: "pages-upserted", pages: sidebarPages.map(pageJson) });
   await broadcast({ type: "jobs-invalidated" });
 }
 
@@ -1175,12 +1197,15 @@ export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, 
       .filter((page) => page.tableRowId)
       .map((page) => ({ rowId: page.tableRowId, pageId: page.id }));
     if (rowDetails.length) {
-      await env.DB.prepare(
+      await assertImportActive(env, job);
+      const linked = await env.DB.prepare(
         `INSERT OR REPLACE INTO table_row_pages (row_id, page_id, created_at)
-         SELECT json_extract(value, '$.rowId'), json_extract(value, '$.pageId'), ? FROM json_each(?)`,
+         SELECT json_extract(value, '$.rowId'), json_extract(value, '$.pageId'), ? FROM json_each(?)
+          WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
       )
-        .bind(Date.now(), JSON.stringify(rowDetails))
+        .bind(Date.now(), JSON.stringify(rowDetails), job.id, job.attempt)
         .run();
+      if (linked.meta.changes !== rowDetails.length) throw new Error("Job is not active.");
     }
   });
   await step.do("verify imported content", async () => {

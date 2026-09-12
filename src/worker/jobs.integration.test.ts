@@ -229,6 +229,147 @@ describe("job execution", () => {
     expect(retry.status).toBe(409);
   });
 
+  it("revalidates current authorization before mutating retry attempts", async () => {
+    const installed = await bootstrap();
+    const privateResponse = await worker.fetch(
+      request(installed.cookie, "/api/spaces", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "Retry private", visibility: "private" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const privateSpace = (await privateResponse.json<{ space: { id: string } }>()).space;
+    const privatePageId = crypto.randomUUID();
+    const backupOwnerId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const jobIds = {
+      import: crypto.randomUUID(),
+      template: crypto.randomUUID(),
+      export: crypto.randomUUID(),
+      search: crypto.randomUUID(),
+      comments: crypto.randomUUID(),
+    };
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         VALUES (?, 'Backup owner', ?, 1, ?, ?)`,
+      ).bind(backupOwnerId, `backup-${backupOwnerId}@example.test`, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)`,
+      ).bind(installed.workspaceId, backupOwnerId, timestamp),
+      env.DB.prepare(
+        `INSERT INTO pages
+          (id, workspace_id, space_id, parent_id, kind, position, title, is_template,
+           created_by, created_at, updated_at)
+         VALUES (?, ?, ?, NULL, 'document', 'z-retry-private', 'Private retry source', 1, ?, ?, ?)`,
+      ).bind(privatePageId, installed.workspaceId, privateSpace.id, installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, space_id, type, status, requested_by, options_json, created_at, updated_at)
+         VALUES (?, ?, ?, 'import', 'failed', ?, ?, ?, ?)`,
+      ).bind(
+        jobIds.import,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        JSON.stringify({
+          filename: "retry.zip",
+          format: "notion_zip",
+          confirmed: true,
+          groupSpaceIds: { Private: privateSpace.id },
+        }),
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, space_id, type, status, requested_by, options_json, created_at, updated_at)
+         VALUES (?, ?, ?, 'template_clone', 'failed', ?, ?, ?, ?)`,
+      ).bind(
+        jobIds.template,
+        installed.workspaceId,
+        privateSpace.id,
+        installed.userId,
+        JSON.stringify({
+          sourcePageId: privatePageId,
+          targetPageId: crypto.randomUUID(),
+          targetSpaceId: privateSpace.id,
+          parentId: null,
+          title: "Retry clone",
+          isTemplate: false,
+        }),
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO jobs
+          (id, workspace_id, space_id, type, status, requested_by, options_json, created_at, updated_at)
+         VALUES (?, ?, ?, 'export', 'failed', ?, ?, ?, ?)`,
+      ).bind(
+        jobIds.export,
+        installed.workspaceId,
+        privateSpace.id,
+        installed.userId,
+        JSON.stringify({ pageId: privatePageId, format: "markdown" }),
+        timestamp,
+        timestamp,
+      ),
+      ...([jobIds.search, jobIds.comments] as const).map((jobId, index) =>
+        env.DB.prepare(
+          `INSERT INTO jobs
+            (id, workspace_id, type, status, requested_by, options_json, created_at, updated_at)
+           VALUES (?, ?, ?, 'failed', ?, '{}', ?, ?)`,
+        ).bind(
+          jobId,
+          installed.workspaceId,
+          index === 0 ? "search_reindex" : "comment_migration",
+          installed.userId,
+          timestamp,
+          timestamp,
+        ),
+      ),
+      env.DB.prepare(`UPDATE workspace_members SET role = 'editor' WHERE workspace_id = ? AND user_id = ?`).bind(
+        installed.workspaceId,
+        installed.userId,
+      ),
+    ]);
+
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create: vi.fn(async ({ id }: { id?: string }) => ({ id })) } });
+    for (const jobId of Object.values(jobIds)) {
+      const response = await worker.fetch(
+        request(installed.cookie, `/api/jobs/${jobId}/retry`, { method: "POST" }),
+        bindings,
+        createExecutionContext(),
+      );
+      expect(response.status).toBe([jobIds.search, jobIds.comments].includes(jobId) ? 403 : 404);
+      expect(await env.DB.prepare(`SELECT status, attempt FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual({
+        status: "failed",
+        attempt: 1,
+      });
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO space_members (space_id, user_id, role, created_by, created_at)
+       VALUES (?, ?, 'editor', ?, ?)`,
+    )
+      .bind(privateSpace.id, installed.userId, backupOwnerId, timestamp)
+      .run();
+    const retryContext = createExecutionContext();
+    const authorized = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobIds.import}/retry`, { method: "POST" }),
+      bindings,
+      retryContext,
+    );
+    expect(authorized.status).toBe(202);
+    expect((await authorized.json<{ job: Job }>()).job.status).toBe("queued");
+    expect(await env.DB.prepare(`SELECT attempt FROM jobs WHERE id = ?`).bind(jobIds.import).first()).toEqual({
+      attempt: 2,
+    });
+    await waitOnExecutionContext(retryContext);
+  });
+
   it("recovers an interrupted cancellation before making the job retryable", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
@@ -1897,6 +2038,119 @@ describe("job execution", () => {
     ).toMatchObject({ name: "photo.png" });
   });
 
+  it("keeps standard wrapped exports nested, reserves exact owners, and warns on unresolved folders", async () => {
+    const installed = await bootstrap();
+    const encoder = new TextEncoder();
+    const exactId = "11110000000000000000000000002222";
+    const zip = createZip([
+      {
+        path: `Export-demo/Exact ${exactId}.md`,
+        bytes: encoder.encode("# Exact\n\nParent body\n"),
+      },
+      {
+        path: `Export-demo/Exact ${exactId}/Exact child aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md`,
+        bytes: encoder.encode("# Exact child\n"),
+      },
+      {
+        path: "Export-demo/Other 1111-2222/Fuzzy child bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md",
+        bytes: encoder.encode("# Fuzzy child\n"),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "wrapped.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const inspected = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job;
+    expect(inspected.result?.preview).toMatchObject({ roots: 2, nested: 1, unresolvedParents: 1 });
+    expect(inspected.result?.preview?.groups?.map((group) => group.key)).toEqual(["Imported"]);
+    expect(inspected.warnings).toContain("unresolved parent: 1");
+
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+
+    const tree = await (
+      await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext())
+    ).json<{ pages: Array<{ id: string; title: string; parentId: string | null }> }>();
+    const exact = tree.pages.find((page) => page.title === "Exact")!;
+    expect(tree.pages.find((page) => page.title === "Exact child")?.parentId).toBe(exact.id);
+    expect(tree.pages.find((page) => page.title === "Fuzzy child")?.parentId).toBeNull();
+  });
+
+  it("confirms a legacy preview with an empty JSON-typed body and rejects malformed nonempty JSON", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const inputKey = `jobs/${jobId}/input/legacy.md`;
+    const timestamp = Date.now();
+    await env.BUCKET.put(inputKey, "# Legacy import\n");
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, space_id, type, status, requested_by, input_key, options_json, result_json,
+         created_at, updated_at)
+       VALUES (?, ?, ?, 'import', 'awaiting_confirmation', ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        inputKey,
+        JSON.stringify({ filename: "legacy.md", format: "markdown", confirmed: false }),
+        JSON.stringify({
+          warnings: [],
+          preview: { format: "markdown", filename: "legacy.md", pages: 1, tables: 0, assets: 0, warnings: [] },
+        }),
+        timestamp,
+        timestamp,
+      )
+      .run();
+
+    const malformed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{",
+      }),
+      env,
+      createExecutionContext(),
+    );
+    expect(malformed.status).toBe(400);
+
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+    expect(await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual({
+      status: "succeeded",
+    });
+  });
+
   it("maps Notion groups to spaces and links row detail pages without duplicating them in the tree", async () => {
     const installed = await bootstrap();
     const privateResponse = await worker.fetch(
@@ -1909,6 +2163,18 @@ describe("job execution", () => {
       createExecutionContext(),
     );
     const privateSpace = (await privateResponse.json<{ space: { id: string } }>()).space;
+    const broadcasts: Array<{ type?: string; pages?: Array<{ title: string }> }> = [];
+    const bindings = bindingsWith({
+      WORKFLOW_INLINE: "true",
+      WORKSPACE_EVENTS: {
+        getByName: () => ({
+          fetch: async (eventRequest: Request) => {
+            broadcasts.push(await eventRequest.json());
+            return new Response(null, { status: 204 });
+          },
+        }),
+      },
+    });
     const encoder = new TextEncoder();
     const tableId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const zip = createZip([
@@ -1935,7 +2201,7 @@ describe("job execution", () => {
     const uploadContext = createExecutionContext();
     const uploaded = await worker.fetch(
       request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
-      inlineBindings(),
+      bindings,
       uploadContext,
     );
     const jobId = (await uploaded.json<{ job: Job }>()).job.id;
@@ -1946,7 +2212,24 @@ describe("job execution", () => {
       ).json<{ job: Job }>()
     ).job.result!.preview!;
     expect(preview).toMatchObject({ pages: 3, tables: 1, roots: 2, nested: 1, unresolvedParents: 0 });
-    expect(preview.groups.map((group) => group.name)).toEqual(["SparkedAI HQ", "Private & Shared"]);
+    expect(preview.groups?.map((group) => group.name)).toEqual(["SparkedAI HQ", "Private & Shared"]);
+
+    const missingMappings = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      bindings,
+      createExecutionContext(),
+    );
+    expect(missingMappings.status).toBe(422);
+    const partialMappings = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ groupSpaceIds: { "SparkedAI HQ": `${installed.workspaceId}-general` } }),
+      }),
+      bindings,
+      createExecutionContext(),
+    );
+    expect(partialMappings.status).toBe(422);
 
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
@@ -1960,7 +2243,7 @@ describe("job execution", () => {
           },
         }),
       }),
-      inlineBindings(),
+      bindings,
       confirmContext,
     );
     expect(confirmed.status).toBe(202);
@@ -1977,11 +2260,23 @@ describe("job execution", () => {
       await worker.fetch(request(installed.cookie, `/api/tables/${tablePage.id}`), env, createExecutionContext())
     ).json<{ table: { rows: Array<{ detailPageId: string | null }> } }>();
     expect(table.table.rows[0]?.detailPageId).toEqual(expect.any(String));
+    const detail = await worker.fetch(
+      request(installed.cookie, `/api/pages/${table.table.rows[0]!.detailPageId}`),
+      env,
+      createExecutionContext(),
+    );
+    expect(detail.status).toBe(200);
+    await expect(detail.json()).resolves.toMatchObject({ page: { title: "Ship" }, sidebarHidden: true });
     expect(
       await env.DB.prepare(`SELECT source_role FROM page_import_sources WHERE page_id = ?`)
         .bind(table.table.rows[0]!.detailPageId)
         .first(),
     ).toMatchObject({ source_role: "table_row_detail" });
+    const pageBroadcast = broadcasts.find((event) => event.type === "pages-upserted");
+    expect(pageBroadcast?.pages?.map((page) => page.title)).toEqual(
+      expect.arrayContaining(["Tech Tasks", "Personal Home"]),
+    );
+    expect(pageBroadcast?.pages?.map((page) => page.title)).not.toContain("Ship");
   });
 
   it("re-fences staged pages and attachments that survive into an import retry", async () => {
@@ -2050,6 +2345,92 @@ describe("job execution", () => {
     expect(published?.r2_key).toContain("/attempts/2/");
     expect(await env.BUCKET.get(surviving.r2_key)).toBeNull();
     expect(await env.BUCKET.get(published!.r2_key)).toBeTruthy();
+  });
+
+  it("does not write row-detail mappings after the import attempt is replaced", async () => {
+    const installed = await bootstrap();
+    const tableId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const zip = createZip([
+      {
+        path: `Tasks ${tableId}.md`,
+        bytes: new TextEncoder().encode("# Tasks\n\nDatabase overview\n"),
+      },
+      {
+        path: `Tasks ${tableId}_all.csv`,
+        bytes: new TextEncoder().encode("Task,Done\nShip,yes\n"),
+      },
+      {
+        path: "Tasks aaaa-aaaa/Ship bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md",
+        bytes: new TextEncoder().encode("# Ship\n\nRow details\n"),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "row-fence.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const awaiting = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+    await env.DB.prepare(`UPDATE jobs SET status = 'running', options_json = ? WHERE id = ?`)
+      .bind(JSON.stringify({ ...JSON.parse(awaiting.options_json), confirmed: true }), jobId)
+      .run();
+    const running = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+    let replaced = false;
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare") {
+          return (query: string) => {
+            const statement = target.prepare(query);
+            if (!query.includes("INSERT OR REPLACE INTO table_row_pages")) return statement;
+            return new Proxy(statement, {
+              get(statementTarget, statementProperty) {
+                if (statementProperty === "bind") {
+                  return (...values: unknown[]) => {
+                    const bound = statementTarget.bind(...values);
+                    return new Proxy(bound, {
+                      get(boundTarget, boundProperty) {
+                        if (boundProperty === "run") {
+                          return async () => {
+                            if (!replaced) {
+                              replaced = true;
+                              await env.DB.prepare(`UPDATE jobs SET attempt = attempt + 1 WHERE id = ?`)
+                                .bind(jobId)
+                                .run();
+                            }
+                            return boundTarget.run();
+                          };
+                        }
+                        const value: unknown = Reflect.get(boundTarget, boundProperty, boundTarget);
+                        return typeof value === "function" ? value.bind(boundTarget) : value;
+                      },
+                    });
+                  };
+                }
+                const value: unknown = Reflect.get(statementTarget, statementProperty, statementTarget);
+                return typeof value === "function" ? value.bind(statementTarget) : value;
+              },
+            });
+          };
+        }
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    await expect(
+      runImport(bindingsWith({ DB: database }), running, {
+        async do<T>(_name: string, callback: () => Promise<T>) {
+          return callback();
+        },
+      } as Parameters<typeof runImport>[2]),
+    ).rejects.toThrow("Job is not active.");
+    expect(replaced).toBe(true);
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM table_row_pages`).first()).toEqual({ count: 0 });
   });
 });
 

@@ -200,6 +200,38 @@ describe("TablePage", () => {
     });
   });
 
+  it("keeps the read-only row-actions column aligned when only some rows have detail pages", async () => {
+    const onSelectPage = vi.fn();
+    vi.mocked(api).mockResolvedValue({
+      table: {
+        ...table,
+        rows: [
+          { ...table.rows[0]!, detailPageId: "detail-page" },
+          { id: "row-without-detail", position: 1, cells: { status: "Waiting" }, detailPageId: null },
+        ],
+        rowCount: 2,
+      },
+    });
+    render(
+      <TablePage
+        page={page}
+        member={member("viewer")}
+        onPageChanged={vi.fn()}
+        onSelectPage={onSelectPage}
+        backlinksRevision={0}
+      />,
+    );
+
+    await screen.findByDisplayValue("Ready");
+    const renderedTable = screen.getByRole("table");
+    expect(renderedTable.querySelectorAll("thead th")).toHaveLength(2);
+    for (const row of renderedTable.querySelectorAll("tbody tr")) {
+      expect(row.querySelectorAll("td")).toHaveLength(2);
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Open row details" }));
+    expect(onSelectPage).toHaveBeenCalledWith("detail-page");
+  });
+
   it("uses the table-load fallback when a request times out", async () => {
     vi.mocked(api).mockRejectedValue(new DOMException("The operation timed out.", "TimeoutError"));
 
