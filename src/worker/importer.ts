@@ -9,7 +9,7 @@ import {
   type ImportedTable,
 } from "../shared/import-content";
 import { documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
-import { normalizeGroupSpaceIds } from "../shared/import-space-mapping";
+import { NOTION_GROUPING_VERSION, parseImportOptions, type ImportOptions } from "../shared/import-space-mapping";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import { projectDocument } from "../shared/document-projection";
 import type { DocumentContentEnvelope, ImportPreview, ProseMirrorJson } from "../shared/types";
@@ -29,13 +29,6 @@ const MAX_NESTED_ZIP_DEPTH = 2;
 const MAX_EXPANDED_BYTES = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 5_000;
 
-type ImportOptions = {
-  filename: string;
-  format: ImportPreview["format"];
-  confirmed: boolean;
-  groupSpaceIds?: Record<string, string>;
-  previewGroupKeys?: string[];
-};
 type ImportAsset = { source: string; name: string; mime: string; bytes: Uint8Array };
 type ImportPage = {
   source: string;
@@ -75,28 +68,9 @@ function record(value: string) {
 }
 
 function importOptions(job: JobRow): ImportOptions {
-  const options = record(job.options_json);
-  if (
-    typeof options.filename !== "string" ||
-    !["markdown", "html", "notion_zip"].includes(String(options.format)) ||
-    typeof options.confirmed !== "boolean"
-  ) {
-    throw new Error("Import options are invalid.");
-  }
-  const groupSpaceIds = normalizeGroupSpaceIds(options.groupSpaceIds);
-  if (groupSpaceIds === null) {
-    throw new Error("Import space mappings are invalid.");
-  }
-  const previewGroupKeys = options.previewGroupKeys;
-  if (
-    previewGroupKeys !== undefined &&
-    (!Array.isArray(previewGroupKeys) ||
-      previewGroupKeys.some((key) => typeof key !== "string") ||
-      new Set(previewGroupKeys).size !== previewGroupKeys.length)
-  ) {
-    throw new Error("Import preview groups are invalid.");
-  }
-  return { ...options, groupSpaceIds, previewGroupKeys } as ImportOptions;
+  const options = parseImportOptions(record(job.options_json));
+  if (!options) throw new Error("Import options are invalid.");
+  return options;
 }
 
 function extension(path: string) {
@@ -447,6 +421,19 @@ function markdownHrefs(source: string) {
 
 function directoryOwners(pages: NotionPageEntry[]) {
   const byPath = new Map(pages.map((page) => [page.path, page]));
+  const byDirectory = new Map<string, NotionPageEntry[]>();
+  const links = new Map<string, (string | null)[]>();
+  for (const page of pages) {
+    const siblings = byDirectory.get(page.directory) ?? [];
+    siblings.push(page);
+    byDirectory.set(page.directory, siblings);
+    links.set(
+      page.path,
+      markdownHrefs(page.text).map((href) => normalizedRelativePath(page.path, href)),
+    );
+  }
+  const linksInto = (page: NotionPageEntry, directory: string) =>
+    links.get(page.path)!.some((target) => target === directory || target?.startsWith(`${directory}/`));
   const directories = new Set<string>();
   for (const page of pages) {
     let directory = page.directory;
@@ -470,7 +457,7 @@ function directoryOwners(pages: NotionPageEntry[]) {
   const ordered = [...directories].filter((directory) => !owners.has(directory)).sort();
   const siblingsFor = (directory: string) => {
     const directoryParent = parentPath(directory);
-    return pages.filter((page) => page.directory === directoryParent && !claimed.has(page.path));
+    return (byDirectory.get(directoryParent) ?? []).filter((page) => !claimed.has(page.path));
   };
   const claim = (directory: string, page: NotionPageEntry) => {
     owners.set(directory, page.path);
@@ -494,51 +481,43 @@ function directoryOwners(pages: NotionPageEntry[]) {
     );
     if (matches.length === 1) claim(directory, matches[0]!);
   }
-  const candidates = new Map<string, NotionPageEntry[]>();
+  // Literal titles are stronger than a guessed shortened-ID suffix, even when
+  // the page also links into another folder. Resolve them before that fallback.
+  const literalCandidates = new Map<string, NotionPageEntry[]>();
   for (const directory of ordered) {
     if (owners.has(directory)) continue;
-    const name = stripNotionId(directory.split("/").at(-1) ?? directory);
-    const siblings = siblingsFor(directory);
-    const literal = siblings.filter((page) => page.title === name);
-    // A suffix such as "2024-2025" can be a real title. Only strip it as a fallback.
-    candidates.set(
+    const name = directory.split("/").at(-1)!;
+    // A full ID is authoritative: an unmatched one must never fall back to a title.
+    if (notionId(name)) continue;
+    literalCandidates.set(
       directory,
-      literal.length
-        ? literal
-        : siblings.filter((page) => page.title === name.replace(/ [\da-f]{4}-[\da-f]{4}$/i, "").trim()),
+      siblingsFor(directory).filter((page) => page.title === name),
     );
   }
+  for (const [directory, matches] of literalCandidates) {
+    const linked = matches.filter((page) => linksInto(page, directory));
+    const page = matches.length === 1 ? matches[0] : linked.length === 1 ? linked[0] : undefined;
+    if (page && !claimed.has(page.path)) claim(directory, page);
+  }
+  const candidates = new Map<string, NotionPageEntry[]>();
   const linkedFolders = new Map<string, string[]>();
-  for (const [directory, matches] of candidates) {
+  for (const directory of ordered) {
+    if (owners.has(directory) || literalCandidates.get(directory)?.length) continue;
+    const name = directory.split("/").at(-1)!;
+    if (notionId(name) || !/ [\da-f]{4}-[\da-f]{4}$/i.test(name)) continue;
+    const title = name.replace(/ [\da-f]{4}-[\da-f]{4}$/i, "").trim();
+    // Dates and ordinary titles can resemble shortened IDs. Require a link
+    // into the folder when no actual identity or literal title matched.
+    const matches = siblingsFor(directory).filter((page) => page.title === title && linksInto(page, directory));
+    candidates.set(directory, matches);
     for (const page of matches) {
-      if (
-        !markdownHrefs(page.text).some((href) => {
-          const target = normalizedRelativePath(page.path, href);
-          return target === directory || target?.startsWith(`${directory}/`);
-        })
-      )
-        continue;
-      const linked = linkedFolders.get(page.path) ?? [];
-      linked.push(directory);
-      linkedFolders.set(page.path, linked);
+      const folders = linkedFolders.get(page.path) ?? [];
+      folders.push(directory);
+      linkedFolders.set(page.path, folders);
     }
   }
-  // Apply unique link evidence across all folders before any remaining title-only claims.
   for (const [directory, matches] of candidates) {
-    const linked = matches.filter((page) => linkedFolders.get(page.path)?.includes(directory));
-    if (linked.length === 1 && linkedFolders.get(linked[0]!.path)?.length === 1) claim(directory, linked[0]!);
-  }
-  for (const [directory, matches] of candidates) {
-    if (owners.has(directory)) continue;
-    const available = matches.filter((page) => !claimed.has(page.path));
-    if (available.length !== 1) continue;
-    const page = available[0]!;
-    if (linkedFolders.has(page.path)) continue;
-    const competing = [...candidates].some(
-      ([other, otherCandidates]) =>
-        other !== directory && !owners.has(other) && otherCandidates.some((candidate) => candidate.path === page.path),
-    );
-    if (!competing) claim(directory, page);
+    if (matches.length === 1 && linkedFolders.get(matches[0]!.path)?.length === 1) claim(directory, matches[0]!);
   }
   return { owners, directories };
 }
@@ -742,6 +721,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   }));
   const preview: ImportPreview = {
     format: "notion_zip",
+    groupingVersion: NOTION_GROUPING_VERSION,
     filename: options.filename,
     pages: pages.length,
     tables: pages.filter((page) => page.kind === "table").length,
@@ -808,6 +788,20 @@ async function loadBundle(env: Env, job: JobRow, options: ImportOptions) {
   if (!object) throw new Error("The import upload is missing.");
   const bytes = new Uint8Array(await object.arrayBuffer());
   return options.format === "notion_zip" ? notionBundle(job, options, bytes) : singlePageBundle(job, options, bytes);
+}
+
+// Old previews may have used different folder ownership and group allocation.
+// Check against the upload before changing a confirmed job's state or attempt.
+export async function validateImportPreview(env: Env, job: JobRow, options: ImportOptions) {
+  const previewGroupKeys =
+    options.previewGroupKeys ?? (options.groupSpaceIds ? Object.keys(options.groupSpaceIds) : undefined);
+  if (!previewGroupKeys) return;
+  if (
+    options.previewGroupKeys &&
+    (options.format !== "notion_zip" || options.previewGroupingVersion === NOTION_GROUPING_VERSION)
+  )
+    return;
+  await loadBundle(env, job, { ...options, previewGroupKeys });
 }
 
 async function assertImportActive(env: Env, job: Pick<JobRow, "id" | "attempt">) {

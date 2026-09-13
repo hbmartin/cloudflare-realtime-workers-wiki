@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
 import type { DiagramContentEnvelope, Job, Page } from "../shared/types";
+import { NOTION_GROUPING_VERSION } from "../shared/import-space-mapping";
 import { createZip, readZip } from "../shared/zip";
 import type { Env } from "./env";
 import { runImport } from "./importer";
@@ -279,6 +280,8 @@ describe("job execution", () => {
           format: "notion_zip",
           confirmed: true,
           groupSpaceIds: { Private: privateSpace.id },
+          previewGroupKeys: ["Private"],
+          previewGroupingVersion: NOTION_GROUPING_VERSION,
         }),
         timestamp,
         timestamp,
@@ -460,6 +463,8 @@ describe("job execution", () => {
       options: { confirmed: true, previewGroupKeys: ["A", "A"], groupSpaceIds: { A: "upload" } },
       destination: true,
     },
+    { label: "missing confirmation state", options: {}, destination: true },
+    { label: "invalid confirmation state", options: { confirmed: "yes" }, destination: true },
   ])("rejects import retry with $label before changing the attempt", async ({ options, destination }) => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
@@ -2282,8 +2287,8 @@ describe("job execution", () => {
   it.each([
     ["aaaa-bbbb", "Renamed"],
     ["aaaa000000000000000000000000bbbb", "Renamed"],
-    ["ffff-eeee", "Old"],
-  ])("resolves folder ID %s to %s before falling back to its title", async (folderId, parentTitle) => {
+    ["ffff-eeee", null],
+  ])("resolves folder ID %s to %s without guessing unmatched identities", async (folderId, parentTitle) => {
     const installed = await bootstrap();
     const encoder = new TextEncoder();
     const zip = createZip([
@@ -2323,8 +2328,8 @@ describe("job execution", () => {
     const tree = await (
       await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext())
     ).json<{ pages: Page[] }>();
-    const parent = tree.pages.find((page) => page.title === parentTitle)!;
-    expect(tree.pages.find((page) => page.title === "Child")?.parentId).toBe(parent.id);
+    const parent = parentTitle ? tree.pages.find((page) => page.title === parentTitle) : null;
+    expect(tree.pages.find((page) => page.title === "Child")?.parentId).toBe(parent?.id ?? null);
   });
 
   it.each([
@@ -2362,6 +2367,60 @@ describe("job execution", () => {
       parents: [
         ["First child", null],
         ["Second child", null],
+      ],
+    },
+    ...[false, true].map((links) => ({
+      label: `literal folder before suffix guesses (links into both: ${links})`,
+      files: [
+        [
+          "Budget aaaa000000000000000000000000bbbb.md",
+          links ? "# Budget\n[one](Budget/Child%201.md) [two](Budget%202024-2025/Child%202.md)" : "# Budget",
+        ],
+        ["Budget/Child 1.md", "# Child 1"],
+        ["Budget 2024-2025/Child 2.md", "# Child 2"],
+      ],
+      parents: [
+        ["Child 1", "Budget"],
+        ["Child 2", null],
+      ],
+    })),
+    {
+      label: "date suffix without identity or links stays unassigned",
+      files: [
+        ["Budget aaaa000000000000000000000000bbbb.md", "# Budget"],
+        ["Budget 2024-2025/Child.md", "# Child"],
+      ],
+      parents: [["Child", null]],
+    },
+    {
+      label: "unmatched full IDs do not fall through to matching titles",
+      files: [
+        ["Budget aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md", "# Budget"],
+        ["Budget bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/Child.md", "# Child"],
+      ],
+      parents: [["Child", null]],
+    },
+    {
+      label: "unmatched bare IDs do not match through empty titles",
+      files: [
+        ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md", "# Unrelated"],
+        ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/Child.md", "# Child"],
+      ],
+      parents: [["Child", null]],
+    },
+    {
+      label: "two equally supported linked suffix folders stay unassigned",
+      files: [
+        [
+          "Budget aaaa000000000000000000000000bbbb.md",
+          "# Budget\n[one](Budget%201111-1111/Child%201.md) [two](Budget%202222-2222/Child%202.md)",
+        ],
+        ["Budget 1111-1111/Child 1.md", "# Child 1"],
+        ["Budget 2222-2222/Child 2.md", "# Child 2"],
+      ],
+      parents: [
+        ["Child 1", null],
+        ["Child 2", null],
       ],
     },
     ...["Budget 2024-2025", "Build cafe-babe"].map((title) => ({
@@ -2595,6 +2654,113 @@ describe("job execution", () => {
     await waitOnExecutionContext(confirmContext);
     expect(await env.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(jobId).first("status")).toBe("succeeded");
   });
+
+  it.each(["confirm", "retry"] as const)(
+    "rejects changed legacy ownership groups before %s changes the job",
+    async (action) => {
+      const installed = await bootstrap();
+      const spaceId = `${installed.workspaceId}-general`;
+      const zip = createZip([
+        { path: "Export-demo/Budget aaaa000000000000000000000000bbbb.md", bytes: new TextEncoder().encode("# Budget") },
+        { path: "Export-demo/Budget 2024-2025/Child.md", bytes: new TextEncoder().encode("# Child") },
+        { path: "Export-demo/Elsewhere/Other.md", bytes: new TextEncoder().encode("# Other") },
+      ]);
+      const upload = new FormData();
+      upload.set("spaceId", spaceId);
+      upload.set("file", new File([zip], "changed-groups.zip", { type: "application/zip" }));
+      const uploadContext = createExecutionContext();
+      const response = await worker.fetch(
+        request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+        inlineBindings(),
+        uploadContext,
+      );
+      const jobId = (await response.json<{ job: Job }>()).job.id;
+      await waitOnExecutionContext(uploadContext);
+      const job = (await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<JobRow>())!;
+      const result = JSON.parse(job.result_json);
+      expect(result.preview.groups.map((group: { key: string }) => group.key)).toEqual([
+        "Imported",
+        "Budget 2024-2025",
+        "Elsewhere",
+      ]);
+      // Before the ownership fix the date-suffixed folder was claimed by Budget,
+      // leaving only one inferred teamspace, so all pages belonged to Imported.
+      delete result.preview.groupingVersion;
+      result.preview.groups = [
+        { key: "Imported", name: "Imported", pages: 3, roots: 2, suggestedVisibility: "workspace" },
+      ];
+      const status = action === "confirm" ? "awaiting_confirmation" : "failed";
+      const options = {
+        ...JSON.parse(job.options_json),
+        confirmed: action === "retry",
+        ...(action === "retry" ? { previewGroupKeys: ["Imported"], groupSpaceIds: { Imported: spaceId } } : {}),
+      };
+      await env.DB.prepare("UPDATE jobs SET status = ?, options_json = ?, result_json = ? WHERE id = ?")
+        .bind(status, JSON.stringify(options), JSON.stringify(result), jobId)
+        .run();
+      const create = vi.fn(async ({ id }: { id?: string }) => ({ id }));
+      const context = createExecutionContext();
+      const attempted = await worker.fetch(
+        request(installed.cookie, action === "confirm" ? `/api/imports/${jobId}/confirm` : `/api/jobs/${jobId}/retry`, {
+          method: "POST",
+          ...(action === "confirm" ? { body: JSON.stringify({ groupSpaceIds: { Imported: spaceId } }) } : {}),
+        }),
+        bindingsWith({ NOTES_WORKFLOW: { create } }),
+        context,
+      );
+      expect(attempted.status).toBe(409);
+      expect(await attempted.json()).toMatchObject({ error: { code: "import_preview_outdated" } });
+      await waitOnExecutionContext(context);
+      expect(create).not.toHaveBeenCalled();
+      expect(await env.DB.prepare("SELECT status, attempt FROM jobs WHERE id = ?").bind(jobId).first()).toEqual({
+        status,
+        attempt: job.attempt,
+      });
+    },
+  );
+
+  it.each(["Imported", "Wrong group"])(
+    "validates legacy mappings without preview keys against the upload: %s",
+    async (groupKey) => {
+      const installed = await bootstrap();
+      const jobId = crypto.randomUUID();
+      const inputKey = `jobs/${jobId}/input/legacy.md`;
+      const spaceId = `${installed.workspaceId}-general`;
+      await env.BUCKET.put(inputKey, "# Legacy");
+      await env.DB.prepare(`INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, options_json, input_key, created_at, updated_at)
+      VALUES (?, ?, ?, 'import', 'failed', ?, ?, ?, ?, ?)`)
+        .bind(
+          jobId,
+          installed.workspaceId,
+          spaceId,
+          installed.userId,
+          JSON.stringify({
+            filename: "legacy.md",
+            format: "markdown",
+            confirmed: true,
+            groupSpaceIds: { [groupKey]: spaceId },
+          }),
+          inputKey,
+          Date.now(),
+          Date.now(),
+        )
+        .run();
+      const create = vi.fn(async ({ id }: { id?: string }) => ({ id }));
+      const context = createExecutionContext();
+      const response = await worker.fetch(
+        request(installed.cookie, `/api/jobs/${jobId}/retry`, { method: "POST" }),
+        bindingsWith({ NOTES_WORKFLOW: { create } }),
+        context,
+      );
+      await waitOnExecutionContext(context);
+      const valid = groupKey === "Imported";
+      expect(response.status).toBe(valid ? 202 : 409);
+      expect(create).toHaveBeenCalledTimes(valid ? 1 : 0);
+      expect(await env.DB.prepare("SELECT attempt FROM jobs WHERE id = ?").bind(jobId).first("attempt")).toBe(
+        valid ? 2 : 1,
+      );
+    },
+  );
 
   it("does not treat a real page whose title starts with Export- as an archive wrapper", async () => {
     const installed = await bootstrap();
