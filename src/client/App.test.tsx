@@ -3605,6 +3605,71 @@ describe("App error handling", () => {
     expect(pageLoads).toBe(2);
   });
 
+  it("loads an initial deep link directly when it is absent from the page tree", async () => {
+    const hiddenPage = { ...page, id: "initial-hidden-page", position: "c0", title: "Initial hidden detail" };
+    history.replaceState(null, "", `/?page=${hiddenPage.id}`);
+    mockShellApi({ pages: [page] });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${hiddenPage.id}`) return { page: hiddenPage, sidebarHidden: true };
+      return shellApi(path, init);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("Initial hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(api).toHaveBeenCalledWith(
+      `/api/pages/${hiddenPage.id}`,
+      expect.objectContaining({ signal: expect.anything() }),
+    );
+    expect(localStorage.getItem("notes:last-page")).toBe(hiddenPage.id);
+  });
+
+  it.each([
+    ["clears", false, "Roadmap"],
+    ["preserves", undefined, "Visibility detail"],
+  ])("%s a hidden-page marker when direct-load visibility is %s", async (_label, sidebarHidden, selectedTitle) => {
+    const hiddenPage = { ...page, id: "visibility-page", position: "c0", title: "Visibility detail" };
+    let treeLoads = 0;
+    let pageLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
+      if (path === `/api/pages/${hiddenPage.id}`) {
+        pageLoads += 1;
+        return pageLoads === 1 ? { page: hiddenPage, sidebarHidden: true } : { page: hiddenPage, sidebarHidden };
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
+    });
+    await screen.findByText("Visibility detail", { selector: ".breadcrumbs span" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: page.id }));
+    });
+    await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    await act(async () => new Promise((resolve) => window.setTimeout(resolve)));
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
+    });
+    await waitFor(() => expect(pageLoads).toBe(2));
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+    await waitFor(() => expect(treeLoads).toBe(3));
+
+    expect(screen.getByText(selectedTitle, { selector: ".breadcrumbs span" })).toBeInTheDocument();
+  });
+
   it("reports a failed direct page load and retries the same endpoint", async () => {
     const hiddenPage = { ...page, id: "hidden-page", position: "c0", title: "Hidden detail" };
     let pageLoads = 0;

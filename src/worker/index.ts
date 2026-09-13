@@ -1913,7 +1913,7 @@ async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow) {
   if (job.type === "import") {
     requireEditor(member);
     const mappings = normalizeGroupSpaceIds(options.groupSpaceIds);
-    if (mappings === null)
+    if (mappings === null || (mappings && Object.keys(mappings).length === 0))
       throw new HttpError(409, "job_options_invalid", "This import's saved space mappings are invalid.");
     const destinations = importDestinationSpaceIds(job.space_id, mappings);
     for (const spaceId of destinations) await editableSpaceForMember(env, member, spaceId);

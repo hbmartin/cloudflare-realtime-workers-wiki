@@ -413,4 +413,45 @@ describe("ActivitiesTray", () => {
 
     expect(screen.getByRole("combobox", { name: "Destination space for Imported" })).toHaveValue(privateSpace.id);
   });
+
+  it("defaults an Imported group to its upload space instead of an exact-name match", () => {
+    const uploadSpace: Space = { ...workspaceSpace, id: "upload-space" };
+    const exactSpace: Space = { ...workspaceSpace, id: "exact-space", name: "Imported" };
+    const importJob: Job = {
+      ...runningJob,
+      id: "imported-exact-match",
+      spaceId: uploadSpace.id,
+      type: "import",
+      status: "awaiting_confirmation",
+      result: {
+        preview: {
+          format: "markdown",
+          filename: "notes.md",
+          pages: 1,
+          tables: 0,
+          assets: 0,
+          groups: [{ key: "Imported", name: "Imported", pages: 1, roots: 1, suggestedVisibility: "workspace" }],
+          warnings: [],
+        },
+      },
+    };
+    render(
+      <ActivitiesTray
+        jobs={[importJob]}
+        spaces={[exactSpace, uploadSpace]}
+        loading={false}
+        error=""
+        pendingJobId={null}
+        onClose={vi.fn()}
+        onRefresh={vi.fn()}
+        onCancel={vi.fn()}
+        onCleanup={vi.fn()}
+        onRetry={vi.fn()}
+        onConfirm={vi.fn()}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("combobox", { name: "Destination space for Imported" })).toHaveValue(uploadSpace.id);
+  });
 });

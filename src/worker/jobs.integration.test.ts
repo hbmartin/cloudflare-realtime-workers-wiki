@@ -401,6 +401,39 @@ describe("job execution", () => {
       createExecutionContext(),
     );
     expect(mappedRetry.status).toBe(202);
+
+    const emptyMappingImportId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, space_id, type, status, requested_by, options_json, created_at, updated_at)
+       VALUES (?, ?, ?, 'import', 'failed', ?, ?, ?, ?)`,
+    )
+      .bind(
+        emptyMappingImportId,
+        installed.workspaceId,
+        privateSpace.id,
+        installed.userId,
+        JSON.stringify({
+          filename: "empty-mapping.md",
+          format: "markdown",
+          confirmed: true,
+          previewGroupKeys: ["Imported"],
+          groupSpaceIds: {},
+        }),
+        timestamp,
+        timestamp,
+      )
+      .run();
+
+    const emptyMappingRetry = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${emptyMappingImportId}/retry`, { method: "POST" }),
+      bindings,
+      createExecutionContext(),
+    );
+    expect(emptyMappingRetry.status).toBe(409);
+    expect(
+      await env.DB.prepare(`SELECT status, attempt FROM jobs WHERE id = ?`).bind(emptyMappingImportId).first(),
+    ).toEqual({ status: "failed", attempt: 1 });
   });
 
   it("recovers an interrupted cancellation before making the job retryable", async () => {
@@ -2076,6 +2109,7 @@ describe("job execution", () => {
     const encoder = new TextEncoder();
     const exactId = "11110000000000000000000000002222";
     const partialId = "cccc000000000000000000000000dddd";
+    const otherPartialId = "bbbb000000000000000000000000eeee";
     const zip = createZip([
       {
         path: `Export-demo/Exact ${exactId}.md`,
@@ -2088,6 +2122,10 @@ describe("job execution", () => {
       {
         path: `Export-demo/Partial ${partialId}.md`,
         bytes: encoder.encode("# Partial\n\nParent body\n"),
+      },
+      {
+        path: `Export-demo/Partial ${otherPartialId}.md`,
+        bytes: encoder.encode("# Partial\n\nSibling body\n"),
       },
       {
         path: "Export-demo/Partial cccc-dddd/Partial child dddddddddddddddddddddddddddddddd.md",
@@ -2114,7 +2152,7 @@ describe("job execution", () => {
         await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext())
       ).json<{ job: Job }>()
     ).job;
-    expect(inspected.result?.preview).toMatchObject({ roots: 3, nested: 2, unresolvedParents: 1 });
+    expect(inspected.result?.preview).toMatchObject({ roots: 4, nested: 2, unresolvedParents: 1 });
     expect(inspected.result?.preview?.groups?.map((group) => group.key)).toEqual(["Imported"]);
     expect(inspected.warnings).toContain("unresolved parent: 1");
 

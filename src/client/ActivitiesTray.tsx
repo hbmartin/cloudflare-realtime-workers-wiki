@@ -6,14 +6,14 @@ const DATE_TIME_FORMAT = new Intl.DateTimeFormat(undefined, { dateStyle: "medium
 type ImportGroup = NonNullable<ImportPreview["groups"]>[number];
 
 function defaultGroupSpace(group: ImportGroup, spaces: Space[], jobSpaceId: string | null) {
+  const uploadSpace = spaces.find((space) => space.id === jobSpaceId);
+  if (group.key === "Imported") return uploadSpace?.id ?? "";
   const exact = spaces.find(
     (space) =>
       space.name.toLocaleLowerCase() === group.name.toLocaleLowerCase() &&
       space.visibility === group.suggestedVisibility,
   );
   if (exact) return exact.id;
-  const uploadSpace = spaces.find((space) => space.id === jobSpaceId);
-  if (group.key === "Imported") return uploadSpace?.id ?? "";
   if (group.suggestedVisibility !== "workspace") return "";
   return uploadSpace?.visibility === "workspace" ? uploadSpace.id : "";
 }
