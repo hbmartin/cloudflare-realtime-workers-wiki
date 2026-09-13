@@ -479,6 +479,8 @@ function directoryOwners(pages: NotionPageEntry[]) {
   };
   for (const directory of ordered) {
     const name = directory.split("/").at(-1) ?? directory;
+    // Reserve title-only folders first; shortened IDs take precedence over conflicting titles.
+    if (/ [\da-f]{4}-[\da-f]{4}$/i.test(name)) continue;
     const titled = siblingsFor(directory).filter((page) => page.title === stripNotionId(name));
     if (titled.length !== 1) continue;
     owners.set(directory, titled[0]!.path);
@@ -501,6 +503,11 @@ function directoryOwners(pages: NotionPageEntry[]) {
     if (owners.has(directory)) continue;
     const name = directory.split("/").at(-1) ?? directory;
     const titled = siblingsFor(directory).filter((page) => page.title === stripNotionId(name));
+    if (titled.length === 1) {
+      owners.set(directory, titled[0]!.path);
+      claimed.add(titled[0]!.path);
+      continue;
+    }
     if (titled.length > 1) {
       const linked = titled.filter((page) =>
         markdownHrefs(page.text).some((href) => {

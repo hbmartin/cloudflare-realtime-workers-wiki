@@ -774,13 +774,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [{ pages, pagesLoaded, selectedId, pendingSelectionId }, dispatchPageAction] = useReducer(
     workspacePageReducer,
     undefined,
-    () => ({
-      pages: [],
-      pagesLoaded: false,
-      selectedId: new URLSearchParams(window.location.search).get("page") ?? localStorage.getItem("notes:last-page"),
-      pendingSelectionId: null,
-      pendingRestoredRoot: null,
-    }),
+    () => {
+      const initialPageId = new URLSearchParams(window.location.search).get("page");
+      return {
+        pages: [],
+        pagesLoaded: false,
+        selectedId: initialPageId ?? localStorage.getItem("notes:last-page"),
+        pendingSelectionId: initialPageId,
+        pendingRestoredRoot: null,
+      };
+    },
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -1044,7 +1047,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         );
         if (activePageAccessRequestRef.current !== activeRequest) return;
         dispatchPageAction({ type: "merge", pages: [page] });
-        if (sidebarHidden) setSidebarHiddenPage(page.id, true);
+        if (sidebarHidden !== undefined) setSidebarHiddenPage(page.id, sidebarHidden);
         setActiveSpaceId(page.spaceId);
         localStorage.setItem(`notes:active-space:${member.workspace.id}`, page.spaceId);
       } catch (error) {
@@ -1151,6 +1154,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         const tombstones = archiveRemovalTombstones.applyLoad(serverPageIds, loadGeneration);
         const authoritativePages = observed.pages.filter((page) => !tombstones.has(page.id));
         clearResolvedPageAccessError(authoritativePages);
+        for (const pageId of sidebarHiddenPageIdsRef.current) {
+          if (serverPageIds.has(pageId)) setSidebarHiddenPage(pageId, false);
+        }
         const preservePageIds = new Set(
           [selectedIdRef.current, pendingSelectionIdRef.current].filter(
             (pageId): pageId is string => pageId !== null && sidebarHiddenPageIdsRef.current.has(pageId),
@@ -1189,6 +1195,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     clearWorkspaceErrors,
     pendingSelectionIdRef,
     selectedIdRef,
+    setSidebarHiddenPage,
   ]);
   const loadFreshPages = useCallback(
     async (observerSignal: AbortSignal) => {
@@ -1508,11 +1515,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   useEffect(() => {
     const signal = workspaceAbortController.current.signal;
-    void loadPages().catch((error) => {
-      if (signal.aborted) return;
-      reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be loaded."));
-    });
-  }, [loadPages, reportWorkspaceError]);
+    void loadPages()
+      .then(({ availablePageIds }) => {
+        const pendingPageId = pendingSelectionIdRef.current;
+        if (pendingPageId && !availablePageIds.has(pendingPageId)) void loadPageForNavigation(pendingPageId);
+      })
+      .catch((error) => {
+        if (signal.aborted) return;
+        reportWorkspaceError({ source: "page-tree" }, apiErrorMessage(error, "The page tree could not be loaded."));
+      });
+  }, [loadPageForNavigation, loadPages, pendingSelectionIdRef, reportWorkspaceError]);
   useEffect(() => {
     void loadUnreadMentions();
   }, [loadUnreadMentions]);

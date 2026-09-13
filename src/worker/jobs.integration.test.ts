@@ -401,6 +401,46 @@ describe("job execution", () => {
       createExecutionContext(),
     );
     expect(mappedRetry.status).toBe(202);
+
+    const emptyMappingImportId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, space_id, type, status, requested_by, options_json, created_at, updated_at)
+       VALUES (?, ?, ?, 'import', 'failed', ?, ?, ?, ?)`,
+    )
+      .bind(
+        emptyMappingImportId,
+        installed.workspaceId,
+        privateSpace.id,
+        installed.userId,
+        JSON.stringify({
+          filename: "empty-mapping.md",
+          format: "markdown",
+          confirmed: true,
+          previewGroupKeys: ["Imported"],
+          groupSpaceIds: {},
+        }),
+        timestamp,
+        timestamp,
+      )
+      .run();
+
+    const emptyMappingRetry = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${emptyMappingImportId}/retry`, { method: "POST" }),
+      bindings,
+      createExecutionContext(),
+    );
+    expect(emptyMappingRetry.status).toBe(409);
+    await expect(emptyMappingRetry.json()).resolves.toMatchObject({
+      error: {
+        code: "job_options_invalid",
+        message:
+          "This import's saved space mappings are invalid. Upload the file again to inspect and confirm its destinations.",
+      },
+    });
+    expect(
+      await env.DB.prepare(`SELECT status, attempt FROM jobs WHERE id = ?`).bind(emptyMappingImportId).first(),
+    ).toEqual({ status: "failed", attempt: 1 });
   });
 
   it("recovers an interrupted cancellation before making the job retryable", async () => {
@@ -2076,6 +2116,7 @@ describe("job execution", () => {
     const encoder = new TextEncoder();
     const exactId = "11110000000000000000000000002222";
     const partialId = "cccc000000000000000000000000dddd";
+    const otherPartialId = "bbbb000000000000000000000000eeee";
     const zip = createZip([
       {
         path: `Export-demo/Exact ${exactId}.md`,
@@ -2088,6 +2129,10 @@ describe("job execution", () => {
       {
         path: `Export-demo/Partial ${partialId}.md`,
         bytes: encoder.encode("# Partial\n\nParent body\n"),
+      },
+      {
+        path: `Export-demo/Partial ${otherPartialId}.md`,
+        bytes: encoder.encode("# Partial\n\nSibling body\n"),
       },
       {
         path: "Export-demo/Partial cccc-dddd/Partial child dddddddddddddddddddddddddddddddd.md",
@@ -2114,7 +2159,7 @@ describe("job execution", () => {
         await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext())
       ).json<{ job: Job }>()
     ).job;
-    expect(inspected.result?.preview).toMatchObject({ roots: 3, nested: 2, unresolvedParents: 1 });
+    expect(inspected.result?.preview).toMatchObject({ roots: 4, nested: 2, unresolvedParents: 1 });
     expect(inspected.result?.preview?.groups?.map((group) => group.key)).toEqual(["Imported"]);
     expect(inspected.warnings).toContain("unresolved parent: 1");
 
@@ -2139,6 +2184,53 @@ describe("job execution", () => {
     expect(tree.pages.find((page) => page.title === "Exact child")?.parentId).toBe(exact.id);
     expect(tree.pages.find((page) => page.title === "Partial child")?.parentId).toBe(partial.id);
     expect(tree.pages.find((page) => page.title === "Fuzzy child")?.parentId).toBeNull();
+  });
+
+  it.each([
+    ["aaaa-bbbb", "Renamed"],
+    ["ffff-eeee", "Old"],
+  ])("resolves shortened folder ID %s to %s before falling back to its title", async (folderId, parentTitle) => {
+    const installed = await bootstrap();
+    const encoder = new TextEncoder();
+    const zip = createZip([
+      {
+        path: "Export-demo/Renamed aaaa000000000000000000000000bbbb.md",
+        bytes: encoder.encode("# Renamed\n"),
+      },
+      {
+        path: "Export-demo/Old cccc000000000000000000000000dddd.md",
+        bytes: encoder.encode("# Old\n"),
+      },
+      {
+        path: `Export-demo/Old ${folderId}/Child eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.md`,
+        bytes: encoder.encode("# Child\n"),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "conflicting-title.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+
+    const tree = await (
+      await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext())
+    ).json<{ pages: Page[] }>();
+    const parent = tree.pages.find((page) => page.title === parentTitle)!;
+    expect(tree.pages.find((page) => page.title === "Child")?.parentId).toBe(parent.id);
   });
 
   it("keeps teamspace grouping when an export wrapper contains an index file", async () => {
