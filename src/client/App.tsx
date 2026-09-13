@@ -1154,6 +1154,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         const tombstones = archiveRemovalTombstones.applyLoad(serverPageIds, loadGeneration);
         const authoritativePages = observed.pages.filter((page) => !tombstones.has(page.id));
         clearResolvedPageAccessError(authoritativePages);
+        for (const pageId of sidebarHiddenPageIdsRef.current) {
+          if (serverPageIds.has(pageId)) setSidebarHiddenPage(pageId, false);
+        }
         const preservePageIds = new Set(
           [selectedIdRef.current, pendingSelectionIdRef.current].filter(
             (pageId): pageId is string => pageId !== null && sidebarHiddenPageIdsRef.current.has(pageId),
@@ -1192,6 +1195,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     clearWorkspaceErrors,
     pendingSelectionIdRef,
     selectedIdRef,
+    setSidebarHiddenPage,
   ]);
   const loadFreshPages = useCallback(
     async (observerSignal: AbortSignal) => {

@@ -3605,6 +3605,40 @@ describe("App error handling", () => {
     expect(pageLoads).toBe(2);
   });
 
+  it("clears hidden markers when a refreshed tree includes the page", async () => {
+    const hiddenPage = { ...page, id: "tree-visible-page", title: "Visible detail", position: "c0" };
+    let visible = false;
+    let treeLoads = 0;
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: visible ? [page, hiddenPage] : [page] };
+      }
+      if (path === `/api/pages/${hiddenPage.id}`) return { page: hiddenPage, sidebarHidden: true };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
+    });
+    await screen.findByText("Visible detail", { selector: ".breadcrumbs span" });
+    expect(screen.queryByRole("button", { name: "Archive Visible detail" })).not.toBeInTheDocument();
+
+    visible = true;
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+    expect(await screen.findByRole("button", { name: "Archive Visible detail" })).toBeInTheDocument();
+    expect(treeLoads).toBe(2);
+
+    visible = false;
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+    expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(treeLoads).toBe(3);
+    expect(screen.queryByRole("button", { name: "Archive Visible detail" })).not.toBeInTheDocument();
+  });
+
   it("loads an initial deep link directly when it is absent from the page tree", async () => {
     const hiddenPage = { ...page, id: "initial-hidden-page", position: "c0", title: "Initial hidden detail" };
     history.replaceState(null, "", `/?page=${hiddenPage.id}`);
@@ -3766,6 +3800,7 @@ describe("App error handling", () => {
     const hiddenPage = { ...page, id: "hidden-during-retry", position: "c0", title: "Hidden during retry" };
     const retry = deferred<{ pages: Page[] }>();
     let treeLoads = 0;
+    let directLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
@@ -3775,7 +3810,10 @@ describe("App error handling", () => {
         if (treeLoads === 1) throw new ApiClientError(503, "tree_unavailable", "Tree unavailable.");
         return retry.promise;
       }
-      if (path === `/api/pages/${hiddenPage.id}`) return { page: hiddenPage, sidebarHidden: true };
+      if (path === `/api/pages/${hiddenPage.id}`) {
+        directLoads += 1;
+        return { page: hiddenPage, sidebarHidden: true };
+      }
       throw new Error(`Unexpected API request: ${path}`);
     });
     render(<App />);
@@ -3786,6 +3824,8 @@ describe("App error handling", () => {
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
+    await waitFor(() => expect(directLoads).toBe(1));
+    await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(hiddenPage.id));
     await act(async () => retry.reject(new ApiClientError(503, "tree_unavailable", "Retry failed.")));
 
     expect(await screen.findByRole("heading", { name: "Workspace unavailable" })).toBeInTheDocument();
