@@ -290,7 +290,7 @@ describe("job execution", () => {
       ).bind(
         jobIds.template,
         installed.workspaceId,
-        privateSpace.id,
+        `${installed.workspaceId}-general`,
         installed.userId,
         JSON.stringify({
           sourcePageId: privatePageId,
@@ -310,7 +310,7 @@ describe("job execution", () => {
       ).bind(
         jobIds.export,
         installed.workspaceId,
-        privateSpace.id,
+        `${installed.workspaceId}-general`,
         installed.userId,
         JSON.stringify({ pageId: privatePageId, format: "markdown" }),
         timestamp,
@@ -368,6 +368,39 @@ describe("job execution", () => {
       attempt: 2,
     });
     await waitOnExecutionContext(retryContext);
+
+    await env.DB.prepare(`UPDATE space_members SET role = 'viewer' WHERE space_id = ? AND user_id = ?`)
+      .bind(privateSpace.id, installed.userId)
+      .run();
+    const mappedImportId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, space_id, type, status, requested_by, options_json, created_at, updated_at)
+       VALUES (?, ?, ?, 'import', 'failed', ?, ?, ?, ?)`,
+    )
+      .bind(
+        mappedImportId,
+        installed.workspaceId,
+        privateSpace.id,
+        installed.userId,
+        JSON.stringify({
+          filename: "mapped.md",
+          format: "markdown",
+          confirmed: true,
+          previewGroupKeys: ["Imported"],
+          groupSpaceIds: { Imported: `${installed.workspaceId}-general` },
+        }),
+        timestamp,
+        timestamp,
+      )
+      .run();
+
+    const mappedRetry = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${mappedImportId}/retry`, { method: "POST" }),
+      bindings,
+      createExecutionContext(),
+    );
+    expect(mappedRetry.status).toBe(202);
   });
 
   it("recovers an interrupted cancellation before making the job retryable", async () => {
@@ -2094,6 +2127,230 @@ describe("job execution", () => {
     const exact = tree.pages.find((page) => page.title === "Exact")!;
     expect(tree.pages.find((page) => page.title === "Exact child")?.parentId).toBe(exact.id);
     expect(tree.pages.find((page) => page.title === "Fuzzy child")?.parentId).toBeNull();
+  });
+
+  it("keeps teamspace grouping when an export wrapper contains an index file", async () => {
+    const installed = await bootstrap();
+    const zip = createZip([
+      {
+        path: "Export-demo/index.html",
+        bytes: new TextEncoder().encode("<html><title>Export index</title></html>"),
+      },
+      {
+        path: "Export-demo/Teamspace/Plan aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+        bytes: new TextEncoder().encode("# Plan\n"),
+      },
+      {
+        path: "Export-demo/Private & Shared/Home bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md",
+        bytes: new TextEncoder().encode("# Home\n"),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "teamspaces.zip", { type: "application/zip" }));
+    const context = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      context,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(context);
+
+    const inspected = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}`),
+      env,
+      createExecutionContext(),
+    );
+    const preview = (await inspected.json<{ job: Job }>()).job.result?.preview;
+    expect(preview?.groups?.map((group) => group.key)).toEqual(["Teamspace", "Private & Shared"]);
+    expect(preview?.pages).toBe(2);
+  });
+
+  it("keeps a single teamspace grouped when an export wrapper contains an index file", async () => {
+    const installed = await bootstrap();
+    const zip = createZip([
+      {
+        path: "Export-demo/index.html",
+        bytes: new TextEncoder().encode("<html><title>Export index</title></html>"),
+      },
+      {
+        path: "Export-demo/Teamspace/Plan aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+        bytes: new TextEncoder().encode("# Plan\n"),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "single-teamspace.zip", { type: "application/zip" }));
+    const context = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      context,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(context);
+
+    const inspected = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}`),
+      env,
+      createExecutionContext(),
+    );
+    const preview = (await inspected.json<{ job: Job }>()).job.result?.preview;
+    expect(preview?.groups?.map((group) => group.key)).toEqual(["Teamspace"]);
+    expect(preview?.pages).toBe(1);
+  });
+
+  it("does not treat a real page whose title starts with Export- as an archive wrapper", async () => {
+    const installed = await bootstrap();
+    const parentId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const zip = createZip([
+      {
+        path: `Export-Plan ${parentId}.md`,
+        bytes: new TextEncoder().encode("# Export-Plan\n"),
+      },
+      {
+        path: `Export-Plan ${parentId}/Child bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md`,
+        bytes: new TextEncoder().encode("# Child\n"),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "export-plan.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+
+    const tree = await (
+      await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext())
+    ).json<{ pages: Array<{ id: string; title: string; parentId: string | null }> }>();
+    const parent = tree.pages.find((page) => page.title === "Export-Plan")!;
+    expect(tree.pages.find((page) => page.title === "Child")?.parentId).toBe(parent.id);
+  });
+
+  it("fails closed when import groups no longer match the preview", async () => {
+    const installed = await bootstrap();
+    const zip = createZip([
+      {
+        path: "Export-demo/Teamspace/Plan aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+        bytes: new TextEncoder().encode("# Plan\n"),
+      },
+      {
+        path: "Export-demo/Private & Shared/Home bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md",
+        bytes: new TextEncoder().encode("# Home\n"),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "changed-groups.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const inspected = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+    await env.DB.prepare(`UPDATE jobs SET status = 'running', options_json = ? WHERE id = ?`)
+      .bind(
+        JSON.stringify({
+          ...JSON.parse(inspected.options_json),
+          confirmed: true,
+          previewGroupKeys: ["Imported"],
+          groupSpaceIds: { Imported: `${installed.workspaceId}-general` },
+        }),
+        jobId,
+      )
+      .run();
+    const running = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
+
+    await expect(
+      runImport(env, running, {
+        async do<T>(_name: string, callback: () => Promise<T>) {
+          return callback();
+        },
+      } as Parameters<typeof runImport>[2]),
+    ).rejects.toThrow("import groups changed after preview");
+  });
+
+  it("writes a single-page import only to its authorized mapped space", async () => {
+    const installed = await bootstrap();
+    const privateResponse = await worker.fetch(
+      request(installed.cookie, "/api/spaces", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "Mapped private", visibility: "private" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const privateSpace = (await privateResponse.json<{ space: { id: string } }>()).space;
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File(["# Mapped page\n"], "mapped.md", { type: "text/markdown" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+
+    const backupOwnerId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+         VALUES (?, 'Backup owner', ?, 1, ?, ?)`,
+      ).bind(backupOwnerId, `backup-${backupOwnerId}@example.test`, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)`,
+      ).bind(installed.workspaceId, backupOwnerId, timestamp),
+      env.DB.prepare(`UPDATE workspace_members SET role = 'editor' WHERE workspace_id = ? AND user_id = ?`).bind(
+        installed.workspaceId,
+        installed.userId,
+      ),
+      env.DB.prepare(
+        `INSERT INTO space_members (space_id, user_id, role, created_by, created_at)
+         VALUES (?, ?, 'viewer', ?, ?)`,
+      ).bind(`${installed.workspaceId}-general`, installed.userId, backupOwnerId, timestamp),
+      env.DB.prepare(
+        `INSERT INTO space_members (space_id, user_id, role, created_by, created_at)
+         VALUES (?, ?, 'editor', ?, ?)`,
+      ).bind(privateSpace.id, installed.userId, backupOwnerId, timestamp),
+    ]);
+
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ groupSpaceIds: { Imported: privateSpace.id } }),
+      }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+
+    expect(
+      await env.DB.prepare(`SELECT space_id FROM pages WHERE title = 'mapped'`).first<{ space_id: string }>(),
+    ).toEqual({ space_id: privateSpace.id });
   });
 
   it("confirms a legacy preview with an empty JSON-typed body and rejects malformed nonempty JSON", async () => {

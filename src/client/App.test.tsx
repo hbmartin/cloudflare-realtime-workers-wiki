@@ -304,6 +304,33 @@ describe("App error handling", () => {
     expect(screen.queryByText("Tree unavailable.")).not.toBeInTheDocument();
   });
 
+  it("does not reload a page that was returned by create", async () => {
+    const createdId = "00000000-0000-4000-8000-000000000099";
+    const created = { ...page, id: createdId, position: "b0", title: "Untitled" };
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(createdId);
+    onTestFinished(() => randomUUID.mockRestore());
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation();
+    let directLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/pages" && init?.method === "POST") return { page: created };
+      if (path === `/api/pages/${created.id}`) {
+        directLoads += 1;
+        return { page: created };
+      }
+      if (!shellApi) throw new Error(`Unexpected API request: ${path}`);
+      return shellApi(path, init);
+    });
+    render(<App />);
+
+    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.click(createButton);
+
+    expect(await screen.findByText("Untitled", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(directLoads).toBe(0);
+  });
+
   it("replaces a page-tree request aborted by the StrictMode effect remount", async () => {
     let firstRequestSignal: AbortSignal | undefined;
     let treeLoads = 0;
@@ -3527,11 +3554,15 @@ describe("App error handling", () => {
 
   it("loads a hidden navigation target directly without adding it to the sidebar", async () => {
     const hiddenPage = { ...page, id: "hidden-page", position: "c0", title: "Hidden detail" };
+    let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
       if (path === `/api/pages/${hiddenPage.id}`) return { page: hiddenPage, sidebarHidden: true };
       throw new Error(`Unexpected API request: ${path}`);
     });
@@ -3547,6 +3578,10 @@ describe("App error handling", () => {
       [...document.querySelectorAll(".page-link")].some((link) => link.textContent?.includes("Hidden detail")),
     ).toBe(false);
     expect(localStorage.getItem("notes:last-page")).toBe(hiddenPage.id);
+
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    expect(screen.getByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
   });
 
   it("reports a failed direct page load and retries the same endpoint", async () => {
@@ -3577,6 +3612,99 @@ describe("App error handling", () => {
 
     expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
     expect(pageLoads).toBe(2);
+  });
+
+  it("clears a direct-load error when a workspace event supplies the page", async () => {
+    const missingPage = { ...page, id: "event-page", position: "c0", title: "Event page" };
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === `/api/pages/${missingPage.id}`) {
+        throw new ApiClientError(503, "page_unavailable", "Page lookup failed.");
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+    });
+    expect((await screen.findAllByText("Page lookup failed.")).length).toBeGreaterThan(0);
+
+    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [missingPage] }));
+
+    expect(await screen.findByText("Event page", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(screen.queryAllByText("Page lookup failed.")).toHaveLength(0);
+  });
+
+  it("times out a stalled direct page load", async () => {
+    const missingPage = { ...page, id: "stalled-page", position: "c0", title: "Stalled" };
+    let pageSignal: AbortSignal | undefined;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [page] };
+      if (path === `/api/pages/${missingPage.id}`) {
+        pageSignal = init?.signal ?? undefined;
+        return new Promise<never>((_resolve, reject) => {
+          pageSignal?.addEventListener("abort", () => reject(pageSignal?.reason), { once: true });
+        });
+      }
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "Archive Roadmap" });
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+      const controller = new AbortController();
+      window.setTimeout(() => controller.abort(new DOMException("Timed out.", "TimeoutError")), milliseconds);
+      return controller.signal;
+    });
+    onTestFinished(() => timeout.mockRestore());
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(15_000));
+
+    expect(pageSignal?.aborted).toBe(true);
+    expect(screen.getByRole("heading", { name: "Page unavailable" })).toBeInTheDocument();
+    expect(screen.getAllByText("The page could not be loaded.").length).toBeGreaterThan(0);
+  });
+
+  it("keeps a failing tree retry independent from direct page navigation", async () => {
+    const hiddenPage = { ...page, id: "hidden-during-retry", position: "c0", title: "Hidden during retry" };
+    const retry = deferred<{ pages: Page[] }>();
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 1) throw new ApiClientError(503, "tree_unavailable", "Tree unavailable.");
+        return retry.promise;
+      }
+      if (path === `/api/pages/${hiddenPage.id}`) return { page: hiddenPage, sidebarHidden: true };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Workspace unavailable" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
+    });
+    await act(async () => retry.reject(new ApiClientError(503, "tree_unavailable", "Retry failed.")));
+
+    expect(await screen.findByRole("heading", { name: "Workspace unavailable" })).toBeInTheDocument();
+    expect(screen.getByText("Retry failed.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh the page tree" })).toBeEnabled();
   });
 
   it("aborts a direct page load when pending navigation is canceled", async () => {

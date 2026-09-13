@@ -12,8 +12,10 @@ function defaultGroupSpace(group: ImportGroup, spaces: Space[], jobSpaceId: stri
       space.visibility === group.suggestedVisibility,
   );
   if (exact) return exact.id;
+  const uploadSpace = spaces.find((space) => space.id === jobSpaceId);
+  if (group.key === "Imported") return uploadSpace?.id ?? "";
   if (group.suggestedVisibility !== "workspace") return "";
-  return spaces.find((space) => space.id === jobSpaceId && space.visibility === "workspace")?.id ?? "";
+  return uploadSpace?.visibility === "workspace" ? uploadSpace.id : "";
 }
 
 function jobTitle(job: Job) {
@@ -47,6 +49,21 @@ function ImportConfirmation({
       (preview?.groups ?? []).map((group) => [group.key, defaultGroupSpace(group, spaces, job.spaceId)]),
     ),
   );
+  const touchedGroups = useRef(new Set<string>());
+  useEffect(() => {
+    setMapping((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const group of preview?.groups ?? []) {
+        if (touchedGroups.current.has(group.key) || next[group.key]) continue;
+        const destination = defaultGroupSpace(group, spaces, job.spaceId);
+        if (!destination) continue;
+        next[group.key] = destination;
+        changed = true;
+      }
+      return changed ? next : current;
+    });
+  }, [job.spaceId, preview, spaces]);
   if (!preview) return null;
   const groups = preview.groups ?? [];
   const incomplete = groups.some((group) => !mapping[group.key]);
@@ -94,7 +111,10 @@ function ImportConfirmation({
           <select
             aria-label={`Destination space for ${group.name}`}
             value={mapping[group.key] ?? ""}
-            onChange={(event) => setMapping((current) => ({ ...current, [group.key]: event.target.value }))}
+            onChange={(event) => {
+              touchedGroups.current.add(group.key);
+              setMapping((current) => ({ ...current, [group.key]: event.target.value }));
+            }}
           >
             <option value="">Choose a space</option>
             {spaces.map((space) => (

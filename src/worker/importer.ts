@@ -9,6 +9,7 @@ import {
   type ImportedTable,
 } from "../shared/import-content";
 import { documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
+import { normalizeGroupSpaceIds } from "../shared/import-space-mapping";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import { projectDocument } from "../shared/document-projection";
 import type { DocumentContentEnvelope, ImportPreview, ProseMirrorJson } from "../shared/types";
@@ -33,6 +34,7 @@ type ImportOptions = {
   format: ImportPreview["format"];
   confirmed: boolean;
   groupSpaceIds?: Record<string, string>;
+  previewGroupKeys?: string[];
 };
 type ImportAsset = { source: string; name: string; mime: string; bytes: Uint8Array };
 type ImportPage = {
@@ -60,7 +62,7 @@ type NotionPageEntry = ZipEntry & {
   title: string;
   notionId: string | null;
 };
-type NotionGrouping = { teamspace: boolean };
+type NotionGrouping = { wrapper: string | null; teamspaces: ReadonlySet<string> };
 
 function record(value: string) {
   const parsed: unknown = JSON.parse(value);
@@ -77,16 +79,20 @@ function importOptions(job: JobRow): ImportOptions {
   ) {
     throw new Error("Import options are invalid.");
   }
-  if (
-    options.groupSpaceIds !== undefined &&
-    (!options.groupSpaceIds ||
-      typeof options.groupSpaceIds !== "object" ||
-      Array.isArray(options.groupSpaceIds) ||
-      Object.values(options.groupSpaceIds).some((value) => typeof value !== "string"))
-  ) {
+  const groupSpaceIds = normalizeGroupSpaceIds(options.groupSpaceIds);
+  if (groupSpaceIds === null) {
     throw new Error("Import space mappings are invalid.");
   }
-  return options as ImportOptions;
+  const previewGroupKeys = options.previewGroupKeys;
+  if (
+    previewGroupKeys !== undefined &&
+    (!Array.isArray(previewGroupKeys) ||
+      previewGroupKeys.some((key) => typeof key !== "string") ||
+      new Set(previewGroupKeys).size !== previewGroupKeys.length)
+  ) {
+    throw new Error("Import preview groups are invalid.");
+  }
+  return { ...options, groupSpaceIds, previewGroupKeys } as ImportOptions;
 }
 
 function extension(path: string) {
@@ -156,26 +162,74 @@ function notionRelativeSegments(source: string) {
 
 function groupingFor(sources: string[]): NotionGrouping {
   const relative = sources.map(notionRelativeSegments);
-  return {
-    teamspace:
-      relative.length > 0 && relative.every((segments) => segments.length >= 3 && /^Export-/i.test(segments[0]!)),
-  };
+  const wrapperCandidates = new Set(
+    relative
+      .filter((segments) => segments.length >= 2 && /^Export-/i.test(segments[0]!))
+      .map((segments) => segments[0]!),
+  );
+  const candidate = wrapperCandidates.size === 1 ? wrapperCandidates.values().next().value! : null;
+  const wrapper =
+    candidate && !relative.some((segments) => segments.length === 1 && stem(segments[0]!) === candidate)
+      ? candidate
+      : null;
+  if (!wrapper) return { wrapper: null, teamspaces: new Set() };
+  const directPageStems = new Set(
+    relative
+      .filter(
+        (segments) =>
+          segments[0] === wrapper &&
+          segments.length === 2 &&
+          [".html", ".htm", ".md", ".markdown", ".csv"].includes(extension(segments[1]!)),
+      )
+      .map((segments) => stem(segments[1]!)),
+  );
+  const inferredTeamspaces = new Set(
+    relative
+      .filter((segments) => segments[0] === wrapper && segments.length >= 3)
+      .map((segments) => segments[1]!)
+      .filter((name) => !directPageStems.has(name)),
+  );
+  const teamspaces =
+    directPageStems.size === 0 ||
+    inferredTeamspaces.size > 1 ||
+    [...inferredTeamspaces].some((name) => /private\s*&\s*shared/i.test(name))
+      ? inferredTeamspaces
+      : new Set<string>();
+  return { wrapper, teamspaces };
 }
 
 function groupKeyFor(source: string, grouping: NotionGrouping) {
   const segments = notionRelativeSegments(source);
-  return grouping.teamspace ? segments[1]! : "Imported";
+  return segments[0] === grouping.wrapper && grouping.teamspaces.has(segments[1] ?? "") ? segments[1]! : "Imported";
 }
 
 function groupRootFor(source: string, grouping: NotionGrouping) {
   const segments = source.split("/");
   const relative = notionRelativeSegments(source);
-  if (!grouping.teamspace) {
-    const wrapperLength = /^Export-/i.test(relative[0] ?? "") ? 1 : 0;
-    return segments.slice(0, segments.length - relative.length + wrapperLength).join("/");
+  const prefixLength = segments.length - relative.length;
+  if (relative[0] !== grouping.wrapper) return segments.slice(0, prefixLength).join("/");
+  const grouped = grouping.teamspaces.has(relative[1] ?? "");
+  return segments.slice(0, prefixLength + (grouped ? 2 : 1)).join("/");
+}
+
+function assertPreviewGroups(options: ImportOptions, groupKeys: string[]) {
+  if (!options.previewGroupKeys) return;
+  const expected = [...options.previewGroupKeys].sort();
+  const actual = [...groupKeys].sort();
+  if (expected.length !== actual.length || expected.some((key, index) => key !== actual[index])) {
+    throw new Error("The import groups changed after preview. Inspect the import again before confirming it.");
   }
-  const groupIndex = segments.length - relative.length + 1;
-  return segments.slice(0, groupIndex + 1).join("/");
+}
+
+function destinationSpaceId(job: JobRow, options: ImportOptions, groupKey: string) {
+  if (options.groupSpaceIds) {
+    if (!Object.hasOwn(options.groupSpaceIds, groupKey)) {
+      throw new Error("The import groups no longer match their destination spaces. Inspect the import again.");
+    }
+    return options.groupSpaceIds[groupKey]!;
+  }
+  if (!job.space_id) throw new Error("The import destination space is missing.");
+  return job.space_id;
 }
 
 function mimeFor(name: string) {
@@ -425,11 +479,15 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     .filter((entry) => {
       const ext = extension(entry.path);
       const parent = parentPath(entry.path);
+      const relative = notionRelativeSegments(entry.path);
       // Nested Part-N.zip entries are prefixed by their archive, so "root" means the top
       // level of whichever archive the entry came out of.
       const atArchiveRoot = parent === "" || /\.zip$/i.test(parent);
+      const wrapperIndex =
+        relative.length === 2 && /^Export-/i.test(relative[0]!) && /^index\.html?$/i.test(relative[1]!);
       return (
         [".html", ".htm", ".md", ".markdown"].includes(ext) &&
+        !wrapperIndex &&
         !(atArchiveRoot && /^index\.html?$/i.test(entry.path.split("/").at(-1) ?? ""))
       );
     })
@@ -459,9 +517,15 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     throw new Error(`Imports are limited to ${MAX_IMPORT_PAGES} pages.`);
   const pageIds = new Map<string, string>();
   for (const entry of pageEntries) pageIds.set(entry.path, await stableId(job.id, "page", entry.path));
-  const fallbackSpaceId = job.space_id;
-  if (!fallbackSpaceId) throw new Error("The import destination space is missing.");
   const grouping = groupingFor([...pageEntries.map((entry) => entry.path), ...csvEntries.map((entry) => entry.path)]);
+  const groupKeys = [
+    ...new Set(
+      [...pageEntries.map((entry) => entry.path), ...csvEntries.map((entry) => entry.path)].map((source) =>
+        groupKeyFor(source, grouping),
+      ),
+    ),
+  ];
+  assertPreviewGroups(options, groupKeys);
   const { owners, directories } = directoryOwners(pageEntries);
   const archiveOrder = new Map(entries.map((entry, index) => [entry.path, index]));
   const matchedCsv = new Set<string>();
@@ -484,7 +548,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
       id: pageIds.get(entry.path)!,
       parentId: parentSource ? (pageIds.get(parentSource) ?? null) : null,
       parentSource,
-      spaceId: options.groupSpaceIds?.[groupKey] ?? fallbackSpaceId,
+      spaceId: destinationSpaceId(job, options, groupKey),
       groupKey,
       notionId: entry.notionId,
       sourceRole: "page",
@@ -508,7 +572,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
       id,
       parentId: parentSource ? (pageIds.get(parentSource) ?? null) : null,
       parentSource,
-      spaceId: options.groupSpaceIds?.[groupKey] ?? fallbackSpaceId,
+      spaceId: destinationSpaceId(job, options, groupKey),
       groupKey,
       notionId: notionId(stem(entry.path)),
       sourceRole: "page",
@@ -603,6 +667,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
 }
 
 async function singlePageBundle(job: JobRow, options: ImportOptions, bytes: Uint8Array): Promise<ImportBundle> {
+  assertPreviewGroups(options, ["Imported"]);
   const source = new TextDecoder().decode(bytes);
   const html = options.format === "html" ? htmlToDocument(source) : null;
   const parsed = html ?? markdownToDocument(source);
@@ -613,11 +678,7 @@ async function singlePageBundle(job: JobRow, options: ImportOptions, bytes: Uint
     id: await stableId(job.id, "page", options.filename),
     parentId: null,
     parentSource: null,
-    spaceId:
-      job.space_id ??
-      (() => {
-        throw new Error("The import destination space is missing.");
-      })(),
+    spaceId: destinationSpaceId(job, options, "Imported"),
     groupKey: "Imported",
     notionId: null,
     sourceRole: "page",
