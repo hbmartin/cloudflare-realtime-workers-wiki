@@ -97,8 +97,12 @@ type WorkspaceError =
       scope: undefined;
     };
 type WorkspaceErrorAttempt = WorkspaceErrorTarget & { generation: number };
-type PageTreeRetryTarget = { source: "page-access" | "page-tree"; scope?: undefined };
-type PageLoadResult = { serverPages: Page[]; removedDuringLoad: ReadonlySet<string> };
+type PageTreeRetryTarget = { source: "page-tree"; scope?: undefined };
+type PageLoadResult = {
+  serverPages: Page[];
+  availablePageIds: ReadonlySet<string>;
+  removedDuringLoad: ReadonlySet<string>;
+};
 
 const PAGE_TREE_REQUEST_TIMEOUT_MS = 15_000;
 
@@ -213,7 +217,7 @@ function pageMutationResponse(value: unknown, expectation: PageMutationExpectati
 }
 
 function observedExpectedPage(result: PageLoadResult, expectation: PageMutationExpectation) {
-  if (result.removedDuringLoad.has(expectation.id)) return null;
+  if (!result.availablePageIds.has(expectation.id)) return null;
   const page = result.serverPages.find((candidate) => candidate.id === expectation.id);
   return page && matchesPageMutationExpectation(page, expectation) ? page : null;
 }
@@ -380,7 +384,7 @@ type WorkspacePageState = {
 type WorkspacePageAction =
   | { type: "select"; pageId: string }
   | { type: "clear-pending-selection"; pageId: string }
-  | { type: "load"; pages: Page[] }
+  | { type: "load"; pages: Page[]; preservePageIds?: ReadonlySet<string> }
   | { type: "merge"; pages: Page[] }
   | { type: "merge-restored"; pages: Page[]; rootPageId: string | null }
   | { type: "remove"; pageIds: ReadonlySet<string> }
@@ -434,7 +438,11 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
     };
   }
   if (action.type === "load") {
-    const pages = mergePageSnapshot(state.pages, action.pages);
+    const snapshotPageIds = new Set(action.pages.map((page) => page.id));
+    const preservedPages = action.preservePageIds
+      ? state.pages.filter((page) => action.preservePageIds!.has(page.id) && !snapshotPageIds.has(page.id))
+      : [];
+    const pages = mergePageSnapshot(state.pages, [...action.pages, ...preservedPages]);
     const pageIds = new Set(pages.map((page) => page.id));
     const pendingSelectionResolved = state.pendingSelectionId !== null && pageIds.has(state.pendingSelectionId);
     const selectedId = pendingSelectionResolved
@@ -789,6 +797,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [trashRefreshVersion, setTrashRefreshVersion] = useState(0);
   const [trashLoading, setTrashLoading] = useState(false);
   const [pageTreeRetrying, setPageTreeRetrying] = useState(false);
+  const [pageAccessLoading, setPageAccessLoading] = useState(false);
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
   const [activitiesOpen, setActivitiesOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -801,6 +810,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [jobsError, setJobsError] = useState("");
   const [pendingJobId, setPendingJobId] = useState<string | null>(null);
   const [sidebarHiddenPageIds, setSidebarHiddenPageIds] = useState<ReadonlySet<string>>(() => new Set());
+  const sidebarHiddenPageIdsRef = useRef<ReadonlySet<string>>(new Set());
   const [spaces, setSpaces] = useState<Space[]>([]);
   const [activeSpaceId, setActiveSpaceId] = useState(
     () => localStorage.getItem(`notes:active-space:${member.workspace.id}`) ?? "",
@@ -849,7 +859,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const activePageTreeRetryRef = useRef<{
     target: PageTreeRetryTarget;
     errorAttempt: WorkspaceErrorAttempt;
-    pendingPageId: string | null;
+    controller: AbortController;
+  } | null>(null);
+  const activePageAccessRequestRef = useRef<{
+    errorAttempt: WorkspaceErrorAttempt;
+    pendingPageId: string;
     controller: AbortController;
   } | null>(null);
   const trashMutationIdsRef = useRef(new Set<string>());
@@ -859,7 +873,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const organizationLoadGenerationRef = useRef(0);
   const pageTagsLoadGenerationRef = useRef(0);
   const selectedIdRef = useCommittedRef(selectedId);
+  const pendingSelectionIdRef = useCommittedRef(pendingSelectionId);
   const selectedSpaceIdRef = useRef<string | null>(null);
+  const setSidebarHiddenPage = useCallback((pageId: string, hidden: boolean) => {
+    const current = sidebarHiddenPageIdsRef.current;
+    if (current.has(pageId) === hidden) return;
+    const next = new Set(current);
+    if (hidden) next.add(pageId);
+    else next.delete(pageId);
+    sidebarHiddenPageIdsRef.current = next;
+    setSidebarHiddenPageIds(next);
+  }, []);
   const abortWorkspaceRequests = useCallback(() => {
     const activePageLoad = pageLoadRequest.current;
     if (activePageLoad) {
@@ -873,6 +897,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       activeTrashLoad.controller.abort();
     }
     activePageTreeRetryRef.current?.controller.abort();
+    activePageAccessRequestRef.current?.controller.abort();
   }, []);
   useEffect(() => {
     if (workspaceAbortController.current.signal.aborted) {
@@ -945,6 +970,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [isCurrentWorkspaceErrorAttempt],
   );
+  const clearResolvedPageAccessError = useCallback(
+    (incomingPages: Page[]) => {
+      const pendingPageId = pendingSelectionIdRef.current;
+      if (pendingPageId && incomingPages.some((page) => page.id === pendingPageId)) {
+        clearWorkspaceErrors({ source: "page-access" });
+      }
+    },
+    [clearWorkspaceErrors, pendingSelectionIdRef],
+  );
   const clearSettledCreateErrors = useCallback(() => {
     setWorkspaceErrors((current) => {
       const next = current.filter(
@@ -964,21 +998,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [clearWorkspaceErrors, finishWorkspaceErrorAttempt, startWorkspaceErrorAttempt],
   );
-  const cancelPageTreeRetry = useCallback(
-    (target: PageTreeRetryTarget) => {
-      const activeRetry = activePageTreeRetryRef.current;
-      if (!activeRetry || workspaceErrorAttemptKey(activeRetry.target) !== workspaceErrorAttemptKey(target)) {
-        invalidateWorkspaceErrorAttempt(target);
-        return;
-      }
-      clearWorkspaceErrors(activeRetry.errorAttempt);
-      finishWorkspaceErrorAttempt(activeRetry.errorAttempt);
-      activePageTreeRetryRef.current = null;
-      setPageTreeRetrying(false);
-      activeRetry.controller.abort();
-    },
-    [clearWorkspaceErrors, finishWorkspaceErrorAttempt, invalidateWorkspaceErrorAttempt],
-  );
   const startClearedWorkspaceErrorAttempt = useCallback(
     (target: WorkspaceErrorTarget) => {
       const attempt = startWorkspaceErrorAttempt(target);
@@ -987,30 +1006,45 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [clearWorkspaceErrors, startWorkspaceErrorAttempt],
   );
+  const cancelPageAccessRequest = useCallback(() => {
+    const activeRequest = activePageAccessRequestRef.current;
+    if (!activeRequest) {
+      invalidateWorkspaceErrorAttempt({ source: "page-access" });
+      return;
+    }
+    clearWorkspaceErrors(activeRequest.errorAttempt);
+    finishWorkspaceErrorAttempt(activeRequest.errorAttempt);
+    activePageAccessRequestRef.current = null;
+    setPageAccessLoading(false);
+    activeRequest.controller.abort();
+  }, [clearWorkspaceErrors, finishWorkspaceErrorAttempt, invalidateWorkspaceErrorAttempt]);
   const loadPageForNavigation = useCallback(
     async (pageId: string) => {
-      const current = activePageTreeRetryRef.current;
-      if (current?.target.source === "page-access" && current.pendingPageId === pageId) return;
-      if (current) cancelPageTreeRetry(current.target);
+      const current = activePageAccessRequestRef.current;
+      if (current?.pendingPageId === pageId) return;
+      if (current) cancelPageAccessRequest();
       const target = { source: "page-access" } as const;
       const errorAttempt = startWorkspaceErrorAttempt(target);
       const activeRequest = {
-        target,
         errorAttempt,
         pendingPageId: pageId,
         controller: new AbortController(),
       };
-      activePageTreeRetryRef.current = activeRequest;
-      setPageTreeRetrying(true);
+      activePageAccessRequestRef.current = activeRequest;
+      setPageAccessLoading(true);
       clearWorkspaceErrors(errorAttempt);
       try {
+        const requestSignal = AbortSignal.any([
+          activeRequest.controller.signal,
+          AbortSignal.timeout(PAGE_TREE_REQUEST_TIMEOUT_MS),
+        ]);
         const { page, sidebarHidden } = await api<{ page: Page; sidebarHidden?: boolean }>(
           `/api/pages/${encodeURIComponent(pageId)}`,
-          { signal: activeRequest.controller.signal },
+          { signal: requestSignal },
         );
-        if (activePageTreeRetryRef.current !== activeRequest) return;
+        if (activePageAccessRequestRef.current !== activeRequest) return;
         dispatchPageAction({ type: "merge", pages: [page] });
-        if (sidebarHidden) setSidebarHiddenPageIds((currentIds) => new Set(currentIds).add(page.id));
+        if (sidebarHidden) setSidebarHiddenPage(page.id, true);
         setActiveSpaceId(page.spaceId);
         localStorage.setItem(`notes:active-space:${member.workspace.id}`, page.spaceId);
       } catch (error) {
@@ -1019,48 +1053,47 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         }
       } finally {
         finishWorkspaceErrorAttempt(errorAttempt);
-        if (activePageTreeRetryRef.current === activeRequest) {
-          activePageTreeRetryRef.current = null;
-          setPageTreeRetrying(false);
+        if (activePageAccessRequestRef.current === activeRequest) {
+          activePageAccessRequestRef.current = null;
+          setPageAccessLoading(false);
         }
       }
     },
     [
-      cancelPageTreeRetry,
+      cancelPageAccessRequest,
       clearWorkspaceErrors,
       finishWorkspaceErrorAttempt,
       member.workspace.id,
       reportWorkspaceError,
+      setSidebarHiddenPage,
       startWorkspaceErrorAttempt,
     ],
   );
   const navigateToPage = useCallback(
-    (pageId: string) => {
-      const activeRetry = activePageTreeRetryRef.current;
-      if (activeRetry?.target.source !== "page-access" || activeRetry.pendingPageId !== pageId) {
-        cancelPageTreeRetry({ source: "page-access" });
-      }
-      const page = pages.find((candidate) => candidate.id === pageId);
+    (pageId: string, knownPage?: Page) => {
+      const page = knownPage ?? pages.find((candidate) => candidate.id === pageId);
       if (page) {
+        cancelPageAccessRequest();
         setActiveSpaceId(page.spaceId);
         localStorage.setItem(`notes:active-space:${member.workspace.id}`, page.spaceId);
       } else {
         void loadPageForNavigation(pageId);
       }
+      pendingSelectionIdRef.current = page ? null : pageId;
       dispatchPageAction({ type: "select", pageId });
       history.replaceState(null, "", `/?page=${encodeURIComponent(pageId)}`);
       setView("pages");
       closeSidebar(true);
     },
-    [cancelPageTreeRetry, closeSidebar, loadPageForNavigation, member.workspace.id, pages],
+    [cancelPageAccessRequest, closeSidebar, loadPageForNavigation, member.workspace.id, pages, pendingSelectionIdRef],
   );
 
   useEffect(() => {
-    const activeRetry = activePageTreeRetryRef.current;
-    if (activeRetry?.target.source === "page-access" && activeRetry.pendingPageId !== pendingSelectionId) {
-      cancelPageTreeRetry(activeRetry.target);
+    const activeRequest = activePageAccessRequestRef.current;
+    if (activeRequest && activeRequest.pendingPageId !== pendingSelectionId) {
+      cancelPageAccessRequest();
     }
-  }, [cancelPageTreeRetry, pendingSelectionId]);
+  }, [cancelPageAccessRequest, pendingSelectionId]);
 
   const recordPageUpserts = useCallback((incoming: Page[]) => {
     pendingPageEvents.current.recordUpserts(incoming);
@@ -1117,7 +1150,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         const serverPageIds = new Set(data.pages.map((page) => page.id));
         const tombstones = archiveRemovalTombstones.applyLoad(serverPageIds, loadGeneration);
         const authoritativePages = observed.pages.filter((page) => !tombstones.has(page.id));
-        dispatchPageAction({ type: "load", pages: authoritativePages });
+        clearResolvedPageAccessError(authoritativePages);
+        const preservePageIds = new Set(
+          [selectedIdRef.current, pendingSelectionIdRef.current].filter(
+            (pageId): pageId is string => pageId !== null && sidebarHiddenPageIdsRef.current.has(pageId),
+          ),
+        );
+        dispatchPageAction({
+          type: "load",
+          pages: authoritativePages,
+          preservePageIds,
+        });
         setWorkspaceErrors((current) => {
           const next = current.filter((error) => error.source !== "archive" || observed.ids.has(error.scope));
           return next.length === current.length ? current : next;
@@ -1125,7 +1168,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         if (pageTreeErrorRevisionRef.current === pageTreeErrorRevision) {
           clearWorkspaceErrors({ source: "page-tree" });
         }
-        return { serverPages: data.pages, removedDuringLoad: removals };
+        return {
+          serverPages: data.pages,
+          availablePageIds: new Set(authoritativePages.map((page) => page.id)),
+          removedDuringLoad: removals,
+        };
       })
       .catch((error) => {
         if (pageLoadRequest.current?.promise === loading) pendingPageEvents.current.cancel();
@@ -1136,7 +1183,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       });
     pageLoadRequest.current = { controller, promise: loading };
     return loading;
-  }, [archiveRemovalTombstones, clearWorkspaceErrors]);
+  }, [
+    archiveRemovalTombstones,
+    clearResolvedPageAccessError,
+    clearWorkspaceErrors,
+    pendingSelectionIdRef,
+    selectedIdRef,
+  ]);
   const loadFreshPages = useCallback(
     async (observerSignal: AbortSignal) => {
       observerSignal.throwIfAborted();
@@ -1725,7 +1778,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
   function editTemplate(template: Page) {
     dispatchPageAction({ type: "merge", pages: [template] });
-    navigateToPage(template.id);
+    navigateToPage(template.id, template);
   }
 
   async function openJobResult(job: Job) {
@@ -1738,7 +1791,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setActiveSpaceId(data.page.spaceId);
       localStorage.setItem(`notes:active-space:${member.workspace.id}`, data.page.spaceId);
       setActivitiesOpen(false);
-      navigateToPage(data.page.id);
+      navigateToPage(data.page.id, data.page);
     } catch (error) {
       setJobsError(apiErrorMessage(error, "The completed page could not be opened."));
     } finally {
@@ -1782,6 +1835,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         for (const page of event.pages) invalidatePagePreview(page.id);
         const visiblePages = event.pages.filter((page) => !archiveRemovalTombstones.has(page.id));
         if (visiblePages.length) {
+          clearResolvedPageAccessError(visiblePages);
           if (event.restored) {
             dispatchPageAction({ type: "merge-restored", pages: visiblePages, rootPageId: restoredRootId });
             excludeConfirmedRestoresFromTrash(visiblePages);
@@ -1826,6 +1880,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     },
     [
       archiveRemovalTombstones,
+      clearResolvedPageAccessError,
       clearConfirmedRestores,
       excludeConfirmedRestoresFromTrash,
       loadJobs,
@@ -2159,7 +2214,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           reportWorkspaceError(attempt, "The page was created, but it is no longer available.");
           return;
         }
-        navigateToPage(result.value.id);
+        navigateToPage(result.value.id, result.value);
         return;
       }
       closeSidebar(true);
@@ -2190,7 +2245,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const created = observation && observedExpectedPage(observation, expectation);
       if (created) {
         clearSettledCreateErrors();
-        navigateToPage(created.id);
+        navigateToPage(created.id, created);
       }
     } catch (error) {
       if (signal.aborted) return;
@@ -2453,7 +2508,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const activeRetry = {
       target: errorTarget,
       errorAttempt,
-      pendingPageId: errorTarget.source === "page-access" ? pendingSelectionId : null,
       controller: new AbortController(),
     };
     activePageTreeRetryRef.current = activeRetry;
@@ -2481,7 +2535,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     void loadPageForNavigation(pendingSelectionId);
   }
   function cancelPendingSelection() {
-    cancelPageTreeRetry({ source: "page-access" });
+    cancelPageAccessRequest();
     if (!pendingSelectionId) return;
     dispatchPageAction({ type: "clear-pending-selection", pageId: pendingSelectionId });
   }
@@ -2494,6 +2548,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const pageUnavailable = useCallback(
     (pageId: string) => {
+      setSidebarHiddenPage(pageId, false);
       clearConfirmedRestores([pageId]);
       archiveRemovalTombstones.pin([pageId], pageLoadGeneration.current);
       const signal = workspaceAbortController.current.signal;
@@ -2506,7 +2561,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         reportWorkspaceError({ source: "page-tree" }, refreshError);
       });
     },
-    [archiveRemovalTombstones, clearConfirmedRestores, loadFreshPages, reportWorkspaceError],
+    [archiveRemovalTombstones, clearConfirmedRestores, loadFreshPages, reportWorkspaceError, setSidebarHiddenPage],
   );
   const documentAccessDenied = useCallback(
     (pageId: string, error: ApiClientError) => {
@@ -2994,7 +3049,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             message={pendingPageError ?? "This page has not reached the workspace tree yet. It may still be syncing."}
             onCancel={cancelPendingSelection}
             onRetry={retryPendingSelection}
-            retrying={pageTreeRetrying}
+            retrying={pageAccessLoading}
             retryLabel="Try loading page again"
             retryingLabel="Loading…"
           />
