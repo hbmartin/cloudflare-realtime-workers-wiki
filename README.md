@@ -6,7 +6,7 @@ Documents use BlockNote backed by Yjs, while diagrams use React Flow backed by t
 
 ## What works
 
-- Operator-token bootstrap, Better Auth email/password sessions, one-use invites, and owner/editor/viewer roles.
+- Operator-token bootstrap, mandatory authenticator or passkey enrollment, fixed 30-day trusted browsers, one-use invites, and owner/editor/viewer roles.
 - Workspace and private spaces, nested pages, favorites, pins, tags, templates, archive/restore, queued deletion, and scoped weighted FTS5 search.
 - Realtime BlockNote editing, awareness, local undo, offline IndexedDB, hidden-tab disconnects, server-enforced viewer read-only access, and five-minute connection reauthorization.
 - First-class realtime diagrams with React Flow stencils, connectors, frames, page links, member mentions, presence, node/edge comments, local undo, generated SVG thumbnails, and reconnectable network-required editing.
@@ -39,6 +39,8 @@ pnpm dev
 ```
 
 Set a strong local `BETTER_AUTH_SECRET` and choose a `BOOTSTRAP_TOKEN` in `.dev.vars`. Open `http://localhost:5173`, enter that token on the first-run screen, and create the owner.
+
+Every account must enroll an authenticator or passkey and save recovery codes before entering the workspace. See [account protection, recovery, and rollout](docs/ACCOUNT_SECURITY.md). Migration 0028 invalidates existing sessions.
 
 Useful checks:
 

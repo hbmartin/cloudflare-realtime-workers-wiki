@@ -68,9 +68,13 @@ import { IntegrationsSettings } from "./IntegrationsSettings";
 
 const DiagramPage = lazy(() => import("./DiagramPage").then((module) => ({ default: module.DiagramPage })));
 
+import type { SecurityStatus } from "../shared/security";
+import { SecurityScreen, finishPasswordSignIn } from "./SecurityScreen";
+
 type AppState =
   | { screen: "loading" }
   | { screen: "bootstrap" }
+  | { screen: "security"; status: SecurityStatus }
   | { screen: "signin"; message?: string }
   | { screen: "invite"; token: string }
   | { screen: "workspace"; member: ClientMemberContext };
@@ -539,10 +543,17 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
 }
 
 async function resolveAppState(): Promise<AppState> {
-  const invite = new URLSearchParams(window.location.search).get("invite");
-  if (invite) return { screen: "invite", token: invite };
+  const invite = new URLSearchParams(window.location.search).get("invite") || sessionStorage.getItem("pending-invite");
   const install = await api<{ initialized: boolean }>("/api/install");
   if (!install.initialized) return { screen: "bootstrap" };
+  const status = await api<SecurityStatus>("/api/security/status");
+  if (status.state === "signed_out") return invite ? { screen: "invite", token: invite } : { screen: "signin" };
+  if (status.state !== "ready") return { screen: "security", status };
+  if (invite) {
+    await api("/api/invites/complete", { method: "POST", body: json({ token: invite }) });
+    sessionStorage.removeItem("pending-invite");
+    history.replaceState(null, "", "/");
+  }
   try {
     const member = await api<ClientMemberContext>("/api/me");
     return { screen: "workspace", member };
@@ -555,10 +566,17 @@ async function resolveAppState(): Promise<AppState> {
 export function App() {
   const [state, setState] = useState<AppState>({ screen: "loading" });
   const signOut = useCallback(() => setState({ screen: "signin" }), []);
-  const sessionExpired = useCallback((error: ApiClientError) => {
+  const sessionExpired = useCallback((failure: ApiClientError) => {
+    if (["enrollment_required", "challenge_required", "recovery_required"].includes(failure.code)) {
+      setState({ screen: "loading" });
+      void resolveAppState()
+        .then(setState)
+        .catch(() => setState({ screen: "signin" }));
+      return;
+    }
     setState((current) =>
       current.screen === "workspace"
-        ? { screen: "signin", message: apiErrorMessage(error, "Your session expired. Sign in again.") }
+        ? { screen: "signin", message: apiErrorMessage(failure, "Your session expired. Sign in again.") }
         : current,
     );
   }, []);
@@ -573,13 +591,14 @@ export function App() {
 
   if (state.screen === "loading") return <LoadingSplash />;
   if (state.screen === "bootstrap") return <BootstrapScreen onComplete={load} />;
+  if (state.screen === "security") return <SecurityScreen initialStatus={state.status} onComplete={load} />;
   if (state.screen === "invite")
     return (
       <InviteScreen
         token={state.token}
         onComplete={() => {
-          history.replaceState(null, "", "/");
-          void load();
+          sessionStorage.setItem("pending-invite", state.token);
+          void finishPasswordSignIn().then(load);
         }}
       />
     );
@@ -732,6 +751,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
         setError(result.error.message?.trim() || "Sign in failed.");
         return;
       }
+      await finishPasswordSignIn();
       await onComplete();
     } catch (cause) {
       setError(apiErrorMessage(cause, "Sign in failed."));
@@ -747,6 +767,24 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
     >
       <form className="auth-form" onSubmit={submit}>
         <h2>Sign in</h2>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            setError("");
+            void authClient.signIn
+              .passkey()
+              .then(async (result) => {
+                if (result.error) throw new Error(result.error.message || "Passkey sign-in failed.");
+                await onComplete();
+              })
+              .catch((cause) => setError(apiErrorMessage(cause, "Passkey sign-in failed.")))
+              .finally(() => setBusy(false));
+          }}
+        >
+          Sign in with a passkey
+        </button>
         <label>
           Email
           <input name="email" type="email" required autoFocus />
@@ -3597,6 +3635,7 @@ function MembersView({ member, spaces, pages }: { member: ClientMemberContext; s
           </div>
         ))}
       </div>
+      <SecurityScreen settings />
       <SlackSettings owner={member.role === "owner"} spaces={spaces} pages={pages} />
       <IntegrationsSettings owner={member.role === "owner"} pages={pages} />
     </main>

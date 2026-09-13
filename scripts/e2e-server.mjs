@@ -8,7 +8,7 @@ const cloudflareEnvironment = "notes-checks-e2e";
 const devVarsPath = resolve(root, `.dev.vars.${cloudflareEnvironment}`);
 const devVars = [
   "BETTER_AUTH_SECRET=e2e-secret-with-at-least-32-characters",
-  "BETTER_AUTH_URL=http://127.0.0.1:4173",
+  "BETTER_AUTH_URL=http://localhost:4173",
   "BOOTSTRAP_TOKEN=e2e-bootstrap-token",
   "",
 ].join("\n");

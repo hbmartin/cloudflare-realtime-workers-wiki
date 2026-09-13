@@ -2,8 +2,10 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
+import { createOTP } from "@better-auth/utils/otp";
+import { base32 } from "@better-auth/utils/base32";
 
-const localBaseURL = "http://127.0.0.1:4173";
+const localBaseURL = "http://localhost:4173";
 const baseURL = process.env.NOTES_LOAD_BASE_URL || localBaseURL;
 const connectionCount = Number.parseInt(process.env.NOTES_LOAD_CONNECTIONS || "30", 10);
 const holdMilliseconds = Number.parseInt(process.env.NOTES_LOAD_HOLD_MS || "5000", 10);
@@ -30,7 +32,10 @@ async function waitForHealth() {
 }
 
 function sessionCookie(response) {
-  return response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  return response.headers
+    .getSetCookie()
+    .map((value) => value.split(";", 1)[0])
+    .join("; ");
 }
 
 async function post(path, body, cookie = "") {
@@ -56,12 +61,35 @@ async function authenticate() {
       password,
     });
     if (!response.ok) throw new Error(`Bootstrap failed (${response.status}).`);
-    return sessionCookie(response);
+    const cookie = sessionCookie(response);
+    const setup = await post("/api/security/setup-totp", { password }, cookie);
+    if (!setup.ok) throw new Error(`Authenticator setup failed (${setup.status}).`);
+    const { totpURI } = await setup.json();
+    const secret = new TextDecoder().decode(base32.decode(new URL(totpURI).searchParams.get("secret")));
+    const verified = await post("/api/security/confirm-totp", { code: await createOTP(secret).totp() }, cookie);
+    if (!verified.ok) throw new Error(`Authenticator verification failed (${verified.status}).`);
+    const complete = sessionCookie(verified);
+    const codes = await post("/api/security/recovery-codes", {}, complete);
+    if (!codes.ok) throw new Error(`Recovery setup failed (${codes.status}).`);
+    const { receipt } = await codes.json();
+    const acknowledged = await post("/api/security/acknowledge-codes", { receipt }, complete);
+    if (!acknowledged.ok) throw new Error(`Recovery acknowledgment failed (${acknowledged.status}).`);
+    return complete;
   }
 
   const response = await post("/api/auth/sign-in/email", { email, password, callbackURL: "/" });
   if (!response.ok) throw new Error(`Sign in failed (${response.status}).`);
-  return sessionCookie(response);
+  const cookie = sessionCookie(response);
+  const result = await response.clone().json();
+  if (!result.twoFactorRedirect) return cookie;
+  const secret = process.env.NOTES_LOAD_TOTP_SECRET;
+  const code =
+    process.env.NOTES_LOAD_TOTP_CODE ||
+    (secret ? await createOTP(new TextDecoder().decode(base32.decode(secret))).totp() : "");
+  if (!code) throw new Error("Set NOTES_LOAD_TOTP_CODE or NOTES_LOAD_TOTP_SECRET for the enrolled load-test account.");
+  const verified = await post("/api/auth/two-factor/verify-totp", { code, trustDevice: false }, cookie);
+  if (!verified.ok) throw new Error(`Second-factor verification failed (${verified.status}).`);
+  return sessionCookie(verified);
 }
 
 try {

@@ -1,37 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 
-const owner = {
-  email: "owner@example.test",
-  password: "password123",
-};
-
-async function signIn(page: Page) {
-  await page.goto("/");
-  const initialized = await page.request
-    .get("/api/install")
-    .then(async (response) => (await response.json()) as { initialized: boolean });
-  if (!initialized.initialized) {
-    await page.getByLabel("Workspace name").fill("E2E Notes");
-    await page.getByLabel("Your name").fill("E2E Owner");
-    await page.getByLabel("Email").fill(owner.email);
-    await page.getByLabel("Password").fill(owner.password);
-    await page.getByLabel("Bootstrap token").fill("e2e-bootstrap-token");
-    await page.getByRole("button", { name: "Create workspace" }).click();
-  } else {
-    // The app settles on the sign-in screen or the workspace only after it has
-    // checked the session, so wait for one of them before deciding: an instant
-    // isVisible() races that render and skips the sign-in form entirely.
-    const signInHeading = page.getByRole("heading", { name: "Sign in" });
-    await expect(signInHeading.or(page.getByLabel("Page title")).first()).toBeVisible();
-    if (await signInHeading.isVisible()) {
-      await page.getByLabel("Email").fill(owner.email);
-      await page.getByLabel("Password").fill(owner.password);
-      await page.getByRole("button", { name: "Continue" }).click();
-    }
-  }
-  await expect(page.getByLabel("Page title")).toBeVisible();
-}
+import { signInOwner as signIn, completeEnrollment } from "./security-helpers";
 
 async function openSidebar(page: Page) {
   // Below the 760px breakpoint the sidebar is an off-canvas drawer. Decide from
@@ -84,6 +54,7 @@ async function acceptInvite(context: BrowserContext, inviteURL: string, role: "e
   await page.getByLabel("Email").fill(`${role}-${suffix}@example.test`);
   await page.getByLabel("Password").fill("password123");
   await page.getByRole("button", { name: "Accept invite" }).click();
+  await completeEnrollment(page);
   await expect(page.getByLabel("Page title")).toBeVisible();
   return page;
 }

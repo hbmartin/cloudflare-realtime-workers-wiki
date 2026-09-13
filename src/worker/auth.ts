@@ -1,15 +1,54 @@
 import { betterAuth } from "better-auth";
+import { passkey } from "@better-auth/passkey";
+import { APIError } from "better-auth/api";
+import { twoFactor } from "better-auth/plugins";
+import { mandatorySecurity, requireSecurity } from "./security";
 import type { MemberContext } from "./env";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 
-export function createAuth(env: Env) {
+export function createAuth(env: Env, allowRegistration = false) {
   return betterAuth({
     database: env.DB,
     secret: env.BETTER_AUTH_SECRET,
     baseURL: env.BETTER_AUTH_URL,
+    appName: "Realtime Notes",
+    advanced: { ipAddress: { ipAddressHeaders: ["cf-connecting-ip"] } },
+    rateLimit: { enabled: true, storage: "database", window: 60, max: 100 },
+    session: { cookieCache: { enabled: false } },
+    plugins: [
+      twoFactor(),
+      passkey({
+        rpID: new URL(env.BETTER_AUTH_URL).hostname,
+        rpName: "Realtime Notes",
+        origin: new URL(env.BETTER_AUTH_URL).origin,
+        authenticatorSelection: { residentKey: "required", userVerification: "required" },
+        registration: {
+          afterVerification: async ({ verification }) => {
+            if (!verification.registrationInfo?.userVerified) {
+              throw new APIError("FORBIDDEN", {
+                code: "USER_VERIFICATION_REQUIRED",
+                message: "Verify with your device PIN or biometrics.",
+              });
+            }
+          },
+        },
+        authentication: {
+          afterVerification: async ({ verification }) => {
+            if (!verification.authenticationInfo.userVerified) {
+              throw new APIError("FORBIDDEN", {
+                code: "USER_VERIFICATION_REQUIRED",
+                message: "Verify with your device PIN or biometrics.",
+              });
+            }
+          },
+        },
+      }),
+      mandatorySecurity(env),
+    ],
     emailAndPassword: {
       enabled: true,
+      disableSignUp: !allowRegistration,
       minPasswordLength: 8,
     },
     telemetry: { enabled: false },
@@ -19,6 +58,7 @@ export function createAuth(env: Env) {
 async function getMember(request: Request, env: Env): Promise<MemberContext | null> {
   const session = await createAuth(env).api.getSession({ headers: request.headers });
   if (!session) return null;
+  const assuranceExpiresAt = await requireSecurity(env, session.user.id, session.session.id);
 
   const row = await env.DB.prepare(
     `SELECT w.id workspace_id, w.name workspace_name, w.location_hint, wm.role
@@ -38,7 +78,10 @@ async function getMember(request: Request, env: Env): Promise<MemberContext | nu
   if (!row) return null;
   return {
     user: { id: session.user.id, name: session.user.name, email: session.user.email },
-    session: { id: session.session.id, expiresAt: session.session.expiresAt },
+    session: {
+      id: session.session.id,
+      expiresAt: new Date(Math.min(session.session.expiresAt.getTime(), assuranceExpiresAt)),
+    },
     workspace: {
       id: row.workspace_id,
       name: row.workspace_name,

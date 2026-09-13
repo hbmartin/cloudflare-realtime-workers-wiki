@@ -2,6 +2,7 @@ import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fracti
 import { Hono, type Context } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
+import { requireSecurity } from "./security";
 import { ARCHIVE_DISCONNECT_RUN_LIMIT, processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
 import {
   isInlineMime,
@@ -690,7 +691,7 @@ async function authEmail(
   const headers = new Headers(request.headers);
   headers.set("content-type", "application/json");
   headers.set("origin", new URL(env.BETTER_AUTH_URL).origin);
-  const response = await createAuth(env).handler(
+  const response = await createAuth(env, path === "/api/auth/sign-up/email").handler(
     new Request(url, {
       method: "POST",
       headers,
@@ -698,7 +699,8 @@ async function authEmail(
     }),
   );
   if (!response.ok) return { response, user: null };
-  const payload = await response.clone().json<{ user?: { id: string } }>();
+  const payload = await response.clone().json<{ user?: { id: string }; twoFactorRedirect?: boolean }>();
+  if (payload.twoFactorRedirect) return { response, user: null };
   if (!payload.user) throw new HttpError(500, "signup_failed", "The account was created without a user record.");
   return { response, user: payload.user };
 }
@@ -1121,27 +1123,44 @@ app.post("/api/invites/accept", async (c) => {
         email: inviteEmail,
         password: text(body.password, "password", 200),
       });
-  if (!signup.user) return signup.response;
-  const existingMembership = await c.env.DB.prepare(
-    `SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?`,
-  )
-    .bind(invite.workspace_id, signup.user.id)
-    .first();
-  if (existingMembership) return signup.response;
-  const timestamp = now();
+  return signup.response;
+});
+
+app.post("/api/invites/complete", async (c) => {
+  assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
+  const session = await createAuth(c.env).api.getSession({ headers: c.req.raw.headers });
+  if (!session) throw new HttpError(401, "unauthorized", "Sign in to continue.");
+  await requireSecurity(c.env, session.user.id, session.session.id);
+  const body = await jsonBody(c.req.raw);
+  const hash = await sha256(text(body.token, "token", 500));
+  const time = now();
+  // Claim and membership insertion are in the same D1 transaction. The used_by
+  // predicate makes retries by this account idempotent without admitting rivals.
   const result = await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
-       SELECT workspace_id, ?, role, ? FROM invites WHERE id = ? AND used_at IS NULL`,
-    ).bind(signup.user.id, timestamp, invite.id),
-    c.env.DB.prepare(`UPDATE invites SET used_by = ?, used_at = ? WHERE id = ? AND used_at IS NULL`).bind(
-      signup.user.id,
-      timestamp,
-      invite.id,
+      `UPDATE invites SET used_by=?,used_at=? WHERE token_hash=? AND used_at IS NULL AND expires_at>?`,
+    ).bind(session.user.id, time, hash, time),
+    c.env.DB.prepare(`INSERT OR IGNORE INTO workspace_members(workspace_id,user_id,role,created_at)
+      SELECT workspace_id,used_by,role,? FROM invites WHERE token_hash=? AND used_by=? AND expires_at>?`).bind(
+      time,
+      hash,
+      session.user.id,
+      time,
+    ),
+    c.env.DB.prepare("SELECT id FROM invites WHERE token_hash=? AND used_by=? AND expires_at>?").bind(
+      hash,
+      session.user.id,
+      time,
     ),
   ]);
-  if (!result[1]!.meta.changes) throw new HttpError(409, "invite_used", "This invite was used by another request.");
-  return signup.response;
+  if (!result[2]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
+  return c.json({ success: true });
+});
+
+app.all("/api/security/*", async (c) => {
+  const url = new URL(c.req.url);
+  url.pathname = url.pathname.replace("/api/security/", "/api/auth/security/");
+  return createAuth(c.env).handler(new Request(url, c.req.raw));
 });
 
 app.all("/api/auth/*", async (c) => {

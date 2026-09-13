@@ -1,3 +1,4 @@
+import { enrollAccount } from "../../tests/helpers/security";
 import { verifyWebhookSignature } from "@notionhq/client";
 import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -25,7 +26,7 @@ async function bootstrap() {
       password: "password123",
     }),
   });
-  const cookie = response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  const cookie = await enrollAccount(response);
   const me = await (
     await SELF.fetch("http://example.test/api/me", { headers: { cookie, origin: "http://example.test" } })
   ).json<{

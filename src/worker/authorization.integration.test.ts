@@ -1,3 +1,4 @@
+import { enrollAccount } from "../../tests/helpers/security";
 import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -24,7 +25,7 @@ async function bootstrap(): Promise<InstalledWorkspace> {
     }),
   });
   expect(response.status).toBe(200);
-  const cookie = response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  const cookie = await enrollAccount(response);
   const me = await (
     await SELF.fetch(request(cookie, "/api/me"))
   ).json<{ user: { id: string }; workspace: { id: string }; session?: unknown }>();
@@ -54,7 +55,7 @@ async function invite(ownerCookie: string, role: Exclude<Role, "owner">) {
     }),
   });
   expect(response.status).toBe(200);
-  return response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  return await enrollAccount(response, created.token);
 }
 
 beforeEach(async () => {

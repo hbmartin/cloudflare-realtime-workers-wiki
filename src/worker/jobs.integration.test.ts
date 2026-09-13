@@ -1,3 +1,4 @@
+import { enrollAccount } from "../../tests/helpers/security";
 import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
@@ -49,7 +50,7 @@ async function bootstrap(): Promise<InstalledWorkspace> {
     createExecutionContext(),
   );
   expect(response.status).toBe(200);
-  const cookie = response.headers.get("set-cookie")!.split(";", 1)[0]!;
+  const cookie = await enrollAccount(response);
   const me = await (
     await worker.fetch(request(cookie, "/api/me"), env, createExecutionContext())
   ).json<{

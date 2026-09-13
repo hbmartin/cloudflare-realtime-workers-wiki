@@ -100,6 +100,9 @@ function mockShellApi(options: { member?: ClientMemberContext; pages?: Page[]; j
   const pages = options.pages ?? [page];
   vi.mocked(api).mockImplementation(async (path) => {
     if (path === "/api/install") return { initialized: true };
+    if (path === "/api/security/status")
+      return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+    if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
     if (path === "/api/me") return currentMember;
     if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
     if (path === "/api/notifications?limit=1&unread=true") return { unreadCount: 0 };
@@ -149,6 +152,9 @@ function mockWorkspaceApi(treeReloadFailure?: ApiClientError, archiveFailure?: A
   let treeLoads = 0;
   vi.mocked(api).mockImplementation(async (path, init) => {
     if (path === "/api/install") return { initialized: true };
+    if (path === "/api/security/status")
+      return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+    if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
     if (path === "/api/me") return member;
     if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
     if (path === "/api/pages/tree?archived=true") return { pages: [] };
@@ -283,6 +289,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -336,6 +345,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -366,6 +378,9 @@ describe("App error handling", () => {
   it("uses the sign-in fallback for an empty Better Auth message", async () => {
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") throw new ApiClientError(401, "unauthorized", "Unauthorized.");
       throw new Error(`Unexpected API request: ${path}`);
     });
@@ -423,6 +438,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -480,6 +498,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -508,6 +529,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -539,6 +563,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -666,6 +693,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree?archived=true") return { pages: [page, child] };
@@ -710,6 +740,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -741,6 +774,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -784,6 +820,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -820,6 +859,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -850,6 +892,9 @@ describe("App error handling", () => {
   it("reports a create failure without an unhandled rejection", async () => {
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -891,6 +936,9 @@ describe("App error handling", () => {
     let creates = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -918,6 +966,9 @@ describe("App error handling", () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page, secondPage] };
@@ -953,6 +1004,9 @@ describe("App error handling", () => {
     onTestFinished(() => randomUUID.mockRestore());
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page, secondPage] };
@@ -991,6 +1045,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -1067,6 +1124,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1114,6 +1174,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1147,6 +1210,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1189,6 +1255,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1224,6 +1293,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1263,6 +1335,9 @@ describe("App error handling", () => {
     let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page, secondPage] };
@@ -1297,6 +1372,9 @@ describe("App error handling", () => {
     let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1338,6 +1416,9 @@ describe("App error handling", () => {
     let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1381,6 +1462,9 @@ describe("App error handling", () => {
     let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1425,6 +1509,9 @@ describe("App error handling", () => {
     let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1465,6 +1552,9 @@ describe("App error handling", () => {
     let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1526,6 +1616,9 @@ describe("App error handling", () => {
     let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1568,6 +1661,9 @@ describe("App error handling", () => {
     let receiptLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1602,6 +1698,9 @@ describe("App error handling", () => {
     const movement = deferred<{ page: Page }>();
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page, secondPage] };
@@ -1644,6 +1743,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1695,6 +1797,9 @@ describe("App error handling", () => {
     let moves = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page, secondPage] };
@@ -1731,6 +1836,9 @@ describe("App error handling", () => {
     onTestFinished(() => recordUpserts.mockRestore());
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -1765,6 +1873,9 @@ describe("App error handling", () => {
     onTestFinished(() => recordUpserts.mockRestore());
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -1804,6 +1915,9 @@ describe("App error handling", () => {
     onTestFinished(() => recordUpserts.mockRestore());
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page, secondPage] };
@@ -1838,6 +1952,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1871,6 +1988,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1915,6 +2035,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return owner;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -1962,6 +2085,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2001,6 +2127,9 @@ describe("App error handling", () => {
     });
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2057,6 +2186,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2098,6 +2230,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2154,6 +2289,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2220,6 +2358,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2258,6 +2399,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2293,6 +2437,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2332,6 +2479,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2359,6 +2509,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2390,6 +2543,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2435,6 +2591,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2474,6 +2633,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2511,6 +2673,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2573,6 +2738,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2612,6 +2780,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -2634,6 +2805,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2657,6 +2831,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2682,6 +2859,9 @@ describe("App error handling", () => {
     let unreadLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") {
         unreadLoads += 1;
@@ -2714,6 +2894,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2742,6 +2925,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2768,6 +2954,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2792,6 +2981,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2819,6 +3011,9 @@ describe("App error handling", () => {
     mocks.waitForReconciliationRetry.mockReturnValueOnce(retryDelay.promise);
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2855,6 +3050,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2881,6 +3079,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2906,6 +3107,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2938,6 +3142,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -2979,6 +3186,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -3011,6 +3221,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3063,6 +3276,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3111,6 +3327,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3155,6 +3374,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3191,6 +3413,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3219,6 +3444,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3246,6 +3474,9 @@ describe("App error handling", () => {
     mocks.waitForReconciliationRetry.mockReturnValueOnce(retryDelay.promise);
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3282,6 +3513,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [] };
@@ -3316,6 +3550,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [otherPage] };
@@ -3343,6 +3580,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -3368,6 +3608,9 @@ describe("App error handling", () => {
     const trashLoad = deferred<{ pages: Page[] }>();
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -3395,6 +3638,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [] };
@@ -3425,6 +3671,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3460,6 +3709,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3485,6 +3737,9 @@ describe("App error handling", () => {
     const archivedPage = { ...page, archivedAt: 2 };
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [] };
@@ -3506,6 +3761,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3533,6 +3791,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3558,6 +3819,9 @@ describe("App error handling", () => {
     let pageLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3889,6 +4153,9 @@ describe("App error handling", () => {
     let pageLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -3930,6 +4197,9 @@ describe("App error handling", () => {
     let pageLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -3959,6 +4229,9 @@ describe("App error handling", () => {
     const missingPage = { ...page, id: "event-page", position: "c0", title: "Event page" };
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -3986,6 +4259,9 @@ describe("App error handling", () => {
     let pageSignal: AbortSignal | undefined;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -4024,6 +4300,9 @@ describe("App error handling", () => {
     let directLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4059,6 +4338,9 @@ describe("App error handling", () => {
     let pageSignal: AbortSignal | undefined;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -4089,6 +4371,9 @@ describe("App error handling", () => {
     const firstLoad = deferred<{ page: Page; sidebarHidden: boolean }>();
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -4117,6 +4402,9 @@ describe("App error handling", () => {
     let trashRequestSignal: AbortSignal | undefined;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -4149,6 +4437,9 @@ describe("App error handling", () => {
     const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -4170,6 +4461,9 @@ describe("App error handling", () => {
     const missingPage = { ...page, id: "missing-page", position: "c0", title: "Missing" };
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -4195,6 +4489,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4227,6 +4524,9 @@ describe("App error handling", () => {
     let restoreCalls = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4266,6 +4566,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4310,6 +4613,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4351,6 +4657,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4378,6 +4687,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4449,6 +4761,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4491,6 +4806,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4528,6 +4846,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4562,6 +4883,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4608,6 +4932,9 @@ describe("App error handling", () => {
     let restoreCalls = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4649,6 +4976,9 @@ describe("App error handling", () => {
     let restoreCalls = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [] };
@@ -4682,6 +5012,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4716,6 +5049,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return owner;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [] };
@@ -4745,6 +5081,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return owner;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [] };
@@ -4782,6 +5121,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return owner;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4824,6 +5166,9 @@ describe("App error handling", () => {
     let restoreCalls = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -4873,6 +5218,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return owner;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [] };
@@ -4914,6 +5262,9 @@ describe("App error handling", () => {
     let deleteCalls = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return owner;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [] };
@@ -4950,6 +5301,9 @@ describe("App error handling", () => {
     let trashLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [] };
@@ -4979,6 +5333,9 @@ describe("App error handling", () => {
   it("does not describe failed trash data as empty", async () => {
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page] };
@@ -5000,6 +5357,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -5030,6 +5390,9 @@ describe("App error handling", () => {
     let mentionLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") {
         mentionLoads += 1;
@@ -5065,6 +5428,9 @@ describe("App error handling", () => {
     let treeLoads = 0;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") {
         throw new ApiClientError(503, "mentions_unavailable", "Mention count unavailable.");
@@ -5143,6 +5509,9 @@ describe("App error handling", () => {
     );
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") {
@@ -5266,6 +5635,9 @@ describe("App error handling", () => {
     const initialPageTags = deferred<{ tags: Tag[] }>();
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
       if (path === "/api/me") return member;
       if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
       if (path === "/api/pages/tree") return { pages: [page, secretPage] };
