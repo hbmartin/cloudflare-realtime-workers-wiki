@@ -9,3 +9,12 @@ export function normalizeGroupSpaceIds(value: unknown): Record<string, string> |
 export function uniqueMappedSpaceIds(mapping: Record<string, string> | undefined) {
   return new Set(mapping ? Object.values(mapping) : []);
 }
+
+export function importDestinationSpaceIds(
+  uploadSpaceId: string | null | undefined,
+  mapping: Record<string, string> | undefined,
+) {
+  const destinations = uniqueMappedSpaceIds(mapping);
+  if (!mapping && uploadSpaceId) destinations.add(uploadSpaceId);
+  return destinations;
+}

@@ -2075,14 +2075,23 @@ describe("job execution", () => {
     const installed = await bootstrap();
     const encoder = new TextEncoder();
     const exactId = "11110000000000000000000000002222";
+    const partialId = "cccc000000000000000000000000dddd";
     const zip = createZip([
       {
         path: `Export-demo/Exact ${exactId}.md`,
         bytes: encoder.encode("# Exact\n\nParent body\n"),
       },
       {
-        path: `Export-demo/Exact ${exactId}/Exact child aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md`,
+        path: "Export-demo/Exact/Exact child aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
         bytes: encoder.encode("# Exact child\n"),
+      },
+      {
+        path: `Export-demo/Partial ${partialId}.md`,
+        bytes: encoder.encode("# Partial\n\nParent body\n"),
+      },
+      {
+        path: "Export-demo/Partial cccc-dddd/Partial child dddddddddddddddddddddddddddddddd.md",
+        bytes: encoder.encode("# Partial child\n"),
       },
       {
         path: "Export-demo/Other 1111-2222/Fuzzy child bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md",
@@ -2105,7 +2114,7 @@ describe("job execution", () => {
         await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext())
       ).json<{ job: Job }>()
     ).job;
-    expect(inspected.result?.preview).toMatchObject({ roots: 2, nested: 1, unresolvedParents: 1 });
+    expect(inspected.result?.preview).toMatchObject({ roots: 3, nested: 2, unresolvedParents: 1 });
     expect(inspected.result?.preview?.groups?.map((group) => group.key)).toEqual(["Imported"]);
     expect(inspected.warnings).toContain("unresolved parent: 1");
 
@@ -2114,6 +2123,7 @@ describe("job execution", () => {
       request(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        body: JSON.stringify({ groupSpaceIds: {} }),
       }),
       inlineBindings(),
       confirmContext,
@@ -2125,7 +2135,9 @@ describe("job execution", () => {
       await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext())
     ).json<{ pages: Array<{ id: string; title: string; parentId: string | null }> }>();
     const exact = tree.pages.find((page) => page.title === "Exact")!;
+    const partial = tree.pages.find((page) => page.title === "Partial")!;
     expect(tree.pages.find((page) => page.title === "Exact child")?.parentId).toBe(exact.id);
+    expect(tree.pages.find((page) => page.title === "Partial child")?.parentId).toBe(partial.id);
     expect(tree.pages.find((page) => page.title === "Fuzzy child")?.parentId).toBeNull();
   });
 
@@ -2164,7 +2176,7 @@ describe("job execution", () => {
     );
     const preview = (await inspected.json<{ job: Job }>()).job.result?.preview;
     expect(preview?.groups?.map((group) => group.key)).toEqual(["Teamspace", "Private & Shared"]);
-    expect(preview?.pages).toBe(2);
+    expect(preview).toMatchObject({ pages: 2, assets: 0 });
   });
 
   it("keeps a single teamspace grouped when an export wrapper contains an index file", async () => {
@@ -2201,6 +2213,88 @@ describe("job execution", () => {
     expect(preview?.pages).toBe(1);
   });
 
+  it("groups each nested archive using its own export wrapper", async () => {
+    const installed = await bootstrap();
+    const zip = createZip([
+      {
+        path: "Part-1.zip",
+        bytes: createZip([
+          {
+            path: "Export-alpha/Alpha/Plan aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+            bytes: new TextEncoder().encode("# Plan\n"),
+          },
+        ]),
+      },
+      {
+        path: "Part-2.zip",
+        bytes: createZip([
+          {
+            path: "Export-beta/Beta/Home bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md",
+            bytes: new TextEncoder().encode("# Home\n"),
+          },
+        ]),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "multipart.zip", { type: "application/zip" }));
+    const context = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      context,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(context);
+
+    const inspected = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}`),
+      env,
+      createExecutionContext(),
+    );
+    const preview = (await inspected.json<{ job: Job }>()).job.result?.preview;
+    expect(preview?.groups?.map((group) => group.key)).toEqual(["Alpha", "Beta"]);
+    expect(preview).toMatchObject({ pages: 2, roots: 2, unresolvedParents: 0 });
+  });
+
+  it("uses distinct group keys for loose pages and a teamspace named Imported", async () => {
+    const installed = await bootstrap();
+    const zip = createZip([
+      {
+        path: "Export-demo/Loose aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+        bytes: new TextEncoder().encode("# Loose\n"),
+      },
+      {
+        path: "Export-demo/Imported/Doc bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md",
+        bytes: new TextEncoder().encode("# Doc\n"),
+      },
+      {
+        path: "Export-demo/Private & Shared/Home cccccccccccccccccccccccccccccccc.md",
+        bytes: new TextEncoder().encode("# Home\n"),
+      },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "imported-teamspace.zip", { type: "application/zip" }));
+    const context = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      context,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(context);
+
+    const inspected = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}`),
+      env,
+      createExecutionContext(),
+    );
+    const groups = (await inspected.json<{ job: Job }>()).job.result?.preview?.groups ?? [];
+    expect(groups.map((group) => group.key)).toEqual(["Imported", "Teamspace: Imported", "Private & Shared"]);
+    expect(groups.map((group) => group.name)).toEqual(["Imported", "Imported", "Private & Shared"]);
+  });
+
   it("does not treat a real page whose title starts with Export- as an archive wrapper", async () => {
     const installed = await bootstrap();
     const parentId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2210,7 +2304,7 @@ describe("job execution", () => {
         bytes: new TextEncoder().encode("# Export-Plan\n"),
       },
       {
-        path: `Export-Plan ${parentId}/Child bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md`,
+        path: "Export-Plan/Child bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md",
         bytes: new TextEncoder().encode("# Child\n"),
       },
     ]);
@@ -2397,6 +2491,7 @@ describe("job execution", () => {
       request(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        body: JSON.stringify({ groupSpaceIds: {} }),
       }),
       inlineBindings(),
       confirmContext,

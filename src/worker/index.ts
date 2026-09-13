@@ -100,7 +100,7 @@ import type {
 import { compareBinaryText } from "../shared/tree-model";
 import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
-import { normalizeGroupSpaceIds, uniqueMappedSpaceIds } from "../shared/import-space-mapping";
+import { importDestinationSpaceIds, normalizeGroupSpaceIds } from "../shared/import-space-mapping";
 import { constantTimeEqual } from "../shared/security";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
@@ -1774,11 +1774,12 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
       throw new HttpError(422, "invalid_space_mapping", "Choose a destination space for every import group.");
     }
   }
-  const destinations = uniqueMappedSpaceIds(groupSpaceIds ?? undefined);
-  if (!groupedImport && (!groupSpaceIds || !Object.hasOwn(groupSpaceIds, "Imported"))) {
-    if (!job.space_id) throw new HttpError(409, "space_required", "The import destination space is missing.");
-    destinations.add(job.space_id);
+  const savedGroupSpaceIds =
+    !groupedImport && groupSpaceIds && !Object.hasOwn(groupSpaceIds, "Imported") ? undefined : groupSpaceIds;
+  if (!savedGroupSpaceIds && !job.space_id) {
+    throw new HttpError(409, "space_required", "The import destination space is missing.");
   }
+  const destinations = importDestinationSpaceIds(job.space_id, savedGroupSpaceIds ?? undefined);
   for (const spaceId of destinations) await editableSpaceForMember(c.env, member, spaceId);
   const instanceId = crypto.randomUUID();
   const queued = await c.env.DB.prepare(
@@ -1791,8 +1792,8 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
       JSON.stringify({
         ...options,
         confirmed: true,
+        groupSpaceIds: savedGroupSpaceIds,
         ...(groups.length ? { previewGroupKeys: groups.map((group) => group.key) } : {}),
-        ...(groupSpaceIds ? { groupSpaceIds } : {}),
       }),
       now(),
       job.id,
@@ -1914,12 +1915,7 @@ async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow) {
     const mappings = normalizeGroupSpaceIds(options.groupSpaceIds);
     if (mappings === null)
       throw new HttpError(409, "job_options_invalid", "This import's saved space mappings are invalid.");
-    const destinations = uniqueMappedSpaceIds(mappings);
-    const previewGroupKeys = options.previewGroupKeys;
-    const usesFallback =
-      !Array.isArray(previewGroupKeys) ||
-      previewGroupKeys.some((group) => typeof group !== "string" || !mappings || !Object.hasOwn(mappings, group));
-    if (usesFallback && job.space_id) destinations.add(job.space_id);
+    const destinations = importDestinationSpaceIds(job.space_id, mappings);
     for (const spaceId of destinations) await editableSpaceForMember(env, member, spaceId);
     return;
   }

@@ -62,7 +62,11 @@ type NotionPageEntry = ZipEntry & {
   title: string;
   notionId: string | null;
 };
-type NotionGrouping = { wrapper: string | null; teamspaces: ReadonlySet<string> };
+type NotionGrouping = {
+  wrappers: ReadonlyMap<string, ReadonlySet<string>>;
+  teamspaceKeys: ReadonlyMap<string, string>;
+  groupNames: ReadonlyMap<string, string>;
+};
 
 function record(value: string) {
   const parsed: unknown = JSON.parse(value);
@@ -160,56 +164,108 @@ function notionRelativeSegments(source: string) {
   return segments.slice(archive + 1);
 }
 
-function groupingFor(sources: string[]): NotionGrouping {
-  const relative = sources.map(notionRelativeSegments);
-  const wrapperCandidates = new Set(
-    relative
-      .filter((segments) => segments.length >= 2 && /^Export-/i.test(segments[0]!))
-      .map((segments) => segments[0]!),
-  );
-  const candidate = wrapperCandidates.size === 1 ? wrapperCandidates.values().next().value! : null;
-  const wrapper =
-    candidate && !relative.some((segments) => segments.length === 1 && stem(segments[0]!) === candidate)
-      ? candidate
-      : null;
-  if (!wrapper) return { wrapper: null, teamspaces: new Set() };
-  const directPageStems = new Set(
-    relative
-      .filter(
-        (segments) =>
-          segments[0] === wrapper &&
-          segments.length === 2 &&
-          [".html", ".htm", ".md", ".markdown", ".csv"].includes(extension(segments[1]!)),
-      )
-      .map((segments) => stem(segments[1]!)),
-  );
-  const inferredTeamspaces = new Set(
-    relative
-      .filter((segments) => segments[0] === wrapper && segments.length >= 3)
-      .map((segments) => segments[1]!)
-      .filter((name) => !directPageStems.has(name)),
-  );
-  const teamspaces =
-    directPageStems.size === 0 ||
-    inferredTeamspaces.size > 1 ||
-    [...inferredTeamspaces].some((name) => /private\s*&\s*shared/i.test(name))
-      ? inferredTeamspaces
-      : new Set<string>();
-  return { wrapper, teamspaces };
+function notionArchivePrefix(source: string) {
+  const segments = source.split("/");
+  const archive = segments.findLastIndex((segment) => /\.zip$/i.test(segment));
+  return segments.slice(0, archive + 1).join("/");
+}
+
+function wrapperPathsFor(sources: string[]) {
+  const byArchive = new Map<string, string[][]>();
+  for (const source of sources) {
+    const prefix = notionArchivePrefix(source);
+    const paths = byArchive.get(prefix) ?? [];
+    paths.push(notionRelativeSegments(source));
+    byArchive.set(prefix, paths);
+  }
+  const wrappers = new Set<string>();
+  for (const [prefix, paths] of byArchive) {
+    const candidates = new Set(
+      paths
+        .filter((segments) => segments.length >= 2 && /^Export-/i.test(segments[0]!))
+        .map((segments) => segments[0]!),
+    );
+    const topLevelPageNames = paths
+      .filter((segments) => segments.length === 1)
+      .map((segments) => stripNotionId(stem(segments[0]!)));
+    for (const candidate of candidates) {
+      if (topLevelPageNames.includes(stripNotionId(candidate))) continue;
+      wrappers.add(prefix ? `${prefix}/${candidate}` : candidate);
+    }
+  }
+  return wrappers;
+}
+
+function wrapperPathFor(source: string, wrappers: { has(value: string): boolean }) {
+  const segments = notionRelativeSegments(source);
+  const prefix = notionArchivePrefix(source);
+  const candidate = prefix ? `${prefix}/${segments[0] ?? ""}` : (segments[0] ?? "");
+  return wrappers.has(candidate) ? candidate : null;
+}
+
+function groupingFor(
+  sources: string[],
+  owners: ReadonlyMap<string, string>,
+  wrapperPaths: ReadonlySet<string>,
+): NotionGrouping {
+  const wrappers = new Map<string, ReadonlySet<string>>();
+  const teamspaceNames = new Set<string>();
+  let hasLoosePages = false;
+  for (const wrapper of wrapperPaths) {
+    const wrapperDepth = wrapper.split("/").length;
+    const wrapperSources = sources.filter((source) => source === wrapper || source.startsWith(`${wrapper}/`));
+    const directPages = wrapperSources.filter((source) => source.split("/").length === wrapperDepth + 1);
+    const inferredTeamspaces = new Set(
+      wrapperSources
+        .filter((source) => source.split("/").length >= wrapperDepth + 2)
+        .map((source) => source.split("/")[wrapperDepth]!)
+        .filter((name) => !owners.has(`${wrapper}/${name}`)),
+    );
+    const teamspaces =
+      directPages.length === 0 ||
+      inferredTeamspaces.size > 1 ||
+      [...inferredTeamspaces].some((name) => /private\s*&\s*shared/i.test(name))
+        ? inferredTeamspaces
+        : new Set<string>();
+    wrappers.set(wrapper, teamspaces);
+    for (const name of teamspaces) teamspaceNames.add(name);
+    if (directPages.length > 0 || inferredTeamspaces.size !== teamspaces.size) hasLoosePages = true;
+  }
+  if (sources.some((source) => !wrapperPathFor(source, wrapperPaths))) hasLoosePages = true;
+
+  const teamspaceKeys = new Map<string, string>();
+  const groupNames = new Map<string, string>([["Imported", "Imported"]]);
+  const usedKeys = new Set(hasLoosePages ? ["Imported"] : []);
+  for (const name of [...teamspaceNames].sort()) {
+    let key = name;
+    if (usedKeys.has(key)) key = `Teamspace: ${name}`;
+    while (usedKeys.has(key)) key = `${key} (teamspace)`;
+    usedKeys.add(key);
+    teamspaceKeys.set(name, key);
+    groupNames.set(key, stripNotionId(name));
+  }
+  return { wrappers, teamspaceKeys, groupNames };
+}
+
+function groupingForSource(source: string, grouping: NotionGrouping) {
+  const wrapper = wrapperPathFor(source, grouping.wrappers);
+  return wrapper ? { wrapper, teamspaces: grouping.wrappers.get(wrapper)! } : null;
 }
 
 function groupKeyFor(source: string, grouping: NotionGrouping) {
-  const segments = notionRelativeSegments(source);
-  return segments[0] === grouping.wrapper && grouping.teamspaces.has(segments[1] ?? "") ? segments[1]! : "Imported";
+  const scoped = groupingForSource(source, grouping);
+  if (!scoped) return "Imported";
+  const name = source.split("/")[scoped.wrapper.split("/").length] ?? "";
+  return scoped.teamspaces.has(name) ? grouping.teamspaceKeys.get(name)! : "Imported";
 }
 
 function groupRootFor(source: string, grouping: NotionGrouping) {
   const segments = source.split("/");
-  const relative = notionRelativeSegments(source);
-  const prefixLength = segments.length - relative.length;
-  if (relative[0] !== grouping.wrapper) return segments.slice(0, prefixLength).join("/");
-  const grouped = grouping.teamspaces.has(relative[1] ?? "");
-  return segments.slice(0, prefixLength + (grouped ? 2 : 1)).join("/");
+  const scoped = groupingForSource(source, grouping);
+  if (!scoped) return notionArchivePrefix(source);
+  const wrapperDepth = scoped.wrapper.split("/").length;
+  const grouped = scoped.teamspaces.has(segments[wrapperDepth] ?? "");
+  return segments.slice(0, wrapperDepth + (grouped ? 1 : 0)).join("/");
 }
 
 function assertPreviewGroups(options: ImportOptions, groupKeys: string[]) {
@@ -416,35 +472,35 @@ function directoryOwners(pages: NotionPageEntry[]) {
       }
     }
   }
-  const ordered = [...directories]
-    .filter((directory) => !owners.has(directory))
-    .sort((left, right) => {
-      const leftPartial = / [\da-f]{4}-[\da-f]{4}$/i.test(left) ? 0 : 1;
-      const rightPartial = / [\da-f]{4}-[\da-f]{4}$/i.test(right) ? 0 : 1;
-      return leftPartial - rightPartial || left.localeCompare(right);
-    });
-  for (const directory of ordered) {
+  const ordered = [...directories].filter((directory) => !owners.has(directory)).sort();
+  const siblingsFor = (directory: string) => {
     const directoryParent = parentPath(directory);
+    return pages.filter((page) => page.directory === directoryParent && !claimed.has(page.path));
+  };
+  for (const directory of ordered) {
     const name = directory.split("/").at(-1) ?? directory;
-    const siblings = pages.filter((page) => page.directory === directoryParent && !claimed.has(page.path));
+    const titled = siblingsFor(directory).filter((page) => page.title === stripNotionId(name));
+    if (titled.length !== 1) continue;
+    owners.set(directory, titled[0]!.path);
+    claimed.add(titled[0]!.path);
+  }
+  for (const directory of ordered) {
+    if (owners.has(directory)) continue;
+    const name = directory.split("/").at(-1) ?? directory;
     const partial = / ([\da-f]{4})-([\da-f]{4})$/i.exec(name);
-    if (partial) {
-      const matches = siblings.filter(
-        (page) =>
-          page.notionId?.startsWith(partial[1]!.toLowerCase()) && page.notionId.endsWith(partial[2]!.toLowerCase()),
-      );
-      if (matches.length === 1) {
-        owners.set(directory, matches[0]!.path);
-        claimed.add(matches[0]!.path);
-        continue;
-      }
-    }
-    const titled = siblings.filter((page) => page.title === stripNotionId(name));
-    if (titled.length === 1) {
-      owners.set(directory, titled[0]!.path);
-      claimed.add(titled[0]!.path);
-      continue;
-    }
+    if (!partial) continue;
+    const matches = siblingsFor(directory).filter(
+      (page) =>
+        page.notionId?.startsWith(partial[1]!.toLowerCase()) && page.notionId.endsWith(partial[2]!.toLowerCase()),
+    );
+    if (matches.length !== 1) continue;
+    owners.set(directory, matches[0]!.path);
+    claimed.add(matches[0]!.path);
+  }
+  for (const directory of ordered) {
+    if (owners.has(directory)) continue;
+    const name = directory.split("/").at(-1) ?? directory;
+    const titled = siblingsFor(directory).filter((page) => page.title === stripNotionId(name));
     if (titled.length > 1) {
       const linked = titled.filter((page) =>
         markdownHrefs(page.text).some((href) => {
@@ -475,22 +531,32 @@ function ownerFor(source: string, owners: ReadonlyMap<string, string>, grouping:
 async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Array): Promise<ImportBundle> {
   const entries = await nestedEntries(bytes);
   const byPath = new Map(entries.map((entry) => [entry.path, entry]));
-  const pageEntries = entries
-    .filter((entry) => {
-      const ext = extension(entry.path);
-      const parent = parentPath(entry.path);
-      const relative = notionRelativeSegments(entry.path);
-      // Nested Part-N.zip entries are prefixed by their archive, so "root" means the top
-      // level of whichever archive the entry came out of.
-      const atArchiveRoot = parent === "" || /\.zip$/i.test(parent);
-      const wrapperIndex =
-        relative.length === 2 && /^Export-/i.test(relative[0]!) && /^index\.html?$/i.test(relative[1]!);
-      return (
-        [".html", ".htm", ".md", ".markdown"].includes(ext) &&
-        !wrapperIndex &&
-        !(atArchiveRoot && /^index\.html?$/i.test(entry.path.split("/").at(-1) ?? ""))
-      );
-    })
+  const documentEntries = entries.filter((entry) => {
+    const ext = extension(entry.path);
+    const parent = parentPath(entry.path);
+    // Nested Part-N.zip entries are prefixed by their archive, so "root" means the top
+    // level of whichever archive the entry came out of.
+    const atArchiveRoot = parent === "" || /\.zip$/i.test(parent);
+    return (
+      [".html", ".htm", ".md", ".markdown"].includes(ext) &&
+      !(atArchiveRoot && /^index\.html?$/i.test(entry.path.split("/").at(-1) ?? ""))
+    );
+  });
+  const rawCsvEntries = entries.filter((entry) => extension(entry.path) === ".csv");
+  const wrapperPaths = wrapperPathsFor([
+    ...documentEntries.map((entry) => entry.path),
+    ...rawCsvEntries.map((entry) => entry.path),
+  ]);
+  const ignoredWrapperIndexes = new Set(
+    documentEntries
+      .filter((entry) => {
+        const wrapper = wrapperPathFor(entry.path, wrapperPaths);
+        return wrapper === parentPath(entry.path) && /^index\.html?$/i.test(entry.path.split("/").at(-1) ?? "");
+      })
+      .map((entry) => entry.path),
+  );
+  const pageEntries = documentEntries
+    .filter((entry) => !ignoredWrapperIndexes.has(entry.path))
     .map<NotionPageEntry>((entry) => {
       const rawStem = stem(entry.path);
       return {
@@ -504,8 +570,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     });
   // Notion writes both a view CSV and an `_all` CSV per database; the latter ignores view filters.
   const csvByDatabase = new Map<string, (typeof entries)[number]>();
-  for (const entry of entries) {
-    if (extension(entry.path) !== ".csv") continue;
+  for (const entry of rawCsvEntries) {
     const name = stem(entry.path);
     const key = `${parentPath(entry.path)}/${name.replace(/_all$/i, "")}`;
     if (!csvByDatabase.has(key) || /_all$/i.test(name)) csvByDatabase.set(key, entry);
@@ -517,26 +582,22 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     throw new Error(`Imports are limited to ${MAX_IMPORT_PAGES} pages.`);
   const pageIds = new Map<string, string>();
   for (const entry of pageEntries) pageIds.set(entry.path, await stableId(job.id, "page", entry.path));
-  const grouping = groupingFor([...pageEntries.map((entry) => entry.path), ...csvEntries.map((entry) => entry.path)]);
-  const groupKeys = [
-    ...new Set(
-      [...pageEntries.map((entry) => entry.path), ...csvEntries.map((entry) => entry.path)].map((source) =>
-        groupKeyFor(source, grouping),
-      ),
-    ),
-  ];
-  assertPreviewGroups(options, groupKeys);
   const { owners, directories } = directoryOwners(pageEntries);
+  const sourcePaths = [...pageEntries.map((entry) => entry.path), ...csvEntries.map((entry) => entry.path)];
+  const grouping = groupingFor(sourcePaths, owners, wrapperPaths);
+  const groupKeyBySource = new Map(sourcePaths.map((source) => [source, groupKeyFor(source, grouping)]));
+  const groupKeys = [...new Set(groupKeyBySource.values())];
+  assertPreviewGroups(options, groupKeys);
   const archiveOrder = new Map(entries.map((entry, index) => [entry.path, index]));
   const matchedCsv = new Set<string>();
-  const knownSources = new Set(pageEntries.map((entry) => entry.path));
+  const knownSources = new Set([...pageEntries.map((entry) => entry.path), ...ignoredWrapperIndexes]);
   const issues: ImportIssue[] = [];
   const pages: ImportPage[] = [];
   for (const entry of pageEntries) {
     const rawStem = entry.rawStem;
     const csv = csvByDatabase.get(`${parentPath(entry.path)}/${rawStem}`);
     const parentSource = ownerFor(entry.path, owners, grouping);
-    const groupKey = groupKeyFor(entry.path, grouping);
+    const groupKey = groupKeyBySource.get(entry.path)!;
     const sourceText = entry.text;
     const html = extension(entry.path).startsWith(".htm") ? htmlToDocument(sourceText) : null;
     const parsed = html ?? markdownToDocument(sourceText);
@@ -566,7 +627,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     const id = await stableId(job.id, "page", entry.path);
     pageIds.set(entry.path, id);
     const parentSource = ownerFor(entry.path, owners, grouping);
-    const groupKey = groupKeyFor(entry.path, grouping);
+    const groupKey = groupKeyBySource.get(entry.path)!;
     pages.push({
       source: entry.path,
       id,
@@ -643,7 +704,7 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   const unresolvedParents = unresolved.length;
   const groups = [...new Set(pages.map((page) => page.groupKey))].map((key) => ({
     key,
-    name: stripNotionId(key),
+    name: grouping.groupNames.get(key) ?? stripNotionId(key),
     pages: pages.filter((page) => page.groupKey === key).length,
     roots: pages.filter((page) => page.groupKey === key && page.parentId === null).length,
     suggestedVisibility: /private\s*&\s*shared/i.test(key) ? ("private" as const) : ("workspace" as const),

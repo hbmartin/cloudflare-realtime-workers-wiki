@@ -3555,6 +3555,7 @@ describe("App error handling", () => {
   it("loads a hidden navigation target directly without adding it to the sidebar", async () => {
     const hiddenPage = { ...page, id: "hidden-page", position: "c0", title: "Hidden detail" };
     let treeLoads = 0;
+    let pageLoads = 0;
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/install") return { initialized: true };
       if (path === "/api/me") return member;
@@ -3563,7 +3564,10 @@ describe("App error handling", () => {
         treeLoads += 1;
         return { pages: [page] };
       }
-      if (path === `/api/pages/${hiddenPage.id}`) return { page: hiddenPage, sidebarHidden: true };
+      if (path === `/api/pages/${hiddenPage.id}`) {
+        pageLoads += 1;
+        return { page: hiddenPage, sidebarHidden: true };
+      }
       throw new Error(`Unexpected API request: ${path}`);
     });
     render(<App />);
@@ -3582,6 +3586,23 @@ describe("App error handling", () => {
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(2));
     expect(screen.getByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(pageLoads).toBe(1);
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: page.id }));
+    });
+    expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+    await waitFor(() => expect(treeLoads).toBe(3));
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve));
+    });
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
+    });
+
+    expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(pageLoads).toBe(2);
   });
 
   it("reports a failed direct page load and retries the same endpoint", async () => {

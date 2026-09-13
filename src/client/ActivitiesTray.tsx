@@ -55,9 +55,10 @@ function ImportConfirmation({
       let changed = false;
       const next = { ...current };
       for (const group of preview?.groups ?? []) {
-        if (touchedGroups.current.has(group.key) || next[group.key]) continue;
-        const destination = defaultGroupSpace(group, spaces, job.spaceId);
-        if (!destination) continue;
+        const currentSpaceId = next[group.key] ?? "";
+        if (spaces.some((space) => space.id === currentSpaceId)) continue;
+        const destination = touchedGroups.current.has(group.key) ? "" : defaultGroupSpace(group, spaces, job.spaceId);
+        if (currentSpaceId === destination) continue;
         next[group.key] = destination;
         changed = true;
       }
@@ -66,7 +67,7 @@ function ImportConfirmation({
   }, [job.spaceId, preview, spaces]);
   if (!preview) return null;
   const groups = preview.groups ?? [];
-  const incomplete = groups.some((group) => !mapping[group.key]);
+  const incomplete = groups.some((group) => !spaces.some((space) => space.id === mapping[group.key]));
   return (
     <div className="import-confirmation">
       <dl className="import-preview">
