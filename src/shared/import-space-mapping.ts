@@ -6,7 +6,7 @@ export function normalizeGroupSpaceIds(value: unknown): Record<string, string> |
   return Object.fromEntries(entries) as Record<string, string>;
 }
 
-export function uniqueMappedSpaceIds(mapping: Record<string, string> | undefined) {
+function uniqueMappedSpaceIds(mapping: Record<string, string> | undefined) {
   return new Set(mapping ? Object.values(mapping) : []);
 }
 
