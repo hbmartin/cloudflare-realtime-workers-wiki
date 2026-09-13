@@ -5,7 +5,7 @@
   "compatibility_date": "2026-08-14",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "upload_source_maps": true,
-  "preview_urls": true,
+  "preview_urls": false,
   "observability": { "enabled": true },
   "assets": {
     "not_found_handling": "single-page-application",

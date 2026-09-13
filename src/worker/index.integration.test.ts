@@ -1,3 +1,4 @@
+import { enrollAccount } from "../../tests/helpers/security";
 import {
   applyD1Migrations,
   abortAllDurableObjects,
@@ -74,7 +75,7 @@ async function bootstrap(): Promise<InstalledWorkspace> {
     }),
   });
   expect(response.status).toBe(200);
-  const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
+  const cookie = await enrollAccount(response);
   expect(cookie).toBeTruthy();
   const me = await (
     await SELF.fetch(authenticatedRequest(cookie!, "/api/me"))

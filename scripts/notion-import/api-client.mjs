@@ -6,9 +6,8 @@
  * owner or editor exactly the way `scripts/realtime-load.mjs` does, and carries the
  * cookie plus the configured origin on every request.
  *
- * The Worker has no rate limiting anywhere and never answers 429, which means nothing
- * pushes back if the importer goes too fast. The token bucket here is the only
- * backpressure in the system, so it is not optional.
+ * Authentication is rate limited, and the importer also throttles application writes
+ * to keep large imports from overwhelming the workspace.
  */
 import { setTimeout as delay } from "node:timers/promises";
 import { open, readFile } from "node:fs/promises";
@@ -85,7 +84,7 @@ export class AmbiguousWriteError extends Error {
   }
 }
 
-export async function createClient({ baseURL, email, password, requestsPerSecond = 20 }) {
+export async function createClient({ baseURL, email, password, totpCode, requestsPerSecond = 20 }) {
   const origin = validateBaseURL(baseURL);
   baseURL = origin;
   const throttle = new Throttle(requestsPerSecond);
@@ -123,7 +122,31 @@ export async function createClient({ baseURL, email, password, requestsPerSecond
   if (!signIn.ok) {
     throw new Error(`Sign in as ${email} failed (${signIn.status}). Check NOTES_IMPORT_PASSWORD.`);
   }
-  const cookie = signIn.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  let cookie = signIn.headers
+    .getSetCookie()
+    .map((value) => value.split(";", 1)[0])
+    .join("; ");
+  const challenge = await signIn.clone().json();
+  if (challenge.twoFactorRedirect) {
+    if (!totpCode)
+      throw new Error(
+        "Set NOTES_IMPORT_TOTP_CODE to a current authenticator code. Enroll an authenticator in the app before importing.",
+      );
+    const verified = await send(
+      "/api/auth/two-factor/verify-totp",
+      {
+        method: "POST",
+        body: JSON.stringify({ code: totpCode, trustDevice: false }),
+      },
+      cookie,
+    );
+    if (!verified.ok)
+      throw new Error(`Second-factor verification failed (${verified.status}). Supply a new NOTES_IMPORT_TOTP_CODE.`);
+    cookie = verified.headers
+      .getSetCookie()
+      .map((value) => value.split(";", 1)[0])
+      .join("; ");
+  }
   if (!cookie) throw new Error("Sign in succeeded but returned no session cookie.");
 
   async function request(path, init = {}, policy = {}) {

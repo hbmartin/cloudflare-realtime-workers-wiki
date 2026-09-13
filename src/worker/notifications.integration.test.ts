@@ -1,3 +1,4 @@
+import { enrollAccount } from "../../tests/helpers/security";
 import { abortAllDurableObjects, applyD1Migrations, env, reset, runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
@@ -52,7 +53,7 @@ async function bootstrap() {
     }),
   });
   expect(response.status).toBe(200);
-  const cookie = response.headers.get("set-cookie")!.split(";", 1)[0]!;
+  const cookie = await enrollAccount(response);
   const me = await (
     await SELF.fetch(request(cookie, "/api/me"))
   ).json<{ user: { id: string }; workspace: { id: string } }>();
@@ -79,7 +80,7 @@ async function invite(ownerCookie: string, suffix: string) {
       password: "password123",
     }),
   });
-  const cookie = response.headers.get("set-cookie")!.split(";", 1)[0]!;
+  const cookie = await enrollAccount(response, token);
   const me = await (await SELF.fetch(request(cookie, "/api/me"))).json<{ user: { id: string } }>();
   return { cookie, userId: me.user.id };
 }

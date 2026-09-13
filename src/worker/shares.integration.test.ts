@@ -1,3 +1,4 @@
+import { enrollAccount } from "../../tests/helpers/security";
 import { abortAllDurableObjects, applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import * as Y from "yjs";
@@ -21,7 +22,7 @@ async function bootstrap() {
       password: "password123",
     }),
   });
-  const cookie = response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  const cookie = await enrollAccount(response);
   const me = await (
     await authenticated(cookie, "/api/me")
   ).json<{

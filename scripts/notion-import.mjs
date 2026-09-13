@@ -229,6 +229,7 @@ async function connect(options, root, { adoptRootParent = false } = {}) {
     baseURL: options.baseURL,
     email: options.email,
     password: process.env.NOTES_IMPORT_PASSWORD,
+    totpCode: process.env.NOTES_IMPORT_TOTP_CODE,
     requestsPerSecond: options.requestsPerSecond,
   });
   const manifest = createManifest({

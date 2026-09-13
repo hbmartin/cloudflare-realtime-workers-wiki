@@ -3272,3 +3272,79 @@ button.mention-chip:focus-visible {
     display: grid;
   }
 }
+
+.security-gate {
+  max-width: 520px;
+  margin: 5vh auto;
+  padding: 28px;
+}
+.security-settings {
+  margin-block: 24px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.security-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+.security-controls label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.security-controls .auth-form label {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.security-qr {
+  background: white;
+  padding: 16px;
+  width: fit-content;
+}
+.recovery-codes {
+  padding: 16px;
+  overflow-x: auto;
+  user-select: all;
+}
+
+.security-gate {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: 0 8px 30px var(--shadow);
+}
+.security-controls button,
+.security-gate > button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  padding: 10px 14px;
+  cursor: pointer;
+}
+.security-controls button:hover:not(:disabled),
+.security-gate > button:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.security-controls button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.security-controls .auth-form button {
+  background: var(--ink);
+  color: var(--paper);
+}
+.security-controls .auth-form {
+  width: 100%;
+}
+.security-gate > button {
+  margin-top: 16px;
+}
+.security-settings p {
+  overflow-wrap: anywhere;
+}

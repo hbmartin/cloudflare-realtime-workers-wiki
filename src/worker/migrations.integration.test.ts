@@ -4,6 +4,23 @@ import { beforeEach, describe, expect, it } from "vitest";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("invalidates existing password-only sessions during the mandatory protection cutover", async () => {
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, -1));
+    await env.DB.prepare(
+      "INSERT INTO user(id,name,email,emailVerified,createdAt,updatedAt) VALUES ('legacy','Legacy','legacy@example.test',0,1,1)",
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO session(id,token,userId,expiresAt,createdAt,updatedAt) VALUES ('legacy-session','token','legacy',?,1,1)",
+    )
+      .bind(Date.now() + 60_000)
+      .run();
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(await env.DB.prepare("SELECT id FROM session").first()).toBeNull();
+    expect(await env.DB.prepare("SELECT user_id,codes_saved FROM account_security").first()).toMatchObject({
+      user_id: "legacy",
+      codes_saved: 0,
+    });
+  });
   it("applies the complete migration history to an empty database and is idempotent", async () => {
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);

@@ -1,3 +1,4 @@
+import { enrollAccount } from "../../tests/helpers/security";
 import { Client } from "@notionhq/client";
 import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,7 +23,7 @@ async function bootstrap() {
       password: "password123",
     }),
   });
-  const cookie = response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  const cookie = await enrollAccount(response);
   const tree = await (
     await SELF.fetch(authenticated(cookie, "/api/pages/tree"))
   ).json<{ pages: Array<{ id: string }> }>();

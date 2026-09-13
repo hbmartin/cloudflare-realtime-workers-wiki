@@ -1,3 +1,4 @@
+import { enrollAccount } from "../../tests/helpers/security";
 import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Page, Space, Tag } from "../shared/types";
@@ -24,7 +25,7 @@ async function bootstrap(): Promise<Installed> {
     }),
   });
   expect(response.status).toBe(200);
-  const cookie = response.headers.get("set-cookie")!.split(";", 1)[0]!;
+  const cookie = await enrollAccount(response);
   const pages = await (await SELF.fetch(request(cookie, "/api/pages/tree"))).json<{ pages: Page[] }>();
   return { cookie, pageId: pages.pages[0]!.id };
 }
@@ -44,7 +45,7 @@ async function inviteViewer(ownerCookie: string) {
     body: JSON.stringify({ token, name: "Viewer", email: "organization-viewer@example.test", password: "password123" }),
   });
   expect(response.status).toBe(200);
-  return response.headers.get("set-cookie")!.split(";", 1)[0]!;
+  return await enrollAccount(response, token);
 }
 
 beforeEach(async () => {

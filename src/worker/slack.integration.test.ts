@@ -1,3 +1,4 @@
+import { enrollAccount } from "../../tests/helpers/security";
 import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
@@ -52,7 +53,7 @@ async function bootstrap() {
     }),
   });
   expect(response.status).toBe(200);
-  const cookie = response.headers.get("set-cookie")!.split(";", 1)[0]!;
+  const cookie = await enrollAccount(response);
   const member = await (await SELF.fetch(request(cookie, "/api/me"))).json<ClientMemberContext>();
   const pages = await (await SELF.fetch(request(cookie, "/api/pages/tree"))).json<{ pages: Page[] }>();
   return { cookie, member, page: pages.pages[0]! };
@@ -78,7 +79,7 @@ async function inviteViewer(ownerCookie: string) {
     }),
   });
   expect(accepted.status).toBe(200);
-  const cookie = accepted.headers.get("set-cookie")!.split(";", 1)[0]!;
+  const cookie = await enrollAccount(accepted, token);
   const member = await (await SELF.fetch(request(cookie, "/api/me"))).json<ClientMemberContext>();
   return { cookie, member };
 }
