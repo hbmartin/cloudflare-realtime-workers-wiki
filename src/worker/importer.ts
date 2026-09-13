@@ -9,7 +9,7 @@ import {
   type ImportedTable,
 } from "../shared/import-content";
 import { documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
-import { NOTION_GROUPING_VERSION, parseImportOptions, type ImportOptions } from "../shared/import-space-mapping";
+import { NOTION_GROUPING_VERSION, requireImportOptions, type ImportOptions } from "../shared/import-space-mapping";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import { projectDocument } from "../shared/document-projection";
 import type { DocumentContentEnvelope, ImportPreview, ProseMirrorJson } from "../shared/types";
@@ -18,7 +18,7 @@ import { isUnsafeMime } from "./attachments";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
 import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
-import { normalizeFilename } from "./http";
+import { HttpError, normalizeFilename } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { refreshPageSearchV2ForIdsStatements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
@@ -68,9 +68,7 @@ function record(value: string) {
 }
 
 function importOptions(job: JobRow): ImportOptions {
-  const options = parseImportOptions(record(job.options_json));
-  if (!options) throw new Error("Import options are invalid.");
-  return options;
+  return requireImportOptions(record(job.options_json));
 }
 
 function extension(path: string) {
@@ -178,7 +176,6 @@ function groupingFor(
   sources: string[],
   owners: ReadonlyMap<string, string>,
   wrapperPaths: ReadonlySet<string>,
-  reserveLooseGroup = true,
 ): NotionGrouping {
   const wrappers = new Map<string, ReadonlySet<string>>();
   const teamspaceNames = new Set<string>();
@@ -204,7 +201,7 @@ function groupingFor(
 
   const teamspaceKeys = new Map<string, string>();
   const groupNames = new Map<string, string>([["Imported", "Imported"]]);
-  const usedKeys = new Set(reserveLooseGroup ? ["Imported"] : []);
+  const usedKeys = new Set(["Imported"]);
   for (const name of [...teamspaceNames].sort()) {
     let key = name;
     if (usedKeys.has(key)) key = `Teamspace: ${name}`;
@@ -415,11 +412,10 @@ async function hydrateDocumentAssets(
   }
 }
 
-function markdownHrefs(source: string) {
-  return [...source.matchAll(/\]\(([^)]+)\)/g)].map((match) => match[1]!);
-}
-
-function directoryOwners(pages: NotionPageEntry[]) {
+function directoryOwners(
+  pages: NotionPageEntry[],
+  parsePage: (page: NotionPageEntry) => { document: ProseMirrorJson },
+) {
   const byPath = new Map(pages.map((page) => [page.path, page]));
   const byDirectory = new Map<string, NotionPageEntry[]>();
   const links = new Map<string, (string | null)[]>();
@@ -427,13 +423,22 @@ function directoryOwners(pages: NotionPageEntry[]) {
     const siblings = byDirectory.get(page.directory) ?? [];
     siblings.push(page);
     byDirectory.set(page.directory, siblings);
-    links.set(
-      page.path,
-      markdownHrefs(page.text).map((href) => normalizedRelativePath(page.path, href)),
-    );
   }
-  const linksInto = (page: NotionPageEntry, directory: string) =>
-    links.get(page.path)!.some((target) => target === directory || target?.startsWith(`${directory}/`));
+  const linksInto = (page: NotionPageEntry, directory: string) => {
+    let targets = links.get(page.path);
+    if (!targets) {
+      targets = [];
+      walkDocument(parsePage(page).document, (node) => {
+        for (const mark of node.marks ?? []) {
+          if (mark.type === "link" && typeof mark.attrs?.href === "string") {
+            targets!.push(normalizedRelativePath(page.path, mark.attrs.href));
+          }
+        }
+      });
+      links.set(page.path, targets);
+    }
+    return targets.some((target) => target === directory || target?.startsWith(`${directory}/`));
+  };
   const directories = new Set<string>();
   for (const page of pages) {
     let directory = page.directory;
@@ -495,9 +500,9 @@ function directoryOwners(pages: NotionPageEntry[]) {
     );
   }
   for (const [directory, matches] of literalCandidates) {
-    const linked = matches.filter((page) => linksInto(page, directory));
+    const linked = matches.length > 1 ? matches.filter((page) => linksInto(page, directory)) : [];
     const page = matches.length === 1 ? matches[0] : linked.length === 1 ? linked[0] : undefined;
-    if (page && !claimed.has(page.path)) claim(directory, page);
+    if (page) claim(directory, page);
   }
   const candidates = new Map<string, NotionPageEntry[]>();
   const linkedFolders = new Map<string, string[]>();
@@ -587,15 +592,19 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     throw new Error(`Imports are limited to ${MAX_IMPORT_PAGES} pages.`);
   const pageIds = new Map<string, string>();
   for (const entry of pageEntries) pageIds.set(entry.path, await stableId(job.id, "page", entry.path));
-  const { owners, directories } = directoryOwners(pageEntries);
+  const parsedPages = new Map<string, ReturnType<typeof markdownToDocument> & { title?: string }>();
+  const parsePage = (entry: NotionPageEntry) => {
+    let parsed = parsedPages.get(entry.path);
+    if (!parsed) {
+      parsed = extension(entry.path).startsWith(".htm") ? htmlToDocument(entry.text) : markdownToDocument(entry.text);
+      parsedPages.set(entry.path, parsed);
+    }
+    return parsed;
+  };
+  const { owners, directories } = directoryOwners(pageEntries, parsePage);
   const sourcePaths = [...pageEntries.map((entry) => entry.path), ...csvEntries.map((entry) => entry.path)];
-  let grouping = groupingFor(sourcePaths, owners, wrapperPaths);
-  let groupKeyBySource = new Map(sourcePaths.map((source) => [source, groupKeyFor(source, grouping)]));
-  // Replay the original key allocation for older previews with an Imported teamspace and no loose pages.
-  if (options.previewGroupKeys?.includes("Imported") && ![...groupKeyBySource.values()].includes("Imported")) {
-    grouping = groupingFor(sourcePaths, owners, wrapperPaths, false);
-    groupKeyBySource = new Map(sourcePaths.map((source) => [source, groupKeyFor(source, grouping)]));
-  }
+  const grouping = groupingFor(sourcePaths, owners, wrapperPaths);
+  const groupKeyBySource = new Map(sourcePaths.map((source) => [source, groupKeyFor(source, grouping)]));
   const groupKeys = [...new Set(groupKeyBySource.values())];
   assertPreviewGroups(options, groupKeys);
   const archiveOrder = new Map(entries.map((entry, index) => [entry.path, index]));
@@ -609,11 +618,10 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     const parentSource = ownerFor(entry.path, owners, grouping);
     const groupKey = groupKeyBySource.get(entry.path)!;
     const sourceText = entry.text;
-    const html = extension(entry.path).startsWith(".htm") ? htmlToDocument(sourceText) : null;
-    const parsed = html ?? markdownToDocument(sourceText);
+    const parsed = parsePage(entry);
     issues.push(...parsed.issues);
     if (csv) matchedCsv.add(csv.path);
-    const title = cleanTitle(html?.title || markdownTitle(sourceText) || rawStem);
+    const title = cleanTitle(parsed.title || markdownTitle(sourceText) || rawStem);
     pages.push({
       source: entry.path,
       id: pageIds.get(entry.path)!,
@@ -783,25 +791,21 @@ async function singlePageBundle(job: JobRow, options: ImportOptions, bytes: Uint
 }
 
 async function loadBundle(env: Env, job: JobRow, options: ImportOptions) {
-  if (!job.input_key?.startsWith(`jobs/${job.id}/input/`)) throw new Error("The import upload is missing.");
+  if (!job.input_key?.startsWith(`jobs/${job.id}/input/`))
+    throw new HttpError(
+      409,
+      "import_upload_missing",
+      "The import upload is missing or expired. Upload the file again.",
+    );
   const object = await env.BUCKET.get(job.input_key);
-  if (!object) throw new Error("The import upload is missing.");
+  if (!object)
+    throw new HttpError(
+      409,
+      "import_upload_missing",
+      "The import upload is missing or expired. Upload the file again.",
+    );
   const bytes = new Uint8Array(await object.arrayBuffer());
   return options.format === "notion_zip" ? notionBundle(job, options, bytes) : singlePageBundle(job, options, bytes);
-}
-
-// Old previews may have used different folder ownership and group allocation.
-// Check against the upload before changing a confirmed job's state or attempt.
-export async function validateImportPreview(env: Env, job: JobRow, options: ImportOptions) {
-  const previewGroupKeys =
-    options.previewGroupKeys ?? (options.groupSpaceIds ? Object.keys(options.groupSpaceIds) : undefined);
-  if (!previewGroupKeys) return;
-  if (
-    options.previewGroupKeys &&
-    (options.format !== "notion_zip" || options.previewGroupingVersion === NOTION_GROUPING_VERSION)
-  )
-    return;
-  await loadBundle(env, job, { ...options, previewGroupKeys });
 }
 
 async function assertImportActive(env: Env, job: Pick<JobRow, "id" | "attempt">) {
@@ -1295,15 +1299,35 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
 }
 
 export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
-  const options = importOptions(job);
+  let options = importOptions(job);
+  // A deployment can supersede confirmation while a workflow is queued or suspended.
+  const refreshing =
+    options.confirmed &&
+    (!options.previewId ||
+      (options.format === "notion_zip" && options.previewGroupingVersion !== NOTION_GROUPING_VERSION));
+  if (refreshing) {
+    options = { filename: options.filename, format: options.format, confirmed: false };
+    await step.do("invalidate obsolete confirmation", async () => {
+      await assertImportActive(env, job);
+      await cleanupImport(env, job, async () => {
+        await assertImportActive(env, job);
+        return true;
+      });
+      await env.DB.prepare(
+        `UPDATE jobs SET options_json = ?, updated_at = ? WHERE id = ? AND attempt = ? AND status = 'running'`,
+      )
+        .bind(JSON.stringify(options), Date.now(), job.id, job.attempt)
+        .run();
+    });
+  }
   let bundlePromise: Promise<ImportBundle> | null = null;
   const bundle = () => (bundlePromise ??= loadBundle(env, job, options));
-  const preview = await step.do("inspect import", async () => {
+  const preview = await step.do(refreshing ? "inspect refreshed import" : "inspect import", async () => {
     await assertImportActive(env, job);
-    return (await bundle()).preview;
+    return { ...(await bundle()).preview, previewId: crypto.randomUUID() };
   });
   if (!options.confirmed) {
-    await step.do("await confirmation", async () => {
+    await step.do(refreshing ? "await refreshed confirmation" : "await confirmation", async () => {
       await assertImportActive(env, job);
       await env.DB.prepare(
         `UPDATE jobs SET status = 'awaiting_confirmation', progress_current = 2, progress_total = 7,

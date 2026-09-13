@@ -79,14 +79,68 @@ function blockDocument(blocks: ProseMirrorJson[]) {
   } satisfies ProseMirrorJson;
 }
 
+// Scan destinations instead of stopping at the first closing parenthesis.
+function markdownDestination(value: string, start: number) {
+  let cursor = start;
+  while (/\s/.test(value[cursor] ?? "") && cursor < value.length) cursor += 1;
+  const angled = value[cursor] === "<";
+  if (angled) cursor += 1;
+  let href = "";
+  let depth = 0;
+  for (; cursor < value.length; cursor += 1) {
+    const character = value[cursor]!;
+    if (character === "\\" && /[!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~]/.test(value[cursor + 1] ?? "")) {
+      href += value[++cursor];
+    } else if (angled && character === ">") {
+      cursor += 1;
+      break;
+    } else if (!angled && character === "(") {
+      depth += 1;
+      href += character;
+    } else if (!angled && character === ")") {
+      if (depth === 0) break;
+      depth -= 1;
+      href += character;
+    } else if (!angled && /\s/.test(character)) {
+      break;
+    } else {
+      href += character;
+    }
+  }
+  if (depth !== 0) return null;
+  const destinationEnd = cursor;
+  while (cursor < value.length && /\s/.test(value[cursor]!)) cursor += 1;
+  if (cursor > destinationEnd && ['"', "'", "("].includes(value[cursor] ?? "")) {
+    const closer = value[cursor] === "(" ? ")" : value[cursor];
+    cursor += 1;
+    while (cursor < value.length && value[cursor] !== closer) {
+      if (value[cursor] === "\\") cursor += 1;
+      cursor += 1;
+    }
+    if (value[cursor] !== closer) return null;
+    cursor += 1;
+    while (cursor < value.length && /\s/.test(value[cursor]!)) cursor += 1;
+  }
+  return value[cursor] === ")" ? { href, end: cursor + 1 } : null;
+}
+
 function markdownInline(value: string, issues: ImportIssue[]) {
   const output: ProseMirrorJson[] = [];
-  const pattern = /(!?)\[([^\]]*)\]\(([^)]+)\)|\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|\*([^*]+)\*|_([^_]+)_/g;
+  const pattern = /(!?)\[([^\]]*)\]\(|\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|\*([^*]+)\*|_([^_]+)_/g;
   let offset = 0;
-  for (const match of value.matchAll(pattern)) {
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(value))) {
     output.push(...inline(value.slice(offset, match.index)));
-    const [whole, image, label, rawUrl, boldA, boldB, code, italicA, italicB] = match;
-    if (rawUrl !== undefined) {
+    const [whole, image, label, boldA, boldB, code, italicA, italicB] = match;
+    if (label !== undefined) {
+      const destination = markdownDestination(value, pattern.lastIndex);
+      if (!destination) {
+        output.push(...inline(whole));
+        offset = pattern.lastIndex;
+        continue;
+      }
+      pattern.lastIndex = destination.end;
+      const rawUrl = destination.href;
       const url = safeLink(rawUrl);
       if (!url) {
         issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
@@ -106,7 +160,7 @@ function markdownInline(value: string, issues: ImportIssue[]) {
     } else {
       output.push(...inline(italicA ?? italicB ?? "", [{ type: "italic" }]));
     }
-    offset = (match.index ?? 0) + whole.length;
+    offset = pattern.lastIndex;
   }
   output.push(...inline(value.slice(offset)));
   return output;

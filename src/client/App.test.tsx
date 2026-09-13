@@ -316,6 +316,82 @@ describe("App error handling", () => {
     expect(jobLoads).toBe(3);
   });
 
+  it("reloads a changed import preview and confirms the replacement identity", async () => {
+    const preview = {
+      previewId: "old-preview",
+      format: "markdown" as const,
+      filename: "notes.md",
+      pages: 1,
+      tables: 0,
+      assets: 0,
+      warnings: [],
+    };
+    const job: Job = {
+      id: "import-1",
+      workspaceId: member.workspace.id,
+      spaceId: shellGeneralSpace.id,
+      type: "import",
+      status: "awaiting_confirmation",
+      progress: { current: 2, total: 7, label: "Ready to import" },
+      warnings: [],
+      result: { preview },
+      error: null,
+      hasDownload: false,
+      cleanupPending: false,
+      expiresAt: null,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const refreshed: Job = {
+      ...job,
+      result: { preview: { ...preview, previewId: "new-preview", pages: 2 } },
+      updatedAt: 2,
+    };
+    mockShellApi({ jobs: () => [job] });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/imports/${job.id}/confirm`) {
+        const body = JSON.parse(String(init?.body));
+        if (body.previewId === "old-preview")
+          throw new ApiClientError(409, "import_preview_changed", "Review the latest preview before confirming.");
+        return { job: { ...refreshed, status: "queued", updatedAt: 3 } };
+      }
+      if (path === `/api/jobs/${job.id}`) return { job: refreshed };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Activities/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Confirm import" }));
+    expect(await screen.findByText("Review the latest preview before confirming.")).toBeInTheDocument();
+    expect(screen.getByText("Pages").parentElement).toHaveTextContent("2");
+    fireEvent.click(screen.getByRole("button", { name: "Confirm import" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Confirm import" })).not.toBeInTheDocument());
+    expect(
+      vi
+        .mocked(api)
+        .mock.calls.filter(([path]) => path === `/api/imports/${job.id}/confirm`)
+        .map(([, init]) => JSON.parse(String(init?.body)).previewId),
+    ).toEqual(["old-preview", "new-preview"]);
+  });
+
+  it("does not rewrite the last-page preference for selected-page metadata updates", async () => {
+    const save = vi.spyOn(localStorage, "setItem");
+    mockShellApi();
+    render(<App />);
+    await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
+    const saves = () => save.mock.calls.filter(([key]) => key === "notes:last-page:workspace:user");
+    const before = saves().length;
+    act(() =>
+      dispatchWorkspaceEvent({
+        type: "pages-upserted",
+        pages: [{ ...page, title: "Renamed", revision: page.revision + 1 }],
+      }),
+    );
+    await screen.findByText("Renamed", { selector: ".breadcrumbs span" });
+    expect(saves()).toHaveLength(before);
+    save.mockRestore();
+  });
+
   it("closes and resets sharing state when the selected page changes", async () => {
     const secondPage = { ...page, id: "second-page", position: "b0", title: "Second" };
     const owner = { ...member, role: "owner" as const };
@@ -4024,16 +4100,6 @@ describe("App error handling", () => {
     },
   );
 
-  it("discards a remembered template already present in the tree", async () => {
-    const template = { ...page, id: "template", title: "Template", isTemplate: true };
-    localStorage.setItem("notes:last-page:workspace:user", template.id);
-    mockShellApi({ pages: [template, page] });
-    render(<App />);
-    await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
-    expect(mocks.editorRender.mock.calls.some(([props]) => props.page.id === template.id)).toBe(false);
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
-  });
-
   it.each([
     { archivedAt: 123, isTemplate: false },
     { archivedAt: null, isTemplate: true },
@@ -4052,6 +4118,14 @@ describe("App error handling", () => {
     expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
     expect(new URLSearchParams(location.search).get("page")).toBe(linked.id);
     expect(screen.queryByRole("button", { name: `Archive ${linked.title}` })).not.toBeInTheDocument();
+    for (let refresh = 0; refresh < 2; refresh += 1) {
+      await act(async () => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+      expect(screen.getByText(linked.title, { selector: ".breadcrumbs span" })).toBeInTheDocument();
+      expect(new URLSearchParams(location.search).get("page")).toBe(linked.id);
+    }
+    await act(async () => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [linked.id], permanently: true }));
+    expect(screen.queryByText(linked.title, { selector: ".breadcrumbs span" })).not.toBeInTheDocument();
+    expect(new URLSearchParams(location.search).get("page")).toBe(page.id);
   });
 
   it("opens an archived Search result", async () => {
@@ -4075,6 +4149,93 @@ describe("App error handling", () => {
     await screen.findByText(archived.title, { selector: ".breadcrumbs span" });
     expect(new URLSearchParams(location.search).get("page")).toBe(archived.id);
   });
+
+  it.each(["archived", "template", "hidden"] as const)(
+    "preserves a directly loaded %s page when its response is batched with a tree refresh",
+    async (kind) => {
+      const target = {
+        ...page,
+        id: "batched",
+        title: "Batched page",
+        archivedAt: kind === "archived" ? 123 : null,
+        isTemplate: kind === "template",
+      };
+      const direct = deferred<{ page: Page; sidebarHidden: boolean }>();
+      const tree = deferred<{ pages: Page[] }>();
+      let loads = 0;
+      mockShellApi();
+      const shellApi = vi.mocked(api).getMockImplementation()!;
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path === "/api/pages/tree" && ++loads === 2) return tree.promise;
+        if (path === `/api/pages/${target.id}`) return direct.promise;
+        return shellApi(path, init);
+      });
+      render(<App />);
+      await screen.findByText(page.title, { selector: ".breadcrumbs span" });
+      act(() => {
+        dispatchWorkspaceEvent({ type: "workspace-invalidated" });
+      });
+      await waitFor(() => expect(loads).toBe(2));
+      act(() => {
+        window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: target.id }));
+      });
+      await waitFor(() => expect(api).toHaveBeenCalledWith(`/api/pages/${target.id}`, expect.anything()));
+      await act(async () => {
+        direct.resolve({ page: target, sidebarHidden: kind === "hidden" });
+        await direct.promise;
+        tree.resolve({ pages: [page] });
+      });
+      expect(await screen.findByText(target.title, { selector: ".breadcrumbs span" })).toBeInTheDocument();
+      expect(new URLSearchParams(location.search).get("page")).toBe(target.id);
+    },
+  );
+
+  it.each([403, 404, 410, 503, "network", "archived", "template"] as const)(
+    "promotes an in-flight remembered lookup to explicit navigation: %s",
+    async (outcome) => {
+      const target = {
+        ...page,
+        id: "remembered",
+        title: "Remembered",
+        archivedAt: outcome === "archived" ? 123 : null,
+        isTemplate: outcome === "template",
+      };
+      const direct = deferred<{ page: Page; sidebarHidden: boolean }>();
+      localStorage.setItem("notes:last-page:workspace:user", target.id);
+      history.replaceState(null, "", "/?view=search&keep=yes#anchor");
+      mockShellApi();
+      const shellApi = vi.mocked(api).getMockImplementation()!;
+      vi.mocked(api).mockImplementation(async (path, init) =>
+        path === `/api/pages/${target.id}` ? direct.promise : shellApi(path, init),
+      );
+      render(<App />);
+      await waitFor(() => expect(api).toHaveBeenCalledWith(`/api/pages/${target.id}`, expect.anything()));
+      act(() => {
+        window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: target.id }));
+      });
+      await act(async () => {
+        if (outcome === "archived" || outcome === "template") direct.resolve({ page: target, sidebarHidden: false });
+        else
+          direct.reject(
+            outcome === "network"
+              ? new Error("Navigation failed")
+              : new ApiClientError(outcome, "page_unavailable", "Navigation failed"),
+          );
+      });
+      const result =
+        outcome === "archived" || outcome === "template"
+          ? await screen.findByText(target.title, { selector: ".breadcrumbs span" })
+          : (
+              await screen.findAllByText(outcome === "network" ? "The page could not be loaded." : "Navigation failed")
+            )[0];
+      expect(result).toBeInTheDocument();
+      expect(vi.mocked(api).mock.calls.filter(([path]) => path === `/api/pages/${target.id}`)).toHaveLength(1);
+      expect(new URLSearchParams(location.search).get("page")).toBe(target.id);
+      expect(new URLSearchParams(location.search).get("keep")).toBe("yes");
+      expect(location.hash).toBe("#anchor");
+      expect(new URLSearchParams(location.search).has("view")).toBe(false);
+    },
+  );
 
   it.each([404, 503])("keeps a failed explicit page lookup (%s) stable through tree refreshes", async (status) => {
     history.replaceState(null, "", "/?page=missing");
@@ -4137,7 +4298,7 @@ describe("App error handling", () => {
     expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
   });
 
-  it("keeps newer hidden visibility through an older tree response and the following refresh", async () => {
+  it("preserves hidden visibility through an older tree, then accepts newer visible state", async () => {
     const hiddenPage = { ...page, id: "newly-hidden", title: "Newly hidden", position: "c0" };
     const staleTree = deferred<{ pages: Page[] }>();
     const freshTree = deferred<{ pages: Page[] }>();

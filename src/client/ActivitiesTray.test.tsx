@@ -179,6 +179,53 @@ describe("ActivitiesTray", () => {
     expect(confirm).toHaveBeenCalledWith(importJob, { Workspace: "space-1" });
   });
 
+  it("resets destination choices when a replacement preview arrives", () => {
+    const job: Job = {
+      ...runningJob,
+      type: "import",
+      spaceId: workspaceSpace.id,
+      status: "awaiting_confirmation",
+      result: {
+        preview: {
+          previewId: "old",
+          format: "markdown",
+          filename: "notes.md",
+          pages: 1,
+          tables: 0,
+          assets: 0,
+          warnings: [],
+          groups: [{ key: "Imported", name: "Imported", pages: 1, roots: 1, suggestedVisibility: "workspace" }],
+        },
+      },
+    };
+    const alternate = { ...workspaceSpace, id: "alternate", name: "Alternate" };
+    const props = {
+      jobs: [job],
+      spaces: [workspaceSpace, alternate],
+      loading: false,
+      error: "",
+      pendingJobId: null,
+      onClose: vi.fn(),
+      onRefresh: vi.fn(),
+      onCancel: vi.fn(),
+      onCleanup: vi.fn(),
+      onRetry: vi.fn(),
+      onConfirm: vi.fn(),
+      onOpenResult: vi.fn(),
+    };
+    const view = render(<ActivitiesTray {...props} />);
+    fireEvent.change(screen.getByLabelText("Destination space for Imported"), { target: { value: alternate.id } });
+    expect(screen.getByLabelText("Destination space for Imported")).toHaveValue(alternate.id);
+    view.rerender(
+      <ActivitiesTray
+        {...props}
+        jobs={[{ ...job, result: { preview: { ...job.result!.preview!, previewId: "new" } } }]}
+      />,
+    );
+    expect(screen.getByLabelText("Destination space for Imported")).toHaveValue(workspaceSpace.id);
+    expect(props.onConfirm).not.toHaveBeenCalled();
+  });
+
   it("requires an explicit destination for an unmatched private import group", () => {
     const confirm = vi.fn();
     const importJob: Job = {

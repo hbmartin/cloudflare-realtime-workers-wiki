@@ -8,6 +8,7 @@ import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { migrateLegacyComments, type CommentPage } from "./comments";
 import { HttpError } from "./http";
+import { errorLogFields } from "../shared/error-log";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Keys, deleteR2Prefix } from "./r2";
@@ -661,7 +662,7 @@ export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "work
     else if (row.type === "export") await runExport(env, row, inlineStep as Parameters<typeof runExport>[2]);
     else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
-    await failJobWithCleanup(env, row, error instanceof Error ? error.message.slice(0, 500) : "The job failed.");
+    await failJobWithCleanup(env, row, error);
     throw error;
   }
 }
@@ -807,12 +808,16 @@ export async function finishPendingJobCleanup(
   }
 }
 
-async function failJobWithCleanup(env: Env, job: JobRow, message: string) {
+async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
+  const message = error instanceof Error ? error.message.slice(0, 500) : "The job failed.";
+  const errorCode = error instanceof HttpError ? error.code : "job_failed";
+  if (!(error instanceof HttpError))
+    console.error("Job execution failed", { jobId: job.id, attempt: job.attempt, ...errorLogFields(error) });
   if (job.type !== "import" && job.type !== "template_clone" && job.type !== "export") {
     await updateJob(env, job, {
       status: "failed",
       label: "Failed",
-      errorCode: "job_failed",
+      errorCode,
       errorMessage: message,
     });
     await notifyJobs(env, job.workspace_id);
@@ -820,10 +825,10 @@ async function failJobWithCleanup(env: Env, job: JobRow, message: string) {
   }
   const pending = await env.DB.prepare(
     `UPDATE jobs SET status = 'failed', cleanup_target = COALESCE(cleanup_target, 'failed'),
-       progress_label = 'Failure cleanup pending', error_code = 'job_failed', error_message = ?, updated_at = ?
+       progress_label = 'Failure cleanup pending', error_code = ?, error_message = ?, updated_at = ?
      WHERE id = ? AND attempt = ? AND status = 'running'`,
   )
-    .bind(message, Date.now(), job.id, job.attempt)
+    .bind(errorCode, message, Date.now(), job.id, job.attempt)
     .run();
   if (!pending.meta.changes) return;
   await notifyJobs(env, job.workspace_id);
@@ -1063,7 +1068,6 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         await notifyJobs(this.env, job.workspace_id);
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message.slice(0, 500) : "The job failed.";
       const current = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
         .bind(jobId, attempt)
         .first<JobRow>();
@@ -1076,7 +1080,7 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         return;
       }
       if (current.status !== "running") return;
-      await failJobWithCleanup(this.env, current, message);
+      await failJobWithCleanup(this.env, current, error);
       throw error;
     }
   }

@@ -103,11 +103,10 @@ import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import {
   importDestinationSpaceIds,
+  isCurrentImportPreview,
   normalizeGroupSpaceIds,
   parseImportOptions,
-  type ImportOptions,
 } from "../shared/import-space-mapping";
-import { validateImportPreview } from "./importer";
 import { constantTimeEqual } from "../shared/security";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
@@ -1792,16 +1791,50 @@ app.post("/api/import-uploads", async (c) => {
   return c.json({ job: jobJson(uploaded) }, 202);
 });
 
-async function validateSavedImportPreview(env: Env, job: JobRow, options: ImportOptions) {
-  try {
-    await validateImportPreview(env, job, options);
-  } catch {
+function savedImportPreview(job: JobRow) {
+  return (JSON.parse(job.result_json) as { preview?: ImportPreview }).preview;
+}
+
+async function refreshImportPreview(c: Context<{ Bindings: Env }>, member: MemberContext, job: JobRow) {
+  requireEditor(member);
+  if (job.space_id) await editableSpaceForMember(c.env, member, job.space_id);
+  const saved = storedJobOptions(job);
+  const options = parseImportOptions({ filename: saved.filename, format: saved.format, confirmed: false });
+  if (!options) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
+  if (!job.input_key?.startsWith(`jobs/${job.id}/input/`)) {
     throw new HttpError(
       409,
-      "import_preview_outdated",
-      "This import's saved preview could not be verified. Upload the file again to inspect and confirm its destinations.",
+      "import_upload_missing",
+      "The import upload is missing or expired. Upload the file again.",
     );
   }
+  const instanceId = crypto.randomUUID();
+  const refreshed = await c.env.DB.prepare(
+    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1,
+      options_json = ?, result_json = '{}', progress_current = 0, progress_label = 'Refreshing preview',
+      error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE id = ? AND attempt = ? AND status = ? AND cleanup_target IS NULL
+        AND status IN ('awaiting_confirmation', 'failed', 'canceled') RETURNING *`,
+  )
+    .bind(instanceId, JSON.stringify(options), now(), job.id, job.attempt, job.status)
+    .first<JobRow>();
+  if (!refreshed)
+    throw new HttpError(
+      409,
+      "import_preview_changed",
+      "This import changed. Refresh it and review the latest preview.",
+    );
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, refreshed).catch((error) => {
+      console.error("Failed to start import reinspection workflow", {
+        jobId: job.id,
+        attempt: refreshed.attempt,
+        error,
+      });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(refreshed) }, 202);
 }
 
 async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string) {
@@ -1814,9 +1847,23 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
   if (job.status !== "awaiting_confirmation") {
     throw new HttpError(409, "import_not_confirmable", "This import is not awaiting confirmation.");
   }
-  const options = JSON.parse(job.options_json) as Record<string, unknown>;
-  const storedResult = JSON.parse(job.result_json) as { preview?: ImportPreview };
-  const groups = storedResult.preview?.groups ?? [];
+  const options = storedJobOptions(job);
+  const preview = savedImportPreview(job);
+  const inspectionOptions = parseImportOptions({
+    filename: options.filename,
+    format: options.format,
+    confirmed: false,
+  });
+  if (!inspectionOptions) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
+  if (!isCurrentImportPreview(preview, inspectionOptions.format)) return refreshImportPreview(c, member, job);
+  if (body.previewId !== preview!.previewId) {
+    throw new HttpError(
+      409,
+      "import_preview_changed",
+      "The preview changed. Review the latest preview before confirming.",
+    );
+  }
+  const groups = preview?.groups ?? [];
   const rawMappings = body.groupSpaceIds;
   const groupSpaceIds = normalizeGroupSpaceIds(rawMappings);
   const groupedImport = groups.length > 1 || groups.some((group) => group.key !== "Imported");
@@ -1849,20 +1896,25 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
     confirmed: true,
     groupSpaceIds: savedGroupSpaceIds,
     ...(groups.length ? { previewGroupKeys: groups.map((group) => group.key) } : {}),
-    previewGroupingVersion: storedResult.preview?.groupingVersion,
+    previewGroupingVersion: preview?.groupingVersion,
+    previewId: preview?.previewId,
   });
   if (!confirmedOptions) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
-  await validateSavedImportPreview(c.env, job, confirmedOptions);
   const instanceId = crypto.randomUUID();
   const queued = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, options_json = ?, progress_label = 'Queued',
       error_code = NULL, error_message = NULL, updated_at = ?
-      WHERE id = ? AND attempt = ? AND status = 'awaiting_confirmation'`,
+      WHERE id = ? AND attempt = ? AND status = 'awaiting_confirmation' AND cleanup_target IS NULL
+        AND json_extract(result_json, '$.preview.previewId') = ?`,
   )
-    .bind(instanceId, JSON.stringify(confirmedOptions), now(), job.id, job.attempt)
+    .bind(instanceId, JSON.stringify(confirmedOptions), now(), job.id, job.attempt, preview!.previewId!)
     .run();
   if (!queued.meta.changes) {
-    throw new HttpError(409, "import_not_confirmable", "This import is no longer awaiting confirmation.");
+    throw new HttpError(
+      409,
+      "import_preview_changed",
+      "This import changed. Review its latest state before confirming.",
+    );
   }
   const confirmed = await jobForMember(c.env, member, job.id);
   c.executionCtx.waitUntil(
@@ -1982,7 +2034,6 @@ async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow) {
         "This import's saved space mappings are invalid. Upload the file again to inspect and confirm its destinations.",
       );
     for (const spaceId of destinations) await editableSpaceForMember(env, member, spaceId);
-    await validateSavedImportPreview(env, job, parsed);
     return;
   }
   if (job.type === "template_clone") {
@@ -2011,6 +2062,19 @@ app.post("/api/jobs/:id/retry", async (c) => {
     throw new HttpError(409, "job_not_retryable", "Only failed or canceled jobs can be retried.");
   }
   await authorizeJobRetry(c.env, member, job);
+  if (job.type === "import") {
+    const options = storedJobOptions(job);
+    const preview = savedImportPreview(job);
+    const parsed = parseImportOptions(options);
+    if (
+      !parsed ||
+      !isCurrentImportPreview(preview, parsed.format) ||
+      (parsed.confirmed &&
+        (parsed.previewId !== preview?.previewId || parsed.previewGroupingVersion !== preview?.groupingVersion))
+    ) {
+      return refreshImportPreview(c, member, job);
+    }
+  }
   const instanceId = crypto.randomUUID();
   const retried = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1, progress_current = 0,

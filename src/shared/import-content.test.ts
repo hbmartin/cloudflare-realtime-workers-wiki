@@ -17,6 +17,22 @@ describe("import content", () => {
     expect(JSON.stringify(json)).toContain("mermaid");
   });
 
+  it.each([
+    ["Folder_(one)/Child.md", "Folder_(one)/Child.md"],
+    ["Folder_\\(one\\)/Child.md", "Folder_(one)/Child.md"],
+    ["Folder%20(one)/Child.md", "Folder%20(one)/Child.md"],
+    ['<Folder (one)/Child.md> "Child title"', "Folder (one)/Child.md"],
+    ["Folder_(one)/Child.md 'Child title'", "Folder_(one)/Child.md"],
+  ])("keeps the complete Markdown link destination: %s", (destination, expected) => {
+    const parsed = markdownToDocument(`Read [child](${destination}) now.`);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "Read " },
+      { type: "text", text: "child", marks: [{ type: "link", attrs: { href: expected } }] },
+      { type: "text", text: " now." },
+    ]);
+  });
+
   it("drops executable HTML and unsafe links while retaining readable content", () => {
     const parsed = htmlToDocument(
       '<html><head><title>Safe</title><script>alert(1)</script></head><body><h1>Heading</h1><p>Hello <strong>world</strong> <a href="javascript:alert(1)">bad</a></p></body></html>',

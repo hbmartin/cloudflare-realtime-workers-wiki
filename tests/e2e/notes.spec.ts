@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { resolve } from "node:path";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 
@@ -330,6 +333,61 @@ test("exports and imports Markdown through resumable jobs", async ({ page }) => 
   await importJob.getByRole("button", { name: "Open page" }).click();
   await expect(page.getByLabel("Page title")).toHaveValue("browser-import");
   await expect(page.locator(".bn-editor")).toContainText("Imported through the browser workflow.");
+});
+
+test("refreshes an old import preview and imports only after a second confirmation", async ({ page }) => {
+  test.setTimeout(90_000);
+  const importTitle = `refresh-preview-${Date.now()}`;
+  test.skip(Boolean(process.env.NOTES_E2E_BASE_URL), "Requires the isolated local D1 test database.");
+  await signIn(page);
+  await page.getByRole("button", { name: /Import/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Import notes" });
+  await dialog.locator('input[type="file"]').setInputFiles({
+    name: `${importTitle}.md`,
+    mimeType: "text/markdown",
+    buffer: Buffer.from("# Refreshed preview\n\nConfirmed after reinspection."),
+  });
+  const uploaded = page.waitForResponse(
+    (response) => response.url().endsWith("/api/import-uploads") && response.request().method() === "POST",
+  );
+  await dialog.getByRole("button", { name: "Upload and inspect" }).click();
+  const { job } = await (await uploaded).json();
+  expect(job.id).toMatch(/^[a-f0-9-]+$/);
+  const activities = page.getByRole("dialog", { name: "Activities" });
+  const item = activities.locator(".activity-list > li").first();
+  await expect(item.getByRole("button", { name: "Confirm import" })).toBeVisible({ timeout: 30_000 });
+  const original = (await (await page.request.get(`/api/jobs/${job.id}`)).json()).job.result.preview.previewId;
+  await promisify(execFile)(process.execPath, [
+    resolve("node_modules/wrangler/bin/wrangler.js"),
+    "--config",
+    resolve("wrangler.jsonc"),
+    "d1",
+    "execute",
+    "DB",
+    "--env",
+    "notes-checks-e2e",
+    "--local",
+    "--persist-to",
+    resolve(".wrangler/e2e"),
+    "--command",
+    `UPDATE jobs SET result_json = json_remove(result_json, '$.preview.previewId') WHERE id = '${job.id}'`,
+  ]);
+  const refreshing = page.waitForResponse((response) => response.url().endsWith(`/api/imports/${job.id}/confirm`));
+  await item.getByRole("button", { name: "Confirm import" }).click();
+  expect((await (await refreshing).json()).job.progress.label).toBe("Refreshing preview");
+  await expect
+    .poll(async () => (await (await page.request.get(`/api/jobs/${job.id}`)).json()).job.status)
+    .toBe("awaiting_confirmation");
+  const refreshed = (await (await page.request.get(`/api/jobs/${job.id}`)).json()).job;
+  expect(refreshed.result.preview.previewId).not.toBe(original);
+  const tree = await (await page.request.get("/api/pages/tree")).json();
+  expect(tree.pages.map((entry: { title: string }) => entry.title)).not.toContain(importTitle);
+  await expect(item.getByRole("button", { name: "Confirm import" })).toBeVisible({ timeout: 30_000 });
+  await item.getByRole("button", { name: "Confirm import" }).click();
+  await expect(item.locator(".job-status")).toHaveText("succeeded", { timeout: 30_000 });
+  await item.getByRole("button", { name: "Open page" }).click();
+  await expect(page.getByLabel("Page title")).toHaveValue(importTitle);
+  await expect(page.locator(".bn-editor")).toContainText("Confirmed after reinspection.");
 });
 
 test("creates, renames, archives, and restores a page through the UI @mobile-sidebar", async ({ page }, testInfo) => {
