@@ -289,4 +289,128 @@ describe("ActivitiesTray", () => {
     expect(screen.getByRole("option", { name: "Workspace (Workspace)" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Private & Shared (Private)" })).toBeInTheDocument();
   });
+
+  it("fills an untouched destination when spaces arrive after the confirmation UI", async () => {
+    const importJob: Job = {
+      ...runningJob,
+      id: "late-spaces-import",
+      spaceId: workspaceSpace.id,
+      type: "import",
+      status: "awaiting_confirmation",
+      result: {
+        preview: {
+          format: "markdown",
+          filename: "notes.md",
+          pages: 1,
+          tables: 0,
+          assets: 0,
+          groups: [{ key: "Imported", name: "Imported", pages: 1, roots: 1, suggestedVisibility: "workspace" }],
+          warnings: [],
+        },
+      },
+    };
+    const props = {
+      jobs: [importJob],
+      loading: false,
+      error: "",
+      pendingJobId: null,
+      onClose: vi.fn(),
+      onRefresh: vi.fn(),
+      onCancel: vi.fn(),
+      onCleanup: vi.fn(),
+      onRetry: vi.fn(),
+      onConfirm: vi.fn(),
+      onOpenResult: vi.fn(),
+    };
+    const view = render(<ActivitiesTray {...props} spaces={[]} />);
+    const mapping = screen.getByRole("combobox", { name: "Destination space for Imported" });
+    expect(mapping).toHaveValue("");
+
+    view.rerender(<ActivitiesTray {...props} spaces={[workspaceSpace]} />);
+
+    await waitFor(() => expect(mapping).toHaveValue(workspaceSpace.id));
+  });
+
+  it("disables confirmation when a selected destination is no longer available", async () => {
+    const importJob: Job = {
+      ...runningJob,
+      id: "removed-space-import",
+      spaceId: workspaceSpace.id,
+      type: "import",
+      status: "awaiting_confirmation",
+      result: {
+        preview: {
+          format: "markdown",
+          filename: "notes.md",
+          pages: 1,
+          tables: 0,
+          assets: 0,
+          groups: [{ key: "Imported", name: "Imported", pages: 1, roots: 1, suggestedVisibility: "workspace" }],
+          warnings: [],
+        },
+      },
+    };
+    const props = {
+      jobs: [importJob],
+      loading: false,
+      error: "",
+      pendingJobId: null,
+      onClose: vi.fn(),
+      onRefresh: vi.fn(),
+      onCancel: vi.fn(),
+      onCleanup: vi.fn(),
+      onRetry: vi.fn(),
+      onConfirm: vi.fn(),
+      onOpenResult: vi.fn(),
+    };
+    const view = render(<ActivitiesTray {...props} spaces={[workspaceSpace]} />);
+    const mapping = screen.getByRole("combobox", { name: "Destination space for Imported" });
+    expect(mapping).toHaveValue(workspaceSpace.id);
+    expect(screen.getByRole("button", { name: "Confirm import" })).toBeEnabled();
+
+    view.rerender(<ActivitiesTray {...props} spaces={[]} />);
+
+    await waitFor(() => expect(mapping).toHaveValue(""));
+    expect(screen.getByRole("button", { name: "Confirm import" })).toBeDisabled();
+  });
+
+  it("defaults a one-group import to its private upload space", () => {
+    const privateSpace: Space = { ...workspaceSpace, id: "space-private", visibility: "private" };
+    const importJob: Job = {
+      ...runningJob,
+      id: "private-single-import",
+      spaceId: privateSpace.id,
+      type: "import",
+      status: "awaiting_confirmation",
+      result: {
+        preview: {
+          format: "markdown",
+          filename: "private.md",
+          pages: 1,
+          tables: 0,
+          assets: 0,
+          groups: [{ key: "Imported", name: "Imported", pages: 1, roots: 1, suggestedVisibility: "workspace" }],
+          warnings: [],
+        },
+      },
+    };
+    render(
+      <ActivitiesTray
+        jobs={[importJob]}
+        spaces={[privateSpace]}
+        loading={false}
+        error=""
+        pendingJobId={null}
+        onClose={vi.fn()}
+        onRefresh={vi.fn()}
+        onCancel={vi.fn()}
+        onCleanup={vi.fn()}
+        onRetry={vi.fn()}
+        onConfirm={vi.fn()}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("combobox", { name: "Destination space for Imported" })).toHaveValue(privateSpace.id);
+  });
 });
