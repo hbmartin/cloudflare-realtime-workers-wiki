@@ -443,6 +443,98 @@ describe("job execution", () => {
     ).toEqual({ status: "failed", attempt: 1 });
   });
 
+  it.each([
+    {
+      label: "partial mappings",
+      options: { confirmed: true, previewGroupKeys: ["A", "B"], groupSpaceIds: { A: "upload" } },
+      destination: true,
+    },
+    {
+      label: "extra mapping keys",
+      options: { confirmed: true, previewGroupKeys: ["A"], groupSpaceIds: { A: "upload", B: "upload" } },
+      destination: true,
+    },
+    { label: "missing destination", options: { confirmed: true }, destination: false },
+    {
+      label: "invalid preview keys",
+      options: { confirmed: true, previewGroupKeys: ["A", "A"], groupSpaceIds: { A: "upload" } },
+      destination: true,
+    },
+  ])("rejects import retry with $label before changing the attempt", async ({ options, destination }) => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const uploadSpaceId = `${installed.workspaceId}-general`;
+    const mappings =
+      "groupSpaceIds" in options
+        ? Object.fromEntries(Object.keys(options.groupSpaceIds).map((key) => [key, uploadSpaceId]))
+        : undefined;
+    await env.DB.prepare(`INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, options_json, created_at, updated_at)
+      VALUES (?, ?, ?, 'import', 'failed', ?, ?, ?, ?)`)
+      .bind(
+        jobId,
+        installed.workspaceId,
+        destination ? uploadSpaceId : null,
+        installed.userId,
+        JSON.stringify({ filename: "notes.zip", format: "notion_zip", ...options, groupSpaceIds: mappings }),
+        Date.now(),
+        Date.now(),
+      )
+      .run();
+    const create = vi.fn(async ({ id }: { id?: string }) => ({ id }));
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}/retry`, { method: "POST" }),
+      bindingsWith({ NOTES_WORKFLOW: { create } }),
+      context,
+    );
+    expect(response.status).toBe(409);
+    await waitOnExecutionContext(context);
+    expect(create).not.toHaveBeenCalled();
+    expect(await env.DB.prepare("SELECT status, attempt FROM jobs WHERE id = ?").bind(jobId).first()).toEqual({
+      status: "failed",
+      attempt: 1,
+    });
+  });
+
+  it.each([false, true])(
+    "retries an import using its upload space without mappings (confirmed: %s)",
+    async (confirmed) => {
+      const installed = await bootstrap();
+      const jobId = crypto.randomUUID();
+      await env.DB.prepare(`INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, options_json, created_at, updated_at)
+      VALUES (?, ?, ?, 'import', 'failed', ?, ?, ?, ?)`)
+        .bind(
+          jobId,
+          installed.workspaceId,
+          `${installed.workspaceId}-general`,
+          installed.userId,
+          JSON.stringify({
+            filename: "notes.md",
+            format: "markdown",
+            confirmed,
+            ...(confirmed ? { previewGroupKeys: ["Imported"] } : {}),
+          }),
+          Date.now(),
+          Date.now(),
+        )
+        .run();
+      const create = vi.fn(async ({ id }: { id?: string }) => ({ id }));
+      const context = createExecutionContext();
+      const response = await worker.fetch(
+        request(installed.cookie, `/api/jobs/${jobId}/retry`, { method: "POST" }),
+        bindingsWith({ NOTES_WORKFLOW: { create } }),
+        context,
+      );
+      expect(response.status).toBe(202);
+      await waitOnExecutionContext(context);
+      expect(create).toHaveBeenCalledOnce();
+      expect(await env.DB.prepare("SELECT status, attempt FROM jobs WHERE id = ?").bind(jobId).first()).toEqual({
+        status: "queued",
+        attempt: 2,
+      });
+    },
+  );
+
   it("recovers an interrupted cancellation before making the job retryable", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
@@ -2111,7 +2203,7 @@ describe("job execution", () => {
     ).toMatchObject({ name: "photo.png" });
   });
 
-  it("keeps standard wrapped exports nested, reserves exact owners, and warns on unresolved folders", async () => {
+  it("keeps wrapped exports nested, prioritizes IDs over titles, and warns on unresolved folders", async () => {
     const installed = await bootstrap();
     const encoder = new TextEncoder();
     const exactId = "11110000000000000000000000002222";
@@ -2181,15 +2273,17 @@ describe("job execution", () => {
     ).json<{ pages: Array<{ id: string; title: string; parentId: string | null }> }>();
     const exact = tree.pages.find((page) => page.title === "Exact")!;
     const partial = tree.pages.find((page) => page.title === "Partial")!;
-    expect(tree.pages.find((page) => page.title === "Exact child")?.parentId).toBe(exact.id);
+    // The matching ID in Other 1111-2222 wins over the title-only Exact folder.
+    expect(tree.pages.find((page) => page.title === "Exact child")?.parentId).toBeNull();
     expect(tree.pages.find((page) => page.title === "Partial child")?.parentId).toBe(partial.id);
-    expect(tree.pages.find((page) => page.title === "Fuzzy child")?.parentId).toBeNull();
+    expect(tree.pages.find((page) => page.title === "Fuzzy child")?.parentId).toBe(exact.id);
   });
 
   it.each([
     ["aaaa-bbbb", "Renamed"],
+    ["aaaa000000000000000000000000bbbb", "Renamed"],
     ["ffff-eeee", "Old"],
-  ])("resolves shortened folder ID %s to %s before falling back to its title", async (folderId, parentTitle) => {
+  ])("resolves folder ID %s to %s before falling back to its title", async (folderId, parentTitle) => {
     const installed = await bootstrap();
     const encoder = new TextEncoder();
     const zip = createZip([
@@ -2231,6 +2325,87 @@ describe("job execution", () => {
     ).json<{ pages: Page[] }>();
     const parent = tree.pages.find((page) => page.title === parentTitle)!;
     expect(tree.pages.find((page) => page.title === "Child")?.parentId).toBe(parent.id);
+  });
+
+  it.each([
+    {
+      label: "ID ownership before title-only folders",
+      files: [
+        ["Renamed aaaa000000000000000000000000bbbb.md", "# Renamed"],
+        ["Renamed/Title child.md", "# Title child"],
+        ["Old aaaa-bbbb/ID child.md", "# ID child"],
+      ],
+      parents: [
+        ["ID child", "Renamed"],
+        ["Title child", null],
+      ],
+    },
+    {
+      label: "link evidence before an earlier title match",
+      files: [
+        ["Old aaaa000000000000000000000000bbbb.md", "# Old\n[child](Old%202222-2222/Linked%20child.md)"],
+        ["Old 1111-1111/Unlinked child.md", "# Unlinked child"],
+        ["Old 2222-2222/Linked child.md", "# Linked child"],
+      ],
+      parents: [
+        ["Unlinked child", null],
+        ["Linked child", "Old"],
+      ],
+    },
+    {
+      label: "ambiguous titles without links remain unassigned",
+      files: [
+        ["Old aaaa000000000000000000000000bbbb.md", "# Old"],
+        ["Old 1111-1111/First child.md", "# First child"],
+        ["Old 2222-2222/Second child.md", "# Second child"],
+      ],
+      parents: [
+        ["First child", null],
+        ["Second child", null],
+      ],
+    },
+    ...["Budget 2024-2025", "Build cafe-babe"].map((title) => ({
+      label: `literal title ${title}`,
+      files: [
+        [`${title} aaaa000000000000000000000000bbbb.md`, `# ${title}`],
+        [`${title.split(" ")[0]} cccc000000000000000000000000dddd.md`, `# ${title.split(" ")[0]}`],
+        [`${title}/Child.md`, "# Child"],
+      ],
+      parents: [["Child", title]],
+    })),
+  ])("matches Notion folders using $label", async ({ files, parents }) => {
+    const installed = await bootstrap();
+    const zip = createZip(files.map(([path, text]) => ({ path: path!, bytes: new TextEncoder().encode(text!) })));
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "ownership.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+    expect(await env.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(jobId).first("status")).toBe("succeeded");
+    const tree = await (
+      await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext())
+    ).json<{ pages: Page[] }>();
+    for (const [childTitle, parentTitle] of parents) {
+      const child = tree.pages.find((page) => page.title === childTitle);
+      expect(child).toBeDefined();
+      const parent = parentTitle === null ? null : tree.pages.find((page) => page.title === parentTitle);
+      expect(parent).not.toBeUndefined();
+      expect(child?.parentId).toBe(parent?.id ?? null);
+    }
   });
 
   it("keeps teamspace grouping when an export wrapper contains an index file", async () => {
@@ -2349,13 +2524,17 @@ describe("job execution", () => {
     expect(preview).toMatchObject({ pages: 2, roots: 2, unresolvedParents: 0 });
   });
 
-  it("uses distinct group keys for loose pages and a teamspace named Imported", async () => {
+  it.each([true, false])("reserves the loose-page group key with loose pages present: %s", async (loose) => {
     const installed = await bootstrap();
     const zip = createZip([
-      {
-        path: "Export-demo/Loose aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
-        bytes: new TextEncoder().encode("# Loose\n"),
-      },
+      ...(loose
+        ? [
+            {
+              path: "Export-demo/Loose aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+              bytes: new TextEncoder().encode("# Loose\n"),
+            },
+          ]
+        : []),
       {
         path: "Export-demo/Imported/Doc bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md",
         bytes: new TextEncoder().encode("# Doc\n"),
@@ -2383,8 +2562,38 @@ describe("job execution", () => {
       createExecutionContext(),
     );
     const groups = (await inspected.json<{ job: Job }>()).job.result?.preview?.groups ?? [];
-    expect(groups.map((group) => group.key)).toEqual(["Imported", "Teamspace: Imported", "Private & Shared"]);
-    expect(groups.map((group) => group.name)).toEqual(["Imported", "Imported", "Private & Shared"]);
+    expect(groups.map((group) => group.key)).toEqual([
+      ...(loose ? ["Imported"] : []),
+      "Teamspace: Imported",
+      "Private & Shared",
+    ]);
+    expect(groups.map((group) => group.name)).toEqual([...(loose ? ["Imported"] : []), "Imported", "Private & Shared"]);
+    const confirmedGroups = groups.map((group) => ({
+      ...group,
+      key: !loose && group.key === "Teamspace: Imported" ? "Imported" : group.key,
+    }));
+    if (!loose) {
+      // Simulate an awaiting-confirmation preview saved before the reserved-key fix.
+      await env.DB.prepare("UPDATE jobs SET result_json = ? WHERE id = ?")
+        .bind(JSON.stringify({ preview: { groups: confirmedGroups } }), jobId)
+        .run();
+    }
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+        method: "POST",
+        body: JSON.stringify({
+          groupSpaceIds: Object.fromEntries(
+            confirmedGroups.map((group) => [group.key, `${installed.workspaceId}-general`]),
+          ),
+        }),
+      }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+    expect(await env.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(jobId).first("status")).toBe("succeeded");
   });
 
   it("does not treat a real page whose title starts with Export- as an archive wrapper", async () => {
