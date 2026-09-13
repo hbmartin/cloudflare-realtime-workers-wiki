@@ -414,7 +414,10 @@ describe("ActivitiesTray", () => {
     expect(screen.getByRole("combobox", { name: "Destination space for Imported" })).toHaveValue(privateSpace.id);
   });
 
-  it("defaults an Imported group to its upload space instead of an exact-name match", () => {
+  it.each([
+    ["Imported", "upload-space"],
+    ["Teamspace: Imported", "exact-space"],
+  ])("defaults group %s to %s", (key, expectedSpaceId) => {
     const uploadSpace: Space = { ...workspaceSpace, id: "upload-space" };
     const exactSpace: Space = { ...workspaceSpace, id: "exact-space", name: "Imported" };
     const importJob: Job = {
@@ -430,7 +433,7 @@ describe("ActivitiesTray", () => {
           pages: 1,
           tables: 0,
           assets: 0,
-          groups: [{ key: "Imported", name: "Imported", pages: 1, roots: 1, suggestedVisibility: "workspace" }],
+          groups: [{ key, name: "Imported", pages: 1, roots: 1, suggestedVisibility: "workspace" }],
           warnings: [],
         },
       },
@@ -452,6 +455,6 @@ describe("ActivitiesTray", () => {
       />,
     );
 
-    expect(screen.getByRole("combobox", { name: "Destination space for Imported" })).toHaveValue(uploadSpace.id);
+    expect(screen.getByRole("combobox", { name: "Destination space for Imported" })).toHaveValue(expectedSpaceId);
   });
 });

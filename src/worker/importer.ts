@@ -109,10 +109,7 @@ function stem(path: string) {
 }
 
 function stripNotionId(value: string) {
-  return value
-    .replace(/[ -]?[\da-f]{32}$/i, "")
-    .replace(/ [\da-f]{4}-[\da-f]{4}$/i, "")
-    .trim();
+  return value.replace(/[ -]?[\da-f]{32}$/i, "").trim();
 }
 
 function cleanTitle(value: string) {
@@ -207,10 +204,10 @@ function groupingFor(
   sources: string[],
   owners: ReadonlyMap<string, string>,
   wrapperPaths: ReadonlySet<string>,
+  reserveLooseGroup = true,
 ): NotionGrouping {
   const wrappers = new Map<string, ReadonlySet<string>>();
   const teamspaceNames = new Set<string>();
-  let hasLoosePages = false;
   for (const wrapper of wrapperPaths) {
     const wrapperDepth = wrapper.split("/").length;
     const wrapperSources = sources.filter((source) => source === wrapper || source.startsWith(`${wrapper}/`));
@@ -229,13 +226,11 @@ function groupingFor(
         : new Set<string>();
     wrappers.set(wrapper, teamspaces);
     for (const name of teamspaces) teamspaceNames.add(name);
-    if (directPages.length > 0 || inferredTeamspaces.size !== teamspaces.size) hasLoosePages = true;
   }
-  if (sources.some((source) => !wrapperPathFor(source, wrapperPaths))) hasLoosePages = true;
 
   const teamspaceKeys = new Map<string, string>();
   const groupNames = new Map<string, string>([["Imported", "Imported"]]);
-  const usedKeys = new Set(hasLoosePages ? ["Imported"] : []);
+  const usedKeys = new Set(reserveLooseGroup ? ["Imported"] : []);
   for (const name of [...teamspaceNames].sort()) {
     let key = name;
     if (usedKeys.has(key)) key = `Teamspace: ${name}`;
@@ -477,14 +472,16 @@ function directoryOwners(pages: NotionPageEntry[]) {
     const directoryParent = parentPath(directory);
     return pages.filter((page) => page.directory === directoryParent && !claimed.has(page.path));
   };
+  const claim = (directory: string, page: NotionPageEntry) => {
+    owners.set(directory, page.path);
+    claimed.add(page.path);
+  };
+  // Resolve every full identity before shortened identities or title evidence can consume it.
   for (const directory of ordered) {
-    const name = directory.split("/").at(-1) ?? directory;
-    // Reserve title-only folders first; shortened IDs take precedence over conflicting titles.
-    if (/ [\da-f]{4}-[\da-f]{4}$/i.test(name)) continue;
-    const titled = siblingsFor(directory).filter((page) => page.title === stripNotionId(name));
-    if (titled.length !== 1) continue;
-    owners.set(directory, titled[0]!.path);
-    claimed.add(titled[0]!.path);
+    const id = notionId(directory.split("/").at(-1) ?? directory);
+    if (!id) continue;
+    const matches = siblingsFor(directory).filter((page) => page.notionId === id);
+    if (matches.length === 1) claim(directory, matches[0]!);
   }
   for (const directory of ordered) {
     if (owners.has(directory)) continue;
@@ -495,31 +492,53 @@ function directoryOwners(pages: NotionPageEntry[]) {
       (page) =>
         page.notionId?.startsWith(partial[1]!.toLowerCase()) && page.notionId.endsWith(partial[2]!.toLowerCase()),
     );
-    if (matches.length !== 1) continue;
-    owners.set(directory, matches[0]!.path);
-    claimed.add(matches[0]!.path);
+    if (matches.length === 1) claim(directory, matches[0]!);
   }
+  const candidates = new Map<string, NotionPageEntry[]>();
   for (const directory of ordered) {
     if (owners.has(directory)) continue;
-    const name = directory.split("/").at(-1) ?? directory;
-    const titled = siblingsFor(directory).filter((page) => page.title === stripNotionId(name));
-    if (titled.length === 1) {
-      owners.set(directory, titled[0]!.path);
-      claimed.add(titled[0]!.path);
-      continue;
-    }
-    if (titled.length > 1) {
-      const linked = titled.filter((page) =>
-        markdownHrefs(page.text).some((href) => {
+    const name = stripNotionId(directory.split("/").at(-1) ?? directory);
+    const siblings = siblingsFor(directory);
+    const literal = siblings.filter((page) => page.title === name);
+    // A suffix such as "2024-2025" can be a real title. Only strip it as a fallback.
+    candidates.set(
+      directory,
+      literal.length
+        ? literal
+        : siblings.filter((page) => page.title === name.replace(/ [\da-f]{4}-[\da-f]{4}$/i, "").trim()),
+    );
+  }
+  const linkedFolders = new Map<string, string[]>();
+  for (const [directory, matches] of candidates) {
+    for (const page of matches) {
+      if (
+        !markdownHrefs(page.text).some((href) => {
           const target = normalizedRelativePath(page.path, href);
           return target === directory || target?.startsWith(`${directory}/`);
-        }),
-      );
-      if (linked.length === 1) {
-        owners.set(directory, linked[0]!.path);
-        claimed.add(linked[0]!.path);
-      }
+        })
+      )
+        continue;
+      const linked = linkedFolders.get(page.path) ?? [];
+      linked.push(directory);
+      linkedFolders.set(page.path, linked);
     }
+  }
+  // Apply unique link evidence across all folders before any remaining title-only claims.
+  for (const [directory, matches] of candidates) {
+    const linked = matches.filter((page) => linkedFolders.get(page.path)?.includes(directory));
+    if (linked.length === 1 && linkedFolders.get(linked[0]!.path)?.length === 1) claim(directory, linked[0]!);
+  }
+  for (const [directory, matches] of candidates) {
+    if (owners.has(directory)) continue;
+    const available = matches.filter((page) => !claimed.has(page.path));
+    if (available.length !== 1) continue;
+    const page = available[0]!;
+    if (linkedFolders.has(page.path)) continue;
+    const competing = [...candidates].some(
+      ([other, otherCandidates]) =>
+        other !== directory && !owners.has(other) && otherCandidates.some((candidate) => candidate.path === page.path),
+    );
+    if (!competing) claim(directory, page);
   }
   return { owners, directories };
 }
@@ -591,8 +610,13 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   for (const entry of pageEntries) pageIds.set(entry.path, await stableId(job.id, "page", entry.path));
   const { owners, directories } = directoryOwners(pageEntries);
   const sourcePaths = [...pageEntries.map((entry) => entry.path), ...csvEntries.map((entry) => entry.path)];
-  const grouping = groupingFor(sourcePaths, owners, wrapperPaths);
-  const groupKeyBySource = new Map(sourcePaths.map((source) => [source, groupKeyFor(source, grouping)]));
+  let grouping = groupingFor(sourcePaths, owners, wrapperPaths);
+  let groupKeyBySource = new Map(sourcePaths.map((source) => [source, groupKeyFor(source, grouping)]));
+  // Replay the original key allocation for older previews with an Imported teamspace and no loose pages.
+  if (options.previewGroupKeys?.includes("Imported") && ![...groupKeyBySource.values()].includes("Imported")) {
+    grouping = groupingFor(sourcePaths, owners, wrapperPaths, false);
+    groupKeyBySource = new Map(sourcePaths.map((source) => [source, groupKeyFor(source, grouping)]));
+  }
   const groupKeys = [...new Set(groupKeyBySource.values())];
   assertPreviewGroups(options, groupKeys);
   const archiveOrder = new Map(entries.map((entry, index) => [entry.path, index]));
