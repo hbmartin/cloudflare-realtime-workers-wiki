@@ -100,7 +100,13 @@ import type {
 import { compareBinaryText } from "../shared/tree-model";
 import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
-import { importDestinationSpaceIds, normalizeGroupSpaceIds } from "../shared/import-space-mapping";
+import {
+  importDestinationSpaceIds,
+  normalizeGroupSpaceIds,
+  parseImportOptions,
+  type ImportOptions,
+} from "../shared/import-space-mapping";
+import { validateImportPreview } from "./importer";
 import { constantTimeEqual } from "../shared/security";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
@@ -1741,6 +1747,18 @@ app.post("/api/import-uploads", async (c) => {
   return c.json({ job: jobJson(uploaded) }, 202);
 });
 
+async function validateSavedImportPreview(env: Env, job: JobRow, options: ImportOptions) {
+  try {
+    await validateImportPreview(env, job, options);
+  } catch {
+    throw new HttpError(
+      409,
+      "import_preview_outdated",
+      "This import's saved preview could not be verified. Upload the file again to inspect and confirm its destinations.",
+    );
+  }
+}
+
 async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string) {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
@@ -1781,24 +1799,22 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
   }
   const destinations = importDestinationSpaceIds(job.space_id, savedGroupSpaceIds ?? undefined);
   for (const spaceId of destinations) await editableSpaceForMember(c.env, member, spaceId);
+  const confirmedOptions = parseImportOptions({
+    ...options,
+    confirmed: true,
+    groupSpaceIds: savedGroupSpaceIds,
+    ...(groups.length ? { previewGroupKeys: groups.map((group) => group.key) } : {}),
+    previewGroupingVersion: storedResult.preview?.groupingVersion,
+  });
+  if (!confirmedOptions) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
+  await validateSavedImportPreview(c.env, job, confirmedOptions);
   const instanceId = crypto.randomUUID();
   const queued = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, options_json = ?, progress_label = 'Queued',
       error_code = NULL, error_message = NULL, updated_at = ?
       WHERE id = ? AND attempt = ? AND status = 'awaiting_confirmation'`,
   )
-    .bind(
-      instanceId,
-      JSON.stringify({
-        ...options,
-        confirmed: true,
-        groupSpaceIds: savedGroupSpaceIds,
-        ...(groups.length ? { previewGroupKeys: groups.map((group) => group.key) } : {}),
-      }),
-      now(),
-      job.id,
-      job.attempt,
-    )
+    .bind(instanceId, JSON.stringify(confirmedOptions), now(), job.id, job.attempt)
     .run();
   if (!queued.meta.changes) {
     throw new HttpError(409, "import_not_confirmable", "This import is no longer awaiting confirmation.");
@@ -1912,29 +1928,16 @@ async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow) {
   const options = storedJobOptions(job);
   if (job.type === "import") {
     requireEditor(member);
-    const mappings = normalizeGroupSpaceIds(options.groupSpaceIds);
-    const previewKeys = options.previewGroupKeys;
-    const invalidPreviewKeys =
-      previewKeys !== undefined &&
-      (!Array.isArray(previewKeys) ||
-        previewKeys.some((key) => typeof key !== "string") ||
-        new Set(previewKeys).size !== previewKeys.length);
-    const destinations = importDestinationSpaceIds(job.space_id, mappings ?? undefined);
-    if (
-      mappings === null ||
-      invalidPreviewKeys ||
-      destinations.size === 0 ||
-      (mappings &&
-        Array.isArray(previewKeys) &&
-        (Object.keys(mappings).length !== previewKeys.length ||
-          previewKeys.some((key) => !Object.hasOwn(mappings, key))))
-    )
+    const parsed = parseImportOptions(options);
+    const destinations = importDestinationSpaceIds(job.space_id, parsed?.groupSpaceIds);
+    if (!parsed || destinations.size === 0)
       throw new HttpError(
         409,
         "job_options_invalid",
         "This import's saved space mappings are invalid. Upload the file again to inspect and confirm its destinations.",
       );
     for (const spaceId of destinations) await editableSpaceForMember(env, member, spaceId);
+    await validateSavedImportPreview(env, job, parsed);
     return;
   }
   if (job.type === "template_clone") {

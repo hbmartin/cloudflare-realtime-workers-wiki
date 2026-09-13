@@ -1085,7 +1085,7 @@ describe("App error handling", () => {
     expect((await screen.findAllByText("Created")).length).toBeGreaterThan(0);
     expect(treeLoads).toBe(2);
     expect(screen.queryByText(/page-creation result could not be verified/i)).not.toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page")).toBe(createdPage.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(createdPage.id);
     expect(api).toHaveBeenCalledWith(
       "/api/pages",
       expect.objectContaining({
@@ -1752,7 +1752,7 @@ describe("App error handling", () => {
     });
 
     expect(recordUpserts).not.toHaveBeenCalled();
-    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
   });
 
   it("does not let a late create response bypass a removal tombstone", async () => {
@@ -1790,7 +1790,7 @@ describe("App error handling", () => {
 
     expect(recordUpserts).not.toHaveBeenCalledWith([createdPage]);
     expect(screen.queryByRole("button", { name: "Archive Created" })).not.toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
     expect(await screen.findByText("The page was created, but it is no longer available.")).toBeInTheDocument();
     expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
     expect(document.querySelector(".sidebar-scrim")).not.toBeInTheDocument();
@@ -3497,7 +3497,7 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
 
-    await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(page.id));
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
   });
 
   it("keeps the restored-root preference when the first confirming tree only has another page", async () => {
@@ -3524,7 +3524,7 @@ describe("App error handling", () => {
 
     await waitFor(() => expect(treeLoads).toBe(3));
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
   });
 
   it("falls back to an available page when a pending restored root is absent", async () => {
@@ -3549,7 +3549,7 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
 
     expect(await screen.findByRole("button", { name: "Archive Other" })).toBeInTheDocument();
-    await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(otherPage.id));
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(otherPage.id));
   });
 
   it("loads a hidden navigation target directly without adding it to the sidebar", async () => {
@@ -3581,7 +3581,7 @@ describe("App error handling", () => {
     expect(
       [...document.querySelectorAll(".page-link")].some((link) => link.textContent?.includes("Hidden detail")),
     ).toBe(false);
-    expect(localStorage.getItem("notes:last-page")).toBe(hiddenPage.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id);
 
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(2));
@@ -3647,7 +3647,7 @@ describe("App error handling", () => {
   ] as const)("loads a hidden startup page from %s after tree retry: %s", async (source, retry) => {
     const hiddenPage = { ...page, id: "initial-hidden-page", position: "c0", title: "Initial hidden detail" };
     if (source === "URL") history.replaceState(null, "", `/?page=${hiddenPage.id}`);
-    else localStorage.setItem("notes:last-page", hiddenPage.id);
+    else localStorage.setItem("notes:last-page:workspace:user", hiddenPage.id);
     mockShellApi();
     const shellApi = vi.mocked(api).getMockImplementation()!;
     let treeLoads = 0;
@@ -3666,8 +3666,118 @@ describe("App error handling", () => {
       `/api/pages/${hiddenPage.id}`,
       expect.objectContaining({ signal: expect.anything() }),
     );
-    expect(localStorage.getItem("notes:last-page")).toBe(hiddenPage.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id);
     expect(screen.queryByRole("button", { name: "Archive Initial hidden detail" })).not.toBeInTheDocument();
+  });
+
+  it.each([403, 404, 410])("discards a remembered page returning %s and permits creation", async (status) => {
+    localStorage.setItem("notes:last-page:workspace:user", "missing");
+    mockShellApi({ pages: [] });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/pages/missing") throw new ApiClientError(status, "page_not_found", "Page missing.");
+      return shellApi(path, init);
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Create a root page" })).toBeEnabled());
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Page unavailable" })).not.toBeInTheDocument();
+  });
+
+  it.each(["notes:last-page", "notes:last-page:workspace:another-user", "notes:last-page:another-workspace:user"])(
+    "ignores saved pages outside the current user and workspace: %s",
+    async (key) => {
+      localStorage.setItem(key, "foreign-page");
+      mockShellApi();
+      render(<App />);
+      await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
+      expect(api).not.toHaveBeenCalledWith("/api/pages/foreign-page", expect.anything());
+      expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
+    },
+  );
+
+  it("discards a remembered template already present in the tree", async () => {
+    const template = { ...page, id: "template", title: "Template", isTemplate: true };
+    localStorage.setItem("notes:last-page:workspace:user", template.id);
+    mockShellApi({ pages: [template, page] });
+    render(<App />);
+    await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
+    expect(mocks.editorRender.mock.calls.some(([props]) => props.page.id === template.id)).toBe(false);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
+  });
+
+  it.each([
+    { archivedAt: 123, isTemplate: false },
+    { archivedAt: null, isTemplate: true },
+  ])("opens an explicit archived/template link without remembering it: %j", async (flags) => {
+    const linked = { ...page, id: "explicit-link", title: "Explicit page", ...flags };
+    localStorage.setItem("notes:last-page:workspace:user", page.id);
+    history.replaceState(null, "", `/?page=${linked.id}`);
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${linked.id}`) return { page: linked, sidebarHidden: false };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    await screen.findByText(linked.title, { selector: ".breadcrumbs span" });
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
+    expect(new URLSearchParams(location.search).get("page")).toBe(linked.id);
+    expect(screen.queryByRole("button", { name: `Archive ${linked.title}` })).not.toBeInTheDocument();
+  });
+
+  it("opens an archived Search result", async () => {
+    const archived = { ...page, id: "archived-result", title: "Archived result", archivedAt: 123 };
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/members") return { members: [] };
+      if (path.startsWith("/api/search?"))
+        return {
+          results: [{ page: archived, space: shellGeneralSpace, snippet: { source: "title", text: archived.title } }],
+          hasMore: false,
+        };
+      if (path === `/api/pages/${archived.id}`) return { page: archived, sidebarHidden: false };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Search/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Search workspace" }), { target: { value: "Archived" } });
+    fireEvent.click(await screen.findByRole("button", { name: /Archived result/ }));
+    await screen.findByText(archived.title, { selector: ".breadcrumbs span" });
+    expect(new URLSearchParams(location.search).get("page")).toBe(archived.id);
+  });
+
+  it.each([404, 503])("keeps a failed explicit page lookup (%s) stable through tree refreshes", async (status) => {
+    history.replaceState(null, "", "/?page=missing");
+    const refreshedTree = deferred<{ pages: Page[] }>();
+    let treeLoads = 0;
+    let pageLoads = 0;
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/pages/tree" && ++treeLoads === 2) return refreshedTree.promise;
+      if (path === "/api/pages/missing") {
+        pageLoads += 1;
+        throw new ApiClientError(status, "page_unavailable", "Page lookup failed.");
+      }
+      return shellApi(path, init);
+    });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Page unavailable" });
+    act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+    await waitFor(() => expect(treeLoads).toBe(2));
+    await act(async () => refreshedTree.resolve({ pages: [page] }));
+    await act(async () => mocks.createWorkspaceEvents.mock.calls.at(-1)![2]());
+    expect(treeLoads).toBe(3);
+    expect(pageLoads).toBe(1);
+    expect(screen.getByRole("heading", { name: "Page unavailable" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Try loading page again" }));
+    await waitFor(() => expect(pageLoads).toBe(2));
+    await screen.findByRole("heading", { name: "Page unavailable" });
+    fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
+    await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
+    expect(new URLSearchParams(location.search).get("page")).toBe(page.id);
   });
 
   it("treats an empty page query as normal startup and permits creation and restored-root selection", async () => {
@@ -3684,9 +3794,9 @@ describe("App error handling", () => {
   it.each([
     { archivedAt: 123, isTemplate: false },
     { archivedAt: null, isTemplate: true },
-  ])("falls back from an archived or template bookmark: %j", async (flags) => {
+  ])("falls back from an archived or template remembered page: %j", async (flags) => {
     const unavailable = { ...page, id: "old-bookmark", title: "Old bookmark", ...flags };
-    history.replaceState(null, "", `/?page=${unavailable.id}`);
+    localStorage.setItem("notes:last-page:workspace:user", unavailable.id);
     mockShellApi();
     const shellApi = vi.mocked(api).getMockImplementation()!;
     vi.mocked(api).mockImplementation(async (path, init) => {
@@ -3696,17 +3806,22 @@ describe("App error handling", () => {
     render(<App />);
     expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs span" })).toBeInTheDocument();
     expect(mocks.editorRender.mock.calls.some(([props]) => props.page.id === unavailable.id)).toBe(false);
-    expect(localStorage.getItem("notes:last-page")).toBe(page.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
   });
 
   it("keeps newer hidden visibility through an older tree response and the following refresh", async () => {
     const hiddenPage = { ...page, id: "newly-hidden", title: "Newly hidden", position: "c0" };
     const staleTree = deferred<{ pages: Page[] }>();
+    const freshTree = deferred<{ pages: Page[] }>();
     let treeLoads = 0;
     mockShellApi();
     const shellApi = vi.mocked(api).getMockImplementation()!;
     vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path === "/api/pages/tree" && ++treeLoads === 2) return staleTree.promise;
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        if (treeLoads === 2) return staleTree.promise;
+        if (treeLoads === 3) return freshTree.promise;
+      }
       if (path === `/api/pages/${hiddenPage.id}`) return { page: hiddenPage, sidebarHidden: true };
       return shellApi(path, init);
     });
@@ -3722,9 +3837,48 @@ describe("App error handling", () => {
     expect(screen.queryByRole("button", { name: "Archive Newly hidden" })).not.toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(3));
+    await act(async () => freshTree.resolve({ pages: [page, hiddenPage] }));
+    expect(await screen.findByRole("button", { name: "Archive Newly hidden" })).toBeInTheDocument();
     expect(screen.getByText("Newly hidden", { selector: ".breadcrumbs span" })).toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page")).toBe(hiddenPage.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id);
   });
+
+  it.each([false, true, "batched"] as const)(
+    "lets an overlapping newer tree supersede direct visibility (tree finishes first: %s)",
+    async (treeFirst) => {
+      const hiddenPage = { ...page, id: "overlapping-page", title: "Overlapping page", position: "c0" };
+      const direct = deferred<{ page: Page; sidebarHidden: boolean }>();
+      const tree = deferred<{ pages: Page[] }>();
+      let treeLoads = 0;
+      mockShellApi();
+      const shellApi = vi.mocked(api).getMockImplementation()!;
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path === "/api/pages/tree" && ++treeLoads === 2) return tree.promise;
+        if (path === `/api/pages/${hiddenPage.id}`) return direct.promise;
+        return shellApi(path, init);
+      });
+      render(<App />);
+      await screen.findByRole("button", { name: "Archive Roadmap" });
+      act(() => {
+        window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
+      });
+      await waitFor(() => expect(api).toHaveBeenCalledWith(`/api/pages/${hiddenPage.id}`, expect.anything()));
+      act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
+      await waitFor(() => expect(treeLoads).toBe(2));
+      if (treeFirst === "batched") {
+        await act(async () => {
+          tree.resolve({ pages: [page, hiddenPage] });
+          direct.resolve({ page: hiddenPage, sidebarHidden: true });
+        });
+      } else {
+        if (treeFirst) await act(async () => tree.resolve({ pages: [page, hiddenPage] }));
+        await act(async () => direct.resolve({ page: hiddenPage, sidebarHidden: true }));
+        if (!treeFirst) await act(async () => tree.resolve({ pages: [page, hiddenPage] }));
+      }
+      expect(await screen.findByRole("button", { name: "Archive Overlapping page" })).toBeInTheDocument();
+      expect(screen.getByText(hiddenPage.title, { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    },
+  );
 
   it.each([
     ["clears", false, "Roadmap"],
@@ -3892,7 +4046,7 @@ describe("App error handling", () => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
     await waitFor(() => expect(directLoads).toBe(1));
-    await waitFor(() => expect(localStorage.getItem("notes:last-page")).toBe(hiddenPage.id));
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id));
     await act(async () => retry.reject(new ApiClientError(503, "tree_unavailable", "Retry failed.")));
 
     expect(await screen.findByRole("heading", { name: "Workspace unavailable" })).toBeInTheDocument();
@@ -3956,7 +4110,7 @@ describe("App error handling", () => {
       await firstLoad.promise;
     });
     expect(screen.getByText("Second", { selector: ".breadcrumbs span" })).toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page")).toBe(secondPage.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(secondPage.id);
   });
 
   it("aborts the archived page-tree request when the workspace unmounts", async () => {
@@ -4062,7 +4216,7 @@ describe("App error handling", () => {
       await reconciliation.promise;
     });
 
-    expect(localStorage.getItem("notes:last-page")).toBe(newerRoot.id);
+    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(newerRoot.id);
     expect(screen.getByRole("button", { name: "Archive Newer root" })).toBeInTheDocument();
   });
 
