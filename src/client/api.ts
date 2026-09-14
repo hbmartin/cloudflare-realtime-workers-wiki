@@ -137,6 +137,7 @@ export function isSuccessfulJsonResponseBodyError(cause: unknown): cause is Succ
 export type UnauthorizedHandler = (error: ApiClientError) => void;
 
 const unauthorizedHandlers = new Set<UnauthorizedHandler>();
+let unauthorizedRequestEpoch = 0;
 
 function apiResponseFailureCause(cause: unknown) {
   if (cause === undefined) return { causeName: null, causeType: null };
@@ -190,7 +191,12 @@ export function onApiUnauthorized(handler: UnauthorizedHandler) {
   };
 }
 
+export function invalidateUnauthorizedRequests() {
+  unauthorizedRequestEpoch += 1;
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const requestEpoch = unauthorizedRequestEpoch;
   const headers = new Headers(init?.headers);
   if (init?.body && !(init.body instanceof FormData)) headers.set("content-type", "application/json");
   const response = await fetch(path, { ...init, headers });
@@ -229,7 +235,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       cause: responseBodyCause,
     });
     if (responseBodyFailure) reportApiResponseFailure(clientError);
-    if (response.status === 401) {
+    if (response.status === 401 && requestEpoch === unauthorizedRequestEpoch) {
       for (const handler of unauthorizedHandlers) {
         try {
           handler(clientError);

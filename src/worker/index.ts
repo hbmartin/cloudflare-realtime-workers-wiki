@@ -2,7 +2,7 @@ import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fracti
 import { Hono, type Context } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
-import { requireSecurity } from "./security";
+import { pruneSecurityState, requireSecurity } from "./security";
 import { ARCHIVE_DISCONNECT_RUN_LIMIT, processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
 import {
   isInlineMime,
@@ -195,6 +195,7 @@ const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
 const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple", "pink"] as const;
 const MAX_IMPORT_UPLOAD_BYTES = 24 * 1024 * 1024;
+const INVITE_CLAIM_MS = 10 * 60_000;
 
 type PageRow = PageJsonRow & {
   created_by: string;
@@ -1104,37 +1105,95 @@ app.post("/api/invites/accept", async (c) => {
   const email = text(body.email, "email", 320).toLowerCase();
   const password = text(body.password, "password", 200);
   const invite = await c.env.DB.prepare(
-    "SELECT id,workspace_id FROM invites WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
+    "SELECT id,workspace_id,expires_at FROM invites WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
   )
     .bind(tokenHash, now())
-    .first<{ id: string; workspace_id: string }>();
+    .first<{ id: string; workspace_id: string; expires_at: number }>();
   if (!invite) throw new HttpError(404, "invite_invalid", "This invite is invalid, expired, or already used.");
   const existing = await c.env.DB.prepare("SELECT id FROM user WHERE email=?").bind(email).first<{ id: string }>();
-  // Existing members can authenticate without reserving or consuming an invitation.
-  const membership =
-    existing &&
-    (await c.env.DB.prepare("SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?")
+  if (existing) {
+    // A guessed address cannot reserve an invitation: prove the existing
+    // account's password before touching claim state.
+    const signin = await authEmail(c.env, c.req.raw, "/api/auth/sign-in/email", { email, password });
+    if (!signin.response.ok) return signin.response;
+    const membership = await c.env.DB.prepare("SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?")
       .bind(invite.workspace_id, existing.id)
-      .first());
-  if (membership) return (await authEmail(c.env, c.req.raw, "/api/auth/sign-in/email", { email, password })).response;
-  const name = existing ? undefined : text(body.name, "name", 100);
-  // Reserve before signup: a post-signup claim would still allow concurrent account creation.
-  // A failed signup can be retried with this same email until the invite expires.
-  const reserved = await c.env.DB.prepare(`UPDATE invites SET claimed_email=?
-    WHERE id=? AND used_at IS NULL AND expires_at>? AND (claimed_email IS NULL OR claimed_email=?) RETURNING id`)
-    .bind(email, invite.id, now(), email)
+      .first();
+    if (membership) {
+      await c.env.DB.prepare("DELETE FROM invites WHERE workspace_id=? AND claimed_by=? AND used_at IS NULL")
+        .bind(invite.workspace_id, existing.id)
+        .run();
+      return signin.response;
+    }
+    const time = now();
+    const claimed = await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE invites SET claimed_email=?,claimed_by=?,claim_token=NULL,claim_expires_at=expires_at
+        WHERE id=? AND used_at IS NULL AND expires_at>?
+          AND (claimed_email IS NULL OR lower(claimed_email)=? OR (claimed_by IS NULL AND claim_expires_at<=?))
+          AND (claimed_by IS NULL OR claimed_by=?)
+          AND (claim_token IS NULL OR claim_expires_at<=?) RETURNING id`).bind(
+        email,
+        existing.id,
+        invite.id,
+        time,
+        email,
+        time,
+        existing.id,
+        time,
+      ),
+      c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND id!=? AND used_at IS NULL
+        AND claimed_by=? AND EXISTS(SELECT 1 FROM invites target WHERE target.id=? AND target.claimed_by=?)`).bind(
+        invite.workspace_id,
+        invite.id,
+        existing.id,
+        invite.id,
+        existing.id,
+      ),
+    ]);
+    if (!claimed[0]!.results.length)
+      throw new HttpError(409, "invite_claimed", "This invite is already reserved for another account.");
+    return signin.response;
+  }
+
+  const name = text(body.name, "name", 100);
+  const claimToken = crypto.randomUUID();
+  const time = now();
+  const reserved = await c.env.DB.prepare(`UPDATE invites
+    SET claimed_email=?,claimed_by=NULL,claim_token=?,claim_expires_at=?
+    WHERE id=? AND used_at IS NULL AND expires_at>? AND claimed_by IS NULL
+      AND (claim_token IS NULL OR claim_expires_at<=?) RETURNING id`)
+    .bind(email, claimToken, time + INVITE_CLAIM_MS, invite.id, time, time)
     .first();
   if (!reserved) throw new HttpError(409, "invite_claimed", "This invite is already reserved for another account.");
-  const signup = existing
-    ? await authEmail(c.env, c.req.raw, "/api/auth/sign-in/email", { email, password })
-    : await signUp(c.env, c.req.raw, { name: name!, email, password });
-  if (!signup.response.ok) return signup.response;
-  // A successful password sign-in may return a two-factor challenge instead of a user.
-  const userId = existing?.id ?? signup.user?.id;
-  if (!userId) throw new HttpError(500, "signup_failed", "Account registration could not be completed.");
-  await c.env.DB.prepare("UPDATE invites SET claimed_by=? WHERE id=? AND claimed_email=? AND used_at IS NULL")
-    .bind(userId, invite.id, email)
-    .run();
+  const signup = await signUp(c.env, c.req.raw, { name, email, password });
+  if (!signup.response.ok || !signup.user) {
+    await c.env.DB.prepare(`UPDATE invites SET claimed_email=NULL,claim_token=NULL,claim_expires_at=NULL
+      WHERE id=? AND claim_token=? AND claimed_by IS NULL`)
+      .bind(invite.id, claimToken)
+      .run();
+    if (!signup.response.ok) return signup.response;
+    throw new HttpError(500, "signup_failed", "Account registration could not be completed.");
+  }
+  const claimed = await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE invites SET claimed_by=?,claim_token=NULL,claim_expires_at=expires_at
+      WHERE id=? AND claimed_email=? AND claim_token=? AND used_at IS NULL AND expires_at>? RETURNING id`).bind(
+      signup.user.id,
+      invite.id,
+      email,
+      claimToken,
+      now(),
+    ),
+    c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND id!=? AND used_at IS NULL
+      AND claimed_by=? AND EXISTS(SELECT 1 FROM invites target WHERE target.id=? AND target.claimed_by=?)`).bind(
+      invite.workspace_id,
+      invite.id,
+      signup.user.id,
+      invite.id,
+      signup.user.id,
+    ),
+  ]);
+  if (!claimed[0]!.results.length)
+    throw new HttpError(409, "invite_claimed", "The invitation reservation expired. Try the invitation again.");
   return signup.response;
 });
 
@@ -1156,21 +1215,32 @@ app.post("/api/invites/complete", async (c) => {
     if (tokenHash) throw new HttpError(409, "invite_invalid", "This invite is invalid, expired, or already used.");
     return c.json({ success: true });
   }
-  // The trigger inserts membership only on the unused -> used transition. A member
-  // opening someone else's invitation is a no-op, and retries cannot undo removal.
+  const time = now();
   const result = await c.env.DB.batch([
-    c.env.DB.prepare(`UPDATE invites SET used_by=?,used_at=?,claimed_by=?,claimed_email=?
+    c.env.DB.prepare(`UPDATE invites SET used_by=?,used_at=?,claimed_by=?,claimed_email=?,claim_token=NULL,
+      claim_expires_at=expires_at
       WHERE id=? AND used_at IS NULL AND expires_at>?
-      AND (claimed_email IS NULL OR claimed_email=?) AND (claimed_by IS NULL OR claimed_by=?)
+      AND (claimed_email IS NULL OR claimed_email=? OR (claimed_by IS NULL AND claim_expires_at<=?))
+      AND (claimed_by IS NULL OR claimed_by=?)
+      AND (claim_token IS NULL OR claim_expires_at<=?)
       AND NOT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=invites.workspace_id AND user_id=?)`).bind(
       session.user.id,
-      now(),
+      time,
       session.user.id,
       session.user.email.toLowerCase(),
       invite.id,
-      now(),
+      time,
       session.user.email.toLowerCase(),
+      time,
       session.user.id,
+      time,
+      session.user.id,
+    ),
+    c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND claimed_by=? AND used_at IS NULL
+      AND EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?)`).bind(
+      invite.workspace_id,
+      session.user.id,
+      invite.workspace_id,
       session.user.id,
     ),
     c.env.DB.prepare("SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?").bind(
@@ -1178,7 +1248,7 @@ app.post("/api/invites/complete", async (c) => {
       session.user.id,
     ),
   ]);
-  if (!result[1]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
+  if (!result[2]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
   return c.json({ success: true });
 });
 
@@ -1268,9 +1338,16 @@ app.delete("/api/members/:id", async (c) => {
     .first<{ role: string }>();
   if (!target) throw new HttpError(404, "member_not_found", "Member not found.");
   if (target.role === "owner") await assertAnotherOwner(c.env, member.workspace.id, targetId);
-  await c.env.DB.prepare(`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?`)
-    .bind(member.workspace.id, targetId)
-    .run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?`).bind(
+      member.workspace.id,
+      targetId,
+    ),
+    c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND claimed_by=? AND used_at IS NULL`).bind(
+      member.workspace.id,
+      targetId,
+    ),
+  ]);
   return c.json({ ok: true });
 });
 
@@ -5792,6 +5869,11 @@ export default {
     context.waitUntil(
       pruneWebhookHistory(env).catch((error) => {
         console.error("Webhook history pruning failed", error);
+      }),
+    );
+    context.waitUntil(
+      pruneSecurityState(env).catch((error) => {
+        console.error("Security state pruning failed", error);
       }),
     );
   },

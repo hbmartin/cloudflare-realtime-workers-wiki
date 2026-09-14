@@ -1,8 +1,22 @@
-import { applyD1Migrations, env, reset } from "cloudflare:test";
+import {
+  applyD1Migrations,
+  createExecutionContext,
+  createScheduledController,
+  env,
+  reset,
+  SELF,
+  waitOnExecutionContext,
+} from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createAuth } from "./auth";
-import { requireSecurity } from "./security";
+import {
+  cleanupFailedPasskeyRegistration,
+  passkeyRegistrationRevokedResponse,
+  requireSecurity,
+  upsertPasskeyRegistrationPermit,
+} from "./security";
 import { sha256 } from "./http";
+import worker from "./index";
 import { enrollAccount, otpFromUri, responseCookies, securityRequest as request } from "../../tests/helpers/security";
 
 beforeEach(async () => {
@@ -17,6 +31,19 @@ function bootstrap() {
     name: "Owner",
     email: "owner@example.test",
     password: "password123",
+  });
+}
+
+function requestFromIp(ip: string, path: string, body: object, cookie = "") {
+  return SELF.fetch(`http://example.test${path}`, {
+    method: "POST",
+    headers: {
+      "cf-connecting-ip": ip,
+      cookie,
+      "content-type": "application/json",
+      origin: "http://example.test",
+    },
+    body: JSON.stringify(body),
   });
 }
 
@@ -85,19 +112,23 @@ describe("mandatory account protection", () => {
   it("requires acknowledgment of the current recovery-code batch after replacement", async () => {
     const cookie = await enrollAccount(await bootstrap());
     expect((await request(cookie, "/api/me")).status).toBe(200);
+    const active = (await env.DB.prepare("SELECT code_hash FROM recovery_codes ORDER BY code_hash").all()).results;
     const first = await (await request(cookie, "/api/security/recovery-codes", {})).json<{ receipt: string }>();
     expect(await (await request(cookie, "/api/security/status")).json()).toMatchObject({
-      state: "enrollment_required",
-      codesSaved: false,
+      state: "ready",
+      codesSaved: true,
     });
-    expect((await request(cookie, "/api/me")).status).toBe(401);
+    expect((await request(cookie, "/api/me")).status).toBe(200);
+    expect((await env.DB.prepare("SELECT code_hash FROM recovery_codes ORDER BY code_hash").all()).results).toEqual(
+      active,
+    );
     const second = await (await request(cookie, "/api/security/recovery-codes", {})).json<{ receipt: string }>();
     expect((await request(cookie, "/api/security/acknowledge-codes", { receipt: first.receipt })).status).toBe(403);
     expect(await (await request(cookie, "/api/security/status")).json()).toMatchObject({
-      state: "enrollment_required",
-      codesSaved: false,
+      state: "ready",
+      codesSaved: true,
     });
-    expect((await request(cookie, "/api/me")).status).toBe(401);
+    expect((await request(cookie, "/api/me")).status).toBe(200);
     expect((await request(cookie, "/api/security/acknowledge-codes", { receipt: second.receipt })).status).toBe(200);
     expect(await (await request(cookie, "/api/security/status")).json()).toMatchObject({
       state: "ready",
@@ -201,6 +232,8 @@ describe("mandatory account protection", () => {
       await request(cookie, "/api/security/recovery-codes", {})
     ).json<{ codes: string[]; receipt: string }>();
     await request(cookie, "/api/security/acknowledge-codes", { receipt });
+    await request(cookie, "/api/security/recovery-codes", {});
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM pending_recovery_codes").first()).toEqual({ count: 10 });
     const login = await request("", "/api/auth/sign-in/email", {
       email: "owner@example.test",
       password: "password123",
@@ -210,6 +243,7 @@ describe("mandatory account protection", () => {
       [0, 1].map(() => request(pending, "/api/security/recover", { password: "password123", code: codes[0] })),
     );
     expect(attempts.filter((response) => response.ok)).toHaveLength(1);
+    expect(await env.DB.prepare("SELECT 1 FROM pending_recovery_codes").first()).toBeNull();
     const recovered = responseCookies(attempts.find((response) => response.ok)!);
     expect((await request(cookie, "/api/me")).status).toBe(401);
     expect((await request(recovered, "/api/me")).status).toBe(401);
@@ -231,11 +265,14 @@ describe("mandatory account protection", () => {
 
   it("operator reset revokes factors atomically and an expired reset cannot enroll", async () => {
     const cookie = await enrollAccount(await bootstrap());
+    await request(cookie, "/api/security/recovery-codes", {});
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM pending_recovery_codes").first()).toEqual({ count: 10 });
     const user = await env.DB.prepare("SELECT id FROM user").first<{ id: string }>();
     await env.DB.prepare("INSERT INTO security_resets(token_hash,user_id,expires_at) VALUES (?,?,?)")
       .bind(await sha256("operator-token"), user!.id, Date.now() - 1)
       .run();
     expect((await request(cookie, "/api/me")).status).toBe(401);
+    expect(await env.DB.prepare("SELECT 1 FROM pending_recovery_codes").first()).toBeNull();
     expect(await env.DB.prepare("SELECT id FROM twoFactor").first()).toBeNull();
     const login = await request("", "/api/auth/sign-in/email", {
       email: "owner@example.test",
@@ -323,6 +360,30 @@ function accept(token: string, email = "guest@example.test") {
 }
 
 describe("security lifecycle regressions", () => {
+  it("does not let a stale recovery replacement delete a newer generation batch", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const user = await env.DB.prepare("SELECT id FROM user").first<{ id: string }>();
+    const auth = beforeBatch(async () => {
+      await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?").bind(user!.id).run();
+      await env.DB.batch(
+        Array.from({ length: 10 }, (_, index) =>
+          env.DB.prepare(
+            "INSERT INTO pending_recovery_codes(code_hash,batch_id,user_id,generation,expires_at) VALUES (?,?,?,?,?)",
+          ).bind(`new-code-${index}`, "new-batch", user!.id, 2, Date.now() + 60_000),
+        ),
+      );
+    });
+
+    expect((await auth.handler(authRequest(cookie, "recovery-codes", {}))).status).toBe(403);
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) count FROM pending_recovery_codes WHERE user_id=? AND batch_id='new-batch' AND generation=2",
+      )
+        .bind(user!.id)
+        .first(),
+    ).toEqual({ count: 10 });
+  });
+
   it("reserves one email before concurrent signup and keeps pending enrollment on the server", async () => {
     const owner = await enrollAccount(await bootstrap());
     const token = await invitation(owner);
@@ -339,7 +400,7 @@ describe("security lifecycle regressions", () => {
     expect((await request(cookie, "/api/me")).status).toBe(200);
   });
 
-  it("allows same-email retries after failed registration but not a different account", async () => {
+  it("releases the exact reservation after failed signup and rebinds it to the next account", async () => {
     const owner = await enrollAccount(await bootstrap());
     const token = await invitation(owner);
     expect(
@@ -352,10 +413,51 @@ describe("security lifecycle regressions", () => {
         })
       ).ok,
     ).toBe(false);
-    expect((await accept(token, "rival@example.test")).status).toBe(409);
-    expect((await accept(token)).status).toBe(200);
-    expect((await accept(token)).status).toBe(200);
+    expect((await accept(token, "rival@example.test")).status).toBe(200);
+    expect((await accept(token)).status).toBe(409);
     expect(await env.DB.prepare("SELECT COUNT(*) count FROM user").first()).toEqual({ count: 2 });
+  });
+
+  it("authenticates an existing account before claiming its invitation", async () => {
+    const owner = await enrollAccount(await bootstrap());
+    const token = await invitation(owner);
+
+    expect(
+      (
+        await request("", "/api/invites/accept", {
+          token,
+          email: "owner@example.test",
+          password: "incorrect",
+        })
+      ).status,
+    ).toBe(401);
+    expect(await env.DB.prepare("SELECT claimed_email,claimed_by,claim_token FROM invites").first()).toEqual({
+      claimed_email: null,
+      claimed_by: null,
+      claim_token: null,
+    });
+  });
+
+  it("supersedes an account's older pending claim in the same workspace", async () => {
+    const owner = await enrollAccount(await bootstrap());
+    const first = await invitation(owner);
+    const second = await invitation(owner);
+    expect((await accept(first)).status).toBe(200);
+    expect(
+      (
+        await request("", "/api/invites/accept", {
+          token: second,
+          email: "guest@example.test",
+          password: "password123",
+        })
+      ).status,
+    ).toBe(200);
+    const user = await env.DB.prepare("SELECT id FROM user WHERE email='guest@example.test'").first<{ id: string }>();
+    expect(
+      await env.DB.prepare("SELECT token_hash FROM invites WHERE claimed_by=? AND used_at IS NULL")
+        .bind(user!.id)
+        .all(),
+    ).toMatchObject({ results: [{ token_hash: await sha256(second) }] });
   });
 
   it("does not burn an existing member's invitation or restore a removed recipient on replay", async () => {
@@ -377,6 +479,55 @@ describe("security lifecycle regressions", () => {
     expect(
       await env.DB.prepare("SELECT 1 FROM workspace_members WHERE user_id=?").bind(member.user.id).first(),
     ).toBeNull();
+  });
+
+  it("deletes a removed member's unused claims before a later completion can restore access", async () => {
+    const owner = await enrollAccount(await bootstrap());
+    const token = await invitation(owner);
+    const guest = await enrollAccount(await accept(token), token);
+    const member = await (await request(guest, "/api/me")).json<{ user: { id: string }; workspace: { id: string } }>();
+    const leftoverToken = "leftover-claim";
+    await env.DB.prepare(`INSERT INTO invites
+      (id,workspace_id,token_hash,role,expires_at,created_by,created_at,claimed_email,claimed_by,claim_expires_at)
+      VALUES ('leftover',?,?, 'viewer',?,?,?,'guest@example.test',?,?)`)
+      .bind(
+        member.workspace.id,
+        await sha256(leftoverToken),
+        Date.now() + 60_000,
+        member.user.id,
+        Date.now(),
+        member.user.id,
+        Date.now() + 60_000,
+      )
+      .run();
+
+    const removed = await SELF.fetch(`http://example.test/api/members/${member.user.id}`, {
+      method: "DELETE",
+      headers: { cookie: owner, origin: "http://example.test" },
+    });
+    expect(removed.status).toBe(200);
+    expect(await env.DB.prepare("SELECT id FROM invites WHERE id='leftover'").first()).toBeNull();
+    expect((await request(guest, "/api/invites/complete", { token: leftoverToken })).status).toBe(409);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM workspace_members WHERE user_id=?").bind(member.user.id).first(),
+    ).toBeNull();
+  });
+
+  it("rejects direct invite completion that does not match the claimed account", async () => {
+    const owner = await enrollAccount(await bootstrap());
+    const token = await invitation(owner);
+    const signup = await accept(token);
+    const guest = await env.DB.prepare("SELECT id FROM user WHERE email='guest@example.test'").first<{ id: string }>();
+    const ownerId = await env.DB.prepare("SELECT id FROM user WHERE email='owner@example.test'").first<{
+      id: string;
+    }>();
+    await expect(
+      env.DB.prepare("UPDATE invites SET used_by=?,used_at=? WHERE claimed_by=?")
+        .bind(ownerId!.id, Date.now(), guest!.id)
+        .run(),
+    ).rejects.toThrow("invite_completion_invalid");
+    expect(await env.DB.prepare("SELECT used_at FROM invites").first()).toEqual({ used_at: null });
+    expect((await request(responseCookies(signup), "/api/invites/complete", { token })).status).toBe(401);
   });
 
   it("clears the pending password challenge on signout, including its server record", async () => {
@@ -420,7 +571,10 @@ describe("security lifecycle regressions", () => {
 
   it("resumes expired recovery only with the original session, password, generation and absolute deadline", async () => {
     const cookie = await enrollAccount(await bootstrap());
-    const { codes } = await (await request(cookie, "/api/security/recovery-codes", {})).json<{ codes: string[] }>();
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
     const recovery = responseCookies(
       await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] }),
     );
@@ -501,12 +655,12 @@ describe("security lifecycle regressions", () => {
     const session = await (
       await request(cookie, "/api/auth/get-session")
     ).json<{ session: { id: string }; user: { id: string } }>();
-    let reads = 0;
+    const statements: string[] = [];
     const db = new Proxy(env.DB, {
       get(target, key) {
         if (key === "prepare")
           return (sql: string) => {
-            reads++;
+            statements.push(sql);
             return target.prepare(sql);
           };
         const value = Reflect.get(target, key);
@@ -516,19 +670,106 @@ describe("security lifecycle regressions", () => {
     await expect(requireSecurity({ ...env, DB: db }, session.user.id, session.session.id)).resolves.toBeGreaterThan(
       Date.now(),
     );
-    expect(reads).toBe(1);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).not.toContain("FROM invites");
     await env.DB.prepare("UPDATE session_security SET expires_at=?")
       .bind(Date.now() - 1)
       .run();
     await expect(requireSecurity(env, session.user.id, session.session.id)).rejects.toMatchObject({ status: 401 });
   });
 
-  it("allows a shared source to perform more than three password sign-ins in ten seconds", async () => {
+  it("restores the strict three-per-ten-second password limit for one source", async () => {
     await enrollAccount(await bootstrap());
-    for (let i = 0; i < 5; i++)
+    for (let i = 0; i < 3; i++)
       expect(
         (await request("", "/api/auth/sign-in/email", { email: "owner@example.test", password: "password123" })).status,
       ).toBe(200);
+    expect(
+      (await request("", "/api/auth/sign-in/email", { email: "owner@example.test", password: "password123" })).status,
+    ).toBe(429);
+  });
+
+  it("restores the strict three-per-ten-second two-factor limit for one source", async () => {
+    await enrollAccount(await bootstrap());
+    const pending = responseCookies(
+      await requestFromIp("192.0.2.10", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    for (let i = 0; i < 3; i++) {
+      expect(
+        (await requestFromIp("192.0.2.10", "/api/auth/two-factor/verify-totp", { code: "invalid" }, pending)).status,
+      ).not.toBe(429);
+    }
+    expect(
+      (await requestFromIp("192.0.2.10", "/api/auth/two-factor/verify-totp", { code: "invalid" }, pending)).status,
+    ).toBe(429);
+  });
+
+  it("limits failed password attempts by normalized account across rotating IPs", async () => {
+    await enrollAccount(await bootstrap());
+    for (let i = 0; i < 10; i++) {
+      expect(
+        (
+          await requestFromIp(`192.0.2.${i + 1}`, "/api/auth/sign-in/email", {
+            email: i % 2 ? "OWNER@EXAMPLE.TEST" : "owner@example.test",
+            password: "incorrect",
+          })
+        ).status,
+      ).toBe(401);
+    }
+    expect(
+      (
+        await requestFromIp("198.51.100.1", "/api/auth/sign-in/email", {
+          email: "owner@example.test",
+          password: "password123",
+        })
+      ).status,
+    ).toBe(429);
+  });
+
+  it("applies the same account password budget to unknown addresses", async () => {
+    await bootstrap();
+    for (let i = 0; i < 10; i++) {
+      expect(
+        (
+          await requestFromIp(`192.0.2.${i + 1}`, "/api/auth/sign-in/email", {
+            email: i % 2 ? "MISSING@EXAMPLE.TEST" : "missing@example.test",
+            password: "incorrect",
+          })
+        ).status,
+      ).toBe(401);
+    }
+    expect(
+      (
+        await requestFromIp("198.51.100.1", "/api/auth/sign-in/email", {
+          email: "missing@example.test",
+          password: "incorrect",
+        })
+      ).status,
+    ).toBe(429);
+  });
+
+  it("clears the account password budget after successful authentication", async () => {
+    await enrollAccount(await bootstrap());
+    expect(
+      (
+        await requestFromIp("192.0.2.1", "/api/auth/sign-in/email", {
+          email: "owner@example.test",
+          password: "incorrect",
+        })
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await requestFromIp("192.0.2.2", "/api/auth/sign-in/email", {
+          email: "OWNER@EXAMPLE.TEST",
+          password: "password123",
+        })
+      ).status,
+    ).toBe(200);
+    expect(await env.DB.prepare("SELECT 1 FROM rateLimit WHERE key LIKE 'password-account:%'").first()).toBeNull();
   });
   it("guards the vendor passkey insert against reset, revoked session and obsolete generation", async () => {
     await enrollAccount(await bootstrap());
@@ -558,6 +799,38 @@ describe("security lifecycle regressions", () => {
     expect(await env.DB.prepare("SELECT 1 FROM passkey").first()).toBeNull();
   });
 
+  it("upserts retry permits, cleans failed registrations, and identifies revoked races", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const session = await (
+      await request(cookie, "/api/auth/get-session")
+    ).json<{ session: { id: string }; user: { id: string } }>();
+    const account = await env.DB.prepare("SELECT generation FROM account_security WHERE user_id=?")
+      .bind(session.user.id)
+      .first<{ generation: number }>();
+    const permit = {
+      credentialId: "retry-credential",
+      userId: session.user.id,
+      sessionId: session.session.id,
+      generation: account!.generation,
+    };
+
+    expect(await upsertPasskeyRegistrationPermit(env, permit)).toBe(true);
+    expect(await upsertPasskeyRegistrationPermit(env, permit)).toBe(true);
+    expect(await cleanupFailedPasskeyRegistration(env, permit)).toEqual({ revoked: false });
+    expect(await env.DB.prepare("SELECT 1 FROM pending_passkeys").first()).toBeNull();
+
+    expect(await upsertPasskeyRegistrationPermit(env, permit)).toBe(true);
+    await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?")
+      .bind(session.user.id)
+      .run();
+    expect(await cleanupFailedPasskeyRegistration(env, permit)).toEqual({ revoked: true });
+    expect(await env.DB.prepare("SELECT 1 FROM pending_passkeys").first()).toBeNull();
+
+    const revoked = passkeyRegistrationRevokedResponse();
+    expect(revoked.status).toBe(403);
+    expect(await revoked.json()).toMatchObject({ code: "SECURITY_REQUIRED" });
+  });
+
   it("resets rate limits on fixed windows during continuous NAT traffic and enforces concurrent bursts", async () => {
     const auth = createAuth(env);
     const consume = (await auth.$context).options.rateLimit!.customStorage!.consume!;
@@ -575,5 +848,46 @@ describe("security lifecycle regressions", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+
+  it("never lets a stale-window write move a rate bucket backward", async () => {
+    const consume = (await createAuth(env).$context).options.rateLimit!.customStorage!.consume!;
+    const clock = vi.spyOn(Date, "now");
+    try {
+      const start = Math.floor(Date.now() / 60_000) * 60_000;
+      clock.mockReturnValue(start + 60_001);
+      expect(await consume("monotonic", { window: 60, max: 2 })).toMatchObject({ allowed: true });
+      clock.mockReturnValue(start + 1);
+      expect(await consume("monotonic", { window: 60, max: 2 })).toMatchObject({ allowed: false });
+      expect(await env.DB.prepare("SELECT count,lastRequest FROM rateLimit WHERE key='monotonic'").first()).toEqual({
+        count: 1,
+        lastRequest: Math.floor((start + 60_001) / 60_000) * 60_000,
+      });
+      clock.mockReturnValue(start + 60_002);
+      expect(await consume("monotonic", { window: 60, max: 2 })).toMatchObject({ allowed: true });
+      expect(await consume("monotonic", { window: 60, max: 2 })).toMatchObject({ allowed: false });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("prunes stale rate buckets and expired staged recovery codes from the scheduled task", async () => {
+    await enrollAccount(await bootstrap());
+    const user = await env.DB.prepare("SELECT id FROM user").first<{ id: string }>();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO rateLimit(id,key,count,lastRequest) VALUES ('stale','stale',1,?)").bind(
+        Date.now() - 25 * 60 * 60_000,
+      ),
+      env.DB.prepare(
+        "INSERT INTO pending_recovery_codes(code_hash,batch_id,user_id,generation,expires_at) VALUES ('expired','batch',?,1,?)",
+      ).bind(user!.id, Date.now() - 1),
+    ]);
+    const context = createExecutionContext();
+    await worker.scheduled!(createScheduledController(), env, context);
+    await waitOnExecutionContext(context);
+    expect(await env.DB.prepare("SELECT id FROM rateLimit WHERE id='stale'").first()).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT code_hash FROM pending_recovery_codes WHERE code_hash='expired'").first(),
+    ).toBeNull();
   });
 });

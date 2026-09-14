@@ -23,7 +23,7 @@ const status: SecurityStatus = {
   fresh: false,
 };
 beforeEach(() => {
-  vi.mocked(api).mockReset();
+  vi.resetAllMocks();
 });
 afterEach(() => {
   cleanup();

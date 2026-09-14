@@ -6,6 +6,7 @@ import { authorizePasskeyRegistration, mandatorySecurity, requireSecurity } from
 import type { MemberContext } from "./env";
 import type { Env } from "./env";
 import { HttpError } from "./http";
+import { consumeFixedWindow } from "./rate-limit";
 
 export function createAuth(env: Env, allowRegistration = false) {
   return betterAuth({
@@ -19,35 +20,8 @@ export function createAuth(env: Env, allowRegistration = false) {
       storage: "database",
       window: 60,
       max: 100,
-      // Per-source, per-endpoint limits allow a team behind one NAT to sign in.
-      // Password-proven TOTP/recovery attempts also have a persistent account budget.
-      customStorage: {
-        // Fixed buckets: continuous low-volume traffic must not accumulate forever.
-        consume: async (key, rule) => {
-          const time = Date.now();
-          const windowMs = rule.window * 1000;
-          const start = Math.floor(time / windowMs) * windowMs;
-          const result = await env.DB.prepare(`INSERT INTO rateLimit(id,key,count,lastRequest) VALUES (?,?,1,?)
-            ON CONFLICT(key) DO UPDATE SET
-              count=CASE WHEN lastRequest!=excluded.lastRequest THEN 1 ELSE count+1 END,
-              lastRequest=excluded.lastRequest
-            WHERE lastRequest!=excluded.lastRequest OR count<? RETURNING count`)
-            .bind(crypto.randomUUID(), key, start, rule.max)
-            .first<{ count: number }>();
-          if (result?.count === 1)
-            await env.DB.prepare("DELETE FROM rateLimit WHERE lastRequest<?")
-              .bind(time - 24 * 60 * 60_000)
-              .run();
-          return {
-            allowed: !!result,
-            retryAfter: result ? null : Math.max(1, Math.ceil((start + windowMs - time) / 1000)),
-          };
-        },
-      },
+      customStorage: { consume: (key, rule) => consumeFixedWindow(env, key, rule) },
       customRules: {
-        "/sign-in/*": { window: 60, max: 60 },
-        "/sign-up/*": { window: 60, max: 30 },
-        "/two-factor/*": { window: 60, max: 60 },
         "/passkey/verify-authentication": { window: 60, max: 60 },
       },
     },

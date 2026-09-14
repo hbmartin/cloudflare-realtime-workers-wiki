@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   editorRender: vi.fn(),
   invalidateAllPagePreviews: vi.fn(),
   invalidatePagePreview: vi.fn(),
+  invokeRealApi: vi.fn(),
   signInEmail: vi.fn(),
   signOut: vi.fn(),
   waitForReconciliationRetry: vi.fn(),
@@ -27,6 +28,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("./api", async (importOriginal) => {
   const original = await importOriginal<typeof import("./api")>();
+  mocks.invokeRealApi.mockImplementation(original.api);
   return {
     ...original,
     api: vi.fn(),
@@ -193,6 +195,7 @@ describe("App error handling", () => {
     mocks.editorRender.mockReset();
     mocks.invalidateAllPagePreviews.mockReset();
     mocks.invalidatePagePreview.mockReset();
+    mocks.invokeRealApi.mockClear();
     mocks.signInEmail.mockReset();
     mocks.signOut.mockReset();
     mocks.waitForReconciliationRetry.mockReset();
@@ -207,7 +210,7 @@ describe("App error handling", () => {
     vi.unstubAllGlobals();
   });
 
-  it("shows an expired-invite error, clears the stale token, and lets an existing member retry", async () => {
+  it("clears a stale invite token and continues for an existing member", async () => {
     mockShellApi();
     const normal = vi.mocked(api).getMockImplementation()!;
     vi.mocked(api).mockImplementation(async (path, init) => {
@@ -217,11 +220,35 @@ describe("App error handling", () => {
     history.replaceState(null, "", "/?invite=expired");
     sessionStorage.setItem("pending-invite", "expired");
     render(<App />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("This invite has expired.");
-    expect(sessionStorage.getItem("pending-invite")).toBeNull();
-    expect(window.location.search).toBe("");
-    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     await screen.findByRole("button", { name: "Simulate document access denial" });
+    expect(sessionStorage.getItem("pending-invite")).toBeNull();
+    expect(new URLSearchParams(window.location.search).has("invite")).toBe(false);
+    expect(screen.queryByRole("heading", { name: "Realtime Notes is unavailable" })).not.toBeInTheDocument();
+  });
+
+  it("falls back from a stale explicit token to the server-owned pending claim", async () => {
+    mockShellApi();
+    const normal = vi.mocked(api).getMockImplementation()!;
+    const completions: string[] = [];
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: true, pendingInvite: true };
+      if (path === "/api/invites/complete") {
+        completions.push(String(init?.body));
+        if (completions.length === 1) throw new ApiClientError(409, "invite_invalid", "This invite has expired.");
+        return { success: true };
+      }
+      return normal(path, init);
+    });
+    history.replaceState(null, "", "/?invite=expired");
+    sessionStorage.setItem("pending-invite", "expired");
+
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    expect(completions).toEqual(['{"token":"expired"}', "{}"]);
+    expect(sessionStorage.getItem("pending-invite")).toBeNull();
+    expect(new URLSearchParams(window.location.search).has("invite")).toBe(false);
   });
 
   it("retains a pending invite across a transient completion failure", async () => {
@@ -267,7 +294,194 @@ describe("App error handling", () => {
     });
     render(<App />);
     expect(await screen.findByRole("alert")).toHaveTextContent("this account has no workspace access");
+    expect(screen.getByRole("heading", { name: "No workspace access" })).toBeInTheDocument();
+    expect(screen.getByText(/Open your invite link/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Sign in" })).not.toBeInTheDocument();
+  });
+
+  it("routes a global workspace-required response to the unassigned screen", async () => {
+    mockShellApi();
+    render(<App />);
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: { code: "workspace_required", message: "No workspace." } }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    vi.mocked(api).mockImplementation((path, init) => mocks.invokeRealApi(path, init));
+
+    await expect(api("/api/me")).rejects.toMatchObject({ code: "workspace_required" });
+
+    expect(await screen.findByRole("heading", { name: "No workspace access" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
+  });
+
+  it("ignores an older unauthorized-state resolution after a newer one completes", async () => {
+    mockShellApi();
+    render(<App />);
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    const oldStatus = deferred<{
+      state: "challenge_required";
+      totp: true;
+      passkeys: number;
+      codesSaved: true;
+      fresh: false;
+    }>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const error = url.endsWith("/old-unauthorized")
+          ? { code: "challenge_required", message: "Verify again." }
+          : { code: "workspace_required", message: "No workspace." };
+        return new Response(JSON.stringify({ error }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+    const normal = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path === "/old-unauthorized" || path === "/new-unauthorized") return mocks.invokeRealApi(path, init);
+      if (path === "/api/security/status") return oldStatus.promise;
+      return normal(path, init);
+    });
+
+    await expect(api("/old-unauthorized")).rejects.toMatchObject({ code: "challenge_required" });
+    await expect(api("/new-unauthorized")).rejects.toMatchObject({ code: "workspace_required" });
+    expect(await screen.findByRole("heading", { name: "No workspace access" })).toBeInTheDocument();
+
+    await act(async () => {
+      oldStatus.resolve({
+        state: "challenge_required",
+        totp: true,
+        passkeys: 0,
+        codesSaved: true,
+        fresh: false,
+      });
+      await oldStatus.promise;
+    });
+    expect(screen.getByRole("heading", { name: "No workspace access" })).toBeInTheDocument();
+  });
+
+  it("ignores a 401 from a request started before a successful reload", async () => {
+    mockShellApi();
+    render(<App />);
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    const staleResponse = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/stale-request")) return staleResponse.promise;
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: { code: "workspace_required", message: "No workspace." } }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }),
+    );
+    const normal = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path === "/stale-request" || path === "/current-request") return mocks.invokeRealApi(path, init);
+      return normal(path, init);
+    });
+
+    const stale = api("/stale-request");
+    await expect(api("/current-request")).rejects.toMatchObject({ code: "workspace_required" });
+    expect(await screen.findByRole("heading", { name: "No workspace access" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+
+    staleResponse.resolve(
+      new Response(JSON.stringify({ error: { code: "challenge_required", message: "Verify again." } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await expect(stale).rejects.toMatchObject({ code: "challenge_required" });
+    expect(screen.getByRole("button", { name: "Simulate document access denial" })).toBeInTheDocument();
+  });
+
+  it("resolves a global security-policy 401 through status", async () => {
+    mockShellApi();
+    const normal = vi.mocked(api).getMockImplementation()!;
+    render(<App />);
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: { code: "challenge_required", message: "Verify again." } }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path === "/trigger-security-policy") return mocks.invokeRealApi(path, init);
+      if (path === "/api/security/status")
+        return Promise.resolve({
+          state: "challenge_required",
+          totp: true,
+          passkeys: 0,
+          codesSaved: true,
+          fresh: false,
+        });
+      return normal(path, init);
+    });
+
+    await expect(api("/trigger-security-policy")).rejects.toMatchObject({ code: "challenge_required" });
+
+    expect(await screen.findByRole("heading", { name: "Protect your account" })).toBeInTheDocument();
+  });
+
+  it("surfaces a startup error when global security status resolution fails", async () => {
+    mockShellApi();
+    const normal = vi.mocked(api).getMockImplementation()!;
+    render(<App />);
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: { code: "challenge_required", message: "Verify again." } }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path === "/trigger-security-policy") return mocks.invokeRealApi(path, init);
+      if (path === "/api/security/status")
+        return Promise.reject(new ApiClientError(503, "unavailable", "Security status unavailable."));
+      return normal(path, init);
+    });
+
+    await expect(api("/trigger-security-policy")).rejects.toMatchObject({ code: "challenge_required" });
+
+    expect(await screen.findByRole("heading", { name: "Realtime Notes is unavailable" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Security status unavailable.");
+  });
+
+  it("uses service guidance and no sign-out action when startup fails", async () => {
+    vi.mocked(api).mockRejectedValueOnce(new ApiClientError(503, "unavailable", "Install service unavailable."));
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Realtime Notes is unavailable" })).toBeInTheDocument();
+    expect(screen.getByText(/Check your connection/)).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Install service unavailable.");
+    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
   });
 
   it("never falls back to a template page", () => {
