@@ -1,4 +1,4 @@
-export const CLIENT_ERROR_EVENTS = [
+const CLIENT_ERROR_EVENTS = [
   "client.global_error",
   "client.unhandled_rejection",
   "client.bundle_load_failed",
@@ -12,10 +12,6 @@ export const CLIENT_ERROR_EVENTS = [
 ] as const;
 
 export type ClientErrorEvent = (typeof CLIENT_ERROR_EVENTS)[number];
-
-interface ClientReportContext {
-  requestId?: string | null;
-}
 
 interface FirstPartySource {
   path: string;
@@ -92,7 +88,11 @@ export function observeWorkerResponse(headers: Headers) {
   latestRelease = opaqueIdentifier(headers.get("x-worker-version")) ?? latestRelease;
 }
 
-export async function reportClientError(event: ClientErrorEvent, error: unknown, context: ClientReportContext = {}) {
+export async function reportClientError(
+  event: ClientErrorEvent,
+  error: unknown,
+  context: { requestId?: string | null } = {},
+) {
   if (!installed || reporting) return;
   const timestamp = Date.now();
   reportTimes = reportTimes.filter((sentAt) => sentAt > timestamp - WINDOW_MS);

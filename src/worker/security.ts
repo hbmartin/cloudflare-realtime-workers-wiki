@@ -626,36 +626,6 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         await resetAttempts(env, id.userId, account.generation);
         return ctx.json({ success: true });
       }),
-      resumeRecovery: post("/security/resume-recovery", async (ctx) => {
-        const id = await requireIdentity(ctx);
-        const { account, status } = await readSecurity(env, id.userId, id.sessionId);
-        if (!status.recoveryCanResume) throw deny("Use a recovery code or operator reset token first.");
-        await attempt(env, id.userId);
-        await password(ctx, id.userId);
-        // Keep verified_at unchanged: password re-entry cannot extend the absolute deadline.
-        const resumed = await env.DB.prepare(`UPDATE session_security SET expires_at=MIN(?,verified_at+?)
-          WHERE session_id=? AND user_id=? AND method='recovery' AND generation=? AND verified_at>?
-          AND EXISTS(SELECT 1 FROM account_security a WHERE a.user_id=session_security.user_id
-            AND a.generation=session_security.generation AND a.recovery_required=1)
-          AND EXISTS(SELECT 1 FROM session live WHERE live.id=session_security.session_id AND live.expiresAt>?) RETURNING session_id`)
-          .bind(
-            Date.now() + RECOVERY_MS,
-            RECOVERY_RESUME_MS,
-            id.sessionId,
-            id.userId,
-            account.generation,
-            Date.now() - RECOVERY_RESUME_MS,
-            new Date().toISOString(),
-          )
-          .first();
-        if (!resumed) throw deny("Recovery expired or was revoked. Use a recovery code or operator reset token.");
-        await env.DB.prepare(
-          "UPDATE account_security SET failed_attempts=0,locked_until=0 WHERE user_id=? AND generation=?",
-        )
-          .bind(id.userId, account.generation)
-          .run();
-        return ctx.json({ success: true });
-      }),
       recoverSecurity: post("/security/recover", async (ctx) => {
         const id = await requireIdentity(ctx);
         const account = await securityAccount(env, id.userId);

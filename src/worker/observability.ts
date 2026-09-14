@@ -154,7 +154,7 @@ function safeField(key: string, value: unknown): string | number | boolean | nul
   }
 }
 
-export function structuredLog(
+function structuredLog(
   level: LogLevel,
   event: string,
   component: string,

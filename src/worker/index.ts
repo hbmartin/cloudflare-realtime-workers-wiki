@@ -1426,7 +1426,7 @@ app.post("/api/invites/complete", async (c) => {
       session.user.id,
     ),
   ]);
-  if (!result[1]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
+  if (!result[2]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
   return c.json({ success: true });
 });
 

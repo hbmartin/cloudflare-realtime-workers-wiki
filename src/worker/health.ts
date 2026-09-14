@@ -8,7 +8,7 @@ const WORK_OVERDUE_MS = 2 * 60 * 60_000;
 const OUTBOX_DUE_MS = 15 * 60_000;
 const WORKFLOW_QUEUED_MS = 30 * 60_000;
 
-export interface ReadinessCheck {
+interface ReadinessCheck {
   name: "d1" | "r2" | "durable_object" | "cron" | "durable_queues";
   ok: boolean;
   durationMs: number;
