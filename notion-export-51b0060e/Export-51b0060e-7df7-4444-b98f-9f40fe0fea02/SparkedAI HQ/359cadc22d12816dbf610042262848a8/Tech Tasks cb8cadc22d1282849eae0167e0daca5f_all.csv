@@ -1,0 +1,50 @@
+﻿Title,Last Updated,Link,Priority,Status
+Kickoff Untitled (https://app.notion.com/p/0ddcadc22d1282b891f981ff349ad806?pvs=21),"May 7, 2026 11:25 AM",,,
+Add agent-readiness eval harness,"May 26, 2026 3:04 PM",https://linear.app/sparked/issue/SPA-56/add-agent-readiness-eval-harness,0,Backlog
+Publish machine-readable contracts (OpenAPI/JSON Schema),"May 26, 2026 4:00 PM",https://linear.app/sparked/issue/SPA-35/publish-machine-readable-contracts-openapijson-schema,0,Canceled
+Restore or correct /api/openapi/app contract docs,"May 26, 2026 4:00 PM",https://linear.app/sparked/issue/SPA-34/restore-or-correct-apiopenapiapp-contract-docs,4,Canceled
+Add mutation testing for high-risk modules,"May 26, 2026 4:01 PM",https://linear.app/sparked/issue/SPA-45/add-mutation-testing-for-high-risk-modules,4,Done
+Add Copilot and Claude instruction files pointing to AGENTS.md,"May 26, 2026 4:01 PM",https://linear.app/sparked/issue/SPA-6/add-copilot-and-claude-instruction-files-pointing-to-agentsmd,3,Canceled
+Add pnpm bootstrap deterministic setup command,"May 26, 2026 4:02 PM",https://linear.app/sparked/issue/SPA-8/add-pnpm-bootstrap-deterministic-setup-command,3,Canceled
+Add repository integration tests against PGlite,"May 26, 2026 4:02 PM",https://linear.app/sparked/issue/SPA-38/add-repository-integration-tests-against-pglite,3,Done
+"Remove or update stale starter docs (OpenAPI, old ORPC refs)","May 26, 2026 4:02 PM",https://linear.app/sparked/issue/SPA-55/remove-or-update-stale-starter-docs-openapi-old-orpc-refs,3,Done
+Harden XSS and CSRF protections,"May 26, 2026 6:04 PM",https://linear.app/sparked/issue/SPA-58/harden-xss-and-csrf-protections,2,Backlog
+Add OWASP security checks to CI,"May 26, 2026 6:07 PM",https://linear.app/sparked/issue/SPA-60/add-owasp-security-checks-to-ci,2,Backlog
+OWASP ASVS Level 2 self-assessment + Top 10 review,"May 26, 2026 6:08 PM",https://linear.app/sparked/issue/SPA-61/owasp-asvs-level-2-self-assessment-top-10-review,3,Backlog
+Add logger interface with OTel wrapper and local debug adapter,"May 27, 2026 5:31 AM",https://linear.app/sparked/issue/SPA-62/add-logger-interface-with-otel-wrapper-and-local-debug-adapter,3,Backlog
+Agent observability tooling: close the feedback loop for AI coding agents,"May 27, 2026 5:42 AM",https://linear.app/sparked/issue/SPA-63/agent-observability-tooling-close-the-feedback-loop-for-ai-coding,3,Backlog
+Adopt Result type; prefer it over throwing errors,"May 27, 2026 5:53 AM",https://linear.app/sparked/issue/SPA-64/adopt-result-type-prefer-it-over-throwing-errors,3,Backlog
+Adopt boxed + ts-pattern; integrate with TanStack Query and Router,"May 27, 2026 11:41 AM",https://linear.app/sparked/issue/SPA-65/adopt-boxed-ts-pattern-integrate-with-tanstack-query-and-router,3,Backlog
+Adopt Result type; prefer it over throwing errors,"May 27, 2026 11:56 AM",https://linear.app/sparked/issue/SPA-64/adopt-result-type-prefer-it-over-throwing-errors,3,Canceled
+Refactor book/user/genre/account into vertical modules,"May 27, 2026 2:57 PM",https://linear.app/sparked/issue/SPA-19/refactor-bookusergenreaccount-into-vertical-modules,2,Done
+Make server functions thin transport adapters,"May 27, 2026 4:53 PM",https://linear.app/sparked/issue/SPA-21/make-server-functions-thin-transport-adapters,3,Done
+Harden XSS and CSRF protections,"May 29, 2026 7:27 AM",https://linear.app/sparked/issue/SPA-58/harden-xss-and-csrf-protections,2,Done
+Pin Node runtime with .node-version,"May 29, 2026 7:27 AM",https://linear.app/sparked/issue/SPA-7/pin-node-runtime-with-node-version,2,Done
+Make lint read-only (split out lint:fix),"May 29, 2026 7:32 AM",https://linear.app/sparked/issue/SPA-10/make-lint-read-only-split-out-lintfix,2,Done
+"Add Sheriff config + scripts, or remove the dependency","May 29, 2026 7:33 AM",https://linear.app/sparked/issue/SPA-16/add-sheriff-config-scripts-or-remove-the-dependency,4,Done
+Gate PR CI on pnpm build,"May 29, 2026 7:39 AM",https://linear.app/sparked/issue/SPA-12/gate-pr-ci-on-pnpm-build,3,Done
+Add secret scanning / pre-commit checks,"May 30, 2026 10:42 AM",https://linear.app/sparked/issue/SPA-52/add-secret-scanning-pre-commit-checks,3,Done
+"Expand E2E coverage (deep links, refresh, search params, auth flows, uploads)","May 30, 2026 10:45 AM",https://linear.app/sparked/issue/SPA-40/expand-e2e-coverage-deep-links-refresh-search-params-auth-flows,3,Done
+Add route integration tests,"May 30, 2026 10:45 AM",https://linear.app/sparked/issue/SPA-39/add-route-integration-tests,3,Done
+Add domain/use-case unit tests (no React/Router/DB/SDK),"May 30, 2026 10:45 AM",https://linear.app/sparked/issue/SPA-37/add-domainuse-case-unit-tests-no-reactrouterdbsdk,3,Done
+Add LIKE-pattern escaping helper + tests,"June 1, 2026 10:50 AM",https://linear.app/sparked/issue/SPA-25/add-like-pattern-escaping-helper-tests,1,Done
+Add security headers / CSP / fetch-metadata / CSRF helpers,"June 1, 2026 10:52 AM",https://linear.app/sparked/issue/SPA-53/add-security-headers-csp-fetch-metadata-csrf-helpers,3,Done
+"Harden GitHub Actions supply chain (perms, pins, checksums, gates)","June 1, 2026 10:52 AM",https://linear.app/sparked/issue/SPA-51/harden-github-actions-supply-chain-perms-pins-checksums-gates,3,Done
+"Add CI artifact retention (reports, traces, SARIF, SBOMs)","June 1, 2026 10:54 AM",https://linear.app/sparked/issue/SPA-49/add-ci-artifact-retention-reports-traces-sarif-sboms,3,Done
+Convert expected business outcomes to typed result unions,"June 1, 2026 10:56 AM",https://linear.app/sparked/issue/SPA-26/convert-expected-business-outcomes-to-typed-result-unions,3,Done
+Replace bare server new Error with structured application errors,"June 1, 2026 12:02 PM",https://linear.app/sparked/issue/SPA-27/replace-bare-server-new-error-with-structured-application-errors,3,Done
+Add branded IDs and domain schemas,"June 1, 2026 12:03 PM",https://linear.app/sparked/issue/SPA-24/add-branded-ids-and-domain-schemas,3,Done
+Add CI jobs for format/depcruise/semgrep/audit/build/coverage/arch,"June 1, 2026 12:04 PM",https://linear.app/sparked/issue/SPA-11/add-ci-jobs-for-formatdepcruisesemgrepauditbuildcoveragearch,3,Done
+Add coverage reporting + thresholds,"June 1, 2026 2:57 PM",https://linear.app/sparked/issue/SPA-44/add-coverage-reporting-thresholds,4,Done
+Adopt boxed + ts-pattern; integrate with TanStack Query and Router,"June 1, 2026 2:57 PM",https://linear.app/sparked/issue/SPA-65/adopt-boxed-ts-pattern-integrate-with-tanstack-query-and-router,3,Done
+SonarQube: Add baseline/risk register for accepted findings,"June 2, 2026 7:25 AM",https://linear.app/sparked/issue/SPA-46/sonarqube-add-baselinerisk-register-for-accepted-findings,2,Backlog
+Move direct Drizzle out of handlers into repository adapters,"June 2, 2026 7:25 AM",https://linear.app/sparked/issue/SPA-20/move-direct-drizzle-out-of-handlers-into-repository-adapters,2,Done
+"Add CodeQL, Dependabot, Dependency Review, action hardening, scheduled scans","June 2, 2026 7:52 AM",https://linear.app/sparked/issue/SPA-13/add-codeql-dependabot-dependency-review-action-hardening-scheduled,3,Done
+Expand .dependency-cruiser.cjs to real layer rules,"June 2, 2026 10:09 AM",https://linear.app/sparked/issue/SPA-14/expand-dependency-cruisercjs-to-real-layer-rules,3,Done
+Move authenticated route guarding into beforeLoad,"June 4, 2026 6:21 AM",https://linear.app/sparked/issue/SPA-28/move-authenticated-route-guarding-into-beforeload,2,Done
+Make SSR QueryClient request-scoped,"June 4, 2026 6:22 AM",https://linear.app/sparked/issue/SPA-31/make-ssr-queryclient-request-scoped,3,Done
+Expand .semgrep.yml to documented security/architecture ruleset,"June 4, 2026 6:25 AM",https://linear.app/sparked/issue/SPA-15/expand-semgrepyml-to-documented-securityarchitecture-ruleset,3,Done
+Add canonical AGENTS.md at repo root,"June 4, 2026 7:06 AM",https://linear.app/sparked/issue/SPA-5/add-canonical-agentsmd-at-repo-root,3,Done
+Add test:affected script or remove from target docs,"June 4, 2026 7:06 AM",https://linear.app/sparked/issue/SPA-43/add-testaffected-script-or-remove-from-target-docs,3,Done
+Cohere .semgrep.yml and AGENTS.md and memories/skills,"June 4, 2026 10:27 AM",https://linear.app/sparked/issue/SPA-66/cohere-semgrepyml-and-agentsmd-and-memoriesskills,0,Backlog
+React UI best practices review,"June 4, 2026 10:27 AM",https://linear.app/sparked/issue/SPA-67/react-ui-best-practices-review,0,Backlog

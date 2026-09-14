@@ -24,16 +24,23 @@ describe("HTTP error handling", () => {
     await expect(response.json()).resolves.toEqual({
       error: { code: "internal_error", message: "Something went wrong." },
     });
-    expect(logged).toHaveBeenCalledWith("Unhandled request error", {
-      requestMethod: "GET",
-      requestPath: "/private",
-      requestRayId: null,
-      errorName: null,
-      errorMessage: null,
-      errorStack: null,
-      errorType: "object",
-      errorValue: "[object omitted]",
-    });
+    expect(logged).toHaveBeenCalledWith(
+      expect.objectContaining({
+        schema: "notes.observability.v1",
+        event: "http.request.unhandled_error",
+        severity: "error",
+        component: "http",
+        message: "Unhandled request error",
+        requestMethod: "GET",
+        requestPath: "/private",
+        requestRayId: null,
+        errorName: null,
+        errorMessage: null,
+        errorStack: null,
+        errorType: "object",
+        errorValue: "[object omitted]",
+      }),
+    );
   });
 
   it("returns a generic classification when an error Proxy has a hostile status", () => {

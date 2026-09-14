@@ -1,5 +1,6 @@
 import { useEffect, useState, type ComponentType } from "react";
 import { AlertSplash, LoadingSplash } from "./Splash";
+import { reportClientError } from "./telemetry";
 
 export type SupportedAppModule = { default: ComponentType };
 export type SupportedAppLoader = () => Promise<SupportedAppModule>;
@@ -40,6 +41,7 @@ export function Startup({
       (error) => {
         if (!active) return;
         console.error("The application bundle could not be loaded", error);
+        void reportClientError("client.bundle_load_failed", error);
         setState({ kind: "unavailable" });
       },
     );

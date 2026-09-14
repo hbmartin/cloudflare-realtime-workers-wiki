@@ -1,0 +1,167 @@
+﻿Meeting name,Attendees,Category,Created by,Date,Summary
+PRD Workshop,,Planning,,"May 26, 2026","Advisory Board Feedback & Strategic Direction
+• Positive feedback from advisory board week
+    ◦ Donnie provided valuable curriculum insights
+    ◦ Katherine and Daniel iterating on curriculum based on input
+• Patent exploration for Launch OS framework
+    ◦ Three-way patent potential between Katherine, Daniel, and Martin
+    ◦ Framework + tech combination creates strong differentiation
+    ◦ Could accelerate investment or acquisition opportunities
+• Martin has patent lawyer recommendation when ready
+
+Financial Management & Expense Tracking
+• QuickBooks connected to all accounts for expense tracking
+    ◦ Martin to review expenses for potential savings
+• Payment infrastructure discussion
+    ◦ Mercury handles virtual cards
+    ◦ Martin to receive virtual card for expenses
+
+Product Development & Hiring
+• Martin completed first hiring search round
+    ◦ 17 top-tier candidates identified
+    ◦ Will begin outreach process
+• PRD development approach using AI collaboration
+    ◦ Martin’s method: iterative questioning with Claude/ChatGPT until ambiguities resolved
+    ◦ Focus on client onboarding user flow for beta
+    ◦ Foundation layer (security, database, authentication, multi-tenant) in progress
+    ◦ Linear project management tool setup for task coordination"
+PRD Workshop,,Planning,,"May 27, 2026","Curriculum Development Progress
+• Katherine finishing situational awareness module (first of curriculum)
+    ◦ Months of work finally complete today
+    ◦ Sending to Martin and Daniel for harsh feedback
+    ◦ Publishing live next week after revisions
+• Positive early feedback from preview recipients
+• Directors inquiring about live training options alongside platform
+Platform Architecture Decisions
+• No prompt editing in client interface
+    ◦ Sparked admin handles all backend prompt programming
+    ◦ Client super admin only uploads documents to designated sections
+• Document requirements:
+    ◦ Three core frameworks mandatory: Education Continuum, Excellence Model, HCP Archetypes
+    ◦ Additional materials optional but enable greater customization
+    ◦ Support for miscellaneous document uploads with admin guidance
+Pricing & Business Model
+• Beta paid pilots: $15K (up to 10 seats, full customization)
+• Annual subscription tiers post-pilot:
+    ◦ 1-year: $1,500/user/year
+    ◦ 2-year: $1,250/user/year
+    ◦ 3-year: $1,000/user/year
+• Custom framework pricing (post-launch):
+    ◦ HCP Archetypes & Excellence Model: $5K each
+    ◦ Education Continuum: $10-15K (market research needed)
+    ◦ Significant undercut vs. consulting rates ($50-100K)
+Multi-Product Support & User Journey
+• Users may cover multiple products simultaneously
+    ◦ Example: Katherine covered 3 therapeutic areas, 7 products as MSL
+    ◦ Product focus shifts annually based on company priorities
+• Platform approach:
+    1. Admin sets percentage mix of products per user
+    2. User journey remains constant (focuses on soft skills)
+    3. Scenario content varies by selected product
+    4. Users can choose specific product for each practice session
+• Future enhancement: Custom HCP persona creation
+    ◦ Integration with H1/Monocle for real practitioner data
+    ◦ API calls to scrape Twitter, PubMed, other sources
+Data Retention & Privacy
+• Hard cutoff after pilot ends (no read-only access)
+• 30-day retention with immediate deletion option
+• Anonymized analytics data retained indefinitely for training
+    ◦ Requires privacy policy and contract provisions
+    ◦ Behavioral dynamics data valuable for future AI development
+• HIPAA compliance not required (no medical information)"
+PRD Workshop,,Planning,,"May 28, 2026","Investor Feedback Discussion
+• Pakage (advisor from The Brink SBDC) call left both confused about direction
+• Two possible paths forward:
+    ◦ Continue with training focus + investor deck while building Launch OS
+    ◦ Pivot fully to Launch OS requiring complete deck rework
+• Need clarity on narrative and strategy before investor outreach
+• Boost VC understands med tech/biotech space better than general investors
+• Investor deck should be output of strategy thinking, not goal itself
+• Must present business clearly to any intelligent investor, not just pharma specialists
+Advisory Support Structure
+• The Brink (San Diego SBDC): Most instrumental mentor, helped refine pitch deck
+• OC Inland Empire SBDC: Less satisfied with mentor quality
+• Octane Launch Pad Accelerator: Same mentor as OC, seeking more diverse feedback
+• Jerry O’Alley: Go-to-market strategy focus
+• Financial projections mentor: Haven’t reconnected recently
+• All services free through SBDC network
+Competitive Landscape Research
+• Pharma-focused AI roleplay competitors:
+    1. Advanced AI Conversations
+    2. Kai Conversations
+    3. Unbox Technologies (stronger foothold than others)
+• General AI roleplay (non-pharma):
+    ◦ Second Nature
+    ◦ Quantified
+• Unbox quoted $150k for 5 custom scenarios + fees before monthly subscription
+• Need to research electronic/online MSL training competitors
+Product Development Priorities
+• Custom modules: Support at launch on case-by-case basis for additional fees
+• Module structure:
+    ◦ Multiple lessons per module
+    ◦ Up to 3 scenarios per lesson
+    ◦ Includes grading rubric, HCP personas, randomized settings
+• Data model must support custom modules as foundation
+• White glove service initially, mini-onboarding capability needed shortly after launch
+Platform Configuration Details
+• Product portfolio management:
+    ◦ Education continuum and HCP archetypes are per-product
+    ◦ Managers set percentage mix for users across products
+    ◦ Users cannot set own mix
+    ◦ Auto-assignment within same product family
+• Content updates:
+    ◦ Framework/messaging changes don’t affect user’s current active module
+    ◦ New modules use latest version automatically
+    ◦ Previous modules update with new information when revisited
+    ◦ All updates permanently saved and versioned
+    ◦ Major curriculum updates incur additional costs (transparent pricing)
+Beta/Pilot Strategy Refinement
+• Three-phase approach:
+    1. Beta: Single tenant, generic product, close friends testing core audio/grading features
+    2. Multi-tenant Beta: Individual users, real products using public data, product customization without framework customization
+    3. Paid Pilot: Full teams, custom frameworks, complete feature set including managerial dashboard
+• Multi-tenant beta allows building client pipeline and internal champions
+• Individual baseline assessment needed starting in beta phase
+Next Steps
+• Martin: Review Pakage call transcript and notes, create 1-2 proposal decks
+• Katherine: Send website login credentials via iMessage, connect VA with Martin for mentoring
+• Katherine: Send meeting documents for tomorrow’s session as pre-read
+• Defer stack adjacency and vendor discussions to tomorrow
+• Martin: Chat with wife about San Diego biocon attendance"
+Investor feedback,,Investor,,"May 28, 2026","Investor Feedback & Pitch Strategy
+• Boost VC feedback: deck didn’t resonate initially
+    ◦ Lit up when discussing human behavioral data goldmine potential
+    ◦ Interested in broader platform vision beyond training
+• Halogen/Jesse Draper feedback: “too early”
+    ◦ Pushed toward Alabama fund (pattern with other founders)
+    ◦ Need more customers or Alabama-based customer for main fund
+• Key investor priorities for 10-year investment horizon:
+    1. Founder vision and ambition
+    2. Execution track record (6-12 months)
+    3. Clear roadmap connecting present to future
+Platform Vision: Launch Intelligence OS
+• Target: Small pharma companies struggling with fragmented systems
+• Problem: Suboptimal profits through product lifecycle due to disparate tools
+• One-stop shop solution components:
+    1. Domain-specific data accumulation
+    2. AI-powered insights generation
+    3. Streamlined workflow automation
+    4. Training and services
+    5. Reporting dashboards
+• Long-term goal: Displace larger CRMs through land-and-expand strategy
+• Martin’s framework: Start with data wedge, absorb CRM stack pieces
+Training Platform as Entry Point
+• Current pharma rep training: costly, ineffective, generic
+• Solution: AI roleplay simulation + managerial co-pilot dashboard
+• TAM: $9.8B training market
+• Strategy debate: Training as revenue generator vs. platform foundation
+• Data collection advantage: Capture interaction patterns, tonality, micro-expressions
+    ◦ Potential to become “Scale AI of human social behavioral dynamics”
+Strategic Alignment Issues
+• Tension between one-stop shop vision and fragmented go-to-market
+• Investor concern: Cannot solve fragmentation problem with fragmented offering
+• Need consistency between problem statement and solution approach
+• Two potential paths:
+    1. Focus purely on $9B training opportunity
+    2. Build full platform with training as customer entry point
+• Next steps: Clarify core value proposition using Sequoia pitch deck template"

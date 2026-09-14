@@ -1,8 +1,10 @@
 import { sha256Hex } from "../shared/import-integrity";
+import { tracing } from "cloudflare:workers";
 import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256Hex } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { publicPageId } from "./integrations";
 import { HttpError } from "./http";
+import { currentObservabilityContext, traced } from "./observability";
 
 const WEBHOOK_EVENT_TYPES = [
   "page.created",
@@ -271,12 +273,14 @@ export async function sendWebhookVerification(env: Env, subscriptionId: string) 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5_000);
   try {
-    const response = await fetch(destination, {
-      method: "POST",
-      headers: { "content-type": "application/json", "user-agent": "Realtime-Notes-Webhook/1.0" },
-      body: JSON.stringify({ verification_token: token }),
-      redirect: "manual",
-      signal: controller.signal,
+    const response = await traced(tracing, "notes.integration.webhook", { "notes.operation": "verification" }, () => {
+      return fetch(destination, {
+        method: "POST",
+        headers: { "content-type": "application/json", "user-agent": "Realtime-Notes-Webhook/1.0" },
+        body: JSON.stringify({ verification_token: token }),
+        redirect: "manual",
+        signal: controller.signal,
+      });
     });
     if (!response.ok) return { ok: false as const, error: `Webhook endpoint returned HTTP ${response.status}.` };
     return { ok: true as const };
@@ -408,10 +412,17 @@ export function webhookEventStatements(
       ),
     database
       .prepare(
-        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
-       SELECT ?, ?, 'webhook_event', ?, ?, ? WHERE changes() > 0`,
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at, correlation_id)
+       SELECT ?, ?, 'webhook_event', ?, ?, ?, ? WHERE changes() > 0`,
       )
-      .bind(outboxId, input.workspaceId, JSON.stringify({ eventId }), input.createdAt, input.createdAt),
+      .bind(
+        outboxId,
+        input.workspaceId,
+        JSON.stringify({ eventId }),
+        input.createdAt,
+        input.createdAt,
+        currentObservabilityContext()?.correlationId ?? null,
+      ),
   ];
 }
 
@@ -462,9 +473,16 @@ export async function fanoutWebhookEvent(env: Env, eventId: string) {
          VALUES (?, ?, ?, 'pending', 0, ?, ?, ?)`,
       ).bind(deliveryId, event.id, subscription.id, timestamp, timestamp, timestamp),
       env.DB.prepare(
-        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
-         SELECT ?, ?, 'webhook_delivery', ?, ?, ? WHERE changes() > 0`,
-      ).bind(outboxId, event.workspace_id, JSON.stringify({ deliveryId }), timestamp, timestamp),
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at, correlation_id)
+         SELECT ?, ?, 'webhook_delivery', ?, ?, ?, ? WHERE changes() > 0`,
+      ).bind(
+        outboxId,
+        event.workspace_id,
+        JSON.stringify({ deliveryId }),
+        timestamp,
+        timestamp,
+        currentObservabilityContext()?.correlationId ?? null,
+      ),
     );
   }
   if (statements.length) await env.DB.batch(statements);
@@ -581,16 +599,18 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
   try {
     const token = await decryptToken(env, subscription.encrypted_verification_token);
     const signature = `sha256=${await hmacSha256Hex(token, payload)}`;
-    const response = await fetch(destination, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "user-agent": "Realtime-Notes-Webhook/1.0",
-        "x-notion-signature": signature,
-      },
-      body: payload,
-      redirect: "manual",
-      signal: controller.signal,
+    const response = await traced(tracing, "notes.integration.webhook", { "notes.operation": "delivery" }, () => {
+      return fetch(destination, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "Realtime-Notes-Webhook/1.0",
+          "x-notion-signature": signature,
+        },
+        body: payload,
+        redirect: "manual",
+        signal: controller.signal,
+      });
     });
     status = response.status;
     headers = Object.fromEntries(
@@ -633,14 +653,22 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
        response_headers_json = ?, response_body = ?, last_error = ?, updated_at = ? WHERE id = ?`,
     ).bind(attempt, availableAt, status, JSON.stringify(headers), received, failure, timestamp, deliveryId),
     env.DB.prepare(
-      `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
-       VALUES (?, ?, 'webhook_delivery', ?, ?, ?)`,
-    ).bind(outboxId, row.workspace_id, JSON.stringify({ deliveryId }), availableAt, timestamp),
+      `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at, correlation_id)
+       VALUES (?, ?, 'webhook_delivery', ?, ?, ?, ?)`,
+    ).bind(
+      outboxId,
+      row.workspace_id,
+      JSON.stringify({ deliveryId }),
+      availableAt,
+      timestamp,
+      currentObservabilityContext()?.correlationId ?? null,
+    ),
   ]);
   try {
     // Put the future retry on the queue immediately. The consumer defers it until
     // available_at, while the durable outbox still recovers ambiguous enqueue failures.
-    await env.DELIVERY_QUEUE.send({ outboxId });
+    const correlationId = currentObservabilityContext()?.correlationId;
+    await env.DELIVERY_QUEUE.send({ outboxId, ...(correlationId ? { correlationId } : {}) });
     await env.DB.prepare(`UPDATE outbox SET enqueued_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?`)
       .bind(Date.now(), outboxId)
       .run();

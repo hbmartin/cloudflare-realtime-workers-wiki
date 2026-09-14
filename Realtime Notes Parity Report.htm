@@ -1,0 +1,320 @@
+
+
+  <aside class="rail">
+    <span class="rail-label">Contents</span>
+    <nav>
+      <a href="#verdict"><span class="num">01</span>The read</a>
+      <a href="#matrix"><span class="num">02</span>Parity matrix</a>
+      <a href="#unlocks"><span class="num">03</span>Three unlocks</a>
+      <a href="#gaps"><span class="num">04</span>Gap by gap</a>
+      <a href="#roadmap"><span class="num">05</span>Build order</a>
+      <a href="#dont"><span class="num">06</span>What not to copy</a>
+    </nav>
+  </aside>
+
+  <main>
+
+  <section id="verdict">
+    <div class="sec-head"><span class="sec-num">01</span><h2>The read</h2></div>
+    <div class="prose">
+      <p class="lede">This is a strong document engine wearing a thin application. The gap to AFFiNE, Docmost, and Outline is almost never in the editing loop — it is in the twenty small products those three built around it.</p>
+
+      <p><strong>What is already ahead.</strong> Per-page hibernating Durable Objects with merged SQLite update chunks, 30-second R2 compaction, IndexedDB offline persistence, and epoch-safe version restore give a better idle-cost and offline story than Docmost or Outline, which both need a permanent Postgres, a Redis, and a separate Hocuspocus process to do less. The operational discipline — worker integration tests, a Chromium E2E suite, coverage gates, a realtime load script, nine operator docs — is ahead of what a project this young usually carries. Attachment handling (range requests, conditional ETags, <code>nosniff</code>, MIME rejection, multipart direct-to-R2) is more careful than Outline's.</p>
+
+      <p><strong>Where the distance is.</strong> Outline exposes thirty-nine API resource areas and runs about seventy background task types. Docmost ships forty-eight migrations covering spaces, groups, labels, watchers, notifications, page permissions, audit, SCIM, MFA, LDAP, templates, favorites, and a Notion-style database engine. This project exposes fifty-four routes, all cookie-authenticated, all scoped to one hardcoded workspace, with no email, no background job runner, no public sharing, no export, and no per-page access control.</p>
+
+      <p><strong>The shape of the fix.</strong> The missing features are not fifty unrelated problems. They cluster behind three architectural unlocks (§3) plus one large pile of pure client work in the editor that needs no server change at all. That editor pile is where the first month should go — it is the most visible gap and the cheapest to close.</p>
+    </div>
+  </section>
+
+  <section id="matrix">
+    <div class="sec-head"><span class="sec-num">02</span><h2>Parity matrix</h2></div>
+    <div class="prose"><p>Sixteen capability areas, read from each project's source rather than its marketing. The three rows at the bottom are where this project leads.</p></div>
+
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Capability</th>
+            <th scope="col" class="mine">This project</th>
+            <th scope="col">AFFiNE</th>
+            <th scope="col">Docmost</th>
+            <th scope="col">Outline</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="area">Realtime co-editing &amp; presence</td><td class="mine"><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Version history &amp; restore</td><td class="mine"><span class="chip c-full">Full</span></td><td><span class="chip c-part">Partial</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Block &amp; node variety in the editor</td><td class="mine"><span class="chip c-part">Partial</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Comments (threads, resolve, notify)</td><td class="mine"><span class="chip c-part">Partial</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Spaces / collections</td><td class="mine"><span class="chip c-none">None</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Groups &amp; per-page permissions</td><td class="mine"><span class="chip c-none">None</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Public share links</td><td class="mine"><span class="chip c-none">None</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Search depth (filters, scope, ranking)</td><td class="mine"><span class="chip c-part">Partial</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Export — Markdown, HTML, PDF</td><td class="mine"><span class="chip c-none">None</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">In-app import</td><td class="mine"><span class="chip c-none">CLI only</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Notifications, email, watchers</td><td class="mine"><span class="chip c-part">Partial</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Favorites, pins, templates, tags</td><td class="mine"><span class="chip c-none">None</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">REST API, tokens, webhooks</td><td class="mine"><span class="chip c-none">None</span></td><td><span class="chip c-part">Partial</span></td><td><span class="chip c-part">Partial</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">SSO, MFA, SCIM, session control</td><td class="mine"><span class="chip c-none">None</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Structured databases &amp; views</td><td class="mine"><span class="chip c-part">Partial</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="c-na">not offered</span></td></tr>
+          <tr><td class="area">Dark mode &amp; localization</td><td class="mine"><span class="chip c-none">None</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td></tr>
+          <tr><td class="area">Offline / local-first editing</td><td class="mine"><span class="chip c-full">Full</span></td><td><span class="chip c-full">Full</span></td><td><span class="chip c-none">None</span></td><td><span class="chip c-none">None</span></td></tr>
+          <tr><td class="area">Idle cost &amp; scale-to-zero</td><td class="mine"><span class="chip c-full">Full</span></td><td><span class="chip c-none">None</span></td><td><span class="chip c-none">None</span></td><td><span class="chip c-none">None</span></td></tr>
+          <tr><td class="area">Deploy footprint (no DB/Redis/queue host)</td><td class="mine"><span class="chip c-full">Full</span></td><td><span class="chip c-none">None</span></td><td><span class="chip c-none">None</span></td><td><span class="chip c-none">None</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="legend">
+      <span>Full — shipped and complete</span>
+      <span>Partial — present but materially behind</span>
+      <span>None — not implemented</span>
+    </div>
+  </section>
+
+  <section id="unlocks">
+    <div class="sec-head"><span class="sec-num">03</span><h2>Three unlocks</h2></div>
+    <div class="prose">
+      <p class="lede">Most of the red in that matrix traces back to three missing pieces of plumbing. Build these and roughly two-thirds of the feature list becomes ordinary work.</p>
+    </div>
+
+    <div class="callout">
+      <h4>A. Server-side structured content</h4>
+      <p>Document bodies exist only as a Yjs <code>XmlFragment</code> inside the page-epoch Durable Object. D1 gets a lossy projection — <code>projectDocument()</code> in <code>src/shared/document-projection.ts</code> flattens everything to plain text plus mention targets. The only server-side byte access is <code>GET /api/versions/:id</code>, which returns an opaque <code>application/vnd.yjs</code> blob.</p>
+      <p>The worker already decodes Yjs to ProseMirror JSON in <code>src/worker/document.ts</code>. Exposing that decode on demand — plus a ProseMirror&nbsp;→&nbsp;Markdown/HTML serializer — unlocks <strong>export, public share pages, a REST content API, richer search projections, and link previews that do not need a live client</strong>. This is the single highest-leverage item in the report, and <code>docs/API_COMPATIBILITY.md</code> already identifies it as the widest-blast-radius gap.</p>
+    </div>
+
+    <div class="callout">
+      <h4>B. A background job runner</h4>
+      <p><code>wrangler.jsonc</code> binds D1, R2, two Durable Objects, and static assets. There is no Queues binding, no Workflows binding, and a single hourly cron trigger doing deletion retries. Docmost's <code>file_tasks</code> table and Outline's ~70 task classes exist because export, import, email, notification fan-out, and webhook delivery all need to outlive a request.</p>
+      <p>Add a Queues (or Workflows) binding plus a <code>jobs</code> table with status and progress. That one addition unlocks <strong>email, notification fan-out, whole-tree export, in-app import, webhooks, and search reindexing</strong> — six matrix rows behind one binding.</p>
+    </div>
+
+    <div class="callout">
+      <h4>C. A scope column</h4>
+      <p><code>install_state</code> carries <code>CHECK (id = 1)</code>, and <code>getMember()</code> in <code>src/worker/auth.ts</code> resolves membership with an unfiltered <code>LIMIT 1</code>. Every route derives scope from the one workspace that can exist. Keeping that single-tenant decision is fine — but adding a <code>space_id</code> on <code>pages</code> plus a grants table gets you <strong>spaces, groups, per-page permissions, personal pages, and share scoping</strong> without touching the multi-workspace constraint at all.</p>
+    </div>
+  </section>
+
+  <section id="gaps">
+    <div class="sec-head"><span class="sec-num">04</span><h2>Gap by gap</h2></div>
+
+    <div class="gaps">
+
+      <article class="gap-card">
+        <span class="gap-tag">Editor · client-only work</span>
+        <h3>The block palette is the default one</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd><code>notesSchema</code> in <code>src/client/mentions.tsx</code> is <code>defaultBlockSpecs</code> plus one custom mention inline. That means paragraph, headings, lists, checklist, toggle, quote, code, table, and media — and nothing else.</dd>
+          <dt>References</dt>
+          <dd>Docmost's <code>@docmost/editor-ext</code> adds callouts, inline and block math, Mermaid, Draw.io, Excalidraw, embeds, PDF, columns, status chips, footnotes, page breaks, subpage lists, transclusion, and find-and-replace. Outline ships <code>Math</code>, <code>MathBlock</code>, <code>Notice</code>, <code>Embed</code>, <code>ToggleBlock</code>, and <code>Emoji</code> nodes. AFFiNE adds Mermaid, Typst, and PDF modules.</dd>
+          <dt>Build</dt>
+          <dd class="build">A block pack: <strong>callout, math (KaTeX), Mermaid, columns, embed, table-of-contents, and a synced/transclusion block</strong>. All are BlockNote custom specs — zero server change, highest visible payoff per hour in the entire report.</dd>
+          <dt>Watch</dt>
+          <dd>Every new spec must also be handled in <code>projectDocument()</code>, or its text silently disappears from search, backlinks, and previews.</dd>
+        </dl>
+      </article>
+
+      <article class="gap-card">
+        <span class="gap-tag">Organization</span>
+        <h3>One flat tree, no way to file anything</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd>A single page tree with fractional ordering, archive, and trash. No favorites, no pins, no tags, no templates, no recently-viewed, no drafts. The sidebar has exactly three views: search, mentions, settings.</dd>
+          <dt>References</dt>
+          <dd>Outline: collections, stars, pins, drafts, templates, insights. Docmost: spaces (including personal spaces), labels, favorites, recent, created-by-me, breadcrumbs, duplicate, move-to-space. AFFiNE: collections with rules, tags, favorites, template docs, and a journal for daily notes.</dd>
+          <dt>Build</dt>
+          <dd class="build">Favorites and recently-viewed first — two small tables and a sidebar section, and they change daily use more than anything else on this list. Then <strong>templates</strong> (a boolean on <code>pages</code> plus a picker on create), <strong>labels</strong>, and finally <strong>spaces</strong> once unlock C exists.</dd>
+        </dl>
+      </article>
+
+      <article class="gap-card">
+        <span class="gap-tag">Access</span>
+        <h3>Three global roles and no way to share out</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd><code>owner</code> / <code>editor</code> / <code>viewer</code> applied workspace-wide by <code>requireOwner</code> / <code>requireEditor</code> in <code>src/worker/auth.ts</code>. No resource-scoped grants, no groups, nothing readable without a session. <code>assertSameOrigin</code> rejects every non-browser caller by design.</dd>
+          <dt>References</dt>
+          <dd>Docmost has <code>page_access</code> + <code>page_permissions</code> keyed to a user <em>or</em> a group. Outline has collection memberships, document memberships, group memberships, and access requests. Both publish share links; Outline's <code>Share</code> model alone carries <code>includeChildDocuments</code>, custom domain, <code>allowIndexing</code>, <code>showTOC</code>, <code>showLastUpdated</code>, a view counter, and revocation.</dd>
+          <dt>Build</dt>
+          <dd class="build"><strong>Public share links are the headline feature</strong> and, on this architecture, unusually cheap: a token table in D1 plus an unauthenticated route that renders HTML from the <em>R2 snapshot</em> rather than waking the Durable Object. That makes shared pages edge-cacheable and costs nothing when nobody is editing — better than any of the three references manage.</dd>
+          <dt>Then</dt>
+          <dd>Groups, then per-page grants checked alongside the existing role check.</dd>
+        </dl>
+      </article>
+
+      <article class="gap-card">
+        <span class="gap-tag">Discovery</span>
+        <h3>Search is one query with no controls</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd><code>GET /api/search</code> — FTS5 prefix-AND over title and flattened body, ranked by <code>bm25</code>, hard <code>LIMIT 30</code>. No pagination, no filters, no archived results, and comments and attachment text are not indexed at all. Results also trail edits by the 30-second compaction cycle.</dd>
+          <dt>References</dt>
+          <dd>Outline's <code>documents.search</code> filters by collection, author, date range, and status, keeps a <code>SearchQuery</code> history, and has a separate <code>search_titles</code> endpoint for the quick switcher. Docmost indexes attachment contents and uses <code>pg_trgm</code> and <code>unaccent</code> for fuzzy and accent-insensitive matching. AFFiNE runs a dedicated indexer plugin with embeddings.</dd>
+          <dt>Build</dt>
+          <dd class="build">Add <strong>filters, pagination, and a title-only endpoint</strong> to what exists — a day's work that makes the current index feel three times bigger. Then index comments and extracted attachment text. Vectorize for semantic search is a later, optional layer.</dd>
+        </dl>
+      </article>
+
+      <article class="gap-card">
+        <span class="gap-tag">Data portability</span>
+        <h3>Nothing comes out; only a CLI puts things in</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd>No export of any kind. Import is <code>pnpm import:notion</code>, an operator-machine script driving the public API.</dd>
+          <dt>References</dt>
+          <dd>Outline exports Markdown zip, HTML zip, JSON, and TextBundle, per document or per collection or whole-instance, and imports docx/markdown/html plus Notion and Confluence through queued <code>Import</code> / <code>ImportTask</code> records. Docmost exports Markdown, HTML, and PDF for a page or a whole space with children, and runs imports through <code>file_tasks</code> with progress in the UI.</dd>
+          <dt>Build</dt>
+          <dd class="build">Per-page <strong>Markdown and HTML export</strong> falls straight out of unlock A and can ship on its own. Whole-tree zip export and in-app import both need unlock B. PDF needs the Browser Rendering binding — the one thing here that cannot be done in-worker.</dd>
+        </dl>
+      </article>
+
+      <article class="gap-card">
+        <span class="gap-tag">Engagement</span>
+        <h3>Nothing ever tells anyone anything</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd>A polled mention inbox (<code>member_mentions</code> + <code>mention_reads</code>) is the entire notification system. Better Auth is configured with <code>emailAndPassword</code> and no mailer, so there is no password reset, no email verification, and invites are copy-a-link only. Comments live in a <code>Y.Map</code> the server never reads, so a comment mention notifies nobody.</dd>
+          <dt>References</dt>
+          <dd>Outline has a <code>Notification</code> model, a <code>Subscription</code> model, email digests, and roughly twenty-five notification task types. Docmost added <code>notifications</code> and <code>watchers</code> tables with a backfill migration and a queue processor. Both send real email.</dd>
+          <dt>Build</dt>
+          <dd class="build"><strong>Watchers plus an in-app notification feed</strong>, pushed live over the existing <code>WorkspaceEvents</code> Durable Object rather than polled. Email fan-out rides on unlock B. Making comments visible to the server — writing thread metadata to D1 on compaction — is what turns comment mentions into notifications and makes comments searchable.</dd>
+        </dl>
+      </article>
+
+      <article class="gap-card">
+        <span class="gap-tag">Identity</span>
+        <h3>Collaborators have no faces and no names</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd>Email and password only. No profile page, no avatar, no session list. In <code>src/client/EditorPage.tsx</code>, <code>resolveUsers</code> returns the literal string <code>"Collaborator"</code> for every user who is not you — so every comment by anyone else is attributed to a nameless stranger.</dd>
+          <dt>References</dt>
+          <dd>Docmost ships MFA, LDAP, SCIM, and SSO with group sync, plus user session management. Outline has OIDC, Google, Azure, Slack, Discord, GitHub, GitLab, and passkeys as first-class plugins.</dd>
+          <dt>Build</dt>
+          <dd class="build">Fix <code>resolveUsers</code> first — it is a small endpoint and a cache, and it repairs comment attribution, presence labels, and mention chips at once. Then profiles and avatars, then password reset once mail exists, then Better Auth's OIDC and two-factor plugins.</dd>
+        </dl>
+      </article>
+
+      <article class="gap-card">
+        <span class="gap-tag">Structured data</span>
+        <h3>Tables are a spreadsheet, not a database</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd>Five column types — text, number, checkbox, date, select — with a 60-second single-editor lease, 20,000-row cap, and server-side paging and sorting. No saved views, no filters, no grouping, no relations, no formulas, no CSV.</dd>
+          <dt>References</dt>
+          <dd>Docmost's <code>bases</code> carry typed properties with <code>type_options</code>, formulas, and a staged type-migration path (<code>pending_type</code>, <code>pending_token</code>) so a column can change type without losing data. AFFiNE has database blocks embeddable inside a page. Outline deliberately offers none of this.</dd>
+          <dt>Build</dt>
+          <dd class="build"><strong>Saved views</strong> (filter, sort, group) and more property types — multi-select, person, URL, created/updated by — before anything exotic. Then CSV import/export, then an inline database block inside a document.</dd>
+          <dt>Note</dt>
+          <dd>The lease model is the one place the app abandons its own realtime story. Moving table state into a Durable Object would make tables collaborative like documents and delete <code>table_leases</code> entirely.</dd>
+        </dl>
+      </article>
+
+      <article class="gap-card">
+        <span class="gap-tag">Interface</span>
+        <h3>No dark mode, no shortcuts, no other languages</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd><code>theme="light"</code> is hardcoded on the BlockNote view and <code>styles.css</code> has no <code>prefers-color-scheme</code> block at all. No command palette, no keyboard shortcut layer, no emoji picker for page icons, no cover images, no localization scaffolding, no PWA manifest.</dd>
+          <dt>References</dt>
+          <dd>All three ship dark mode and translate through Crowdin — Docmost advertises ten-plus languages. AFFiNE adds quick search, peek view, find-in-page, and a theme editor.</dd>
+          <dt>Build</dt>
+          <dd class="build"><strong>Dark mode</strong> as a token pass over <code>styles.css</code>, and a <strong>Cmd-K quick switcher</strong> on the new title-search endpoint. Both are afternoon-sized and both are the first thing anyone notices is missing.</dd>
+        </dl>
+      </article>
+
+      <article class="gap-card">
+        <span class="gap-tag">Extensibility</span>
+        <h3>Nothing can talk to it but the browser</h3>
+        <dl class="gap-grid">
+          <dt>Now</dt>
+          <dd>Fifty-four routes, all authenticated by session cookie, all origin-locked. No tokens, no webhooks, no integrations. Document content cannot be read or written over HTTP at all.</dd>
+          <dt>References</dt>
+          <dd>Outline is API-first: thirty-nine resource areas, API keys, OAuth clients with dynamic registration, a webhooks plugin, and twenty-four integration plugins. Docmost added API keys and an audit log.</dd>
+          <dt>Build</dt>
+          <dd class="build">A <strong>personal access token</strong> table plus a bearer branch in the auth middleware — <code>docs/API_COMPATIBILITY.md</code> already sketches the exact shape, and the existing invite code gives you the hash-only storage pattern to copy. Read-only content endpoints first; writes are genuine distributed-systems work because a REST edit has to become a Yjs transaction against a possibly-hibernating object.</dd>
+        </dl>
+      </article>
+
+    </div>
+  </section>
+
+  <section id="roadmap">
+    <div class="sec-head"><span class="sec-num">05</span><h2>Build order</h2></div>
+    <div class="prose"><p>Ordered by visible gain per unit of work, not by size. Tier 1 needs no schema change and no new binding.</p></div>
+
+    <div class="tier">
+      <div class="tier-head">
+        <h3>Tier 1 — ship without touching the architecture</h3>
+        <span class="tier-badge">weeks, not months</span>
+      </div>
+      <p>Every item here is client-side or a single new D1 table. Together they close most of the perceived quality gap.</p>
+      <ol class="items">
+        <li><span class="n">01</span><span class="t">Editor block pack</span><span class="d">Callout, math, Mermaid, columns, embed, table of contents. Extend <code>projectDocument()</code> in the same commit so the new text stays searchable.</span></li>
+        <li><span class="n">02</span><span class="t">Dark mode</span><span class="d">Token pass over <code>styles.css</code>, drop the hardcoded <code>theme="light"</code>, respect the OS preference with an explicit override.</span></li>
+        <li><span class="n">03</span><span class="t">Cmd-K quick switcher</span><span class="d">Needs a title-only search endpoint, which the search work wants anyway.</span></li>
+        <li><span class="n">04</span><span class="t">Real collaborator identity</span><span class="d">Replace the <code>"Collaborator"</code> placeholder with a member lookup; add profiles and avatars. Fixes comments, presence, and mentions at once.</span></li>
+        <li><span class="n">05</span><span class="t">Favorites and recently viewed</span><span class="d">Two tables, one sidebar section. Disproportionate effect on daily use.</span></li>
+        <li><span class="n">06</span><span class="t">Search filters and pagination</span><span class="d">Author, date, kind, archived, plus a cursor. The index already exists.</span></li>
+        <li><span class="n">07</span><span class="t">Page templates</span><span class="d">A flag on <code>pages</code> and a picker on the create path.</span></li>
+        <li><span class="n">08</span><span class="t">Keyboard shortcuts and a help overlay</span><span class="d">Table-stakes for a wiki people live in all day.</span></li>
+      </ol>
+    </div>
+
+    <div class="tier">
+      <div class="tier-head">
+        <h3>Tier 2 — behind the three unlocks</h3>
+        <span class="tier-badge">a quarter</span>
+      </div>
+      <p>Each one depends on unlock A (server-side content), B (job runner), or C (scope column).</p>
+      <ol class="items">
+        <li><span class="n">09</span><span class="t">Markdown and HTML export</span><span class="d">Unlock A. The first user-visible proof that content escapes the CRDT.</span></li>
+        <li><span class="n">10</span><span class="t">Public share links</span><span class="d">Unlocks A and C. Render from the R2 snapshot so shared pages are cacheable and never wake a Durable Object.</span></li>
+        <li><span class="n">11</span><span class="t">Notifications, watchers, and email</span><span class="d">Unlock B. Push the in-app feed over the existing <code>WorkspaceEvents</code> object; queue the email.</span></li>
+        <li><span class="n">12</span><span class="t">Spaces and groups</span><span class="d">Unlock C. Adds the container everything else wants to scope to.</span></li>
+        <li><span class="n">13</span><span class="t">Per-page permissions</span><span class="d">Unlock C. A grants check layered under the existing role check.</span></li>
+        <li><span class="n">14</span><span class="t">In-app import</span><span class="d">Unlock B. Move <code>notion-import.mjs</code> onto the job model and give it a progress UI.</span></li>
+        <li><span class="n">15</span><span class="t">Personal access tokens and a read API</span><span class="d">Unlock A. Bearer branch in auth, hash-only storage, read endpoints first.</span></li>
+        <li><span class="n">16</span><span class="t">Comments visible to the server</span><span class="d">Unlock A. Project thread metadata to D1 so comments notify, search, and survive a schema bump.</span></li>
+      </ol>
+    </div>
+
+    <div class="tier">
+      <div class="tier-head">
+        <h3>Tier 3 — larger bets</h3>
+        <span class="tier-badge">deliberate scope calls</span>
+      </div>
+      <p>Worth doing, but each is a project rather than a feature. Decide these one at a time.</p>
+      <ol class="items">
+        <li><span class="n">17</span><span class="t">Database views and property types</span><span class="d">Plus moving table state into a Durable Object so tables become collaborative and the lease disappears.</span></li>
+        <li><span class="n">18</span><span class="t">SSO, two-factor, session management</span><span class="d">Better Auth plugins carry most of it; SCIM does not.</span></li>
+        <li><span class="n">19</span><span class="t">PDF export</span><span class="d">Needs the Browser Rendering binding. The only item here that cannot run in-worker.</span></li>
+        <li><span class="n">20</span><span class="t">Semantic search</span><span class="d">Vectorize alongside FTS5, with embeddings written on the same compaction pass.</span></li>
+        <li><span class="n">21</span><span class="t">Audit log, page views, insights</span><span class="d">An events table plus the read paths Outline models as <code>View</code> and <code>DocumentInsight</code>.</span></li>
+        <li><span class="n">22</span><span class="t">Webhooks</span><span class="d">Unlock B plus a delivery table with retry and signature.</span></li>
+        <li><span class="n">23</span><span class="t">Multi-workspace</span><span class="d">Drop <code>CHECK (id = 1)</code> and thread <code>workspace_id</code> through every route. Worth asking first whether the product wants it.</span></li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="dont">
+    <div class="sec-head"><span class="sec-num">06</span><h2>What not to copy</h2></div>
+    <div class="prose">
+      <p>Five things the reference projects do that this architecture should decline, and one it should stop apologizing for.</p>
+      <ul>
+        <li><strong>AFFiNE's edgeless whiteboard.</strong> BlockSuite is an enormous surface, and an infinite canvas grows a Y.Doc in exactly the direction the 16&nbsp;MiB warning and 24&nbsp;MiB read-only ceiling in <code>src/worker/document.ts</code> cannot absorb.</li>
+        <li><strong>Server-side image processing.</strong> Docmost uses <code>sharp</code> for avatar and icon resizing; that is a native libvips binary and will never load in a V8 isolate. Use Cloudflare Images or resize in the browser before upload.</li>
+        <li><strong>Per-keystroke cross-document indexes.</strong> Search, backlinks, and previews trailing the compaction cycle is inherent to one-object-per-document, not a bug to chase. Say so in the UI instead — a quiet "indexed a moment ago" beats a fix that cannot exist.</li>
+        <li><strong>Redis-shaped job semantics.</strong> BullMQ and Bull assume blocking commands and a long-lived worker loop. Queues, Workflows, and Durable Object alarms are the native answer; re-express the jobs rather than emulating the queue.</li>
+        <li><strong>Multi-tenant billing, quota, and licensing.</strong> AFFiNE's payment, quota, entitlement, and license modules exist because it sells a cloud. A self-hosted single-workspace wiki carries that weight for nothing.</li>
+        <li><strong>And the one to stop apologizing for:</strong> permanent Durable Object placement and the resulting transatlantic latency is a real limit, but it only affects initial load and cursor sync — Yjs local echo hides typing entirely. Document it as a deployment consideration, not as a defect.</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>
+    Sources read directly: this project's worker routes, D1 migrations, BlockNote schema, editor page, and operator docs; Outline's <code>server/routes/api</code>, <code>server/models</code>, <code>server/queues/tasks</code>, <code>shared/editor</code>, and <code>plugins</code>; Docmost's <code>apps/server/src/core</code>, <code>integrations</code>, <code>database/migrations</code>, and <code>@docmost/editor-ext</code>; AFFiNE's <code>packages/backend/server/src/core</code>, <code>plugins</code>, and <code>packages/frontend/core/src/modules</code>. Effort framing is relative, not estimated in hours.
+  </footer>
+
+  </main>

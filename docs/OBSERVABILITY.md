@@ -1,133 +1,160 @@
 # Observability
 
-## What exists
+This installation uses Cloudflare-native telemetry only: Workers Logs, Workers Traces, Analytics Engine,
+Cloudflare product metrics, and a GitHub Actions failure notification. It does not use Sentry, Logpush, an
+external OTLP backend, or an in-app dashboard.
 
-`wrangler.jsonc` enables Workers Logs and source map upload:
+## Collection and retention
 
-```jsonc
-"observability": { "enabled": true },
-"upload_source_maps": true,
+Production collects 100% of structured application and invocation logs and samples traces at 5%. Local and
+E2E runs collect all traces so Local Explorer can show a complete request. Analytics Engine points are
+non-blocking and retained by Cloudflare for three months. The production dataset is
+`cloudflare_realtime_notes_production`.
+
+Every response, including a WebSocket handshake, carries `X-Request-Id`. When version metadata is available it
+also carries `X-Worker-Version`; `GET /api/health` exposes the same deployment ID. The Notion-compatible API
+continues to return its `request_id` field and now uses the outer Worker request ID.
+
+Custom spans use these fixed names:
+
+| Span                                                                              | Scope                             |
+| --------------------------------------------------------------------------------- | --------------------------------- |
+| `notes.route_request`                                                             | HTTP route or WebSocket handshake |
+| `notes.document.compact`                                                          | document or diagram compaction    |
+| `notes.document.restore`                                                          | version restore transaction       |
+| `notes.scheduled.<task>`                                                          | one cron subtask                  |
+| `notes.workflow.job`                                                              | one Workflow invocation           |
+| `notes.job.import`, `notes.job.export`                                            | import/export job body            |
+| `notes.outbox.delivery`                                                           | durable outbox delivery           |
+| `notes.integration.webhook`, `notes.integration.slack`, `notes.integration.email` | outbound integration call         |
+
+Cloudflare adds automatic child spans for handlers, bindings, and outbound requests.
+
+## Structured log contract
+
+Each application log call emits one JSON object. Required fields are `schema`, `event`, `severity`,
+`component`, and `message`. Invocation context adds `requestId`, `correlationId`, `rayId`, `trigger`,
+`versionId`, and `versionTag` when available. Errors are normalized and bounded.
+
+Stable event families include:
+
+| Family        | Examples                                                                                           | Owner               |
+| ------------- | -------------------------------------------------------------------------------------------------- | ------------------- |
+| HTTP/realtime | `http.request.failed`, `http.request.unhandled_error`, `realtime.handshake.failed`                 | application on-call |
+| scheduler     | `scheduled.task.failed`, `scheduled.task_state.failed`, `scheduled.run.completed`                  | application on-call |
+| jobs/outbox   | `workflow.job.failed`, `workflow.*.start_failed`, `outbox.enqueue.failed`, `queue.delivery.failed` | application on-call |
+| documents     | `document.compaction.failed`, `document.restore.failed`, `document.restore_reconcile.failed`       | storage on-call     |
+| consistency   | `table.revision.invariant_failed`, `page_move.receipt.invalid`, `page_move.batch_result.invalid`   | incident commander  |
+| integrations  | `webhook.verification.failed`, `slack.channel_digest.failed`, `notification.digest_email.failed`   | integrations owner  |
+| browser       | `client.error.reported` with a fixed `eventCode` and hashed `fingerprint`                          | frontend owner      |
+| readiness     | `health.readiness.failed`                                                                          | application on-call |
+
+Expected HTTP errors and ordinary request volume are metrics, not application logs. Successful compactions,
+outbox deliveries, and integration calls are spans/metrics. Logs retain warnings, failures, recovery actions,
+and lifecycle summaries.
+
+### Privacy policy
+
+Never add cookies, authorization headers, credentials, email addresses, request bodies, document content or
+titles, Slack/webhook payloads, or URL query strings to telemetry. The logger redacts sensitive keys, known
+credential formats, email-shaped values, bearer tokens, and query strings, including nested diagnostic values.
+Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to
+Analytics Engine.
+
+Browser reports contain only an event code, error name, SHA-256 fingerprint, same-origin source path/line/column,
+request ID, release, online state, and visibility. Raw messages and stacks never leave the browser.
+
+## Analytics Engine schema
+
+`index1` is always `event`. Positions are fixed:
+
+| Position            | Value                                                                         |
+| ------------------- | ----------------------------------------------------------------------------- |
+| `blob1`…`blob7`     | schema, component, operation/route, outcome, code, subtype, Worker version ID |
+| `double1`…`double6` | duration ms, bytes, attempts, lag ms, backlog, connection count               |
+
+Analytics Engine may sample rows. Every count and weighted aggregate must use `_sample_interval`:
+
+```sql
+SELECT index1 AS event, blob2 AS component, blob4 AS outcome,
+       SUM(_sample_interval) AS events,
+       quantileExactWeighted(0.95)(double1, _sample_interval) AS p95_duration_ms
+FROM cloudflare_realtime_notes_production
+WHERE timestamp > NOW() - INTERVAL '15' MINUTE
+GROUP BY event, component, outcome
+ORDER BY events DESC;
 ```
 
-That is the entirety of the instrumentation. There is deliberately **no** Sentry, Analytics Engine
-binding, tail consumer, Logpush configuration, OpenTelemetry export, or metrics emitter. Application
-logging uses `console.error` in the Worker. Unhandled Hono request errors carry the method, pathname, and
-Cloudflare Ray ID when available; most other logs have no request-id correlation. Most calls pass a bare
-error object; page-move reconciliation failures and `Table revision could not be advanced` carry structured
-fields because their client responses do not identify the affected operation.
+To investigate repeated browser failures:
 
-Plan monitoring around that constraint: Cloudflare's own dashboards carry the numeric signal, and the
-two D1 work queues carry the durable error state. Logs are for narrative detail after something else
-has told you where to look.
+```sql
+SELECT blob3 AS event_code, blob6 AS fingerprint, SUM(_sample_interval) AS reports
+FROM cloudflare_realtime_notes_production
+WHERE index1 = 'client.error' AND timestamp > NOW() - INTERVAL '15' MINUTE
+GROUP BY event_code, fingerprint
+HAVING reports >= 5;
+```
 
-## Health checking
+Suggested Cloudflare dashboard views are Worker requests/errors and CPU, trace latency by span name, Queue
+backlog/DLQ, Workflow status/queued events, D1 storage/latency, R2 operations/storage, and Durable Object billed
+duration. The five-minute GitHub monitor is the paging view; dashboards are for diagnosis and capacity.
+
+## Health and paging
+
+`GET /api/health` remains public and checks D1 compatibility. Protected readiness uses a secret header:
 
 ```sh
-curl -s https://notes.example.com/api/health
+curl -fsS -H "X-Observability-Token: $OBSERVABILITY_PROBE_TOKEN" \
+  "$PRODUCTION_BASE_URL/api/health/ready"
 ```
 
-```json
-{ "ok": true, "version": "0.1.0", "time": "2026-08-18T00:00:00.000Z" }
-```
+Readiness runs D1, R2 sentinel `head`, read-only Durable Object, cron-freshness, and durable queue checks in
+parallel with a two-second timeout per check. It returns `200`/`ready` or `503`/`degraded` with stable sanitized
+codes. A missing or invalid probe token returns `401`.
 
-Two limitations that determine how you use it:
+The monitor retries readiness three times at 45-second intervals and evaluates:
 
-- It runs `SELECT 1` against D1 and nothing else. **It reports healthy during a complete R2 or Durable
-  Object outage.** An uptime monitor on this endpoint proves the Worker is running and D1 is reachable;
-  it proves nothing about document editing, attachments, or version history.
-- `version` is a hardcoded string, not a build identifier. It cannot tell you which revision is live.
-  Use `pnpm wrangler deployments list --env production`.
+- all three readiness probes fail, or any scheduled task has no success for 35 minutes;
+- three Worker exceptions in five minutes, or 5xx above 2% with at least 50 requests;
+- any DLQ backlog, oldest Queue message above five minutes, or backlog above 100 throughout 15 minutes;
+- Workflow infrastructure failures, a Cloudflare Workflow queued above 30 minutes, or a locally durable job
+  queued above 30 minutes;
+- deletion/upload attempts above five, archive attempts above nine, any work above two hours, outbox due above
+  15 minutes, or D1 size above 8 GB;
+- any invariant-corruption metric, two compaction/restore failures, or five identical browser fingerprints in
+  15 minutes.
 
-`GET /api/install` returns `{"initialized": boolean}` and is a useful probe for the bootstrap state of
-a fresh installation. Both endpoints are unauthenticated.
-
-## What to watch
-
-| Signal                                 | Where                   | Why                                                   |
-| -------------------------------------- | ----------------------- | ----------------------------------------------------- |
-| Worker error rate                      | Workers metrics         | The primary outage indicator                          |
-| Worker CPU time                        | Workers metrics         | Compaction of large documents is the expensive path   |
-| Cron invocation success                | Workers → Cron Triggers | Every queue and reaper stalls silently if this fails  |
-| R2 Class A operations                  | R2 metrics              | Every uploaded part is one, so multipart moves this   |
-| Incomplete multipart uploads           | `attachment_uploads`    | Parts R2 still holds for uploads nobody finished      |
-| D1 database size                       | D1 metrics              | Hard 10 GB cap; there is no sharding                  |
-| D1 query latency                       | D1 metrics              | Single-threaded; search and projection writes contend |
-| R2 storage and Class A/B operations    | R2 metrics              | Grows with attachments, snapshots, and versions       |
-| Durable Object billed duration         | Durable Object metrics  | Idle connected rooms should approach zero             |
-| Durable Object request rate per object | Durable Object metrics  | A single hot room is a single-threaded bottleneck     |
-
-Durable Object billed duration deserves specific attention. Both classes set `hibernate: true`, and the
-design depends on idle rooms costing nothing. Miniflare cannot prove hibernation behavior, so this can
-only be verified on a deployed account — it is listed in the
-[production smoke checklist](DEPLOYMENT.md#production-smoke-checklist) for that reason. If idle rooms
-accrue duration, hibernation is not working and cost scales with connections rather than activity.
-
-## Suggested alerts
-
-| Alert                    | Condition                                                                                                 | Why it matters                                                                                                                              |
-| ------------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| Cron failure             | Scheduled invocation errors, or no successful invocation in 2 hours                                       | Both cleanup queues stop draining; deleted content leaks and archived pages keep editors connected                                          |
-| Sustained 5xx            | Worker error rate above baseline for 5 minutes                                                            | General outage                                                                                                                              |
-| `table_revision_failed`  | Any `Table revision could not be advanced` log line                                                       | A table mutation invariant was violated. Not transient; see [Troubleshooting](TROUBLESHOOTING.md#the-table-mutation-guard)                  |
-| Unresolved page move     | Any `Page move receipt could not be read.` log line                                                       | D1 could not determine an idempotent move outcome. Retry with the same operation id; sustained occurrences indicate a D1 outage             |
-| Invalid move receipt     | Any `Page move receipt was invalid.` log line                                                             | A persisted receipt or committed batch result is corrupt or unsupported. Inspect the phase and recovery fields                              |
-| Inconsistent move result | Any `Committed page move receipt result was inconsistent.` log line                                       | A committed batch result contradicted the request. The Worker retries from the authoritative stored receipt                                 |
-| Invalid move batch       | Any `Page move batch result was invalid or inconsistent.` log line                                        | D1 returned malformed metadata or a result that contradicted the read-back state. `recoveredFromReceipt` records whether recovery succeeded |
-| Conflicting move replay  | Any `Page move recovery found a conflicting receipt.` log line                                            | A failed move raced with reuse of its operation id. Inspect the flattened move and receipt errors                                           |
-| Deletion backlog         | `deletion_jobs` count above 10                                                                            | 10 is the per-tick drain rate, so this is the point where the queue stops keeping up                                                        |
-| Move-receipt backlog     | Any `Page move receipt pruning reached its catch-up limit` log line                                       | More than 10000 expired receipts reached one pass; retention cleanup may be falling behind                                                  |
-| Stuck deletion           | Any `deletion_jobs` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5              | Overdue by more than a cron interval, so the runner is not clearing it; `attempts` past the clamp means it is at the 16-hour ceiling        |
-| Stuck archive            | Any `archive_disconnect_targets` row with `next_attempt_at` more than 2 hours past, or `attempts` above 9 | Same, against the 42 min 40 s ceiling                                                                                                       |
-| Stuck upload             | Any `attachment_uploads` row with `next_attempt_at` more than 2 hours past, or `attempts` above 5         | The reaper is not clearing it, so R2 keeps holding the parts                                                                                |
-| D1 size                  | Above 8 GB                                                                                                | Approaching the 10 GB cap with no migration path                                                                                            |
-
-The queue-based alerts have no push mechanism in this repository. Run the queries from
-[Operations](OPERATIONS.md#inspecting-the-work-queues) from an external scheduler and alert on a
-non-zero count.
-
-Alert on `next_attempt_at` and `attempts`, never on how old a row is. The only general runner is the
-15-minute cron, so a row that failed with a 10-second backoff still waits until the next tick: a healthy
-retrying row is routinely older than the delay that scheduled it. Row age says nothing about whether
-work is progressing.
-
-## Log triage
-
-Search Workers Logs by message string; see the full table in
-[Troubleshooting](TROUBLESHOOTING.md#log-triage). The highest-signal strings are:
-
-```
-Scheduled deletion cleanup failed
-Scheduled archive disconnect failed
-Document restore failed
-Failed to reconcile pending document restore
-Page move receipt could not be read.
-Page move receipt was invalid.
-Committed page move receipt result was inconsistent.
-Page move batch result was invalid or inconsistent.
-Page move recovery found a conflicting receipt.
-Unhandled request error
-Failed to handle document party request for
-```
-
-Source maps are uploaded, so stack traces in the dashboard resolve to TypeScript source rather than
-bundled output.
-
-Two things to remember:
-
-- Unrecognised exceptions are collapsed into `500 internal_error` with the original logged separately.
-  The log carries `requestMethod` plus bounded `requestPath`, `requestRayId`, and error fields; use the Ray ID when the client or
-  Cloudflare request record has it, and otherwise correlate by timestamp.
-- Expected errors are never logged, by design. A client reporting a `404 room_not_found` or a
-  `409 stale_epoch` on `/parties/*` will leave no trace in Workers Logs. Malformed upgrade paths land
-  in that group, so a burst of them is visible in request metrics but not in the logs.
-
-## Verifying a deploy
+Run the same collector by hand:
 
 ```sh
-pnpm wrangler deployments list --env production          # which revision is live
-curl -s https://notes.example.com/api/health
-pnpm wrangler d1 execute DB --env production --remote --command \
-  "SELECT COUNT(*) jobs FROM deletion_jobs;"
+pnpm observability:report   # 15-minute and 24-hour summaries
+pnpm observability:check    # paging thresholds, non-zero on failure
 ```
 
-Then confirm the next cron tick succeeds before considering the deploy settled.
+The commands require `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_OBSERVABILITY_TOKEN`, `PRODUCTION_BASE_URL`, and
+`OBSERVABILITY_PROBE_TOKEN`. The read-only Cloudflare token needs Workers Observability Read, Analytics Engine
+Read, Queues Read, and D1 Read for the configured account. Operators own `.github/workflows/observability.yml`
+and must enable GitHub Actions failure emails under GitHub notification settings.
+
+## Request-ID triage
+
+Start with the `X-Request-Id` shown by the browser/API caller. Search Workers Logs for `requestId`, then pivot to
+`correlationId` to follow the job, outbox, Queue, Workflow, and internal Durable Object work. Old persisted rows
+fall back to their job or outbox ID. Compare `versionId` with the response's `X-Worker-Version` and the active
+Cloudflare deployment. Use `rayId` only as a secondary Cloudflare edge lookup.
+
+For local investigation run `pnpm dev`, open the Vite plugin's Local Explorer link, and filter logs/traces by the
+response request ID. Local trace sampling is 100%, so the request, binding calls, outbound calls, and custom spans
+should form one story.
+
+## Post-deploy verification
+
+After migrations and deploy:
+
+1. Confirm `/api/health` deployment ID equals `X-Worker-Version` and the active Cloudflare version.
+2. Call protected readiness and run `pnpm observability:check`.
+3. In Local Explorer, confirm a local request has correlated logs and D1/R2/Durable Object spans.
+4. In production, confirm Analytics Engine receives `http.request`, scheduled, document, outbox, integration,
+   and client event families as applicable.
+5. Wait for the next cron and verify every `observability_task_runs.last_succeeded_at` advances.
+6. Manually dispatch the Production observability workflow and confirm its job summary is healthy.

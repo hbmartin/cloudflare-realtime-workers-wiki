@@ -37,10 +37,24 @@ import { processDeletionJob } from "./cleanup";
 import { migrateLegacyColumns } from "./document";
 import type { Env } from "./env";
 import { HttpError } from "./http";
-import worker from "./index";
+import worker, { executeScheduledTasks } from "./index";
 import { broadcastWorkspaceEvent, eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
 
 const TRUNCATION_MARKER = "…[truncated]";
+
+function expectStructuredLog(
+  spy: { mock: { calls: readonly (readonly unknown[])[] } },
+  event: string,
+  fields: unknown,
+) {
+  const records = spy.mock.calls
+    .map(([record]) => record)
+    .filter(
+      (record): record is Record<string, unknown> =>
+        record !== null && typeof record === "object" && (record as Record<string, unknown>).event === event,
+    );
+  expect(records).toContainEqual(expect.objectContaining(fields as Record<string, unknown>));
+}
 
 type InstalledWorkspace = {
   cookie: string;
@@ -639,7 +653,155 @@ describe("Worker integration", () => {
     ]);
     expect(health.status).toBe(200);
     expect(await health.json()).toMatchObject({ ok: true, version: "0.1.0" });
+    expect(health.headers.get("x-request-id")).toMatch(/^[0-9a-f-]{36}$/);
+    expect(health.headers.get("x-worker-version")).toBeTruthy();
     expect(await install.json()).toEqual({ initialized: false });
+  });
+
+  it("protects readiness and reports sanitized dependency results", async () => {
+    const unauthorized = await SELF.fetch("http://example.test/api/health/ready");
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).toEqual({ ok: false, code: "probe_unauthorized" });
+
+    const ready = await SELF.fetch("http://example.test/api/health/ready", {
+      headers: { "x-observability-token": "worker-observability-probe-token" },
+    });
+    expect(ready.status).toBe(200);
+    expect(await ready.json()).toMatchObject({
+      ok: true,
+      status: "ready",
+      checks: [
+        { name: "d1", ok: true, code: "ok" },
+        { name: "r2", ok: true, code: "ok" },
+        { name: "durable_object", ok: true, code: "ok" },
+        { name: "cron", ok: true, code: "ok" },
+        { name: "durable_queues", ok: true, code: "ok" },
+      ],
+    });
+  });
+
+  it("reports stale cron state through readiness without exposing task details", async () => {
+    await env.DB.prepare(`UPDATE observability_task_runs SET last_succeeded_at = 0 WHERE task_name = 'outbox'`).run();
+    try {
+      const response = await SELF.fetch("http://example.test/api/health/ready", {
+        headers: { "x-observability-token": "worker-observability-probe-token" },
+      });
+      expect(response.status).toBe(503);
+      const body = await response.json<{ checks: Array<{ name: string; code: string; value?: number }> }>();
+      expect(body.checks).toContainEqual(
+        expect.objectContaining({ name: "cron", code: "cron_success_stale", value: 1 }),
+      );
+      expect(JSON.stringify(body)).not.toContain("outbox");
+    } finally {
+      await env.DB.prepare(`UPDATE observability_task_runs SET last_succeeded_at = ? WHERE task_name = 'outbox'`)
+        .bind(Date.now())
+        .run();
+    }
+  });
+
+  it("accepts only the bounded privacy-safe client telemetry schema", async () => {
+    const valid = {
+      event: "client.global_error",
+      errorName: "TypeError",
+      fingerprint: "a".repeat(64),
+      source: { path: "/assets/app.js", line: 10, column: 4 },
+      requestId: crypto.randomUUID(),
+      release: "version-1",
+      online: true,
+      visibility: "visible",
+    };
+    const send = (body: unknown) =>
+      SELF.fetch("http://example.test/api/telemetry/client-errors", {
+        method: "POST",
+        headers: { origin: "http://example.test", "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    expect((await send(valid)).status).toBe(204);
+    expect((await send({ ...valid, stack: "private stack" })).status).toBe(422);
+    expect((await send({ ...valid, source: { path: "/app.js?secret=yes", line: 1, column: 1 } })).status).toBe(422);
+  });
+
+  it("rate-limits browser telemetry by source without accepting sensitive payload fields", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const statuses: number[] = [];
+      for (let attempt = 0; attempt < 21; attempt += 1) {
+        const response = await SELF.fetch("http://example.test/api/telemetry/client-errors", {
+          method: "POST",
+          headers: {
+            origin: "http://example.test",
+            "content-type": "application/json",
+            "cf-connecting-ip": "192.0.2.44",
+          },
+          body: JSON.stringify({
+            event: "client.global_error",
+            errorName: "TypeError",
+            fingerprint: attempt.toString(16).padStart(64, "0"),
+            online: true,
+            visibility: "visible",
+          }),
+        });
+        statuses.push(response.status);
+      }
+      expect(statuses.slice(0, 20)).toEqual(Array.from({ length: 20 }, () => 204));
+      expect(statuses[20]).toBe(429);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("waits for every scheduled task, records outcomes, and rejects an aggregate failure", async () => {
+    const completed: string[] = [];
+    const context = createExecutionContext();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(
+        executeScheduledTasks(env, context, [
+          {
+            name: "test_failure",
+            run: async () => {
+              await Promise.resolve();
+              completed.push("failed");
+              throw new Error("synthetic scheduled failure");
+            },
+          },
+          {
+            name: "test_success",
+            run: async () => {
+              await Promise.resolve();
+              completed.push("succeeded");
+            },
+          },
+        ]),
+      ).rejects.toThrow("Scheduled tasks failed");
+      expect(completed.sort()).toEqual(["failed", "succeeded"]);
+      expect(
+        await env.DB.prepare(
+          `SELECT task_name, last_succeeded_at, last_failed_at, last_duration_ms, last_error
+             FROM observability_task_runs WHERE task_name LIKE 'test_%' ORDER BY task_name`,
+        ).all(),
+      ).toMatchObject({
+        results: [
+          {
+            task_name: "test_failure",
+            last_succeeded_at: null,
+            last_failed_at: expect.any(Number),
+            last_duration_ms: expect.any(Number),
+            last_error: "synthetic scheduled failure",
+          },
+          {
+            task_name: "test_success",
+            last_succeeded_at: expect.any(Number),
+            last_failed_at: null,
+            last_duration_ms: expect.any(Number),
+            last_error: null,
+          },
+        ],
+      });
+    } finally {
+      logged.mockRestore();
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name LIKE 'test_%'`).run();
+    }
   });
 
   it("blocks the raw Better Auth registration endpoint", async () => {
@@ -786,8 +948,7 @@ describe("Worker integration", () => {
         error: { code: "internal_error", message: "Something went wrong." },
       });
       expect(error).toHaveBeenCalledTimes(1);
-      expect(error.mock.calls[0]![0]).toBe(`Failed to handle document party request for ${installed.pageId}~1`);
-      expect(error.mock.calls[0]![1]).toMatchObject({
+      expectStructuredLog(error, "realtime.handshake.failed", {
         party: "document",
         room: `${installed.pageId}~1`,
         errorName: "Error",
@@ -845,7 +1006,7 @@ describe("Worker integration", () => {
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error: { code: "internal_error", message: "Something went wrong." } });
     expect(error).toHaveBeenCalledOnce();
-    expect(error).toHaveBeenCalledWith("Unhandled request error", {
+    expectStructuredLog(error, "http.request.unhandled_error", {
       requestMethod: "GET",
       requestPath: `${requestedPath.slice(0, LOG_TEXT_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
       requestRayId: `${"r".repeat(LOG_IDENTIFIER_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
@@ -1126,7 +1287,8 @@ describe("Worker integration", () => {
         permanently: false,
       });
 
-      expect(warn).toHaveBeenCalledWith("Workspace event delivery deferred to an authoritative resync.", {
+      expect(warn).toHaveBeenCalledOnce();
+      expectStructuredLog(warn, "workspace_events.delivery.deferred", {
         workspaceId,
       });
     } finally {
@@ -1237,9 +1399,10 @@ describe("Worker integration", () => {
         expect(await response.json()).toEqual({ delivered: false, resyncScheduled: true });
         expect(delivered).toEqual([{ type: "workspace-invalidated" }]);
         expect(close).toHaveBeenCalledWith(1012, "Workspace refresh required.");
-        expect(error).toHaveBeenCalledWith("Workspace event state check failed; scheduling workspace invalidation.", {
+        expectStructuredLog(error, "workspace_events.state_check.failed", {
           workspaceId: installed.workspaceId,
-          error: failure,
+          errorName: failure.name,
+          errorMessage: failure.message,
         });
       } finally {
         error.mockRestore();
@@ -4362,7 +4525,7 @@ describe("Worker integration", () => {
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
+    expectStructuredLog(logged, "page_move.receipt.unreadable", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -4438,7 +4601,7 @@ describe("Worker integration", () => {
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
+    expectStructuredLog(logged, "page_move.receipt.unreadable", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -4474,18 +4637,15 @@ describe("Worker integration", () => {
     await waitOnExecutionContext(context);
 
     expect(response.status).toBe(503);
-    expect(logged).toHaveBeenCalledWith(
-      "Page move receipt could not be read.",
-      expect.objectContaining({
-        receiptReadPhase: "recovery",
-        moveErrorName: null,
-        moveErrorMessage: null,
-        moveErrorStack: null,
-        moveErrorType: "undefined",
-        moveErrorValue: "undefined",
-        receiptErrorMessage: failed.replayError.message,
-      }),
-    );
+    expectStructuredLog(logged, "page_move.receipt.unreadable", {
+      receiptReadPhase: "recovery",
+      moveErrorName: null,
+      moveErrorMessage: null,
+      moveErrorStack: null,
+      moveErrorType: "undefined",
+      moveErrorValue: "undefined",
+      receiptErrorMessage: failed.replayError.message,
+    });
   });
 
   it("returns the same unresolved result when an idempotent replay receipt cannot be read", async () => {
@@ -4510,7 +4670,7 @@ describe("Worker integration", () => {
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
+    expectStructuredLog(logged, "page_move.receipt.unreadable", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -4546,7 +4706,7 @@ describe("Worker integration", () => {
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
+    expectStructuredLog(logged, "page_move.receipt.unreadable", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -4661,7 +4821,7 @@ describe("Worker integration", () => {
       },
     ]);
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move batch result was invalid or inconsistent.", {
+    expectStructuredLog(logged, "page_move.batch_result.invalid", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -4756,7 +4916,8 @@ describe("Worker integration", () => {
     expect(body.error.code).toBe("internal_error");
     expect(delivered).toEqual([]);
     expect(logged).toHaveBeenCalledTimes(2);
-    expect(logged).toHaveBeenNthCalledWith(1, "Page move batch result was invalid or inconsistent.", {
+    expect(logged.mock.calls[0]?.[0]).toMatchObject({
+      event: "page_move.batch_result.invalid",
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -4767,7 +4928,7 @@ describe("Worker integration", () => {
       moveErrorStack: expect.any(String),
       moveErrorType: "object",
     });
-    expect(logged).toHaveBeenNthCalledWith(2, "Unhandled request error", expect.any(Object));
+    expect(logged.mock.calls[1]?.[0]).toMatchObject({ event: "http.request.unhandled_error" });
   });
 
   it("logs an invalid batch result when its recovery receipt cannot be read", async () => {
@@ -4808,30 +4969,24 @@ describe("Worker integration", () => {
     expect(body.error.code).toBe("page_move_unresolved");
     expect(delivered).toEqual([]);
     expect(logged).toHaveBeenCalledTimes(2);
-    expect(logged).toHaveBeenNthCalledWith(
-      1,
-      "Page move receipt could not be read.",
-      expect.objectContaining({
-        workspaceId: installed.workspaceId,
-        pageId: installed.pageId,
-        operationId,
-        receiptReadPhase: "recovery",
-        moveErrorName: "InvalidPageMoveBatchResultError",
-        receiptErrorMessage: recoveryError.message,
-      }),
-    );
-    expect(logged).toHaveBeenNthCalledWith(
-      2,
-      "Page move batch result was invalid or inconsistent.",
-      expect.objectContaining({
-        workspaceId: installed.workspaceId,
-        pageId: installed.pageId,
-        operationId,
-        receiptReadPhase: "recovery",
-        recoveredFromReceipt: false,
-        moveErrorName: "InvalidPageMoveBatchResultError",
-      }),
-    );
+    expect(logged.mock.calls[0]?.[0]).toMatchObject({
+      event: "page_move.receipt.unreadable",
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "recovery",
+      moveErrorName: "InvalidPageMoveBatchResultError",
+      receiptErrorMessage: recoveryError.message,
+    });
+    expect(logged.mock.calls[1]?.[0]).toMatchObject({
+      event: "page_move.batch_result.invalid",
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "recovery",
+      recoveredFromReceipt: false,
+      moveErrorName: "InvalidPageMoveBatchResultError",
+    });
   });
 
   it("reports a zero-change result for an active page as an inconsistent batch result", async () => {
@@ -4871,18 +5026,15 @@ describe("Worker integration", () => {
       },
     ]);
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith(
-      "Page move batch result was invalid or inconsistent.",
-      expect.objectContaining({
-        workspaceId: installed.workspaceId,
-        pageId: installed.pageId,
-        operationId,
-        receiptReadPhase: "recovery",
-        recoveredFromReceipt: true,
-        moveErrorName: "InvalidPageMoveBatchResultError",
-        moveErrorMessage: "An active page move unexpectedly changed no rows.",
-      }),
-    );
+    expectStructuredLog(logged, "page_move.batch_result.invalid", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "recovery",
+      recoveredFromReceipt: true,
+      moveErrorName: "InvalidPageMoveBatchResultError",
+      moveErrorMessage: "An active page move unexpectedly changed no rows.",
+    });
   });
 
   it("returns and broadcasts authoritative state when the committed receipt result cannot be decoded", async () => {
@@ -4920,7 +5072,7 @@ describe("Worker integration", () => {
       },
     ]);
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move receipt was invalid.", {
+    expectStructuredLog(logged, "page_move.receipt.invalid", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -4979,19 +5131,16 @@ describe("Worker integration", () => {
       },
     ]);
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith(
-      "Page move receipt was invalid.",
-      expect.objectContaining({
-        workspaceId: installed.workspaceId,
-        pageId: installed.pageId,
-        operationId,
-        receiptReadPhase: "commit",
-        receiptErrorName: "InvalidPageMoveReceiptError",
-        receiptErrorMessage: "A stored page move receipt contains malformed JSON.",
-        pageStateErrorName: "InvalidPageMoveReceiptError",
-        pageStateErrorMessage: "The committed page state contains malformed JSON.",
-      }),
-    );
+    expectStructuredLog(logged, "page_move.receipt.invalid", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "commit",
+      receiptErrorName: "InvalidPageMoveReceiptError",
+      receiptErrorMessage: "A stored page move receipt contains malformed JSON.",
+      pageStateErrorName: "InvalidPageMoveReceiptError",
+      pageStateErrorMessage: "The committed page state contains malformed JSON.",
+    });
   });
 
   it("does not require fallback page state when the committed receipt is valid", async () => {
@@ -5070,7 +5219,7 @@ describe("Worker integration", () => {
       },
     ]);
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Committed page move receipt result was inconsistent.", {
+    expectStructuredLog(logged, "page_move.receipt.inconsistent", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -5117,21 +5266,18 @@ describe("Worker integration", () => {
     expect(response.status).toBe(409);
     expect((await response.json<{ error: { code: string } }>()).error.code).toBe("idempotency_key_reused");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith(
-      "Page move recovery found a conflicting receipt.",
-      expect.objectContaining({
-        workspaceId: installed.workspaceId,
-        pageId: installed.pageId,
-        operationId,
-        receiptReadPhase: "recovery",
-        moveErrorName: expect.any(String),
-        moveErrorMessage: expect.any(String),
-        receiptErrorName: "Error",
-        receiptErrorMessage: "That move operation id was already used for another move.",
-        receiptErrorStatus: 409,
-        receiptErrorCode: "idempotency_key_reused",
-      }),
-    );
+    expectStructuredLog(logged, "page_move.receipt.conflict", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "recovery",
+      moveErrorName: expect.any(String),
+      moveErrorMessage: expect.any(String),
+      receiptErrorName: "Error",
+      receiptErrorMessage: "That move operation id was already used for another move.",
+      receiptErrorStatus: 409,
+      receiptErrorCode: "idempotency_key_reused",
+    });
   });
 
   it("logs both failures when a committed move receipt is invalid", async () => {
@@ -5159,7 +5305,7 @@ describe("Worker integration", () => {
     expect(response.status).toBe(500);
     expect((await response.json<{ error: { code: string } }>()).error.code).toBe("internal_error");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move receipt was invalid.", {
+    expectStructuredLog(logged, "page_move.receipt.invalid", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -5203,7 +5349,7 @@ describe("Worker integration", () => {
     expect(response.status).toBe(500);
     expect((await response.json<{ error: { code: string } }>()).error.code).toBe("internal_error");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move receipt was invalid.", {
+    expectStructuredLog(logged, "page_move.receipt.invalid", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -5242,17 +5388,14 @@ describe("Worker integration", () => {
 
     expect(response.status).toBe(500);
     expect((await response.json<{ error: { code: string } }>()).error.code).toBe("internal_error");
-    expect(logged).toHaveBeenCalledWith(
-      "Page move receipt was invalid.",
-      expect.objectContaining({
-        workspaceId: installed.workspaceId,
-        pageId: installed.pageId,
-        operationId,
-        receiptReadPhase: "reconciliation",
-        receiptErrorName: "InvalidPageMoveReceiptError",
-        receiptErrorMessage: "A stored page move receipt row is malformed.",
-      }),
-    );
+    expectStructuredLog(logged, "page_move.receipt.invalid", {
+      workspaceId: installed.workspaceId,
+      pageId: installed.pageId,
+      operationId,
+      receiptReadPhase: "reconciliation",
+      receiptErrorName: "InvalidPageMoveReceiptError",
+      receiptErrorMessage: "A stored page move receipt row is malformed.",
+    });
   });
 
   it("returns an unresolved result when the reconciliation receipt cannot be read", async () => {
@@ -5274,7 +5417,7 @@ describe("Worker integration", () => {
     expect(response.status).toBe(503);
     expect(body.error.code).toBe("page_move_unresolved");
     expect(logged).toHaveBeenCalledOnce();
-    expect(logged).toHaveBeenCalledWith("Page move receipt could not be read.", {
+    expectStructuredLog(logged, "page_move.receipt.unreadable", {
       workspaceId: installed.workspaceId,
       pageId: installed.pageId,
       operationId,
@@ -5376,13 +5519,10 @@ describe("Worker integration", () => {
     await runPrune();
     expect(await countExpired()).toEqual({ count: 1 });
     expect(warned).toHaveBeenCalledOnce();
-    expect(warned).toHaveBeenCalledWith(
-      "Page move receipt pruning reached its catch-up limit; expired receipts may remain.",
-      {
-        batchSize: PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
-        maxBatches: PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
-      },
-    );
+    expectStructuredLog(warned, "page_move.receipt_prune.capped", {
+      batchSize: PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
+      maxBatches: PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
+    });
 
     await runPrune();
     expect(await countExpired()).toEqual({ count: 0 });
@@ -6593,7 +6733,12 @@ describe("Worker integration", () => {
       // runs onStart and then onAlarm. Only onStart may contact the dependency.
       expect(await runDurableObjectAlarm(restarted)).toBe(true);
       expect(
-        error.mock.calls.filter(([message]) => message === "Failed to reconcile pending document restore"),
+        error.mock.calls.filter(
+          ([record]) =>
+            record !== null &&
+            typeof record === "object" &&
+            (record as Record<string, unknown>).event === "document.restore_reconcile.failed",
+        ),
       ).toHaveLength(1);
     } finally {
       error.mockRestore();

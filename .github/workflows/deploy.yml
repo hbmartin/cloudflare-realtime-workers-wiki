@@ -139,7 +139,7 @@ jobs:
       # queries the search, reference, mention, deletion-job, archive-disconnect,
       # and table-state tables on ordinary request paths.
       - name: Apply D1 migrations
-        run: pnpm wrangler d1 migrations apply DB --env production --remote
+        run: pnpm db:remote
 
       - name: Deploy Worker
         run: pnpm wrangler deploy --env production

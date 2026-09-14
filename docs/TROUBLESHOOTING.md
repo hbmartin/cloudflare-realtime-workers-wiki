@@ -18,8 +18,8 @@ Organised by what you actually observe. For the tables and commands referenced h
 | Slack settings say the integration is unavailable                                                  | One or more `SLACK_*` secrets is absent                                                                     | Set all four Slack secrets, deploy, then reload Workspace settings                          |
 | Slack commands or unfurls return signature errors                                                  | Slack's signing secret differs, the request is over five minutes old, or it is a replay                     | Verify `SLACK_SIGNING_SECRET`, endpoint URLs, and Worker clock; do not bypass replay checks |
 
-`/api/health` returning `{"ok":true,"version":"0.1.0"}` does **not** confirm which revision is live;
-`version` is a hardcoded string.
+`/api/health` now includes the active `deployment.id`; it should equal `X-Worker-Version`. A `503` from protected
+`/api/health/ready` includes only stable dependency codes. Start production triage with `pnpm observability:check`.
 
 ## WebSocket close codes
 
@@ -174,9 +174,9 @@ D1 error message, so a change to D1's error formatting cannot degrade a `404` in
 
 ## Log triage
 
-Logs use stable message strings with structured diagnostic fields. Unhandled Hono errors carry a
-`requestRayId` when Cloudflare supplied one; other entries have no request-id correlation. Triage starts with
-the message string in the Workers Logs search box and then uses the attached identifiers.
+Logs are single structured JSON objects with stable `event` names. Start with the caller's `X-Request-Id`, search
+Workers Logs for `requestId`, then follow `correlationId` across Workflow, Queue, outbox, and Durable Object work.
+The complete current event catalog and privacy rules are in [Observability](OBSERVABILITY.md#structured-log-contract).
 
 | Message                                                      | Meaning                                                                                                                                                                                                                                                                  |
 | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

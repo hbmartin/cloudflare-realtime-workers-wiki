@@ -8,7 +8,7 @@ import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { migrateLegacyComments, type CommentPage } from "./comments";
 import { HttpError, safeHttpError } from "./http";
-import { errorLogFields, safeErrorMessage } from "../shared/error-log";
+import { safeErrorMessage } from "../shared/error-log";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Keys, deleteR2Prefix } from "./r2";
@@ -18,6 +18,14 @@ import { cleanupExport, runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
 import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
 import { deliverWebhook, fanoutWebhookEvent } from "./webhooks";
+import {
+  correlationHeaders,
+  currentObservabilityContext,
+  logger,
+  recordMetric,
+  traced,
+  withObservabilityContext,
+} from "./observability";
 
 const REINDEX_BATCH_SIZE = 100;
 const OUTBOX_SWEEP_BATCH_SIZE = 50;
@@ -32,8 +40,10 @@ const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
 
-export type JobWorkflowParams = { jobId: string; attempt?: number };
-export type DeliveryQueueMessage = { outboxId: string } | { sweep: true };
+export type JobWorkflowParams = { jobId: string; attempt?: number; correlationId?: string };
+export type DeliveryQueueMessage =
+  | { outboxId: string; correlationId?: string }
+  | { sweep: true; correlationId?: string };
 export type OutboxSweepResult = "completed" | "contended" | "lease-lost";
 
 export type JobRow = {
@@ -60,6 +70,7 @@ export type JobRow = {
   attempt: number;
   created_at: number;
   updated_at: number;
+  correlation_id: string | null;
 };
 
 function jsonRecord(value: string) {
@@ -247,7 +258,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
   if (source.kind === "document" || source.kind === "diagram") {
     const response = await env.DOCUMENT.getByName(`${source.id}~${source.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
       }),
     );
     if (!response.ok) throw new Error("The template content could not be flushed.");
@@ -443,7 +454,11 @@ async function initializeTemplateDocument(
   const response = await env.DOCUMENT.getByName(`${options.targetPageId}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/initialize", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+      headers: {
+        "content-type": "application/json",
+        "x-notes-internal": env.BETTER_AUTH_SECRET,
+        ...correlationHeaders(),
+      },
       body: JSON.stringify({ jobId: job.id, inputKey }),
     }),
   );
@@ -512,7 +527,7 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
     const purged = await env.DOCUMENT.getByName(`${staged.id}~${staged.content_epoch}`).fetch(
       new Request("https://document.internal/purge", {
         method: "POST",
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
       }),
     );
     if (!(await stillOwned())) return;
@@ -605,11 +620,13 @@ export async function createJob(
 ) {
   const id = crypto.randomUUID();
   const timestamp = Date.now();
+  const correlationId =
+    currentObservabilityContext()?.correlationId ?? currentObservabilityContext()?.requestId ?? null;
   await env.DB.prepare(
     `INSERT INTO jobs
       (id, workspace_id, space_id, type, status, requested_by, workflow_instance_id, input_key,
-       options_json, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
+       options_json, created_at, updated_at, correlation_id)
+     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       id,
@@ -622,15 +639,26 @@ export async function createJob(
       JSON.stringify(input.options ?? {}),
       timestamp,
       timestamp,
+      correlationId,
     )
     .run();
   return (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(id).first<JobRow>())!;
 }
 
-async function startJobWorkflow(env: Env, job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt">) {
+async function startJobWorkflow(
+  env: Env,
+  job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt"> & Partial<Pick<JobRow, "correlation_id">>,
+) {
   const instanceId = job.workflow_instance_id ?? job.id;
   try {
-    await env.NOTES_WORKFLOW.create({ id: instanceId, params: { jobId: job.id, attempt: job.attempt } });
+    await env.NOTES_WORKFLOW.create({
+      id: instanceId,
+      params: {
+        jobId: job.id,
+        attempt: job.attempt,
+        ...(job.correlation_id ? { correlationId: job.correlation_id } : {}),
+      },
+    });
   } catch (error) {
     // A successful create followed by a lost response is indistinguishable from
     // an existing instance. Its status is authoritative and makes retries safe.
@@ -641,7 +669,10 @@ async function startJobWorkflow(env: Env, job: Pick<JobRow, "id" | "workflow_ins
   }
 }
 
-export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt">) {
+export async function startJobExecution(
+  env: Env,
+  job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt"> & Partial<Pick<JobRow, "correlation_id">>,
+) {
   if (env.WORKFLOW_INLINE !== "true") return startJobWorkflow(env, job);
   const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(job.id, job.attempt)
@@ -676,7 +707,13 @@ async function notifyJobs(env: Env, workspaceId: string) {
   try {
     await broadcastWorkspaceEvent(env, workspaceId, { type: "jobs-invalidated" });
   } catch (error) {
-    console.error("Failed to broadcast job progress", { workspaceId, error });
+    logger.error(
+      "workflow.progress_broadcast.failed",
+      "workflow",
+      "Job progress broadcast failed.",
+      { workspaceId },
+      error,
+    );
   }
 }
 
@@ -818,7 +855,13 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
   const message = (httpError?.message ?? safeErrorMessage(error, "The job failed.")).slice(0, 500);
   const errorCode = httpError?.code ?? "job_failed";
   if (!httpError)
-    console.error("Job execution failed", { jobId: job.id, attempt: job.attempt, ...errorLogFields(error) });
+    logger.error(
+      "workflow.job.failed",
+      "workflow",
+      "Job execution failed.",
+      { jobId: job.id, attempt: job.attempt },
+      error,
+    );
   if (job.type !== "import" && job.type !== "template_clone" && job.type !== "export") {
     await updateJob(env, job, {
       status: "failed",
@@ -839,7 +882,13 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
   if (!pending.meta.changes) return;
   await notifyJobs(env, job.workspace_id);
   await finishPendingJobCleanup(env, job, { terminateWorkflow: false }).catch((cleanupError) => {
-    console.error("Failed to clean up failed job", { jobId: job.id, cleanupError });
+    logger.error(
+      "workflow.failure_cleanup.failed",
+      "workflow",
+      "Failed job cleanup failed.",
+      { jobId: job.id },
+      cleanupError,
+    );
   });
 }
 
@@ -1006,6 +1055,21 @@ export async function claimJobWorkflowRun(
 
 export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
   async run(event: Readonly<WorkflowEvent<JobWorkflowParams>>, step: WorkflowStep) {
+    const correlationId = event.payload.correlationId ?? event.payload.jobId;
+    return withObservabilityContext(this.env, { trigger: "workflow", correlationId }, () =>
+      traced(
+        this.ctx.tracing,
+        "notes.workflow.job",
+        {
+          "notes.job_id": event.payload.jobId,
+          "notes.job_attempt": event.payload.attempt,
+        },
+        () => this.runObserved(event, step),
+      ),
+    );
+  }
+
+  private async runObserved(event: Readonly<WorkflowEvent<JobWorkflowParams>>, step: WorkflowStep) {
     const { jobId } = event.payload;
     const attempt =
       event.payload.attempt ??
@@ -1097,11 +1161,11 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
 export async function recoverQueuedJobs(env: Env) {
   const cutoff = Date.now() - 30_000;
   const queued = await env.DB.prepare(
-    `SELECT id, workflow_instance_id, attempt FROM jobs
+    `SELECT id, workflow_instance_id, attempt, correlation_id FROM jobs
       WHERE status = 'queued' AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
   )
     .bind(cutoff)
-    .all<Pick<JobRow, "id" | "workflow_instance_id" | "attempt">>();
+    .all<Pick<JobRow, "id" | "workflow_instance_id" | "attempt" | "correlation_id">>();
   for (const job of queued.results) {
     try {
       await startJobExecution(env, job);
@@ -1123,14 +1187,24 @@ export async function recoverQueuedJobs(env: Env) {
     try {
       await finishPendingJobCleanup(env, job);
     } catch (error) {
-      console.error("Pending job cleanup failed", { jobId: job.id, error });
+      logger.error(
+        "workflow.pending_cleanup.failed",
+        "workflow",
+        "Pending job cleanup failed.",
+        { jobId: job.id },
+        error,
+      );
     }
   }
 }
 
 async function enqueueOutbox(env: Env, outboxId: string) {
   try {
-    await env.DELIVERY_QUEUE.send({ outboxId });
+    const row = await env.DB.prepare(`SELECT correlation_id FROM outbox WHERE id = ?`)
+      .bind(outboxId)
+      .first<{ correlation_id: string | null }>();
+    const correlationId = row?.correlation_id ?? currentObservabilityContext()?.correlationId ?? undefined;
+    await env.DELIVERY_QUEUE.send({ outboxId, ...(correlationId ? { correlationId } : {}) });
     await env.DB.prepare(`UPDATE outbox SET enqueued_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?`)
       .bind(Date.now(), outboxId)
       .run();
@@ -1152,10 +1226,19 @@ async function enqueueOutbox(env: Env, outboxId: string) {
       failed &&
       (failed.attempts === OUTBOX_POISON_WARNING_ATTEMPTS || failed.attempts % OUTBOX_POISON_WARNING_INTERVAL === 0)
     ) {
-      console.error("Outbox row has persistent enqueue failures", {
-        outboxId,
+      logger.error(
+        "outbox.enqueue.persistent_failure",
+        "outbox",
+        "Outbox row has persistent enqueue failures.",
+        { outboxId, attempts: failed.attempts },
+        failed.last_error,
+      );
+      recordMetric(env, {
+        event: "outbox.delivery",
+        component: "outbox",
+        operation: "enqueue",
+        outcome: "failure",
         attempts: failed.attempts,
-        error: failed.last_error,
       });
     }
     throw error;
@@ -1164,9 +1247,10 @@ async function enqueueOutbox(env: Env, outboxId: string) {
 
 async function enqueueSweepContinuation(env: Env, failureMessage: string) {
   try {
-    await env.DELIVERY_QUEUE.send({ sweep: true });
+    const correlationId = currentObservabilityContext()?.correlationId;
+    await env.DELIVERY_QUEUE.send({ sweep: true, ...(correlationId ? { correlationId } : {}) });
   } catch (error) {
-    console.error(failureMessage, { error });
+    logger.error("outbox.sweep_continuation.enqueue_failed", "outbox", failureMessage, {}, error);
     throw error;
   }
 }
@@ -1201,7 +1285,9 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
     if (requested) return "contended";
   }
   if (!claimed) {
-    console.warn("Outbox sweep claim race retry exhausted", { attempts: OUTBOX_SWEEP_CLAIM_ATTEMPTS });
+    logger.warn("outbox.sweep.claim_exhausted", "outbox", "Outbox sweep claim retries were exhausted.", {
+      attempts: OUTBOX_SWEEP_CLAIM_ATTEMPTS,
+    });
     await enqueueSweepContinuation(env, "Outbox sweep fallback enqueue failed");
     return "contended";
   }
@@ -1228,7 +1314,7 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
         .first<{ id: number }>(),
     );
     if (!renewed) {
-      console.error("Outbox sweep lease lost", { stage });
+      logger.error("outbox.sweep.lease_lost", "outbox", "Outbox sweep lease was lost.", { stage });
       if (!continuation) {
         await enqueueSweepContinuation(env, "Outbox sweep lease-loss continuation enqueue failed");
       }
@@ -1250,7 +1336,7 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
         try {
           await enqueueOutbox(env, row.id);
         } catch (error) {
-          console.error("Outbox enqueue failed", { outboxId: row.id, error });
+          logger.error("outbox.enqueue.failed", "outbox", "Outbox enqueue failed.", { outboxId: row.id }, error);
         }
       }
       if (!(await renewLease("after-batch"))) return "lease-lost";
@@ -1270,7 +1356,7 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
       .bind(Date.now())
       .first<{ pending: number }>();
     if (!remaining && (await releaseIfIdle())) return "completed";
-    console.warn("Outbox sweep cap reached; scheduling continuation", {
+    logger.warn("outbox.sweep.capped", "outbox", "Outbox sweep cap reached; scheduling continuation.", {
       maxRows: OUTBOX_SWEEP_BATCH_SIZE * OUTBOX_SWEEP_MAX_BATCHES,
     });
     if (!(await renewLease("before-continuation"))) return "lease-lost";

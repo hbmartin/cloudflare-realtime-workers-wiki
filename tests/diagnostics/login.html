@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Login startup diagnostics</title>
+  </head>
+  <body>
+    <h1>Login startup diagnostics</h1>
+    <p>Runs the real App against simulated startup responses. No requests reach a backend.</p>
+    <label
+      >Scenario
+      <select id="scenario">
+        <option value="normal">Normal signed-out startup</option>
+        <option value="html">HTML response (200)</option>
+        <option value="empty">Empty response (200)</option>
+        <option value="server">Empty server error (500)</option>
+        <option value="json-error">JSON server error (500)</option>
+        <option value="network">Network failure</option>
+        <option value="storage">Blocked session storage</option>
+      </select></label
+    >
+    <button id="run">Run scenario</button>
+    <button id="probe">Probe browser storage</button>
+    <pre id="diagnostics" aria-label="Diagnostic results"></pre>
+    <div id="app"></div>
+    <script type="module">
+      import React from "react";
+      import { createRoot } from "react-dom/client";
+      import { App } from "/src/client/App.tsx";
+
+      const root = createRoot(document.getElementById("app"));
+      const storageDescriptor = Object.getOwnPropertyDescriptor(window, "sessionStorage");
+      const output = document.getElementById("diagnostics");
+      let runId = 0;
+      let events = [];
+      function report(event) {
+        events.push(event);
+        output.textContent = JSON.stringify(events, null, 2);
+      }
+      function restoreStorage() {
+        Object.defineProperty(window, "sessionStorage", storageDescriptor);
+      }
+      document.getElementById("probe").onclick = () => {
+        restoreStorage();
+        events = [];
+        // Only a new disposable key is touched. Existing values are never read.
+        for (const kind of ["localStorage", "sessionStorage"]) {
+          const key = `notes-diagnostic-${crypto.randomUUID()}`;
+          try {
+            const storage = window[kind];
+            storage.setItem(key, "probe");
+            const ok = storage.getItem(key) === "probe";
+            storage.removeItem(key);
+            report({ check: kind, outcome: ok ? "PASS" : "FAIL" });
+          } catch (error) {
+            report({ check: kind, outcome: "FAIL", errorName: error.name });
+          }
+        }
+      };
+      document.getElementById("run").onclick = () => {
+        restoreStorage();
+        events = [];
+        const scenario = document.getElementById("scenario").value;
+        report({ scenario });
+        if (scenario === "storage") {
+          Object.defineProperty(window, "sessionStorage", {
+            configurable: true,
+            get() {
+              report({ check: "sessionStorage", errorName: "SecurityError", requestsSent: 0 });
+              throw new DOMException("Storage deliberately blocked by diagnostic", "SecurityError");
+            },
+          });
+        }
+        window.fetch = async (path) => {
+          let response;
+          if (path === "/api/install") response = Response.json({ initialized: true });
+          else if (path === "/api/security/status") {
+            if (scenario === "network") {
+              report({ path, errorName: "TypeError", outcome: "network failure" });
+              throw new TypeError("Failed to fetch");
+            }
+            response =
+              scenario === "html"
+                ? new Response("<!doctype html><title>Proxy</title>", { headers: { "content-type": "text/html" } })
+                : scenario === "empty"
+                  ? new Response("", { headers: { "content-type": "application/json" } })
+                  : scenario === "server"
+                    ? new Response("", { status: 500 })
+                    : scenario === "json-error"
+                      ? Response.json(
+                          { error: { code: "internal_error", message: "Something went wrong." } },
+                          { status: 500 },
+                        )
+                      : Response.json({
+                          state: "signed_out",
+                          totp: false,
+                          passkeys: 0,
+                          codesSaved: false,
+                          fresh: false,
+                        });
+          } else throw new Error("The diagnostic only permits mocked startup requests.");
+          report({
+            path,
+            status: response.status,
+            contentType: response.headers.get("content-type"),
+            bodyLength: (await response.clone().text()).length,
+          });
+          return response;
+        };
+        root.render(React.createElement(App, { key: ++runId }));
+      };
+    </script>
+  </body>
+</html>

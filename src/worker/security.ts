@@ -8,6 +8,7 @@ import type { SecurityStatus } from "../shared/security";
 import type { Env } from "./env";
 import { HttpError, sha256 } from "./http";
 import { clearRateLimit, consumeFixedWindow } from "./rate-limit";
+import { logger } from "./observability";
 
 const TRUST_MS = 30 * 24 * 60 * 60_000;
 const FRESH_MS = 5 * 60_000;
@@ -195,7 +196,9 @@ async function stamp(
       .first();
   if (!result) throw deny("Security settings changed. Sign in again.");
   await resetAttempts(env, userId, generation);
-  console.info("account-security", { event: "verified", userId, method });
+  logger.info("account_security.verified", "account-security", "Account security verification succeeded.", {
+    method,
+  });
 }
 
 async function issueSession(
@@ -623,6 +626,36 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         await resetAttempts(env, id.userId, account.generation);
         return ctx.json({ success: true });
       }),
+      resumeRecovery: post("/security/resume-recovery", async (ctx) => {
+        const id = await requireIdentity(ctx);
+        const { account, status } = await readSecurity(env, id.userId, id.sessionId);
+        if (!status.recoveryCanResume) throw deny("Use a recovery code or operator reset token first.");
+        await attempt(env, id.userId);
+        await password(ctx, id.userId);
+        // Keep verified_at unchanged: password re-entry cannot extend the absolute deadline.
+        const resumed = await env.DB.prepare(`UPDATE session_security SET expires_at=MIN(?,verified_at+?)
+          WHERE session_id=? AND user_id=? AND method='recovery' AND generation=? AND verified_at>?
+          AND EXISTS(SELECT 1 FROM account_security a WHERE a.user_id=session_security.user_id
+            AND a.generation=session_security.generation AND a.recovery_required=1)
+          AND EXISTS(SELECT 1 FROM session live WHERE live.id=session_security.session_id AND live.expiresAt>?) RETURNING session_id`)
+          .bind(
+            Date.now() + RECOVERY_MS,
+            RECOVERY_RESUME_MS,
+            id.sessionId,
+            id.userId,
+            account.generation,
+            Date.now() - RECOVERY_RESUME_MS,
+            new Date().toISOString(),
+          )
+          .first();
+        if (!resumed) throw deny("Recovery expired or was revoked. Use a recovery code or operator reset token.");
+        await env.DB.prepare(
+          "UPDATE account_security SET failed_attempts=0,locked_until=0 WHERE user_id=? AND generation=?",
+        )
+          .bind(id.userId, account.generation)
+          .run();
+        return ctx.json({ success: true });
+      }),
       recoverSecurity: post("/security/recover", async (ctx) => {
         const id = await requireIdentity(ctx);
         const account = await securityAccount(env, id.userId);
@@ -691,7 +724,9 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         );
         expireCookie(ctx, ctx.context.createAuthCookie("two_factor"));
         expireCookie(ctx, trustCookie(ctx));
-        console.info("account-security", { event: "recovery", userId: id.userId, operator: reset });
+        logger.warn("account_security.recovery.completed", "account-security", "Account recovery completed.", {
+          operatorInitiated: reset,
+        });
         return ctx.json({ success: true });
       }),
     },
@@ -826,7 +861,12 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
               const rateLimitKey = policy.notesPasswordRateLimitKey;
               if (rateLimitKey) await clearRateLimit(env, rateLimitKey);
               delete policy.notesPasswordRateLimitKey;
-              console.info("account-security", { event: "password-authenticated", outcome: "verification-required" });
+              logger.info(
+                "account_security.password_authenticated",
+                "account-security",
+                "Password accepted; additional verification is required.",
+                { outcome: "verification-required" },
+              );
             }
             return undefined;
           }),
