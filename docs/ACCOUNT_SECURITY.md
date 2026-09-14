@@ -14,7 +14,7 @@ Realtime grants last at most five minutes and are capped by session/assurance ex
 
 ## Recovery
 
-Every enrollment method receives ten single-use recovery codes. They are displayed once, stored only as hashes, and replaced as a set. The password plus a recovery code creates a ten-minute recovery session. Other sessions, browser trust, and the remaining recovery codes are revoked. The user must restore a factor and save new recovery codes before accessing the workspace.
+Every enrollment method receives ten single-use recovery codes. They are displayed once, stored only as hashes, and replaced as a set. The password plus a recovery code creates a ten-minute recovery session. Other sessions, browser trust, and the remaining recovery codes are revoked. The user must restore a factor and save new recovery codes before accessing the workspace. If the ten-minute grant expires, the same live recovery session can resume enrollment after password re-entry for up to 24 hours from the original recovery. This does not grant private access or extend that absolute deadline. Signing out, losing that session, or an operator reset removes the ability to resume; a fresh password session alone cannot resume recovery.
 
 For loss of all factors and codes, a deployment operator must verify identity outside the app, then run:
 
@@ -40,6 +40,14 @@ Do not roll back to a Worker that lacks the mandatory policy: that would restore
 Production version `14b77bec-d667-4444-9726-c3eb5d721c46` was deployed after a private database export and successful migrations through 0028. Live checks confirmed the sign-in UI, anonymous health/security status, private API and realtime denial, and the canonical passkey RP ID with required user verification. No active public share existed for a live share check; anonymous sharing passed the local integration suite. Production enrollment with a user's own authenticator remains a user action.
 
 Validation passed: 787 unit tests with coverage; the full 325-test Worker coverage suite followed by all 11 updated security tests; all 13 Chromium tests, including concurrent last-factor removal; and a 30-connection authenticated realtime load check. Lint, type checks, dead-code analysis, generated binding checks, application formatting, and production builds passed. The repository-wide `pnpm check` stops at unrelated formatting errors in the pre-existing untracked Notion export; its remaining checks were run separately. Those user files were left unchanged.
+
+## Invitation and authentication limits
+
+Invite acceptance reserves the invitation for one normalized email before account creation. Failed registration can be retried with the same email; changing the recipient requires a new invite. Once password authentication succeeds, the pending invitation belongs to that account in D1 and can complete after protection enrollment in another tab. Existing members do not consume invitations. Completed invitations cannot recreate revoked membership.
+
+Authentication limits use fixed time windows per source IP and endpoint: 60 requests per minute for password sign-in, TOTP verification, and passkey verification; 30 per minute for signup; 100 per minute for other endpoints. Password-proven TOTP and recovery attempts retain the persistent account budget. Unverified passkey credential IDs never charge that account budget.
+
+Deploy migration `0029_security_lifecycle.sql` before the updated Worker/client, in the same maintenance window. It adds invitation claims and the atomic membership-consumption trigger, initializes account security on user creation, and binds passkey persistence to the session and security generation that verified registration.
 
 ## Command-line clients
 

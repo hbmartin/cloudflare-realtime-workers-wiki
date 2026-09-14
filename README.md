@@ -59,14 +59,18 @@ maintainability findings without treating the repository's inherited complexity 
 separately for the browser, Worker, unit tests, Worker integration tests, and build configuration. Coverage thresholds are
 enforced by `pnpm test:coverage` and `pnpm test:worker:coverage`.
 
-The E2E server deletes only `.wrangler/e2e`, reapplies every D1 migration, and injects dedicated local test bindings. To
-run the realtime load check against a deployed environment, set `NOTES_LOAD_BASE_URL`, `NOTES_LOAD_EMAIL`, and
-`NOTES_LOAD_PASSWORD`. `NOTES_LOAD_CONNECTIONS` and `NOTES_LOAD_HOLD_MS` tune the connection count and hold time.
+The E2E server deletes only `.wrangler/e2e`, reapplies every D1 migration, and injects dedicated local test bindings.
+Fresh local realtime load checks enroll their own authenticator automatically. To run the realtime load check against a
+deployed environment, set `NOTES_LOAD_BASE_URL`, `NOTES_LOAD_EMAIL`, and `NOTES_LOAD_PASSWORD` for an account with an
+enrolled authenticator, plus either `NOTES_LOAD_TOTP_CODE` (a current six-digit code) or `NOTES_LOAD_TOTP_SECRET` (the
+Base32 authenticator secret used to generate a code). `NOTES_LOAD_CONNECTIONS` and `NOTES_LOAD_HOLD_MS` tune the
+connection count and hold time.
 
 Pull requests run static checks, coverage suites, production builds, a Wrangler deployment dry run, and Chromium UI
 checks in separate CI jobs. The scheduled workflow adds the full browser/mobile matrix and realtime load checks. Configure
-the `STAGING_BASE_URL` repository variable plus `STAGING_LOAD_EMAIL` and `STAGING_LOAD_PASSWORD` secrets to include a
-deployed staging target in that load check.
+the `STAGING_BASE_URL` repository variable plus `STAGING_LOAD_EMAIL`, `STAGING_LOAD_PASSWORD`, and
+`STAGING_LOAD_TOTP_SECRET` secrets to include a deployed staging target in that load check. The TOTP secret is exposed
+only to the staging load-check step.
 
 ## Architecture
 

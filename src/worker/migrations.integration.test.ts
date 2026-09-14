@@ -5,7 +5,10 @@ beforeEach(() => reset());
 
 describe("D1 migrations", () => {
   it("invalidates existing password-only sessions during the mandatory protection cutover", async () => {
-    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, -1));
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0028"),
+    );
     await env.DB.prepare(
       "INSERT INTO user(id,name,email,emailVerified,createdAt,updatedAt) VALUES ('legacy','Legacy','legacy@example.test',0,1,1)",
     ).run();

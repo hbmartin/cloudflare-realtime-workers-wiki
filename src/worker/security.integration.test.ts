@@ -1,5 +1,8 @@
 import { applyD1Migrations, env, reset } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createAuth } from "./auth";
+import { requireSecurity } from "./security";
+import { sha256 } from "./http";
 import { enrollAccount, otpFromUri, responseCookies, securityRequest as request } from "../../tests/helpers/security";
 
 beforeEach(async () => {
@@ -79,13 +82,27 @@ describe("mandatory account protection", () => {
     expect((await request(pending, "/api/auth/two-factor/verify-totp", { code })).status).not.toBe(200);
   });
 
-  it("rejects acknowledgment of superseded recovery codes", async () => {
+  it("requires acknowledgment of the current recovery-code batch after replacement", async () => {
     const cookie = await enrollAccount(await bootstrap());
+    expect((await request(cookie, "/api/me")).status).toBe(200);
     const first = await (await request(cookie, "/api/security/recovery-codes", {})).json<{ receipt: string }>();
+    expect(await (await request(cookie, "/api/security/status")).json()).toMatchObject({
+      state: "enrollment_required",
+      codesSaved: false,
+    });
+    expect((await request(cookie, "/api/me")).status).toBe(401);
     const second = await (await request(cookie, "/api/security/recovery-codes", {})).json<{ receipt: string }>();
     expect((await request(cookie, "/api/security/acknowledge-codes", { receipt: first.receipt })).status).toBe(403);
-    expect((await request(cookie, "/api/me")).status).toBe(200);
+    expect(await (await request(cookie, "/api/security/status")).json()).toMatchObject({
+      state: "enrollment_required",
+      codesSaved: false,
+    });
+    expect((await request(cookie, "/api/me")).status).toBe(401);
     expect((await request(cookie, "/api/security/acknowledge-codes", { receipt: second.receipt })).status).toBe(200);
+    expect(await (await request(cookie, "/api/security/status")).json()).toMatchObject({
+      state: "ready",
+      codesSaved: true,
+    });
     expect((await request(cookie, "/api/me")).status).toBe(200);
   });
 
@@ -214,7 +231,6 @@ describe("mandatory account protection", () => {
 
   it("operator reset revokes factors atomically and an expired reset cannot enroll", async () => {
     const cookie = await enrollAccount(await bootstrap());
-    const { sha256 } = await import("./http");
     const user = await env.DB.prepare("SELECT id FROM user").first<{ id: string }>();
     await env.DB.prepare("INSERT INTO security_resets(token_hash,user_id,expires_at) VALUES (?,?,?)")
       .bind(await sha256("operator-token"), user!.id, Date.now() - 1)
@@ -250,7 +266,7 @@ describe("mandatory account protection", () => {
     ).toBe(200);
   });
 
-  it("does not consume invitations until enrolled and rejects competing acceptance", async () => {
+  it("keeps invitations pending until enrollment and makes existing-member completion harmless", async () => {
     const owner = await enrollAccount(await bootstrap());
     const { invite } = await (
       await request(owner, "/api/invites", { role: "viewer" })
@@ -268,6 +284,296 @@ describe("mandatory account protection", () => {
       request(enrolled, "/api/invites/complete", { token: invite.token }),
       request(owner, "/api/invites/complete", { token: invite.token }),
     ]);
-    expect(completions.filter((response) => response.ok)).toHaveLength(1);
+    expect(completions.every((response) => response.ok)).toBe(true);
+    expect((await request(enrolled, "/api/me")).status).toBe(200);
+  });
+});
+
+// Inject an actual database state change after authorization, immediately before
+// the endpoint's transaction. The endpoint still executes real D1 SQL.
+function beforeBatch(change: () => Promise<unknown>) {
+  return createAuth({
+    ...env,
+    DB: new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            await change();
+            return target.batch(statements);
+          };
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  });
+}
+function authRequest(cookie: string, path: string, body: object) {
+  return new Request(`http://example.test/api/auth/security/${path}`, {
+    method: "POST",
+    headers: { cookie, origin: "http://example.test", "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+async function invitation(owner: string) {
+  return (await (await request(owner, "/api/invites", { role: "viewer" })).json<{ invite: { token: string } }>()).invite
+    .token;
+}
+function accept(token: string, email = "guest@example.test") {
+  return request("", "/api/invites/accept", { token, name: "Guest", email, password: "password123" });
+}
+
+describe("security lifecycle regressions", () => {
+  it("reserves one email before concurrent signup and keeps pending enrollment on the server", async () => {
+    const owner = await enrollAccount(await bootstrap());
+    const token = await invitation(owner);
+    const responses = await Promise.all([accept(token), accept(token, "rival@example.test")]);
+    expect(responses.filter((response) => response.ok)).toHaveLength(1);
+    expect(responses.find((response) => !response.ok)?.status).toBe(409);
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM user").first()).toEqual({ count: 2 });
+    const cookie = await enrollAccount(responses.find((response) => response.ok)!);
+    expect(await (await request(cookie, "/api/security/status")).json()).toMatchObject({
+      state: "ready",
+      pendingInvite: true,
+    });
+    expect((await request(cookie, "/api/invites/complete", {})).status).toBe(200);
+    expect((await request(cookie, "/api/me")).status).toBe(200);
+  });
+
+  it("allows same-email retries after failed registration but not a different account", async () => {
+    const owner = await enrollAccount(await bootstrap());
+    const token = await invitation(owner);
+    expect(
+      (
+        await request("", "/api/invites/accept", {
+          token,
+          name: "Guest",
+          email: "guest@example.test",
+          password: "short",
+        })
+      ).ok,
+    ).toBe(false);
+    expect((await accept(token, "rival@example.test")).status).toBe(409);
+    expect((await accept(token)).status).toBe(200);
+    expect((await accept(token)).status).toBe(200);
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM user").first()).toEqual({ count: 2 });
+  });
+
+  it("does not burn an existing member's invitation or restore a removed recipient on replay", async () => {
+    const owner = await enrollAccount(await bootstrap());
+    const token = await invitation(owner);
+    expect((await request(owner, "/api/invites/complete", { token })).status).toBe(200);
+    expect(await env.DB.prepare("SELECT used_at,claimed_by FROM invites").first()).toEqual({
+      used_at: null,
+      claimed_by: null,
+    });
+    const guest = await enrollAccount(await accept(token), token);
+    expect((await request(guest, "/api/invites/complete", { token })).status).toBe(200);
+    const member = await (await request(guest, "/api/me")).json<{ user: { id: string }; workspace: { id: string } }>();
+    await env.DB.prepare("DELETE FROM workspace_members WHERE workspace_id=? AND user_id=?")
+      .bind(member.workspace.id, member.user.id)
+      .run();
+    expect((await request(guest, "/api/invites/complete", { token })).status).toBe(409);
+    expect((await request(guest, "/api/me")).status).toBe(401);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM workspace_members WHERE user_id=?").bind(member.user.id).first(),
+    ).toBeNull();
+  });
+
+  it("clears the pending password challenge on signout, including its server record", async () => {
+    await enrollAccount(await bootstrap());
+    const login = await request("", "/api/auth/sign-in/email", {
+      email: "owner@example.test",
+      password: "password123",
+    });
+    const pending = responseCookies(login);
+    const signedOut = await request(pending, "/api/auth/sign-out", {});
+    expect(signedOut.status).toBe(200);
+    expect(await (await request(responseCookies(signedOut, pending), "/api/security/status")).json()).toMatchObject({
+      state: "signed_out",
+    });
+    // A saved copy of the old cookie must also fail.
+    expect(await (await request(pending, "/api/security/status")).json()).toMatchObject({ state: "signed_out" });
+    expect(await env.DB.prepare("SELECT 1 FROM verification WHERE identifier LIKE '2fa-%'").first()).toBeNull();
+  });
+
+  it("does not let unverified passkey IDs lock out an account or successful setup accumulate attempts", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const user = await env.DB.prepare("SELECT id FROM user").first<{ id: string }>();
+    await env.DB.prepare(`INSERT INTO pending_passkeys(credential_id,user_id,session_id,generation)
+      SELECT 'known-id',s.userId,s.id,a.generation FROM session s JOIN account_security a ON a.user_id=s.userId LIMIT 1`).run();
+    await env.DB.prepare(
+      "INSERT INTO passkey(id,publicKey,userId,credentialID,counter,deviceType,backedUp) VALUES ('key','unused',?,'known-id',0,'singleDevice',0)",
+    )
+      .bind(user!.id)
+      .run();
+    for (let i = 0; i < 12; i++) {
+      expect((await request("", "/api/auth/passkey/verify-authentication", { response: { id: "known-id" } })).ok).toBe(
+        false,
+      );
+      expect((await request(cookie, "/api/security/setup-totp", { password: "password123" })).status).toBe(200);
+    }
+    expect(await env.DB.prepare("SELECT failed_attempts,locked_until FROM account_security").first()).toEqual({
+      failed_attempts: 0,
+      locked_until: 0,
+    });
+  });
+
+  it("resumes expired recovery only with the original session, password, generation and absolute deadline", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes } = await (await request(cookie, "/api/security/recovery-codes", {})).json<{ codes: string[] }>();
+    const recovery = responseCookies(
+      await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] }),
+    );
+    await env.DB.prepare("UPDATE session_security SET expires_at=? WHERE method='recovery'")
+      .bind(Date.now() - 1)
+      .run();
+    expect((await request(recovery, "/api/security/setup-totp", { password: "password123" })).status).toBe(403);
+    const freshPassword = responseCookies(
+      await request("", "/api/auth/sign-in/email", { email: "owner@example.test", password: "password123" }),
+    );
+    expect((await request(freshPassword, "/api/security/resume-recovery", { password: "password123" })).status).toBe(
+      403,
+    );
+    expect((await request(recovery, "/api/security/resume-recovery", { password: "incorrect" })).status).toBe(403);
+    expect((await request(recovery, "/api/security/resume-recovery", { password: "password123" })).status).toBe(200);
+    expect((await request(recovery, "/api/me")).status).toBe(401);
+    expect((await request(recovery, "/api/security/setup-totp", { password: "password123" })).status).toBe(200);
+    const original = Date.now() - 24 * 60 * 60_000 + 60_000;
+    await env.DB.prepare("UPDATE session_security SET verified_at=? WHERE method='recovery'").bind(original).run();
+    expect((await request(recovery, "/api/security/resume-recovery", { password: "password123" })).status).toBe(200);
+    expect(await env.DB.prepare("SELECT expires_at FROM session_security WHERE method='recovery'").first()).toEqual({
+      expires_at: original + 24 * 60 * 60_000,
+    });
+    await env.DB.prepare("UPDATE session_security SET verified_at=? WHERE method='recovery'")
+      .bind(Date.now() - 25 * 60 * 60_000)
+      .run();
+    expect((await request(recovery, "/api/security/resume-recovery", { password: "password123" })).status).toBe(403);
+    await env.DB.prepare("UPDATE session_security SET verified_at=? WHERE method='recovery'").bind(Date.now()).run();
+    await env.DB.prepare("UPDATE account_security SET generation=generation+1").run();
+    expect((await request(recovery, "/api/security/resume-recovery", { password: "password123" })).status).toBe(403);
+  });
+
+  it("does not burn recovery credentials when a challenge expires between authorization and consumption", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+    const pending = responseCookies(
+      await request("", "/api/auth/sign-in/email", { email: "owner@example.test", password: "password123" }),
+    );
+    const auth = beforeBatch(() =>
+      env.DB.prepare("UPDATE verification SET expiresAt=? WHERE identifier LIKE '2fa-%'")
+        .bind(new Date(0).toISOString())
+        .run(),
+    );
+    expect(
+      (await auth.handler(authRequest(pending, "recover", { password: "password123", code: codes[0] }))).status,
+    ).toBe(403);
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM recovery_codes").first()).toEqual({ count: 10 });
+    expect((await request(cookie, "/api/me")).status).toBe(200);
+  });
+
+  it("preserves an operator reset that races with authenticator confirmation", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { totpURI } = await (
+      await request(cookie, "/api/security/setup-totp", { password: "password123" })
+    ).json<{ totpURI: string }>();
+    const user = await env.DB.prepare("SELECT id FROM user").first<{ id: string }>();
+    const hash = await sha256("reset-token");
+    const auth = beforeBatch(() =>
+      env.DB.prepare("INSERT INTO security_resets(token_hash,user_id,expires_at) VALUES (?,?,?)")
+        .bind(hash, user!.id, Date.now() + 60_000)
+        .run(),
+    );
+    expect((await auth.handler(authRequest(cookie, "confirm-totp", { code: await otpFromUri(totpURI) }))).status).toBe(
+      403,
+    );
+    expect(await env.DB.prepare("SELECT twoFactorEnabled FROM user").first()).toEqual({ twoFactorEnabled: 0 });
+    expect(await env.DB.prepare("SELECT 1 FROM twoFactor").first()).toBeNull();
+    expect(await env.DB.prepare("SELECT recovery_required FROM account_security").first()).toEqual({
+      recovery_required: 1,
+    });
+  });
+
+  it("reads a single security snapshot and rejects expired grants with 401", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const session = await (
+      await request(cookie, "/api/auth/get-session")
+    ).json<{ session: { id: string }; user: { id: string } }>();
+    let reads = 0;
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) => {
+            reads++;
+            return target.prepare(sql);
+          };
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(requireSecurity({ ...env, DB: db }, session.user.id, session.session.id)).resolves.toBeGreaterThan(
+      Date.now(),
+    );
+    expect(reads).toBe(1);
+    await env.DB.prepare("UPDATE session_security SET expires_at=?")
+      .bind(Date.now() - 1)
+      .run();
+    await expect(requireSecurity(env, session.user.id, session.session.id)).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("allows a shared source to perform more than three password sign-ins in ten seconds", async () => {
+    await enrollAccount(await bootstrap());
+    for (let i = 0; i < 5; i++)
+      expect(
+        (await request("", "/api/auth/sign-in/email", { email: "owner@example.test", password: "password123" })).status,
+      ).toBe(200);
+  });
+  it("guards the vendor passkey insert against reset, revoked session and obsolete generation", async () => {
+    await enrollAccount(await bootstrap());
+    const user = await env.DB.prepare("SELECT id FROM user").first<{ id: string }>();
+    const permit = (credential: string) =>
+      env.DB.prepare(`INSERT INTO pending_passkeys(credential_id,user_id,session_id,generation)
+      SELECT ?,s.userId,s.id,a.generation FROM session s JOIN account_security a ON a.user_id=s.userId LIMIT 1`)
+        .bind(credential)
+        .run();
+    const insert = (credential: string) =>
+      env.DB.prepare(
+        "INSERT INTO passkey(id,publicKey,userId,credentialID,counter,deviceType,backedUp) VALUES (?, 'verified-public-key', ?, ?, 0, 'singleDevice', 0)",
+      )
+        .bind(credential, user!.id, credential)
+        .run();
+    await permit("legitimate");
+    await insert("legitimate");
+    expect(await env.DB.prepare("SELECT 1 FROM pending_passkeys").first()).toBeNull();
+    await permit("old-generation");
+    await env.DB.prepare("UPDATE account_security SET generation=generation+1").run();
+    await expect(insert("old-generation")).rejects.toThrow("passkey_registration_revoked");
+    await permit("reset-race");
+    await env.DB.prepare("INSERT INTO security_resets(token_hash,user_id,expires_at) VALUES (?,?,?)")
+      .bind(await sha256("passkey-reset"), user!.id, Date.now() + 60_000)
+      .run();
+    await expect(insert("reset-race")).rejects.toThrow("passkey_registration_revoked");
+    expect(await env.DB.prepare("SELECT 1 FROM passkey").first()).toBeNull();
+  });
+
+  it("resets rate limits on fixed windows during continuous NAT traffic and enforces concurrent bursts", async () => {
+    const auth = createAuth(env);
+    const consume = (await auth.$context).options.rateLimit!.customStorage!.consume!;
+    const clock = vi.spyOn(Date, "now");
+    try {
+      const start = Math.floor(Date.now() / 60_000) * 60_000;
+      for (let i = 0; i < 61; i++) {
+        clock.mockReturnValue(start + i * 20_000);
+        expect(await consume("steady-nat", { window: 60, max: 60 })).toMatchObject({ allowed: true });
+      }
+      clock.mockReturnValue(start + 1_300_000);
+      const burst = await Promise.all(Array.from({ length: 12 }, () => consume("burst", { window: 60, max: 10 })));
+      expect(burst.filter((result) => result.allowed)).toHaveLength(10);
+      expect(burst.filter((result) => !result.allowed).every((result) => result.retryAfter! > 0)).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });

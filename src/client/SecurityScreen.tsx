@@ -4,14 +4,7 @@ import type { SecurityStatus } from "../shared/security";
 import { api, apiErrorMessage, authClient, json } from "./api";
 
 async function securityAction<T = { success: boolean }>(path: string, body: object = {}): Promise<T> {
-  const response = await fetch(`/api/security/${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: json(body),
-  });
-  const result = (await response.json()) as T & { message?: string; error?: { message?: string } };
-  if (!response.ok) throw new Error(result.error?.message || result.message || "Security request failed.");
-  return result;
+  return api<T>(`/api/security/${path}`, { method: "POST", body: json(body) });
 }
 
 export async function finishPasswordSignIn() {
@@ -55,7 +48,7 @@ export function SecurityScreen({
   }, [settings]);
   useEffect(() => {
     let active = true;
-    void api<SecurityStatus>("/api/security/status")
+    void (initialStatus ? Promise.resolve(initialStatus) : api<SecurityStatus>("/api/security/status"))
       .then(async (loaded) => {
         if (!active) return;
         setStatus(loaded);
@@ -70,7 +63,7 @@ export function SecurityScreen({
     return () => {
       active = false;
     };
-  }, [settings]);
+  }, [settings, initialStatus]);
 
   async function run(action: () => Promise<void>) {
     setBusy(true);
@@ -85,11 +78,15 @@ export function SecurityScreen({
     }
   }
 
-  async function verified() {
+  async function verified(preserveCodes = true) {
     const next = await reload();
     setRecover(false);
     setSetup(false);
     setUri("");
+    if (preserveCodes && codes.length > 0) {
+      setNotice("Account protection verified. Continue to confirm your saved recovery codes.");
+      return;
+    }
     if (!next.codesSaved) {
       const generated = await securityAction<{ codes: string[]; receipt: string }>("recovery-codes");
       setCodes(generated.codes);
@@ -168,7 +165,7 @@ export function SecurityScreen({
                 void run(async () => {
                   await securityAction("acknowledge-codes", { receipt });
                   setCodes([]);
-                  await verified();
+                  await verified(false);
                 })
               }
             >
@@ -181,6 +178,26 @@ export function SecurityScreen({
               <button type="button" onClick={() => void run(verified)}>
                 Generate recovery codes to finish setup
               </button>
+            )}
+            {recoveryEnrollment && status.recoveryCanResume && (
+              <form
+                className="auth-form"
+                onSubmit={(event) =>
+                  submit(event, async (values) => {
+                    await securityAction("resume-recovery", { password: values.get("password") });
+                    setUri("");
+                    await reload();
+                    setNotice("Recovery resumed. Finish restoring an authenticator or passkey.");
+                  })
+                }
+              >
+                <p>If your ten-minute setup session expires, resume here within 24 hours of recovery.</p>
+                <label>
+                  Password to resume recovery
+                  <input name="password" type="password" autoComplete="current-password" required />
+                </label>
+                <button>Resume recovery</button>
+              </form>
             )}
             {(enrollment || setup || recoveryEnrollment) && (
               <>
@@ -248,43 +265,6 @@ export function SecurityScreen({
                   >
                     Cancel setup
                   </button>
-                )}
-              </>
-            )}
-            {!enrollment && !setup && (
-              <>
-                {status.passkeys > 0 && (
-                  <button type="button" onClick={() => void run(passkeySignIn)}>
-                    Verify with passkey
-                  </button>
-                )}
-                {status.totp && (
-                  <form
-                    className="auth-form"
-                    onSubmit={(event) =>
-                      submit(event, async (values) => {
-                        const result = await authClient.twoFactor.verifyTotp({
-                          code: String(values.get("code")),
-                          trustDevice: false,
-                        });
-                        if (result.error) throw new Error(result.error.message || "The code is invalid.");
-                        await verified();
-                      })
-                    }
-                  >
-                    <label>
-                      Authenticator code
-                      <input
-                        name="code"
-                        inputMode="numeric"
-                        autoComplete="one-time-code"
-                        pattern="[0-9]{6}"
-                        maxLength={6}
-                        required
-                      />
-                    </label>
-                    <button>Verify code</button>
-                  </form>
                 )}
               </>
             )}
@@ -412,6 +392,43 @@ export function SecurityScreen({
             )}
           </>
         )}
+        {!enrollment && !setup && (
+          <>
+            {status.passkeys > 0 && (
+              <button type="button" onClick={() => void run(passkeySignIn)}>
+                Verify with passkey
+              </button>
+            )}
+            {status.totp && (
+              <form
+                className="auth-form"
+                onSubmit={(event) =>
+                  submit(event, async (values) => {
+                    const result = await authClient.twoFactor.verifyTotp({
+                      code: String(values.get("code")),
+                      trustDevice: false,
+                    });
+                    if (result.error) throw new Error(result.error.message || "The code is invalid.");
+                    await verified();
+                  })
+                }
+              >
+                <label>
+                  Authenticator code
+                  <input
+                    name="code"
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    pattern="[0-9]{6}"
+                    maxLength={6}
+                    required
+                  />
+                </label>
+                <button>Verify code</button>
+              </form>
+            )}
+          </>
+        )}
       </fieldset>
       {!settings && (
         <button
@@ -419,7 +436,8 @@ export function SecurityScreen({
           disabled={busy}
           onClick={() =>
             void run(async () => {
-              await authClient.signOut();
+              const result = await authClient.signOut();
+              if (result.error) throw new Error(result.error.message || "Sign out failed.");
               await onComplete?.();
             })
           }

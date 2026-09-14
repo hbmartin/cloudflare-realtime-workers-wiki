@@ -1101,28 +1101,41 @@ app.post("/api/install/bootstrap", async (c) => {
 app.post("/api/invites/accept", async (c) => {
   assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
   const body = await jsonBody(c.req.raw);
-  const inviteToken = text(body.token, "token", 500);
-  const tokenHash = await sha256(inviteToken);
+  const tokenHash = await sha256(text(body.token, "token", 500));
+  const email = text(body.email, "email", 320).toLowerCase();
+  const password = text(body.password, "password", 200);
   const invite = await c.env.DB.prepare(
-    `SELECT id, workspace_id, role FROM invites
-      WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`,
+    "SELECT id,workspace_id FROM invites WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
   )
     .bind(tokenHash, now())
-    .first<{ id: string; workspace_id: string; role: "editor" | "viewer" }>();
+    .first<{ id: string; workspace_id: string }>();
   if (!invite) throw new HttpError(404, "invite_invalid", "This invite is invalid, expired, or already used.");
-
-  const inviteEmail = text(body.email, "email", 320).toLowerCase();
-  const existingUser = await c.env.DB.prepare(`SELECT id FROM user WHERE email = ?`).bind(inviteEmail).first();
-  const signup = existingUser
-    ? await authEmail(c.env, c.req.raw, "/api/auth/sign-in/email", {
-        email: inviteEmail,
-        password: text(body.password, "password", 200),
-      })
-    : await signUp(c.env, c.req.raw, {
-        name: text(body.name, "name", 100),
-        email: inviteEmail,
-        password: text(body.password, "password", 200),
-      });
+  const existing = await c.env.DB.prepare("SELECT id FROM user WHERE email=?").bind(email).first<{ id: string }>();
+  // Existing members can authenticate without reserving or consuming an invitation.
+  const membership =
+    existing &&
+    (await c.env.DB.prepare("SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?")
+      .bind(invite.workspace_id, existing.id)
+      .first());
+  if (membership) return (await authEmail(c.env, c.req.raw, "/api/auth/sign-in/email", { email, password })).response;
+  const name = existing ? undefined : text(body.name, "name", 100);
+  // Reserve before signup: a post-signup claim would still allow concurrent account creation.
+  // A failed signup can be retried with this same email until the invite expires.
+  const reserved = await c.env.DB.prepare(`UPDATE invites SET claimed_email=?
+    WHERE id=? AND used_at IS NULL AND expires_at>? AND (claimed_email IS NULL OR claimed_email=?) RETURNING id`)
+    .bind(email, invite.id, now(), email)
+    .first();
+  if (!reserved) throw new HttpError(409, "invite_claimed", "This invite is already reserved for another account.");
+  const signup = existing
+    ? await authEmail(c.env, c.req.raw, "/api/auth/sign-in/email", { email, password })
+    : await signUp(c.env, c.req.raw, { name: name!, email, password });
+  if (!signup.response.ok) return signup.response;
+  // A successful password sign-in may return a two-factor challenge instead of a user.
+  const userId = existing?.id ?? signup.user?.id;
+  if (!userId) throw new HttpError(500, "signup_failed", "Account registration could not be completed.");
+  await c.env.DB.prepare("UPDATE invites SET claimed_by=? WHERE id=? AND claimed_email=? AND used_at IS NULL")
+    .bind(userId, invite.id, email)
+    .run();
   return signup.response;
 });
 
@@ -1132,28 +1145,41 @@ app.post("/api/invites/complete", async (c) => {
   if (!session) throw new HttpError(401, "unauthorized", "Sign in to continue.");
   await requireSecurity(c.env, session.user.id, session.session.id);
   const body = await jsonBody(c.req.raw);
-  const hash = await sha256(text(body.token, "token", 500));
-  const time = now();
-  // Claim and membership insertion are in the same D1 transaction. The used_by
-  // predicate makes retries by this account idempotent without admitting rivals.
+  const tokenHash = body.token === undefined ? null : await sha256(text(body.token, "token", 500));
+  const invite = await c.env.DB.prepare(
+    tokenHash
+      ? "SELECT id,workspace_id FROM invites WHERE token_hash=?"
+      : "SELECT id,workspace_id FROM invites WHERE claimed_by=? AND used_at IS NULL AND expires_at>? ORDER BY created_at LIMIT 1",
+  )
+    .bind(...(tokenHash ? [tokenHash] : [session.user.id, now()]))
+    .first<{ id: string; workspace_id: string }>();
+  if (!invite) {
+    if (tokenHash) throw new HttpError(409, "invite_invalid", "This invite is invalid, expired, or already used.");
+    return c.json({ success: true });
+  }
+  // The trigger inserts membership only on the unused -> used transition. A member
+  // opening someone else's invitation is a no-op, and retries cannot undo removal.
   const result = await c.env.DB.batch([
-    c.env.DB.prepare(
-      `UPDATE invites SET used_by=?,used_at=? WHERE token_hash=? AND used_at IS NULL AND expires_at>?`,
-    ).bind(session.user.id, time, hash, time),
-    c.env.DB.prepare(`INSERT OR IGNORE INTO workspace_members(workspace_id,user_id,role,created_at)
-      SELECT workspace_id,used_by,role,? FROM invites WHERE token_hash=? AND used_by=? AND expires_at>?`).bind(
-      time,
-      hash,
+    c.env.DB.prepare(`UPDATE invites SET used_by=?,used_at=?,claimed_by=?,claimed_email=?
+      WHERE id=? AND used_at IS NULL AND expires_at>?
+      AND (claimed_email IS NULL OR claimed_email=?) AND (claimed_by IS NULL OR claimed_by=?)
+      AND NOT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=invites.workspace_id AND user_id=?)`).bind(
       session.user.id,
-      time,
+      now(),
+      session.user.id,
+      session.user.email.toLowerCase(),
+      invite.id,
+      now(),
+      session.user.email.toLowerCase(),
+      session.user.id,
+      session.user.id,
     ),
-    c.env.DB.prepare("SELECT id FROM invites WHERE token_hash=? AND used_by=? AND expires_at>?").bind(
-      hash,
+    c.env.DB.prepare("SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?").bind(
+      invite.workspace_id,
       session.user.id,
-      time,
     ),
   ]);
-  if (!result[2]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
+  if (!result[1]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
   return c.json({ success: true });
 });
 

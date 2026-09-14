@@ -21,7 +21,6 @@ jobs:
       NOTES_LOAD_BASE_URL: ${{ vars.STAGING_BASE_URL }}
       NOTES_LOAD_EMAIL: ${{ secrets.STAGING_LOAD_EMAIL }}
       NOTES_LOAD_PASSWORD: ${{ secrets.STAGING_LOAD_PASSWORD }}
-      NOTES_LOAD_TOTP_SECRET: ${{ secrets.STAGING_LOAD_TOTP_SECRET }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,6 +51,8 @@ jobs:
         run: pnpm load:realtime
       - name: Staging realtime load check
         if: "!cancelled() && env.NOTES_LOAD_BASE_URL != '' && env.NOTES_LOAD_EMAIL != '' && env.NOTES_LOAD_PASSWORD != ''"
+        env:
+          NOTES_LOAD_TOTP_SECRET: ${{ secrets.STAGING_LOAD_TOTP_SECRET }}
         run: pnpm load:realtime
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()

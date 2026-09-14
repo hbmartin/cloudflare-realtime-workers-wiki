@@ -73,6 +73,8 @@ import { SecurityScreen, finishPasswordSignIn } from "./SecurityScreen";
 
 type AppState =
   | { screen: "loading" }
+  | { screen: "error"; message: string }
+  | { screen: "unassigned" }
   | { screen: "bootstrap" }
   | { screen: "security"; status: SecurityStatus }
   | { screen: "signin"; message?: string }
@@ -542,6 +544,13 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
   return assertNeverWorkspacePageAction(action);
 }
 
+function clearPendingInvite() {
+  sessionStorage.removeItem("pending-invite");
+  const url = new URL(window.location.href);
+  url.searchParams.delete("invite");
+  history.replaceState(null, "", url.pathname + url.search + url.hash);
+}
+
 async function resolveAppState(): Promise<AppState> {
   const invite = new URLSearchParams(window.location.search).get("invite") || sessionStorage.getItem("pending-invite");
   const install = await api<{ initialized: boolean }>("/api/install");
@@ -549,16 +558,23 @@ async function resolveAppState(): Promise<AppState> {
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state === "signed_out") return invite ? { screen: "invite", token: invite } : { screen: "signin" };
   if (status.state !== "ready") return { screen: "security", status };
-  if (invite) {
-    await api("/api/invites/complete", { method: "POST", body: json({ token: invite }) });
-    sessionStorage.removeItem("pending-invite");
-    history.replaceState(null, "", "/");
+  if (invite || status.pendingInvite) {
+    try {
+      await api("/api/invites/complete", { method: "POST", body: json(invite ? { token: invite } : {}) });
+      clearPendingInvite();
+    } catch (cause) {
+      if (cause instanceof ApiClientError && ["invite_invalid", "invite_claimed"].includes(cause.code))
+        clearPendingInvite();
+      throw cause;
+    }
   }
   try {
     const member = await api<ClientMemberContext>("/api/me");
     return { screen: "workspace", member };
   } catch (error) {
-    if (error instanceof ApiClientError && error.status === 401) return { screen: "signin" };
+    if (error instanceof ApiClientError && error.status === 401) {
+      return error.code === "workspace_required" ? { screen: "unassigned" } : { screen: "signin" };
+    }
     throw error;
   }
 }
@@ -581,7 +597,15 @@ export function App() {
     );
   }, []);
 
-  const load = useCallback(() => resolveAppState().then(setState), []);
+  const load = useCallback(
+    () =>
+      resolveAppState()
+        .then(setState)
+        .catch((cause) => {
+          setState({ screen: "error", message: apiErrorMessage(cause, "Unable to open the workspace. Try again.") });
+        }),
+    [],
+  );
 
   useEffect(() => onApiUnauthorized(sessionExpired), [sessionExpired]);
 
@@ -590,15 +614,47 @@ export function App() {
   }, [load]);
 
   if (state.screen === "loading") return <LoadingSplash />;
+  if (state.screen === "error" || state.screen === "unassigned")
+    return (
+      <AuthLayout
+        eyebrow="Workspace access"
+        title="Let’s get you into your workspace."
+        copy="Open an invitation from your workspace owner to join."
+      >
+        <p role="alert">
+          {state.screen === "error"
+            ? state.message
+            : "You’re signed in, but this account has no workspace access. Open your invite link or ask the owner for a new invitation."}
+        </p>
+        <button type="button" onClick={() => void load()}>
+          Try again
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            void authClient
+              .signOut()
+              .then(async (result) => {
+                if (result.error) throw new Error(result.error.message || "Sign out failed.");
+                await load();
+              })
+              .catch((cause) => setState({ screen: "error", message: apiErrorMessage(cause, "Sign out failed.") }));
+          }}
+        >
+          Sign out
+        </button>
+      </AuthLayout>
+    );
   if (state.screen === "bootstrap") return <BootstrapScreen onComplete={load} />;
   if (state.screen === "security") return <SecurityScreen initialStatus={state.status} onComplete={load} />;
   if (state.screen === "invite")
     return (
       <InviteScreen
         token={state.token}
-        onComplete={() => {
+        onComplete={async () => {
           sessionStorage.setItem("pending-invite", state.token);
-          void finishPasswordSignIn().then(load);
+          await finishPasswordSignIn();
+          await load();
         }}
       />
     );
@@ -689,7 +745,7 @@ function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
   );
 }
 
-function InviteScreen({ token, onComplete }: { token: string; onComplete: () => void }) {
+function InviteScreen({ token, onComplete }: { token: string; onComplete: () => Promise<void> }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -701,7 +757,7 @@ function InviteScreen({ token, onComplete }: { token: string; onComplete: () => 
         method: "POST",
         body: json({ ...Object.fromEntries(new FormData(event.currentTarget)), token }),
       });
-      onComplete();
+      await onComplete();
     } catch (cause) {
       setError(apiErrorMessage(cause, "Invite could not be accepted."));
     } finally {

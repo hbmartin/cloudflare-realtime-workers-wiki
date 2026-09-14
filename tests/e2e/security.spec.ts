@@ -39,7 +39,8 @@ test("passkey enrollment, passwordless sign-in, replay rejection, and mandatory 
     signup = await context.request.post("http://localhost:4173/api/invites/accept", { data: signupBody });
   }
   expect(signup.ok()).toBe(true);
-  await guest.goto(`/?invite=${invite.token}`);
+  // A fresh tab has no URL token or sessionStorage; the server owns the pending invitation.
+  await guest.goto("/");
   await expect(guest.getByRole("heading", { name: "Protect your account" })).toBeVisible();
   await guest.screenshot({ path: "test-results/security-enrollment.png" });
   await guest.getByRole("button", { name: "Create a passkey", exact: true }).click();
