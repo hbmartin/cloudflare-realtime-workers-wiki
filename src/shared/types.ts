@@ -243,6 +243,7 @@ export type Job = {
 };
 
 export type ImportPreview = {
+  previewId?: string;
   groupingVersion?: number;
   format: "markdown" | "html" | "notion_zip";
   filename: string;

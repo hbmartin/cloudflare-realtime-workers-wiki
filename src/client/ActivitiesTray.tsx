@@ -216,14 +216,15 @@ export function ActivitiesTray({
             {loading ? "Refreshing…" : "Refresh"}
           </button>
         </div>
-        {error ? (
+        {error && (
           <div className="activity-error" role="alert">
             <p>{error}</p>
             <button className="quiet-button" onClick={onRefresh}>
               Try again
             </button>
           </div>
-        ) : jobs.length ? (
+        )}
+        {jobs.length ? (
           <ol className="activity-list">
             {jobs.map((job) => {
               const active = isJobActive(job);
@@ -251,7 +252,13 @@ export function ActivitiesTray({
                   )}
                   {job.error && <p className="activity-job-error">{job.error.message}</p>}
                   {job.status === "awaiting_confirmation" && job.result?.preview && (
-                    <ImportConfirmation job={job} spaces={spaces} pending={pending} onConfirm={onConfirm} />
+                    <ImportConfirmation
+                      key={job.result.preview.previewId ?? "legacy"}
+                      job={job}
+                      spaces={spaces}
+                      pending={pending}
+                      onConfirm={onConfirm}
+                    />
                   )}
                   {job.warnings.map((warning) => (
                     <p className="activity-warning" key={warning}>
@@ -291,13 +298,13 @@ export function ActivitiesTray({
               );
             })}
           </ol>
-        ) : (
+        ) : !error ? (
           <div className="activity-empty">
             <span aria-hidden="true">↻</span>
             <h3>No background work yet</h3>
             <p>Imports, exports, templates, and maintenance jobs will appear here.</p>
           </div>
-        )}
+        ) : null}
       </dialog>
     </>
   );

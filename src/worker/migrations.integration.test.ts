@@ -65,6 +65,10 @@ describe("D1 migrations", () => {
         "integrations",
         "integration_tokens",
         "integration_grants",
+        "pending_recovery_codes",
+        "validate_invite_completion",
+        "initialize_account_security",
+        "prune_stale_rate_limit_on_insert",
         "api_page_ids",
         "api_blocks",
         "transclusion_sources",
@@ -84,6 +88,8 @@ describe("D1 migrations", () => {
     expect(indexes.results.map((index) => index.name)).toContain("idx_pages_workspace_page");
     expect(indexes.results.map((index) => index.name)).toContain("idx_slack_channels_unique");
     expect(indexes.results.map((index) => index.name)).toContain("idx_comment_threads_page_block");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_rate_limit_last_request");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_pending_recovery_expiry");
 
     const slackColumns = await env.DB.prepare(`PRAGMA table_info(slack_installations)`).all<{ name: string }>();
     expect(slackColumns.results.map((column) => column.name)).toEqual(
@@ -169,6 +175,77 @@ describe("D1 migrations", () => {
       lease_until: 0,
       rescan_requested: 0,
     });
+  });
+
+  it("preserves preloaded account security when a restore inserts the user row later", async () => {
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    const trigger = await env.DB.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='initialize_account_security'",
+    ).first<{ sql: string }>();
+    expect(trigger?.sql).toContain("INSERT OR IGNORE INTO account_security");
+
+    await env.DB.batch([
+      env.DB.prepare("PRAGMA defer_foreign_keys=ON"),
+      env.DB.prepare("INSERT INTO account_security(user_id,generation,codes_saved) VALUES ('restored-user',7,1)"),
+      env.DB.prepare(`INSERT INTO user(id,name,email,emailVerified,createdAt,updatedAt)
+        VALUES ('restored-user','Restored','restored@example.test',1,1,1)`),
+    ]);
+
+    expect(
+      await env.DB.prepare("SELECT generation,codes_saved FROM account_security WHERE user_id='restored-user'").first(),
+    ).toEqual({
+      generation: 7,
+      codes_saved: 1,
+    });
+  });
+
+  it("cleans abandoned, member-owned, and duplicate invite claims during the follow-up migration", async () => {
+    const followup = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0030_security_review_followups.sql");
+    expect(followup).toBeTruthy();
+    const followupIndex = env.TEST_MIGRATIONS!.indexOf(followup!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, followupIndex));
+    await env.DB.batch([
+      ...[
+        ["owner", "owner@example.test"],
+        ["member", "member@example.test"],
+        ["guest", "guest@example.test"],
+      ].map(([id, email]) =>
+        env.DB.prepare("INSERT INTO user(id,name,email,emailVerified,createdAt,updatedAt) VALUES (?,?,?,1,1,1)").bind(
+          id,
+          id,
+          email,
+        ),
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES ('workspace','Notes',1)"),
+      env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES ('workspace','owner','owner',1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES ('workspace','member','viewer',1)",
+      ),
+      ...[
+        ["abandoned", "abandoned-token", 1, Date.now() + 60_000, "abandoned@example.test", null],
+        ["member-claim", "member-token", 2, Date.now() + 60_000, "member@example.test", "member"],
+        ["guest-old", "guest-old-token", 3, Date.now() + 60_000, "guest@example.test", "guest"],
+        ["guest-new", "guest-new-token", 4, Date.now() - 1, "guest@example.test", "guest"],
+      ].map(([id, token, createdAt, expiresAt, email, claimedBy]) =>
+        env.DB.prepare(`INSERT INTO invites
+          (id,workspace_id,token_hash,role,expires_at,created_by,created_at,claimed_email,claimed_by)
+          VALUES (?,'workspace',?,'viewer',?,'owner',?,?,?)`).bind(id, token, expiresAt, createdAt, email, claimedBy),
+      ),
+    ]);
+
+    await applyD1Migrations(env.DB, [followup!]);
+
+    expect(await env.DB.prepare("SELECT claimed_email FROM invites WHERE id='abandoned'").first()).toEqual({
+      claimed_email: null,
+    });
+    expect(await env.DB.prepare("SELECT 1 FROM invites WHERE id='member-claim'").first()).toBeNull();
+    expect(await env.DB.prepare("SELECT 1 FROM invites WHERE id='guest-new'").first()).toBeNull();
+    const preserved = await env.DB.prepare("SELECT claim_expires_at FROM invites WHERE id='guest-old'").first<{
+      claim_expires_at: number;
+    }>();
+    expect(preserved!.claim_expires_at).toBeGreaterThan(Date.now());
   });
 
   it("repairs a missing comment lookup index in the forward archive migration", async () => {

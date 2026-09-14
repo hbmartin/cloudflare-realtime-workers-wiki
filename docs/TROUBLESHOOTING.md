@@ -47,16 +47,16 @@ explicitly and listed under [Log triage](#log-triage).
 
 ### Authentication and installation
 
-| Code                           | Status | Meaning                                                                                                                                                                                           |
-| ------------------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `invalid_origin`               | 403    | The `Origin` header did not match `BETTER_AUTH_URL` exactly. Almost always a misconfigured `BETTER_AUTH_URL`, or a request reaching the Worker on a second hostname such as a `workers.dev` route |
-| `registration_closed`          | 403    | Public sign-up is deliberately blocked. Expected; it is a smoke-test assertion                                                                                                                    |
-| `invalid_bootstrap_token`      | 403    | Wrong or rotated `BOOTSTRAP_TOKEN`                                                                                                                                                                |
-| `already_initialized`          | 409    | The owner already exists. Bootstrap is one-time                                                                                                                                                   |
-| `invite_invalid`               | 404    | Invite is invalid, expired, or already used                                                                                                                                                       |
-| `invite_used`                  | 409    | Another request consumed the invite first                                                                                                                                                         |
-| `final_owner`                  | 409    | Blocked by the last-owner triggers. Promote another owner first                                                                                                                                   |
-| `owner_required` / `read_only` | 403    | Role gate. `read_only` means an editor action attempted by a viewer                                                                                                                               |
+| Code                           | Status  | Meaning                                                                                                                                                                                           |
+| ------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `invalid_origin`               | 403     | The `Origin` header did not match `BETTER_AUTH_URL` exactly. Almost always a misconfigured `BETTER_AUTH_URL`, or a request reaching the Worker on a second hostname such as a `workers.dev` route |
+| `registration_closed`          | 403     | Public sign-up is deliberately blocked. Expected; it is a smoke-test assertion                                                                                                                    |
+| `invalid_bootstrap_token`      | 403     | Wrong or rotated `BOOTSTRAP_TOKEN`                                                                                                                                                                |
+| `already_initialized`          | 409     | The owner already exists. Bootstrap is one-time                                                                                                                                                   |
+| `invite_invalid`               | 404/409 | Invite acceptance could not find a live token, or completion could not consume a valid claim. The client clears stale explicit tokens and retries a server-owned claim when one exists            |
+| `invite_claimed`               | 409     | The invite has a live ten-minute signup reservation or belongs to another account                                                                                                                 |
+| `final_owner`                  | 409     | Blocked by the last-owner triggers. Promote another owner first                                                                                                                                   |
+| `owner_required` / `read_only` | 403     | Role gate. `read_only` means an editor action attempted by a viewer                                                                                                                               |
 
 ### Pages and content
 

@@ -34,6 +34,7 @@ import {
   api,
   apiErrorMessage,
   authClient,
+  invalidateUnauthorizedRequests,
   isPageNotFoundError,
   isSuccessfulJsonResponseBodyError,
   json,
@@ -73,8 +74,8 @@ import { SecurityScreen, finishPasswordSignIn } from "./SecurityScreen";
 
 type AppState =
   | { screen: "loading" }
-  | { screen: "error"; message: string }
-  | { screen: "unassigned" }
+  | { screen: "error"; kind: "request" | "service"; message: string }
+  | { screen: "unassigned"; message?: string }
   | { screen: "bootstrap" }
   | { screen: "security"; status: SecurityStatus }
   | { screen: "signin"; message?: string }
@@ -390,7 +391,7 @@ type WorkspacePageState = {
 type WorkspacePageAction =
   | { type: "select"; pageId: string }
   | { type: "clear-pending-selection"; pageId: string }
-  | { type: "load"; pages: Page[]; preservePageIds?: ReadonlySet<string> }
+  | { type: "load"; pages: Page[]; preservePageIds?: ReadonlySet<string>; removedPageIds?: ReadonlySet<string> }
   | { type: "merge"; pages: Page[] }
   | { type: "merge-restored"; pages: Page[]; rootPageId: string | null }
   | { type: "remove"; pageIds: ReadonlySet<string> }
@@ -447,9 +448,14 @@ function workspacePageReducer(state: WorkspacePageState, action: WorkspacePageAc
   }
   if (action.type === "load") {
     const snapshotPageIds = new Set(action.pages.map((page) => page.id));
-    const preservedPages = action.preservePageIds
-      ? state.pages.filter((page) => action.preservePageIds!.has(page.id) && !snapshotPageIds.has(page.id))
-      : [];
+    const preservedPages = state.pages.filter(
+      (page) =>
+        !snapshotPageIds.has(page.id) &&
+        !action.removedPageIds?.has(page.id) &&
+        (action.preservePageIds?.has(page.id) ||
+          ((page.id === state.selectedId || page.id === state.pendingSelectionId) &&
+            (page.isTemplate || page.archivedAt !== null))),
+    );
     const pages = mergePageSnapshot(state.pages, [...action.pages, ...preservedPages]);
     const pageIds = new Set(pages.map((page) => page.id));
     const pendingSelectionResolved = state.pendingSelectionId !== null && pageIds.has(state.pendingSelectionId);
@@ -551,6 +557,29 @@ function clearPendingInvite() {
   history.replaceState(null, "", url.pathname + url.search + url.hash);
 }
 
+const SECURITY_REQUIRED_CODES = new Set(["enrollment_required", "challenge_required", "recovery_required"]);
+
+function startupError(cause: unknown, fallback: string): AppState {
+  const requestFailure =
+    cause instanceof ApiClientError && cause.status < 500 && !cause.messageFromFallback && !cause.responseBodyFailure;
+  return {
+    screen: "error",
+    kind: requestFailure ? "request" : "service",
+    message: apiErrorMessage(cause, fallback),
+  };
+}
+
+async function stateAfterUnauthorized(failure: ApiClientError): Promise<AppState | null> {
+  if (failure.code === "workspace_required") return { screen: "unassigned" };
+  if (!SECURITY_REQUIRED_CODES.has(failure.code)) {
+    return { screen: "signin", message: apiErrorMessage(failure, "Your session expired. Sign in again.") };
+  }
+  const status = await api<SecurityStatus>("/api/security/status");
+  if (status.state === "signed_out") return { screen: "signin" };
+  if (status.state !== "ready") return { screen: "security", status };
+  return null;
+}
+
 async function resolveAppState(): Promise<AppState> {
   const invite = new URLSearchParams(window.location.search).get("invite") || sessionStorage.getItem("pending-invite");
   const install = await api<{ initialized: boolean }>("/api/install");
@@ -558,14 +587,23 @@ async function resolveAppState(): Promise<AppState> {
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state === "signed_out") return invite ? { screen: "invite", token: invite } : { screen: "signin" };
   if (status.state !== "ready") return { screen: "security", status };
+  let inviteFailure: ApiClientError | null = null;
   if (invite || status.pendingInvite) {
     try {
       await api("/api/invites/complete", { method: "POST", body: json(invite ? { token: invite } : {}) });
       clearPendingInvite();
     } catch (cause) {
-      if (cause instanceof ApiClientError && ["invite_invalid", "invite_claimed"].includes(cause.code))
+      if (invite && cause instanceof ApiClientError && cause.code === "invite_invalid") {
+        inviteFailure = cause;
         clearPendingInvite();
-      throw cause;
+        if (status.pendingInvite) {
+          await api("/api/invites/complete", { method: "POST", body: json({}) });
+          clearPendingInvite();
+          inviteFailure = null;
+        }
+      } else {
+        throw cause;
+      }
     }
   }
   try {
@@ -573,7 +611,13 @@ async function resolveAppState(): Promise<AppState> {
     return { screen: "workspace", member };
   } catch (error) {
     if (error instanceof ApiClientError && error.status === 401) {
-      return error.code === "workspace_required" ? { screen: "unassigned" } : { screen: "signin" };
+      if (error.code === "workspace_required" && inviteFailure) {
+        return { screen: "unassigned", message: inviteFailure.message };
+      }
+      const next = await stateAfterUnauthorized(error);
+      if (next) return next;
+      const member = await api<ClientMemberContext>("/api/me");
+      return { screen: "workspace", member };
     }
     throw error;
   }
@@ -581,50 +625,87 @@ async function resolveAppState(): Promise<AppState> {
 
 export function App() {
   const [state, setState] = useState<AppState>({ screen: "loading" });
-  const signOut = useCallback(() => setState({ screen: "signin" }), []);
-  const sessionExpired = useCallback((failure: ApiClientError) => {
-    if (["enrollment_required", "challenge_required", "recovery_required"].includes(failure.code)) {
-      setState({ screen: "loading" });
-      void resolveAppState()
-        .then(setState)
-        .catch(() => setState({ screen: "signin" }));
-      return;
-    }
-    setState((current) =>
-      current.screen === "workspace"
-        ? { screen: "signin", message: apiErrorMessage(failure, "Your session expired. Sign in again.") }
-        : current,
-    );
+  const stateTransition = useRef(0);
+  const commitState = useCallback((transition: number, next: AppState) => {
+    if (stateTransition.current === transition) setState(next);
   }, []);
-
-  const load = useCallback(
-    () =>
-      resolveAppState()
-        .then(setState)
-        .catch((cause) => {
-          setState({ screen: "error", message: apiErrorMessage(cause, "Unable to open the workspace. Try again.") });
-        }),
-    [],
+  const showState = useCallback((next: AppState) => {
+    stateTransition.current += 1;
+    setState(next);
+  }, []);
+  const signOut = useCallback(() => {
+    invalidateUnauthorizedRequests();
+    showState({ screen: "signin" });
+  }, [showState]);
+  const sessionExpired = useCallback(
+    (failure: ApiClientError) => {
+      invalidateUnauthorizedRequests();
+      const transition = ++stateTransition.current;
+      void stateAfterUnauthorized(failure)
+        .then((next) => {
+          if (next) commitState(transition, next);
+        })
+        .catch((cause) => commitState(transition, startupError(cause, "Unable to reach Realtime Notes. Try again.")));
+    },
+    [commitState],
   );
 
-  useEffect(() => onApiUnauthorized(sessionExpired), [sessionExpired]);
+  const load = useCallback(() => {
+    invalidateUnauthorizedRequests();
+    const transition = ++stateTransition.current;
+    return resolveAppState()
+      .catch(async (cause): Promise<AppState> => {
+        if (cause instanceof ApiClientError && cause.status === 401) {
+          try {
+            const next = await stateAfterUnauthorized(cause);
+            if (next) return next;
+            return await resolveAppState();
+          } catch (statusCause) {
+            return startupError(statusCause, "Unable to open the workspace. Try again.");
+          }
+        }
+        return startupError(cause, "Unable to open the workspace. Try again.");
+      })
+      .then((next) => commitState(transition, next));
+  }, [commitState]);
+
+  useEffect(() => {
+    if (state.screen === "workspace") return onApiUnauthorized(sessionExpired);
+    return undefined;
+  }, [sessionExpired, state.screen]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
   if (state.screen === "loading") return <LoadingSplash />;
-  if (state.screen === "error" || state.screen === "unassigned")
+  if (state.screen === "error")
+    return (
+      <AuthLayout
+        eyebrow={state.kind === "service" ? "Connection problem" : "Unable to continue"}
+        title={state.kind === "service" ? "Realtime Notes is unavailable" : "Realtime Notes couldn’t open"}
+        copy={
+          state.kind === "service"
+            ? "We couldn’t reach the service. Check your connection and try again. If the problem continues, the service may be unavailable."
+            : "Review the message below and try again."
+        }
+      >
+        <p role="alert">{state.message}</p>
+        <button type="button" onClick={() => void load()}>
+          Try again
+        </button>
+      </AuthLayout>
+    );
+  if (state.screen === "unassigned")
     return (
       <AuthLayout
         eyebrow="Workspace access"
-        title="Let’s get you into your workspace."
+        title="No workspace access"
         copy="Open an invitation from your workspace owner to join."
       >
         <p role="alert">
-          {state.screen === "error"
-            ? state.message
-            : "You’re signed in, but this account has no workspace access. Open your invite link or ask the owner for a new invitation."}
+          {state.message ??
+            "You’re signed in, but this account has no workspace access. Open your invite link or ask the owner for a new invitation."}
         </p>
         <button type="button" onClick={() => void load()}>
           Try again
@@ -632,13 +713,14 @@ export function App() {
         <button
           type="button"
           onClick={() => {
+            invalidateUnauthorizedRequests();
             void authClient
               .signOut()
               .then(async (result) => {
                 if (result.error) throw new Error(result.error.message || "Sign out failed.");
                 await load();
               })
-              .catch((cause) => setState({ screen: "error", message: apiErrorMessage(cause, "Sign out failed.") }));
+              .catch((cause) => showState(startupError(cause, "Sign out failed.")));
           }}
         >
           Sign out
@@ -868,28 +950,37 @@ export function useCommittedRef<T>(value: T) {
 
 function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
   const lastPageStorageKey = `notes:last-page:${member.workspace.id}:${member.user.id}`;
-  const [rememberedPageId] = useState(() =>
-    new URLSearchParams(window.location.search).get("page") ? null : localStorage.getItem(lastPageStorageKey),
-  );
-  const rememberedPageIdRef = useRef(rememberedPageId);
+  const startupNavigation = useRef<{
+    pageId: string | null;
+    view: string | null;
+    restoring: boolean;
+    lookupPending: boolean;
+  }>(null);
+  if (!startupNavigation.current) {
+    const params = new URLSearchParams(window.location.search);
+    const explicitId = params.get("page") || null;
+    startupNavigation.current = {
+      pageId: explicitId ?? localStorage.getItem(lastPageStorageKey),
+      view: params.get("view"),
+      restoring: !explicitId,
+      lookupPending: true,
+    };
+  }
   const [{ pages, pagesLoaded, selectedId, pendingSelectionId }, dispatchPageAction] = useReducer(
     workspacePageReducer,
     undefined,
-    () => {
-      const initialPageId = new URLSearchParams(window.location.search).get("page") || rememberedPageId || null;
-      return {
-        pages: [],
-        pagesLoaded: false,
-        selectedId: initialPageId,
-        pendingSelectionId: initialPageId,
-        pendingRestoredRoot: null,
-      };
-    },
+    () => ({
+      pages: [],
+      pagesLoaded: false,
+      selectedId: startupNavigation.current!.pageId,
+      pendingSelectionId: startupNavigation.current!.pageId,
+      pendingRestoredRoot: null,
+    }),
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [view, setView] = useState<"pages" | "search" | "mentions" | "templates" | "trash" | "settings">(() => {
-    const requested = new URLSearchParams(window.location.search).get("view");
+    const requested = startupNavigation.current!.view;
     return requested && ["search", "mentions", "templates", "trash", "settings"].includes(requested)
       ? (requested as "search" | "mentions" | "templates" | "trash" | "settings")
       : "pages";
@@ -949,7 +1040,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   workspaceAbortController.current ??= new AbortController();
   const pageLoadGeneration = useRef(0);
   const latestTreeVisibilityRef = useRef<{ generation: number; pageIds: ReadonlySet<string> } | null>(null);
-  const startupPageLookupPendingRef = useRef(true);
   const pageLoadRequest = useRef<{
     controller: AbortController;
     promise: Promise<PageLoadResult>;
@@ -971,6 +1061,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const activePageAccessRequestRef = useRef<{
     errorAttempt: WorkspaceErrorAttempt;
     pendingPageId: string;
+    restoring: boolean;
     controller: AbortController;
   } | null>(null);
   const trashMutationIdsRef = useRef(new Set<string>());
@@ -1131,17 +1222,20 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     activeRequest.controller.abort();
   }, [clearWorkspaceErrors, finishWorkspaceErrorAttempt, invalidateWorkspaceErrorAttempt]);
   const loadPageForNavigation = useCallback(
-    async (pageId: string) => {
+    async (pageId: string, restoring = false) => {
       const current = activePageAccessRequestRef.current;
-      if (current?.pendingPageId === pageId) return;
+      if (current?.pendingPageId === pageId) {
+        if (!restoring) current.restoring = false;
+        return;
+      }
       if (current) cancelPageAccessRequest();
       const target = { source: "page-access" } as const;
       const errorAttempt = startWorkspaceErrorAttempt(target);
       const visibilityGeneration = pageLoadGeneration.current;
-      const restoringRememberedPage = rememberedPageIdRef.current === pageId;
       const activeRequest = {
         errorAttempt,
         pendingPageId: pageId,
+        restoring,
         controller: new AbortController(),
       };
       activePageAccessRequestRef.current = activeRequest;
@@ -1157,13 +1251,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           { signal: requestSignal },
         );
         if (activePageAccessRequestRef.current !== activeRequest) return;
-        if (restoringRememberedPage && (page.archivedAt !== null || page.isTemplate)) {
+        if (activeRequest.restoring && (page.archivedAt !== null || page.isTemplate)) {
           localStorage.removeItem(lastPageStorageKey);
-          rememberedPageIdRef.current = null;
           dispatchPageAction({ type: "clear-pending-selection", pageId });
           return;
         }
-        rememberedPageIdRef.current = null;
         dispatchPageAction({ type: "merge", pages: [page] });
         if (sidebarHidden !== undefined) {
           // A newer tree may have completed in the same render batch, before
@@ -1176,9 +1268,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         localStorage.setItem(`notes:active-space:${member.workspace.id}`, page.spaceId);
       } catch (error) {
         if (activePageAccessRequestRef.current !== activeRequest) return;
-        if (restoringRememberedPage && error instanceof ApiClientError && [403, 404, 410].includes(error.status)) {
+        if (activeRequest.restoring && error instanceof ApiClientError && [403, 404, 410].includes(error.status)) {
           localStorage.removeItem(lastPageStorageKey);
-          rememberedPageIdRef.current = null;
           dispatchPageAction({ type: "clear-pending-selection", pageId });
           return;
         }
@@ -1206,8 +1297,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const navigateToPage = useCallback(
     (pageId: string, knownPage?: Page) => {
-      rememberedPageIdRef.current = null;
-      startupPageLookupPendingRef.current = false;
+      startupNavigation.current!.lookupPending = false;
       const page = knownPage ?? pages.find((candidate) => candidate.id === pageId);
       if (page) {
         cancelPageAccessRequest();
@@ -1218,7 +1308,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       }
       pendingSelectionIdRef.current = page ? null : pageId;
       dispatchPageAction({ type: "select", pageId });
-      history.replaceState(null, "", `/?page=${encodeURIComponent(pageId)}`);
       setView("pages");
       closeSidebar(true);
     },
@@ -1310,26 +1399,19 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             (pageId): pageId is string => pageId !== null && sidebarHiddenPageIdsRef.current.has(pageId),
           ),
         );
-        const remembered = authoritativePages.find((page) => page.id === rememberedPageIdRef.current);
-        if (remembered) {
-          rememberedPageIdRef.current = null;
-          if (remembered.isTemplate || remembered.archivedAt !== null) {
-            localStorage.removeItem(lastPageStorageKey);
-            dispatchPageAction({ type: "clear-pending-selection", pageId: remembered.id });
-          }
-        }
         dispatchPageAction({
           type: "load",
           pages: authoritativePages,
           preservePageIds,
+          removedPageIds: tombstones,
         });
         // Only startup needs a lookup after the tree. Refreshing the tree must
         // not implicitly retry a failed direct navigation.
-        if (startupPageLookupPendingRef.current) {
-          startupPageLookupPendingRef.current = false;
+        if (startupNavigation.current!.lookupPending) {
+          startupNavigation.current!.lookupPending = false;
           const pendingPageId = pendingSelectionIdRef.current;
           if (pendingPageId && !authoritativePages.some((page) => page.id === pendingPageId)) {
-            void loadPageForNavigation(pendingPageId);
+            void loadPageForNavigation(pendingPageId, startupNavigation.current!.restoring);
           }
         }
         setWorkspaceErrors((current) => {
@@ -1358,7 +1440,6 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     archiveRemovalTombstones,
     clearResolvedPageAccessError,
     clearWorkspaceErrors,
-    lastPageStorageKey,
     loadPageForNavigation,
     pendingSelectionIdRef,
     selectedIdRef,
@@ -2157,7 +2238,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             : `/api/jobs/${encodeURIComponent(job.id)}/${action}`;
         const data = await api<{ job: Job }>(path, {
           method: "POST",
-          ...(action === "confirm" ? { body: json({ groupSpaceIds: groupSpaceIds ?? {} }) } : {}),
+          ...(action === "confirm"
+            ? { body: json({ groupSpaceIds: groupSpaceIds ?? {}, previewId: job.result?.preview?.previewId }) }
+            : {}),
         });
         setJobs((current) =>
           current.map((candidate) =>
@@ -2166,6 +2249,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         );
         setJobsError("");
       } catch (error) {
+        if (error instanceof ApiClientError && error.code === "import_preview_changed") {
+          try {
+            const latest = await api<{ job: Job }>(`/api/jobs/${encodeURIComponent(job.id)}`);
+            setJobs((current) =>
+              current.map((candidate) =>
+                candidate.id === job.id ? latestJobSnapshot(candidate, latest.job) : candidate,
+              ),
+            );
+          } catch {
+            // Keep the original actionable error; the Activities refresh remains available.
+          }
+        }
         setJobsError(
           apiErrorMessage(
             error,
@@ -2219,11 +2314,19 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     () => (activeSpace ? { ...member, role: activeSpace.effectiveRole } : member),
     [activeSpace, member],
   );
+  const rememberSelected = Boolean(activeSelected && !activeSelected.isTemplate && activeSelected.archivedAt === null);
   useEffect(() => {
-    if (resolvedSelectedId && activeSelected && !activeSelected.isTemplate && activeSelected.archivedAt === null) {
-      localStorage.setItem(lastPageStorageKey, resolvedSelectedId);
-    }
-  }, [activeSelected, lastPageStorageKey, resolvedSelectedId]);
+    if (resolvedSelectedId && rememberSelected) localStorage.setItem(lastPageStorageKey, resolvedSelectedId);
+  }, [rememberSelected, lastPageStorageKey, resolvedSelectedId]);
+  useEffect(() => {
+    if (!pagesLoaded && !pendingSelectionId) return;
+    const url = new URL(window.location.href);
+    const pageId = pendingSelectionId ?? resolvedSelectedId;
+    if (view === "pages") url.searchParams.delete("view");
+    if (pageId) url.searchParams.set("page", pageId);
+    else url.searchParams.delete("page");
+    if (url.href !== window.location.href) history.replaceState(null, "", url);
+  }, [pagesLoaded, pendingSelectionId, resolvedSelectedId, view]);
   const tree = useMemo(() => buildTree(activePages), [activePages]);
   const breadcrumbs = useMemo(() => {
     if (pendingSelectionId) return [];
@@ -2713,10 +2816,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   function cancelPendingSelection() {
     cancelPageAccessRequest();
     if (!pendingSelectionId) return;
-    rememberedPageIdRef.current = null;
-    const current = pages.find((page) => page.id === selectedId);
-    const fallbackId = current?.id ?? fallbackPageId(pages, pages, selectedId);
-    history.replaceState(null, "", fallbackId ? `/?page=${encodeURIComponent(fallbackId)}` : "/");
+    startupNavigation.current!.lookupPending = false;
     dispatchPageAction({ type: "clear-pending-selection", pageId: pendingSelectionId });
   }
   const updatePage = useCallback(
@@ -3023,6 +3123,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         <footer className="sidebar-footer">
           <button
             onClick={async () => {
+              invalidateUnauthorizedRequests();
               await authClient.signOut();
               onSignOut();
             }}

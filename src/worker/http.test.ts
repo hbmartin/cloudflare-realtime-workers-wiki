@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { HttpError, classifyError, errorResponse, safeHttpErrorCode } from "./http";
+import { HttpError, classifyError, errorResponse, safeHttpError, safeHttpErrorCode } from "./http";
 
 describe("HTTP error handling", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -68,5 +68,60 @@ describe("HTTP error handling", () => {
       body: { error: { code: "internal_error", message: "Something went wrong." } },
     });
     expect(safeHttpErrorCode(new Error("ordinary failure"))).toBeNull();
+  });
+
+  it("reconstructs only explicitly marked serialized HTTP errors", () => {
+    const original = new HttpError(409, "import_upload_missing", "Upload the file again.");
+    const transported = Object.assign(new Error(original.message), Object.fromEntries(Object.entries(original)));
+
+    expect(safeHttpError(transported)).toEqual({
+      status: 409,
+      code: "import_upload_missing",
+      message: "Upload the file again.",
+    });
+    expect(classifyError(transported)).toMatchObject({
+      expected: true,
+      status: 409,
+      body: { error: { code: "import_upload_missing", message: "Upload the file again." } },
+    });
+    expect(safeHttpErrorCode({ status: 409, code: "import_upload_missing", message: original.message })).toBeNull();
+    expect(
+      safeHttpErrorCode({
+        transportKind: "realtime-notes.http-error.v1",
+        status: 418,
+        code: "import_upload_missing",
+        message: original.message,
+      }),
+    ).toBeNull();
+  });
+
+  it.each([
+    { transportKind: "wrong", status: 409, code: "conflict", message: "Conflict" },
+    { transportKind: "realtime-notes.http-error.v1", status: 409, code: "NOT_ALLOWED", message: "Conflict" },
+    { transportKind: "realtime-notes.http-error.v1", status: 409, code: "conflict", message: "" },
+    { transportKind: "realtime-notes.http-error.v1", status: 409, code: "conflict", message: "x".repeat(2_001) },
+  ])("rejects malformed transported HTTP errors: $code", (error) => {
+    expect(safeHttpError(error)).toBeNull();
+    expect(classifyError(error).expected).toBe(false);
+  });
+
+  it("rejects a marked transport object with hostile getters", () => {
+    const error = new Proxy(
+      {
+        transportKind: "realtime-notes.http-error.v1",
+        status: 409,
+        code: "conflict",
+        message: "Conflict",
+      },
+      {
+        get(target, property, receiver) {
+          if (property === "code") throw new Error("code is unavailable");
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+
+    expect(safeHttpError(error)).toBeNull();
+    expect(classifyError(error).expected).toBe(false);
   });
 });

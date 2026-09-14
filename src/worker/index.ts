@@ -2,7 +2,7 @@ import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fracti
 import { Hono, type Context } from "hono";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
-import { requireSecurity } from "./security";
+import { pruneSecurityState, requireSecurity } from "./security";
 import { ARCHIVE_DISCONNECT_RUN_LIMIT, processArchiveDisconnectTargets, processDueArchiveDisconnects } from "./archive";
 import {
   isInlineMime,
@@ -103,11 +103,12 @@ import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import {
   importDestinationSpaceIds,
+  hasCurrentImportConfirmation,
+  importConfirmationMatchesPreview,
+  isCurrentImportPreview,
   normalizeGroupSpaceIds,
   parseImportOptions,
-  type ImportOptions,
 } from "../shared/import-space-mapping";
-import { validateImportPreview } from "./importer";
 import { constantTimeEqual } from "../shared/security";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
@@ -196,6 +197,7 @@ const PAGE_BATCH_MAX = 50;
 const TABLE_LEASE_DURATION_MS = 60_000;
 const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple", "pink"] as const;
 const MAX_IMPORT_UPLOAD_BYTES = 24 * 1024 * 1024;
+const INVITE_CLAIM_MS = 10 * 60_000;
 
 type PageRow = PageJsonRow & {
   created_by: string;
@@ -1105,38 +1107,104 @@ app.post("/api/invites/accept", async (c) => {
   const email = text(body.email, "email", 320).toLowerCase();
   const password = text(body.password, "password", 200);
   const invite = await c.env.DB.prepare(
-    "SELECT id,workspace_id FROM invites WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
+    "SELECT id,workspace_id,expires_at FROM invites WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
   )
     .bind(tokenHash, now())
-    .first<{ id: string; workspace_id: string }>();
+    .first<{ id: string; workspace_id: string; expires_at: number }>();
   if (!invite) throw new HttpError(404, "invite_invalid", "This invite is invalid, expired, or already used.");
   const existing = await c.env.DB.prepare("SELECT id FROM user WHERE email=?").bind(email).first<{ id: string }>();
-  // Existing members can authenticate without reserving or consuming an invitation.
-  const membership =
-    existing &&
-    (await c.env.DB.prepare("SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?")
+  if (existing) {
+    // A guessed address cannot reserve an invitation: prove the existing
+    // account's password before touching claim state.
+    const signin = await authEmail(c.env, c.req.raw, "/api/auth/sign-in/email", { email, password });
+    if (!signin.response.ok) return signin.response;
+    const membership = await c.env.DB.prepare("SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?")
       .bind(invite.workspace_id, existing.id)
-      .first());
-  if (membership) return (await authEmail(c.env, c.req.raw, "/api/auth/sign-in/email", { email, password })).response;
-  const name = existing ? undefined : text(body.name, "name", 100);
-  // Reserve before signup: a post-signup claim would still allow concurrent account creation.
-  // A failed signup can be retried with this same email until the invite expires.
-  const reserved = await c.env.DB.prepare(`UPDATE invites SET claimed_email=?
-    WHERE id=? AND used_at IS NULL AND expires_at>? AND (claimed_email IS NULL OR claimed_email=?) RETURNING id`)
-    .bind(email, invite.id, now(), email)
+      .first();
+    if (membership) {
+      await c.env.DB.prepare("DELETE FROM invites WHERE workspace_id=? AND claimed_by=? AND used_at IS NULL")
+        .bind(invite.workspace_id, existing.id)
+        .run();
+      return signin.response;
+    }
+    const time = now();
+    const claimed = await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE invites SET claimed_email=?,claimed_by=?,claim_token=NULL,claim_expires_at=expires_at
+        WHERE id=? AND used_at IS NULL AND expires_at>?
+          AND (claimed_email IS NULL OR lower(claimed_email)=? OR (claimed_by IS NULL AND claim_expires_at<=?))
+          AND (claimed_by IS NULL OR claimed_by=?)
+          AND (claim_token IS NULL OR claim_expires_at<=?) RETURNING id`).bind(
+        email,
+        existing.id,
+        invite.id,
+        time,
+        email,
+        time,
+        existing.id,
+        time,
+      ),
+      c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND id!=? AND used_at IS NULL
+        AND claimed_by=? AND EXISTS(SELECT 1 FROM invites target WHERE target.id=? AND target.claimed_by=?)`).bind(
+        invite.workspace_id,
+        invite.id,
+        existing.id,
+        invite.id,
+        existing.id,
+      ),
+    ]);
+    if (!claimed[0]!.results.length)
+      throw new HttpError(409, "invite_claimed", "This invite is already reserved for another account.");
+    return signin.response;
+  }
+
+  const name = text(body.name, "name", 100);
+  const claimToken = crypto.randomUUID();
+  const time = now();
+  const reserved = await c.env.DB.prepare(`UPDATE invites
+    SET claimed_email=?,claimed_by=NULL,claim_token=?,claim_expires_at=?
+    WHERE id=? AND used_at IS NULL AND expires_at>? AND claimed_by IS NULL
+      AND (claim_token IS NULL OR claim_expires_at<=?) RETURNING id`)
+    .bind(email, claimToken, time + INVITE_CLAIM_MS, invite.id, time, time)
     .first();
   if (!reserved) throw new HttpError(409, "invite_claimed", "This invite is already reserved for another account.");
-  const signup = existing
-    ? await authEmail(c.env, c.req.raw, "/api/auth/sign-in/email", { email, password })
-    : await signUp(c.env, c.req.raw, { name: name!, email, password });
-  if (!signup.response.ok) return signup.response;
-  // A successful password sign-in may return a two-factor challenge instead of a user.
-  const userId = existing?.id ?? signup.user?.id;
-  if (!userId) throw new HttpError(500, "signup_failed", "Account registration could not be completed.");
-  await c.env.DB.prepare("UPDATE invites SET claimed_by=? WHERE id=? AND claimed_email=? AND used_at IS NULL")
-    .bind(userId, invite.id, email)
-    .run();
-  return signup.response;
+  let completed = false;
+  try {
+    const signup = await signUp(c.env, c.req.raw, { name, email, password });
+    if (!signup.response.ok || !signup.user) {
+      if (!signup.response.ok) return signup.response;
+      throw new HttpError(500, "signup_failed", "Account registration could not be completed.");
+    }
+    const claimed = await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE invites SET claimed_by=?,claim_token=NULL,claim_expires_at=expires_at
+        WHERE id=? AND claimed_email=? AND claim_token=? AND used_at IS NULL AND expires_at>? RETURNING id`).bind(
+        signup.user.id,
+        invite.id,
+        email,
+        claimToken,
+        now(),
+      ),
+      c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND id!=? AND used_at IS NULL
+        AND claimed_by=? AND EXISTS(SELECT 1 FROM invites target WHERE target.id=? AND target.claimed_by=?)`).bind(
+        invite.workspace_id,
+        invite.id,
+        signup.user.id,
+        invite.id,
+        signup.user.id,
+      ),
+    ]);
+    if (!claimed[0]!.results.length)
+      throw new HttpError(409, "invite_claimed", "The invitation reservation expired. Try the invitation again.");
+    completed = true;
+    return signup.response;
+  } finally {
+    if (!completed) {
+      await c.env.DB.prepare(`UPDATE invites SET claimed_email=NULL,claim_token=NULL,claim_expires_at=NULL
+        WHERE id=? AND claim_token=? AND claimed_by IS NULL`)
+        .bind(invite.id, claimToken)
+        .run()
+        .catch((error) => console.error("Failed to release invite signup reservation", { inviteId: invite.id, error }));
+    }
+  }
 });
 
 app.post("/api/invites/complete", async (c) => {
@@ -1157,21 +1225,32 @@ app.post("/api/invites/complete", async (c) => {
     if (tokenHash) throw new HttpError(409, "invite_invalid", "This invite is invalid, expired, or already used.");
     return c.json({ success: true });
   }
-  // The trigger inserts membership only on the unused -> used transition. A member
-  // opening someone else's invitation is a no-op, and retries cannot undo removal.
+  const time = now();
   const result = await c.env.DB.batch([
-    c.env.DB.prepare(`UPDATE invites SET used_by=?,used_at=?,claimed_by=?,claimed_email=?
+    c.env.DB.prepare(`UPDATE invites SET used_by=?,used_at=?,claimed_by=?,claimed_email=?,claim_token=NULL,
+      claim_expires_at=expires_at
       WHERE id=? AND used_at IS NULL AND expires_at>?
-      AND (claimed_email IS NULL OR claimed_email=?) AND (claimed_by IS NULL OR claimed_by=?)
+      AND (claimed_email IS NULL OR claimed_email=? OR (claimed_by IS NULL AND claim_expires_at<=?))
+      AND (claimed_by IS NULL OR claimed_by=?)
+      AND (claim_token IS NULL OR claim_expires_at<=?)
       AND NOT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=invites.workspace_id AND user_id=?)`).bind(
       session.user.id,
-      now(),
+      time,
       session.user.id,
       session.user.email.toLowerCase(),
       invite.id,
-      now(),
+      time,
       session.user.email.toLowerCase(),
+      time,
       session.user.id,
+      time,
+      session.user.id,
+    ),
+    c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND claimed_by=? AND used_at IS NULL
+      AND EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?)`).bind(
+      invite.workspace_id,
+      session.user.id,
+      invite.workspace_id,
       session.user.id,
     ),
     c.env.DB.prepare("SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=?").bind(
@@ -1179,7 +1258,7 @@ app.post("/api/invites/complete", async (c) => {
       session.user.id,
     ),
   ]);
-  if (!result[1]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
+  if (!result[2]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
   return c.json({ success: true });
 });
 
@@ -1269,9 +1348,16 @@ app.delete("/api/members/:id", async (c) => {
     .first<{ role: string }>();
   if (!target) throw new HttpError(404, "member_not_found", "Member not found.");
   if (target.role === "owner") await assertAnotherOwner(c.env, member.workspace.id, targetId);
-  await c.env.DB.prepare(`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?`)
-    .bind(member.workspace.id, targetId)
-    .run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?`).bind(
+      member.workspace.id,
+      targetId,
+    ),
+    c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND claimed_by=? AND used_at IS NULL`).bind(
+      member.workspace.id,
+      targetId,
+    ),
+  ]);
   return c.json({ ok: true });
 });
 
@@ -1792,16 +1878,50 @@ app.post("/api/import-uploads", async (c) => {
   return c.json({ job: jobJson(uploaded) }, 202);
 });
 
-async function validateSavedImportPreview(env: Env, job: JobRow, options: ImportOptions) {
-  try {
-    await validateImportPreview(env, job, options);
-  } catch {
+function savedImportPreview(job: JobRow) {
+  return (JSON.parse(job.result_json) as { preview?: ImportPreview }).preview;
+}
+
+async function refreshImportPreview(c: Context<{ Bindings: Env }>, member: MemberContext, job: JobRow) {
+  requireEditor(member);
+  if (job.space_id) await editableSpaceForMember(c.env, member, job.space_id);
+  const saved = storedJobOptions(job);
+  const options = parseImportOptions({ filename: saved.filename, format: saved.format, confirmed: false });
+  if (!options) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
+  if (!job.input_key?.startsWith(`jobs/${job.id}/input/`)) {
     throw new HttpError(
       409,
-      "import_preview_outdated",
-      "This import's saved preview could not be verified. Upload the file again to inspect and confirm its destinations.",
+      "import_upload_missing",
+      "The import upload is missing or expired. Upload the file again.",
     );
   }
+  const instanceId = crypto.randomUUID();
+  const refreshed = await c.env.DB.prepare(
+    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1,
+      options_json = ?, result_json = '{}', progress_current = 0, progress_label = 'Refreshing preview',
+      error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE id = ? AND attempt = ? AND status = ? AND cleanup_target IS NULL
+        AND status IN ('awaiting_confirmation', 'failed', 'canceled') RETURNING *`,
+  )
+    .bind(instanceId, JSON.stringify(options), now(), job.id, job.attempt, job.status)
+    .first<JobRow>();
+  if (!refreshed)
+    throw new HttpError(
+      409,
+      "import_preview_changed",
+      "This import changed. Refresh it and review the latest preview.",
+    );
+  c.executionCtx.waitUntil(
+    startJobExecution(c.env, refreshed).catch((error) => {
+      console.error("Failed to start import reinspection workflow", {
+        jobId: job.id,
+        attempt: refreshed.attempt,
+        error,
+      });
+    }),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
+  return c.json({ job: jobJson(refreshed) }, 202);
 }
 
 async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string) {
@@ -1814,9 +1934,23 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
   if (job.status !== "awaiting_confirmation") {
     throw new HttpError(409, "import_not_confirmable", "This import is not awaiting confirmation.");
   }
-  const options = JSON.parse(job.options_json) as Record<string, unknown>;
-  const storedResult = JSON.parse(job.result_json) as { preview?: ImportPreview };
-  const groups = storedResult.preview?.groups ?? [];
+  const options = storedJobOptions(job);
+  const preview = savedImportPreview(job);
+  const inspectionOptions = parseImportOptions({
+    filename: options.filename,
+    format: options.format,
+    confirmed: false,
+  });
+  if (!inspectionOptions) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
+  if (!isCurrentImportPreview(preview, inspectionOptions.format)) return refreshImportPreview(c, member, job);
+  if (body.previewId !== preview!.previewId) {
+    throw new HttpError(
+      409,
+      "import_preview_changed",
+      "The preview changed. Review the latest preview before confirming.",
+    );
+  }
+  const groups = preview?.groups ?? [];
   const rawMappings = body.groupSpaceIds;
   const groupSpaceIds = normalizeGroupSpaceIds(rawMappings);
   const groupedImport = groups.length > 1 || groups.some((group) => group.key !== "Imported");
@@ -1849,20 +1983,25 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
     confirmed: true,
     groupSpaceIds: savedGroupSpaceIds,
     ...(groups.length ? { previewGroupKeys: groups.map((group) => group.key) } : {}),
-    previewGroupingVersion: storedResult.preview?.groupingVersion,
+    previewGroupingVersion: preview?.groupingVersion,
+    previewId: preview?.previewId,
   });
   if (!confirmedOptions) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
-  await validateSavedImportPreview(c.env, job, confirmedOptions);
   const instanceId = crypto.randomUUID();
   const queued = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, options_json = ?, progress_label = 'Queued',
       error_code = NULL, error_message = NULL, updated_at = ?
-      WHERE id = ? AND attempt = ? AND status = 'awaiting_confirmation'`,
+      WHERE id = ? AND attempt = ? AND status = 'awaiting_confirmation' AND cleanup_target IS NULL
+        AND json_extract(result_json, '$.preview.previewId') = ?`,
   )
-    .bind(instanceId, JSON.stringify(confirmedOptions), now(), job.id, job.attempt)
+    .bind(instanceId, JSON.stringify(confirmedOptions), now(), job.id, job.attempt, preview!.previewId!)
     .run();
   if (!queued.meta.changes) {
-    throw new HttpError(409, "import_not_confirmable", "This import is no longer awaiting confirmation.");
+    throw new HttpError(
+      409,
+      "import_preview_changed",
+      "This import changed. Review its latest state before confirming.",
+    );
   }
   const confirmed = await jobForMember(c.env, member, job.id);
   c.executionCtx.waitUntil(
@@ -1982,7 +2121,6 @@ async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow) {
         "This import's saved space mappings are invalid. Upload the file again to inspect and confirm its destinations.",
       );
     for (const spaceId of destinations) await editableSpaceForMember(env, member, spaceId);
-    await validateSavedImportPreview(env, job, parsed);
     return;
   }
   if (job.type === "template_clone") {
@@ -2011,6 +2149,19 @@ app.post("/api/jobs/:id/retry", async (c) => {
     throw new HttpError(409, "job_not_retryable", "Only failed or canceled jobs can be retried.");
   }
   await authorizeJobRetry(c.env, member, job);
+  if (job.type === "import") {
+    const options = storedJobOptions(job);
+    const preview = savedImportPreview(job);
+    const parsed = parseImportOptions(options);
+    if (
+      !parsed ||
+      !isCurrentImportPreview(preview, parsed.format) ||
+      (parsed.confirmed &&
+        (!hasCurrentImportConfirmation(parsed) || !importConfirmationMatchesPreview(parsed, preview)))
+    ) {
+      return refreshImportPreview(c, member, job);
+    }
+  }
   const instanceId = crypto.randomUUID();
   const retried = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1, progress_current = 0,
@@ -5728,6 +5879,11 @@ export default {
     context.waitUntil(
       pruneWebhookHistory(env).catch((error) => {
         console.error("Webhook history pruning failed", error);
+      }),
+    );
+    context.waitUntil(
+      pruneSecurityState(env).catch((error) => {
+        console.error("Security state pruning failed", error);
       }),
     );
   },

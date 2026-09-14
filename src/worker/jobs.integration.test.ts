@@ -3,10 +3,12 @@ import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionC
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
+import { sha256Hex } from "../shared/import-integrity";
 import type { DiagramContentEnvelope, Job, Page } from "../shared/types";
 import { NOTION_GROUPING_VERSION } from "../shared/import-space-mapping";
 import { createZip, readZip } from "../shared/zip";
 import type { Env } from "./env";
+import { HttpError } from "./http";
 import { runImport } from "./importer";
 import {
   claimJobWorkflowRun,
@@ -17,6 +19,7 @@ import {
   recoverQueuedJobs,
   resolveJobWorkflowAttempt,
   runCommentMigration,
+  startJobExecution,
   runTemplateClone,
   sweepOutbox,
   type DeliveryQueueMessage,
@@ -31,6 +34,24 @@ function request(cookie: string, path: string, init: RequestInit = {}) {
   headers.set("cookie", cookie);
   headers.set("origin", "http://example.test");
   return new Request(`http://example.test${path}`, { ...init, headers });
+}
+
+// Confirmation sends the identity of the preview this test has inspected.
+async function importRequest(cookie: string, path: string, init: RequestInit = {}) {
+  let body: Record<string, unknown>;
+  try {
+    body = init.body ? JSON.parse(String(init.body)) : {};
+  } catch {
+    return request(cookie, path, init);
+  }
+  const id = /^\/api\/imports\/([^/]+)\/confirm$/.exec(path)?.[1] ?? body.jobId;
+  const result = await env.DB.prepare("SELECT result_json FROM jobs WHERE id = ?")
+    .bind(id)
+    .first<string>("result_json");
+  return request(cookie, path, {
+    ...init,
+    body: JSON.stringify({ ...body, previewId: result ? JSON.parse(result).preview?.previewId : undefined }),
+  });
 }
 
 async function bootstrap(): Promise<InstalledWorkspace> {
@@ -340,6 +361,16 @@ describe("job execution", () => {
       ),
     ]);
 
+    await env.DB.prepare(
+      `UPDATE jobs SET result_json = ?, options_json = json_set(options_json, '$.previewId', 'retry-preview') WHERE id = ?`,
+    )
+      .bind(
+        JSON.stringify({
+          preview: { format: "notion_zip", previewId: "retry-preview", groupingVersion: NOTION_GROUPING_VERSION },
+        }),
+        jobIds.import,
+      )
+      .run();
     const bindings = bindingsWith({ NOTES_WORKFLOW: { create: vi.fn(async ({ id }: { id?: string }) => ({ id })) } });
     for (const jobId of Object.values(jobIds)) {
       const response = await worker.fetch(
@@ -399,6 +430,11 @@ describe("job execution", () => {
       )
       .run();
 
+    await env.DB.prepare(
+      `UPDATE jobs SET result_json = ?, options_json = json_set(options_json, '$.previewId', 'mapped-preview') WHERE id = ?`,
+    )
+      .bind(JSON.stringify({ preview: { format: "markdown", previewId: "mapped-preview" } }), mappedImportId)
+      .run();
     const mappedRetry = await worker.fetch(
       request(installed.cookie, `/api/jobs/${mappedImportId}/retry`, { method: "POST" }),
       bindings,
@@ -523,6 +559,9 @@ describe("job execution", () => {
           Date.now(),
           Date.now(),
         )
+        .run();
+      await env.DB.prepare("UPDATE jobs SET input_key = ? WHERE id = ?")
+        .bind(`jobs/${jobId}/input/notes.md`, jobId)
         .run();
       const create = vi.fn(async ({ id }: { id?: string }) => ({ id }));
       const context = createExecutionContext();
@@ -2114,7 +2153,7 @@ describe("job execution", () => {
 
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${queued.id}/confirm`, { method: "POST" }),
+      await importRequest(installed.cookie, `/api/imports/${queued.id}/confirm`, { method: "POST" }),
       inlineBindings(),
       confirmContext,
     );
@@ -2184,7 +2223,7 @@ describe("job execution", () => {
 
     const confirmContext = createExecutionContext();
     await worker.fetch(
-      request(installed.cookie, "/api/imports", {
+      await importRequest(installed.cookie, "/api/imports", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jobId }),
@@ -2263,7 +2302,7 @@ describe("job execution", () => {
 
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ groupSpaceIds: {} }),
@@ -2319,7 +2358,7 @@ describe("job execution", () => {
     await waitOnExecutionContext(uploadContext);
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
       inlineBindings(),
       confirmContext,
     );
@@ -2358,6 +2397,37 @@ describe("job execution", () => {
         ["Linked child", "Old"],
       ],
     },
+    ...["block", "inline"].map((placement) => ({
+      label: `${placement} Markdown image evidence before an earlier title match`,
+      files: [
+        [
+          "Old aaaa000000000000000000000000bbbb.md",
+          placement === "block"
+            ? '# Old\n\n![cover](Old%202222-2222/Folder_(one).png "Cover")'
+            : "# Old\nSee ![cover](Old%202222-2222/Folder_(one).png) here.",
+        ],
+        ["Old 1111-1111/Unlinked child.md", "# Unlinked child"],
+        ["Old 2222-2222/Linked child.md", "# Linked child"],
+        ["Old 2222-2222/Folder_(one).png", "image"],
+      ],
+      parents: [
+        ["Unlinked child", null],
+        ["Linked child", "Old"],
+      ],
+    })),
+    ...["html", "md"].map((format) => ({
+      label: `${format} link evidence with parentheses in a folder`,
+      files: [
+        [
+          `Budget (draft) aaaa000000000000000000000000bbbb.${format}`,
+          format === "html"
+            ? '<html><head><title>Budget (draft)</title></head><body><a href="Budget%20(draft)%201111-1111/Child.md">Child</a></body></html>'
+            : '# Budget (draft)\n[child](Budget%20(draft)%201111-1111/Child.md "Child")',
+        ],
+        ["Budget (draft) 1111-1111/Child.md", "# Child"],
+      ],
+      parents: [["Child", "Budget (draft)"]],
+    })),
     {
       label: "ambiguous titles without links remain unassigned",
       files: [
@@ -2449,7 +2519,7 @@ describe("job execution", () => {
     await waitOnExecutionContext(uploadContext);
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
       inlineBindings(),
       confirmContext,
     );
@@ -2628,19 +2698,10 @@ describe("job execution", () => {
       "Private & Shared",
     ]);
     expect(groups.map((group) => group.name)).toEqual([...(loose ? ["Imported"] : []), "Imported", "Private & Shared"]);
-    const confirmedGroups = groups.map((group) => ({
-      ...group,
-      key: !loose && group.key === "Teamspace: Imported" ? "Imported" : group.key,
-    }));
-    if (!loose) {
-      // Simulate an awaiting-confirmation preview saved before the reserved-key fix.
-      await env.DB.prepare("UPDATE jobs SET result_json = ? WHERE id = ?")
-        .bind(JSON.stringify({ preview: { groups: confirmedGroups } }), jobId)
-        .run();
-    }
+    const confirmedGroups = groups;
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         body: JSON.stringify({
           groupSpaceIds: Object.fromEntries(
@@ -2657,7 +2718,376 @@ describe("job execution", () => {
   });
 
   it.each(["confirm", "retry"] as const)(
-    "rejects changed legacy ownership groups before %s changes the job",
+    "refreshes legacy hierarchy even when group keys are unchanged: %s",
+    async (action) => {
+      const installed = await bootstrap();
+      const upload = new FormData();
+      upload.set("spaceId", `${installed.workspaceId}-general`);
+      upload.set(
+        "file",
+        new File(
+          [
+            createZip([
+              { path: "Budget aaaa000000000000000000000000bbbb.md", bytes: new TextEncoder().encode("# Budget") },
+              { path: "Budget 2024-2025/Child.md", bytes: new TextEncoder().encode("# Child") },
+            ]),
+          ],
+          "hierarchy.zip",
+        ),
+      );
+      const uploadContext = createExecutionContext();
+      const uploaded = await worker.fetch(
+        request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+        inlineBindings(),
+        uploadContext,
+      );
+      const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+      await waitOnExecutionContext(uploadContext);
+      const original = (await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<JobRow>())!;
+      const result = JSON.parse(original.result_json);
+      expect(result.preview.groups.map((group: { key: string }) => group.key)).toEqual(["Imported"]);
+      const oldPreviewId = result.preview.previewId;
+      result.preview.groupingVersion = NOTION_GROUPING_VERSION - 1;
+      result.preview.roots = 1;
+      result.preview.nested = 1;
+      result.preview.warnings = [];
+      const options = {
+        ...JSON.parse(original.options_json),
+        confirmed: action === "retry",
+        previewId: oldPreviewId,
+        previewGroupingVersion: NOTION_GROUPING_VERSION - 1,
+      };
+      await env.DB.prepare("UPDATE jobs SET status = ?, options_json = ?, result_json = ? WHERE id = ?")
+        .bind(
+          action === "retry" ? "failed" : "awaiting_confirmation",
+          JSON.stringify(options),
+          JSON.stringify(result),
+          jobId,
+        )
+        .run();
+      const refreshContext = createExecutionContext();
+      const refresh = await worker.fetch(
+        request(installed.cookie, action === "retry" ? `/api/jobs/${jobId}/retry` : `/api/imports/${jobId}/confirm`, {
+          method: "POST",
+        }),
+        inlineBindings(),
+        refreshContext,
+      );
+      expect(refresh.status).toBe(202);
+      await waitOnExecutionContext(refreshContext);
+      const refreshed = (await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<JobRow>())!;
+      const preview = JSON.parse(refreshed.result_json).preview;
+      expect(refreshed.status).toBe("awaiting_confirmation");
+      expect(refreshed.attempt).toBe(original.attempt + 1);
+      expect(preview).toMatchObject({ roots: 2, nested: 0, groupingVersion: NOTION_GROUPING_VERSION });
+      expect(preview.warnings.length).toBeGreaterThan(0);
+      expect(preview.previewId).not.toBe(oldPreviewId);
+      expect(
+        await env.DB.prepare("SELECT count(*) AS total FROM pages WHERE import_job_id = ?").bind(jobId).first("total"),
+      ).toBe(0);
+      expect(
+        await claimJobWorkflowRun(
+          env,
+          { payload: { jobId, attempt: original.attempt }, instanceId: original.workflow_instance_id ?? jobId },
+          original.attempt,
+        ),
+      ).toBeNull();
+      const stale = await worker.fetch(
+        request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+          method: "POST",
+          body: JSON.stringify({ previewId: oldPreviewId }),
+        }),
+        env,
+        createExecutionContext(),
+      );
+      expect(stale.status).toBe(409);
+      expect(await stale.json()).toMatchObject({ error: { code: "import_preview_changed" } });
+      const contexts = [createExecutionContext(), createExecutionContext()];
+      const create = vi.fn(async ({ id }: { id?: string }) => ({ id }));
+      const confirmed = await Promise.all(
+        contexts.map((context) =>
+          worker.fetch(
+            request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+              method: "POST",
+              body: JSON.stringify({ previewId: preview.previewId }),
+            }),
+            bindingsWith({
+              NOTES_WORKFLOW: { create },
+              BUCKET: {
+                get: () => {
+                  throw new Error("Confirmation must not download the upload");
+                },
+              },
+            }),
+            context,
+          ),
+        ),
+      );
+      expect(confirmed.map((response) => response.status).sort((left, right) => left - right)).toEqual([202, 409]);
+      for (const context of contexts) await waitOnExecutionContext(context);
+      expect(create).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("recovers a lost invalidation response, cleans obsolete resources, and refreshes a confirmed import", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const inputKey = `jobs/${jobId}/input/old.zip`;
+    await env.BUCKET.put(inputKey, createZip([{ path: "Current.md", bytes: new TextEncoder().encode("# Current") }]));
+    await env.DB.prepare(`INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, options_json, input_key, created_at, updated_at)
+      VALUES (?, ?, ?, 'import', 'running', ?, ?, ?, ?, ?)`)
+      .bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        JSON.stringify({
+          filename: "old.zip",
+          format: "notion_zip",
+          confirmed: true,
+          previewId: "old",
+          previewGroupingVersion: NOTION_GROUPING_VERSION - 1,
+        }),
+        inputKey,
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const stagedPageId = `page-${(await sha256Hex(`${jobId}:page:Current.md`)).slice(0, 48)}`;
+    await env.DB.prepare(`INSERT INTO pages (id, workspace_id, space_id, parent_id, kind, position, title, is_template, import_job_id, content_epoch, created_by, created_at, updated_at)
+      VALUES (?, ?, ?, NULL, 'document', 'z0', 'Obsolete staged page', 0, ?, 1, ?, ?, ?)`)
+      .bind(
+        stagedPageId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        jobId,
+        installed.userId,
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const running = (await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<JobRow>())!;
+    const steps: string[] = [];
+    let invalidationResponseLost = false;
+    await runImport(env, running, {
+      async do<T>(name: string, callback: () => Promise<T>) {
+        steps.push(name);
+        const result = await callback();
+        if (name === "invalidate obsolete confirmation" && !invalidationResponseLost) {
+          invalidationResponseLost = true;
+          steps.push(name);
+          return callback();
+        }
+        return result;
+      },
+    } as Parameters<typeof runImport>[2]);
+    const refreshed = (await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<JobRow>())!;
+    expect(refreshed.status).toBe("awaiting_confirmation");
+    expect(refreshed.attempt).toBe(2);
+    expect(JSON.parse(refreshed.options_json).confirmed).toBe(false);
+    expect(JSON.parse(refreshed.result_json).preview).toMatchObject({
+      previewId: expect.any(String),
+      groupingVersion: NOTION_GROUPING_VERSION,
+      pages: 1,
+    });
+    expect(steps).toEqual([
+      "invalidate obsolete confirmation",
+      "invalidate obsolete confirmation",
+      "inspect refreshed import",
+      "await refreshed confirmation",
+    ]);
+    expect(
+      await env.DB.prepare("SELECT count(*) AS total FROM pages WHERE import_job_id = ?").bind(jobId).first("total"),
+    ).toBe(0);
+
+    const confirmationContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      inlineBindings(),
+      confirmationContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmationContext);
+    expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=? AND attempt=2").bind(jobId).first("status")).toBe(
+      "succeeded",
+    );
+    expect(await env.DB.prepare("SELECT title,content_epoch FROM pages WHERE id=?").bind(stagedPageId).first()).toEqual(
+      {
+        title: "Current",
+        content_epoch: 2,
+      },
+    );
+  });
+
+  it("persists a transported HTTP failure against the attempt created by internal preview invalidation", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const instanceId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(`INSERT INTO jobs
+      (id,workspace_id,space_id,type,status,requested_by,workflow_instance_id,attempt,options_json,input_key,created_at,updated_at)
+      VALUES (?,?,?,'import','queued',?,?,1,?,?,?,?)`)
+      .bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        instanceId,
+        JSON.stringify({
+          filename: "obsolete.zip",
+          format: "notion_zip",
+          confirmed: true,
+          previewId: "obsolete",
+          previewGroupingVersion: NOTION_GROUPING_VERSION - 1,
+        }),
+        `jobs/${jobId}/input/obsolete.zip`,
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const original = new HttpError(409, "import_upload_missing", "Upload the file again.");
+    const transported = Object.assign(new Error(original.message), Object.fromEntries(Object.entries(original)));
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "get") return async () => Promise.reject(transported);
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    await expect(
+      startJobExecution(bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: bucket }), {
+        id: jobId,
+        workflow_instance_id: instanceId,
+        attempt: 1,
+      }),
+    ).rejects.toBe(transported);
+    expect(
+      await env.DB.prepare("SELECT attempt,status,error_code,error_message FROM jobs WHERE id=?").bind(jobId).first(),
+    ).toEqual({
+      attempt: 2,
+      status: "failed",
+      error_code: "import_upload_missing",
+      error_message: "Upload the file again.",
+    });
+  });
+
+  it("does not attribute an obsolete workflow failure to an externally superseding attempt", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const instanceId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(`INSERT INTO jobs
+      (id,workspace_id,space_id,type,status,requested_by,workflow_instance_id,attempt,options_json,input_key,created_at,updated_at)
+      VALUES (?,?,?,'import','queued',?,?,1,?,?,?,?)`)
+      .bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        instanceId,
+        JSON.stringify({
+          filename: "obsolete.zip",
+          format: "notion_zip",
+          confirmed: true,
+          previewId: "obsolete",
+          previewGroupingVersion: NOTION_GROUPING_VERSION - 1,
+        }),
+        `jobs/${jobId}/input/obsolete.zip`,
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const replacementId = crypto.randomUUID();
+    const failure = new Error("obsolete workflow failed");
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "get")
+          return async () => {
+            await env.DB.prepare(
+              "UPDATE jobs SET attempt=3,workflow_instance_id=?,status='queued' WHERE id=? AND attempt=2",
+            )
+              .bind(replacementId, jobId)
+              .run();
+            throw failure;
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    await expect(
+      startJobExecution(bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: bucket }), {
+        id: jobId,
+        workflow_instance_id: instanceId,
+        attempt: 1,
+      }),
+    ).rejects.toBe(failure);
+    expect(
+      await env.DB.prepare("SELECT attempt,status,workflow_instance_id,error_code FROM jobs WHERE id=?")
+        .bind(jobId)
+        .first(),
+    ).toEqual({ attempt: 3, status: "queued", workflow_instance_id: replacementId, error_code: null });
+  });
+
+  it.each(["missing", "storage", "parser"] as const)(
+    "reports reinspection failures accurately: %s",
+    async (failure) => {
+      const installed = await bootstrap();
+      const jobId = crypto.randomUUID();
+      const inputKey = `jobs/${jobId}/input/failure.zip`;
+      const timestamp = Date.now();
+      await env.DB.prepare(`INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, options_json, input_key, created_at, updated_at)
+      VALUES (?, ?, ?, 'import', 'awaiting_confirmation', ?, ?, ?, ?, ?)`)
+        .bind(
+          jobId,
+          installed.workspaceId,
+          `${installed.workspaceId}-general`,
+          installed.userId,
+          JSON.stringify({ filename: "failure.zip", format: "notion_zip", confirmed: false }),
+          inputKey,
+          timestamp,
+          timestamp,
+        )
+        .run();
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      onTestFinished(() => log.mockRestore());
+      const bucket = new Proxy(env.BUCKET, {
+        get(target, property) {
+          if (property === "get")
+            return async () => {
+              if (failure === "missing") return null;
+              if (failure === "storage") throw new Error("R2 temporarily unavailable");
+              return { arrayBuffer: async () => new Uint8Array([0, 1, 2]).buffer };
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const context = createExecutionContext();
+      const response = await worker.fetch(
+        request(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+        bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: bucket }),
+        context,
+      );
+      expect(response.status).toBe(202);
+      await waitOnExecutionContext(context);
+      const failed = (await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<JobRow>())!;
+      expect(failed.status).toBe("failed");
+      expect(failed.error_code).toBe(failure === "missing" ? "import_upload_missing" : "job_failed");
+      expect(failed.error_message).not.toContain("preview");
+      const executionLogs = log.mock.calls.filter(([message]) => message === "Job execution failed");
+      expect(executionLogs).toHaveLength(failure === "missing" ? 0 : 1);
+      expect(failed.error_message?.includes("Upload the file again")).toBe(failure === "missing");
+      expect(executionLogs.map(([, details]) => ({ jobId: details.jobId, attempt: details.attempt }))).toEqual(
+        failure === "missing" ? [] : [{ jobId, attempt: 2 }],
+      );
+    },
+  );
+
+  it.each(["confirm", "retry"] as const)(
+    "queues reinspection of changed legacy ownership groups on %s without reading R2",
     async (action) => {
       const installed = await bootstrap();
       const spaceId = `${installed.workspaceId}-general`;
@@ -2706,62 +3136,65 @@ describe("job execution", () => {
           method: "POST",
           ...(action === "confirm" ? { body: JSON.stringify({ groupSpaceIds: { Imported: spaceId } }) } : {}),
         }),
-        bindingsWith({ NOTES_WORKFLOW: { create } }),
+        bindingsWith({
+          NOTES_WORKFLOW: { create },
+          BUCKET: {
+            get: () => {
+              throw new Error("HTTP must not read the upload");
+            },
+          },
+        }),
         context,
       );
-      expect(attempted.status).toBe(409);
-      expect(await attempted.json()).toMatchObject({ error: { code: "import_preview_outdated" } });
+      expect(attempted.status).toBe(202);
+      expect(await attempted.json()).toMatchObject({
+        job: { status: "queued", progress: { label: "Refreshing preview" } },
+      });
       await waitOnExecutionContext(context);
-      expect(create).not.toHaveBeenCalled();
+      expect(create).toHaveBeenCalledTimes(1);
       expect(await env.DB.prepare("SELECT status, attempt FROM jobs WHERE id = ?").bind(jobId).first()).toEqual({
-        status,
-        attempt: job.attempt,
+        status: "queued",
+        attempt: job.attempt + 1,
       });
     },
   );
 
-  it.each(["Imported", "Wrong group"])(
-    "validates legacy mappings without preview keys against the upload: %s",
-    async (groupKey) => {
-      const installed = await bootstrap();
-      const jobId = crypto.randomUUID();
-      const inputKey = `jobs/${jobId}/input/legacy.md`;
-      const spaceId = `${installed.workspaceId}-general`;
-      await env.BUCKET.put(inputKey, "# Legacy");
-      await env.DB.prepare(`INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, options_json, input_key, created_at, updated_at)
+  it.each(["Imported", "Wrong group"])("refreshes legacy mappings without preview keys: %s", async (groupKey) => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const inputKey = `jobs/${jobId}/input/legacy.md`;
+    const spaceId = `${installed.workspaceId}-general`;
+    await env.BUCKET.put(inputKey, "# Legacy");
+    await env.DB.prepare(`INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, options_json, input_key, created_at, updated_at)
       VALUES (?, ?, ?, 'import', 'failed', ?, ?, ?, ?, ?)`)
-        .bind(
-          jobId,
-          installed.workspaceId,
-          spaceId,
-          installed.userId,
-          JSON.stringify({
-            filename: "legacy.md",
-            format: "markdown",
-            confirmed: true,
-            groupSpaceIds: { [groupKey]: spaceId },
-          }),
-          inputKey,
-          Date.now(),
-          Date.now(),
-        )
-        .run();
-      const create = vi.fn(async ({ id }: { id?: string }) => ({ id }));
-      const context = createExecutionContext();
-      const response = await worker.fetch(
-        request(installed.cookie, `/api/jobs/${jobId}/retry`, { method: "POST" }),
-        bindingsWith({ NOTES_WORKFLOW: { create } }),
-        context,
-      );
-      await waitOnExecutionContext(context);
-      const valid = groupKey === "Imported";
-      expect(response.status).toBe(valid ? 202 : 409);
-      expect(create).toHaveBeenCalledTimes(valid ? 1 : 0);
-      expect(await env.DB.prepare("SELECT attempt FROM jobs WHERE id = ?").bind(jobId).first("attempt")).toBe(
-        valid ? 2 : 1,
-      );
-    },
-  );
+      .bind(
+        jobId,
+        installed.workspaceId,
+        spaceId,
+        installed.userId,
+        JSON.stringify({
+          filename: "legacy.md",
+          format: "markdown",
+          confirmed: true,
+          groupSpaceIds: { [groupKey]: spaceId },
+        }),
+        inputKey,
+        Date.now(),
+        Date.now(),
+      )
+      .run();
+    const create = vi.fn(async ({ id }: { id?: string }) => ({ id }));
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}/retry`, { method: "POST" }),
+      bindingsWith({ NOTES_WORKFLOW: { create } }),
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(response.status).toBe(202);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(await env.DB.prepare("SELECT attempt FROM jobs WHERE id = ?").bind(jobId).first("attempt")).toBe(2);
+  });
 
   it("does not treat a real page whose title starts with Export- as an archive wrapper", async () => {
     const installed = await bootstrap();
@@ -2789,7 +3222,7 @@ describe("job execution", () => {
     await waitOnExecutionContext(uploadContext);
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
       inlineBindings(),
       confirmContext,
     );
@@ -2832,6 +3265,8 @@ describe("job execution", () => {
         JSON.stringify({
           ...JSON.parse(inspected.options_json),
           confirmed: true,
+          previewId: JSON.parse(inspected.result_json).preview.previewId,
+          previewGroupingVersion: NOTION_GROUPING_VERSION,
           previewGroupKeys: ["Imported"],
           groupSpaceIds: { Imported: `${installed.workspaceId}-general` },
         }),
@@ -2899,7 +3334,7 @@ describe("job execution", () => {
 
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ groupSpaceIds: { Imported: privateSpace.id } }),
@@ -2915,7 +3350,7 @@ describe("job execution", () => {
     ).toEqual({ space_id: privateSpace.id });
   });
 
-  it("confirms a legacy preview with an empty JSON-typed body and rejects malformed nonempty JSON", async () => {
+  it("refreshes a legacy preview and requires confirmation again, rejecting malformed JSON", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
     const inputKey = `jobs/${jobId}/input/legacy.md`;
@@ -2944,7 +3379,7 @@ describe("job execution", () => {
       .run();
 
     const malformed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: "{",
@@ -2956,7 +3391,7 @@ describe("job execution", () => {
 
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ groupSpaceIds: {} }),
@@ -2967,8 +3402,17 @@ describe("job execution", () => {
     expect(confirmed.status).toBe(202);
     await waitOnExecutionContext(confirmContext);
     expect(await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual({
-      status: "succeeded",
+      status: "awaiting_confirmation",
     });
+    const finalContext = createExecutionContext();
+    const final = await worker.fetch(
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      inlineBindings(),
+      finalContext,
+    );
+    expect(final.status).toBe(202);
+    await waitOnExecutionContext(finalContext);
+    expect(await env.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(jobId).first("status")).toBe("succeeded");
   });
 
   it("maps Notion groups to spaces and links row detail pages without duplicating them in the tree", async () => {
@@ -3035,13 +3479,13 @@ describe("job execution", () => {
     expect(preview.groups?.map((group) => group.name)).toEqual(["SparkedAI HQ", "Private & Shared"]);
 
     const missingMappings = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
       bindings,
       createExecutionContext(),
     );
     expect(missingMappings.status).toBe(422);
     const partialMappings = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ groupSpaceIds: { "SparkedAI HQ": `${installed.workspaceId}-general` } }),
@@ -3053,7 +3497,7 @@ describe("job execution", () => {
 
     const confirmContext = createExecutionContext();
     const confirmed = await worker.fetch(
-      request(installed.cookie, `/api/imports/${jobId}/confirm`, {
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -3124,7 +3568,15 @@ describe("job execution", () => {
     await waitOnExecutionContext(uploadContext);
     const awaiting = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
     await env.DB.prepare(`UPDATE jobs SET status = 'running', options_json = ? WHERE id = ?`)
-      .bind(JSON.stringify({ ...JSON.parse(awaiting.options_json), confirmed: true }), jobId)
+      .bind(
+        JSON.stringify({
+          ...JSON.parse(awaiting.options_json),
+          confirmed: true,
+          previewId: JSON.parse(awaiting.result_json).preview.previewId,
+          previewGroupingVersion: NOTION_GROUPING_VERSION,
+        }),
+        jobId,
+      )
       .run();
     const firstAttempt = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
 
@@ -3197,7 +3649,15 @@ describe("job execution", () => {
     await waitOnExecutionContext(uploadContext);
     const awaiting = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
     await env.DB.prepare(`UPDATE jobs SET status = 'running', options_json = ? WHERE id = ?`)
-      .bind(JSON.stringify({ ...JSON.parse(awaiting.options_json), confirmed: true }), jobId)
+      .bind(
+        JSON.stringify({
+          ...JSON.parse(awaiting.options_json),
+          confirmed: true,
+          previewId: JSON.parse(awaiting.result_json).preview.previewId,
+          previewGroupingVersion: NOTION_GROUPING_VERSION,
+        }),
+        jobId,
+      )
       .run();
     const running = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(jobId).first<JobRow>())!;
     let replaced = false;

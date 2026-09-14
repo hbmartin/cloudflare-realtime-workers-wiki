@@ -132,8 +132,10 @@ by source IP or by caller zone for cross-zone Worker traffic. It then uses `API_
 `API_MINUTE_LIMIT` bindings per authenticated integration. These are declared
 in `wrangler.jsonc`. The source limits are 300 requests per 10 seconds and 1,800 per minute; integration
 limits are 100 per 10 seconds and 600 per minute. Both return a Notion-compatible `429` response. Browser
-authentication and install routes are still unthrottled at the application layer, so retain external
-protection for them. A dashboard rule for `/v1/*` can additionally reject abuse before Worker execution.
+authentication is also limited in D1: password sign-in, signup, and two-factor routes allow three requests
+per source IP every ten seconds, while failed password attempts share a normalized-account limit of ten per
+15 minutes across source IPs. Install bootstrap and the work performed before invite authentication still
+need edge protection. A dashboard rule for `/v1/*` can additionally reject abuse before Worker execution.
 
 Add Cloudflare Rate Limiting rules before exposing the origin publicly. At minimum:
 
@@ -166,6 +168,12 @@ runtime failures rather than a clean startup error.
 production migrations and must remain in order; never edit an applied migration or mark it applied by
 hand. Before upgrading an existing installation, take a D1 export and stop any running Notion import,
 then run `pnpm db:remote` before deploying the Worker that consumes the new schema.
+
+For the security lifecycle follow-up, apply `0029_security_lifecycle.sql` and then
+`0030_security_review_followups.sql` before deploying the updated Worker. Migration `0030` is compatible
+with the Worker released alongside `0029`, so both migrations can finish before the code rollout. It adds
+expiring invitation claim leases, staged recovery-code storage, rate-limit retention indexing, stricter
+invite-completion validation, and restore-order-safe account-security initialization.
 
 `0005_import_reliability.sql` adopts existing multipart sessions as `active`, so uploads already in
 progress remain recoverable. It also clears legacy bulk-write replay receipts because they have no

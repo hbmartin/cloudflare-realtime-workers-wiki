@@ -7,11 +7,14 @@ import { generateRandomString, symmetricDecrypt, symmetricEncrypt } from "better
 import type { SecurityStatus } from "../shared/security";
 import type { Env } from "./env";
 import { HttpError, sha256 } from "./http";
+import { clearRateLimit, consumeFixedWindow } from "./rate-limit";
 
 const TRUST_MS = 30 * 24 * 60 * 60_000;
 const FRESH_MS = 5 * 60_000;
 const RECOVERY_MS = 10 * 60_000;
 const RECOVERY_RESUME_MS = 24 * 60 * 60_000;
+const PENDING_RECOVERY_MS = 30 * 60_000;
+const PASSWORD_ATTEMPT_RULE = { window: 15 * 60, max: 10 };
 type SecurityAccount = { generation: number; recovery_required: number; codes_saved: number; locked_until: number };
 type Grant = { method: "totp" | "passkey" | "trust" | "recovery"; verified_at: number; expires_at: number };
 type Identity = { userId: string; sessionId: string | null; challenge: string | null };
@@ -40,10 +43,17 @@ async function securityAccount(env: Env, userId: string): Promise<SecurityAccoun
 
 // One database snapshot owns both the status decision and the proof it returns.
 // Expired recovery proof is retained only for password-protected resumption.
-async function readSecurity(env: Env, userId: string, sessionId: string | null) {
+async function readSecurity(env: Env, userId: string, sessionId: string | null, includePendingInvite = false) {
   const time = Date.now();
+  const pendingInvite = includePendingInvite
+    ? `EXISTS(SELECT 1 FROM invites invite JOIN user claimant ON claimant.id=a.user_id
+        WHERE invite.claimed_by=a.user_id AND lower(invite.claimed_email)=lower(claimant.email)
+          AND invite.used_at IS NULL AND invite.expires_at>?
+          AND NOT EXISTS(SELECT 1 FROM workspace_members member
+            WHERE member.workspace_id=invite.workspace_id AND member.user_id=a.user_id))`
+    : "0";
   const row = await env.DB.prepare(`SELECT a.*,
-    EXISTS(SELECT 1 FROM invites WHERE claimed_by=a.user_id AND used_at IS NULL AND expires_at>?) pending_invite,
+    ${pendingInvite} pending_invite,
     EXISTS(SELECT 1 FROM twoFactor WHERE userId=a.user_id AND verified=1) totp,
     (SELECT COUNT(*) FROM passkey WHERE userId=a.user_id) passkeys,
     s.method,s.verified_at,s.expires_at
@@ -53,7 +63,7 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null) 
       AND (s.method!='trust' OR EXISTS(SELECT 1 FROM trusted_browsers t
         WHERE t.id=s.trust_id AND t.user_id=a.user_id AND t.generation=a.generation AND t.expires_at>?))
     WHERE a.user_id=?`)
-    .bind(time, sessionId, new Date(time).toISOString(), time, userId)
+    .bind(...(includePendingInvite ? [time] : []), sessionId, new Date(time).toISOString(), time, userId)
     .first<
       SecurityAccount & {
         pending_invite: number;
@@ -151,6 +161,12 @@ async function attempt(env: Env, userId: string) {
     });
 }
 
+async function resetAttempts(env: Env, userId: string, generation: number) {
+  return env.DB.prepare("UPDATE account_security SET failed_attempts=0,locked_until=0 WHERE user_id=? AND generation=?")
+    .bind(userId, generation)
+    .run();
+}
+
 async function password(ctx: GenericEndpointContext, userId: string) {
   const value = field(ctx, "password");
   const accounts = await ctx.context.internalAdapter.findAccounts(userId);
@@ -178,9 +194,7 @@ async function stamp(
       .bind(sessionId, Date.now(), expiresAt, method, trustId, userId, generation)
       .first();
   if (!result) throw deny("Security settings changed. Sign in again.");
-  await env.DB.prepare("UPDATE account_security SET failed_attempts = 0, locked_until = 0 WHERE user_id = ?")
-    .bind(userId)
-    .run();
+  await resetAttempts(env, userId, generation);
   console.info("account-security", { event: "verified", userId, method });
 }
 
@@ -222,21 +236,96 @@ function trustCookie(ctx: GenericEndpointContext) {
 
 // Session generation is captured before verification, so a concurrent reset cannot
 // turn a response from an old ceremony into a grant for the new account generation.
-type PolicyContext = { notesSecurity?: { userId: string; generation: number } };
+export type PasskeyPermit = { credentialId: string; userId: string; sessionId: string; generation: number };
+type PolicyContext = {
+  notesSecurity?: { userId: string; generation: number };
+  notesPasswordRateLimitKey?: string;
+  notesPasskeyPermit?: PasskeyPermit;
+};
 function captureSecurity(ctx: GenericEndpointContext, userId: string, generation: number) {
   (ctx.context as typeof ctx.context & PolicyContext).notesSecurity = { userId, generation };
+}
+
+export async function upsertPasskeyRegistrationPermit(env: Env, permit: PasskeyPermit) {
+  const permitted = await env.DB.prepare(`INSERT INTO pending_passkeys(credential_id,user_id,session_id,generation)
+    SELECT ?,a.user_id,s.id,a.generation FROM account_security a JOIN session s ON s.userId=a.user_id
+    WHERE a.user_id=? AND a.generation=? AND s.id=? AND s.expiresAt>?
+    ON CONFLICT(credential_id) DO UPDATE SET user_id=excluded.user_id,session_id=excluded.session_id,
+      generation=excluded.generation RETURNING credential_id`)
+    .bind(permit.credentialId, permit.userId, permit.generation, permit.sessionId, new Date().toISOString())
+    .first();
+  return !!permitted;
 }
 
 export async function authorizePasskeyRegistration(ctx: GenericEndpointContext, env: Env, credentialId: string) {
   const id = await requireIdentity(ctx);
   const capture = (ctx.context as typeof ctx.context & PolicyContext).notesSecurity;
   if (!id.sessionId || !capture || capture.userId !== id.userId) throw deny();
-  const permitted = await env.DB.prepare(`INSERT INTO pending_passkeys(credential_id,user_id,session_id,generation)
-    SELECT ?,a.user_id,s.id,a.generation FROM account_security a JOIN session s ON s.userId=a.user_id
-    WHERE a.user_id=? AND a.generation=? AND s.id=? AND s.expiresAt>? RETURNING credential_id`)
-    .bind(credentialId, id.userId, capture.generation, id.sessionId, new Date().toISOString())
-    .first();
+  const permit = {
+    credentialId,
+    userId: id.userId,
+    sessionId: id.sessionId,
+    generation: capture.generation,
+  };
+  const permitted = await upsertPasskeyRegistrationPermit(env, permit);
   if (!permitted) throw deny("Security settings changed. Sign in again.");
+  (ctx.context as typeof ctx.context & PolicyContext).notesPasskeyPermit = permit;
+}
+
+export async function cleanupFailedPasskeyRegistration(env: Env, permit: PasskeyPermit) {
+  const current = await env.DB.prepare(`SELECT 1 FROM pending_passkeys candidate
+    JOIN account_security account
+      ON account.user_id=candidate.user_id AND account.generation=candidate.generation
+    JOIN session live ON live.id=candidate.session_id AND live.userId=candidate.user_id
+    WHERE candidate.credential_id=? AND candidate.user_id=? AND candidate.session_id=?
+      AND candidate.generation=? AND live.expiresAt>?`)
+    .bind(permit.credentialId, permit.userId, permit.sessionId, permit.generation, new Date().toISOString())
+    .first();
+  await env.DB.prepare(
+    "DELETE FROM pending_passkeys WHERE credential_id=? AND user_id=? AND session_id=? AND generation=?",
+  )
+    .bind(permit.credentialId, permit.userId, permit.sessionId, permit.generation)
+    .run();
+  return { revoked: !current };
+}
+
+export function passkeyRegistrationRevokedResponse() {
+  const error = deny("Security settings changed. Sign in again.");
+  return new Response(JSON.stringify(error.body), {
+    status: error.statusCode,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+export async function pruneSecurityState(env: Env) {
+  const time = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM rateLimit WHERE id IN(
+      SELECT id FROM rateLimit WHERE lastRequest<? ORDER BY lastRequest LIMIT 500
+    )`).bind(time - 24 * 60 * 60_000),
+    env.DB.prepare(`DELETE FROM pending_recovery_codes WHERE code_hash IN(
+      SELECT code_hash FROM pending_recovery_codes WHERE expires_at<=? ORDER BY expires_at LIMIT 500
+    )`).bind(time),
+  ]);
+}
+
+function passwordSource(headers: Headers | undefined) {
+  const raw = headers?.get("cf-connecting-ip")?.trim().toLowerCase();
+  if (!raw) return "unknown";
+  const ipv4 = raw.split(".");
+  if (ipv4.length === 4 && ipv4.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255))
+    return ipv4.map(Number).join(".");
+  if (!raw.includes(":")) return "unknown";
+  try {
+    const hostname = new URL(`http://[${raw}]/`).hostname;
+    return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+async function passwordRateLimitKey(email: string, headers: Headers | undefined) {
+  return `password-account-v2:${await sha256(JSON.stringify([email, passwordSource(headers)]))}`;
 }
 
 const post = (path: string, handler: (ctx: GenericEndpointContext) => Promise<unknown>) =>
@@ -250,7 +339,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         const id = await identity(ctx);
         return ctx.json(
           id
-            ? (await readSecurity(env, id.userId, id.sessionId)).status
+            ? (await readSecurity(env, id.userId, id.sessionId, true)).status
             : ({
                 state: "signed_out",
                 totp: false,
@@ -335,11 +424,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
           ON CONFLICT(session_id) DO UPDATE SET secret=excluded.secret,expires_at=excluded.expires_at`)
           .bind(id.sessionId, id.userId, encrypted, Date.now() + RECOVERY_MS)
           .run();
-        await env.DB.prepare(
-          "UPDATE account_security SET failed_attempts=0,locked_until=0 WHERE user_id=? AND generation=?",
-        )
-          .bind(id.userId, id.security.account.generation)
-          .run();
+        await resetAttempts(env, id.userId, id.security.account.generation);
         const user = await ctx.context.internalAdapter.findUserById(id.userId);
         return ctx.json({ totpURI: createOTP(secret, { digits: 6, period: 30 }).url("Realtime Notes", user!.email) });
       }),
@@ -423,32 +508,93 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         const codes = Array.from({ length: 10 }, () => generateRandomString(24));
         const hashes = await Promise.all(codes.map(sha256));
         const receipt = crypto.randomUUID();
-        // The batch receipt binds acknowledgment to the codes actually displayed.
-        // Every write is also conditional on the issuing session surviving revocation.
+        const expiresAt = Date.now() + PENDING_RECOVERY_MS;
+        const fresh = `EXISTS(SELECT 1 FROM account_security a
+          JOIN session live ON live.userId=a.user_id
+          JOIN session_security proof ON proof.session_id=live.id AND proof.user_id=a.user_id AND proof.generation=a.generation
+          WHERE a.user_id=? AND a.generation=? AND live.id=? AND live.expiresAt>?
+            AND proof.method IN ('totp','passkey') AND proof.verified_at>? AND proof.expires_at>?)`;
+        const freshBinds = [
+          id.userId,
+          id.security.account.generation,
+          id.sessionId,
+          new Date().toISOString(),
+          Date.now() - FRESH_MS,
+          Date.now(),
+        ];
+        // A replacement remains pending until the exact displayed batch is
+        // acknowledged. Existing active codes and private access stay intact.
         const result = await env.DB.batch([
-          env.DB.prepare(
-            "UPDATE account_security SET codes_batch=?,codes_saved=0 WHERE user_id=? AND EXISTS(SELECT 1 FROM session WHERE id=?) RETURNING user_id",
-          ).bind(receipt, id.userId, id.sessionId),
-          env.DB.prepare(
-            "DELETE FROM recovery_codes WHERE user_id=? AND EXISTS(SELECT 1 FROM account_security WHERE user_id=? AND codes_batch=?)",
-          ).bind(id.userId, id.userId, receipt),
+          env.DB.prepare(`DELETE FROM pending_recovery_codes
+              WHERE user_id=? AND generation=? AND ${fresh}`).bind(
+            id.userId,
+            id.security.account.generation,
+            ...freshBinds,
+          ),
           ...hashes.map((hash) =>
-            env.DB.prepare(
-              "INSERT INTO recovery_codes(code_hash,user_id) SELECT ?,user_id FROM account_security WHERE user_id=? AND codes_batch=?",
-            ).bind(hash, id.userId, receipt),
+            env.DB.prepare(`INSERT INTO pending_recovery_codes(code_hash,batch_id,user_id,generation,expires_at)
+                SELECT ?,?,?,?,? WHERE ${fresh} RETURNING code_hash`).bind(
+              hash,
+              receipt,
+              id.userId,
+              id.security.account.generation,
+              expiresAt,
+              ...freshBinds,
+            ),
           ),
         ]);
-        if (!result[0]!.results.length) throw deny("Sign in again before generating recovery codes.");
+        if (!result[1]!.results.length) throw deny("Sign in again before generating recovery codes.");
         return ctx.json({ codes, receipt });
       }),
       acknowledgeRecovery: post("/security/acknowledge-codes", async (ctx) => {
         const id = await requireFresh(ctx, env);
-        const result = await env.DB.prepare(
-          "UPDATE account_security SET codes_saved=1 WHERE user_id=? AND codes_batch=? AND EXISTS(SELECT 1 FROM session WHERE id=?)",
-        )
-          .bind(id.userId, field(ctx, "receipt"), id.sessionId)
-          .run();
-        if (!result.meta.changes) throw deny("Those recovery codes were replaced. Generate and save a new set.");
+        const receipt = field(ctx, "receipt");
+        const time = Date.now();
+        const generation = id.security.account.generation;
+        const validBatch = `EXISTS(SELECT 1 FROM pending_recovery_codes pending
+          WHERE pending.user_id=? AND pending.batch_id=? AND pending.generation=? AND pending.expires_at>?
+          GROUP BY pending.user_id,pending.batch_id,pending.generation HAVING COUNT(*)=10)`;
+        const fresh = `EXISTS(SELECT 1 FROM session live JOIN session_security proof
+          ON proof.session_id=live.id AND proof.user_id=live.userId
+          WHERE live.id=? AND live.userId=? AND live.expiresAt>? AND proof.generation=?
+            AND proof.method IN ('totp','passkey') AND proof.verified_at>? AND proof.expires_at>?)`;
+        const guardBinds = [
+          id.userId,
+          receipt,
+          generation,
+          time,
+          id.sessionId,
+          id.userId,
+          new Date(time).toISOString(),
+          generation,
+          time - FRESH_MS,
+          time,
+        ];
+        const result = await env.DB.batch([
+          env.DB.prepare(`DELETE FROM recovery_codes WHERE user_id=? AND ${validBatch} AND ${fresh}`).bind(
+            id.userId,
+            ...guardBinds,
+          ),
+          env.DB.prepare(`INSERT INTO recovery_codes(code_hash,user_id)
+            SELECT pending.code_hash,pending.user_id FROM pending_recovery_codes pending
+            WHERE pending.user_id=? AND pending.batch_id=? AND pending.generation=? AND pending.expires_at>?
+              AND ${validBatch} AND ${fresh}`).bind(id.userId, receipt, generation, time, ...guardBinds),
+          env.DB.prepare(`UPDATE account_security SET codes_saved=1,codes_batch=NULL
+              WHERE user_id=? AND generation=? AND ${validBatch} AND ${fresh} RETURNING user_id`).bind(
+            id.userId,
+            generation,
+            ...guardBinds,
+          ),
+          env.DB.prepare(`DELETE FROM pending_recovery_codes
+            WHERE user_id=? AND batch_id=? AND generation=? AND ${validBatch} AND ${fresh}`).bind(
+            id.userId,
+            receipt,
+            generation,
+            ...guardBinds,
+          ),
+        ]);
+        if (!result[2]!.results.length)
+          throw deny("Those recovery codes were replaced or expired. Generate a new set.");
         return ctx.json({ success: true });
       }),
       resumeRecovery: post("/security/resume-recovery", async (ctx) => {
@@ -474,11 +620,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
           )
           .first();
         if (!resumed) throw deny("Recovery expired or was revoked. Use a recovery code or operator reset token.");
-        await env.DB.prepare(
-          "UPDATE account_security SET failed_attempts=0,locked_until=0 WHERE user_id=? AND generation=?",
-        )
-          .bind(id.userId, account.generation)
-          .run();
+        await resetAttempts(env, id.userId, account.generation);
         return ctx.json({ success: true });
       }),
       recoverSecurity: post("/security/recover", async (ctx) => {
@@ -519,6 +661,11 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
           ),
           env.DB.prepare(`DELETE FROM session WHERE userId=? AND ${guard}`).bind(id.userId, id.userId, receipt),
           env.DB.prepare(`DELETE FROM trusted_browsers WHERE user_id=? AND ${guard}`).bind(
+            id.userId,
+            id.userId,
+            receipt,
+          ),
+          env.DB.prepare(`DELETE FROM pending_recovery_codes WHERE user_id=? AND ${guard}`).bind(
             id.userId,
             id.userId,
             receipt,
@@ -594,8 +741,21 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
                   .run();
               expireCookie(ctx, cookie);
             }
+            if (ctx.path === "/sign-in/email") {
+              const email = typeof ctx.body?.email === "string" ? ctx.body.email.trim().toLowerCase() : null;
+              if (email) {
+                const key = await passwordRateLimitKey(email, ctx.headers);
+                const limit = await consumeFixedWindow(env, key, PASSWORD_ATTEMPT_RULE);
+                if (!limit.allowed)
+                  throw new APIError("TOO_MANY_REQUESTS", {
+                    code: "PASSWORD_RATE_LIMITED",
+                    message: "Too many password attempts. Try again in 15 minutes.",
+                  });
+                (ctx.context as typeof ctx.context & PolicyContext).notesPasswordRateLimitKey = key;
+              }
+              return;
+            }
             const publicPaths = new Set([
-              "/sign-in/email",
               "/sign-up/email",
               "/sign-out",
               "/get-session",
@@ -626,7 +786,17 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         {
           matcher: () => true,
           handler: createAuthMiddleware(async (ctx) => {
-            if (ctx.context.returned instanceof APIError) return undefined;
+            const policy = ctx.context as typeof ctx.context & PolicyContext;
+            const permit = policy.notesPasskeyPermit;
+            if (ctx.context.returned instanceof APIError) {
+              if (permit) {
+                const { revoked } = await cleanupFailedPasskeyRegistration(env, permit);
+                delete policy.notesPasskeyPermit;
+                if (ctx.context.returned.statusCode === 500 && revoked) return passkeyRegistrationRevokedResponse();
+              }
+              return undefined;
+            }
+            delete policy.notesPasskeyPermit;
             if (ctx.path === "/passkey/generate-authenticate-options") {
               const options = ctx.context.returned as Record<string, unknown>;
               return ctx.json({ ...options, userVerification: "required" });
@@ -653,6 +823,9 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
                 .run();
             }
             if (ctx.path === "/sign-in/email" || ctx.path === "/sign-up/email") {
+              const rateLimitKey = policy.notesPasswordRateLimitKey;
+              if (rateLimitKey) await clearRateLimit(env, rateLimitKey);
+              delete policy.notesPasswordRateLimitKey;
               console.info("account-security", { event: "password-authenticated", outcome: "verification-required" });
             }
             return undefined;

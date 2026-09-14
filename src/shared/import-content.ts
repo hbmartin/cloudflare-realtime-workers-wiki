@@ -79,24 +79,80 @@ function blockDocument(blocks: ProseMirrorJson[]) {
   } satisfies ProseMirrorJson;
 }
 
-function markdownInline(value: string, issues: ImportIssue[]) {
+// Scan destinations instead of stopping at the first closing parenthesis.
+function markdownDestination(value: string, start: number) {
+  let cursor = start;
+  while (/\s/.test(value[cursor] ?? "") && cursor < value.length) cursor += 1;
+  const angled = value[cursor] === "<";
+  if (angled) cursor += 1;
+  let href = "";
+  let depth = 0;
+  for (; cursor < value.length; cursor += 1) {
+    const character = value[cursor]!;
+    if (character === "\\" && /[!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~]/.test(value[cursor + 1] ?? "")) {
+      href += value[++cursor];
+    } else if (angled && character === ">") {
+      cursor += 1;
+      break;
+    } else if (!angled && character === "(") {
+      depth += 1;
+      href += character;
+    } else if (!angled && character === ")") {
+      if (depth === 0) break;
+      depth -= 1;
+      href += character;
+    } else if (!angled && /\s/.test(character)) {
+      break;
+    } else {
+      href += character;
+    }
+  }
+  if (depth !== 0) return null;
+  const destinationEnd = cursor;
+  while (cursor < value.length && /\s/.test(value[cursor]!)) cursor += 1;
+  if (cursor > destinationEnd && ['"', "'", "("].includes(value[cursor] ?? "")) {
+    const closer = value[cursor] === "(" ? ")" : value[cursor];
+    cursor += 1;
+    while (cursor < value.length && value[cursor] !== closer) {
+      if (value[cursor] === "\\") cursor += 1;
+      cursor += 1;
+    }
+    if (value[cursor] !== closer) return null;
+    cursor += 1;
+    while (cursor < value.length && /\s/.test(value[cursor]!)) cursor += 1;
+  }
+  return value[cursor] === ")" ? { href, end: cursor + 1 } : null;
+}
+
+function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
   const output: ProseMirrorJson[] = [];
-  const pattern = /(!?)\[([^\]]*)\]\(([^)]+)\)|\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|\*([^*]+)\*|_([^_]+)_/g;
+  const pattern = /(!?)\[([^\]]*)\]\(|\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|\*([^*]+)\*|_([^_]+)_/g;
   let offset = 0;
-  for (const match of value.matchAll(pattern)) {
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(value))) {
     output.push(...inline(value.slice(offset, match.index)));
-    const [whole, image, label, rawUrl, boldA, boldB, code, italicA, italicB] = match;
-    if (rawUrl !== undefined) {
+    const [whole, image, label, boldA, boldB, code, italicA, italicB] = match;
+    if (label !== undefined) {
+      const destination = markdownDestination(value, pattern.lastIndex);
+      if (!destination) {
+        output.push(...inline(whole));
+        offset = pattern.lastIndex;
+        continue;
+      }
+      pattern.lastIndex = destination.end;
+      const rawUrl = destination.href;
       const url = safeLink(rawUrl);
       if (!url) {
         issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
         output.push(...inline(label ?? ""));
       } else if (image) {
+        references.push(url);
         // Images are not inline nodes in this schema, so both branches degrade to the
         // label; the issue keeps that downgrade visible in the import warnings.
         issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
         output.push(...inline(label ?? ""));
       } else {
+        references.push(url);
         output.push(...inline(label ?? "", [{ type: "link", attrs: { href: url } }]));
       }
     } else if (boldA !== undefined || boldB !== undefined) {
@@ -106,14 +162,23 @@ function markdownInline(value: string, issues: ImportIssue[]) {
     } else {
       output.push(...inline(italicA ?? italicB ?? "", [{ type: "italic" }]));
     }
-    offset = (match.index ?? 0) + whole.length;
+    offset = pattern.lastIndex;
   }
   output.push(...inline(value.slice(offset)));
   return output;
 }
 
+function markdownImage(value: string) {
+  const opener = /^!\[([^\]]*)\]\(/.exec(value);
+  if (!opener) return null;
+  const destination = markdownDestination(value, opener[0].length);
+  if (!destination || value.slice(destination.end).trim()) return null;
+  return { label: opener[1] ?? "", href: destination.href };
+}
+
 export function markdownToDocument(source: string) {
   const issues: ImportIssue[] = [];
+  const references: string[] = [];
   const blocks: ProseMirrorJson[] = [];
   const lines = source.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
   let paragraphLines: string[] = [];
@@ -121,7 +186,7 @@ export function markdownToDocument(source: string) {
   let codeLanguage = "";
   const flushParagraph = () => {
     if (!paragraphLines.length) return;
-    blocks.push(paragraph(markdownInline(paragraphLines.join(" ").trim(), issues)));
+    blocks.push(paragraph(markdownInline(paragraphLines.join(" ").trim(), issues, references)));
     paragraphLines = [];
   };
   for (const line of lines) {
@@ -149,7 +214,7 @@ export function markdownToDocument(source: string) {
       continue;
     }
     const heading = /^(#{1,6})\s+(.+)$/.exec(line);
-    const image = /^!\[([^\]]*)\]\(([^)]+)\)\s*$/.exec(line);
+    const image = markdownImage(line);
     const checklist = /^\s*[-*+]\s+\[([ xX])\]\s+(.+)$/.exec(line);
     const bullet = /^\s*[-*+]\s+(.+)$/.exec(line);
     const numbered = /^\s*\d+[.)]\s+(.+)$/.exec(line);
@@ -160,43 +225,52 @@ export function markdownToDocument(source: string) {
         blocks.push({
           type: "heading",
           attrs: { ...BLOCK_ATTRS, level: heading[1]!.length, isToggleable: false },
-          content: markdownInline(heading[2]!, issues),
+          content: markdownInline(heading[2]!, issues, references),
         });
       } else if (image) {
-        const url = safeLink(image[2]!);
-        if (url)
+        const url = safeLink(image.href);
+        if (url) {
+          references.push(url);
           blocks.push({
             type: "image",
             attrs: {
               backgroundColor: "default",
               textAlignment: "left",
               url,
-              caption: image[1] ?? "",
-              name: image[1] || "image",
+              caption: image.label,
+              name: image.label || "image",
               showPreview: true,
               previewWidth: 512,
             },
           });
-        else {
-          issues.push({ code: "unsafe_url", detail: image[2]!.slice(0, 120) });
-          blocks.push(paragraph(inline(image[1] ?? "image")));
+        } else {
+          issues.push({ code: "unsafe_url", detail: image.href.slice(0, 120) });
+          blocks.push(paragraph(inline(image.label || "image")));
         }
       } else if (checklist) {
         blocks.push({
           type: "checkListItem",
           attrs: { ...BLOCK_ATTRS, checked: checklist[1]!.toLowerCase() === "x" },
-          content: markdownInline(checklist[2]!, issues),
+          content: markdownInline(checklist[2]!, issues, references),
         });
       } else if (bullet) {
-        blocks.push({ type: "bulletListItem", attrs: { ...BLOCK_ATTRS }, content: markdownInline(bullet[1]!, issues) });
+        blocks.push({
+          type: "bulletListItem",
+          attrs: { ...BLOCK_ATTRS },
+          content: markdownInline(bullet[1]!, issues, references),
+        });
       } else if (numbered) {
         blocks.push({
           type: "numberedListItem",
           attrs: { ...BLOCK_ATTRS, start: 1 },
-          content: markdownInline(numbered[1]!, issues),
+          content: markdownInline(numbered[1]!, issues, references),
         });
       } else if (quote) {
-        blocks.push({ type: "quote", attrs: { ...BLOCK_ATTRS }, content: markdownInline(quote[1]!, issues) });
+        blocks.push({
+          type: "quote",
+          attrs: { ...BLOCK_ATTRS },
+          content: markdownInline(quote[1]!, issues, references),
+        });
       } else blocks.push({ type: "divider" });
       continue;
     }
@@ -207,7 +281,7 @@ export function markdownToDocument(source: string) {
     issues.push({ code: "unterminated_code_fence", detail: "The final code block had no closing fence." });
     blocks.push({ type: "codeBlock", attrs: { language: codeLanguage }, content: inline(codeLines.join("\n")) });
   }
-  return { document: blockDocument(blocks), issues };
+  return { document: blockDocument(blocks), issues, references };
 }
 
 function htmlAttributes(tag: string) {
@@ -220,6 +294,7 @@ function htmlAttributes(tag: string) {
 
 export function htmlToDocument(source: string) {
   const issues: ImportIssue[] = [];
+  const references: string[] = [];
   const blocks: ProseMirrorJson[] = [];
   const cleaned = source
     .replace(/<!--[\s\S]*?-->/g, "")
@@ -312,7 +387,8 @@ export function htmlToDocument(source: string) {
     } else if (!closing && name === "img") {
       flush();
       const url = safeLink(attrs.src ?? "");
-      if (url)
+      if (url) {
+        references.push(url);
         blocks.push({
           type: "image",
           attrs: {
@@ -325,10 +401,11 @@ export function htmlToDocument(source: string) {
             previewWidth: Math.min(Math.max(Number(attrs.width) || 512, 64), 1600),
           },
         });
-      else if (attrs.src) issues.push({ code: "unsafe_url", detail: attrs.src.slice(0, 120) });
+      } else if (attrs.src) issues.push({ code: "unsafe_url", detail: attrs.src.slice(0, 120) });
     } else if (!closing && name === "a") {
       const url = safeLink(attrs.href ?? "");
       if (!url && attrs.href) issues.push({ code: "unsafe_url", detail: attrs.href.slice(0, 120) });
+      if (url) references.push(url);
       link = url;
     } else if (closing && name === "a") link = null;
     else {
@@ -351,7 +428,7 @@ export function htmlToDocument(source: string) {
     }
   }
   flush();
-  return { document: blockDocument(blocks), title, issues };
+  return { document: blockDocument(blocks), title, issues, references };
 }
 
 function prosemirrorNodeToYjs(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {

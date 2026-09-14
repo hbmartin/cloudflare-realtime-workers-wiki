@@ -9,25 +9,80 @@ import {
 import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
 
+const HTTP_ERROR_KIND = "realtime-notes.http-error.v1";
+const HTTP_ERROR_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422, 429, 500, 502, 503]);
+
+export type HttpErrorStatus = 400 | 401 | 403 | 404 | 409 | 413 | 415 | 422 | 429 | 500 | 502 | 503;
+
+export type DecodedHttpError = {
+  status: HttpErrorStatus;
+  code: string;
+  message: string;
+  details?: unknown;
+};
+
 export class HttpError extends Error {
   constructor(
-    readonly status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 422 | 429 | 500 | 502 | 503,
+    readonly status: HttpErrorStatus,
     readonly code: string,
     message: string,
     readonly details?: unknown,
   ) {
     super(message);
+    Object.defineProperty(this, "transportKind", {
+      value: HTTP_ERROR_KIND,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
   }
 }
 
-export function safeHttpErrorCode(error: unknown) {
-  if (!safeInstanceOf(error, HttpError)) return null;
+function safeProperty(value: object, property: string) {
   try {
-    const code = error.code;
-    return typeof code === "string" ? code : null;
+    return Reflect.get(value, property) as unknown;
   } catch {
-    return null;
+    return undefined;
   }
+}
+
+function safelyHasOwn(value: object, property: string) {
+  try {
+    return Object.hasOwn(value, property);
+  } catch {
+    return false;
+  }
+}
+
+export function safeHttpError(error: unknown): DecodedHttpError | null {
+  if (typeof error !== "object" || error === null || Array.isArray(error)) return null;
+  const local = safeInstanceOf(error, HttpError);
+  if (!local && (!safelyHasOwn(error, "transportKind") || safeProperty(error, "transportKind") !== HTTP_ERROR_KIND))
+    return null;
+  const status = safeProperty(error, "status");
+  const code = safeProperty(error, "code");
+  const message = safeProperty(error, "message");
+  if (
+    typeof status !== "number" ||
+    !HTTP_ERROR_STATUSES.has(status) ||
+    typeof code !== "string" ||
+    !/^[a-z][a-z0-9_]{0,199}$/.test(code) ||
+    typeof message !== "string" ||
+    !message.trim() ||
+    message.length > 2_000
+  )
+    return null;
+  const details = safeProperty(error, "details");
+  return {
+    status: status as HttpErrorStatus,
+    code,
+    message,
+    ...(details === undefined ? {} : { details }),
+  };
+}
+
+export function safeHttpErrorCode(error: unknown) {
+  return safeHttpError(error)?.code ?? null;
 }
 
 // An error whose message was written for the client. Anything else is an
@@ -43,11 +98,14 @@ export function classifyError(error: unknown) {
         body: { error: { code: "invalid_input", message: error.message } },
       };
     }
-    if (safeInstanceOf(error, HttpError)) {
+    const httpError = safeHttpError(error);
+    if (httpError) {
       return {
         expected: true as const,
-        status: error.status,
-        body: { error: { code: error.code, message: error.message, details: error.details } },
+        status: httpError.status,
+        body: {
+          error: { code: httpError.code, message: httpError.message, details: httpError.details },
+        },
       };
     }
   } catch {

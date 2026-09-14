@@ -17,6 +17,51 @@ describe("import content", () => {
     expect(JSON.stringify(json)).toContain("mermaid");
   });
 
+  it.each([
+    ["Folder_(one)/Child.md", "Folder_(one)/Child.md"],
+    ["Folder_\\(one\\)/Child.md", "Folder_(one)/Child.md"],
+    ["Folder%20(one)/Child.md", "Folder%20(one)/Child.md"],
+    ['<Folder (one)/Child.md> "Child title"', "Folder (one)/Child.md"],
+    ["Folder_(one)/Child.md 'Child title'", "Folder_(one)/Child.md"],
+  ])("keeps the complete Markdown link destination: %s", (destination, expected) => {
+    const parsed = markdownToDocument(`Read [child](${destination}) now.`);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "Read " },
+      { type: "text", text: "child", marks: [{ type: "link", attrs: { href: expected } }] },
+      { type: "text", text: " now." },
+    ]);
+  });
+
+  it.each([
+    ["Folder_(one)/Image.png", "Folder_(one)/Image.png"],
+    ["Folder_\\(one\\)/Image.png", "Folder_(one)/Image.png"],
+    ['<Folder (one)/Image.png> "Image title"', "Folder (one)/Image.png"],
+  ])("keeps the complete block image destination: %s", (destination, expected) => {
+    const parsed = markdownToDocument(`![diagram](${destination})`);
+    const block = parsed.document.content![0]!.content![0]!.content![0]!;
+    expect(block).toMatchObject({
+      type: "image",
+      attrs: { url: expected, caption: "diagram", name: "diagram" },
+    });
+    expect(parsed.references).toEqual([expected]);
+    expect(parsed.issues).toEqual([]);
+  });
+
+  it("retains degraded inline images as ownership references", () => {
+    const parsed = markdownToDocument("Before ![diagram](Folder_(one)/Image.png) after.");
+    expect(parsed.references).toEqual(["Folder_(one)/Image.png"]);
+    expect(parsed.issues).toEqual([{ code: "image_not_imported", detail: "Folder_(one)/Image.png" }]);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content.map((node) => node.text).join("")).toBe("Before diagram after.");
+  });
+
+  it("does not retain unsafe block image destinations as ownership evidence", () => {
+    const parsed = markdownToDocument("![diagram](javascript:alert(1))");
+    expect(parsed.references).toEqual([]);
+    expect(parsed.issues).toEqual([{ code: "unsafe_url", detail: "javascript:alert(1)" }]);
+  });
+
   it("drops executable HTML and unsafe links while retaining readable content", () => {
     const parsed = htmlToDocument(
       '<html><head><title>Safe</title><script>alert(1)</script></head><body><h1>Heading</h1><p>Hello <strong>world</strong> <a href="javascript:alert(1)">bad</a></p></body></html>',
@@ -25,6 +70,7 @@ describe("import content", () => {
     expect(JSON.stringify(parsed.document)).not.toContain("alert(1)");
     expect(JSON.stringify(parsed.document)).toContain("world");
     expect(parsed.issues).toEqual([{ code: "unsafe_url", detail: "javascript:alert(1)" }]);
+    expect(parsed.references).toEqual([]);
   });
 
   it("keeps NUL and lone-surrogate entities literal so imports round-trip through Yjs", () => {

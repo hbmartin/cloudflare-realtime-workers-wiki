@@ -239,21 +239,21 @@ pnpm import:notion verify notion-export --base-url https://notes.example.com --e
 Run `inspect` and `plan` first. Neither touches the network, and `plan` is where a construct this
 installation cannot represent shows up — while it is still free to do something about it.
 
-| Setting                                | Meaning                                                                                                                                      |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NOTES_IMPORT_PASSWORD`                | Required for `run` and `verify`. Never accepted as a flag.                                                                                   |
-| `--email`                              | An owner or editor. A viewer is rejected before anything is created.                                                                         |
-| `--manifest <path>`                    | Progress record. Re-running with the same manifest resumes; default `./notion-import.manifest.json`.                                         |
-| `--parent <pageId>`                    | Import beneath an existing page instead of at the top level.                                                                                 |
-| `--limit <n>`                          | Import the first n pages plus their ancestors, for a tree-safe smoke test.                                                                   |
-| `--rps <n>`                            | Request rate, default 20. **The Worker has no rate limiting and never returns 429, so this is the only backpressure in the system.**         |
-| `--linger-ms <n>`                      | How long each document stays open after a write so the compaction alarm is armed; default 1200.                                              |
-| `--keep-ambiguous-table <source-path>` | Resolve one previously recorded `table_recovery_ambiguous` table by accepting the live one as the destination's. Repeat for each exact path. |
-| `--adopt-legacy-fingerprint`           | Resume a manifest written with the older raw-byte export fingerprint. See below.                                                             |
-| `--verbose`                            | Print one progress line per page instead of a throttled summary.                                                                             |
-| `NOTES_IMPORT_BASE_URL`                | Default for `--base-url`; otherwise `http://127.0.0.1:4173`.                                                                                 |
-| `NOTES_IMPORT_EMAIL`                   | Default for `--email`.                                                                                                                       |
-| `NOTES_IMPORT_RPS`                     | Default for `--rps`; otherwise 20.                                                                                                           |
+| Setting                                | Meaning                                                                                                                                          |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `NOTES_IMPORT_PASSWORD`                | Required for `run` and `verify`. Never accepted as a flag.                                                                                       |
+| `--email`                              | An owner or editor. A viewer is rejected before anything is created.                                                                             |
+| `--manifest <path>`                    | Progress record. Re-running with the same manifest resumes; default `./notion-import.manifest.json`.                                             |
+| `--parent <pageId>`                    | Import beneath an existing page instead of at the top level.                                                                                     |
+| `--limit <n>`                          | Import the first n pages plus their ancestors, for a tree-safe smoke test.                                                                       |
+| `--rps <n>`                            | Request rate, default 20. The `/v1` API can return `429`; keep this client-side backpressure below the configured source and integration limits. |
+| `--linger-ms <n>`                      | How long each document stays open after a write so the compaction alarm is armed; default 1200.                                                  |
+| `--keep-ambiguous-table <source-path>` | Resolve one previously recorded `table_recovery_ambiguous` table by accepting the live one as the destination's. Repeat for each exact path.     |
+| `--adopt-legacy-fingerprint`           | Resume a manifest written with the older raw-byte export fingerprint. See below.                                                                 |
+| `--verbose`                            | Print one progress line per page instead of a throttled summary.                                                                                 |
+| `NOTES_IMPORT_BASE_URL`                | Default for `--base-url`; otherwise `http://127.0.0.1:4173`.                                                                                     |
+| `NOTES_IMPORT_EMAIL`                   | Default for `--email`.                                                                                                                           |
+| `NOTES_IMPORT_RPS`                     | Default for `--rps`; otherwise 20.                                                                                                               |
 
 **Re-running is safe with the manifest.** Pages and attachments already recorded in it are skipped, and
 content is re-pushed only if it differs — block ids are derived from the source, so an unchanged page
@@ -328,8 +328,9 @@ pnpm load:realtime
 - **`nightly.yml` holds live account credentials.** `STAGING_LOAD_EMAIL` and `STAGING_LOAD_PASSWORD`
   are real sign-in credentials for whatever `STAGING_BASE_URL` points at. Scope that account to the
   minimum role and never point it at production.
-- **No application rate limiting.** The Worker never returns `429`. Bootstrap, invite acceptance, and
-  sign-in must be protected by Cloudflare WAF rules; see [Deployment](DEPLOYMENT.md#4-configure-rate-limiting).
+- **Edge rate limiting is still required.** The Worker limits `/v1` callers and authentication attempts,
+  including strict source-IP and normalized-account password budgets, but bootstrap and the unauthenticated
+  work before invite authentication still need Cloudflare WAF rules; see [Deployment](DEPLOYMENT.md#4-configure-rate-limiting).
 - **`/api/health` cannot identify the running revision.** Its `version` field is a hardcoded string.
   Use `pnpm wrangler deployments list --env production`.
 - **Durable Object placement is permanent.** A workspace's location hint is fixed at bootstrap and
