@@ -40,4 +40,6 @@ export interface SecurityStatus {
   passkeys: number;
   codesSaved: boolean;
   fresh: boolean;
+  recoveryCanResume?: boolean;
+  pendingInvite?: boolean;
 }

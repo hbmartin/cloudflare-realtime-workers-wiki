@@ -186,6 +186,7 @@ describe("App error handling", () => {
       setItem: (key: string, value: string) => stored.set(key, value),
     } satisfies Storage);
     history.replaceState(null, "", "/");
+    sessionStorage.clear();
     vi.mocked(api).mockReset();
     mocks.createWorkspaceEvents.mockClear();
     mocks.editorAction.mockReset();
@@ -204,6 +205,69 @@ describe("App error handling", () => {
     cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("shows an expired-invite error, clears the stale token, and lets an existing member retry", async () => {
+    mockShellApi();
+    const normal = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/invites/complete") throw new ApiClientError(409, "invite_invalid", "This invite has expired.");
+      return normal(path, init);
+    });
+    history.replaceState(null, "", "/?invite=expired");
+    sessionStorage.setItem("pending-invite", "expired");
+    render(<App />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("This invite has expired.");
+    expect(sessionStorage.getItem("pending-invite")).toBeNull();
+    expect(window.location.search).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+  });
+
+  it("retains a pending invite across a transient completion failure", async () => {
+    mockShellApi();
+    const normal = vi.mocked(api).getMockImplementation()!;
+    let attempts = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/invites/complete") {
+        if (++attempts === 1) throw new ApiClientError(503, "unavailable", "Try later.");
+        return { success: true };
+      }
+      return normal(path, init);
+    });
+    sessionStorage.setItem("pending-invite", "retry-token");
+    render(<App />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Try later.");
+    expect(sessionStorage.getItem("pending-invite")).toBe("retry-token");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    expect(sessionStorage.getItem("pending-invite")).toBeNull();
+  });
+
+  it("completes server-owned pending enrollment in a tab with no invite token", async () => {
+    mockShellApi();
+    const normal = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: true, pendingInvite: true };
+      if (path === "/api/invites/complete") return { success: true };
+      return normal(path, init);
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    expect(api).toHaveBeenCalledWith("/api/invites/complete", { method: "POST", body: "{}" });
+  });
+
+  it("explains missing membership instead of repeatedly asking a ready user to sign in", async () => {
+    mockShellApi();
+    const normal = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/me") throw new ApiClientError(401, "workspace_required", "No workspace.");
+      return normal(path, init);
+    });
+    render(<App />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("this account has no workspace access");
+    expect(screen.queryByRole("heading", { name: "Sign in" })).not.toBeInTheDocument();
   });
 
   it("never falls back to a template page", () => {

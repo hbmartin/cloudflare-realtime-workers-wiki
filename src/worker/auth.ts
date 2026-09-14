@@ -2,7 +2,7 @@ import { betterAuth } from "better-auth";
 import { passkey } from "@better-auth/passkey";
 import { APIError } from "better-auth/api";
 import { twoFactor } from "better-auth/plugins";
-import { mandatorySecurity, requireSecurity } from "./security";
+import { authorizePasskeyRegistration, mandatorySecurity, requireSecurity } from "./security";
 import type { MemberContext } from "./env";
 import type { Env } from "./env";
 import { HttpError } from "./http";
@@ -14,7 +14,43 @@ export function createAuth(env: Env, allowRegistration = false) {
     baseURL: env.BETTER_AUTH_URL,
     appName: "Realtime Notes",
     advanced: { ipAddress: { ipAddressHeaders: ["cf-connecting-ip"] } },
-    rateLimit: { enabled: true, storage: "database", window: 60, max: 100 },
+    rateLimit: {
+      enabled: true,
+      storage: "database",
+      window: 60,
+      max: 100,
+      // Per-source, per-endpoint limits allow a team behind one NAT to sign in.
+      // Password-proven TOTP/recovery attempts also have a persistent account budget.
+      customStorage: {
+        // Fixed buckets: continuous low-volume traffic must not accumulate forever.
+        consume: async (key, rule) => {
+          const time = Date.now();
+          const windowMs = rule.window * 1000;
+          const start = Math.floor(time / windowMs) * windowMs;
+          const result = await env.DB.prepare(`INSERT INTO rateLimit(id,key,count,lastRequest) VALUES (?,?,1,?)
+            ON CONFLICT(key) DO UPDATE SET
+              count=CASE WHEN lastRequest!=excluded.lastRequest THEN 1 ELSE count+1 END,
+              lastRequest=excluded.lastRequest
+            WHERE lastRequest!=excluded.lastRequest OR count<? RETURNING count`)
+            .bind(crypto.randomUUID(), key, start, rule.max)
+            .first<{ count: number }>();
+          if (result?.count === 1)
+            await env.DB.prepare("DELETE FROM rateLimit WHERE lastRequest<?")
+              .bind(time - 24 * 60 * 60_000)
+              .run();
+          return {
+            allowed: !!result,
+            retryAfter: result ? null : Math.max(1, Math.ceil((start + windowMs - time) / 1000)),
+          };
+        },
+      },
+      customRules: {
+        "/sign-in/*": { window: 60, max: 60 },
+        "/sign-up/*": { window: 60, max: 30 },
+        "/two-factor/*": { window: 60, max: 60 },
+        "/passkey/verify-authentication": { window: 60, max: 60 },
+      },
+    },
     session: { cookieCache: { enabled: false } },
     plugins: [
       twoFactor(),
@@ -24,13 +60,14 @@ export function createAuth(env: Env, allowRegistration = false) {
         origin: new URL(env.BETTER_AUTH_URL).origin,
         authenticatorSelection: { residentKey: "required", userVerification: "required" },
         registration: {
-          afterVerification: async ({ verification }) => {
+          afterVerification: async ({ ctx, verification }) => {
             if (!verification.registrationInfo?.userVerified) {
               throw new APIError("FORBIDDEN", {
                 code: "USER_VERIFICATION_REQUIRED",
                 message: "Verify with your device PIN or biometrics.",
               });
             }
+            await authorizePasskeyRegistration(ctx, env, verification.registrationInfo.credential.id);
           },
         },
         authentication: {
@@ -75,7 +112,12 @@ async function getMember(request: Request, env: Env): Promise<MemberContext | nu
       role: MemberContext["role"];
     }>();
 
-  if (!row) return null;
+  if (!row)
+    throw new HttpError(
+      401,
+      "workspace_required",
+      "This account has no workspace access. Open an invite or contact the workspace owner.",
+    );
   return {
     user: { id: session.user.id, name: session.user.name, email: session.user.email },
     session: {
