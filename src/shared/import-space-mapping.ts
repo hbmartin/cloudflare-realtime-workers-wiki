@@ -62,6 +62,23 @@ export function isCurrentImportPreview(preview: ImportPreview | undefined, forma
   );
 }
 
+export function hasCurrentImportConfirmation(options: ImportOptions) {
+  return Boolean(
+    options.confirmed &&
+    options.previewId &&
+    (options.format !== "notion_zip" || options.previewGroupingVersion === NOTION_GROUPING_VERSION),
+  );
+}
+
+export function importConfirmationMatchesPreview(options: ImportOptions, preview: ImportPreview | undefined) {
+  return Boolean(
+    options.confirmed &&
+    preview &&
+    options.previewId === preview?.previewId &&
+    options.previewGroupingVersion === preview?.groupingVersion,
+  );
+}
+
 export function normalizeGroupSpaceIds(value: unknown): Record<string, string> | undefined | null {
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;

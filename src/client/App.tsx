@@ -74,8 +74,8 @@ import { SecurityScreen, finishPasswordSignIn } from "./SecurityScreen";
 
 type AppState =
   | { screen: "loading" }
-  | { screen: "error"; message: string }
-  | { screen: "unassigned" }
+  | { screen: "error"; kind: "request" | "service"; message: string }
+  | { screen: "unassigned"; message?: string }
   | { screen: "bootstrap" }
   | { screen: "security"; status: SecurityStatus }
   | { screen: "signin"; message?: string }
@@ -559,7 +559,17 @@ function clearPendingInvite() {
 
 const SECURITY_REQUIRED_CODES = new Set(["enrollment_required", "challenge_required", "recovery_required"]);
 
-async function stateAfterUnauthorized(failure: ApiClientError): Promise<AppState> {
+function startupError(cause: unknown, fallback: string): AppState {
+  const requestFailure =
+    cause instanceof ApiClientError && cause.status < 500 && !cause.messageFromFallback && !cause.responseBodyFailure;
+  return {
+    screen: "error",
+    kind: requestFailure ? "request" : "service",
+    message: apiErrorMessage(cause, fallback),
+  };
+}
+
+async function stateAfterUnauthorized(failure: ApiClientError): Promise<AppState | null> {
   if (failure.code === "workspace_required") return { screen: "unassigned" };
   if (!SECURITY_REQUIRED_CODES.has(failure.code)) {
     return { screen: "signin", message: apiErrorMessage(failure, "Your session expired. Sign in again.") };
@@ -567,10 +577,7 @@ async function stateAfterUnauthorized(failure: ApiClientError): Promise<AppState
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state === "signed_out") return { screen: "signin" };
   if (status.state !== "ready") return { screen: "security", status };
-  return {
-    screen: "security",
-    status: { ...status, state: failure.code as "enrollment_required" | "challenge_required" | "recovery_required" },
-  };
+  return null;
 }
 
 async function resolveAppState(): Promise<AppState> {
@@ -580,16 +587,19 @@ async function resolveAppState(): Promise<AppState> {
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state === "signed_out") return invite ? { screen: "invite", token: invite } : { screen: "signin" };
   if (status.state !== "ready") return { screen: "security", status };
+  let inviteFailure: ApiClientError | null = null;
   if (invite || status.pendingInvite) {
     try {
       await api("/api/invites/complete", { method: "POST", body: json(invite ? { token: invite } : {}) });
       clearPendingInvite();
     } catch (cause) {
       if (invite && cause instanceof ApiClientError && cause.code === "invite_invalid") {
+        inviteFailure = cause;
         clearPendingInvite();
         if (status.pendingInvite) {
           await api("/api/invites/complete", { method: "POST", body: json({}) });
           clearPendingInvite();
+          inviteFailure = null;
         }
       } else {
         throw cause;
@@ -601,7 +611,13 @@ async function resolveAppState(): Promise<AppState> {
     return { screen: "workspace", member };
   } catch (error) {
     if (error instanceof ApiClientError && error.status === 401) {
-      return stateAfterUnauthorized(error);
+      if (error.code === "workspace_required" && inviteFailure) {
+        return { screen: "unassigned", message: inviteFailure.message };
+      }
+      const next = await stateAfterUnauthorized(error);
+      if (next) return next;
+      const member = await api<ClientMemberContext>("/api/me");
+      return { screen: "workspace", member };
     }
     throw error;
   }
@@ -617,20 +633,19 @@ export function App() {
     stateTransition.current += 1;
     setState(next);
   }, []);
-  const signOut = useCallback(() => showState({ screen: "signin" }), [showState]);
+  const signOut = useCallback(() => {
+    invalidateUnauthorizedRequests();
+    showState({ screen: "signin" });
+  }, [showState]);
   const sessionExpired = useCallback(
     (failure: ApiClientError) => {
       invalidateUnauthorizedRequests();
       const transition = ++stateTransition.current;
-      setState({ screen: "loading" });
       void stateAfterUnauthorized(failure)
-        .then((next) => commitState(transition, next))
-        .catch((cause) =>
-          commitState(transition, {
-            screen: "error",
-            message: apiErrorMessage(cause, "Unable to reach Realtime Notes. Try again."),
-          }),
-        );
+        .then((next) => {
+          if (next) commitState(transition, next);
+        })
+        .catch((cause) => commitState(transition, startupError(cause, "Unable to reach Realtime Notes. Try again.")));
     },
     [commitState],
   );
@@ -642,20 +657,22 @@ export function App() {
       .catch(async (cause): Promise<AppState> => {
         if (cause instanceof ApiClientError && cause.status === 401) {
           try {
-            return await stateAfterUnauthorized(cause);
+            const next = await stateAfterUnauthorized(cause);
+            if (next) return next;
+            return await resolveAppState();
           } catch (statusCause) {
-            return {
-              screen: "error",
-              message: apiErrorMessage(statusCause, "Unable to open the workspace. Try again."),
-            };
+            return startupError(statusCause, "Unable to open the workspace. Try again.");
           }
         }
-        return { screen: "error", message: apiErrorMessage(cause, "Unable to open the workspace. Try again.") };
+        return startupError(cause, "Unable to open the workspace. Try again.");
       })
       .then((next) => commitState(transition, next));
   }, [commitState]);
 
-  useEffect(() => onApiUnauthorized(sessionExpired), [sessionExpired]);
+  useEffect(() => {
+    if (state.screen === "workspace") return onApiUnauthorized(sessionExpired);
+    return undefined;
+  }, [sessionExpired, state.screen]);
 
   useEffect(() => {
     void load();
@@ -665,9 +682,13 @@ export function App() {
   if (state.screen === "error")
     return (
       <AuthLayout
-        eyebrow="Connection problem"
-        title="Realtime Notes is unavailable"
-        copy="We couldn’t reach the service. Check your connection and try again. If the problem continues, the service may be unavailable."
+        eyebrow={state.kind === "service" ? "Connection problem" : "Unable to continue"}
+        title={state.kind === "service" ? "Realtime Notes is unavailable" : "Realtime Notes couldn’t open"}
+        copy={
+          state.kind === "service"
+            ? "We couldn’t reach the service. Check your connection and try again. If the problem continues, the service may be unavailable."
+            : "Review the message below and try again."
+        }
       >
         <p role="alert">{state.message}</p>
         <button type="button" onClick={() => void load()}>
@@ -683,8 +704,8 @@ export function App() {
         copy="Open an invitation from your workspace owner to join."
       >
         <p role="alert">
-          You’re signed in, but this account has no workspace access. Open your invite link or ask the owner for a new
-          invitation.
+          {state.message ??
+            "You’re signed in, but this account has no workspace access. Open your invite link or ask the owner for a new invitation."}
         </p>
         <button type="button" onClick={() => void load()}>
           Try again
@@ -692,13 +713,14 @@ export function App() {
         <button
           type="button"
           onClick={() => {
+            invalidateUnauthorizedRequests();
             void authClient
               .signOut()
               .then(async (result) => {
                 if (result.error) throw new Error(result.error.message || "Sign out failed.");
                 await load();
               })
-              .catch((cause) => showState({ screen: "error", message: apiErrorMessage(cause, "Sign out failed.") }));
+              .catch((cause) => showState(startupError(cause, "Sign out failed.")));
           }}
         >
           Sign out
@@ -3101,6 +3123,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         <footer className="sidebar-footer">
           <button
             onClick={async () => {
+              invalidateUnauthorizedRequests();
               await authClient.signOut();
               onSignOut();
             }}

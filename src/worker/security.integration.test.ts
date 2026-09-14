@@ -418,6 +418,32 @@ describe("security lifecycle regressions", () => {
     expect(await env.DB.prepare("SELECT COUNT(*) count FROM user").first()).toEqual({ count: 2 });
   });
 
+  it("releases a temporary invite reservation when signup throws after creating the account", async () => {
+    const owner = await enrollAccount(await bootstrap());
+    const token = await invitation(owner);
+    const originalClone = Response.prototype.clone;
+    let injected = false;
+    const clone = vi.spyOn(Response.prototype, "clone").mockImplementation(function (this: Response) {
+      if (!injected && this.ok && this.headers.has("set-cookie")) {
+        injected = true;
+        throw new Error("signup response became unreadable");
+      }
+      return originalClone.call(this);
+    });
+    const failed = await accept(token);
+    clone.mockRestore();
+
+    expect(injected).toBe(true);
+    expect(failed.status).toBe(500);
+    expect(await env.DB.prepare("SELECT id FROM user WHERE email='guest@example.test'").first()).not.toBeNull();
+    expect(await env.DB.prepare("SELECT claimed_email,claim_token,claim_expires_at FROM invites").first()).toEqual({
+      claimed_email: null,
+      claim_token: null,
+      claim_expires_at: null,
+    });
+    expect((await accept(token)).status).toBe(200);
+  });
+
   it("authenticates an existing account before claiming its invitation", async () => {
     const owner = await enrollAccount(await bootstrap());
     const token = await invitation(owner);
@@ -707,9 +733,55 @@ describe("security lifecycle regressions", () => {
     ).toBe(429);
   });
 
-  it("limits failed password attempts by normalized account across rotating IPs", async () => {
+  it("limits normalized password attempts within one source without locking another source", async () => {
+    const owner = await enrollAccount(await bootstrap());
+    const token = await invitation(owner);
+    const clock = vi.spyOn(Date, "now");
+    try {
+      const start = Math.floor(Date.now() / (15 * 60_000)) * 15 * 60_000;
+      for (let i = 0; i < 10; i++) {
+        clock.mockReturnValue(start + i * 11_000);
+        expect(
+          (
+            await requestFromIp("192.0.2.10", "/api/auth/sign-in/email", {
+              email: i % 2 ? "OWNER@EXAMPLE.TEST" : "owner@example.test",
+              password: "incorrect",
+            })
+          ).status,
+        ).toBe(401);
+      }
+      clock.mockReturnValue(start + 110_000);
+      const blocked = await requestFromIp("192.0.2.10", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      });
+      expect(blocked.status).toBe(429);
+      await expect(blocked.json()).resolves.toMatchObject({ code: "PASSWORD_RATE_LIMITED" });
+      expect(
+        (
+          await requestFromIp("198.51.100.1", "/api/auth/sign-in/email", {
+            email: "owner@example.test",
+            password: "password123",
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await requestFromIp("203.0.113.1", "/api/invites/accept", {
+            token,
+            email: "owner@example.test",
+            password: "password123",
+          })
+        ).status,
+      ).toBe(200);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("keeps password budgets separate across rotating sources", async () => {
     await enrollAccount(await bootstrap());
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 10; i++)
       expect(
         (
           await requestFromIp(`192.0.2.${i + 1}`, "/api/auth/sign-in/email", {
@@ -718,7 +790,6 @@ describe("security lifecycle regressions", () => {
           })
         ).status,
       ).toBe(401);
-    }
     expect(
       (
         await requestFromIp("198.51.100.1", "/api/auth/sign-in/email", {
@@ -726,50 +797,96 @@ describe("security lifecycle regressions", () => {
           password: "password123",
         })
       ).status,
-    ).toBe(429);
+    ).toBe(200);
   });
 
-  it("applies the same account password budget to unknown addresses", async () => {
+  it("applies the same source-scoped password budget to unknown addresses", async () => {
     await bootstrap();
-    for (let i = 0; i < 10; i++) {
+    const clock = vi.spyOn(Date, "now");
+    try {
+      const start = Math.floor(Date.now() / (15 * 60_000)) * 15 * 60_000;
+      for (let i = 0; i < 10; i++) {
+        clock.mockReturnValue(start + i * 11_000);
+        expect(
+          (
+            await requestFromIp("192.0.2.20", "/api/auth/sign-in/email", {
+              email: i % 2 ? "MISSING@EXAMPLE.TEST" : "missing@example.test",
+              password: "incorrect",
+            })
+          ).status,
+        ).toBe(401);
+      }
+      clock.mockReturnValue(start + 110_000);
       expect(
         (
-          await requestFromIp(`192.0.2.${i + 1}`, "/api/auth/sign-in/email", {
-            email: i % 2 ? "MISSING@EXAMPLE.TEST" : "missing@example.test",
+          await requestFromIp("192.0.2.20", "/api/auth/sign-in/email", {
+            email: "missing@example.test",
+            password: "incorrect",
+          })
+        ).status,
+      ).toBe(429);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("clears only the successful source's password budget", async () => {
+    await enrollAccount(await bootstrap());
+    for (const ip of ["192.0.2.1", "192.0.2.2"])
+      expect(
+        (
+          await requestFromIp(ip, "/api/auth/sign-in/email", {
+            email: "owner@example.test",
             password: "incorrect",
           })
         ).status,
       ).toBe(401);
-    }
     expect(
-      (
-        await requestFromIp("198.51.100.1", "/api/auth/sign-in/email", {
-          email: "missing@example.test",
-          password: "incorrect",
-        })
-      ).status,
-    ).toBe(429);
-  });
-
-  it("clears the account password budget after successful authentication", async () => {
-    await enrollAccount(await bootstrap());
+      await env.DB.prepare("SELECT COUNT(*) count FROM rateLimit WHERE key LIKE 'password-account-v2:%'").first(),
+    ).toEqual({ count: 2 });
     expect(
       (
         await requestFromIp("192.0.2.1", "/api/auth/sign-in/email", {
-          email: "owner@example.test",
+          email: "OWNER@EXAMPLE.TEST",
+          password: "password123",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      await env.DB.prepare("SELECT COUNT(*) count FROM rateLimit WHERE key LIKE 'password-account-v2:%'").first(),
+    ).toEqual({ count: 1 });
+  });
+
+  it("canonicalizes equivalent IPv6 sources and groups absent or malformed sources", async () => {
+    await bootstrap();
+    expect(
+      (
+        await requestFromIp("2001:0db8:0:0:0:0:0:1", "/api/auth/sign-in/email", {
+          email: "missing@example.test",
           password: "incorrect",
         })
       ).status,
     ).toBe(401);
     expect(
       (
-        await requestFromIp("192.0.2.2", "/api/auth/sign-in/email", {
-          email: "OWNER@EXAMPLE.TEST",
-          password: "password123",
+        await requestFromIp("2001:db8::1", "/api/auth/sign-in/email", {
+          email: "missing@example.test",
+          password: "incorrect",
         })
       ).status,
-    ).toBe(200);
-    expect(await env.DB.prepare("SELECT 1 FROM rateLimit WHERE key LIKE 'password-account:%'").first()).toBeNull();
+    ).toBe(401);
+    expect(
+      await env.DB.prepare("SELECT count FROM rateLimit WHERE key LIKE 'password-account-v2:%'").all(),
+    ).toMatchObject({ results: [{ count: 2 }] });
+
+    await request("", "/api/auth/sign-in/email", { email: "fallback@example.test", password: "incorrect" });
+    await requestFromIp("not-an-ip", "/api/auth/sign-in/email", {
+      email: "fallback@example.test",
+      password: "incorrect",
+    });
+    expect(
+      await env.DB.prepare("SELECT count FROM rateLimit WHERE key LIKE 'password-account-v2:%' ORDER BY count").all(),
+    ).toMatchObject({ results: [{ count: 2 }, { count: 2 }] });
   });
   it("guards the vendor passkey insert against reset, revoked session and obsolete generation", async () => {
     await enrollAccount(await bootstrap());
@@ -889,5 +1006,25 @@ describe("security lifecycle regressions", () => {
     expect(
       await env.DB.prepare("SELECT code_hash FROM pending_recovery_codes WHERE code_hash='expired'").first(),
     ).toBeNull();
+  });
+
+  it("retires one stale bucket whenever a new distinct rate-limit bucket is inserted", async () => {
+    const timestamp = Date.now();
+    const staleIds = Array.from({ length: 600 }, (_, index) => `stale-${index}`);
+    await env.DB.prepare(`INSERT INTO rateLimit(id,key,count,lastRequest)
+      SELECT value,value,1,? FROM json_each(?)`)
+      .bind(timestamp - 25 * 60 * 60_000, JSON.stringify(staleIds))
+      .run();
+    const consume = (await createAuth(env).$context).options.rateLimit!.customStorage!.consume!;
+    for (let index = 0; index < 50; index++) {
+      expect(await consume(`current-${index}`, { window: 60, max: 2 })).toMatchObject({ allowed: true });
+    }
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM rateLimit").first()).toEqual({ count: 600 });
+    expect(
+      await env.DB.prepare("SELECT COUNT(*) count FROM rateLimit WHERE lastRequest<?")
+        .bind(timestamp - 24 * 60 * 60_000)
+        .first(),
+    ).toEqual({ count: 550 });
+    expect(await env.DB.prepare("SELECT count FROM rateLimit WHERE key='current-0'").first()).toEqual({ count: 1 });
   });
 });

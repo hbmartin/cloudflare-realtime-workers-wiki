@@ -3,10 +3,12 @@ import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionC
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
+import { sha256Hex } from "../shared/import-integrity";
 import type { DiagramContentEnvelope, Job, Page } from "../shared/types";
 import { NOTION_GROUPING_VERSION } from "../shared/import-space-mapping";
 import { createZip, readZip } from "../shared/zip";
 import type { Env } from "./env";
+import { HttpError } from "./http";
 import { runImport } from "./importer";
 import {
   claimJobWorkflowRun,
@@ -17,6 +19,7 @@ import {
   recoverQueuedJobs,
   resolveJobWorkflowAttempt,
   runCommentMigration,
+  startJobExecution,
   runTemplateClone,
   sweepOutbox,
   type DeliveryQueueMessage,
@@ -2394,6 +2397,24 @@ describe("job execution", () => {
         ["Linked child", "Old"],
       ],
     },
+    ...["block", "inline"].map((placement) => ({
+      label: `${placement} Markdown image evidence before an earlier title match`,
+      files: [
+        [
+          "Old aaaa000000000000000000000000bbbb.md",
+          placement === "block"
+            ? '# Old\n\n![cover](Old%202222-2222/Folder_(one).png "Cover")'
+            : "# Old\nSee ![cover](Old%202222-2222/Folder_(one).png) here.",
+        ],
+        ["Old 1111-1111/Unlinked child.md", "# Unlinked child"],
+        ["Old 2222-2222/Linked child.md", "# Linked child"],
+        ["Old 2222-2222/Folder_(one).png", "image"],
+      ],
+      parents: [
+        ["Unlinked child", null],
+        ["Linked child", "Old"],
+      ],
+    })),
     ...["html", "md"].map((format) => ({
       label: `${format} link evidence with parentheses in a folder`,
       files: [
@@ -2808,7 +2829,7 @@ describe("job execution", () => {
     },
   );
 
-  it("cleans obsolete staged resources and refreshes a suspended confirmed import", async () => {
+  it("recovers a lost invalidation response, cleans obsolete resources, and refreshes a confirmed import", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
     const timestamp = Date.now();
@@ -2833,10 +2854,11 @@ describe("job execution", () => {
         timestamp,
       )
       .run();
+    const stagedPageId = `page-${(await sha256Hex(`${jobId}:page:Current.md`)).slice(0, 48)}`;
     await env.DB.prepare(`INSERT INTO pages (id, workspace_id, space_id, parent_id, kind, position, title, is_template, import_job_id, content_epoch, created_by, created_at, updated_at)
-      VALUES (?, ?, ?, NULL, 'table', 'z0', 'Obsolete staged page', 0, ?, 1, ?, ?, ?)`)
+      VALUES (?, ?, ?, NULL, 'document', 'z0', 'Obsolete staged page', 0, ?, 1, ?, ?, ?)`)
       .bind(
-        `${jobId}-staged`,
+        stagedPageId,
         installed.workspaceId,
         `${installed.workspaceId}-general`,
         jobId,
@@ -2847,14 +2869,22 @@ describe("job execution", () => {
       .run();
     const running = (await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<JobRow>())!;
     const steps: string[] = [];
+    let invalidationResponseLost = false;
     await runImport(env, running, {
       async do<T>(name: string, callback: () => Promise<T>) {
         steps.push(name);
-        return callback();
+        const result = await callback();
+        if (name === "invalidate obsolete confirmation" && !invalidationResponseLost) {
+          invalidationResponseLost = true;
+          steps.push(name);
+          return callback();
+        }
+        return result;
       },
     } as Parameters<typeof runImport>[2]);
     const refreshed = (await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<JobRow>())!;
     expect(refreshed.status).toBe("awaiting_confirmation");
+    expect(refreshed.attempt).toBe(2);
     expect(JSON.parse(refreshed.options_json).confirmed).toBe(false);
     expect(JSON.parse(refreshed.result_json).preview).toMatchObject({
       previewId: expect.any(String),
@@ -2863,12 +2893,142 @@ describe("job execution", () => {
     });
     expect(steps).toEqual([
       "invalidate obsolete confirmation",
+      "invalidate obsolete confirmation",
       "inspect refreshed import",
       "await refreshed confirmation",
     ]);
     expect(
       await env.DB.prepare("SELECT count(*) AS total FROM pages WHERE import_job_id = ?").bind(jobId).first("total"),
     ).toBe(0);
+
+    const confirmationContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      inlineBindings(),
+      confirmationContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmationContext);
+    expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=? AND attempt=2").bind(jobId).first("status")).toBe(
+      "succeeded",
+    );
+    expect(await env.DB.prepare("SELECT title,content_epoch FROM pages WHERE id=?").bind(stagedPageId).first()).toEqual(
+      {
+        title: "Current",
+        content_epoch: 2,
+      },
+    );
+  });
+
+  it("persists a transported HTTP failure against the attempt created by internal preview invalidation", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const instanceId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(`INSERT INTO jobs
+      (id,workspace_id,space_id,type,status,requested_by,workflow_instance_id,attempt,options_json,input_key,created_at,updated_at)
+      VALUES (?,?,?,'import','queued',?,?,1,?,?,?,?)`)
+      .bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        instanceId,
+        JSON.stringify({
+          filename: "obsolete.zip",
+          format: "notion_zip",
+          confirmed: true,
+          previewId: "obsolete",
+          previewGroupingVersion: NOTION_GROUPING_VERSION - 1,
+        }),
+        `jobs/${jobId}/input/obsolete.zip`,
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const original = new HttpError(409, "import_upload_missing", "Upload the file again.");
+    const transported = Object.assign(new Error(original.message), Object.fromEntries(Object.entries(original)));
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "get") return async () => Promise.reject(transported);
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    await expect(
+      startJobExecution(bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: bucket }), {
+        id: jobId,
+        workflow_instance_id: instanceId,
+        attempt: 1,
+      }),
+    ).rejects.toBe(transported);
+    expect(
+      await env.DB.prepare("SELECT attempt,status,error_code,error_message FROM jobs WHERE id=?").bind(jobId).first(),
+    ).toEqual({
+      attempt: 2,
+      status: "failed",
+      error_code: "import_upload_missing",
+      error_message: "Upload the file again.",
+    });
+  });
+
+  it("does not attribute an obsolete workflow failure to an externally superseding attempt", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const instanceId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(`INSERT INTO jobs
+      (id,workspace_id,space_id,type,status,requested_by,workflow_instance_id,attempt,options_json,input_key,created_at,updated_at)
+      VALUES (?,?,?,'import','queued',?,?,1,?,?,?,?)`)
+      .bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        instanceId,
+        JSON.stringify({
+          filename: "obsolete.zip",
+          format: "notion_zip",
+          confirmed: true,
+          previewId: "obsolete",
+          previewGroupingVersion: NOTION_GROUPING_VERSION - 1,
+        }),
+        `jobs/${jobId}/input/obsolete.zip`,
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const replacementId = crypto.randomUUID();
+    const failure = new Error("obsolete workflow failed");
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "get")
+          return async () => {
+            await env.DB.prepare(
+              "UPDATE jobs SET attempt=3,workflow_instance_id=?,status='queued' WHERE id=? AND attempt=2",
+            )
+              .bind(replacementId, jobId)
+              .run();
+            throw failure;
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    await expect(
+      startJobExecution(bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: bucket }), {
+        id: jobId,
+        workflow_instance_id: instanceId,
+        attempt: 1,
+      }),
+    ).rejects.toBe(failure);
+    expect(
+      await env.DB.prepare("SELECT attempt,status,workflow_instance_id,error_code FROM jobs WHERE id=?")
+        .bind(jobId)
+        .first(),
+    ).toEqual({ attempt: 3, status: "queued", workflow_instance_id: replacementId, error_code: null });
   });
 
   it.each(["missing", "storage", "parser"] as const)(

@@ -68,6 +68,7 @@ describe("D1 migrations", () => {
         "pending_recovery_codes",
         "validate_invite_completion",
         "initialize_account_security",
+        "prune_stale_rate_limit_on_insert",
         "api_page_ids",
         "api_blocks",
         "transclusion_sources",

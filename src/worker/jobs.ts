@@ -7,8 +7,8 @@ import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { migrateLegacyComments, type CommentPage } from "./comments";
-import { HttpError } from "./http";
-import { errorLogFields } from "../shared/error-log";
+import { HttpError, safeHttpError } from "./http";
+import { errorLogFields, safeErrorMessage } from "../shared/error-log";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Keys, deleteR2Prefix } from "./r2";
@@ -662,7 +662,12 @@ export async function startJobExecution(env: Env, job: Pick<JobRow, "id" | "work
     else if (row.type === "export") await runExport(env, row, inlineStep as Parameters<typeof runExport>[2]);
     else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
-    await failJobWithCleanup(env, row, error);
+    const current = await env.DB.prepare(
+      `SELECT * FROM jobs WHERE id=? AND attempt>=? AND COALESCE(workflow_instance_id,id)=?`,
+    )
+      .bind(row.id, row.attempt, row.workflow_instance_id ?? row.id)
+      .first<JobRow>();
+    if (current?.status === "running") await failJobWithCleanup(env, current, error);
     throw error;
   }
 }
@@ -809,9 +814,10 @@ export async function finishPendingJobCleanup(
 }
 
 async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
-  const message = error instanceof Error ? error.message.slice(0, 500) : "The job failed.";
-  const errorCode = error instanceof HttpError ? error.code : "job_failed";
-  if (!(error instanceof HttpError))
+  const httpError = safeHttpError(error);
+  const message = (httpError?.message ?? safeErrorMessage(error, "The job failed.")).slice(0, 500);
+  const errorCode = httpError?.code ?? "job_failed";
+  if (!httpError)
     console.error("Job execution failed", { jobId: job.id, attempt: job.attempt, ...errorLogFields(error) });
   if (job.type !== "import" && job.type !== "template_clone" && job.type !== "export") {
     await updateJob(env, job, {
@@ -1068,8 +1074,10 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         await notifyJobs(this.env, job.workspace_id);
       });
     } catch (error) {
-      const current = await this.env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
-        .bind(jobId, attempt)
+      const current = await this.env.DB.prepare(
+        `SELECT * FROM jobs WHERE id=? AND attempt>=? AND COALESCE(workflow_instance_id,id)=?`,
+      )
+        .bind(jobId, attempt, event.instanceId)
         .first<JobRow>();
       // A superseded workflow belongs to an older attempt and must not clean up or
       // report failure against the replacement attempt.

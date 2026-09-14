@@ -309,6 +309,25 @@ export async function pruneSecurityState(env: Env) {
   ]);
 }
 
+function passwordSource(headers: Headers | undefined) {
+  const raw = headers?.get("cf-connecting-ip")?.trim().toLowerCase();
+  if (!raw) return "unknown";
+  const ipv4 = raw.split(".");
+  if (ipv4.length === 4 && ipv4.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255))
+    return ipv4.map(Number).join(".");
+  if (!raw.includes(":")) return "unknown";
+  try {
+    const hostname = new URL(`http://[${raw}]/`).hostname;
+    return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+async function passwordRateLimitKey(email: string, headers: Headers | undefined) {
+  return `password-account-v2:${await sha256(JSON.stringify([email, passwordSource(headers)]))}`;
+}
+
 const post = (path: string, handler: (ctx: GenericEndpointContext) => Promise<unknown>) =>
   createAuthEndpoint(path, { method: "POST" }, handler);
 
@@ -725,7 +744,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
             if (ctx.path === "/sign-in/email") {
               const email = typeof ctx.body?.email === "string" ? ctx.body.email.trim().toLowerCase() : null;
               if (email) {
-                const key = `password-account:${await sha256(email)}`;
+                const key = await passwordRateLimitKey(email, ctx.headers);
                 const limit = await consumeFixedWindow(env, key, PASSWORD_ATTEMPT_RULE);
                 if (!limit.allowed)
                   throw new APIError("TOO_MANY_REQUESTS", {

@@ -9,7 +9,12 @@ import {
   type ImportedTable,
 } from "../shared/import-content";
 import { documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
-import { NOTION_GROUPING_VERSION, requireImportOptions, type ImportOptions } from "../shared/import-space-mapping";
+import {
+  hasCurrentImportConfirmation,
+  NOTION_GROUPING_VERSION,
+  requireImportOptions,
+  type ImportOptions,
+} from "../shared/import-space-mapping";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import { projectDocument } from "../shared/document-projection";
 import type { DocumentContentEnvelope, ImportPreview, ProseMirrorJson } from "../shared/types";
@@ -412,10 +417,7 @@ async function hydrateDocumentAssets(
   }
 }
 
-function directoryOwners(
-  pages: NotionPageEntry[],
-  parsePage: (page: NotionPageEntry) => { document: ProseMirrorJson },
-) {
+function directoryOwners(pages: NotionPageEntry[], parsePage: (page: NotionPageEntry) => { references: string[] }) {
   const byPath = new Map(pages.map((page) => [page.path, page]));
   const byDirectory = new Map<string, NotionPageEntry[]>();
   const links = new Map<string, (string | null)[]>();
@@ -427,14 +429,7 @@ function directoryOwners(
   const linksInto = (page: NotionPageEntry, directory: string) => {
     let targets = links.get(page.path);
     if (!targets) {
-      targets = [];
-      walkDocument(parsePage(page).document, (node) => {
-        for (const mark of node.marks ?? []) {
-          if (mark.type === "link" && typeof mark.attrs?.href === "string") {
-            targets!.push(normalizedRelativePath(page.path, mark.attrs.href));
-          }
-        }
-      });
+      targets = parsePage(page).references.map((reference) => normalizedRelativePath(page.path, reference));
       links.set(page.path, targets);
     }
     return targets.some((target) => target === directory || target?.startsWith(`${directory}/`));
@@ -1301,23 +1296,49 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
 export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   let options = importOptions(job);
   // A deployment can supersede confirmation while a workflow is queued or suspended.
-  const refreshing =
-    options.confirmed &&
-    (!options.previewId ||
-      (options.format === "notion_zip" && options.previewGroupingVersion !== NOTION_GROUPING_VERSION));
+  const refreshing = options.confirmed && !hasCurrentImportConfirmation(options);
   if (refreshing) {
+    const obsoleteJob = job;
     options = { filename: options.filename, format: options.format, confirmed: false };
-    await step.do("invalidate obsolete confirmation", async () => {
-      await assertImportActive(env, job);
-      await cleanupImport(env, job, async () => {
-        await assertImportActive(env, job);
+    const refreshedOptionsJson = JSON.stringify(options);
+    const recoverCommittedRefresh = () =>
+      env.DB.prepare(
+        `SELECT * FROM jobs WHERE id=? AND attempt=? AND status='running'
+          AND COALESCE(workflow_instance_id,id)=? AND options_json=? AND result_json='{}'`,
+      )
+        .bind(
+          obsoleteJob.id,
+          obsoleteJob.attempt + 1,
+          obsoleteJob.workflow_instance_id ?? obsoleteJob.id,
+          refreshedOptionsJson,
+        )
+        .first<JobRow>();
+    job = await step.do("invalidate obsolete confirmation", async () => {
+      // D1 may commit the bump even if the Workflow step loses its response.
+      // Recover that exact same-instance transition before retrying cleanup.
+      const committed = await recoverCommittedRefresh();
+      if (committed) return committed;
+      await assertImportActive(env, obsoleteJob);
+      await cleanupImport(env, obsoleteJob, async () => {
+        await assertImportActive(env, obsoleteJob);
         return true;
       });
-      await env.DB.prepare(
-        `UPDATE jobs SET options_json = ?, updated_at = ? WHERE id = ? AND attempt = ? AND status = 'running'`,
-      )
-        .bind(JSON.stringify(options), Date.now(), job.id, job.attempt)
-        .run();
+      let refreshed: JobRow | null = null;
+      try {
+        refreshed = await env.DB.prepare(
+          `UPDATE jobs SET attempt=attempt+1, options_json=?, result_json='{}', error_code=NULL, error_message=NULL,
+            updated_at=? WHERE id=? AND attempt=? AND status='running' RETURNING *`,
+        )
+          .bind(refreshedOptionsJson, Date.now(), obsoleteJob.id, obsoleteJob.attempt)
+          .first<JobRow>();
+      } catch (error) {
+        const recovered = await recoverCommittedRefresh();
+        if (recovered) return recovered;
+        throw error;
+      }
+      refreshed ??= await recoverCommittedRefresh();
+      if (!refreshed) throw new Error("Job is not active.");
+      return refreshed;
     });
   }
   let bundlePromise: Promise<ImportBundle> | null = null;

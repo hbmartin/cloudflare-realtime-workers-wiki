@@ -103,6 +103,8 @@ import { isCleanupJobStatus } from "../shared/job-state";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import {
   importDestinationSpaceIds,
+  hasCurrentImportConfirmation,
+  importConfirmationMatchesPreview,
   isCurrentImportPreview,
   normalizeGroupSpaceIds,
   parseImportOptions,
@@ -1165,36 +1167,44 @@ app.post("/api/invites/accept", async (c) => {
     .bind(email, claimToken, time + INVITE_CLAIM_MS, invite.id, time, time)
     .first();
   if (!reserved) throw new HttpError(409, "invite_claimed", "This invite is already reserved for another account.");
-  const signup = await signUp(c.env, c.req.raw, { name, email, password });
-  if (!signup.response.ok || !signup.user) {
-    await c.env.DB.prepare(`UPDATE invites SET claimed_email=NULL,claim_token=NULL,claim_expires_at=NULL
-      WHERE id=? AND claim_token=? AND claimed_by IS NULL`)
-      .bind(invite.id, claimToken)
-      .run();
-    if (!signup.response.ok) return signup.response;
-    throw new HttpError(500, "signup_failed", "Account registration could not be completed.");
+  let completed = false;
+  try {
+    const signup = await signUp(c.env, c.req.raw, { name, email, password });
+    if (!signup.response.ok || !signup.user) {
+      if (!signup.response.ok) return signup.response;
+      throw new HttpError(500, "signup_failed", "Account registration could not be completed.");
+    }
+    const claimed = await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE invites SET claimed_by=?,claim_token=NULL,claim_expires_at=expires_at
+        WHERE id=? AND claimed_email=? AND claim_token=? AND used_at IS NULL AND expires_at>? RETURNING id`).bind(
+        signup.user.id,
+        invite.id,
+        email,
+        claimToken,
+        now(),
+      ),
+      c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND id!=? AND used_at IS NULL
+        AND claimed_by=? AND EXISTS(SELECT 1 FROM invites target WHERE target.id=? AND target.claimed_by=?)`).bind(
+        invite.workspace_id,
+        invite.id,
+        signup.user.id,
+        invite.id,
+        signup.user.id,
+      ),
+    ]);
+    if (!claimed[0]!.results.length)
+      throw new HttpError(409, "invite_claimed", "The invitation reservation expired. Try the invitation again.");
+    completed = true;
+    return signup.response;
+  } finally {
+    if (!completed) {
+      await c.env.DB.prepare(`UPDATE invites SET claimed_email=NULL,claim_token=NULL,claim_expires_at=NULL
+        WHERE id=? AND claim_token=? AND claimed_by IS NULL`)
+        .bind(invite.id, claimToken)
+        .run()
+        .catch((error) => console.error("Failed to release invite signup reservation", { inviteId: invite.id, error }));
+    }
   }
-  const claimed = await c.env.DB.batch([
-    c.env.DB.prepare(`UPDATE invites SET claimed_by=?,claim_token=NULL,claim_expires_at=expires_at
-      WHERE id=? AND claimed_email=? AND claim_token=? AND used_at IS NULL AND expires_at>? RETURNING id`).bind(
-      signup.user.id,
-      invite.id,
-      email,
-      claimToken,
-      now(),
-    ),
-    c.env.DB.prepare(`DELETE FROM invites WHERE workspace_id=? AND id!=? AND used_at IS NULL
-      AND claimed_by=? AND EXISTS(SELECT 1 FROM invites target WHERE target.id=? AND target.claimed_by=?)`).bind(
-      invite.workspace_id,
-      invite.id,
-      signup.user.id,
-      invite.id,
-      signup.user.id,
-    ),
-  ]);
-  if (!claimed[0]!.results.length)
-    throw new HttpError(409, "invite_claimed", "The invitation reservation expired. Try the invitation again.");
-  return signup.response;
 });
 
 app.post("/api/invites/complete", async (c) => {
@@ -2147,7 +2157,7 @@ app.post("/api/jobs/:id/retry", async (c) => {
       !parsed ||
       !isCurrentImportPreview(preview, parsed.format) ||
       (parsed.confirmed &&
-        (parsed.previewId !== preview?.previewId || parsed.previewGroupingVersion !== preview?.groupingVersion))
+        (!hasCurrentImportConfirmation(parsed) || !importConfirmationMatchesPreview(parsed, preview)))
     ) {
       return refreshImportPreview(c, member, job);
     }

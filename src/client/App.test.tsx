@@ -226,6 +226,55 @@ describe("App error handling", () => {
     expect(screen.queryByRole("heading", { name: "Realtime Notes is unavailable" })).not.toBeInTheDocument();
   });
 
+  it("shows an expired invite error to an unassigned signed-in user", async () => {
+    mockShellApi();
+    const normal = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/invites/complete") throw new ApiClientError(409, "invite_invalid", "This invite has expired.");
+      if (path === "/api/me") throw new ApiClientError(401, "workspace_required", "No workspace.");
+      return normal(path, init);
+    });
+    history.replaceState(null, "", "/?invite=expired");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "No workspace access" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("This invite has expired.");
+  });
+
+  it("keeps the invite form and entered values after an existing account rejects its password", async () => {
+    history.replaceState(null, "", "/?invite=invite-token");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json(
+          { error: { code: "INVALID_EMAIL_OR_PASSWORD", message: "Invalid email or password." } },
+          { status: 401 },
+        ),
+      ),
+    );
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path === "/api/install") return Promise.resolve({ initialized: true });
+      if (path === "/api/security/status") return Promise.resolve({ state: "signed_out" });
+      if (path === "/api/invites/accept") return mocks.invokeRealApi(path, init);
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+    const name = await screen.findByLabelText("Your name");
+    const email = screen.getByLabelText("Email");
+    const password = screen.getByLabelText("Password");
+    fireEvent.change(name, { target: { value: "Guest" } });
+    fireEvent.change(email, { target: { value: "guest@example.test" } });
+    fireEvent.change(password, { target: { value: "incorrect" } });
+    fireEvent.click(screen.getByRole("button", { name: "Accept invite" }));
+
+    expect(await screen.findByText("Invalid email or password.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Join workspace" })).toBeInTheDocument();
+    expect(name).toHaveValue("Guest");
+    expect(email).toHaveValue("guest@example.test");
+    expect(password).toHaveValue("incorrect");
+  });
+
   it("falls back from a stale explicit token to the server-owned pending claim", async () => {
     mockShellApi();
     const normal = vi.mocked(api).getMockImplementation()!;
@@ -411,6 +460,39 @@ describe("App error handling", () => {
     expect(screen.getByRole("button", { name: "Simulate document access denial" })).toBeInTheDocument();
   });
 
+  it("ignores a late 401 from a request started before sign-out", async () => {
+    mockShellApi();
+    const signedOut = deferred<{ error: null }>();
+    mocks.signOut.mockReturnValue(signedOut.promise);
+    render(<App />);
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    const lateResponse = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => lateResponse.promise),
+    );
+    const normal = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path === "/late-unauthorized") return mocks.invokeRealApi(path, init);
+      return normal(path, init);
+    });
+    const late = api("/late-unauthorized");
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    lateResponse.resolve(
+      Response.json({ error: { code: "challenge_required", message: "Verify again." } }, { status: 401 }),
+    );
+    await expect(late).rejects.toMatchObject({ code: "challenge_required" });
+    expect(screen.getByRole("button", { name: "Simulate document access denial" })).toBeInTheDocument();
+
+    signedOut.resolve({ error: null });
+    const email = await screen.findByLabelText("Email");
+    fireEvent.change(email, { target: { value: "typing@example.test" } });
+
+    expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument();
+    expect(email).toHaveValue("typing@example.test");
+  });
+
   it("resolves a global security-policy 401 through status", async () => {
     mockShellApi();
     const normal = vi.mocked(api).getMockImplementation()!;
@@ -442,6 +524,63 @@ describe("App error handling", () => {
     await expect(api("/trigger-security-policy")).rejects.toMatchObject({ code: "challenge_required" });
 
     expect(await screen.findByRole("heading", { name: "Protect your account" })).toBeInTheDocument();
+  });
+
+  it("keeps the workspace when a stale security 401 resolves to ready", async () => {
+    mockShellApi();
+    render(<App />);
+    await screen.findByRole("button", { name: "Simulate document access denial" });
+    const initialStatusLoads = vi.mocked(api).mock.calls.filter(([path]) => path === "/api/security/status").length;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({ error: { code: "challenge_required", message: "Verify again." } }, { status: 401 }),
+      ),
+    );
+    const normal = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path === "/stale-security") return mocks.invokeRealApi(path, init);
+      if (path === "/api/security/status")
+        return Promise.resolve({ state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: true });
+      return normal(path, init);
+    });
+
+    await expect(api("/stale-security")).rejects.toMatchObject({ code: "challenge_required" });
+    await waitFor(() =>
+      expect(vi.mocked(api).mock.calls.filter(([path]) => path === "/api/security/status")).toHaveLength(
+        initialStatusLoads + 1,
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Simulate document access denial" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Protect your account" })).not.toBeInTheDocument();
+  });
+
+  it("resolves a startup security 401 with one status recheck", async () => {
+    let statusLoads = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({ error: { code: "challenge_required", message: "Verify again." } }, { status: 401 }),
+      ),
+    );
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path === "/api/install") return Promise.resolve({ initialized: true });
+      if (path === "/api/security/status") {
+        statusLoads += 1;
+        return Promise.resolve(
+          statusLoads === 1
+            ? { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: true }
+            : { state: "challenge_required", totp: true, passkeys: 0, codesSaved: true, fresh: false },
+        );
+      }
+      if (path === "/api/me") return mocks.invokeRealApi(path, init);
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Protect your account" })).toBeInTheDocument();
+    expect(statusLoads).toBe(2);
   });
 
   it("surfaces a startup error when global security status resolution fails", async () => {
@@ -482,6 +621,17 @@ describe("App error handling", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Install service unavailable.");
     expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
+  });
+
+  it("uses neutral guidance for a domain failure while the app loads", async () => {
+    vi.mocked(api).mockRejectedValueOnce(new ApiClientError(409, "invite_invalid", "This invite has expired."));
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Realtime Notes couldn’t open" })).toBeInTheDocument();
+    expect(screen.getByText("Review the message below and try again.")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("This invite has expired.");
+    expect(screen.queryByText(/Check your connection/)).not.toBeInTheDocument();
   });
 
   it("never falls back to a template page", () => {
@@ -1499,7 +1649,7 @@ describe("App error handling", () => {
     expect((await screen.findAllByText("Created")).length).toBeGreaterThan(0);
     expect(treeLoads).toBe(2);
     expect(screen.queryByText(/page-creation result could not be verified/i)).not.toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(createdPage.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(createdPage.id));
     expect(api).toHaveBeenCalledWith(
       "/api/pages",
       expect.objectContaining({
@@ -2214,7 +2364,7 @@ describe("App error handling", () => {
     });
 
     expect(recordUpserts).not.toHaveBeenCalled();
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
   });
 
   it("does not let a late create response bypass a removal tombstone", async () => {
@@ -2255,7 +2405,7 @@ describe("App error handling", () => {
 
     expect(recordUpserts).not.toHaveBeenCalledWith([createdPage]);
     expect(screen.queryByRole("button", { name: "Archive Created" })).not.toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
     expect(await screen.findByText("The page was created, but it is no longer available.")).toBeInTheDocument();
     expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
     expect(document.querySelector(".sidebar-scrim")).not.toBeInTheDocument();
@@ -4136,7 +4286,7 @@ describe("App error handling", () => {
 
     await waitFor(() => expect(treeLoads).toBe(3));
     expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
   });
 
   it("falls back to an available page when a pending restored root is absent", async () => {
@@ -4199,7 +4349,7 @@ describe("App error handling", () => {
     expect(
       [...document.querySelectorAll(".page-link")].some((link) => link.textContent?.includes("Hidden detail")),
     ).toBe(false);
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id));
 
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(2));
@@ -4284,7 +4434,7 @@ describe("App error handling", () => {
       `/api/pages/${hiddenPage.id}`,
       expect.objectContaining({ signal: expect.anything() }),
     );
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id));
     expect(screen.queryByRole("button", { name: "Archive Initial hidden detail" })).not.toBeInTheDocument();
   });
 
@@ -4298,7 +4448,7 @@ describe("App error handling", () => {
     });
     render(<App />);
     await waitFor(() => expect(screen.getByRole("button", { name: "Create a root page" })).toBeEnabled());
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBeNull();
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBeNull());
     expect(screen.queryByRole("heading", { name: "Page unavailable" })).not.toBeInTheDocument();
   });
 
@@ -4310,7 +4460,7 @@ describe("App error handling", () => {
       render(<App />);
       await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
       expect(api).not.toHaveBeenCalledWith("/api/pages/foreign-page", expect.anything());
-      expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
+      await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
     },
   );
 
@@ -4329,7 +4479,7 @@ describe("App error handling", () => {
     });
     render(<App />);
     await screen.findByText(linked.title, { selector: ".breadcrumbs span" });
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
     expect(new URLSearchParams(location.search).get("page")).toBe(linked.id);
     expect(screen.queryByRole("button", { name: `Archive ${linked.title}` })).not.toBeInTheDocument();
     for (let refresh = 0; refresh < 2; refresh += 1) {
@@ -4509,7 +4659,7 @@ describe("App error handling", () => {
     render(<App />);
     expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs span" })).toBeInTheDocument();
     expect(mocks.editorRender.mock.calls.some(([props]) => props.page.id === unavailable.id)).toBe(false);
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
   });
 
   it("preserves hidden visibility through an older tree, then accepts newer visible state", async () => {
@@ -4543,7 +4693,7 @@ describe("App error handling", () => {
     await act(async () => freshTree.resolve({ pages: [page, hiddenPage] }));
     expect(await screen.findByRole("button", { name: "Archive Newly hidden" })).toBeInTheDocument();
     expect(screen.getByText("Newly hidden", { selector: ".breadcrumbs span" })).toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id));
   });
 
   it.each([false, true, "batched"] as const)(
@@ -4834,7 +4984,7 @@ describe("App error handling", () => {
       await firstLoad.promise;
     });
     expect(screen.getByText("Second", { selector: ".breadcrumbs span" })).toBeInTheDocument();
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(secondPage.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(secondPage.id));
   });
 
   it("aborts the archived page-tree request when the workspace unmounts", async () => {
@@ -4952,7 +5102,7 @@ describe("App error handling", () => {
       await reconciliation.promise;
     });
 
-    expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(newerRoot.id);
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(newerRoot.id));
     expect(screen.getByRole("button", { name: "Archive Newer root" })).toBeInTheDocument();
   });
 

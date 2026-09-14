@@ -6,6 +6,9 @@ export async function consumeFixedWindow(env: Env, key: string, rule: RateLimitR
   const time = Date.now();
   const windowMs = rule.window * 1000;
   const start = Math.floor(time / windowMs) * windowMs;
+  // Keep the stored window monotonic. If requests straddle a boundary and the
+  // later window commits first, the older request is deliberately denied
+  // instead of reopening budget in a superseded window.
   const result = await env.DB.prepare(`INSERT INTO rateLimit(id,key,count,lastRequest) VALUES (?,?,1,?)
     ON CONFLICT(key) DO UPDATE SET
       count=CASE WHEN rateLimit.lastRequest<excluded.lastRequest THEN 1 ELSE rateLimit.count+1 END,
