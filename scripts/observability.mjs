@@ -167,7 +167,11 @@ async function staleQueuedWorkflows(accountId, token, timestamp, fetcher = fetch
       throw new Error("Cloudflare Workflow instance query returned an invalid response.");
     }
     instances.push(...response.result);
-    const cursor = response.result_info?.cursor;
+    const info = response.result_info;
+    if (info !== undefined && info !== null && (typeof info !== "object" || Array.isArray(info))) {
+      throw new Error("Cloudflare Workflow instance query returned invalid pagination metadata.");
+    }
+    const cursor = info?.cursor;
     if (cursor === undefined || cursor === null || cursor === "") {
       return { instances, complete: response.result.length < 100 };
     }

@@ -60,21 +60,22 @@ export function main(argv, execute) {
     if (schema.some((row) => typeof row.name !== "string" || typeof row.type !== "string")) {
       throw new Error("Wrangler returned an invalid schema result");
     }
-    const names = new Set(schema.map((row) => row.name));
-    const required = [
-      "d1_migrations",
-      "user",
-      "invites",
-      "account_security",
-      "session_security",
-      "twoFactor",
-      "passkey",
-      "pending_passkeys",
-      "initialize_account_security",
-      "authorize_passkey_insert",
-      "complete_invite",
-    ];
-    const missing = required.filter((name) => !names.has(name));
+    const required = new Map([
+      ["d1_migrations", "table"],
+      ["user", "table"],
+      ["invites", "table"],
+      ["account_security", "table"],
+      ["session_security", "table"],
+      ["twoFactor", "table"],
+      ["passkey", "table"],
+      ["pending_passkeys", "table"],
+      ["initialize_account_security", "trigger"],
+      ["authorize_passkey_insert", "trigger"],
+      ["complete_invite", "trigger"],
+    ]);
+    const missing = [...required]
+      .filter(([name, type]) => !schema.some((row) => row.name === name && row.type === type))
+      .map(([name]) => name);
     if (missing.length) {
       console.error(JSON.stringify({ check: "security-schema", outcome: "FAIL", missing }));
       return 1;

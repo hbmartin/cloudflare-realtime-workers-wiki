@@ -4,6 +4,7 @@ import { base32 } from "@better-auth/utils/base32";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const ownerCookies = ".wrangler/e2e/owner-cookies.json";
+const WORKSPACE_READY_TIMEOUT_MS = 20_000;
 
 export async function completeEnrollment(page: Page, trust = false) {
   await expect(page.getByRole("heading", { name: "Protect your account" })).toBeVisible();
@@ -35,13 +36,15 @@ export async function signInOwner(page: Page) {
     await completeEnrollment(page, true);
   } else {
     const heading = page.getByRole("heading", { name: "Sign in", exact: true });
-    await expect(heading.or(page.getByLabel("Page title")).first()).toBeVisible();
+    await expect(heading.or(page.getByLabel("Page title")).first()).toBeVisible({
+      timeout: WORKSPACE_READY_TIMEOUT_MS,
+    });
     if (await heading.isVisible()) {
       await page.getByLabel("Email", { exact: true }).fill("owner@example.test");
       await page.getByLabel("Password", { exact: true }).fill("password123");
       await page.getByRole("button", { name: "Continue", exact: true }).click();
     }
   }
-  await expect(page.getByLabel("Page title")).toBeVisible();
+  await expect(page.getByLabel("Page title")).toBeVisible({ timeout: WORKSPACE_READY_TIMEOUT_MS });
   writeFileSync(ownerCookies, JSON.stringify(await page.context().cookies()), { mode: 0o600 });
 }

@@ -16,6 +16,11 @@ const requiredNames = [
   "authorize_passkey_insert",
   "complete_invite",
 ];
+const triggerNames = new Set(["initialize_account_security", "authorize_passkey_insert", "complete_invite"]);
+
+function schemaRows() {
+  return requiredNames.map((name) => ({ name, type: triggerNames.has(name) ? "trigger" : "table" }));
+}
 
 function result(rows) {
   return { status: 0, stdout: JSON.stringify([{ results: rows }]) };
@@ -25,7 +30,7 @@ describe("account security preflight exit codes", () => {
   it("returns 0 for a completed passing check", () => {
     const execute = vi
       .fn()
-      .mockReturnValueOnce(result(requiredNames.map((name) => ({ name, type: "table" }))))
+      .mockReturnValueOnce(result(schemaRows()))
       .mockReturnValueOnce(result([{ name: "claimed_by" }, { name: "claimed_email" }]))
       .mockReturnValueOnce(result([{ name: "0028_mandatory_security.sql" }, { name: "0029_security_lifecycle.sql" }]))
       .mockReturnValueOnce(result([{ users_missing_security: 0 }]));
@@ -45,6 +50,26 @@ describe("account security preflight exit codes", () => {
     try {
       expect(main(["--local"], execute)).toBe(1);
       expect(JSON.parse(output.mock.calls[0][0]).outcome).toBe("FAIL");
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it.each([
+    ["table", "d1_migrations", "trigger"],
+    ["trigger", "initialize_account_security", "table"],
+  ])("rejects a required %s with the wrong object type", (_kind, name, wrongType) => {
+    const rows = schemaRows().map((row) => (row.name === name ? { ...row, type: wrongType } : row));
+    const execute = vi.fn().mockReturnValueOnce(result(rows));
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      expect(main(["--local"], execute)).toBe(1);
+      expect(execute).toHaveBeenCalledOnce();
+      expect(JSON.parse(output.mock.calls[0][0])).toEqual({
+        check: "security-schema",
+        outcome: "FAIL",
+        missing: [name],
+      });
     } finally {
       output.mockRestore();
     }

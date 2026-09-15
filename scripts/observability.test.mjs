@@ -160,6 +160,24 @@ describe("observability thresholds", () => {
     expect(evaluateThresholds(snapshot)).toContain("workflow_metadata_unavailable");
   });
 
+  it.each([
+    ["string", "next"],
+    ["array", [{ cursor: "next" }]],
+  ])("rejects %s Workflow pagination metadata", async (_shape, resultInfo) => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      {
+        fetcher: cloudflareFetcher({
+          workflows: () => Response.json({ success: true, result: [{ id: "stale" }], result_info: resultInfo }),
+        }),
+        delay: async () => undefined,
+      },
+    );
+    expect(snapshot.staleQueuedWorkflows).toBeNull();
+    expect(snapshot.sourceFailures).toContain("workflow_metadata_unavailable");
+    expect(evaluateThresholds(snapshot)).toContain("workflow_metadata_unavailable");
+  });
+
   it("keeps an old queued Workflow paging until authoritative current state resolves it", async () => {
     const timestamp = Date.now();
     const stale = {
