@@ -81,10 +81,14 @@ attach one, `BETTER_AUTH_URL` must match it exactly, including scheme and absenc
 pnpm wrangler secret put BETTER_AUTH_SECRET --env production
 pnpm wrangler secret put BOOTSTRAP_TOKEN --env production
 pnpm wrangler secret put WEBHOOK_ENCRYPTION_KEY --env production
+pnpm wrangler secret put OBSERVABILITY_PROBE_TOKEN --env production
 ```
 
 Use at least 32 random bytes for `BETTER_AUTH_SECRET`. Treat `BOOTSTRAP_TOKEN` as a one-time operator
 credential and rotate or remove it after the owner is created.
+
+Generate `OBSERVABILITY_PROBE_TOKEN` independently with at least 32 random bytes. Put the same value in
+the GitHub `OBSERVABILITY_PROBE_TOKEN` Actions secret; it protects the dependency-aware readiness endpoint.
 
 Generate `WEBHOOK_ENCRYPTION_KEY` as exactly 32 random bytes in unpadded base64url form, for example
 with `openssl rand -base64 32 | tr '+/' '-_' | tr -d '='`. It encrypts integration webhook
@@ -151,9 +155,7 @@ These are configured in the Cloudflare dashboard, not in this repository.
 ## 5. Migrate and deploy
 
 ```sh
-pnpm build
-pnpm db:remote
-pnpm deploy
+pnpm run deploy
 ```
 
 Migrations must complete before the Worker is deployed. The Worker queries the projection, mention,
@@ -161,13 +163,17 @@ deletion-job, archive-disconnect, table-state, page-creation receipt, and page-m
 ordinary request paths; deploying code that expects a migration which has not been applied produces
 runtime failures rather than a clean startup error.
 
-`pnpm deploy` runs `pnpm build` again, which runs the full typecheck. To deploy from CI instead, see
+`pnpm run deploy` runs the full typecheck and production build, applies all pending D1 migrations,
+then deploys the Worker. A failed build or migration stops the command before deployment. Already
+applied migrations are skipped. Use this command for local releases; invoking `wrangler deploy`
+directly bypasses the D1 migration step. CI also applies migrations before uploading the Worker; see
 [Automated deployment](#automated-deployment).
 
 `0001_initial.sql` is the squashed pre-production baseline. Files `0002` and later are forward-only
 production migrations and must remain in order; never edit an applied migration or mark it applied by
 hand. Before upgrading an existing installation, take a D1 export and stop any running Notion import,
-then run `pnpm db:remote` before deploying the Worker that consumes the new schema.
+then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
+new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
 
 For the security lifecycle follow-up, apply `0029_security_lifecycle.sql` and then
 `0030_security_review_followups.sql` before deploying the updated Worker. Migration `0030` is compatible
@@ -254,14 +260,15 @@ bootstrap regardless.
 ## 7. Verify
 
 ```sh
-curl -s https://notes.example.com/api/health
+curl -i -s https://notes.example.com/api/health
+curl -fsS -H "X-Observability-Token: $OBSERVABILITY_PROBE_TOKEN" \
+  https://notes.example.com/api/health/ready
+pnpm observability:check
 ```
 
-Expect `{"ok":true,"version":"0.1.0","time":"..."}`. Note that `version` is a hardcoded string, not a
-build identifier, so this endpoint confirms the Worker is up and D1 is reachable but **cannot tell you
-which revision is live**. Use `pnpm wrangler deployments list --env production` for that.
-
-The health check probes D1 only. It returns `ok` during a complete R2 or Durable Object outage.
+Expect `ok:true`, a `deployment.id` matching the `X-Worker-Version` response header, and protected readiness
+status `ready`. Readiness checks D1, R2, a read-only Durable Object request, cron freshness, and durable queues.
+Compare the ID with `pnpm wrangler deployments list --env production`.
 
 ### Production smoke checklist
 
@@ -282,6 +289,10 @@ The health check probes D1 only. It returns `ok` during a complete R2 or Durable
 - The scheduled handler runs successfully and no deletion jobs or unfinished targets remain.
 - Idle connected rooms stop accruing billed duration in Cloudflare analytics.
 - D1, R2, and Durable Object metrics and Worker logs are visible.
+- Workers Traces contain D1, R2, Durable Object, and fixed `notes.*` custom spans.
+- Analytics Engine contains each exercised event family and the next cron advances every
+  `observability_task_runs.last_succeeded_at` value.
+- A manual run of `.github/workflows/observability.yml` succeeds and writes a healthy summary.
 
 The last item must be measured on a deployed account; Miniflare cannot prove billing behavior.
 
@@ -293,11 +304,11 @@ The last item must be measured on a deployed account; Miniflare cannot prove bil
 2. Build and test the exact revision locally with `pnpm check`. CI runs a superset of the same gate on
    every push and the deploy workflow refuses to proceed unless it passed, so a failure here is a
    failure there.
-3. Run `pnpm db:remote` and confirm every migration in `migrations/` reports success before deploying.
+3. Run `pnpm run deploy`, which builds, applies pending migrations, and then deploys the Worker.
+   Confirm every migration in `migrations/` reports success before the Worker upload starts.
    The directory is the source of truth for what must be applied; do not rely on a list enumerated in
    documentation, which drifts.
-4. Deploy the Worker.
-5. Test sign-in, page metadata, document and workspace-event WebSockets, attachment range and
+4. Test sign-in, page metadata, document and workspace-event WebSockets, attachment range and
    conditional download, table lease acquisition, and version listing.
 
 Durable Object migrations are append-only in `wrangler.jsonc`. Never rename or delete the `Document` or
@@ -339,7 +350,8 @@ then use `workflow_dispatch` and check its page-move receipt migration confirmat
 until that manually dispatched run has deployed the new Worker.
 
 It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository or environment secrets and
-`PRODUCTION_BASE_URL` as a variable. Secrets set with `wrangler secret put --env production` are not
+`PRODUCTION_BASE_URL` as a variable. The monitor additionally needs `CLOUDFLARE_OBSERVABILITY_TOKEN` and
+`OBSERVABILITY_PROBE_TOKEN`. Secrets set with `wrangler secret put --env production` are not
 managed by the workflow; they persist across deploys and are set once, manually, per the steps above.
 
 See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md) for the gate's behavior, the credentials, the

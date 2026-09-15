@@ -42,8 +42,10 @@
     "db:remote": "wrangler d1 migrations apply DB --env production --remote",
     "db:export": "node scripts/d1-export.mjs",
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker",
-    "deploy": "pnpm build && wrangler deploy --env production",
-    "security:reset": "node scripts/security-reset.mjs"
+    "deploy": "pnpm build && pnpm db:remote && wrangler deploy --env production",
+    "security:reset": "node scripts/security-reset.mjs",
+    "observability:report": "node scripts/observability.mjs report",
+    "observability:check": "node scripts/observability.mjs check"
   },
   "dependencies": {
     "@better-auth/core": "1.7.2",

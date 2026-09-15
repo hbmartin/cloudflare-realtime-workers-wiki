@@ -1,4 +1,4 @@
-import type { WorkflowStep } from "cloudflare:workers";
+import { tracing, type WorkflowStep } from "cloudflare:workers";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import {
   csvToTable,
@@ -23,6 +23,7 @@ import { isUnsafeMime } from "./attachments";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
 import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
+import { correlationHeaders, logger, traced } from "./observability";
 import { HttpError, normalizeFilename } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { refreshPageSearchV2ForIdsStatements } from "./search-index";
@@ -983,7 +984,11 @@ async function initializeDocument(env: Env, job: JobRow, page: ImportPage) {
   const response = await env.DOCUMENT.getByName(`${page.id}~${job.attempt}`).fetch(
     new Request("https://document.internal/initialize", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+      headers: {
+        "content-type": "application/json",
+        "x-notes-internal": env.BETTER_AUTH_SECRET,
+        ...correlationHeaders(),
+      },
       body: JSON.stringify({ jobId: job.id, inputKey }),
     }),
   );
@@ -1100,7 +1105,9 @@ async function verifyPage(env: Env, job: JobRow, page: ImportPage) {
   }
   if (page.document) {
     const response = await env.DOCUMENT.getByName(`${page.id}~${job.attempt}`).fetch(
-      new Request("https://document.internal/content", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
+      }),
     );
     if (!response.ok) throw new Error(`Imported document verification failed (${response.status}).`);
     const envelope = await response.json<DocumentContentEnvelope>();
@@ -1228,7 +1235,13 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
     try {
       await broadcastWorkspaceEvent(env, job.workspace_id, event);
     } catch (error) {
-      console.error("Failed to broadcast a published import", { jobId: job.id, type: event.type, error });
+      logger.error(
+        "import.publish_broadcast.failed",
+        "import",
+        "Published import broadcast failed.",
+        { jobId: job.id, eventType: event.type },
+        error,
+      );
     }
   };
   const hiddenPageIds = new Set(
@@ -1264,7 +1277,7 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
     const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
       new Request("https://document.internal/purge", {
         method: "POST",
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
       }),
     );
     if (!(await stillOwned())) return;
@@ -1293,7 +1306,13 @@ export async function cleanupImport(env: Env, job: JobRow, stillOwned: () => Pro
     .run();
 }
 
-export async function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
+export function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
+  return traced(tracing, "notes.job.import", { "notes.job_id": job.id, "notes.job_attempt": job.attempt }, () =>
+    runImportObserved(env, job, step),
+  );
+}
+
+async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   let options = importOptions(job);
   // A deployment can supersede confirmation while a workflow is queued or suspended.
   const refreshing = options.confirmed && !hasCurrentImportConfirmation(options);

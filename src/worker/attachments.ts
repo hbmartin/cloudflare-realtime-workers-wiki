@@ -1,5 +1,6 @@
 import type { Env } from "./env";
 import { safeErrorMessage } from "../shared/error-log.ts";
+import { logger } from "./observability.ts";
 
 /**
  * Attachment upload policy, shared by both upload paths, plus the reaper that
@@ -177,7 +178,13 @@ async function reapUpload(env: Env, id: string) {
       // whose multipart state may already be gone; the terminal retry path reconciles it.
       await rescheduleUpload(env, claimed, leaseUntil, "reaping", error);
     } catch (retryError) {
-      console.error("Failed to reschedule abandoned upload", retryError);
+      logger.error(
+        "upload.reap.reschedule_failed",
+        "attachments",
+        "Abandoned upload reschedule failed.",
+        { uploadId: id },
+        retryError,
+      );
     }
     return false;
   }
@@ -191,7 +198,13 @@ async function reapUpload(env: Env, id: string) {
     // R2 is already clean. Do not make the row active again: it would advertise a
     // resumable multipart upload that no longer exists. The fenced reaping row is safe
     // for an operator to discard after D1 recovers.
-    console.error("Failed to delete reaped upload row", error);
+    logger.error(
+      "upload.reap.row_delete_failed",
+      "attachments",
+      "Reaped upload row deletion failed.",
+      { uploadId: id },
+      error,
+    );
     return false;
   }
 }
@@ -218,7 +231,13 @@ async function retryTerminalAbort(env: Env, id: string, state: "reaping" | "abor
     return true;
   } catch (error) {
     await rescheduleUpload(env, claimed, leaseUntil, state, error).catch((retryError) => {
-      console.error("Failed to reschedule terminal upload abort", retryError);
+      logger.error(
+        "upload.abort.reschedule_failed",
+        "attachments",
+        "Terminal upload abort reschedule failed.",
+        { uploadId: id },
+        retryError,
+      );
     });
     return false;
   }
@@ -273,7 +292,13 @@ async function inspectStaleCompletion(env: Env, id: string) {
     try {
       await rescheduleUpload(env, claimed, leaseUntil, "completing", error);
     } catch (retryError) {
-      console.error("Failed to reschedule completion inspection", retryError);
+      logger.error(
+        "upload.completion_inspect.reschedule_failed",
+        "attachments",
+        "Completion inspection reschedule failed.",
+        { uploadId: id },
+        retryError,
+      );
     }
     return false;
   }
@@ -329,7 +354,13 @@ async function resolveCompletedUpload(env: Env, id: string) {
     return true;
   } catch (error) {
     await rescheduleUpload(env, claimed, leaseUntil, "r2_complete", error).catch((retryError) => {
-      console.error("Failed to reschedule completed upload resolution", retryError);
+      logger.error(
+        "upload.completed_resolution.reschedule_failed",
+        "attachments",
+        "Completed upload resolution reschedule failed.",
+        { uploadId: id },
+        retryError,
+      );
     });
     return false;
   }

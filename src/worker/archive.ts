@@ -1,6 +1,7 @@
 import type { Env } from "./env";
 import { locationHint } from "./http";
 import { safeErrorMessage } from "../shared/error-log";
+import { correlationHeaders, logger } from "./observability";
 
 export interface ArchiveDisconnectTarget {
   page_id: string;
@@ -62,7 +63,7 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
     const response = await stub.fetch(
       new Request("https://document.internal/archive", {
         method: "POST",
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
         signal: AbortSignal.timeout(ARCHIVE_DISCONNECT_TIMEOUT_MS),
       }),
     );
@@ -91,7 +92,13 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
         .run();
     } catch (retryError) {
       // The original target row remains due and can be retried by the next cron.
-      console.error("Failed to reschedule archive disconnect", retryError);
+      logger.error(
+        "archive.disconnect.reschedule_failed",
+        "archive",
+        "Archive disconnect reschedule failed.",
+        { pageId: target.page_id, attempts: recordedAttempts },
+        retryError,
+      );
     }
     return false;
   }

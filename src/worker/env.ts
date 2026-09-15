@@ -15,6 +15,9 @@ export interface AppBindings {
   API_SOURCE_MINUTE_LIMIT: RateLimit;
   API_BURST_LIMIT: RateLimit;
   API_MINUTE_LIMIT: RateLimit;
+  CLIENT_TELEMETRY_LIMIT: RateLimit;
+  OBSERVABILITY: AnalyticsEngineDataset;
+  CF_VERSION_METADATA: WorkerVersionMetadata;
   SEND_EMAIL?: SendEmail;
   BROWSER?: BrowserRun;
   EMAIL_FROM?: string;
@@ -29,6 +32,7 @@ export interface AppBindings {
   BOOTSTRAP_TOKEN: string;
   DO_LOCATION_HINT?: DurableObjectLocationHint;
   WORKFLOW_INLINE?: "true";
+  OBSERVABILITY_PROBE_TOKEN?: string;
 }
 
 export interface Env extends AppBindings {}

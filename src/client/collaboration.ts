@@ -5,6 +5,7 @@ import type { WorkspaceEvent } from "../shared/types";
 import { parseWorkspaceEvent } from "../shared/validation";
 import { CollaborationDurability } from "./collaboration-durability";
 import { connectionRetryDelay } from "./retry";
+import { reportClientError } from "./telemetry";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -107,6 +108,7 @@ export function createCollaboration(
         if (destroyed) return;
         onStatus("offline");
         console.error("Failed to connect document collaboration", error);
+        void reportClientError("client.realtime_connection_failed", error);
         if (document.visibilityState !== "hidden") {
           connectionTimer = window.setTimeout(connect, connectionRetryDelay(connectionAttempt++));
         }
@@ -150,6 +152,7 @@ export function createCollaboration(
     .catch((error) => {
       if (destroyed) return;
       console.error("Failed to load offline document state", error);
+      void reportClientError("client.offline_storage_failed", error);
       onStatus("offline");
       throw error;
     });
@@ -190,7 +193,10 @@ export function createCollaboration(
       provider.off("custom-message", handleCustomMessage);
       provider.awareness.setLocalState(null);
       provider.destroy();
-      void indexeddb.destroy().catch((error) => console.error("Failed to close offline document storage", error));
+      void indexeddb.destroy().catch((error) => {
+        console.error("Failed to close offline document storage", error);
+        void reportClientError("client.offline_storage_failed", error);
+      });
       doc.destroy();
     },
   };
@@ -234,6 +240,7 @@ export function createNetworkCollaboration(
         if (destroyed) return;
         onStatus("offline");
         console.error("Failed to connect diagram collaboration", error);
+        void reportClientError("client.realtime_connection_failed", error);
         if (document.visibilityState !== "hidden") {
           retryTimer = window.setTimeout(connect, connectionRetryDelay(retryAttempt++));
         }

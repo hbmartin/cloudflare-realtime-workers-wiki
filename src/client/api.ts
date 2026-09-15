@@ -2,6 +2,7 @@ import { createAuthClient } from "better-auth/react";
 
 import { twoFactorClient } from "better-auth/client/plugins";
 import { passkeyClient } from "@better-auth/passkey/client";
+import { observeWorkerResponse, reportClientError } from "./telemetry";
 
 export const authClient = createAuthClient({
   baseURL: window.location.origin,
@@ -16,12 +17,16 @@ export interface ApiClientErrorDiagnostics {
   contentType?: string | null;
   responseBodyFailure?: ApiResponseBodyFailure;
   cause?: unknown;
+  requestId?: string | null;
+  workerVersion?: string | null;
 }
 
 export interface EmptyApiResponseDiagnostics {
   requestPath: string;
   responseUrl: string | null;
   contentType: string | null;
+  requestId?: string | null;
+  workerVersion?: string | null;
 }
 
 export interface SuccessfulApiResponseDiagnostics extends EmptyApiResponseDiagnostics {
@@ -39,6 +44,8 @@ export class ApiClientError extends Error {
   readonly responseUrl: string | null;
   readonly contentType: string | null;
   readonly responseBodyFailure: ApiResponseBodyFailure | null;
+  readonly requestId: string | null;
+  readonly workerVersion: string | null;
 
   constructor(
     readonly status: number,
@@ -53,6 +60,8 @@ export class ApiClientError extends Error {
     this.responseUrl = diagnostics.responseUrl ?? null;
     this.contentType = diagnostics.contentType ?? null;
     this.responseBodyFailure = diagnostics.responseBodyFailure ?? null;
+    this.requestId = diagnostics.requestId ?? null;
+    this.workerVersion = diagnostics.workerVersion ?? null;
   }
 }
 
@@ -86,6 +95,8 @@ export abstract class SuccessfulApiResponseError extends Error {
   readonly requestPath: string;
   readonly responseUrl: string | null;
   readonly contentType: string | null;
+  readonly requestId: string | null;
+  readonly workerVersion: string | null;
 
   constructor(
     readonly status: number,
@@ -106,6 +117,8 @@ export abstract class SuccessfulApiResponseError extends Error {
     this.responseUrl = diagnostics.responseUrl;
     this.contentType = diagnostics.contentType;
     this.hasJsonContentType = hasJsonContentType;
+    this.requestId = diagnostics.requestId ?? null;
+    this.workerVersion = diagnostics.workerVersion ?? null;
   }
 }
 
@@ -164,6 +177,13 @@ function reportApiResponseFailure(error: ApiClientError | SuccessfulApiResponseE
     causeName,
     causeType,
   });
+  const event =
+    error.responseBodyFailure === "empty"
+      ? "client.api_response_empty"
+      : error.responseBodyFailure === "read"
+        ? "client.api_response_unreadable"
+        : "client.api_response_invalid";
+  void reportClientError(event, error, { requestId: error.requestId });
 }
 
 function errorChainIncludesTimeout(cause: unknown) {
@@ -200,8 +220,11 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !(init.body instanceof FormData)) headers.set("content-type", "application/json");
   const response = await fetch(path, { ...init, headers });
+  observeWorkerResponse(response.headers);
   const responseUrl = response.url || null;
   const contentType = response.headers.get("content-type");
+  const requestId = response.headers.get("x-request-id");
+  const workerVersion = response.headers.get("x-worker-version");
   if (!response.ok) {
     const fallback = { code: "request_failed", message: `Request failed (${response.status}).` };
     let payload: ApiErrorPayload | null = null;
@@ -233,6 +256,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       contentType,
       responseBodyFailure,
       cause: responseBodyCause,
+      requestId,
+      workerVersion,
     });
     if (responseBodyFailure) reportApiResponseFailure(clientError);
     if (response.status === 401 && requestEpoch === unauthorizedRequestEpoch) {
@@ -241,6 +266,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
           handler(clientError);
         } catch (handlerError) {
           console.error("API unauthorized handler failed", handlerError);
+          void reportClientError("client.api_unauthorized_handler_failed", handlerError, { requestId });
         }
       }
     }
@@ -257,6 +283,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       responseUrl,
       contentType,
       cause,
+      requestId,
+      workerVersion,
     });
     reportApiResponseFailure(error);
     throw error;
@@ -266,6 +294,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       requestPath: path,
       responseUrl,
       contentType,
+      requestId,
+      workerVersion,
     });
     reportApiResponseFailure(error);
     throw error;
@@ -278,6 +308,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       responseUrl,
       contentType,
       cause,
+      requestId,
+      workerVersion,
     });
     reportApiResponseFailure(error);
     throw error;

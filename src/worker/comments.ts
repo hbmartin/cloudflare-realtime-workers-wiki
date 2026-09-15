@@ -4,6 +4,7 @@ import type { Env } from "./env";
 import { HttpError } from "./http";
 import { notificationFanoutStatements } from "./notifications";
 import { refreshPageSearchV2Statements } from "./search-index";
+import { correlationHeaders, logger } from "./observability";
 import { webhookEventStatements } from "./webhooks";
 
 const COMMENT_BODY_MAX_BYTES = 32 * 1024;
@@ -572,7 +573,7 @@ export async function migrateLegacyComments(env: Env, page: CommentPage) {
   if (migrated) return;
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/legacy-comments", {
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
     }),
   );
   if (!response.ok) throw new HttpError(503, "comments_unavailable", "Comments are temporarily unavailable.");
@@ -645,8 +646,16 @@ export async function migrateLegacyComments(env: Env, page: CommentPage) {
     .fetch(
       new Request("https://document.internal/legacy-comments/clear", {
         method: "POST",
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
       }),
     )
-    .catch((error) => console.error("Failed to clear migrated Yjs comment bodies", { pageId: page.id, error }));
+    .catch((error) =>
+      logger.error(
+        "comments.legacy_body_clear.failed",
+        "comments",
+        "Migrated Yjs comment bodies could not be cleared.",
+        { pageId: page.id },
+        error,
+      ),
+    );
 }

@@ -3,6 +3,9 @@ import { createRoot } from "react-dom/client";
 import { browserSupportsRequiredFeatures } from "./browser-support";
 import { Startup } from "./startup";
 import "./startup.css";
+import { installClientTelemetry } from "./telemetry";
+
+installClientTelemetry();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

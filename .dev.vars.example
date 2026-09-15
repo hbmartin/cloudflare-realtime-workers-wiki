@@ -1,6 +1,7 @@
 BETTER_AUTH_SECRET=replace-with-at-least-32-random-characters
 BETTER_AUTH_URL=http://localhost:5173
 BOOTSTRAP_TOKEN=replace-with-a-one-time-install-token
+OBSERVABILITY_PROBE_TOKEN=replace-with-a-high-entropy-probe-token
 DO_LOCATION_HINT=
 SLACK_CLIENT_ID=
 SLACK_CLIENT_SECRET=

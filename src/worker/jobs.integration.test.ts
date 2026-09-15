@@ -29,6 +29,20 @@ import worker from "./index";
 
 type InstalledWorkspace = { cookie: string; pageId: string; userId: string; workspaceId: string };
 
+function expectStructuredLog(
+  spy: { mock: { calls: readonly (readonly unknown[])[] } },
+  event: string,
+  fields: unknown,
+) {
+  const records = spy.mock.calls
+    .map(([record]) => record)
+    .filter(
+      (record): record is Record<string, unknown> =>
+        record !== null && typeof record === "object" && (record as Record<string, unknown>).event === event,
+    );
+  expect(records).toContainEqual(expect.objectContaining(fields as Record<string, unknown>));
+}
+
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
   headers.set("cookie", cookie);
@@ -173,7 +187,10 @@ describe("job execution", () => {
     expect(first.coalesced).toBe(false);
     expect(first.job).toMatchObject({ type: "search_reindex", status: "queued", hasDownload: false });
     await waitOnExecutionContext(context);
-    expect(create).toHaveBeenCalledWith({ id: first.job.id, params: { jobId: first.job.id, attempt: 1 } });
+    expect(create).toHaveBeenCalledWith({
+      id: first.job.id,
+      params: { jobId: first.job.id, attempt: 1, correlationId: expect.any(String) },
+    });
 
     const feed = await worker.fetch(request(installed.cookie, "/api/jobs"), env, createExecutionContext());
     expect(feed.status).toBe(200);
@@ -193,7 +210,10 @@ describe("job execution", () => {
     expect(response.status).toBe(202);
     const job = (await response.json<{ job: Job }>()).job;
     await waitOnExecutionContext(context);
-    expect(create).toHaveBeenCalledWith({ id: job.id, params: { jobId: job.id, attempt: 1 } });
+    expect(create).toHaveBeenCalledWith({
+      id: job.id,
+      params: { jobId: job.id, attempt: 1, correlationId: expect.any(String) },
+    });
 
     await env.DB.prepare(`UPDATE jobs SET status = 'running' WHERE id = ?`).bind(job.id).run();
     const row = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(job.id).first<JobRow>())!;
@@ -3077,12 +3097,20 @@ describe("job execution", () => {
       expect(failed.status).toBe("failed");
       expect(failed.error_code).toBe(failure === "missing" ? "import_upload_missing" : "job_failed");
       expect(failed.error_message).not.toContain("preview");
-      const executionLogs = log.mock.calls.filter(([message]) => message === "Job execution failed");
+      const executionLogs = log.mock.calls.filter(
+        ([record]) =>
+          record !== null &&
+          typeof record === "object" &&
+          (record as Record<string, unknown>).event === "workflow.job.failed",
+      );
       expect(executionLogs).toHaveLength(failure === "missing" ? 0 : 1);
       expect(failed.error_message?.includes("Upload the file again")).toBe(failure === "missing");
-      expect(executionLogs.map(([, details]) => ({ jobId: details.jobId, attempt: details.attempt }))).toEqual(
-        failure === "missing" ? [] : [{ jobId, attempt: 2 }],
-      );
+      expect(
+        executionLogs.map(([details]) => ({
+          jobId: (details as Record<string, unknown>).jobId,
+          attempt: (details as Record<string, unknown>).attempt,
+        })),
+      ).toEqual(failure === "missing" ? [] : [{ jobId, attempt: 2 }]);
     },
   );
 
@@ -3443,15 +3471,15 @@ describe("job execution", () => {
     const tableId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const zip = createZip([
       {
-        path: `Export-demo/SparkedAI HQ/Tasks ${tableId}.md`,
+        path: `Export-demo/Example HQ/Tasks ${tableId}.md`,
         bytes: encoder.encode("# Tech Tasks\n\nDatabase overview\n"),
       },
       {
-        path: `Export-demo/SparkedAI HQ/Tasks ${tableId}_all.csv`,
+        path: `Export-demo/Example HQ/Tasks ${tableId}_all.csv`,
         bytes: encoder.encode("Task,Done\nShip,yes\n"),
       },
       {
-        path: `Export-demo/SparkedAI HQ/Tasks aaaa-aaaa/Ship bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md`,
+        path: `Export-demo/Example HQ/Tasks aaaa-aaaa/Ship bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md`,
         bytes: encoder.encode("# Ship\n\nDetailed acceptance criteria\n"),
       },
       {
@@ -3476,7 +3504,7 @@ describe("job execution", () => {
       ).json<{ job: Job }>()
     ).job.result!.preview!;
     expect(preview).toMatchObject({ pages: 3, tables: 1, roots: 2, nested: 1, unresolvedParents: 0 });
-    expect(preview.groups?.map((group) => group.name)).toEqual(["SparkedAI HQ", "Private & Shared"]);
+    expect(preview.groups?.map((group) => group.name)).toEqual(["Example HQ", "Private & Shared"]);
 
     const missingMappings = await worker.fetch(
       await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
@@ -3488,7 +3516,7 @@ describe("job execution", () => {
       await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ groupSpaceIds: { "SparkedAI HQ": `${installed.workspaceId}-general` } }),
+        body: JSON.stringify({ groupSpaceIds: { "Example HQ": `${installed.workspaceId}-general` } }),
       }),
       bindings,
       createExecutionContext(),
@@ -3502,7 +3530,7 @@ describe("job execution", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           groupSpaceIds: {
-            "SparkedAI HQ": `${installed.workspaceId}-general`,
+            "Example HQ": `${installed.workspaceId}-general`,
             "Private & Shared": privateSpace.id,
           },
         }),
@@ -3793,7 +3821,10 @@ describe("delivery outbox", () => {
 
     expect(send).toHaveBeenCalledOnce();
     expect(send).toHaveBeenCalledWith({ sweep: true });
-    expect(log).toHaveBeenCalledWith("Outbox sweep fallback enqueue failed", { error: failure });
+    expectStructuredLog(log, "outbox.sweep_continuation.enqueue_failed", {
+      errorName: failure.name,
+      errorMessage: failure.message,
+    });
   });
 
   it("stops enqueueing when the sweep lease token is replaced", async () => {
@@ -3823,7 +3854,7 @@ describe("delivery outbox", () => {
     expect(send).toHaveBeenCalledTimes(2);
     expect(send).toHaveBeenNthCalledWith(1, { outboxId: ids[0] });
     expect(send).toHaveBeenNthCalledWith(2, { sweep: true });
-    expect(log).toHaveBeenCalledWith("Outbox sweep lease lost", { stage: "before-row" });
+    expectStructuredLog(log, "outbox.sweep.lease_lost", { stage: "before-row" });
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 1 });
@@ -3861,7 +3892,7 @@ describe("delivery outbox", () => {
     expect(send).toHaveBeenCalledTimes(2);
     expect(send).toHaveBeenNthCalledWith(1, { outboxId: ids[0] });
     expect(send).toHaveBeenNthCalledWith(2, { sweep: true });
-    expect(log).toHaveBeenCalledWith("Outbox sweep lease lost", { stage: "before-row" });
+    expectStructuredLog(log, "outbox.sweep.lease_lost", { stage: "before-row" });
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 1 });
@@ -3900,8 +3931,11 @@ describe("delivery outbox", () => {
     expect(send).toHaveBeenCalledTimes(2);
     expect(send).toHaveBeenNthCalledWith(1, { outboxId: ids[0] });
     expect(send).toHaveBeenNthCalledWith(2, { sweep: true });
-    expect(log).toHaveBeenCalledWith("Outbox sweep lease lost", { stage: "before-row" });
-    expect(log).toHaveBeenCalledWith("Outbox sweep lease-loss continuation enqueue failed", { error: failure });
+    expectStructuredLog(log, "outbox.sweep.lease_lost", { stage: "before-row" });
+    expectStructuredLog(log, "outbox.sweep_continuation.enqueue_failed", {
+      errorName: failure.name,
+      errorMessage: failure.message,
+    });
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 1 });
@@ -3952,7 +3986,7 @@ describe("delivery outbox", () => {
 
     expect(send).toHaveBeenCalledTimes(251);
     expect(send).toHaveBeenLastCalledWith({ sweep: true });
-    expect(warning).toHaveBeenCalledWith("Outbox sweep cap reached; scheduling continuation", { maxRows: 250 });
+    expectStructuredLog(warning, "outbox.sweep.capped", { maxRows: 250 });
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 1 });
@@ -3973,6 +4007,50 @@ describe("delivery outbox", () => {
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 0 });
+  });
+
+  it("acknowledges a malformed queue body without blocking a valid sibling", async () => {
+    const invalidAck = vi.fn();
+    const invalidRetry = vi.fn();
+    const validAck = vi.fn();
+    const validRetry = vi.fn();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    onTestFinished(() => warning.mockRestore());
+    const invalid = {
+      id: "invalid-message",
+      timestamp: new Date(),
+      body: 7 as unknown as DeliveryQueueMessage,
+      attempts: 1,
+      ack: invalidAck,
+      retry: invalidRetry,
+    } satisfies Message<DeliveryQueueMessage>;
+    const valid = {
+      id: "valid-message",
+      timestamp: new Date(),
+      body: { outboxId: "missing-outbox" },
+      attempts: 1,
+      ack: validAck,
+      retry: validRetry,
+    } satisfies Message<DeliveryQueueMessage>;
+
+    await expect(
+      worker.queue(
+        {
+          queue: "delivery",
+          messages: [invalid, valid],
+          metadata: { metrics: { backlogCount: 2, backlogBytes: 0 } },
+          ackAll: vi.fn(),
+          retryAll: vi.fn(),
+        } satisfies MessageBatch<DeliveryQueueMessage>,
+        env,
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(invalidAck).toHaveBeenCalledOnce();
+    expect(invalidRetry).not.toHaveBeenCalled();
+    expect(validAck).toHaveBeenCalledOnce();
+    expect(validRetry).not.toHaveBeenCalled();
+    expectStructuredLog(warning, "queue.message.invalid", { messageId: "invalid-message", attempts: 1 });
   });
 
   it("retries a sweep message when its capped continuation cannot be enqueued", async () => {
@@ -4024,10 +4102,13 @@ describe("delivery outbox", () => {
     );
 
     expect(send).toHaveBeenCalledTimes(251);
-    expect(send).toHaveBeenLastCalledWith({ sweep: true });
+    expect(send).toHaveBeenLastCalledWith({ sweep: true, correlationId: "failed-sweep-continuation" });
     expect(ack).not.toHaveBeenCalled();
     expect(retry).toHaveBeenCalledWith({ delaySeconds: 2 });
-    expect(log).toHaveBeenCalledWith("Outbox sweep continuation enqueue failed", { error: failure });
+    expectStructuredLog(log, "outbox.sweep_continuation.enqueue_failed", {
+      errorName: failure.name,
+      errorMessage: failure.message,
+    });
     await expect(
       env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE enqueued_at IS NULL`).first<{ count: number }>(),
     ).resolves.toEqual({ count: 1 });
@@ -4074,10 +4155,10 @@ describe("delivery outbox", () => {
       bindingsWith({ DELIVERY_QUEUE: { send: vi.fn(async () => Promise.reject(new Error("poison"))) } }),
     );
 
-    expect(log).toHaveBeenCalledWith("Outbox row has persistent enqueue failures", {
+    expectStructuredLog(log, "outbox.enqueue.persistent_failure", {
       outboxId,
       attempts: 10,
-      error: "poison",
+      errorValue: "poison",
     });
     expect(await env.DB.prepare(`SELECT attempts, last_error FROM outbox WHERE id = ?`).bind(outboxId).first()).toEqual(
       {

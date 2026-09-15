@@ -1,4 +1,5 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
+import { tracing } from "cloudflare:workers";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
@@ -21,6 +22,7 @@ import { notificationFanoutStatements } from "./notifications";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { webhookEventStatements } from "./webhooks";
+import { logger, recordMetric, traced, withDurableObjectContext } from "./observability";
 
 const COMPACTION_DELAY_MS = 30_000;
 const ALARM_RETRY_DELAY_MS = 5_000;
@@ -693,6 +695,10 @@ export class Document extends YServer {
   }
 
   async onRequest(request: Request) {
+    return withDurableObjectContext(this.bindings, request, () => this.onRequestObserved(request));
+  }
+
+  private async onRequestObserved(request: Request) {
     const url = new URL(request.url);
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
@@ -1036,7 +1042,35 @@ export class Document extends YServer {
     if (active) {
       return active.catch(() => undefined).then(() => this.compact(forceVersion, suppressExternalEffects));
     }
-    const compacting = this.compactOnce(forceVersion, suppressExternalEffects);
+    const { pageId } = this.ids;
+    const startedAt = performance.now();
+    const compacting = traced(
+      tracing,
+      "notes.document.compact",
+      { "notes.page_id": pageId, "notes.content_kind": this.metadata.content_kind },
+      async () => {
+        try {
+          await this.compactOnce(forceVersion, suppressExternalEffects);
+          recordMetric(this.bindings, {
+            event: "document.compaction",
+            component: "document",
+            operation: this.metadata.content_kind,
+            outcome: "success",
+            durationMs: performance.now() - startedAt,
+          });
+        } catch (error) {
+          recordMetric(this.bindings, {
+            event: "document.compaction",
+            component: "document",
+            operation: this.metadata.content_kind,
+            outcome: "failure",
+            durationMs: performance.now() - startedAt,
+          });
+          logger.error("document.compaction.failed", "document", "Document compaction failed.", { pageId }, error);
+          throw error;
+        }
+      },
+    );
     const tracked = compacting.finally(() => {
       if (this.compaction === tracked) this.compaction = null;
     });
@@ -1447,7 +1481,13 @@ export class Document extends YServer {
         if (pageProjected && superseded && superseded !== structuredKey) {
           this.state.waitUntil(
             this.bindings.BUCKET.delete(superseded).catch((error: unknown) => {
-              console.error("Failed to delete superseded document projection", { pageId, epoch, error });
+              logger.error(
+                "document.projection_delete.failed",
+                "document",
+                "Superseded document projection deletion failed.",
+                { pageId, epoch },
+                error,
+              );
             }),
           );
         }
@@ -1459,7 +1499,15 @@ export class Document extends YServer {
 
         if (pageProjected && !effectsSuppressed) {
           this.state.waitUntil(
-            sweepOutbox(this.bindings).catch((error) => console.error("Failed to enqueue webhook events", error)),
+            sweepOutbox(this.bindings).catch((error) =>
+              logger.error(
+                "document.webhook_enqueue.failed",
+                "document",
+                "Webhook event enqueue failed.",
+                { pageId },
+                error,
+              ),
+            ),
           );
           const currentPageTargets = (results[currentPageTargetsIndex]?.results as Array<{ id: string }>) ?? [];
           const currentUserTargets = (results[currentUserTargetsIndex]?.results as Array<{ id: string }>) ?? [];
@@ -1475,7 +1523,15 @@ export class Document extends YServer {
               pageId,
               backlinkTargetIds,
               mentionTargetUserIds,
-            }).catch((error) => console.error("Failed to broadcast projection update", error)),
+            }).catch((error) =>
+              logger.error(
+                "document.projection_broadcast.failed",
+                "document",
+                "Projection update broadcast failed.",
+                { pageId },
+                error,
+              ),
+            ),
           );
           if (
             metadataAtStart.notify_edit &&
@@ -1486,7 +1542,15 @@ export class Document extends YServer {
               Promise.all([
                 broadcastWorkspaceEvent(this.bindings, page.workspace_id, { type: "notifications-invalidated" }),
                 sweepOutbox(this.bindings),
-              ]).catch((error) => console.error("Failed to enqueue document notifications", error)),
+              ]).catch((error) =>
+                logger.error(
+                  "document.notification_enqueue.failed",
+                  "document",
+                  "Document notification enqueue failed.",
+                  { pageId },
+                  error,
+                ),
+              ),
             );
           }
         }
@@ -1509,7 +1573,13 @@ export class Document extends YServer {
       if (pageProjected && versionKey) {
         this.state.waitUntil(
           this.pruneVersions(pageId).catch((error) => {
-            console.error("Failed to prune document versions", error);
+            logger.error(
+              "document.version_prune.failed",
+              "document",
+              "Document version pruning failed.",
+              { pageId },
+              error,
+            );
           }),
         );
       }
@@ -1523,7 +1593,13 @@ export class Document extends YServer {
       try {
         await this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS);
       } catch (alarmError) {
-        console.error("Failed to schedule compaction retry", alarmError);
+        logger.error(
+          "document.compaction_retry.schedule_failed",
+          "document",
+          "Compaction retry could not be scheduled.",
+          { pageId },
+          alarmError,
+        );
       }
       throw error;
     }
@@ -1837,7 +1913,13 @@ export class Document extends YServer {
           if (oldObjects.length) {
             this.state.waitUntil(
               this.bindings.BUCKET.delete(oldObjects).catch((error: unknown) => {
-                console.error("Failed to delete superseded diagram projection", { pageId, epoch, error });
+                logger.error(
+                  "diagram.projection_delete.failed",
+                  "document",
+                  "Superseded diagram projection deletion failed.",
+                  { pageId, epoch },
+                  error,
+                );
               }),
             );
           }
@@ -1850,7 +1932,15 @@ export class Document extends YServer {
 
         if (pageProjected) {
           this.state.waitUntil(
-            sweepOutbox(this.bindings).catch((error) => console.error("Failed to enqueue webhook events", error)),
+            sweepOutbox(this.bindings).catch((error) =>
+              logger.error(
+                "diagram.webhook_enqueue.failed",
+                "document",
+                "Webhook event enqueue failed.",
+                { pageId },
+                error,
+              ),
+            ),
           );
           const currentPageTargets = (results[currentPageTargetsIndex]?.results as Array<{ id: string }>) ?? [];
           const currentUserTargets = (results[currentUserTargetsIndex]?.results as Array<{ id: string }>) ?? [];
@@ -1866,7 +1956,15 @@ export class Document extends YServer {
               pageId,
               backlinkTargetIds,
               mentionTargetUserIds,
-            }).catch((error) => console.error("Failed to broadcast diagram projection update", error)),
+            }).catch((error) =>
+              logger.error(
+                "diagram.projection_broadcast.failed",
+                "document",
+                "Diagram projection broadcast failed.",
+                { pageId },
+                error,
+              ),
+            ),
           );
           if (
             metadataAtStart.notify_edit &&
@@ -1877,7 +1975,15 @@ export class Document extends YServer {
               Promise.all([
                 broadcastWorkspaceEvent(this.bindings, page.workspace_id, { type: "notifications-invalidated" }),
                 sweepOutbox(this.bindings),
-              ]).catch((error) => console.error("Failed to enqueue diagram notifications", error)),
+              ]).catch((error) =>
+                logger.error(
+                  "diagram.notification_enqueue.failed",
+                  "document",
+                  "Diagram notification enqueue failed.",
+                  { pageId },
+                  error,
+                ),
+              ),
             );
           }
         }
@@ -1896,7 +2002,15 @@ export class Document extends YServer {
       this.metadata.last_version_at = versionAt;
       if (pageProjected && versionKey) {
         this.state.waitUntil(
-          this.pruneVersions(pageId).catch((error) => console.error("Failed to prune diagram versions", error)),
+          this.pruneVersions(pageId).catch((error) =>
+            logger.error(
+              "diagram.version_prune.failed",
+              "document",
+              "Diagram version pruning failed.",
+              { pageId },
+              error,
+            ),
+          ),
         );
       }
     } catch (error) {
@@ -1909,7 +2023,13 @@ export class Document extends YServer {
       try {
         await this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS);
       } catch (alarmError) {
-        console.error("Failed to schedule diagram compaction retry", alarmError);
+        logger.error(
+          "diagram.compaction_retry.schedule_failed",
+          "document",
+          "Diagram compaction retry could not be scheduled.",
+          { pageId },
+          alarmError,
+        );
       }
       throw error;
     }
@@ -1983,7 +2103,13 @@ export class Document extends YServer {
   }
 
   private async deferRestoreReconciliation(error: unknown) {
-    console.error("Failed to reconcile pending document restore", error);
+    logger.error(
+      "document.restore_reconcile.failed",
+      "document",
+      "Pending document restore reconciliation failed.",
+      { pageId: this.ids.pageId, attempts: this.metadata.restore_attempts },
+      error,
+    );
     // A purge can land during the dependency call that just failed; its
     // storage is gone, so there is nothing left to record or arm.
     if (this.purged) return;
@@ -2003,7 +2129,13 @@ export class Document extends YServer {
       this.metadata.restore_attempts = attempt + 1;
       this.metadata.restore_retry_at = retryAt;
     } catch (storageError) {
-      console.error("Failed to record restore reconciliation attempt", storageError);
+      logger.error(
+        "document.restore_reconcile.record_failed",
+        "document",
+        "Restore reconciliation attempt could not be recorded.",
+        { pageId: this.ids.pageId },
+        storageError,
+      );
     }
     // Remember the backoff so finishTransition does not pull the alarm forward
     // and retry immediately against the dependency that just failed.
@@ -2018,7 +2150,13 @@ export class Document extends YServer {
     try {
       await this.state.storage.setAlarm(retryAt);
     } catch (alarmError) {
-      console.error("Failed to schedule restore reconciliation", alarmError);
+      logger.error(
+        "document.restore_reconcile.schedule_failed",
+        "document",
+        "Restore reconciliation could not be scheduled.",
+        { pageId: this.ids.pageId },
+        alarmError,
+      );
     }
   }
 
@@ -2073,7 +2211,24 @@ export class Document extends YServer {
     return true;
   }
 
-  private async restoreVersion(versionId: string, userId: string) {
+  private restoreVersion(versionId: string, userId: string) {
+    const { pageId } = this.ids;
+    const startedAt = performance.now();
+    return traced(tracing, "notes.document.restore", { "notes.page_id": pageId }, async () => {
+      const response = await this.restoreVersionOnce(versionId, userId);
+      recordMetric(this.bindings, {
+        event: "document.restore",
+        component: "document",
+        operation: "version",
+        outcome: response.ok ? "success" : response.status < 500 ? "rejected" : "failure",
+        code: String(response.status),
+        durationMs: performance.now() - startedAt,
+      });
+      return response;
+    });
+  }
+
+  private async restoreVersionOnce(versionId: string, userId: string) {
     if (
       this.validatingTransition ||
       this.transition ||
@@ -2096,7 +2251,13 @@ export class Document extends YServer {
         if (!selected) return Response.json({ error: "Version snapshot is missing." }, { status: 404 });
         selectedBytes = new Uint8Array(await selected.arrayBuffer());
       } catch (error) {
-        console.error("Document restore validation failed", error);
+        logger.error(
+          "document.restore_validation.failed",
+          "document",
+          "Document restore validation failed.",
+          { pageId },
+          error,
+        );
         return Response.json({ error: "The version could not be restored." }, { status: 503 });
       }
 
@@ -2115,7 +2276,13 @@ export class Document extends YServer {
         } catch (error) {
           // D1 is authoritative for routing. A restarted old room also reconciles
           // its retired state from the committed epoch before accepting clients.
-          console.error("Failed to persist retired document state", error);
+          logger.error(
+            "document.restore_retired_state.failed",
+            "document",
+            "Retired document state could not be persisted.",
+            { pageId },
+            error,
+          );
         }
       };
       const cleanupUncommittedRestore = async () => {
@@ -2204,7 +2371,13 @@ export class Document extends YServer {
             if (current?.content_epoch === newEpoch) commitState = "committed";
             else if (current?.content_epoch === epoch) commitState = "not-committed";
           } catch (lookupError) {
-            console.error("Failed to confirm restore commit state", lookupError);
+            logger.error(
+              "document.restore_commit_check.failed",
+              "document",
+              "Restore commit state could not be confirmed.",
+              { pageId },
+              lookupError,
+            );
           }
         }
         if (commitState === "not-committed") {
@@ -2214,7 +2387,7 @@ export class Document extends YServer {
         } else {
           await this.deferRestoreReconciliation(error);
         }
-        console.error("Document restore failed", error);
+        logger.error("document.restore.failed", "document", "Document restore failed.", { pageId }, error);
         return Response.json({ error: "The version could not be restored." }, { status: 503 });
       } finally {
         await this.finishTransition();
@@ -2255,7 +2428,13 @@ export class Document extends YServer {
       if (retryAt !== null) await this.deferAlarm(retryAt);
       else if (alarmWasDeferred) await this.scheduleAlarm(Date.now());
     } catch (error) {
-      console.error("Failed to resume document alarm after transition", error);
+      logger.error(
+        "document.transition_alarm.resume_failed",
+        "document",
+        "Document alarm could not resume after transition.",
+        { pageId: this.ids.pageId },
+        error,
+      );
     }
   }
 

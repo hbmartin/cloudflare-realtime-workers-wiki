@@ -154,7 +154,8 @@ There is no supported way to invoke the deployed cron on demand. Options:
   the same request via `waitUntil`.
 - Locally, `pnpm wrangler dev --test-scheduled` exposes a `/__scheduled` endpoint.
 
-Confirm a tick ran by checking that queue rows advanced their `attempts` and `next_attempt_at`.
+Confirm a tick ran with `SELECT * FROM observability_task_runs ORDER BY task_name`; every subtask records its
+last start, success/failure, duration, and bounded error. The invocation rejects only after all subtasks finish.
 
 ## Leases
 
@@ -238,6 +239,8 @@ pnpm import:notion verify notion-export --base-url https://notes.example.com --e
 
 Run `inspect` and `plan` first. Neither touches the network, and `plan` is where a construct this
 installation cannot represent shows up — while it is still free to do something about it.
+Notion exports contain private workspace data and must remain local and untracked; the standard
+`notion-export*` working directories are ignored by Git for this reason.
 
 | Setting                                | Meaning                                                                                                                                          |
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -331,7 +334,7 @@ pnpm load:realtime
 - **Edge rate limiting is still required.** The Worker limits `/v1` callers and authentication attempts,
   including strict source-IP and normalized-account password budgets, but bootstrap and the unauthenticated
   work before invite authentication still need Cloudflare WAF rules; see [Deployment](DEPLOYMENT.md#4-configure-rate-limiting).
-- **`/api/health` cannot identify the running revision.** Its `version` field is a hardcoded string.
-  Use `pnpm wrangler deployments list --env production`.
+- **There is no in-app telemetry dashboard.** Use Local Explorer locally, Cloudflare dashboards for diagnosis,
+  and `pnpm observability:report` / `pnpm observability:check` for the production summary and alert thresholds.
 - **Durable Object placement is permanent.** A workspace's location hint is fixed at bootstrap and
   Durable Objects do not relocate after creation.

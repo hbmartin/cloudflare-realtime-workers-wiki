@@ -1,8 +1,10 @@
 import type { NotificationEventType, SearchResponse } from "../shared/types";
+import { tracing } from "cloudflare:workers";
 import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256 } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { parseSearchRequest, searchPages } from "./search";
+import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
 
 const OAUTH_STATE_TTL_MS = 10 * 60_000;
 const LINK_TOKEN_TTL_MS = 10 * 60_000;
@@ -218,9 +220,18 @@ export async function disconnectSlack(env: Env, member: MemberContext) {
     try {
       await slackApi(env, installation, "auth.revoke", {});
     } catch (error) {
-      console.error("Slack token revocation failed during disconnect", {
-        workspaceId: member.workspace.id,
+      logger.error(
+        "slack.token_revoke.failed",
+        "slack",
+        "Slack token revocation failed during disconnect.",
+        { workspaceId: member.workspace.id },
         error,
+      );
+      recordMetric(env, {
+        event: "integration.call",
+        component: "slack",
+        operation: "token_revoke",
+        outcome: "failure",
       });
     }
   }
@@ -466,17 +477,19 @@ async function usableBotToken(env: Env, installation: SlackInstallation) {
 }
 
 async function slackApi(env: Env, installation: SlackInstallation, method: string, payload: Record<string, unknown>) {
-  const response = await fetch(`https://slack.com/api/${method}`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${await usableBotToken(env, installation)}`,
-      "content-type": "application/json; charset=utf-8",
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
-  }).catch((error: unknown) => {
-    if (isTimeoutAbort(error)) throw new Error(`Slack ${method} timed out.`);
-    throw error;
+  const response = await traced(tracing, "notes.integration.slack", { "notes.operation": method }, async () => {
+    return fetch(`https://slack.com/api/${method}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${await usableBotToken(env, installation)}`,
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
+    }).catch((error: unknown) => {
+      if (isTimeoutAbort(error)) throw new Error(`Slack ${method} timed out.`);
+      throw error;
+    });
   });
   if (response.status === 429) {
     // Retry-After may legally be an HTTP date, which Number() turns into NaN and
@@ -662,12 +675,19 @@ export function slackChannelFanoutStatements(
       ),
     database
       .prepare(
-        `INSERT OR IGNORE INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
-         SELECT 'outbox:' || event.id, event.workspace_id, 'slack_channel', json_object('eventId', event.id), ?, ?
+        `INSERT OR IGNORE INTO outbox
+          (id, workspace_id, topic, payload_json, available_at, created_at, correlation_id)
+         SELECT 'outbox:' || event.id, event.workspace_id, 'slack_channel', json_object('eventId', event.id), ?, ?, ?
            FROM slack_channel_events event WHERE event.id >= ? AND event.id < ?
              AND event.cadence = 'immediate'`,
       )
-      .bind(fanout.createdAt, fanout.createdAt, idPrefix, `${eventId};`),
+      .bind(
+        fanout.createdAt,
+        fanout.createdAt,
+        currentObservabilityContext()?.correlationId ?? null,
+        idPrefix,
+        `${eventId};`,
+      ),
   ];
 }
 
@@ -904,12 +924,21 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
         timestamp,
       ),
       env.DB.prepare(
-        `INSERT OR IGNORE INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
-         VALUES (?, ?, 'slack_unfurl', json_object('unfurlId', ?), ?, ?)`,
-      ).bind(outboxId, installation.workspace_id, id, timestamp, timestamp),
+        `INSERT OR IGNORE INTO outbox
+          (id, workspace_id, topic, payload_json, available_at, created_at, correlation_id)
+         VALUES (?, ?, 'slack_unfurl', json_object('unfurlId', ?), ?, ?, ?)`,
+      ).bind(
+        outboxId,
+        installation.workspace_id,
+        id,
+        timestamp,
+        timestamp,
+        currentObservabilityContext()?.correlationId ?? null,
+      ),
     ]);
     try {
-      await env.DELIVERY_QUEUE.send({ outboxId });
+      const correlationId = currentObservabilityContext()?.correlationId;
+      await env.DELIVERY_QUEUE.send({ outboxId, ...(correlationId ? { correlationId } : {}) });
       await env.DB.prepare(`UPDATE outbox SET enqueued_at = ? WHERE id = ? AND enqueued_at IS NULL`)
         .bind(Date.now(), outboxId)
         .run();
@@ -1096,7 +1125,13 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
     } catch (error) {
       if (error instanceof SlackRateLimitError) rateLimitedInstallations.add(installationId);
       // One unreachable channel must not starve the digests queued behind it.
-      console.error("Slack channel digest failed", { subscriptionId, error });
+      logger.error("slack.channel_digest.failed", "slack", "Slack channel digest failed.", { subscriptionId }, error);
+      recordMetric(env, {
+        event: "integration.call",
+        component: "slack",
+        operation: "channel_digest",
+        outcome: "failure",
+      });
     }
   }
 }

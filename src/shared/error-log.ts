@@ -1,11 +1,12 @@
 export const LOG_IDENTIFIER_LIMIT = 200;
 export const LOG_TEXT_LIMIT = 2_000;
+export const LOG_STACK_LIMIT = 16_000;
 export const PERSISTED_ERROR_MESSAGE_LIMIT = 1_000;
 
 const ERROR_NAME_LIMIT = LOG_IDENTIFIER_LIMIT;
 const ERROR_CODE_LIMIT = LOG_IDENTIFIER_LIMIT;
 const ERROR_MESSAGE_LIMIT = LOG_TEXT_LIMIT;
-const ERROR_STACK_LIMIT = 16_000;
+const ERROR_STACK_LIMIT = LOG_STACK_LIMIT;
 const TRUNCATION_MARKER = "…[truncated]";
 
 export function boundedLogString(value: string, limit: number) {
