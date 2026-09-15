@@ -57,7 +57,9 @@ describe("SlackSettings", () => {
       linked: false,
     });
     render(<SlackSettings owner spaces={[space]} pages={[page]} />);
-    expect(await screen.findByText(/Slack is unavailable until an operator configures/)).toBeInTheDocument();
+    expect(await screen.findByText(/Slack is unavailable until an operator configures/)).toHaveTextContent(
+      "NoteFlare notifications remain available in-app",
+    );
     expect(screen.queryByRole("button", { name: "Add to Slack" })).not.toBeInTheDocument();
   });
 

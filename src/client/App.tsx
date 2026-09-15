@@ -759,7 +759,7 @@ function AuthLayout({
     <main className="auth-layout">
       <section className="auth-story">
         <div className="brand">
-          <img className="brand-mark" src="/logo.jpg" alt="" aria-hidden="true" />
+          <img className="brand-mark" src="/apple-touch-icon.png" alt="" aria-hidden="true" />
           <span>NoteFlare</span>
         </div>
         <div>

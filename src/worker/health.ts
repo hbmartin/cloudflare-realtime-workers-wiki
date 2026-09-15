@@ -1,6 +1,7 @@
 import type { Env } from "./env";
 import { safeErrorMessage } from "../shared/error-log";
 import { correlationHeaders } from "./observability";
+import { SCHEDULED_TASK_NAMES } from "./scheduled-task-names";
 
 const CHECK_TIMEOUT_MS = 2_000;
 const CRON_STALE_MS = 35 * 60_000;
@@ -64,13 +65,20 @@ async function checkDurableObject(env: Env) {
 }
 
 async function checkCron(env: Env, timestamp: number) {
-  const row = await env.DB.prepare(
-    `SELECT COUNT(*) total FROM observability_task_runs
-      WHERE last_succeeded_at IS NULL OR last_succeeded_at < ?`,
+  const rows = await env.DB.prepare(
+    `SELECT task_name, last_succeeded_at FROM observability_task_runs
+      WHERE task_name IN (${SCHEDULED_TASK_NAMES.map(() => "?").join(", ")})`,
   )
-    .bind(timestamp - CRON_STALE_MS)
-    .first<CountRow>();
-  const stale = row?.total ?? 1;
+    .bind(...SCHEDULED_TASK_NAMES)
+    .all<{ task_name: string; last_succeeded_at: number | null }>();
+  const succeededAt = new Map(rows.results.map((row) => [row.task_name, row.last_succeeded_at]));
+  const deploymentAt = Date.parse(env.CF_VERSION_METADATA?.timestamp ?? "");
+  const firstSuccessGrace =
+    Number.isFinite(deploymentAt) && deploymentAt <= timestamp && timestamp - deploymentAt < CRON_STALE_MS;
+  const stale = SCHEDULED_TASK_NAMES.filter((name) => {
+    const success = succeededAt.get(name);
+    return success === null || success === undefined ? !firstSuccessGrace : success < timestamp - CRON_STALE_MS;
+  }).length;
   return stale === 0 ? { ok: true, code: "ok", value: 0 } : { ok: false, code: "cron_success_stale", value: stale };
 }
 

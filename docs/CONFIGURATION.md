@@ -41,23 +41,24 @@ Declared in `wrangler.jsonc`, typed in `src/worker/env.ts`.
 The existing `cloudflare-realtime-notes` resource names are intentionally retained so the NoteFlare
 rebrand does not replace production data or deployment infrastructure.
 
-| Binding                   | Kind           | Target                                                                    |
-| ------------------------- | -------------- | ------------------------------------------------------------------------- |
-| `DB`                      | D1             | `cloudflare-realtime-notes`, migrations in `migrations/`                  |
-| `BUCKET`                  | R2             | `cloudflare-realtime-notes`, preview `cloudflare-realtime-notes-preview`  |
-| `DOCUMENT`                | Durable Object | class `Document`, SQLite-backed, hibernating                              |
-| `WORKSPACE_EVENTS`        | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, audience-filtered    |
-| `NOTES_WORKFLOW`          | Workflow       | resumable imports, exports, template clones, migrations, and reindexing   |
-| `DELIVERY_QUEUE`          | Queue          | notification, email, Slack, and digest fan-out; configured with a DLQ     |
-| `BROWSER`                 | Browser Run    | optional PDF generation                                                   |
-| `SEND_EMAIL`              | Email Service  | optional email delivery; the UI reports it unavailable when absent        |
-| `API_SOURCE_BURST_LIMIT`  | Rate Limit     | Pre-authentication `/v1` throttle: 300 requests per source per 10 seconds |
-| `API_SOURCE_MINUTE_LIMIT` | Rate Limit     | Pre-authentication `/v1` throttle: 1,800 requests per source per minute   |
-| `API_BURST_LIMIT`         | Rate Limit     | Authenticated `/v1` throttle: 100 requests per integration per 10 seconds |
-| `API_MINUTE_LIMIT`        | Rate Limit     | Authenticated `/v1` throttle: 600 requests per integration per minute     |
-| `CLIENT_TELEMETRY_LIMIT`  | Rate Limit     | Same-origin browser error reports: 20 requests per source per minute      |
-| `OBSERVABILITY`           | Analytics      | Fixed-position operational metrics; production dataset retained 3 months  |
-| `CF_VERSION_METADATA`     | Version        | Active Worker version ID, tag, and deployment timestamp                   |
+| Binding                          | Kind           | Target                                                                                      |
+| -------------------------------- | -------------- | ------------------------------------------------------------------------------------------- |
+| `DB`                             | D1             | `cloudflare-realtime-notes`, migrations in `migrations/`                                    |
+| `BUCKET`                         | R2             | `cloudflare-realtime-notes`, preview `cloudflare-realtime-notes-preview`                    |
+| `DOCUMENT`                       | Durable Object | class `Document`, SQLite-backed, hibernating                                                |
+| `WORKSPACE_EVENTS`               | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, audience-filtered                      |
+| `NOTES_WORKFLOW`                 | Workflow       | resumable imports, exports, template clones, migrations, and reindexing                     |
+| `DELIVERY_QUEUE`                 | Queue          | notification, email, Slack, and digest fan-out; configured with a DLQ                       |
+| `BROWSER`                        | Browser Run    | optional PDF generation                                                                     |
+| `SEND_EMAIL`                     | Email Service  | optional email delivery; the UI reports it unavailable when absent                          |
+| `API_SOURCE_BURST_LIMIT`         | Rate Limit     | Pre-authentication `/v1` throttle: 300 requests per source per 10 seconds                   |
+| `API_SOURCE_MINUTE_LIMIT`        | Rate Limit     | Pre-authentication `/v1` throttle: 1,800 requests per source per minute                     |
+| `API_BURST_LIMIT`                | Rate Limit     | Authenticated `/v1` throttle: 100 requests per integration per 10 seconds                   |
+| `API_MINUTE_LIMIT`               | Rate Limit     | Authenticated `/v1` throttle: 600 requests per integration per minute                       |
+| `CLIENT_TELEMETRY_PREAUTH_LIMIT` | Rate Limit     | Browser telemetry pre-authentication throttle: 300 requests per hashed source IP per minute |
+| `CLIENT_TELEMETRY_LIMIT`         | Rate Limit     | Authenticated browser error reports: 20 requests per hashed user ID per minute              |
+| `OBSERVABILITY`                  | Analytics      | Fixed-position operational metrics; production dataset retained 3 months                    |
+| `CF_VERSION_METADATA`            | Version        | Active Worker version ID, tag, and deployment timestamp                                     |
 
 No KV, Workers AI, Vectorize, Hyperdrive, or Containers bindings are used. Slack is
 inactive until its four secrets are configured. Verified integration webhooks can make outbound HTTPS

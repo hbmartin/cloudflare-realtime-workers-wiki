@@ -20,6 +20,7 @@ export interface ObservabilityContext {
   trigger: ObservabilityTrigger;
   versionId?: string;
   versionTag?: string;
+  metricRouteTemplate?: string;
 }
 
 type LogLevel = "debug" | "info" | "warn" | "error";
@@ -28,7 +29,7 @@ type LogFields = Readonly<Record<string, unknown>>;
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
 const EMAIL_VALUE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
-const BASIC_VALUE = /\bBasic\s+[^\s]+/gi;
+const BASIC_VALUE = /\bBasic[ \t]+([A-Za-z0-9+/=]+)/gi;
 const BEARER_VALUE = /\bBearer\s+[^\s]+/gi;
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
@@ -66,6 +67,15 @@ export function currentObservabilityContext() {
   return contextStorage.getStore();
 }
 
+export function setMetricRouteTemplate(template: string) {
+  const context = currentObservabilityContext();
+  if (context) context.metricRouteTemplate = template || "/unmatched";
+}
+
+export function metricRouteTemplate() {
+  return currentObservabilityContext()?.metricRouteTemplate ?? "/unmatched";
+}
+
 export function correlationHeaders(): Record<string, string> {
   const context = currentObservabilityContext();
   const correlationId = context?.correlationId ?? context?.requestId;
@@ -87,7 +97,16 @@ export function withDurableObjectContext<T>(env: Env, request: Request, callback
 function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
   return boundedLogString(
     value
-      .replace(BASIC_VALUE, "Basic [redacted]")
+      .replace(BASIC_VALUE, (match, encoded: string) => {
+        try {
+          // Basic credentials encode "username:password". Do not consume ordinary
+          // prose such as "Basic constraints" or "Basic idea" as a credential.
+          if (atob(encoded).includes(":")) return "Basic [redacted]";
+        } catch {
+          // A malformed token is not valid Basic authentication.
+        }
+        return match;
+      })
       .replace(BEARER_VALUE, "Bearer [redacted]")
       .replace(SECRET_VALUE, "[redacted-secret]")
       .replace(EMAIL_VALUE, "[redacted-email]")
@@ -270,15 +289,4 @@ export function traced<T>(
     }
     return callback();
   });
-}
-
-export function normalizedRoute(pathname: string) {
-  if (pathname.startsWith("/parties/document/")) return "/parties/document/:room";
-  if (pathname.startsWith("/parties/workspace-events/")) return "/parties/workspace-events/:workspace";
-  const segments = pathname
-    .split("/")
-    .map((segment) =>
-      /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(segment) || /^(?=.*\d)[A-Za-z0-9_-]{20,}$/.test(segment) ? ":id" : segment,
-    );
-  return boundedLogString(segments.join("/"), LOG_IDENTIFIER_LIMIT);
 }

@@ -39,7 +39,7 @@ describe("Startup", () => {
     expect(status).toHaveTextContent("Opening NoteFlare…");
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(screen.getByRole("main")).toContainElement(status);
-    expect(screen.getByRole("main").querySelector('img[src="/logo.jpg"]')).toHaveAttribute("alt", "");
+    expect(screen.getByRole("main").querySelector('img[src="/apple-touch-icon.png"]')).toHaveAttribute("alt", "");
   });
 
   it("renders the supported application after its bundle loads", async () => {

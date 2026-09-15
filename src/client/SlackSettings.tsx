@@ -186,8 +186,8 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
       {!status && !error && <p className="muted">Checking Slack configuration…</p>}
       {status && !status.available && (
         <output className="channel-status">
-          Slack is unavailable until an operator configures the app credentials. Notes notifications remain available
-          in-app.
+          Slack is unavailable until an operator configures the app credentials. NoteFlare notifications remain
+          available in-app.
         </output>
       )}
       {status?.available && !connected && (

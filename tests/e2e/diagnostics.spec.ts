@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 test("restores inherited session storage after the blocked-storage diagnostic", async ({ page }) => {
+  test.skip(Boolean(process.env.NOTES_E2E_BASE_URL), "Requires the local Vite diagnostic harness.");
   await page.addInitScript(() => {
     const descriptor = Object.getOwnPropertyDescriptor(window, "sessionStorage");
     if (!descriptor) return;

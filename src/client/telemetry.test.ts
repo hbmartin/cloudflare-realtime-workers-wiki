@@ -143,7 +143,28 @@ describe("client telemetry", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("does not consume deduplication or rate budget when authentication rejects a report", async () => {
+  it("counts an in-flight POST only once toward the five-report budget", async () => {
+    let releaseFourth!: () => void;
+    const fourthBlocked = new Promise<void>((resolve) => {
+      releaseFourth = resolve;
+    });
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      if (fetchMock.mock.calls.length === 4) await fourthBlocked;
+      return new Response(null, { status: 204 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    for (let index = 0; index < 3; index += 1) {
+      await reportClientError("client.global_error", new Error(`first-${index}`));
+    }
+    const fourth = reportClientError("client.global_error", new Error("fourth"));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    const fifth = reportClientError("client.global_error", new Error("fifth"));
+    releaseFourth();
+    await Promise.all([fourth, fifth]);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("does not deduplicate a fingerprint until authentication accepts a report", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(new Response(null, { status: 401 }))
@@ -155,6 +176,20 @@ describe("client telemetry", () => {
     await reportClientError("client.global_error", error);
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("charges rejected and network-failed POST attempts to the five-per-minute budget", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(null, { status: 429 }))
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    for (let index = 0; index < 7; index += 1) {
+      await reportClientError("client.global_error", new Error(`rejected-${index}`));
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(5);
   });
 
   it("throttles distinct reports to five per minute", async () => {

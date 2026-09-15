@@ -1,5 +1,6 @@
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
+import { routePath } from "hono/route";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { pruneSecurityState, requireSecurity } from "./security";
@@ -110,6 +111,7 @@ import {
   parseImportOptions,
 } from "../shared/import-space-mapping";
 import { constantTimeEqual } from "../shared/security";
+import { CLIENT_ERROR_EVENTS, isClientErrorName, isTelemetryIdentifier } from "../shared/client-telemetry-contract";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { pageJson, type PageJsonRow } from "./page-row";
@@ -192,15 +194,25 @@ import { diagramThumbnailResponse } from "./diagram-thumbnail";
 import {
   correlationHeaders,
   logger,
-  normalizedRoute,
+  metricRouteTemplate,
   recordMetric,
   safeTelemetryErrorMessage,
+  setMetricRouteTemplate,
   traced,
   withObservabilityContext,
 } from "./observability";
 import { deploymentMetadata, readiness } from "./health";
+import { SCHEDULED_TASK_NAMES, type ScheduledTaskName } from "./scheduled-task-names";
 
 const app = new Hono<{ Bindings: Env }>();
+app.use("*", async (c, next) => {
+  try {
+    await next();
+  } finally {
+    const registered = routePath(c);
+    setMetricRouteTemplate(registered === "*" || registered === "/*" ? "/unmatched" : registered);
+  }
+});
 const DELETION_TARGET_BATCH_SIZE = 50;
 // Each page costs three or four statements, so this stays far inside D1's per-invocation
 // query ceiling while still collapsing a tree level into one request.
@@ -210,18 +222,7 @@ const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple"
 const MAX_IMPORT_UPLOAD_BYTES = 24 * 1024 * 1024;
 const INVITE_CLAIM_MS = 10 * 60_000;
 const CLIENT_TELEMETRY_MAX_BYTES = 8 * 1024;
-const CLIENT_TELEMETRY_EVENTS = new Set([
-  "client.global_error",
-  "client.unhandled_rejection",
-  "client.bundle_load_failed",
-  "client.api_response_invalid",
-  "client.api_response_unreadable",
-  "client.api_response_empty",
-  "client.api_unauthorized_handler_failed",
-  "client.mutation_uncertain",
-  "client.offline_storage_failed",
-  "client.realtime_connection_failed",
-]);
+const CLIENT_TELEMETRY_EVENTS = new Set<string>(CLIENT_ERROR_EVENTS);
 
 type PageRow = PageJsonRow & {
   created_by: string;
@@ -708,14 +709,13 @@ function clientTelemetryReport(body: Record<string, unknown>): ClientTelemetryRe
     typeof body.event !== "string" ||
     !CLIENT_TELEMETRY_EVENTS.has(body.event) ||
     typeof body.errorName !== "string" ||
-    !/^[A-Za-z][A-Za-z0-9_.:-]{0,99}$/.test(body.errorName) ||
+    !isClientErrorName(body.errorName) ||
     typeof body.fingerprint !== "string" ||
     !/^[a-f0-9]{64}$/.test(body.fingerprint) ||
     typeof body.online !== "boolean" ||
     (body.visibility !== "hidden" && body.visibility !== "visible" && body.visibility !== "prerender") ||
-    (body.requestId !== undefined &&
-      (typeof body.requestId !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/.test(body.requestId))) ||
-    (body.release !== undefined && (typeof body.release !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/.test(body.release)))
+    (body.requestId !== undefined && !isTelemetryIdentifier(body.requestId)) ||
+    (body.release !== undefined && !isTelemetryIdentifier(body.release))
   ) {
     throw new HttpError(422, "telemetry_invalid", "The telemetry report is invalid.");
   }
@@ -1147,15 +1147,21 @@ function tableRowBinds(query: TableRowQuery, limit: number) {
 app.onError((error, c) => errorResponse(c, error));
 
 app.post("/api/telemetry/client-errors", async (c) => {
+  const ip = c.req.header("cf-connecting-ip")?.trim().toLowerCase() || "unattributed";
+  const { success: sourceAllowed } = await c.env.CLIENT_TELEMETRY_PREAUTH_LIMIT.limit({
+    key: await sha256(`telemetry-source:${ip}`),
+  });
+  if (!sourceAllowed) throw new HttpError(429, "telemetry_rate_limited", "Telemetry rate limit exceeded.");
   if (!c.req.header("origin")) {
     throw new HttpError(403, "invalid_origin", "This request is not from the application origin.");
   }
   assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
   const session = await createAuth(c.env).api.getSession({ headers: c.req.raw.headers });
   if (!session) throw new HttpError(401, "unauthorized", "Sign in to continue.");
-  const ip = c.req.header("cf-connecting-ip")?.trim().toLowerCase() || "unattributed";
   if (c.env.CLIENT_TELEMETRY_LIMIT) {
-    const { success } = await c.env.CLIENT_TELEMETRY_LIMIT.limit({ key: await sha256(`telemetry:${ip}`) });
+    const { success } = await c.env.CLIENT_TELEMETRY_LIMIT.limit({
+      key: await sha256(`telemetry-user:${session.user.id}`),
+    });
     if (!success) throw new HttpError(429, "telemetry_rate_limited", "Telemetry rate limit exceeded.");
   }
   const body = await limitedJsonBody(
@@ -1466,7 +1472,7 @@ app.get("/api/health", async (c) => {
 app.get("/api/health/ready", async (c) => {
   const expected = c.env.OBSERVABILITY_PROBE_TOKEN;
   const supplied = c.req.header("x-observability-token") ?? "";
-  if (!expected || !supplied || !constantTimeEqual(supplied, expected)) {
+  if (!expected || !supplied || !constantTimeEqual(await sha256(supplied), await sha256(expected))) {
     return c.json({ ok: false, code: "probe_unauthorized" }, 401);
   }
   const result = await readiness(c.env);
@@ -6135,17 +6141,26 @@ async function handlePartyRequest(request: Request, env: Env) {
 export type ScheduledTask = { name: string; run: () => Promise<unknown> };
 
 async function recordScheduledTaskStart(env: Env, taskName: string, startedAt: number) {
-  await env.DB.prepare(
+  const row = await env.DB.prepare(
     `INSERT INTO observability_task_runs (task_name, last_started_at)
       VALUES (?, ?)
-      ON CONFLICT(task_name) DO UPDATE SET last_started_at = excluded.last_started_at
-      WHERE observability_task_runs.last_started_at <= excluded.last_started_at`,
+      ON CONFLICT(task_name) DO UPDATE SET
+        last_started_at = MAX(observability_task_runs.last_started_at + 1, excluded.last_started_at)
+      RETURNING last_started_at`,
   )
     .bind(taskName, startedAt)
-    .run();
+    .first<{ last_started_at: number }>();
+  if (!row || !Number.isSafeInteger(row.last_started_at)) throw new Error("Scheduled task start token unavailable");
+  return row.last_started_at;
 }
 
-async function recordScheduledTaskResult(env: Env, taskName: string, startedAt: number, error?: unknown) {
+async function recordScheduledTaskResult(
+  env: Env,
+  taskName: string,
+  startedAt: number,
+  executionToken: number | null,
+  error?: unknown,
+) {
   const finishedAt = Date.now();
   if (error === undefined) {
     await env.DB.prepare(
@@ -6153,13 +6168,20 @@ async function recordScheduledTaskResult(env: Env, taskName: string, startedAt: 
           (task_name, last_started_at, last_succeeded_at, last_duration_ms, last_error)
         VALUES (?, ?, ?, ?, NULL)
         ON CONFLICT(task_name) DO UPDATE SET
-          last_started_at = excluded.last_started_at,
-          last_succeeded_at = excluded.last_succeeded_at,
-          last_duration_ms = excluded.last_duration_ms,
-          last_error = NULL
-        WHERE observability_task_runs.last_started_at <= excluded.last_started_at`,
+          last_succeeded_at = MAX(COALESCE(observability_task_runs.last_succeeded_at, 0), excluded.last_succeeded_at),
+          last_duration_ms = CASE WHEN observability_task_runs.last_started_at = ?
+            THEN excluded.last_duration_ms ELSE observability_task_runs.last_duration_ms END,
+          last_error = CASE WHEN observability_task_runs.last_started_at = ?
+            THEN NULL ELSE observability_task_runs.last_error END`,
     )
-      .bind(taskName, startedAt, finishedAt, Math.max(0, finishedAt - startedAt))
+      .bind(
+        taskName,
+        executionToken ?? startedAt,
+        finishedAt,
+        Math.max(0, finishedAt - startedAt),
+        executionToken,
+        executionToken,
+      )
       .run();
     return;
   }
@@ -6168,26 +6190,27 @@ async function recordScheduledTaskResult(env: Env, taskName: string, startedAt: 
         (task_name, last_started_at, last_failed_at, last_duration_ms, last_error)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(task_name) DO UPDATE SET
-        last_started_at = excluded.last_started_at,
         last_failed_at = excluded.last_failed_at,
         last_duration_ms = excluded.last_duration_ms,
         last_error = excluded.last_error
-      WHERE observability_task_runs.last_started_at <= excluded.last_started_at`,
+      WHERE observability_task_runs.last_started_at = ?`,
   )
     .bind(
       taskName,
-      startedAt,
+      executionToken ?? startedAt,
       finishedAt,
       Math.max(0, finishedAt - startedAt),
       safeTelemetryErrorMessage(error, "Scheduled task failed"),
+      executionToken,
     )
     .run();
 }
 
 async function runScheduledTask(env: Env, context: ExecutionContext, task: ScheduledTask) {
   const startedAt = Date.now();
+  let executionToken: number | null = null;
   try {
-    await recordScheduledTaskStart(env, task.name, startedAt);
+    executionToken = await recordScheduledTaskStart(env, task.name, startedAt);
   } catch (error) {
     logger.warn(
       "scheduled.task_state.failed",
@@ -6203,7 +6226,7 @@ async function runScheduledTask(env: Env, context: ExecutionContext, task: Sched
     });
   } catch (error) {
     try {
-      await recordScheduledTaskResult(env, task.name, startedAt, error);
+      await recordScheduledTaskResult(env, task.name, startedAt, executionToken, error);
     } catch (stateError) {
       logger.warn(
         "scheduled.task_state.failed",
@@ -6224,7 +6247,7 @@ async function runScheduledTask(env: Env, context: ExecutionContext, task: Sched
     throw error;
   }
   try {
-    await recordScheduledTaskResult(env, task.name, startedAt);
+    await recordScheduledTaskResult(env, task.name, startedAt, executionToken);
   } catch (error) {
     logger.warn(
       "scheduled.task_state.failed",
@@ -6267,30 +6290,38 @@ export default {
       },
       async () => {
         const startedAt = performance.now();
-        const route = normalizedRoute(new URL(request.url).pathname);
+        const pathname = new URL(request.url).pathname;
+        if (pathname.startsWith("/parties/document/")) setMetricRouteTemplate("/parties/document/:room");
+        else if (pathname.startsWith("/parties/workspace-events/"))
+          setMetricRouteTemplate("/parties/workspace-events/:workspace");
         let response: Response;
         try {
-          response = await traced(
-            context.tracing,
-            "notes.route_request",
-            { "notes.request_id": requestId, "http.route": route },
-            async () => {
-              const party = await handlePartyRequest(request, env);
-              return party ?? app.fetch(request, env, context);
-            },
-          );
+          const handle = async () => {
+            const party = await handlePartyRequest(request, env);
+            return party ?? app.fetch(request, env, context);
+          };
+          response = context.tracing
+            ? await context.tracing.enterSpan("notes.route_request", async (span) => {
+                span.setAttribute("notes.request_id", requestId);
+                try {
+                  return await handle();
+                } finally {
+                  span.setAttribute("http.route", metricRouteTemplate());
+                }
+              })
+            : await handle();
         } catch (error) {
           logger.error(
             "http.request.failed",
             "http",
             "Request handling failed outside the application router",
-            { route },
+            { route: metricRouteTemplate() },
             error,
           );
           recordMetric(env, {
             event: "http.request",
             component: "http",
-            operation: route,
+            operation: metricRouteTemplate(),
             outcome: "exception",
             code: "500",
             durationMs: performance.now() - startedAt,
@@ -6306,7 +6337,7 @@ export default {
         recordMetric(env, {
           event: "http.request",
           component: "http",
-          operation: route,
+          operation: metricRouteTemplate(),
           outcome: response.status >= 500 ? "server_error" : response.status >= 400 ? "client_error" : "success",
           code: String(response.status),
           durationMs: performance.now() - startedAt,
@@ -6324,20 +6355,21 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext) {
     const correlationId = crypto.randomUUID();
     return withObservabilityContext(env, { trigger: "scheduled", correlationId }, async () => {
-      const tasks: ScheduledTask[] = [
-        { name: "archive_disconnects", run: () => processDueArchiveDisconnects(env) },
-        { name: "deletion_jobs", run: () => processDueDeletionJobs(env) },
-        { name: "upload_reaps", run: () => processDueUploadReaps(env) },
-        { name: "page_move_receipts", run: () => pruneExpiredPageMoveReceipts(env.DB) },
-        { name: "queued_jobs", run: () => recoverQueuedJobs(env) },
-        { name: "outbox", run: () => sweepOutbox(env) },
-        { name: "job_artifacts", run: () => expireJobArtifacts(env) },
-        { name: "notification_digests", run: () => sendDueNotificationDigests(env) },
-        { name: "slack_digests", run: () => sendDueSlackChannelDigests(env) },
-        { name: "slack_security_records", run: () => pruneSlackSecurityRecords(env) },
-        { name: "webhook_history", run: () => pruneWebhookHistory(env) },
-        { name: "security_state", run: () => pruneSecurityState(env) },
-      ];
+      const runners: Record<ScheduledTaskName, ScheduledTask["run"]> = {
+        archive_disconnects: () => processDueArchiveDisconnects(env),
+        deletion_jobs: () => processDueDeletionJobs(env),
+        upload_reaps: () => processDueUploadReaps(env),
+        page_move_receipts: () => pruneExpiredPageMoveReceipts(env.DB),
+        queued_jobs: () => recoverQueuedJobs(env),
+        outbox: () => sweepOutbox(env),
+        job_artifacts: () => expireJobArtifacts(env),
+        notification_digests: () => sendDueNotificationDigests(env),
+        slack_digests: () => sendDueSlackChannelDigests(env),
+        slack_security_records: () => pruneSlackSecurityRecords(env),
+        webhook_history: () => pruneWebhookHistory(env),
+        security_state: () => pruneSecurityState(env),
+      };
+      const tasks: ScheduledTask[] = SCHEDULED_TASK_NAMES.map((name) => ({ name, run: runners[name] }));
       await executeScheduledTasks(env, context, tasks);
       logger.info("scheduled.run.completed", "scheduler", "Scheduled maintenance completed", {
         taskCount: tasks.length,
@@ -6356,7 +6388,7 @@ export default {
               context?.tracing,
               "notes.outbox.delivery",
               { "messaging.queue": batch.queue, "messaging.attempt": message.attempts },
-              () => consumeDeliveryMessage(env, message),
+              () => consumeDeliveryMessage(env, message, body),
             );
             recordMetric(env, {
               event: "queue.delivery",

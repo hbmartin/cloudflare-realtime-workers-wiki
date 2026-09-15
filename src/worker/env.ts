@@ -16,6 +16,7 @@ export interface AppBindings {
   API_BURST_LIMIT: RateLimit;
   API_MINUTE_LIMIT: RateLimit;
   CLIENT_TELEMETRY_LIMIT: RateLimit;
+  CLIENT_TELEMETRY_PREAUTH_LIMIT: RateLimit;
   OBSERVABILITY: AnalyticsEngineDataset;
   CF_VERSION_METADATA: WorkerVersionMetadata;
   SEND_EMAIL?: SendEmail;

@@ -1,7 +1,7 @@
 export function LoadingSplash() {
   return (
     <main className="startup-splash">
-      <img className="brand-mark" src="/logo.jpg" alt="" aria-hidden="true" />
+      <img className="brand-mark" src="/apple-touch-icon.png" alt="" aria-hidden="true" />
       <p aria-live="polite" aria-atomic="true">
         Opening NoteFlare…
       </p>
