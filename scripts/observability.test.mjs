@@ -18,6 +18,7 @@ function healthy() {
     dlq: { backlog_count: 0 },
     database: { file_size: 8_000_000_000 },
     queue: [{ avg: { messages: 100 } }],
+    staleQueuedWorkflows: [],
     workflow: [
       {
         datetime: new Date(now - 30 * 60_000).toISOString(),
@@ -29,7 +30,24 @@ function healthy() {
 }
 
 function evaluate(value) {
-  return evaluateThresholds(value, value.now);
+  return evaluateThresholds(value);
+}
+
+async function malformedWorkflowFetcher(url, init = {}) {
+  const target = String(url);
+  if (target.includes("/api/health/ready")) return Response.json({ ok: true });
+  if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
+  if (target.includes("/queues?")) return Response.json({ result: [] });
+  if (target.includes("/d1/database?")) return Response.json({ result: [] });
+  if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
+    return Response.json({ success: true });
+  }
+  if (target.endsWith("/graphql")) {
+    return Response.json({
+      data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } },
+    });
+  }
+  throw new Error(`Unexpected observability request: ${target} ${String(init.method ?? "GET")}`);
 }
 
 describe("observability thresholds", () => {
@@ -55,9 +73,10 @@ describe("observability thresholds", () => {
     expect(delays).toEqual([45_000, 45_000]);
   });
 
-  it("queries two hours of Workflow events during a five-minute monitor run", async () => {
+  it("queries two hours of Workflow events and authoritative stale queued state", async () => {
     let workflowStart = 0;
     let workflowQuery = "";
+    let workflowInstancesUrl;
     const before = Date.now();
     const fetcher = async (url, init = {}) => {
       const target = String(url);
@@ -65,6 +84,10 @@ describe("observability thresholds", () => {
       if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
       if (target.includes("/queues?")) return Response.json({ result: [] });
       if (target.includes("/d1/database?")) return Response.json({ result: [] });
+      if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
+        workflowInstancesUrl = new URL(target);
+        return Response.json({ success: true, result: [] });
+      }
       if (target.endsWith("/graphql")) {
         const body = JSON.parse(String(init.body));
         workflowQuery = body.query;
@@ -84,6 +107,55 @@ describe("observability thresholds", () => {
     expect(workflowStart).toBeLessThanOrEqual(before - 2 * 60 * 60_000 + 1_000);
     expect(workflowStart).toBeGreaterThanOrEqual(before - 2 * 60 * 60_000 - 1_000);
     expect(workflowQuery).toContain("orderBy: [datetime_DESC]");
+    expect(workflowInstancesUrl.searchParams.get("status")).toBe("queued");
+    expect(workflowInstancesUrl.searchParams.get("per_page")).toBe("1");
+    expect(Date.parse(workflowInstancesUrl.searchParams.get("date_end"))).toBeGreaterThanOrEqual(
+      before - 30 * 60_000 - 1_000,
+    );
+    expect(Date.parse(workflowInstancesUrl.searchParams.get("date_end"))).toBeLessThanOrEqual(before - 30 * 60_000);
+  });
+
+  it("rejects a malformed authoritative Workflow response", async () => {
+    await expect(
+      collectSnapshot(
+        { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+        { fetcher: malformedWorkflowFetcher, delay: async () => undefined },
+      ),
+    ).rejects.toThrow("Cloudflare Workflow instance query returned an invalid response");
+  });
+
+  it("keeps an old queued Workflow paging until authoritative current state resolves it", async () => {
+    const timestamp = Date.now();
+    const stale = {
+      id: "old-workflow",
+      status: "queued",
+      created_on: new Date(timestamp - 3 * 60 * 60_000).toISOString(),
+    };
+    let currentQueued = [stale];
+    const fetcher = async (url) => {
+      const target = String(url);
+      if (target.includes("/api/health/ready")) return Response.json({ ok: true });
+      if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
+      if (target.includes("/queues?")) return Response.json({ result: [] });
+      if (target.includes("/d1/database?")) return Response.json({ result: [] });
+      if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
+        return Response.json({ success: true, result: currentQueued });
+      }
+      if (target.endsWith("/graphql")) {
+        return Response.json({ data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } } });
+      }
+      throw new Error(`Unexpected observability request: ${target}`);
+    };
+    const config = { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" };
+    const options = { fetcher, delay: async () => undefined, timestamp };
+
+    const queued = await collectSnapshot(config, options);
+    expect(queued.workflow).toEqual([]);
+    expect(evaluateThresholds(queued)).toContain("workflow_queued_stale");
+
+    currentQueued = [];
+    const resolved = await collectSnapshot(config, options);
+    expect(evaluateThresholds(resolved)).not.toContain("workflow_queued_stale");
   });
   it("keeps every healthy boundary non-paging", () => {
     expect(evaluate(healthy())).toEqual([]);
@@ -96,6 +168,9 @@ describe("observability thresholds", () => {
     ["client_error_fingerprint_repeated", (value) => (value.analytics[2].count = 5)],
     ["document_compaction_repeated_failure", (value) => (value.analytics[3].count = 2)],
     ["document_restore_repeated_failure", (value) => (value.analytics[4].count = 2)],
+    ["delivery_queue_metadata_missing", (value) => (value.delivery = null)],
+    ["delivery_dlq_metadata_missing", (value) => (value.dlq = null)],
+    ["d1_metadata_missing", (value) => (value.database = null)],
     ["delivery_dlq_nonempty", (value) => (value.dlq.backlog_count = 1)],
     ["d1_size_high", (value) => (value.database.file_size = 8_000_000_001)],
     [
@@ -107,10 +182,23 @@ describe("observability thresholds", () => {
     ],
     [
       "workflow_queued_stale",
-      (value) => (value.workflow[0].datetime = new Date(value.now - 30 * 60_000 - 1).toISOString()),
+      (value) =>
+        (value.staleQueuedWorkflows = [
+          { id: "stale-workflow", status: "queued", created_on: new Date(value.now - 90 * 60_000).toISOString() },
+        ]),
     ],
     ["workflow_infrastructure_failure", (value) => (value.workflow[0].eventType = "WORKFLOW_INTERNAL_ERROR")],
   ])("pages at the %s threshold", (code, mutate) => {
+    const value = healthy();
+    mutate(value);
+    expect(evaluate(value)).toContain(code);
+  });
+
+  it.each([
+    ["delivery queue", "delivery_queue_metadata_missing", (value) => delete value.delivery.backlog_count],
+    ["delivery DLQ", "delivery_dlq_metadata_missing", (value) => delete value.dlq.backlog_count],
+    ["D1", "d1_metadata_missing", (value) => delete value.database.file_size],
+  ])("pages when %s metadata omits its monitored value", (_resource, code, mutate) => {
     const value = healthy();
     mutate(value);
     expect(evaluate(value)).toContain(code);
@@ -157,7 +245,10 @@ describe("observability thresholds", () => {
 
   it("detects a Workflow that has remained queued for ninety minutes", () => {
     const value = healthy();
-    value.workflow[0].datetime = new Date(value.now - 90 * 60_000).toISOString();
+    value.workflow = [];
+    value.staleQueuedWorkflows = [
+      { id: "stale-workflow", status: "queued", created_on: new Date(value.now - 90 * 60_000).toISOString() },
+    ];
     expect(evaluate(value)).toContain("workflow_queued_stale");
   });
 });

@@ -18,6 +18,7 @@ beforeEach(() => {
 afterEach(() => {
   uninstall();
   resetClientTelemetryForTests();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -49,6 +50,39 @@ describe("client telemetry", () => {
     expect(JSON.stringify(payload)).not.toContain("private message");
     expect(JSON.stringify(payload)).not.toContain("person@example.test");
     expect(payload.source).toEqual({ path: "/assets/app.js", line: 12, column: 4 });
+  });
+
+  it("preserves explicit null response identifiers instead of using stale latest values", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    observeWorkerResponse(new Headers({ "x-request-id": "stale-request", "x-worker-version": "stale-release" }));
+
+    await reportClientError("client.api_response_invalid", new Error("response failed"), {
+      requestId: null,
+      release: null,
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const payload = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(payload).not.toHaveProperty("requestId");
+    expect(payload).not.toHaveProperty("release");
+  });
+
+  it("uses explicit response identifiers when both are present", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    observeWorkerResponse(new Headers({ "x-request-id": "stale-request", "x-worker-version": "stale-release" }));
+
+    await reportClientError("client.api_response_invalid", new Error("response failed"), {
+      requestId: "response-request",
+      release: "response-release",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      requestId: "response-request",
+      release: "response-release",
+    });
   });
 
   it("reports global errors without recursively reporting a failed telemetry request", async () => {
@@ -130,6 +164,25 @@ describe("client telemetry", () => {
       await reportClientError("client.realtime_connection_failed", new Error(`failure-${index}`));
     }
     expect(fetchMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("removes expired fingerprints while retaining active deduplication", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const expired = new Error("expired fingerprint");
+
+    await reportClientError("client.global_error", expired);
+    const deleteSpy = vi.spyOn(Map.prototype, "delete");
+    vi.advanceTimersByTime(60_001);
+    const active = new Error("new fingerprint");
+    await reportClientError("client.global_error", active);
+
+    expect(deleteSpy.mock.calls.some(([key]) => String(key).startsWith("client.global_error:"))).toBe(true);
+    await reportClientError("client.global_error", active);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    deleteSpy.mockRestore();
   });
 
   it("drops hostile correlation headers and normalizes a non-code error name", async () => {

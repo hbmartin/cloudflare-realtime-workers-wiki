@@ -6138,7 +6138,8 @@ async function recordScheduledTaskStart(env: Env, taskName: string, startedAt: n
   await env.DB.prepare(
     `INSERT INTO observability_task_runs (task_name, last_started_at)
       VALUES (?, ?)
-      ON CONFLICT(task_name) DO UPDATE SET last_started_at = excluded.last_started_at`,
+      ON CONFLICT(task_name) DO UPDATE SET last_started_at = excluded.last_started_at
+      WHERE observability_task_runs.last_started_at <= excluded.last_started_at`,
   )
     .bind(taskName, startedAt)
     .run();
@@ -6148,24 +6149,37 @@ async function recordScheduledTaskResult(env: Env, taskName: string, startedAt: 
   const finishedAt = Date.now();
   if (error === undefined) {
     await env.DB.prepare(
-      `UPDATE observability_task_runs
-          SET last_succeeded_at = ?, last_duration_ms = ?, last_error = NULL
-        WHERE task_name = ?`,
+      `INSERT INTO observability_task_runs
+          (task_name, last_started_at, last_succeeded_at, last_duration_ms, last_error)
+        VALUES (?, ?, ?, ?, NULL)
+        ON CONFLICT(task_name) DO UPDATE SET
+          last_started_at = excluded.last_started_at,
+          last_succeeded_at = excluded.last_succeeded_at,
+          last_duration_ms = excluded.last_duration_ms,
+          last_error = NULL
+        WHERE observability_task_runs.last_started_at <= excluded.last_started_at`,
     )
-      .bind(finishedAt, Math.max(0, finishedAt - startedAt), taskName)
+      .bind(taskName, startedAt, finishedAt, Math.max(0, finishedAt - startedAt))
       .run();
     return;
   }
   await env.DB.prepare(
-    `UPDATE observability_task_runs
-        SET last_failed_at = ?, last_duration_ms = ?, last_error = ?
-      WHERE task_name = ?`,
+    `INSERT INTO observability_task_runs
+        (task_name, last_started_at, last_failed_at, last_duration_ms, last_error)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(task_name) DO UPDATE SET
+        last_started_at = excluded.last_started_at,
+        last_failed_at = excluded.last_failed_at,
+        last_duration_ms = excluded.last_duration_ms,
+        last_error = excluded.last_error
+      WHERE observability_task_runs.last_started_at <= excluded.last_started_at`,
   )
     .bind(
+      taskName,
+      startedAt,
       finishedAt,
       Math.max(0, finishedAt - startedAt),
       safeTelemetryErrorMessage(error, "Scheduled task failed"),
-      taskName,
     )
     .run();
 }
@@ -6286,7 +6300,9 @@ export default {
         const headers = new Headers(response.headers);
         headers.set("x-request-id", requestId);
         headers.set("x-worker-version", env.CF_VERSION_METADATA?.id ?? "local");
-        const contentLength = Number(headers.get("content-length"));
+        const contentLengthHeader = headers.get("content-length");
+        const contentLength =
+          contentLengthHeader !== null && /^\d+$/.test(contentLengthHeader.trim()) ? Number(contentLengthHeader) : null;
         recordMetric(env, {
           event: "http.request",
           component: "http",
@@ -6294,7 +6310,7 @@ export default {
           outcome: response.status >= 500 ? "server_error" : response.status >= 400 ? "client_error" : "success",
           code: String(response.status),
           durationMs: performance.now() - startedAt,
-          ...(Number.isFinite(contentLength) ? { bytes: contentLength } : {}),
+          ...(contentLength !== null && Number.isFinite(contentLength) ? { bytes: contentLength } : {}),
         });
         return new Response(response.body, {
           status: response.status,
@@ -6336,7 +6352,7 @@ export default {
         await withObservabilityContext(env, { trigger: "queue", correlationId }, async () => {
           const startedAt = performance.now();
           try {
-            await traced(
+            const outcome = await traced(
               context?.tracing,
               "notes.outbox.delivery",
               { "messaging.queue": batch.queue, "messaging.attempt": message.attempts },
@@ -6346,7 +6362,7 @@ export default {
               event: "queue.delivery",
               component: "delivery-queue",
               operation: batch.queue,
-              outcome: "success",
+              outcome,
               attempts: message.attempts,
               durationMs: performance.now() - startedAt,
             });

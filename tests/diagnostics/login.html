@@ -38,7 +38,8 @@
         output.textContent = JSON.stringify(events, null, 2);
       }
       function restoreStorage() {
-        Object.defineProperty(window, "sessionStorage", storageDescriptor);
+        if (storageDescriptor) Object.defineProperty(window, "sessionStorage", storageDescriptor);
+        else delete window.sessionStorage;
       }
       document.getElementById("probe").onclick = () => {
         restoreStorage();

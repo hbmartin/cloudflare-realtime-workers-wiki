@@ -13,6 +13,7 @@ import {
   onApiUnauthorized,
   UnreadableApiResponseError,
 } from "./api";
+import { installClientTelemetry, observeWorkerResponse, resetClientTelemetryForTests } from "./telemetry";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -407,6 +408,36 @@ describe("api", () => {
     expect(reported.mock.calls[0]?.[1]).not.toHaveProperty("cause");
   });
 
+  it("does not attribute a response failure to stale response identifiers", async () => {
+    const reported = silenceApiResponseReport();
+    resetClientTelemetryForTests();
+    const uninstall = installClientTelemetry();
+    onTestFinished(() => {
+      uninstall();
+      resetClientTelemetryForTests();
+    });
+    observeWorkerResponse(new Headers({ "x-request-id": "stale-request", "x-worker-version": "stale-release" }));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        responseAt("https://example.test/api/example", "not-json", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api("/api/example")).rejects.toBeInstanceOf(InvalidApiResponseError);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const telemetryInit = fetchMock.mock.calls[1]?.[1] as RequestInit;
+    const payload = JSON.parse(String(telemetryInit.body)) as Record<string, unknown>;
+    expect(payload).not.toHaveProperty("requestId");
+    expect(payload).not.toHaveProperty("release");
+    expect(reported).toHaveBeenCalledOnce();
+  });
+
   it("preserves deliberate cancellation without reporting a response failure", async () => {
     const reported = silenceApiResponseReport();
     const controller = new AbortController();
@@ -523,5 +554,39 @@ describe("api", () => {
     await expect(api("/api/private")).rejects.toMatchObject({ status: 401, code: "session_expired" });
     expect(laterSubscriber).toHaveBeenCalledWith(expect.objectContaining({ status: 401 }));
     expect(logged).toHaveBeenCalledWith("API unauthorized handler failed", subscriberError);
+  });
+
+  it("does not attribute an unauthorized-handler failure to stale response identifiers", async () => {
+    resetClientTelemetryForTests();
+    const uninstall = installClientTelemetry();
+    onTestFinished(() => {
+      uninstall();
+      resetClientTelemetryForTests();
+    });
+    observeWorkerResponse(new Headers({ "x-request-id": "stale-request", "x-worker-version": "stale-release" }));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: "session_expired", message: "Sign in again." } }), {
+          status: 401,
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const subscriberError = new Error("subscriber failed");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const unsubscribe = onApiUnauthorized(() => {
+      throw subscriberError;
+    });
+    onTestFinished(unsubscribe);
+
+    await expect(api("/api/private")).rejects.toMatchObject({ status: 401, code: "session_expired" });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const telemetryInit = fetchMock.mock.calls[1]?.[1] as RequestInit;
+    const payload = JSON.parse(String(telemetryInit.body)) as Record<string, unknown>;
+    expect(payload).not.toHaveProperty("requestId");
+    expect(payload).not.toHaveProperty("release");
   });
 });

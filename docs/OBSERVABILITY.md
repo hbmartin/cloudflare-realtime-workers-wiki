@@ -58,7 +58,8 @@ and lifecycle summaries.
 
 Never add cookies, authorization headers, credentials, email addresses, request bodies, document content or
 titles, Slack/webhook payloads, or URL query strings to telemetry. The logger redacts sensitive keys, known
-credential formats, email-shaped values, bearer tokens, and query strings, including nested diagnostic values.
+credential formats, email-shaped values, Basic and Bearer authorization values, and query strings, including nested
+diagnostic values.
 Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to
 Analytics Engine.
 
@@ -70,10 +71,13 @@ messages and stacks never leave the browser; pre-login failures are deliberately
 
 `index1` is always `event`. Positions are fixed:
 
-| Position            | Value                                                                         |
-| ------------------- | ----------------------------------------------------------------------------- |
-| `blob1`…`blob7`     | schema, component, operation/route, outcome, code, subtype, Worker version ID |
-| `double1`…`double6` | duration ms, bytes, attempts, lag ms, backlog, connection count               |
+| Position            | Value                                                                                   |
+| ------------------- | --------------------------------------------------------------------------------------- |
+| `blob1`…`blob7`     | schema, component, operation/route, outcome, code, subtype, Worker version ID           |
+| `double1`…`double7` | duration ms, bytes, attempts, lag ms, backlog, connection count, byte-count-known (`1`) |
+
+Treat `double2` as a response byte count only when `double7 = 1`; older points and responses without a valid
+`Content-Length` have `double7 = 0`.
 
 Analytics Engine may sample rows. Every count and weighted aggregate must use `_sample_interval`:
 
@@ -118,15 +122,18 @@ The monitor retries readiness three times at 45-second intervals and evaluates:
 
 - all three readiness probes fail, or any scheduled task has no success for 35 minutes;
 - three Worker exceptions in five minutes, or 5xx above 2% with at least 50 requests;
-- any DLQ backlog or Queue backlog above 100 throughout 15 minutes; oldest message age remains diagnostic because
-  delayed webhook retries intentionally remain queued;
-- latest-state Workflow internal/rollback failures, a Cloudflare Workflow queued above 30 minutes within the
-  two-hour monitor lookback, or a locally durable job unchanged in `queued` for 30 minutes;
+- missing delivery Queue, DLQ, or D1 metadata; any DLQ backlog; or Queue backlog above 100 throughout 15 minutes;
+  oldest message age remains diagnostic because delayed webhook retries intentionally remain queued;
+- latest-state Workflow internal/rollback failures from the two-hour event window, a Workflow whose authoritative
+  current state remains `queued` above 30 minutes, or a locally durable job unchanged in `queued` for 30 minutes;
 - deletion/upload attempts above five, archive attempts above nine, durable work overdue by two hours after its
   `next_attempt_at`, outbox due above 15 minutes, or D1 size above 8 GB; active multipart uploads retain their full
   24-hour session deadline before the overdue grace starts;
 - any invariant-corruption metric, two compaction failures, two restore 5xx failures, or five identical
   authenticated browser fingerprints in 15 minutes.
+
+Missing external metadata reports `delivery_queue_metadata_missing`, `delivery_dlq_metadata_missing`, or
+`d1_metadata_missing` instead of interpreting an unavailable resource as zero.
 
 Run the same collector by hand:
 
@@ -136,9 +143,10 @@ pnpm observability:check    # paging thresholds, non-zero on failure
 ```
 
 The commands require `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_OBSERVABILITY_TOKEN`, `PRODUCTION_BASE_URL`, and
-`OBSERVABILITY_PROBE_TOKEN`. The read-only Cloudflare token needs Workers Observability Read, Analytics Engine
-Read, Queues Read, and D1 Read for the configured account. Operators own `.github/workflows/observability.yml`
-and must enable GitHub Actions failure emails under GitHub notification settings.
+`OBSERVABILITY_PROBE_TOKEN`. The read-only Cloudflare token needs Workers Observability Read, Workers Scripts Read,
+Analytics Engine Read, Queues Read, and D1 Read for the configured account. Operators own
+`.github/workflows/observability.yml` and must enable GitHub Actions failure emails under GitHub notification
+settings.
 
 ## Request-ID triage
 

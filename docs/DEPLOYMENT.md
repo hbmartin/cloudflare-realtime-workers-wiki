@@ -354,7 +354,8 @@ until that manually dispatched run has deployed the new Worker.
 
 It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository or environment secrets and
 `PRODUCTION_BASE_URL` as a variable. The monitor additionally needs `CLOUDFLARE_OBSERVABILITY_TOKEN` and
-`OBSERVABILITY_PROBE_TOKEN`. Secrets set with `wrangler secret put --env production` are not
+`OBSERVABILITY_PROBE_TOKEN`; its Cloudflare token includes Workers Scripts Read so it can list current Workflow
+instance states. Secrets set with `wrangler secret put --env production` are not
 managed by the workflow; they persist across deploys and are set once, manually, per the steps above.
 
 See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md) for the gate's behavior, the credentials, the

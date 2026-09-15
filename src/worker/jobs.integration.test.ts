@@ -3992,14 +3992,16 @@ describe("delivery outbox", () => {
     ).resolves.toEqual({ count: 1 });
 
     const ack = vi.fn();
-    await consumeDeliveryMessage(bindings, {
-      id: "sweep-continuation",
-      timestamp: new Date(),
-      body: { sweep: true },
-      attempts: 1,
-      ack,
-      retry: vi.fn(),
-    } satisfies Message<DeliveryQueueMessage>);
+    await expect(
+      consumeDeliveryMessage(bindings, {
+        id: "sweep-continuation",
+        timestamp: new Date(),
+        body: { sweep: true },
+        attempts: 1,
+        ack,
+        retry: vi.fn(),
+      } satisfies Message<DeliveryQueueMessage>),
+    ).resolves.toBe("acknowledged");
 
     expect(send).toHaveBeenCalledTimes(252);
     expect(send).toHaveBeenLastCalledWith({ outboxId: ids[250] });
@@ -4015,6 +4017,13 @@ describe("delivery outbox", () => {
     const validAck = vi.fn();
     const validRetry = vi.fn();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const writeDataPoint = vi.fn();
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "OBSERVABILITY") return { writeDataPoint };
+        return Reflect.get(target, property, receiver);
+      },
+    });
     onTestFinished(() => warning.mockRestore());
     const invalid = {
       id: "invalid-message",
@@ -4042,7 +4051,7 @@ describe("delivery outbox", () => {
           ackAll: vi.fn(),
           retryAll: vi.fn(),
         } satisfies MessageBatch<DeliveryQueueMessage>,
-        env,
+        bindings,
       ),
     ).resolves.toBeUndefined();
 
@@ -4051,6 +4060,61 @@ describe("delivery outbox", () => {
     expect(validAck).toHaveBeenCalledOnce();
     expect(validRetry).not.toHaveBeenCalled();
     expectStructuredLog(warning, "queue.message.invalid", { messageId: "invalid-message", attempts: 1 });
+    expect(
+      writeDataPoint.mock.calls
+        .map(([point]) => point)
+        .filter((point) => point.indexes[0] === "queue.delivery")
+        .map((point) => point.blobs[3]),
+    ).toEqual(["discarded", "acknowledged"]);
+  });
+
+  it("records a thrown delivery attempt as a failure before retrying it", async () => {
+    const installed = await bootstrap();
+    const outboxId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+       VALUES (?, ?, 'unsupported', '{}', ?, ?)`,
+    )
+      .bind(outboxId, installed.workspaceId, Date.now() - 1, Date.now())
+      .run();
+    const ack = vi.fn();
+    const retry = vi.fn();
+    const writeDataPoint = vi.fn();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "OBSERVABILITY") return { writeDataPoint };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    await worker.queue(
+      {
+        queue: "delivery",
+        messages: [
+          {
+            id: "unsupported-message",
+            timestamp: new Date(),
+            body: { outboxId },
+            attempts: 1,
+            ack,
+            retry,
+          },
+        ],
+        metadata: { metrics: { backlogCount: 1, backlogBytes: 0 } },
+        ackAll: vi.fn(),
+        retryAll: vi.fn(),
+      } satisfies MessageBatch<DeliveryQueueMessage>,
+      bindings,
+    );
+
+    expect(ack).not.toHaveBeenCalled();
+    expect(retry).toHaveBeenCalledOnce();
+    expect(
+      writeDataPoint.mock.calls.map(([point]) => point).find((point) => point.indexes[0] === "queue.delivery")
+        ?.blobs[3],
+    ).toBe("failure");
   });
 
   it("retries a sweep message when its capped continuation cannot be enqueued", async () => {
@@ -4124,14 +4188,16 @@ describe("delivery outbox", () => {
     const ack = vi.fn();
     const retry = vi.fn();
 
-    await consumeDeliveryMessage(env, {
-      id: "sweep-continuation",
-      timestamp: new Date(),
-      body: { sweep: true },
-      attempts: 3,
-      ack,
-      retry,
-    } satisfies Message<DeliveryQueueMessage>);
+    await expect(
+      consumeDeliveryMessage(env, {
+        id: "sweep-continuation",
+        timestamp: new Date(),
+        body: { sweep: true },
+        attempts: 3,
+        ack,
+        retry,
+      } satisfies Message<DeliveryQueueMessage>),
+    ).resolves.toBe("retried");
 
     expect(ack).not.toHaveBeenCalled();
     expect(retry).toHaveBeenCalledWith({ delaySeconds: 8 });
@@ -4223,8 +4289,8 @@ describe("delivery outbox", () => {
       ack,
       retry: vi.fn(),
     } satisfies Message<{ outboxId: string }>;
-    await consumeDeliveryMessage(env, queueMessage);
-    await consumeDeliveryMessage(env, queueMessage);
+    await expect(consumeDeliveryMessage(env, queueMessage)).resolves.toBe("acknowledged");
+    await expect(consumeDeliveryMessage(env, queueMessage)).resolves.toBe("acknowledged");
     expect(ack).toHaveBeenCalledTimes(2);
     expect(
       (

@@ -116,8 +116,9 @@ the workflow. They persist across deploys and are set once, by hand, per
 
 The separate five-minute `observability.yml` workflow uses the same account and base URL plus
 `CLOUDFLARE_OBSERVABILITY_TOKEN` and `OBSERVABILITY_PROBE_TOKEN`. Give the observability token only
-Workers Observability Read, Analytics Engine Read, Queues Read, and D1 Read. It never deploys or writes
-Cloudflare state. Enable Actions failure email in each operator's GitHub notification settings.
+Workers Observability Read, Workers Scripts Read, Analytics Engine Read, Queues Read, and D1 Read. It uses Workers
+Scripts Read only to list authoritative Workflow instance states; it never deploys or writes Cloudflare state.
+Enable Actions failure email in each operator's GitHub notification settings.
 
 ```sh
 gh secret set CLOUDFLARE_OBSERVABILITY_TOKEN
