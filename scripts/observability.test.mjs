@@ -1,4 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { analyticsQuery, collectSnapshot, evaluateThresholds, main, probeReadiness } from "./observability.mjs";
 
 function healthy() {
@@ -360,6 +365,60 @@ describe("observability thresholds", () => {
       expect.objectContaining({ source: "d1", code: "d1_source_unavailable", reason: "invalid_response" }),
     );
     expect(evaluateThresholds(snapshot)).toContain("d1_source_unavailable");
+  });
+
+  it.each([
+    [
+      "network_error",
+      () => {
+        throw new TypeError("fetch failed");
+      },
+    ],
+    [
+      "invalid_response",
+      () => ({
+        ok: true,
+        json: async () => {
+          throw new TypeError("body failed");
+        },
+      }),
+    ],
+    [
+      "timeout",
+      () => ({
+        ok: true,
+        json: async () => {
+          throw new DOMException("body timed out", "TimeoutError");
+        },
+      }),
+    ],
+    ["http_error", () => new Response("unavailable", { status: 503 })],
+  ])("classifies Analytics %s at the failing stage", async (reason, analytics) => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      { fetcher: cloudflareFetcher({ analytics }), delay: async () => undefined },
+    );
+    expect(snapshot.sourceDiagnostics).toContainEqual(
+      expect.objectContaining({
+        source: "analytics",
+        code: "analytics_unavailable",
+        reason,
+        ...(reason === "http_error" ? { status: 503 } : {}),
+      }),
+    );
+  });
+
+  it("executes the monitor through a symlink as a direct script", () => {
+    const directory = mkdtempSync(join(tmpdir(), "observability symlink "));
+    try {
+      const link = join(directory, "monitor.mjs");
+      symlinkSync(fileURLToPath(new URL("./observability.mjs", import.meta.url)), link);
+      const child = spawnSync(process.execPath, [link, "invalid-mode"], { encoding: "utf8" });
+      expect(child.status).toBe(1);
+      expect(child.stderr).toContain("Use observability.mjs report or check.");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it.each([

@@ -28,11 +28,13 @@ type LogFields = Readonly<Record<string, unknown>>;
 
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
-const EMAIL_VALUE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
-const BASIC_VALUE = /\bBasic(\s+)([^\s]+)/gi;
-const BEARER_VALUE = /\bBearer\s+[^\s]+/gi;
+const BASIC_HEADER_VALUE = /\b((?:proxy-)?authorization[ \t]*:[ \t]*Basic[ \t]+)[A-Za-z0-9+/_=-]+/gi;
+const BEARER_VALUE = /\bBearer[ \t]+[A-Za-z0-9._~+/=-]+/gi;
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
+const PARTIAL_SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]*|xox[baprs]-[A-Za-z0-9-]*)$/i;
+const TRUNCATION_MARKER = "…[truncated]";
+const NESTED_VALUE_BUDGET = 100;
 const RESERVED_LOG_FIELDS = new Set([
   "schema",
   "event",
@@ -94,43 +96,100 @@ export function withDurableObjectContext<T>(env: Env, request: Request, callback
   );
 }
 
-function redactKnownValues(value: string) {
-  return value
-    .replace(BASIC_VALUE, (match, separator: string, candidate: string, offset: number, source: string) => {
-      const before = source.slice(Math.max(0, offset - 80), offset);
-      const authorizationHeader = /\b(?:proxy-)?authorization\s*:\s*$/i.test(before);
-      const terminal = candidate.match(/[.,;!?]+$/)?.[0] ?? "";
-      const core = candidate.slice(0, candidate.length - terminal.length);
-      const proseWord = /^[a-z]+$/.test(core);
-      // A plain lowercase word in free text can be prose. In a header context,
-      // after a line break, or for a token-shaped value, scrub without decoding.
-      return authorizationHeader || /[\r\n]/.test(separator) || !proseWord ? `Basic [redacted]${terminal}` : match;
-    })
+function isAsciiLetter(code: number) {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isAsciiDigit(code: number) {
+  return code >= 48 && code <= 57;
+}
+
+function isEmailLocal(code: number) {
+  return isAsciiLetter(code) || isAsciiDigit(code) || "._%+-".includes(String.fromCharCode(code));
+}
+
+function isEmailDomain(code: number) {
+  return isAsciiLetter(code) || isAsciiDigit(code) || code === 46 || code === 45;
+}
+
+function redactEmails(value: string) {
+  const parts: string[] = [];
+  let cursor = 0;
+  let at = value.indexOf("@");
+  while (at >= 0) {
+    let start = at;
+    while (start > cursor && at - start < 64 && isEmailLocal(value.charCodeAt(start - 1))) start -= 1;
+    let end = at + 1;
+    while (end < value.length && end - at <= 253 && isEmailDomain(value.charCodeAt(end))) end += 1;
+    let domainEnd = end;
+    while (domainEnd > at + 1 && value.charCodeAt(domainEnd - 1) === 46) domainEnd -= 1;
+    const dot = value.lastIndexOf(".", domainEnd - 1);
+    const tldLength = domainEnd - dot - 1;
+    let validTld = tldLength >= 2 && tldLength <= 63;
+    for (let index = dot + 1; validTld && index < domainEnd; index += 1) {
+      validTld = isAsciiLetter(value.charCodeAt(index));
+    }
+    const boundedLocal = start === 0 || !isEmailLocal(value.charCodeAt(start - 1));
+    const boundedDomain = end === value.length || !isEmailDomain(value.charCodeAt(end));
+    if (start < at && dot > at + 1 && validTld && boundedLocal && boundedDomain) {
+      parts.push(value.slice(cursor, start), "[redacted-email]");
+      cursor = domainEnd;
+    }
+    at = value.indexOf("@", Math.max(at + 1, cursor));
+  }
+  parts.push(value.slice(cursor));
+  return parts.join("");
+}
+
+function redactPartialEmail(value: string) {
+  const at = value.lastIndexOf("@");
+  if (at < 0 || value.length - at > 254) return value;
+  let start = at;
+  while (start > 0 && at - start < 64 && isEmailLocal(value.charCodeAt(start - 1))) start -= 1;
+  if (start === at) return value;
+  for (let index = at + 1; index < value.length; index += 1) {
+    if (!isEmailDomain(value.charCodeAt(index))) return value;
+  }
+  return value.slice(0, start) + "[redacted-email]";
+}
+
+function redactKnownValues(value: string, truncated = false) {
+  let safe = value
+    .replace(BASIC_HEADER_VALUE, "$1[redacted]")
     .replace(BEARER_VALUE, "Bearer [redacted]")
     .replace(SECRET_VALUE, "[redacted-secret]")
-    .replace(EMAIL_VALUE, "[redacted-email]")
     .replace(URL_QUERY, "$1");
+  safe = redactEmails(safe);
+  if (truncated) safe = redactPartialEmail(safe).replace(PARTIAL_SECRET_VALUE, "[redacted-secret]");
+  return safe;
 }
 
 function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
-  return boundedLogString(redactKnownValues(value), limit);
+  const truncated = value.length > limit;
+  const bounded = boundedLogString(value, limit);
+  const payload = truncated ? bounded.slice(0, -TRUNCATION_MARKER.length) : bounded;
+  const safe = redactKnownValues(payload, truncated);
+  return boundedLogString(truncated ? safe + TRUNCATION_MARKER : safe, limit);
 }
 
 export function safeTelemetryErrorMessage(error: unknown, fallback: string) {
   return redactedString(rawSafeErrorMessage(error, fallback), 1_000);
 }
 
-function safeNested(value: unknown, depth: number, seen: WeakSet<object>): unknown {
-  if (value === null || typeof value === "boolean" || typeof value === "string" || typeof value === "number") {
+function safeNested(value: unknown, depth: number, seen: WeakSet<object>, budget: { remaining: number }): unknown {
+  if (budget.remaining <= 0) return "[entries omitted]";
+  budget.remaining -= 1;
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
     return typeof value === "number" && !Number.isFinite(value) ? String(value) : value;
   }
-  if (typeof value === "bigint") return String(value);
+  if (typeof value === "string") return redactedString(value);
+  if (typeof value === "bigint") return boundedLogString(String(value), LOG_IDENTIFIER_LIMIT);
   if (value === undefined) return undefined;
-  if (typeof value !== "object") return `[${typeof value} omitted]`;
+  if (typeof value !== "object") return "[" + typeof value + " omitted]";
   if (depth >= 3) return "[depth omitted]";
   if (seen.has(value)) return "[circular]";
   seen.add(value);
-  if (value instanceof Error) return errorLogFields(value, redactKnownValues);
+  if (value instanceof Error) return errorLogFields(value, redactedString);
   let keys: string[];
   try {
     keys = Object.keys(value).slice(0, 30);
@@ -138,22 +197,32 @@ function safeNested(value: unknown, depth: number, seen: WeakSet<object>): unkno
     return "[object omitted]";
   }
   if (Array.isArray(value)) {
-    return keys.map((key) => {
-      try {
-        return safeNested(Reflect.get(value, key), depth + 1, seen);
-      } catch {
-        return "[property omitted]";
+    const result: unknown[] = [];
+    for (const key of keys) {
+      if (budget.remaining <= 0) {
+        result.push("[entries omitted]");
+        break;
       }
-    });
+      try {
+        result.push(safeNested(Reflect.get(value, key), depth + 1, seen, budget));
+      } catch {
+        result.push("[property omitted]");
+      }
+    }
+    return result;
   }
   const result: Record<string, unknown> = {};
   for (const key of keys) {
+    if (budget.remaining <= 0) {
+      result["omitted"] = "[entries omitted]";
+      break;
+    }
     if (SENSITIVE_KEY.test(key)) {
       result[key] = "[redacted]";
       continue;
     }
     try {
-      result[key] = safeNested(Reflect.get(value, key), depth + 1, seen);
+      result[key] = safeNested(Reflect.get(value, key), depth + 1, seen, budget);
     } catch {
       result[key] = "[property omitted]";
     }
@@ -177,10 +246,11 @@ function safeField(key: string, value: unknown): string | number | boolean | nul
   if (typeof value === "bigint") return boundedLogString(String(value), LOG_IDENTIFIER_LIMIT);
   if (value === undefined) return undefined;
   try {
-    const serialized = JSON.stringify(safeNested(value, 0, new WeakSet()));
-    return redactedString(serialized ?? `[${typeof value} omitted]`, LOG_TEXT_LIMIT);
+    const serialized = JSON.stringify(safeNested(value, 0, new WeakSet(), { remaining: NESTED_VALUE_BUDGET }));
+    if (!serialized) return JSON.stringify("[" + typeof value + " omitted]");
+    return serialized.length > LOG_TEXT_LIMIT ? JSON.stringify("[object truncated]") : serialized;
   } catch {
-    return `[${typeof value} omitted]`;
+    return "[" + typeof value + " omitted]";
   }
 }
 
@@ -209,9 +279,17 @@ function structuredLog(
   }
   const normalizedError: Record<string, unknown> = {};
   if (error !== undefined) {
-    for (const [key, value] of Object.entries(errorLogFields(error, redactKnownValues))) {
-      const safe = safeField(key, value);
-      if (safe !== undefined) normalizedError[key] = safe;
+    for (const [key, value] of Object.entries(errorLogFields(error, redactedString))) {
+      if (value === undefined) continue;
+      if (value !== null && typeof value === "object") {
+        try {
+          normalizedError[key] = boundedLogString(JSON.stringify(value), LOG_TEXT_LIMIT);
+        } catch {
+          normalizedError[key] = "[object omitted]";
+        }
+      } else {
+        normalizedError[key] = value;
+      }
     }
   }
   const record = {

@@ -1,5 +1,4 @@
 import { appendFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
 
 // Production resource identifiers intentionally remain stable through the NoteFlare rebrand.
 export const ANALYTICS_DATASET = "cloudflare_realtime_notes_production";
@@ -22,15 +21,26 @@ class ObservabilityApiError extends Error {
   }
 }
 
+class ObservabilitySourceError extends Error {
+  constructor(reason) {
+    super(`Observability source failed (${reason}).`);
+    this.reason = reason;
+  }
+}
+
+function isTimeout(error) {
+  return error?.name === "TimeoutError" || error?.name === "AbortError";
+}
+
 function sourceDiagnostic(source, code, error) {
   const status = error instanceof ObservabilityApiError ? error.status : undefined;
   const reason =
     status !== undefined
       ? "http_error"
-      : error?.name === "TimeoutError" || error?.name === "AbortError"
-        ? "timeout"
-        : error instanceof TypeError
-          ? "network_error"
+      : error instanceof ObservabilitySourceError
+        ? error.reason
+        : isTimeout(error)
+          ? "timeout"
           : "invalid_response";
   return { source, code, reason, ...(status !== undefined ? { status } : {}) };
 }
@@ -58,10 +68,20 @@ function requiredEnvironment(environment) {
 }
 
 async function fetchJson(url, init, fetcher = fetch) {
-  const response = await fetcher(url, { ...init, signal: AbortSignal.timeout(15_000) });
-  const body = await response.json().catch(() => null);
+  let response;
+  try {
+    response = await fetcher(url, { ...init, signal: AbortSignal.timeout(15_000) });
+  } catch (error) {
+    throw new ObservabilitySourceError(isTimeout(error) ? "timeout" : "network_error");
+  }
   if (!response.ok) throw new ObservabilityApiError(response.status);
-  if (body === null) throw new Error("Observability API returned an invalid response.");
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    throw new ObservabilitySourceError(isTimeout(error) ? "timeout" : "invalid_response");
+  }
+  if (body === null) throw new ObservabilitySourceError("invalid_response");
   return body;
 }
 
@@ -216,7 +236,7 @@ async function staleQueuedWorkflows(accountId, token, timestamp, fetcher = fetch
     seenCursors.add(cursor);
     url.searchParams.set("cursor", cursor);
   }
-  throw new Error("Cloudflare Workflow instance query exceeded the pagination limit.");
+  return { instances, complete: false };
 }
 
 async function graphqlMetrics(accountId, token, queueId, startedAt, fetcher = fetch) {
@@ -504,7 +524,11 @@ export async function main(arguments_, environment = process.env) {
   return { snapshot, failures };
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (typeof import.meta.main !== "boolean") {
+  throw new Error("This script requires a Node.js runtime with import.meta.main support.");
+}
+
+if (import.meta.main) {
   main(process.argv.slice(2)).catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
