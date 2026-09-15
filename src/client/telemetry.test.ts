@@ -143,7 +143,7 @@ describe("client telemetry", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("does not consume deduplication or rate budget when authentication rejects a report", async () => {
+  it("does not deduplicate a fingerprint until authentication accepts a report", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(new Response(null, { status: 401 }))
@@ -155,6 +155,20 @@ describe("client telemetry", () => {
     await reportClientError("client.global_error", error);
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("charges rejected and network-failed POST attempts to the five-per-minute budget", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(null, { status: 429 }))
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    for (let index = 0; index < 7; index += 1) {
+      await reportClientError("client.global_error", new Error(`rejected-${index}`));
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(5);
   });
 
   it("throttles distinct reports to five per minute", async () => {

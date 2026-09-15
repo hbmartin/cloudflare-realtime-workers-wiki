@@ -20,6 +20,7 @@ export interface ObservabilityContext {
   trigger: ObservabilityTrigger;
   versionId?: string;
   versionTag?: string;
+  metricRouteTemplate?: string;
 }
 
 type LogLevel = "debug" | "info" | "warn" | "error";
@@ -64,6 +65,15 @@ export function withObservabilityContext<T>(
 
 export function currentObservabilityContext() {
   return contextStorage.getStore();
+}
+
+export function setMetricRouteTemplate(template: string) {
+  const context = currentObservabilityContext();
+  if (context) context.metricRouteTemplate = template || "/unmatched";
+}
+
+export function metricRouteTemplate() {
+  return currentObservabilityContext()?.metricRouteTemplate ?? "/unmatched";
 }
 
 export function correlationHeaders(): Record<string, string> {
@@ -270,15 +280,4 @@ export function traced<T>(
     }
     return callback();
   });
-}
-
-export function normalizedRoute(pathname: string) {
-  if (pathname.startsWith("/parties/document/")) return "/parties/document/:room";
-  if (pathname.startsWith("/parties/workspace-events/")) return "/parties/workspace-events/:workspace";
-  const segments = pathname
-    .split("/")
-    .map((segment) =>
-      /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(segment) || /^(?=.*\d)[A-Za-z0-9_-]{20,}$/.test(segment) ? ":id" : segment,
-    );
-  return boundedLogString(segments.join("/"), LOG_IDENTIFIER_LIMIT);
 }

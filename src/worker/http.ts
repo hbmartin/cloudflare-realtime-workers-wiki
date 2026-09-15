@@ -2,7 +2,7 @@ import type { Context } from "hono";
 import { LOG_IDENTIFIER_LIMIT, LOG_TEXT_LIMIT, boundedLogString, safeInstanceOf } from "../shared/error-log";
 import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
-import { currentObservabilityContext, logger } from "./observability";
+import { logger } from "./observability";
 
 // This versioned wire discriminator is compatibility-sensitive and is not a display name.
 const HTTP_ERROR_KIND = "realtime-notes.http-error.v1";
@@ -130,10 +130,7 @@ export function errorResponse(c: Context, error: unknown) {
       error,
     );
   }
-  const response = c.json(body, status);
-  const requestId = currentObservabilityContext()?.requestId;
-  if (requestId) response.headers.set("x-request-id", requestId);
-  return response;
+  return c.json(body, status);
 }
 
 export async function sha256(value: string) {

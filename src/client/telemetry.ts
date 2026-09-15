@@ -1,17 +1,7 @@
-const CLIENT_ERROR_EVENTS = [
-  "client.global_error",
-  "client.unhandled_rejection",
-  "client.bundle_load_failed",
-  "client.api_response_invalid",
-  "client.api_response_unreadable",
-  "client.api_response_empty",
-  "client.api_unauthorized_handler_failed",
-  "client.mutation_uncertain",
-  "client.offline_storage_failed",
-  "client.realtime_connection_failed",
-] as const;
+import { sha256Hex } from "../shared/import-integrity";
+import { isClientErrorName, isTelemetryIdentifier, type ClientErrorEvent } from "../shared/client-telemetry-contract";
 
-export type ClientErrorEvent = (typeof CLIENT_ERROR_EVENTS)[number];
+export type { ClientErrorEvent } from "../shared/client-telemetry-contract";
 
 export interface ClientErrorContext {
   requestId?: string | null;
@@ -36,11 +26,11 @@ let latestRequestId: string | null = null;
 let latestRelease: string | null = null;
 
 function opaqueIdentifier(value: string | null | undefined) {
-  return value && /^[A-Za-z0-9._:-]{1,200}$/.test(value) ? value : null;
+  return isTelemetryIdentifier(value) ? value : null;
 }
 
 function safeErrorName(value: unknown) {
-  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.:-]{0,99}$/.test(value) ? value : "UnknownError";
+  return isClientErrorName(value) ? value : "UnknownError";
 }
 
 function property(value: unknown, name: string) {
@@ -65,13 +55,6 @@ function errorIdentity(error: unknown) {
     message: typeof message === "string" ? message : typeof error === "string" ? error : "",
     stack: typeof stack === "string" ? stack : "",
   };
-}
-
-async function sha256Hex(value: string) {
-  const subtle = globalThis.crypto?.subtle;
-  if (!subtle) throw new Error("Web Crypto is unavailable.");
-  const digest = await subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function firstPartySource(stack: string): FirstPartySource | undefined {
@@ -130,6 +113,7 @@ export async function reportClientError(event: ClientErrorEvent, error: unknown,
         online: navigator.onLine,
         visibility: document.visibilityState,
       };
+      reportTimes.push(Date.now());
       const response = await fetch("/api/telemetry/client-errors", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -140,7 +124,6 @@ export async function reportClientError(event: ClientErrorEvent, error: unknown,
       if (!response.ok) return;
       const acceptedAt = Date.now();
       sentFingerprints.set(key, acceptedAt);
-      reportTimes.push(acceptedAt);
     } catch {
       // Telemetry must never interfere with the user flow or recursively report itself.
     } finally {

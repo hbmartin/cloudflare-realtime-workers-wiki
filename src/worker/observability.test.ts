@@ -4,8 +4,9 @@ import type { Env } from "./env";
 import {
   OBSERVABILITY_SCHEMA,
   logger,
-  normalizedRoute,
+  metricRouteTemplate,
   recordMetric,
+  setMetricRouteTemplate,
   traced,
   withObservabilityContext,
 } from "./observability";
@@ -88,11 +89,14 @@ describe("worker observability", () => {
     expect(writeDataPoint.mock.calls[0]?.[0].doubles).toEqual([0, 0, 0, 0, 0, 0, 1]);
   });
 
-  it("normalizes opaque route identifiers", () => {
-    expect(normalizedRoute("/api/pages/12345678901234567890/attachments")).toBe("/api/pages/:id/attachments");
-    expect(normalizedRoute("/api/pages/abcdefghijklmnopqrs1/attachments")).toBe("/api/pages/:id/attachments");
-    expect(normalizedRoute("/api/notification-preferences")).toBe("/api/notification-preferences");
-    expect(normalizedRoute("/parties/document/page~1")).toBe("/parties/document/:room");
+  it("keeps the registered metric route template in the request context", () => {
+    const env = {} as Env;
+    withObservabilityContext(env, { trigger: "fetch" }, () => {
+      expect(metricRouteTemplate()).toBe("/unmatched");
+      setMetricRouteTemplate("/api/pages/:id/attachments");
+      expect(metricRouteTemplate()).toBe("/api/pages/:id/attachments");
+    });
+    expect(metricRouteTemplate()).toBe("/unmatched");
   });
 
   it("redacts nested data and survives hostile error objects", () => {

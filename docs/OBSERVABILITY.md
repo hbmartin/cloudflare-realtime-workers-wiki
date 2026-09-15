@@ -61,11 +61,16 @@ titles, Slack/webhook payloads, or URL query strings to telemetry. The logger re
 credential formats, email-shaped values, Basic and Bearer authorization values, and query strings, including nested
 diagnostic values.
 Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to
-Analytics Engine.
+Analytics Engine. HTTP metric operations use Hono's registered route template, fixed Party templates, or
+`/unmatched`; they never derive a route value from request path segments.
 
 Browser reports are accepted only with a valid Better Auth session and contain only an event code, error name,
 SHA-256 fingerprint, same-origin source path/line/column, request ID, release, online state, and visibility. Raw
 messages and stacks never leave the browser; pre-login failures are deliberately not ingested.
+The browser budgets five attempted telemetry POSTs per minute, including rejected and network-failed attempts,
+but deduplicates fingerprints only after an accepted report. The Worker separately limits 300 requests per
+source IP per minute before origin/session checks and 20 authenticated requests per user per minute. Both keys
+are hashed before passing them to Worker Rate Limit bindings.
 
 ## Analytics Engine schema
 
@@ -78,6 +83,8 @@ messages and stacks never leave the browser; pre-login failures are deliberately
 
 Treat `double2` as a response byte count only when `double7 = 1`; older points and responses without a valid
 `Content-Length` have `double7 = 0`.
+Queue delivery metric outcomes are `acknowledged`, `retried`, or `discarded`; a thrown attempt records `failure`
+before retrying. A retry is not counted as a successful delivery.
 
 Analytics Engine may sample rows. Every count and weighted aggregate must use `_sample_interval`:
 
@@ -118,9 +125,12 @@ Readiness runs D1, R2 sentinel `head`, read-only Durable Object, cron-freshness,
 parallel with a two-second timeout per check. It returns `200`/`ready` or `503`/`degraded` with stable sanitized
 codes. A missing or invalid probe token returns `401`.
 
-The monitor retries readiness three times at 45-second intervals and evaluates:
+The monitor makes one to three readiness probes, stopping at the first success. It waits 45 seconds only between
+failed attempts and evaluates:
 
-- all three readiness probes fail, or any scheduled task has no success for 35 minutes;
+- every attempted readiness probe fails, or an active scheduled task's success is more than 35 minutes old.
+  Removed tasks' historical rows are ignored. A new/renamed task without its first success gets 35 minutes
+  after the current deployment timestamp; missing deployment metadata or a previously stale success gets no grace;
 - three Worker exceptions in five minutes, or 5xx above 2% with at least 50 requests;
 - missing delivery Queue, DLQ, or D1 metadata; any DLQ backlog; or Queue backlog above 100 throughout 15 minutes;
   oldest message age remains diagnostic because delayed webhook retries intentionally remain queued;

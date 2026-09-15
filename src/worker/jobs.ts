@@ -1219,12 +1219,9 @@ export async function recoverQueuedJobs(env: Env) {
   }
 }
 
-async function enqueueOutbox(env: Env, outboxId: string) {
+async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: string | null) {
   try {
-    const row = await env.DB.prepare(`SELECT correlation_id FROM outbox WHERE id = ?`)
-      .bind(outboxId)
-      .first<{ correlation_id: string | null }>();
-    const correlationId = row?.correlation_id ?? currentObservabilityContext()?.correlationId ?? undefined;
+    const correlationId = storedCorrelationId ?? currentObservabilityContext()?.correlationId ?? undefined;
     await env.DELIVERY_QUEUE.send({ outboxId, ...(correlationId ? { correlationId } : {}) });
     await env.DB.prepare(`UPDATE outbox SET enqueued_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?`)
       .bind(Date.now(), outboxId)
@@ -1347,15 +1344,15 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
     for (let batch = 0; batch < OUTBOX_SWEEP_MAX_BATCHES; batch += 1) {
       if (!(await renewLease("before-batch"))) return "lease-lost";
       const rows = await env.DB.prepare(
-        `SELECT id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
+        `SELECT id, correlation_id FROM outbox WHERE enqueued_at IS NULL AND available_at <= ?
           ORDER BY available_at, created_at, id LIMIT ?`,
       )
         .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
-        .all<{ id: string }>();
+        .all<{ id: string; correlation_id: string | null }>();
       for (const row of rows.results) {
         if (!(await renewLease("before-row"))) return "lease-lost";
         try {
-          await enqueueOutbox(env, row.id);
+          await enqueueOutbox(env, row.id, row.correlation_id);
         } catch (error) {
           logger.error("outbox.enqueue.failed", "outbox", "Outbox enqueue failed.", { outboxId: row.id }, error);
         }
@@ -1396,8 +1393,8 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
 export async function consumeDeliveryMessage(
   env: Env,
   message: Message<DeliveryQueueMessage>,
+  body = deliveryQueueMessageBody(message.body),
 ): Promise<DeliveryMessageOutcome> {
-  const body = deliveryQueueMessageBody(message.body);
   if (!body) {
     logger.warn("queue.message.invalid", "delivery-queue", "Delivery queue message body is invalid.", {
       messageId: message.id,

@@ -10,7 +10,7 @@ function healthy() {
     analytics: [
       { event: "http.request", code: "200", outcome: "success", count: 49 },
       { event: "http.request", code: "500", outcome: "server_error", count: 1 },
-      { event: "client.error", subtype: "fingerprint", count: 4 },
+      { event: "client.error", operation: "client.global_error", subtype: "fingerprint", count: 4 },
       { event: "document.compaction", outcome: "failure", count: 1 },
       { event: "document.restore", outcome: "failure", count: 1 },
     ],
@@ -37,7 +37,8 @@ async function malformedWorkflowFetcher(url, init = {}) {
   const target = String(url);
   if (target.includes("/api/health/ready")) return Response.json({ ok: true });
   if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
-  if (target.includes("/queues?")) return Response.json({ result: [] });
+  if (target.includes("/queues?"))
+    return Response.json({ success: true, result: [], result_info: { page: 1, total_pages: 1 } });
   if (target.includes("/d1/database?")) return Response.json({ result: [] });
   if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
     return Response.json({ success: true });
@@ -48,6 +49,19 @@ async function malformedWorkflowFetcher(url, init = {}) {
     });
   }
   throw new Error(`Unexpected observability request: ${target} ${String(init.method ?? "GET")}`);
+}
+
+async function malformedQueuePaginationFetcher(url) {
+  const target = String(url);
+  if (target.includes("/api/health/ready")) return Response.json({ ok: true });
+  if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
+  if (target.includes("/d1/database?")) return Response.json({ result: [] });
+  if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
+    return Response.json({ success: true, result: [] });
+  }
+  if (target.includes("/queues?"))
+    return Response.json({ success: true, result: [], result_info: { page: 2, total_pages: 2 } });
+  throw new Error(`Unexpected observability request: ${target}`);
 }
 
 describe("observability thresholds", () => {
@@ -73,6 +87,36 @@ describe("observability thresholds", () => {
     expect(delays).toEqual([45_000, 45_000]);
   });
 
+  it("stops probing after the first successful readiness response", async () => {
+    const delay = [];
+    const attempts = await probeReadiness("https://notes.example.test", "probe", {
+      fetcher: async () => Response.json({ ok: true }),
+      delay: async (milliseconds) => delay.push(milliseconds),
+    });
+    expect(attempts).toHaveLength(1);
+    expect(delay).toEqual([]);
+    const value = healthy();
+    value.readiness = attempts;
+    expect(evaluate(value)).not.toContain("readiness_failed");
+  });
+
+  it("fails closed when no readiness attempts are available", () => {
+    expect(evaluate({ ...healthy(), readiness: [] })).toContain("readiness_failed");
+  });
+
+  it("retries one failed readiness response, then stops at success", async () => {
+    let calls = 0;
+    const delays = [];
+    const attempts = await probeReadiness("https://notes.example.test", "probe", {
+      fetcher: async () =>
+        ++calls === 1 ? Response.json({ ok: false }, { status: 503 }) : Response.json({ ok: true }),
+      delay: async (milliseconds) => delays.push(milliseconds),
+    });
+    expect(attempts).toHaveLength(2);
+    expect(delays).toEqual([45_000]);
+    expect(evaluate({ ...healthy(), readiness: attempts })).not.toContain("readiness_failed");
+  });
+
   it("queries two hours of Workflow events and authoritative stale queued state", async () => {
     let workflowStart = 0;
     let workflowQuery = "";
@@ -82,7 +126,8 @@ describe("observability thresholds", () => {
       const target = String(url);
       if (target.includes("/api/health/ready")) return Response.json({ ok: true });
       if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
-      if (target.includes("/queues?")) return Response.json({ result: [] });
+      if (target.includes("/queues?"))
+        return Response.json({ success: true, result: [], result_info: { page: 1, total_pages: 1 } });
       if (target.includes("/d1/database?")) return Response.json({ result: [] });
       if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
         workflowInstancesUrl = new URL(target);
@@ -136,7 +181,8 @@ describe("observability thresholds", () => {
       const target = String(url);
       if (target.includes("/api/health/ready")) return Response.json({ ok: true });
       if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
-      if (target.includes("/queues?")) return Response.json({ result: [] });
+      if (target.includes("/queues?"))
+        return Response.json({ success: true, result: [], result_info: { page: 1, total_pages: 1 } });
       if (target.includes("/d1/database?")) return Response.json({ result: [] });
       if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
         return Response.json({ success: true, result: currentQueued });
@@ -159,6 +205,77 @@ describe("observability thresholds", () => {
   });
   it("keeps every healthy boundary non-paging", () => {
     expect(evaluate(healthy())).toEqual([]);
+  });
+
+  it("sums identical fingerprints across online state and error-name rows", () => {
+    const value = healthy();
+    value.analytics = [
+      {
+        event: "client.error",
+        operation: "client.global_error",
+        subtype: "same",
+        outcome: "online",
+        code: "TypeError",
+        count: 3,
+      },
+      {
+        event: "client.error",
+        operation: "client.global_error",
+        subtype: "same",
+        outcome: "offline",
+        code: "Error",
+        count: 2,
+      },
+    ];
+    expect(evaluate(value)).toContain("client_error_fingerprint_repeated");
+    value.analytics[1].subtype = "different";
+    expect(evaluate(value)).not.toContain("client_error_fingerprint_repeated");
+  });
+
+  it("finds both named queues beyond the first Queue API page", async () => {
+    const queuePages = [];
+    const fetcher = async (url) => {
+      const target = String(url);
+      if (target.includes("/api/health/ready")) return Response.json({ ok: true });
+      if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
+      if (target.includes("/d1/database?")) return Response.json({ result: [] });
+      if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
+        return Response.json({ success: true, result: [] });
+      }
+      if (target.includes("/queues?")) {
+        const page = Number(new URL(target).searchParams.get("page"));
+        queuePages.push(page);
+        const result =
+          page === 2
+            ? [{ queue_name: "cloudflare-realtime-notes-delivery", queue_id: "delivery-id" }]
+            : page === 3
+              ? [{ queue_name: "cloudflare-realtime-notes-delivery-dlq", queue_id: "dlq-id" }]
+              : [];
+        return Response.json({ success: true, result, result_info: { page, total_pages: 3 } });
+      }
+      if (target.includes("/queues/delivery-id/metrics")) return Response.json({ result: { backlog_count: 0 } });
+      if (target.includes("/queues/dlq-id/metrics")) return Response.json({ result: { backlog_count: 0 } });
+      if (target.endsWith("/graphql")) {
+        return Response.json({ data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } } });
+      }
+      throw new Error(`Unexpected observability request: ${target}`);
+    };
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      { fetcher, delay: async () => undefined },
+    );
+    expect(queuePages).toEqual([1, 2, 3]);
+    expect(snapshot.deliveryQueueId).toBe("delivery-id");
+    expect(evaluateThresholds(snapshot)).not.toContain("delivery_dlq_metadata_missing");
+  });
+
+  it("rejects malformed Queue API pagination", async () => {
+    await expect(
+      collectSnapshot(
+        { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+        { fetcher: malformedQueuePaginationFetcher, delay: async () => undefined },
+      ),
+    ).rejects.toThrow("invalid pagination metadata");
   });
 
   it.each([
@@ -198,6 +315,13 @@ describe("observability thresholds", () => {
     ["delivery queue", "delivery_queue_metadata_missing", (value) => delete value.delivery.backlog_count],
     ["delivery DLQ", "delivery_dlq_metadata_missing", (value) => delete value.dlq.backlog_count],
     ["D1", "d1_metadata_missing", (value) => delete value.database.file_size],
+    [
+      "invalid delivery count",
+      "delivery_queue_metadata_missing",
+      (value) => (value.delivery.backlog_count = "invalid"),
+    ],
+    ["invalid DLQ count", "delivery_dlq_metadata_missing", (value) => (value.dlq.backlog_count = -1)],
+    ["invalid D1 size", "d1_metadata_missing", (value) => (value.database.file_size = "NaN")],
   ])("pages when %s metadata omits its monitored value", (_resource, code, mutate) => {
     const value = healthy();
     mutate(value);

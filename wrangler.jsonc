@@ -65,6 +65,7 @@
     { "name": "API_BURST_LIMIT", "namespace_id": "2101", "simple": { "limit": 100, "period": 10 } },
     { "name": "API_MINUTE_LIMIT", "namespace_id": "2102", "simple": { "limit": 600, "period": 60 } },
     { "name": "CLIENT_TELEMETRY_LIMIT", "namespace_id": "2105", "simple": { "limit": 20, "period": 60 } },
+    { "name": "CLIENT_TELEMETRY_PREAUTH_LIMIT", "namespace_id": "2106", "simple": { "limit": 300, "period": 60 } },
   ],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Document"] },
@@ -131,6 +132,7 @@
         { "name": "API_BURST_LIMIT", "namespace_id": "2101", "simple": { "limit": 100, "period": 10 } },
         { "name": "API_MINUTE_LIMIT", "namespace_id": "2102", "simple": { "limit": 600, "period": 60 } },
         { "name": "CLIENT_TELEMETRY_LIMIT", "namespace_id": "2105", "simple": { "limit": 20, "period": 60 } },
+        { "name": "CLIENT_TELEMETRY_PREAUTH_LIMIT", "namespace_id": "2106", "simple": { "limit": 300, "period": 60 } },
       ],
       "vars": {
         "BETTER_AUTH_URL": "https://cloudflare-realtime-notes.harold-martin.workers.dev",
@@ -186,6 +188,7 @@
         { "name": "API_BURST_LIMIT", "namespace_id": "2101", "simple": { "limit": 100, "period": 10 } },
         { "name": "API_MINUTE_LIMIT", "namespace_id": "2102", "simple": { "limit": 600, "period": 60 } },
         { "name": "CLIENT_TELEMETRY_LIMIT", "namespace_id": "2205", "simple": { "limit": 20, "period": 60 } },
+        { "name": "CLIENT_TELEMETRY_PREAUTH_LIMIT", "namespace_id": "2206", "simple": { "limit": 300, "period": 60 } },
       ],
       "vars": {
         "BETTER_AUTH_URL": "http://127.0.0.1:4173",

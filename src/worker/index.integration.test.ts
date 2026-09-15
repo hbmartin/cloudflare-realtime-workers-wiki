@@ -663,6 +663,13 @@ describe("Worker integration", () => {
     expect(unauthorized.status).toBe(401);
     expect(await unauthorized.json()).toEqual({ ok: false, code: "probe_unauthorized" });
 
+    for (const token of ["wrong", "worker-observability-probe-tokeN", "worker-observability-probe-token-extra"]) {
+      const invalid = await SELF.fetch("http://example.test/api/health/ready", {
+        headers: { "x-observability-token": token },
+      });
+      expect(invalid.status).toBe(401);
+    }
+
     const ready = await SELF.fetch("http://example.test/api/health/ready", {
       headers: { "x-observability-token": "worker-observability-probe-token" },
     });
@@ -678,6 +685,56 @@ describe("Worker integration", () => {
         { name: "durable_queues", ok: true, code: "ok" },
       ],
     });
+  });
+
+  it("ignores removed cron rows and grants only never-successful active tasks deployment grace", async () => {
+    const now = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO observability_task_runs
+        (task_name, last_started_at, last_succeeded_at)
+        VALUES ('removed_task', ?, 0)`).bind(now),
+      env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = 'outbox'`),
+    ]);
+    const probe = async (deploymentTimestamp: string | undefined) => {
+      const bindings = new Proxy(env, {
+        get(target, property, receiver) {
+          if (property === "CF_VERSION_METADATA") {
+            return deploymentTimestamp ? { id: "test-version", timestamp: deploymentTimestamp } : undefined;
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const response = await worker.fetch(
+        new Request("http://example.test/api/health/ready", {
+          headers: { "x-observability-token": "worker-observability-probe-token" },
+        }),
+        bindings,
+        createExecutionContext(),
+      );
+      return {
+        status: response.status,
+        body: await response.json<{ checks: Array<{ name: string; code: string; value?: number }> }>(),
+      };
+    };
+    const freshDeploy = new Date(now - 10 * 60_000).toISOString();
+    expect((await probe(freshDeploy)).status).toBe(200);
+    const expired = await probe(new Date(now - 36 * 60_000).toISOString());
+    expect(expired.status).toBe(503);
+    expect(expired.body.checks).toContainEqual(
+      expect.objectContaining({ name: "cron", code: "cron_success_stale", value: 1 }),
+    );
+    expect((await probe(undefined)).status).toBe(503);
+
+    await env.DB.prepare(`INSERT INTO observability_task_runs
+      (task_name, last_started_at, last_succeeded_at)
+      VALUES ('outbox', ?, 0)`)
+      .bind(now)
+      .run();
+    expect((await probe(freshDeploy)).status).toBe(503);
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE observability_task_runs SET last_succeeded_at = ? WHERE task_name = 'outbox'`).bind(now),
+      env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = 'removed_task'`),
+    ]);
   });
 
   it("reports stale cron state through readiness without exposing task details", async () => {
@@ -811,7 +868,7 @@ describe("Worker integration", () => {
     expect(cancel).toHaveBeenCalledOnce();
   });
 
-  it("rate-limits browser telemetry by source without accepting sensitive payload fields", async () => {
+  it("rate-limits authenticated browser telemetry by user without accepting sensitive payload fields", async () => {
     const installed = await bootstrap();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -822,7 +879,7 @@ describe("Worker integration", () => {
           headers: {
             origin: "http://example.test",
             "content-type": "application/json",
-            "cf-connecting-ip": "192.0.2.44",
+            "cf-connecting-ip": attempt % 2 ? "192.0.2.44" : "192.0.2.45",
             cookie: installed.cookie,
           },
           body: JSON.stringify({
@@ -840,6 +897,78 @@ describe("Worker integration", () => {
     } finally {
       warning.mockRestore();
     }
+  });
+
+  it("applies a hashed source throttle before origin/session checks and a separate user throttle after auth", async () => {
+    const installed = await bootstrap();
+    const preauthKeys: string[] = [];
+    const userKeys: string[] = [];
+    let rejectSource = false;
+    const preauth = {
+      limit: vi.fn(async ({ key }: { key: string }) => {
+        preauthKeys.push(key);
+        return { success: !rejectSource };
+      }),
+    };
+    const authenticated = {
+      limit: vi.fn(async ({ key }: { key: string }) => {
+        userKeys.push(key);
+        return { success: true };
+      }),
+    };
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "CLIENT_TELEMETRY_PREAUTH_LIMIT") return preauth;
+        if (property === "CLIENT_TELEMETRY_LIMIT") return authenticated;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const request = (ip: string, cookie?: string, origin?: string) =>
+      new Request("http://example.test/api/telemetry/client-errors", {
+        method: "POST",
+        headers: {
+          "cf-connecting-ip": ip,
+          "content-type": "application/json",
+          ...(cookie ? { cookie } : {}),
+          ...(origin ? { origin } : {}),
+        },
+        body: JSON.stringify({
+          event: "client.global_error",
+          errorName: "TypeError",
+          fingerprint: "a".repeat(64),
+          online: true,
+          visibility: "visible",
+        }),
+      });
+    expect((await worker.fetch(request("192.0.2.1"), bindings, createExecutionContext())).status).toBe(403);
+    expect(userKeys).toHaveLength(0);
+    rejectSource = true;
+    expect((await worker.fetch(request("192.0.2.1"), bindings, createExecutionContext())).status).toBe(429);
+    rejectSource = false;
+    expect(
+      (
+        await worker.fetch(
+          request("192.0.2.2", installed.cookie, "http://example.test"),
+          bindings,
+          createExecutionContext(),
+        )
+      ).status,
+    ).toBe(204);
+    expect(
+      (
+        await worker.fetch(
+          request("192.0.2.3", installed.cookie, "http://example.test"),
+          bindings,
+          createExecutionContext(),
+        )
+      ).status,
+    ).toBe(204);
+    expect(preauthKeys[0]).toBe(preauthKeys[1]);
+    expect(preauthKeys[2]).not.toBe(preauthKeys[3]);
+    expect(preauthKeys.every((key) => /^[a-f0-9]{64}$/.test(key))).toBe(true);
+    expect(userKeys).toHaveLength(2);
+    expect(userKeys[0]).toBe(userKeys[1]);
+    expect(userKeys[0]).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it("distinguishes unknown response bytes from a known zero Content-Length", async () => {
@@ -873,6 +1002,41 @@ describe("Worker integration", () => {
       [0, 0],
       [0, 0],
     ]);
+  });
+
+  it("writes only registered templates for opaque, suffixed, short, and unmatched routes", async () => {
+    const writeDataPoint = vi.fn();
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "OBSERVABILITY") return { writeDataPoint };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const uuid = crypto.randomUUID();
+    const shareKey = "shareKeyWithoutDigits";
+    const paths = [
+      `/api/pages/${uuid}/diagram-thumbnail.svg`,
+      "/api/pages/abc/diagram-thumbnail.svg",
+      `/share/${shareKey}/diagram-thumbnails/abc.svg`,
+      "/api/no-such-route/short-id.svg",
+      "/parties/document/abc~1",
+    ];
+    for (const path of paths) {
+      await worker.fetch(new Request(`http://example.test${path}`), bindings, createExecutionContext());
+    }
+    const operations = writeDataPoint.mock.calls
+      .map(([point]) => point)
+      .filter((point) => point.indexes[0] === "http.request")
+      .map((point) => point.blobs[2]);
+    expect(operations).toEqual([
+      "/api/pages/:id/diagram-thumbnail.svg",
+      "/api/pages/:id/diagram-thumbnail.svg",
+      "/share/:key/diagram-thumbnails/:fileName",
+      "/unmatched",
+      "/parties/document/:room",
+    ]);
+    expect(JSON.stringify(operations)).not.toContain(uuid);
+    expect(JSON.stringify(operations)).not.toContain(shareKey);
   });
 
   it("waits for every scheduled task, records outcomes, and rejects an aggregate failure", async () => {

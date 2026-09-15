@@ -26,6 +26,7 @@ import {
   type JobRow,
 } from "./jobs";
 import worker from "./index";
+import { withObservabilityContext } from "./observability";
 
 type InstalledWorkspace = { cookie: string; pageId: string; userId: string; workspaceId: string };
 
@@ -3962,6 +3963,50 @@ describe("delivery outbox", () => {
     expect(new Set(send.mock.calls.map(([body]) => (body as { outboxId: string }).outboxId))).toEqual(new Set(ids));
   });
 
+  it("sweeps stored correlation IDs without an extra SELECT per outbox row", async () => {
+    const installed = await bootstrap();
+    const outboxId = crypto.randomUUID();
+    const correlationId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(`INSERT INTO outbox
+      (id, workspace_id, topic, payload_json, correlation_id, available_at, created_at)
+      VALUES (?, ?, 'notification', '{}', ?, ?, ?)`)
+      .bind(outboxId, installed.workspaceId, correlationId, timestamp - 1, timestamp)
+      .run();
+    const prepared: string[] = [];
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property === "prepare")
+          return (sql: string) => {
+            prepared.push(sql);
+            return target.prepare(sql);
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const send = vi.fn(async (_body: unknown) => undefined);
+    await sweepOutbox(bindingsWith({ DB: database, DELIVERY_QUEUE: { send } }));
+    expect(send).toHaveBeenCalledWith({ outboxId, correlationId });
+    expect(prepared.some((sql) => /SELECT\s+correlation_id\s+FROM\s+outbox/i.test(sql))).toBe(false);
+    expect(prepared.some((sql) => /SELECT\s+id,\s*correlation_id\s+FROM\s+outbox/i.test(sql))).toBe(true);
+  });
+
+  it("falls back to invocation correlation when an older outbox row stores null", async () => {
+    const installed = await bootstrap();
+    const outboxId = crypto.randomUUID();
+    const correlationId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(`INSERT INTO outbox
+      (id, workspace_id, topic, payload_json, correlation_id, available_at, created_at)
+      VALUES (?, ?, 'notification', '{}', NULL, ?, ?)`)
+      .bind(outboxId, installed.workspaceId, timestamp - 1, timestamp)
+      .run();
+    const send = vi.fn(async (_body: unknown) => undefined);
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
+    await withObservabilityContext(bindings, { trigger: "scheduled", correlationId }, () => sweepOutbox(bindings));
+    expect(send).toHaveBeenCalledWith({ outboxId, correlationId });
+  });
+
   it("continues a capped sweep through the delivery queue", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();
@@ -4068,6 +4113,33 @@ describe("delivery outbox", () => {
     ).toEqual(["discarded", "acknowledged"]);
   });
 
+  it("reads and normalizes a queue body only once in the Worker wrapper", async () => {
+    const body = vi.fn(() => ({ outboxId: "missing-outbox" }));
+    const ack = vi.fn();
+    const message = {
+      id: "one-body-read",
+      timestamp: new Date(),
+      get body() {
+        return body();
+      },
+      attempts: 1,
+      ack,
+      retry: vi.fn(),
+    } satisfies Message<DeliveryQueueMessage>;
+    await worker.queue(
+      {
+        queue: "delivery",
+        messages: [message],
+        metadata: { metrics: { backlogCount: 1, backlogBytes: 0 } },
+        ackAll: vi.fn(),
+        retryAll: vi.fn(),
+      } satisfies MessageBatch<DeliveryQueueMessage>,
+      env,
+    );
+    expect(body).toHaveBeenCalledOnce();
+    expect(ack).toHaveBeenCalledOnce();
+  });
+
   it("records a thrown delivery attempt as a failure before retrying it", async () => {
     const installed = await bootstrap();
     const outboxId = crypto.randomUUID();
@@ -4136,7 +4208,8 @@ describe("delivery outbox", () => {
     const send = vi.fn(async (body: unknown) => {
       if ((body as { sweep?: boolean }).sweep) throw failure;
     });
-    const bindings = bindingsWith({ DELIVERY_QUEUE: { send } });
+    const writeDataPoint = vi.fn();
+    const bindings = bindingsWith({ DELIVERY_QUEUE: { send }, OBSERVABILITY: { writeDataPoint } });
     const ack = vi.fn();
     const retry = vi.fn();
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -4169,6 +4242,10 @@ describe("delivery outbox", () => {
     expect(send).toHaveBeenLastCalledWith({ sweep: true, correlationId: "failed-sweep-continuation" });
     expect(ack).not.toHaveBeenCalled();
     expect(retry).toHaveBeenCalledWith({ delaySeconds: 2 });
+    expect(
+      writeDataPoint.mock.calls.map(([point]) => point).find((point) => point.indexes[0] === "queue.delivery")
+        ?.blobs[3],
+    ).toBe("failure");
     expectStructuredLog(log, "outbox.sweep_continuation.enqueue_failed", {
       errorName: failure.name,
       errorMessage: failure.message,
@@ -4201,6 +4278,32 @@ describe("delivery outbox", () => {
 
     expect(ack).not.toHaveBeenCalled();
     expect(retry).toHaveBeenCalledWith({ delaySeconds: 8 });
+
+    const writeDataPoint = vi.fn();
+    const bindings = bindingsWith({ OBSERVABILITY: { writeDataPoint } });
+    await worker.queue(
+      {
+        queue: "delivery",
+        messages: [
+          {
+            id: "contended-sweep-wrapper",
+            timestamp: new Date(),
+            body: { sweep: true },
+            attempts: 3,
+            ack: vi.fn(),
+            retry: vi.fn(),
+          },
+        ],
+        metadata: { metrics: { backlogCount: 1, backlogBytes: 0 } },
+        ackAll: vi.fn(),
+        retryAll: vi.fn(),
+      } satisfies MessageBatch<DeliveryQueueMessage>,
+      bindings,
+    );
+    expect(
+      writeDataPoint.mock.calls.map(([point]) => point).find((point) => point.indexes[0] === "queue.delivery")
+        ?.blobs[3],
+    ).toBe("retried");
   });
 
   it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {
