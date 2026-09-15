@@ -14,7 +14,7 @@
     "test-results/**",
     "reviews_triage/**",
     "triage_decisions.db",
-    "Realtime Notes Parity Report.htm",
+    "NoteFlare Parity Report.htm",
     "worker-configuration.d.ts"
   ]
 }

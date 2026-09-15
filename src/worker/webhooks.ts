@@ -276,7 +276,7 @@ export async function sendWebhookVerification(env: Env, subscriptionId: string) 
     const response = await traced(tracing, "notes.integration.webhook", { "notes.operation": "verification" }, () => {
       return fetch(destination, {
         method: "POST",
-        headers: { "content-type": "application/json", "user-agent": "Realtime-Notes-Webhook/1.0" },
+        headers: { "content-type": "application/json", "user-agent": "NoteFlare-Webhook/1.0" },
         body: JSON.stringify({ verification_token: token }),
         redirect: "manual",
         signal: controller.signal,
@@ -604,7 +604,7 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "user-agent": "Realtime-Notes-Webhook/1.0",
+          "user-agent": "NoteFlare-Webhook/1.0",
           "x-notion-signature": signature,
         },
         body: payload,

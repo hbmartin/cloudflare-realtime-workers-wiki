@@ -9,7 +9,8 @@ external OTLP backend, or an in-app dashboard.
 Production collects 100% of structured application and invocation logs and samples traces at 5%. Local and
 E2E runs collect all traces so Local Explorer can show a complete request. Analytics Engine points are
 non-blocking and retained by Cloudflare for three months. The production dataset is
-`cloudflare_realtime_notes_production`.
+`cloudflare_realtime_notes_production`; that pre-NoteFlare identifier is retained so existing telemetry
+history and dashboards continue to work.
 
 Every response, including a WebSocket handshake, carries `X-Request-Id`. When version metadata is available it
 also carries `X-Worker-Version`; `GET /api/health` exposes the same deployment ID. The Notion-compatible API

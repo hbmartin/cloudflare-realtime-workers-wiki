@@ -31,14 +31,11 @@ body,
 }
 
 .brand-mark {
-  display: inline-grid;
-  place-items: center;
+  display: block;
   width: 36px;
   height: 36px;
   border-radius: 10px;
   background: #25231f;
-  color: white;
-  font-family: Georgia, serif;
-  font-size: 23px;
+  object-fit: cover;
   box-shadow: 0 4px 16px #25231f29;
 }

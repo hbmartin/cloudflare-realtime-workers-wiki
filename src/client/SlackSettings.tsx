@@ -75,7 +75,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
     }
     void api("/api/slack/link", { method: "POST", body: json({ token }) })
       .then(() => {
-        setNotice("Your Notes and Slack accounts are linked.");
+        setNotice("Your NoteFlare and Slack accounts are linked.");
         removeLinkToken();
         return load();
       })

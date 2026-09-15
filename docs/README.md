@@ -1,6 +1,6 @@
 # Operator documentation
 
-Cloudflare Realtime Notes is a single-workspace, self-hosted collaborative wiki running entirely on
+NoteFlare is a single-workspace, self-hosted collaborative wiki running entirely on
 Cloudflare Workers Paid, D1, R2, and two SQLite-backed Durable Object classes.
 
 ## I need to…

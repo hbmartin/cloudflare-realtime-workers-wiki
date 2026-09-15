@@ -114,7 +114,7 @@ describe("protection recovery flows", () => {
   it("offers password-protected resumption only when the server allows it", async () => {
     const recovery = { ...status, state: "recovery_required" as const, recoveryCanResume: true };
     vi.mocked(api).mockImplementation(async (path) =>
-      path === "/api/security/setup-totp" ? { totpURI: "otpauth://totp/Notes?secret=EXPIRED" } : recovery,
+      path === "/api/security/setup-totp" ? { totpURI: "otpauth://totp/NoteFlare?secret=EXPIRED" } : recovery,
     );
     render(<SecurityScreen initialStatus={recovery} />);
     const setup = screen.getByLabelText("Account password");

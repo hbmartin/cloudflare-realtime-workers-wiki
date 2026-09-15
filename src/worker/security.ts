@@ -429,7 +429,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
           .run();
         await resetAttempts(env, id.userId, id.security.account.generation);
         const user = await ctx.context.internalAdapter.findUserById(id.userId);
-        return ctx.json({ totpURI: createOTP(secret, { digits: 6, period: 30 }).url("Realtime Notes", user!.email) });
+        return ctx.json({ totpURI: createOTP(secret, { digits: 6, period: 30 }).url("NoteFlare", user!.email) });
       }),
       confirmTotp: post("/security/confirm-totp", async (ctx) => {
         const id = await requireEnrollment(ctx, env);

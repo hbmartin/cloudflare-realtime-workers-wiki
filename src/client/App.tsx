@@ -645,7 +645,7 @@ export function App() {
         .then((next) => {
           if (next) commitState(transition, next);
         })
-        .catch((cause) => commitState(transition, startupError(cause, "Unable to reach Realtime Notes. Try again.")));
+        .catch((cause) => commitState(transition, startupError(cause, "Unable to reach NoteFlare. Try again.")));
     },
     [commitState],
   );
@@ -683,7 +683,7 @@ export function App() {
     return (
       <AuthLayout
         eyebrow={state.kind === "service" ? "Connection problem" : "Unable to continue"}
-        title={state.kind === "service" ? "Realtime Notes is unavailable" : "Realtime Notes couldn’t open"}
+        title={state.kind === "service" ? "NoteFlare is unavailable" : "NoteFlare couldn’t open"}
         copy={
           state.kind === "service"
             ? "We couldn’t reach the service. Check your connection and try again. If the problem continues, the service may be unavailable."
@@ -759,7 +759,8 @@ function AuthLayout({
     <main className="auth-layout">
       <section className="auth-story">
         <div className="brand">
-          <span className="brand-mark">N</span> Notes
+          <img className="brand-mark" src="/logo.jpg" alt="" aria-hidden="true" />
+          <span>NoteFlare</span>
         </div>
         <div>
           <p className="eyebrow">{eyebrow}</p>
@@ -797,7 +798,7 @@ function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
       copy="Create the owner account and one private workspace. New members can only join with an invite."
     >
       <form className="auth-form" onSubmit={submit}>
-        <h2>Set up Notes</h2>
+        <h2>Set up NoteFlare</h2>
         <label>
           Workspace name
           <input name="workspaceName" required maxLength={100} autoFocus />

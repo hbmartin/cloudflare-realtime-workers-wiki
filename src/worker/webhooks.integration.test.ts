@@ -157,16 +157,19 @@ describe("Notion-compatible webhooks", () => {
       .first<{ id: string }>();
     let receivedBody = "";
     let receivedSignature = "";
+    let receivedUserAgent = "";
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_url: string, init?: RequestInit) => {
         receivedBody = String(init?.body ?? "");
         receivedSignature = new Headers(init?.headers).get("x-notion-signature") ?? "";
+        receivedUserAgent = new Headers(init?.headers).get("user-agent") ?? "";
         return new Response("accepted", { status: 202, headers: { "x-request-id": "receiver-1" } });
       }),
     );
 
     await deliverWebhook(env, delivery!.id);
+    expect(receivedUserAgent).toBe("NoteFlare-Webhook/1.0");
     expect(
       await verifyWebhookSignature({ body: receivedBody, signature: receivedSignature, verificationToken: token }),
     ).toBe(true);

@@ -115,7 +115,7 @@ describe("SlackSettings", () => {
       throw new Error(`Unexpected request: ${path}`);
     });
     render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
-    expect(await screen.findByText("Your Notes and Slack accounts are linked.")).toBeInTheDocument();
+    expect(await screen.findByText("Your NoteFlare and Slack accounts are linked.")).toBeInTheDocument();
     // The token is single use, so a second POST would burn it and 4xx the retry.
     const linkCalls = vi
       .mocked(api)

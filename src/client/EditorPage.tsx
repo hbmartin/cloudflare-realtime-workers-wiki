@@ -539,7 +539,7 @@ function CollaborativeEditor({
           title: item.label,
           subtext: item.description,
           aliases: [item.type],
-          group: "Notes blocks",
+          group: "NoteFlare blocks",
           icon: <span>{item.icon}</span>,
           onItemClick: () => {
             if (item.type === "columnList") {
@@ -559,7 +559,7 @@ function CollaborativeEditor({
           title: "Sub-page",
           subtext: "Create a real child page and insert a link",
           aliases: ["child page", "page inside"],
-          group: "Notes blocks",
+          group: "NoteFlare blocks",
           icon: <span>⊞</span>,
           onItemClick: () => {
             void (async () => {
@@ -596,7 +596,7 @@ function CollaborativeEditor({
           title: "Inline math",
           subtext: "Insert a KaTeX formula in this line",
           aliases: ["formula", "latex"],
-          group: "Notes blocks",
+          group: "NoteFlare blocks",
           icon: <span>𝑥</span>,
           onItemClick: () =>
             editor.insertInlineContent([{ type: "inlineMath", props: { formula: "x" } }], {

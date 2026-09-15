@@ -38,6 +38,8 @@ For local development these live in `.dev.vars`; see `.dev.vars.example`.
 ## Bindings
 
 Declared in `wrangler.jsonc`, typed in `src/worker/env.ts`.
+The existing `cloudflare-realtime-notes` resource names are intentionally retained so the NoteFlare
+rebrand does not replace production data or deployment infrastructure.
 
 | Binding                   | Kind           | Target                                                                    |
 | ------------------------- | -------------- | ------------------------------------------------------------------------- |

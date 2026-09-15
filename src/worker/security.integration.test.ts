@@ -160,6 +160,7 @@ describe("mandatory account protection", () => {
     expect(await env.DB.prepare("SELECT secret FROM twoFactor").first()).toEqual(original);
     expect((await request(cookie, "/api/security/confirm-totp", { code: "invalid" })).status).toBe(403);
     const { totpURI } = await setup.json<{ totpURI: string }>();
+    expect(decodeURIComponent(new URL(totpURI).pathname)).toContain("NoteFlare");
     const changed = await request(cookie, "/api/security/confirm-totp", { code: await otpFromUri(totpURI) });
     expect(changed.status).toBe(200);
     expect(await env.DB.prepare("SELECT secret FROM twoFactor").first()).not.toEqual(original);

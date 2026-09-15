@@ -13,7 +13,7 @@ export function createAuth(env: Env, allowRegistration = false) {
     database: env.DB,
     secret: env.BETTER_AUTH_SECRET,
     baseURL: env.BETTER_AUTH_URL,
-    appName: "Realtime Notes",
+    appName: "NoteFlare",
     advanced: { ipAddress: { ipAddressHeaders: ["cf-connecting-ip"] } },
     rateLimit: {
       enabled: true,
@@ -30,7 +30,7 @@ export function createAuth(env: Env, allowRegistration = false) {
       twoFactor(),
       passkey({
         rpID: new URL(env.BETTER_AUTH_URL).hostname,
-        rpName: "Realtime Notes",
+        rpName: "NoteFlare",
         origin: new URL(env.BETTER_AUTH_URL).origin,
         authenticatorSelection: { residentKey: "required", userVerification: "required" },
         registration: {

@@ -84,21 +84,10 @@ select:focus-visible {
   justify-content: space-between;
   color: white;
   background:
-    radial-gradient(circle at 80% 15%, #7776e6 0, transparent 30%),
-    linear-gradient(150deg, #22213a, #33315e 58%, #4f4e8e);
+    linear-gradient(150deg, #22213ae6, #33315ecf 58%, #4f4e8eb8),
+    url("/logo.jpg") center / cover;
   overflow: hidden;
   position: relative;
-}
-.auth-story::after {
-  content: "";
-  position: absolute;
-  width: 420px;
-  height: 420px;
-  border: 1px solid #ffffff22;
-  border-radius: 42% 58% 64% 36%;
-  right: -150px;
-  bottom: -190px;
-  transform: rotate(20deg);
 }
 .brand {
   display: flex;
@@ -109,7 +98,7 @@ select:focus-visible {
 }
 .brand .brand-mark {
   background: white;
-  color: #33315e;
+  border: 1px solid #ffffff66;
 }
 .auth-story h1 {
   font-family: Georgia, "Times New Roman", serif;

@@ -1,10 +1,13 @@
 # Deployment
 
-Cloudflare Realtime Notes targets Workers Paid for production capacity. The application uses Workers
+NoteFlare targets Workers Paid for production capacity. The application uses Workers
 Static Assets, D1, R2, and SQLite-backed Durable Objects.
 
 Read [Configuration](CONFIGURATION.md) alongside this document; it is the reference for every value
 named here.
+
+Existing installations intentionally retain their `cloudflare-realtime-notes` Worker and resource
+identifiers. These deployment names are compatibility details; the product presented to users is NoteFlare.
 
 ## 0. Prerequisites
 
