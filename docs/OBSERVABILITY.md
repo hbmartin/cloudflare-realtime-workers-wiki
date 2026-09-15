@@ -60,10 +60,11 @@ and lifecycle summaries.
 
 Never add cookies, authorization headers, credentials, email addresses, request bodies, document content or
 titles, Slack/webhook payloads, or URL query strings to telemetry. The logger redacts sensitive keys, known
-credential formats, email-shaped values, Basic values in authorization contexts or with token-shaped text, Bearer
-values, and query strings, including nested diagnostic values. Redaction runs before log-length limits. A bare
-all-lowercase malformed Basic value in generic free text is indistinguishable from ordinary prose and may remain;
-never put authorization headers in diagnostic text.
+credential formats, email-shaped values, Basic values in authorization headers, Bearer
+values, and query strings, including nested diagnostic values. Raw fields are bounded before scanning, and
+recognizable secrets at a truncation boundary are scrubbed. Basic values are redacted only after an
+`Authorization:` or `Proxy-Authorization:` label; free-text Basic credentials can remain, so never put
+authorization headers or credentials in diagnostic text.
 Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to
 Analytics Engine. HTTP metric operations use Hono's registered route template, fixed Party templates, or
 `/unmatched`; they never derive a route value from request path segments.

@@ -694,6 +694,34 @@ describe("Worker integration", () => {
     });
   });
 
+  it("does not write cron rows during routine readiness probes", async () => {
+    let cronWrites = 0;
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property !== "prepare") return Reflect.get(target, property, receiver);
+        return (query: string) => {
+          if (query.includes("INSERT INTO observability_task_runs")) cronWrites++;
+          return target.prepare(query);
+        };
+      },
+    });
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const response = await worker.fetch(
+      new Request("http://example.test/api/health/ready", {
+        headers: { "x-observability-token": "worker-observability-probe-token" },
+      }),
+      bindings,
+      createExecutionContext(),
+    );
+    expect(response.status).toBe(200);
+    expect(cronWrites).toBe(0);
+  });
+
   it("anchors new-task grace at its first readiness probe across deployments", async () => {
     const now = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
@@ -1061,6 +1089,8 @@ describe("Worker integration", () => {
       "/api/pages/abc/diagram-thumbnail.svg",
       `/share/${shareKey}/diagram-thumbnails/abc.svg`,
       "/api/no-such-route/short-id.svg",
+      "/api/auth/no-such-route",
+      "/api/security/no-such-route",
       "/parties/document/abc~1",
       "/parties/workspace-events/abc",
     ];
@@ -1076,6 +1106,8 @@ describe("Worker integration", () => {
       "/api/pages/:id/diagram-thumbnail.svg",
       "/share/:key/diagram-thumbnails/:fileName",
       "/unmatched",
+      "/api/auth/*",
+      "/api/security/*",
       "/parties/document/:room",
       "/parties/workspace-events/:workspace",
     ]);
@@ -1185,7 +1217,7 @@ describe("Worker integration", () => {
       get(target, property, receiver) {
         if (property !== "prepare") return Reflect.get(target, property, receiver);
         return (query: string) => {
-          if (/\(task_name, last_started_at\)\s*VALUES/.test(query)) {
+          if (query.includes("INSERT INTO observability_task_runs (task_name, last_started_at, run_id")) {
             return { bind: () => ({ run: () => Promise.reject(new Error("start write unavailable")) }) };
           }
           return target.prepare(query);
@@ -1222,15 +1254,15 @@ describe("Worker integration", () => {
     }
   });
 
-  it("records failed-start outcomes without replacing a newer same-time result", async () => {
+  it("records failed-start results only when the start time is newer", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(200);
     const taskNames = ["test_fallback_failure", "test_fallback_success", "test_fallback_tie"] as const;
     await env.DB.batch(
       taskNames.map((taskName) =>
         env.DB.prepare(
           `INSERT INTO observability_task_runs
-        (task_name, last_started_at, execution_token, first_observed_at, last_duration_ms, last_error)
-        VALUES (?, ?, 100, 100, 5, 'older failure')`,
+            (task_name, last_started_at, execution_token, first_observed_at, last_duration_ms, last_error)
+            VALUES (?, ?, 100, 100, 5, 'older failure')`,
         ).bind(taskName, taskName === "test_fallback_tie" ? 200 : 100),
       ),
     );
@@ -1238,8 +1270,8 @@ describe("Worker integration", () => {
       get(target, property, receiver) {
         if (property !== "prepare") return Reflect.get(target, property, receiver);
         return (query: string) =>
-          query.includes("RETURNING execution_token")
-            ? { bind: () => ({ first: () => Promise.reject(new Error("start write unavailable")) }) }
+          query.includes("INSERT INTO observability_task_runs (task_name, last_started_at, run_id")
+            ? { bind: () => ({ run: () => Promise.reject(new Error("start write unavailable")) }) }
             : target.prepare(query);
       },
     });
@@ -1269,33 +1301,36 @@ describe("Worker integration", () => {
           },
         ]),
       ).rejects.toThrow("Scheduled tasks failed");
-      const rows = await env.DB.prepare(`SELECT task_name, last_started_at, execution_token,
+      const rows = await env.DB.prepare(`SELECT task_name, last_started_at, run_id, execution_token,
         last_succeeded_at, last_failed_at, last_duration_ms, last_error
         FROM observability_task_runs WHERE task_name IN (?, ?, ?) ORDER BY task_name`)
         .bind(...taskNames)
         .all();
       expect(rows.results).toEqual([
-        {
+        expect.objectContaining({
           task_name: taskNames[0],
           last_started_at: 200,
-          execution_token: 100,
+          run_id: expect.any(String),
+          execution_token: null,
           last_succeeded_at: null,
           last_failed_at: 200,
           last_duration_ms: 0,
           last_error: "new failure",
-        },
-        {
+        }),
+        expect.objectContaining({
           task_name: taskNames[1],
           last_started_at: 200,
-          execution_token: 100,
+          run_id: expect.any(String),
+          execution_token: null,
           last_succeeded_at: 200,
           last_failed_at: null,
           last_duration_ms: 0,
           last_error: null,
-        },
+        }),
         {
           task_name: taskNames[2],
           last_started_at: 200,
+          run_id: null,
           execution_token: 100,
           last_succeeded_at: null,
           last_failed_at: 200,
@@ -1310,6 +1345,55 @@ describe("Worker integration", () => {
       await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name IN (?, ?, ?)`)
         .bind(...taskNames)
         .run();
+    }
+  });
+
+  it("records a result when the start committed but its response was lost", async () => {
+    const taskName = "test_lost_start_response";
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property !== "prepare") return Reflect.get(target, property, receiver);
+        return (query: string) => {
+          if (!query.includes("INSERT INTO observability_task_runs (task_name, last_started_at, run_id"))
+            return target.prepare(query);
+          const statement = target.prepare(query);
+          return {
+            bind: (...values: unknown[]) => {
+              const bound = statement.bind(...values);
+              return {
+                run: async () => {
+                  await bound.run();
+                  throw new Error("start response lost");
+                },
+              };
+            },
+          };
+        };
+      },
+    });
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await executeScheduledTasks(bindings, createExecutionContext(), [{ name: taskName, run: async () => undefined }]);
+      expect(
+        await env.DB.prepare(`SELECT run_id, execution_token, last_succeeded_at, last_error
+        FROM observability_task_runs WHERE task_name = ?`)
+          .bind(taskName)
+          .first(),
+      ).toMatchObject({
+        run_id: expect.any(String),
+        execution_token: null,
+        last_succeeded_at: expect.any(Number),
+        last_error: null,
+      });
+    } finally {
+      warning.mockRestore();
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
     }
   });
 
@@ -1363,6 +1447,156 @@ describe("Worker integration", () => {
       now.mockRestore();
       logged.mockRestore();
       releaseOlder();
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
+    }
+  });
+
+  it("keeps a newer failed-start error when an older run later succeeds", async () => {
+    const taskName = "test_failed_newer_start";
+    let releaseOlder!: () => void;
+    let markOlderStarted!: () => void;
+    const olderStarted = new Promise<void>((resolve) => {
+      markOlderStarted = resolve;
+    });
+    const olderBlocked = new Promise<void>((resolve) => {
+      releaseOlder = resolve;
+    });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property !== "prepare") return Reflect.get(target, property, receiver);
+        return (query: string) =>
+          query.includes("INSERT INTO observability_task_runs (task_name, last_started_at, run_id")
+            ? { bind: () => ({ run: () => Promise.reject(new Error("newer start unavailable")) }) }
+            : target.prepare(query);
+      },
+    });
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    try {
+      const older = executeScheduledTasks(env, createExecutionContext(), [
+        {
+          name: taskName,
+          run: async () => {
+            markOlderStarted();
+            await olderBlocked;
+          },
+        },
+      ]);
+      await olderStarted;
+      clock.mockReturnValue(2_000);
+      await expect(
+        executeScheduledTasks(bindings, createExecutionContext(), [
+          {
+            name: taskName,
+            run: async () => {
+              throw new Error("newer error");
+            },
+          },
+        ]),
+      ).rejects.toThrow("Scheduled tasks failed");
+      clock.mockReturnValue(3_000);
+      releaseOlder();
+      await older;
+      expect(
+        await env.DB.prepare(`SELECT last_started_at, last_succeeded_at, last_failed_at,
+        last_error FROM observability_task_runs WHERE task_name = ?`)
+          .bind(taskName)
+          .first(),
+      ).toEqual({
+        last_started_at: 2_000,
+        last_succeeded_at: 3_000,
+        last_failed_at: 2_000,
+        last_error: "newer error",
+      });
+    } finally {
+      releaseOlder();
+      clock.mockRestore();
+      logged.mockRestore();
+      warning.mockRestore();
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
+    }
+  });
+
+  it("does not let a delayed older start move last_started_at backwards", async () => {
+    const taskName = "test_delayed_start";
+    let releaseStart!: () => void;
+    let markStartPending!: () => void;
+    const startPending = new Promise<void>((resolve) => {
+      markStartPending = resolve;
+    });
+    const startBlocked = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property !== "prepare") return Reflect.get(target, property, receiver);
+        return (query: string) => {
+          if (!query.includes("INSERT INTO observability_task_runs (task_name, last_started_at, run_id"))
+            return target.prepare(query);
+          const statement = target.prepare(query);
+          return {
+            bind: (...values: unknown[]) => {
+              const bound = statement.bind(...values);
+              return {
+                run: async () => {
+                  markStartPending();
+                  await startBlocked;
+                  return bound.run();
+                },
+              };
+            },
+          };
+        };
+      },
+    });
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    try {
+      const older = executeScheduledTasks(bindings, createExecutionContext(), [
+        {
+          name: taskName,
+          run: async () => undefined,
+        },
+      ]);
+      await startPending;
+      clock.mockReturnValue(2_000);
+      await executeScheduledTasks(env, createExecutionContext(), [
+        {
+          name: taskName,
+          run: async () => undefined,
+        },
+      ]);
+      const newer = await env.DB.prepare(`SELECT run_id FROM observability_task_runs
+        WHERE task_name = ?`)
+        .bind(taskName)
+        .first<{ run_id: string }>();
+      releaseStart();
+      await older;
+      expect(
+        await env.DB.prepare(`SELECT last_started_at, run_id, last_succeeded_at
+        FROM observability_task_runs WHERE task_name = ?`)
+          .bind(taskName)
+          .first(),
+      ).toEqual({
+        last_started_at: 2_000,
+        run_id: newer?.run_id,
+        last_succeeded_at: 2_000,
+      });
+    } finally {
+      releaseStart();
+      clock.mockRestore();
       await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
     }
   });
@@ -1423,7 +1657,7 @@ describe("Worker integration", () => {
     }
   });
 
-  it("uses distinct execution tokens for starts in the same millisecond", async () => {
+  it("uses distinct run IDs for starts in the same millisecond", async () => {
     const taskName = "test_same_millisecond";
     let releaseOlder!: () => void;
     let markOlderStarted!: () => void;
@@ -1451,13 +1685,14 @@ describe("Worker integration", () => {
       releaseOlder();
       await expect(older).rejects.toThrow("Scheduled tasks failed");
       await expect(
-        env.DB.prepare(`SELECT last_started_at, execution_token, last_succeeded_at, last_failed_at, last_error
+        env.DB.prepare(`SELECT last_started_at, run_id, execution_token, last_succeeded_at, last_failed_at, last_error
         FROM observability_task_runs WHERE task_name = ?`)
           .bind(taskName)
           .first(),
       ).resolves.toEqual({
         last_started_at: 1_000,
-        execution_token: 2,
+        run_id: expect.any(String),
+        execution_token: null,
         last_succeeded_at: 1_000,
         last_failed_at: 1_000,
         last_error: null,
@@ -1478,7 +1713,7 @@ describe("Worker integration", () => {
       get(target, property, receiver) {
         if (property !== "prepare") return Reflect.get(target, property, receiver);
         return (query: string) => {
-          if (query.includes("last_succeeded_at = MAX")) {
+          if (query.includes("last_succeeded_at = CASE")) {
             return { bind: () => ({ run: () => Promise.reject(stateError) }) };
           }
           return target.prepare(query);
@@ -1518,7 +1753,7 @@ describe("Worker integration", () => {
       get(target, property, receiver) {
         if (property !== "prepare") return Reflect.get(target, property, receiver);
         return (query: string) => {
-          if (query.includes("last_failed_at = MAX")) {
+          if (query.includes("last_failed_at = CASE")) {
             return { bind: () => ({ run: () => Promise.reject(stateError) }) };
           }
           return target.prepare(query);
