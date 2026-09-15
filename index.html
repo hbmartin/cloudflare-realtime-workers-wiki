@@ -4,7 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f7f5f0" />
-    <meta name="description" content="A self-hosted realtime team wiki on Cloudflare." />
+    <meta name="application-name" content="NoteFlare" />
+    <meta name="description" content="NoteFlare is a self-hosted realtime team wiki on Cloudflare." />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" href="/favicon-32x32.png" sizes="32x32" />
+    <link rel="icon" type="image/png" href="/favicon-16x16.png" sizes="16x16" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
     <script>
       try {
         const saved = localStorage.getItem("notes:color-scheme") || "auto";
@@ -12,7 +17,7 @@
         document.documentElement.dataset.mantineColorScheme = dark ? "dark" : "light";
       } catch {}
     </script>
-    <title>Notes</title>
+    <title>NoteFlare</title>
   </head>
   <body>
     <div id="root"></div>

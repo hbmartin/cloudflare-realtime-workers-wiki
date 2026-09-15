@@ -258,7 +258,7 @@ describe("Slack security and integration", () => {
     });
   });
 
-  it("links accounts once and keeps slash search scoped to the linked Notes user", async () => {
+  it("links accounts once and keeps slash search scoped to the linked NoteFlare user", async () => {
     const installed = await bootstrap();
     const viewer = await inviteViewer(installed.cookie);
     await installSlack(installed.member);
@@ -305,7 +305,7 @@ describe("Slack security and integration", () => {
       slackEnv(),
       new URLSearchParams("team_id=T123&user_id=UVIEWER&text=Orchid"),
     );
-    expect(viewerResult.text).toContain("No Notes pages matched");
+    expect(viewerResult.text).toContain("No NoteFlare pages matched");
   });
 
   it("suppresses private unfurls unless the linked user has access and the channel is explicitly mapped", async () => {
@@ -667,9 +667,12 @@ describe("Slack security and integration", () => {
       ),
     ]);
     const channels: string[] = [];
+    const payloads: Array<Record<string, unknown>> = [];
     let remainingRateLimits = 1;
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      channels.push(JSON.parse(String(init?.body)).channel as string);
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      payloads.push(payload);
+      channels.push(payload.channel as string);
       const authorization = new Headers(init?.headers).get("authorization");
       return authorization === "Bearer xoxb-test-bot-token" && remainingRateLimits-- > 0
         ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
@@ -681,6 +684,10 @@ describe("Slack security and integration", () => {
     await sendDueSlackChannelDigests(slackEnv(), timestamp);
 
     expect(channels).toEqual(["CRATEA", "CRATEC"]);
+    expect(payloads[0]).toMatchObject({
+      text: "1 NoteFlare update",
+      blocks: [{ text: { text: expect.stringContaining("Your NoteFlare digest") } }],
+    });
     expect(
       await env.DB.prepare(
         `SELECT id, delivered_at IS NOT NULL delivered FROM slack_channel_events

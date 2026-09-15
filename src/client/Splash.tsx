@@ -1,11 +1,9 @@
 export function LoadingSplash() {
   return (
     <main className="startup-splash">
-      <div className="brand-mark" aria-hidden="true">
-        N
-      </div>
+      <img className="brand-mark" src="/logo.jpg" alt="" aria-hidden="true" />
       <p aria-live="polite" aria-atomic="true">
-        Opening Notes…
+        Opening NoteFlare…
       </p>
     </main>
   );

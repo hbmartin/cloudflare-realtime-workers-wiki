@@ -76,12 +76,22 @@ describe("worker observability", () => {
     expect(writeDataPoint).toHaveBeenCalledWith({
       indexes: ["http.request"],
       blobs: [OBSERVABILITY_SCHEMA, "http", "/api/pages/:id", "success", "200", "", "version-2"],
-      doubles: [12, 34, 0, 0, 0, 0],
+      doubles: [12, 34, 0, 0, 0, 0, 1],
     });
+
+    writeDataPoint.mockClear();
+    recordMetric(env, { event: "http.request", component: "http" });
+    expect(writeDataPoint.mock.calls[0]?.[0].doubles).toEqual([0, 0, 0, 0, 0, 0, 0]);
+
+    writeDataPoint.mockClear();
+    recordMetric(env, { event: "http.request", component: "http", bytes: 0 });
+    expect(writeDataPoint.mock.calls[0]?.[0].doubles).toEqual([0, 0, 0, 0, 0, 0, 1]);
   });
 
   it("normalizes opaque route identifiers", () => {
     expect(normalizedRoute("/api/pages/12345678901234567890/attachments")).toBe("/api/pages/:id/attachments");
+    expect(normalizedRoute("/api/pages/abcdefghijklmnopqrs1/attachments")).toBe("/api/pages/:id/attachments");
+    expect(normalizedRoute("/api/notification-preferences")).toBe("/api/notification-preferences");
     expect(normalizedRoute("/parties/document/page~1")).toBe("/parties/document/:room");
   });
 
@@ -103,14 +113,14 @@ describe("worker observability", () => {
       logger.error(
         "test.hostile",
         "test",
-        "Bearer abc crn_thismustberedacted xoxb-thismustberedacted secret_thismustberedacted person@example.com https://example.test/path?secret=yes",
+        "Bearer abc Basic Zm9vOmJhcg== crn_thismustberedacted xoxb-thismustberedacted secret_thismustberedacted person@example.com https://example.test/path?secret=yes",
         { nested: { authorization: "Basic credential", value: "person@example.com" }, hostile },
         hostile,
       ),
     ).not.toThrow();
     const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(record.message).toBe(
-      "Bearer [redacted] [redacted-secret] [redacted-secret] [redacted-secret] [redacted-email] https://example.test/path",
+      "Bearer [redacted] Basic [redacted] [redacted-secret] [redacted-secret] [redacted-secret] [redacted-email] https://example.test/path",
     );
     expect(record.nested).toBe('{"authorization":"[redacted]","value":"[redacted-email]"}');
     expect(record.hostile).toBe('"[object omitted]"');
@@ -120,7 +130,7 @@ describe("worker observability", () => {
   it("redacts invocation context and preserves the stack-specific size limit", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const error = new Error("failed");
-    error.stack = `secret_thismustberedacted ${"x".repeat(LOG_STACK_LIMIT + 1_000)}`;
+    error.stack = `Basic Zm9vOmJhcg== secret_thismustberedacted ${"x".repeat(LOG_STACK_LIMIT + 1_000)}`;
 
     withObservabilityContext({} as Env, { trigger: "queue", correlationId: "secret_thismustberedacted" }, () =>
       logger.error("test.stack", "test", "failed", {}, error),
@@ -131,6 +141,7 @@ describe("worker observability", () => {
     expect(String(record.errorStack).length).toBeGreaterThan(2_000);
     expect(String(record.errorStack).length).toBeLessThanOrEqual(LOG_STACK_LIMIT);
     expect(record.errorStack).toMatch(/…\[truncated\]$/);
+    expect(record.errorStack).toContain("Basic [redacted]");
     expect(record.errorStack).not.toContain("secret_thismustberedacted");
     output.mockRestore();
   });

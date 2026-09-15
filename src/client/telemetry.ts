@@ -13,6 +13,11 @@ const CLIENT_ERROR_EVENTS = [
 
 export type ClientErrorEvent = (typeof CLIENT_ERROR_EVENTS)[number];
 
+export interface ClientErrorContext {
+  requestId?: string | null;
+  release?: string | null;
+}
+
 interface FirstPartySource {
   path: string;
   line: number;
@@ -91,11 +96,7 @@ export function observeWorkerResponse(headers: Headers) {
   latestRelease = opaqueIdentifier(headers.get("x-worker-version")) ?? latestRelease;
 }
 
-export async function reportClientError(
-  event: ClientErrorEvent,
-  error: unknown,
-  context: { requestId?: string | null } = {},
-) {
+export async function reportClientError(event: ClientErrorEvent, error: unknown, context: ClientErrorContext = {}) {
   if (!installed) return;
   const timestamp = Date.now();
   reportTimes = reportTimes.filter((sentAt) => sentAt > timestamp - WINDOW_MS);
@@ -108,19 +109,24 @@ export async function reportClientError(
       const fingerprint = await sha256Hex(`${event}\n${identity.name}\n${identity.message}\n${identity.stack}`);
       const sentAt = Date.now();
       const key = `${event}:${fingerprint}`;
-      if ((sentFingerprints.get(key) ?? 0) > sentAt - DEDUPLICATION_MS) return;
+      const deduplicationCutoff = sentAt - DEDUPLICATION_MS;
+      for (const [sentKey, fingerprintSentAt] of sentFingerprints) {
+        if (fingerprintSentAt <= deduplicationCutoff) sentFingerprints.delete(sentKey);
+      }
+      if ((sentFingerprints.get(key) ?? 0) > deduplicationCutoff) return;
       reportTimes = reportTimes.filter((time) => time > sentAt - WINDOW_MS);
       if (reportTimes.length >= MAX_REPORTS_PER_WINDOW) return;
 
       const source = firstPartySource(identity.stack);
-      const requestId = opaqueIdentifier(context.requestId ?? latestRequestId);
+      const requestId = opaqueIdentifier(Object.hasOwn(context, "requestId") ? context.requestId : latestRequestId);
+      const release = opaqueIdentifier(Object.hasOwn(context, "release") ? context.release : latestRelease);
       const payload = {
         event,
         errorName: identity.name,
         fingerprint,
         ...(source ? { source } : {}),
         ...(requestId ? { requestId } : {}),
-        ...(latestRelease ? { release: latestRelease } : {}),
+        ...(release ? { release } : {}),
         online: navigator.onLine,
         visibility: document.visibilityState,
       };

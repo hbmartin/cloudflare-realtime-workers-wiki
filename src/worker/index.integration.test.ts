@@ -842,6 +842,39 @@ describe("Worker integration", () => {
     }
   });
 
+  it("distinguishes unknown response bytes from a known zero Content-Length", async () => {
+    const writeDataPoint = vi.fn();
+    const assetFetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("unknown"))
+      .mockResolvedValueOnce(new Response(null, { headers: { "content-length": "0" } }))
+      .mockResolvedValueOnce(new Response("known", { headers: { "content-length": "5" } }))
+      .mockResolvedValueOnce(new Response("invalid", { headers: { "content-length": "invalid" } }))
+      .mockResolvedValueOnce(new Response("empty", { headers: { "content-length": "" } }));
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "ASSETS") return { fetch: assetFetch };
+        if (property === "OBSERVABILITY") return { writeDataPoint };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    for (const path of ["unknown", "zero", "known", "invalid", "empty"]) {
+      await worker.fetch(new Request(`http://example.test/${path}`), bindings, createExecutionContext());
+    }
+
+    const metrics = writeDataPoint.mock.calls
+      .map(([point]) => point)
+      .filter((point) => point.indexes[0] === "http.request");
+    expect(metrics.map((point) => [point.doubles[1], point.doubles[6]])).toEqual([
+      [0, 0],
+      [0, 1],
+      [5, 1],
+      [0, 0],
+      [0, 0],
+    ]);
+  });
+
   it("waits for every scheduled task, records outcomes, and rejects an aggregate failure", async () => {
     const completed: string[] = [];
     const context = createExecutionContext();
@@ -896,6 +929,103 @@ describe("Worker integration", () => {
     }
   });
 
+  it("inserts a scheduled result when its start state could not be recorded", async () => {
+    const taskName = "test_missing_start";
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property !== "prepare") return Reflect.get(target, property, receiver);
+        return (query: string) => {
+          if (/\(task_name, last_started_at\)\s*VALUES/.test(query)) {
+            return { bind: () => ({ run: () => Promise.reject(new Error("start write unavailable")) }) };
+          }
+          return target.prepare(query);
+        };
+      },
+    });
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await executeScheduledTasks(bindings, createExecutionContext(), [{ name: taskName, run: async () => undefined }]);
+
+      await expect(
+        env.DB.prepare(
+          `SELECT task_name, last_started_at, last_succeeded_at, last_failed_at, last_error
+             FROM observability_task_runs WHERE task_name = ?`,
+        )
+          .bind(taskName)
+          .first(),
+      ).resolves.toMatchObject({
+        task_name: taskName,
+        last_started_at: expect.any(Number),
+        last_succeeded_at: expect.any(Number),
+        last_failed_at: null,
+        last_error: null,
+      });
+    } finally {
+      warning.mockRestore();
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
+    }
+  });
+
+  it("prevents an older overlapping scheduled execution from overwriting newer state", async () => {
+    const taskName = "test_overlap";
+    const olderFailure = new Error("older execution failed");
+    let releaseOlder!: () => void;
+    let markOlderStarted!: () => void;
+    const olderStarted = new Promise<void>((resolve) => {
+      markOlderStarted = resolve;
+    });
+    const olderBlocked = new Promise<void>((resolve) => {
+      releaseOlder = resolve;
+    });
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const older = executeScheduledTasks(env, createExecutionContext(), [
+        {
+          name: taskName,
+          run: async () => {
+            markOlderStarted();
+            await olderBlocked;
+            throw olderFailure;
+          },
+        },
+      ]);
+      await olderStarted;
+
+      now.mockReturnValue(2_000);
+      await executeScheduledTasks(env, createExecutionContext(), [{ name: taskName, run: async () => undefined }]);
+      now.mockReturnValue(3_000);
+      releaseOlder();
+      await expect(older).rejects.toMatchObject({ errors: [olderFailure] });
+
+      await expect(
+        env.DB.prepare(
+          `SELECT last_started_at, last_succeeded_at, last_failed_at, last_duration_ms, last_error
+             FROM observability_task_runs WHERE task_name = ?`,
+        )
+          .bind(taskName)
+          .first(),
+      ).resolves.toEqual({
+        last_started_at: 2_000,
+        last_succeeded_at: 2_000,
+        last_failed_at: null,
+        last_duration_ms: 0,
+        last_error: null,
+      });
+    } finally {
+      now.mockRestore();
+      logged.mockRestore();
+      releaseOlder();
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
+    }
+  });
+
   it("keeps a successful scheduled task successful when its result state cannot be recorded", async () => {
     const taskRun = vi.fn().mockResolvedValue(undefined);
     const writeDataPoint = vi.fn();
@@ -904,7 +1034,7 @@ describe("Worker integration", () => {
       get(target, property, receiver) {
         if (property !== "prepare") return Reflect.get(target, property, receiver);
         return (query: string) => {
-          if (query.includes("SET last_succeeded_at")) {
+          if (query.includes("last_succeeded_at = excluded.last_succeeded_at")) {
             return { bind: () => ({ run: () => Promise.reject(stateError) }) };
           }
           return target.prepare(query);
@@ -944,7 +1074,7 @@ describe("Worker integration", () => {
       get(target, property, receiver) {
         if (property !== "prepare") return Reflect.get(target, property, receiver);
         return (query: string) => {
-          if (query.includes("SET last_failed_at")) {
+          if (query.includes("last_failed_at = excluded.last_failed_at")) {
             return { bind: () => ({ run: () => Promise.reject(stateError) }) };
           }
           return target.prepare(query);

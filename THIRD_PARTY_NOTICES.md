@@ -1,6 +1,6 @@
 # Third-party notices
 
-Cloudflare Realtime Notes is licensed under AGPL-3.0. It depends on or adapts ideas from the following projects. Their licenses remain applicable to their respective works.
+NoteFlare is licensed under AGPL-3.0. It depends on or adapts ideas from the following projects. Their licenses remain applicable to their respective works.
 
 ## BlockNote
 

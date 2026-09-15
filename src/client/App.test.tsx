@@ -223,7 +223,7 @@ describe("App error handling", () => {
     await screen.findByRole("button", { name: "Simulate document access denial" });
     expect(sessionStorage.getItem("pending-invite")).toBeNull();
     expect(new URLSearchParams(window.location.search).has("invite")).toBe(false);
-    expect(screen.queryByRole("heading", { name: "Realtime Notes is unavailable" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "NoteFlare is unavailable" })).not.toBeInTheDocument();
   });
 
   it("shows an expired invite error to an unassigned signed-in user", async () => {
@@ -607,7 +607,7 @@ describe("App error handling", () => {
 
     await expect(api("/trigger-security-policy")).rejects.toMatchObject({ code: "challenge_required" });
 
-    expect(await screen.findByRole("heading", { name: "Realtime Notes is unavailable" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "NoteFlare is unavailable" })).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("Security status unavailable.");
   });
 
@@ -616,7 +616,10 @@ describe("App error handling", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Realtime Notes is unavailable" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "NoteFlare is unavailable" })).toBeInTheDocument();
+    const brand = screen.getByText("NoteFlare").closest(".brand");
+    expect(brand).not.toBeNull();
+    expect(brand!.querySelector('img[src="/logo.jpg"]')).toHaveAttribute("alt", "");
     expect(screen.getByText(/Check your connection/)).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("Install service unavailable.");
     expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
@@ -628,7 +631,7 @@ describe("App error handling", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Realtime Notes couldn’t open" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "NoteFlare couldn’t open" })).toBeInTheDocument();
     expect(screen.getByText("Review the message below and try again.")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("This invite has expired.");
     expect(screen.queryByText(/Check your connection/)).not.toBeInTheDocument();

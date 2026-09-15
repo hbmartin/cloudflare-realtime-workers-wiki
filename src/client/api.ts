@@ -183,7 +183,7 @@ function reportApiResponseFailure(error: ApiClientError | SuccessfulApiResponseE
       : error.responseBodyFailure === "read"
         ? "client.api_response_unreadable"
         : "client.api_response_invalid";
-  void reportClientError(event, error, { requestId: error.requestId });
+  void reportClientError(event, error, { requestId: error.requestId, release: error.workerVersion });
 }
 
 function errorChainIncludesTimeout(cause: unknown) {
@@ -266,7 +266,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
           handler(clientError);
         } catch (handlerError) {
           console.error("API unauthorized handler failed", handlerError);
-          void reportClientError("client.api_unauthorized_handler_failed", handlerError, { requestId });
+          void reportClientError("client.api_unauthorized_handler_failed", handlerError, {
+            requestId,
+            release: workerVersion,
+          });
         }
       }
     }

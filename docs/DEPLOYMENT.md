@@ -1,10 +1,13 @@
 # Deployment
 
-Cloudflare Realtime Notes targets Workers Paid for production capacity. The application uses Workers
+NoteFlare targets Workers Paid for production capacity. The application uses Workers
 Static Assets, D1, R2, and SQLite-backed Durable Objects.
 
 Read [Configuration](CONFIGURATION.md) alongside this document; it is the reference for every value
 named here.
+
+Existing installations intentionally retain their `cloudflare-realtime-notes` Worker and resource
+identifiers. These deployment names are compatibility details; the product presented to users is NoteFlare.
 
 ## 0. Prerequisites
 
@@ -351,7 +354,8 @@ until that manually dispatched run has deployed the new Worker.
 
 It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository or environment secrets and
 `PRODUCTION_BASE_URL` as a variable. The monitor additionally needs `CLOUDFLARE_OBSERVABILITY_TOKEN` and
-`OBSERVABILITY_PROBE_TOKEN`. Secrets set with `wrangler secret put --env production` are not
+`OBSERVABILITY_PROBE_TOKEN`; its Cloudflare token includes Workers Scripts Read so it can list current Workflow
+instance states. Secrets set with `wrangler secret put --env production` are not
 managed by the workflow; they persist across deploys and are set once, manually, per the steps above.
 
 See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md) for the gate's behavior, the credentials, the

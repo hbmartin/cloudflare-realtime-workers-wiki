@@ -1,15 +1,16 @@
 display_information:
-  name: Realtime Notes
+  name: NoteFlare
   description: Search notes, receive notifications, and safely unfurl page links.
   background_color: "#5452a8"
+# The installed production Worker keeps its existing hostname through the NoteFlare rebrand.
 features:
   bot_user:
-    display_name: Realtime Notes
+    display_name: NoteFlare
     always_online: false
   slash_commands:
     - command: /notes
       url: https://cloudflare-realtime-notes.harold-martin.workers.dev/api/slack/commands
-      description: Search your accessible Notes pages
+      description: Search your accessible NoteFlare pages
       usage_hint: <query> or link
       should_escape: false
 oauth_config:

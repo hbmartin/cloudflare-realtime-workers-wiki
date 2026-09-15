@@ -536,7 +536,7 @@ export async function handleSlackCommand(env: Env, form: URLSearchParams) {
   const slackUserId = form.get("user_id") ?? "";
   const query = (form.get("text") ?? "").trim();
   const installation = await activeInstallation(env, teamId);
-  if (!installation) return { response_type: "ephemeral", text: "Notes is not connected to this Slack workspace." };
+  if (!installation) return { response_type: "ephemeral", text: "NoteFlare is not connected to this Slack workspace." };
   if (query.toLowerCase() === "link") {
     const rawToken = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(24)));
     await env.DB.prepare(
@@ -547,7 +547,7 @@ export async function handleSlackCommand(env: Env, form: URLSearchParams) {
       .run();
     return {
       response_type: "ephemeral",
-      text: `Link your Notes account: ${env.BETTER_AUTH_URL}/?view=settings&slackLink=${encodeURIComponent(rawToken)}`,
+      text: `Link your NoteFlare account: ${env.BETTER_AUTH_URL}/?view=settings&slackLink=${encodeURIComponent(rawToken)}`,
     };
   }
   const member = await linkedMember(env, teamId, slackUserId);
@@ -570,7 +570,7 @@ export async function handleSlackCommand(env: Env, form: URLSearchParams) {
               `• <${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(item.page.id)}|${escapeSlackMrkdwn(item.page.title)}> — ${escapeSlackMrkdwn(item.space.name)}`,
           )
           .join("\n")
-      : `No Notes pages matched “${query.slice(0, 100)}”.`,
+      : `No NoteFlare pages matched “${query.slice(0, 100)}”.`,
   };
 }
 
@@ -787,7 +787,7 @@ export async function deliverSlackChannelEvent(env: Env, eventId: string) {
           type: "section",
           text: {
             type: "mrkdwn",
-            text: `${copy}\n<${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(row.page_id)}|Open in Notes>`,
+            text: `${copy}\n<${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(row.page_id)}|Open in NoteFlare>`,
           },
         },
       ],
@@ -829,7 +829,7 @@ export async function sendPersonalSlackNotification(
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `${safeText}\n<${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(pageId)}|Open in Notes>`,
+          text: `${safeText}\n<${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(pageId)}|Open in NoteFlare>`,
         },
       },
     ],
@@ -1104,8 +1104,8 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
       try {
         await slackApi(env, installation, "chat.postMessage", {
           channel: first.channel_id,
-          text: `${claimed.length} Notes update${claimed.length === 1 ? "" : "s"}`,
-          blocks: [{ type: "section", text: { type: "mrkdwn", text: `*Your Notes digest*\n${lines.join("\n")}` } }],
+          text: `${claimed.length} NoteFlare update${claimed.length === 1 ? "" : "s"}`,
+          blocks: [{ type: "section", text: { type: "mrkdwn", text: `*Your NoteFlare digest*\n${lines.join("\n")}` } }],
         });
       } catch (error) {
         await releaseSlackClaims(

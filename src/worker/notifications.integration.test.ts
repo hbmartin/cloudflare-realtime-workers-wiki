@@ -473,7 +473,9 @@ describe("notification feed and subscriptions", () => {
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({
         to: "digest-user-51@example.test",
-        text: expect.stringContaining("mentioned you"),
+        subject: "1 NoteFlare update",
+        text: expect.stringMatching(/Your daily NoteFlare digest:[\s\S]*mentioned you/),
+        html: expect.stringContaining("Your daily NoteFlare digest"),
       }),
     );
     expect(
@@ -771,13 +773,24 @@ describe("notification feed and subscriptions", () => {
         return Reflect.get(target, property, receiver);
       },
     });
-    const fetchMock = vi.fn(async () => Response.json({ ok: true }));
+    let firstSlackPayload: Record<string, unknown> | undefined;
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      firstSlackPayload ??= JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return Response.json({ ok: true });
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     await sendDueNotificationDigests(bindings, timestamp);
 
     expect(send).toHaveBeenCalledTimes(10);
     expect(fetchMock).toHaveBeenCalledTimes(10);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: "1 NoteFlare update", text: expect.stringContaining("NoteFlare digest") }),
+    );
+    expect(firstSlackPayload).toMatchObject({
+      text: expect.stringContaining("Your daily NoteFlare digest"),
+      blocks: [{ text: { text: expect.stringContaining("Your daily NoteFlare digest") } }],
+    });
     expect(statementCount).toBeLessThanOrEqual(240);
   });
 

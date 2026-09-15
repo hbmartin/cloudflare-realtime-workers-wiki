@@ -1,6 +1,7 @@
 import { appendFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
+// Production resource identifiers intentionally remain stable through the NoteFlare rebrand.
 export const ANALYTICS_DATASET = "cloudflare_realtime_notes_production";
 export const WORKER_SCRIPT = "cloudflare-realtime-notes";
 export const WORKFLOW_NAME = "cloudflare-realtime-notes-jobs";
@@ -11,6 +12,7 @@ export const D1_NAME = "cloudflare-realtime-notes";
 const READINESS_ATTEMPTS = 3;
 const READINESS_DELAY_MS = 45_000;
 const WORKFLOW_LOOKBACK_MS = 2 * 60 * 60_000;
+const WORKFLOW_QUEUED_MS = 30 * 60_000;
 
 function requiredEnvironment(environment) {
   const values = {
@@ -118,6 +120,20 @@ async function d1Metadata(accountId, token, fetcher = fetch) {
   return details?.result ?? null;
 }
 
+async function staleQueuedWorkflows(accountId, token, timestamp, fetcher = fetch) {
+  const url = new URL(
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/workflows/${encodeURIComponent(WORKFLOW_NAME)}/instances`,
+  );
+  url.searchParams.set("status", "queued");
+  url.searchParams.set("date_end", new Date(timestamp - WORKFLOW_QUEUED_MS - 1).toISOString());
+  url.searchParams.set("per_page", "1");
+  const response = await fetchJson(url, { headers: { authorization: `Bearer ${token}` } }, fetcher);
+  if (response?.success !== true || !Array.isArray(response.result)) {
+    throw new Error("Cloudflare Workflow instance query returned an invalid response.");
+  }
+  return response.result;
+}
+
 async function graphqlMetrics(accountId, token, queueId, startedAt, fetcher = fetch) {
   const query = `query Observability($account: string!, $start: Time!, $workflowStart: Time!, $end: Time!, $script: string!, $workflow: string!, $queue: string!) {
     viewer { accounts(filter: { accountTag: $account }) {
@@ -162,7 +178,7 @@ function number(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-export function evaluateThresholds(snapshot, timestamp = Date.now()) {
+export function evaluateThresholds(snapshot) {
   const failures = [];
   if (snapshot.readiness?.length === READINESS_ATTEMPTS && snapshot.readiness.every((attempt) => !attempt.ok)) {
     failures.push("readiness_failed");
@@ -201,11 +217,19 @@ export function evaluateThresholds(snapshot, timestamp = Date.now()) {
     failures.push("invariant_corruption");
   }
 
-  if (number(snapshot.dlq?.backlog_count) > 0) failures.push("delivery_dlq_nonempty");
-  if (number(snapshot.database?.file_size) > 8_000_000_000) failures.push("d1_size_high");
-  const backlog = number(snapshot.delivery?.backlog_count);
+  const dlqBacklog = snapshot.dlq?.backlog_count;
+  if (dlqBacklog === null || dlqBacklog === undefined) failures.push("delivery_dlq_metadata_missing");
+  else if (number(dlqBacklog) > 0) failures.push("delivery_dlq_nonempty");
+  const databaseSize = snapshot.database?.file_size;
+  if (databaseSize === null || databaseSize === undefined) failures.push("d1_metadata_missing");
+  else if (number(databaseSize) > 8_000_000_000) failures.push("d1_size_high");
+  const deliveryBacklog = snapshot.delivery?.backlog_count;
+  if (deliveryBacklog === null || deliveryBacklog === undefined) failures.push("delivery_queue_metadata_missing");
+  const backlog = number(deliveryBacklog);
   const averageBacklog = Math.max(0, ...snapshot.queue.map((row) => number(row.avg?.messages)));
-  if (backlog > 100 && averageBacklog > 100) failures.push("queue_backlog_sustained");
+  if (deliveryBacklog !== null && deliveryBacklog !== undefined && backlog > 100 && averageBacklog > 100) {
+    failures.push("queue_backlog_sustained");
+  }
 
   const latestWorkflowEvents = new Map();
   for (const row of snapshot.workflow) {
@@ -216,13 +240,7 @@ export function evaluateThresholds(snapshot, timestamp = Date.now()) {
     const previous = latestWorkflowEvents.get(instanceId);
     if (!previous || datetime >= previous.datetime) latestWorkflowEvents.set(instanceId, { eventType, datetime });
   }
-  if (
-    [...latestWorkflowEvents.values()].some(
-      (event) => event.eventType === "WORKFLOW_QUEUED" && timestamp - event.datetime > 30 * 60_000,
-    )
-  ) {
-    failures.push("workflow_queued_stale");
-  }
+  if (snapshot.staleQueuedWorkflows?.length) failures.push("workflow_queued_stale");
   if (
     [...latestWorkflowEvents.values()].some((event) =>
       ["WORKFLOW_INTERNAL_ERROR", "ROLLBACK_FAILED", "ROLLBACK_ATTEMPT_FAILURE"].includes(event.eventType),
@@ -235,16 +253,27 @@ export function evaluateThresholds(snapshot, timestamp = Date.now()) {
 
 function markdown(snapshot, failures, windows, title = "Cloudflare observability monitor") {
   const latest = snapshot.readiness.at(-1);
-  const oldestMessage = number(snapshot.delivery?.oldest_message_timestamp_ms);
-  const oldestMessageAge = oldestMessage > 0 ? Math.max(0, Date.now() - oldestMessage) : 0;
+  const deliveryBacklog = snapshot.delivery?.backlog_count;
+  const dlqBacklog = snapshot.dlq?.backlog_count;
+  const databaseSize = snapshot.database?.file_size;
+  const oldestMessageValue = snapshot.delivery?.oldest_message_timestamp_ms;
+  const oldestMessage = number(oldestMessageValue);
+  const oldestMessageAge =
+    oldestMessageValue === null || oldestMessageValue === undefined
+      ? "unavailable"
+      : oldestMessage > 0
+        ? Math.max(0, Date.now() - oldestMessage)
+        : 0;
+  const availableNumber = (value) => (value === null || value === undefined ? "unavailable" : number(value));
   return [
     `## ${title}`,
     "",
     `- Readiness: ${latest?.ok ? "ready" : "failed"} (${snapshot.readiness.map((item) => item.status).join(", ")})`,
     `- Worker requests (${windows.graphqlMinutes}m): ${snapshot.worker.reduce((total, row) => total + number(row.sum?.requests), 0)}`,
     `- Analytics events (${windows.analyticsMinutes}m, sampling-adjusted): ${snapshot.analytics.reduce((total, row) => total + number(row.count), 0)}`,
-    `- Delivery backlog / DLQ / oldest age: ${number(snapshot.delivery?.backlog_count)} / ${number(snapshot.dlq?.backlog_count)} / ${oldestMessageAge} ms`,
-    `- D1 size: ${number(snapshot.database?.file_size)} bytes`,
+    `- Delivery backlog / DLQ / oldest age: ${availableNumber(deliveryBacklog)} / ${availableNumber(dlqBacklog)} / ${oldestMessageAge}${oldestMessageAge === "unavailable" ? "" : " ms"}`,
+    `- D1 size: ${availableNumber(databaseSize)}${databaseSize === null || databaseSize === undefined ? "" : " bytes"}`,
+    `- Stale queued Workflows: ${snapshot.staleQueuedWorkflows?.length ?? 0}`,
     `- Alert codes: ${failures === null ? "not evaluated (run observability:check)" : failures.length ? failures.join(", ") : "none"}`,
     "",
   ].join("\n");
@@ -254,11 +283,13 @@ export async function collectSnapshot(config, options = {}) {
   const fetcher = options.fetcher ?? fetch;
   const graphqlMinutes = options.graphqlMinutes ?? 5;
   const analyticsMinutes = options.analyticsMinutes ?? 15;
-  const [readiness, queues, analytics, database] = await Promise.all([
+  const timestamp = options.timestamp ?? Date.now();
+  const [readiness, queues, analytics, database, staleWorkflows] = await Promise.all([
     probeReadiness(config.baseUrl, config.probeToken, options),
     queueMetadata(config.accountId, config.token, fetcher),
     analyticsSql(config.accountId, config.token, analyticsMinutes, fetcher),
     d1Metadata(config.accountId, config.token, fetcher),
+    staleQueuedWorkflows(config.accountId, config.token, timestamp, fetcher),
   ]);
   const [delivery, dlq, graphql] = await Promise.all([
     queueMetrics(config.accountId, config.token, queues.delivery?.queue_id ?? queues.delivery?.id, fetcher),
@@ -277,6 +308,7 @@ export async function collectSnapshot(config, options = {}) {
     delivery,
     dlq,
     database,
+    staleQueuedWorkflows: staleWorkflows,
     deliveryQueueId: queues.delivery?.queue_id ?? queues.delivery?.id,
     ...graphql,
   };

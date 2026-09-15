@@ -44,6 +44,7 @@ export type JobWorkflowParams = { jobId: string; attempt?: number; correlationId
 export type DeliveryQueueMessage =
   | { outboxId: string; correlationId?: string }
   | { sweep: true; correlationId?: string };
+export type DeliveryMessageOutcome = "acknowledged" | "retried" | "discarded";
 export type OutboxSweepResult = "completed" | "contended" | "lease-lost";
 
 function deliveryQueueIdentifier(value: unknown) {
@@ -1392,7 +1393,10 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
   }
 }
 
-export async function consumeDeliveryMessage(env: Env, message: Message<DeliveryQueueMessage>) {
+export async function consumeDeliveryMessage(
+  env: Env,
+  message: Message<DeliveryQueueMessage>,
+): Promise<DeliveryMessageOutcome> {
   const body = deliveryQueueMessageBody(message.body);
   if (!body) {
     logger.warn("queue.message.invalid", "delivery-queue", "Delivery queue message body is invalid.", {
@@ -1400,12 +1404,15 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
       attempts: message.attempts,
     });
     message.ack();
-    return;
+    return "discarded";
   }
   if ("sweep" in body) {
-    if ((await sweepOutbox(env, true)) === "completed") message.ack();
-    else message.retry({ delaySeconds: Math.min(60, 2 ** Math.min(message.attempts, 6)) });
-    return;
+    if ((await sweepOutbox(env, true)) === "completed") {
+      message.ack();
+      return "acknowledged";
+    }
+    message.retry({ delaySeconds: Math.min(60, 2 ** Math.min(message.attempts, 6)) });
+    return "retried";
   }
   const outboxId = body.outboxId;
   const row = await env.DB.prepare(`SELECT id, topic, payload_json, available_at FROM outbox WHERE id = ?`)
@@ -1413,21 +1420,22 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
     .first<{ id: string; topic: string; payload_json: string; available_at: number }>();
   if (!row) {
     message.ack();
-    return;
+    return "acknowledged";
   }
   if (row.available_at > Date.now()) {
     message.retry({
       delaySeconds: Math.min(12 * 60 * 60, Math.max(1, Math.ceil((row.available_at - Date.now()) / 1000))),
     });
-    return;
+    return "retried";
   }
   const payload = jsonRecord(row.payload_json);
   // A payload that fails validation will never become valid, so record it and ack
   // instead of retrying. An unknown topic still throws: a rolling deploy can leave an
   // older consumer reading a topic a newer one writes, and that does resolve on retry.
-  const rejectPayload = async (reason: string) => {
+  const rejectPayload = async (reason: string): Promise<DeliveryMessageOutcome> => {
     await env.DB.prepare(`UPDATE outbox SET last_error = ? WHERE id = ?`).bind(reason, outboxId).run();
     message.ack();
+    return "discarded";
   };
   if (row.topic === "notification") {
     const notificationId = payload.notificationId;
@@ -1452,6 +1460,7 @@ export async function consumeDeliveryMessage(env: Env, message: Message<Delivery
     await deliverWebhook(env, deliveryId);
   } else throw new Error(`Unsupported outbox topic: ${row.topic}`);
   message.ack();
+  return "acknowledged";
 }
 
 export async function expireJobArtifacts(env: Env) {

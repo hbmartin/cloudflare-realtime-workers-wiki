@@ -35,10 +35,11 @@ describe("Startup", () => {
 
     render(<Startup supported loadSupportedApp={() => application.promise} />);
 
-    const status = screen.getByText("Opening Notes…");
-    expect(status).toHaveTextContent("Opening Notes…");
+    const status = screen.getByText("Opening NoteFlare…");
+    expect(status).toHaveTextContent("Opening NoteFlare…");
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(screen.getByRole("main")).toContainElement(status);
+    expect(screen.getByRole("main").querySelector('img[src="/logo.jpg"]')).toHaveAttribute("alt", "");
   });
 
   it("renders the supported application after its bundle loads", async () => {
@@ -51,7 +52,7 @@ describe("Startup", () => {
     });
 
     expect(screen.getByText("Application loaded")).toBeInTheDocument();
-    expect(screen.queryByText("Opening Notes…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Opening NoteFlare…")).not.toBeInTheDocument();
   });
 
   it("logs and announces an application bundle load failure", async () => {

@@ -1,4 +1,8 @@
-# Cloudflare Realtime Notes
+<p align="center">
+  <img src="./public/logo.jpg" alt="NoteFlare golden quill and scroll logo" width="360" />
+</p>
+
+# NoteFlare
 
 A private, self-hosted collaborative wiki built entirely on Cloudflare Workers, Durable Objects, D1, and R2.
 

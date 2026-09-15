@@ -933,9 +933,9 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
         await env.SEND_EMAIL.send({
           from: env.EMAIL_FROM,
           to: candidate.email,
-          subject: `${claimed.length} Notes update${claimed.length === 1 ? "" : "s"}`,
-          text: `Your daily Notes digest:\n\n${lines.join("\n")}`,
-          html: `<p>Your daily Notes digest:</p><ul>${claimed
+          subject: `${claimed.length} NoteFlare update${claimed.length === 1 ? "" : "s"}`,
+          text: `Your daily NoteFlare digest:\n\n${lines.join("\n")}`,
+          html: `<p>Your daily NoteFlare digest:</p><ul>${claimed
             .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
             .join("")}</ul>`,
         });
@@ -1039,7 +1039,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           env,
           candidate.user_id,
           candidate.workspace_id,
-          `Your daily Notes digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
+          `Your daily NoteFlare digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
           claimed[0]!.page_id,
         );
         await finishClaimedDeliveries(
