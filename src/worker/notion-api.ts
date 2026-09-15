@@ -33,6 +33,7 @@ import { attachmentDisposition, HttpError } from "./http";
 import { sweepOutbox } from "./jobs";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
+import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import { webhookEventStatements, type WebhookEventType } from "./webhooks";
 import { broadcastWorkspaceEvent } from "./workspace-events";
@@ -109,10 +110,13 @@ notionApi.onError((error, c) => {
                       : "validation_error";
     return notionErrorResponse(requestId, new NotionError(status, code, error.message));
   }
-  console.error("Notion API request failed", {
-    requestId,
-    error: error instanceof Error ? error.message : String(error),
-  });
+  logger.error(
+    "notion_api.request.failed",
+    "notion-api",
+    "Notion-compatible API request failed.",
+    { requestId },
+    error,
+  );
   return notionErrorResponse(requestId, new NotionError(500, "internal_server_error", "Internal server error."));
 });
 
@@ -147,7 +151,7 @@ async function sourceRateLimitKey(request: Request) {
 }
 
 notionApi.use("*", async (c, next) => {
-  const requestId = crypto.randomUUID();
+  const requestId = currentObservabilityContext()?.requestId ?? crypto.randomUUID();
   c.set("requestId", requestId);
   c.header("x-request-id", requestId);
   const version = c.req.header("notion-version");
@@ -173,13 +177,23 @@ function capability(principal: IntegrationPrincipal, name: keyof IntegrationPrin
 }
 
 function enqueueWebhooks(c: Context<ApiContext>) {
-  c.executionCtx.waitUntil(sweepOutbox(c.env).catch((error) => console.error("Webhook enqueue failed", error)));
+  c.executionCtx.waitUntil(
+    sweepOutbox(c.env).catch((error) =>
+      logger.error("notion_api.webhook_enqueue.failed", "notion-api", "Webhook enqueue failed.", {}, error),
+    ),
+  );
 }
 
 function enqueueWorkspaceEvent(c: Context<ApiContext>, workspaceId: string, event: WorkspaceEvent) {
   c.executionCtx.waitUntil(
     broadcastWorkspaceEvent(c.env, workspaceId, event).catch((error) =>
-      console.error("Notion API workspace broadcast failed", error),
+      logger.error(
+        "notion_api.workspace_broadcast.failed",
+        "notion-api",
+        "Workspace broadcast failed.",
+        { workspaceId },
+        error,
+      ),
     ),
   );
 }
@@ -455,7 +469,9 @@ async function pageObject(env: Env, page: IntegrationPage, origin: string, prelo
 
 async function liveDocument(env: Env, page: IntegrationPage) {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
-    new Request("https://document.internal/content", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+    new Request("https://document.internal/content", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
+    }),
   );
   if (!response.ok) throw new NotionError(503, "service_unavailable", "Document state is unavailable.");
   return response.json<DocumentContentEnvelope>();
@@ -548,7 +564,11 @@ async function mutateDocument(
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/api-mutate", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+      headers: {
+        "content-type": "application/json",
+        "x-notes-internal": env.BETTER_AUTH_SECRET,
+        ...correlationHeaders(),
+      },
       body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects }),
     }),
   );
@@ -564,21 +584,39 @@ async function cleanupStagedPage(env: Env, pageId: string, contentEpoch: number,
     await env.DOCUMENT.getByName(`${pageId}~${contentEpoch}`).fetch(
       new Request("https://document.internal/purge", {
         method: "POST",
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
       }),
     );
   } catch (error) {
-    console.error("Failed to purge a staged Notion API page", { pageId, error });
+    logger.error(
+      "notion_api.staged_page.purge_failed",
+      "notion-api",
+      "Staged page Durable Object purge failed.",
+      { pageId },
+      error,
+    );
   }
   try {
     await deleteR2Prefix(env.BUCKET, `documents/${pageId}/`);
   } catch (error) {
-    console.error("Failed to delete staged Notion API page objects", { pageId, error });
+    logger.error(
+      "notion_api.staged_page.objects_delete_failed",
+      "notion-api",
+      "Staged page objects could not be deleted.",
+      { pageId },
+      error,
+    );
   }
   try {
     await env.DB.prepare(`DELETE FROM pages WHERE id = ? AND import_job_id = ?`).bind(pageId, stageId).run();
   } catch (error) {
-    console.error("Failed to delete a staged Notion API page", { pageId, error });
+    logger.error(
+      "notion_api.staged_page.delete_failed",
+      "notion-api",
+      "Staged page metadata could not be deleted.",
+      { pageId },
+      error,
+    );
   }
 }
 
@@ -1028,7 +1066,7 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
     if (inTrash === true) {
       c.executionCtx.waitUntil(
         processArchiveDisconnectTargets(c.env, mutationResults[0]?.results ?? []).catch((error) =>
-          console.error("Notion API archive disconnect failed", error),
+          logger.error("notion_api.archive_disconnect.failed", "notion-api", "Archive disconnect failed.", {}, error),
         ),
       );
     }

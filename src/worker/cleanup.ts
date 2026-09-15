@@ -1,6 +1,7 @@
 import type { Env } from "./env";
 import { locationHint } from "./http";
 import { safeErrorMessage } from "../shared/error-log";
+import { correlationHeaders } from "./observability";
 
 type DeletionTargetKind = "document_do" | "r2_object" | "r2_prefix";
 
@@ -40,7 +41,7 @@ async function processTarget(env: Env, target: DeletionTargetRow, hint?: Durable
   const response = await stub.fetch(
     new Request("https://document.internal/purge", {
       method: "POST",
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
       signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
     }),
   );

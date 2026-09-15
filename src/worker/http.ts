@@ -1,13 +1,8 @@
 import type { Context } from "hono";
-import {
-  LOG_IDENTIFIER_LIMIT,
-  LOG_TEXT_LIMIT,
-  boundedLogString,
-  errorLogFields,
-  safeInstanceOf,
-} from "../shared/error-log";
+import { LOG_IDENTIFIER_LIMIT, LOG_TEXT_LIMIT, boundedLogString, safeInstanceOf } from "../shared/error-log";
 import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
+import { currentObservabilityContext, logger } from "./observability";
 
 const HTTP_ERROR_KIND = "realtime-notes.http-error.v1";
 const HTTP_ERROR_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422, 429, 500, 502, 503]);
@@ -122,14 +117,22 @@ export function errorResponse(c: Context, error: unknown) {
   const { expected, status, body } = classifyError(error);
   if (!expected) {
     const rayId = c.req.header("cf-ray");
-    console.error("Unhandled request error", {
-      requestMethod: c.req.method,
-      requestPath: boundedLogString(new URL(c.req.url).pathname, LOG_TEXT_LIMIT),
-      requestRayId: rayId ? boundedLogString(rayId, LOG_IDENTIFIER_LIMIT) : null,
-      ...errorLogFields(error),
-    });
+    logger.error(
+      "http.request.unhandled_error",
+      "http",
+      "Unhandled request error",
+      {
+        requestMethod: c.req.method,
+        requestPath: boundedLogString(new URL(c.req.url).pathname, LOG_TEXT_LIMIT),
+        requestRayId: rayId ? boundedLogString(rayId, LOG_IDENTIFIER_LIMIT) : null,
+      },
+      error,
+    );
   }
-  return c.json(body, status);
+  const response = c.json(body, status);
+  const requestId = currentObservabilityContext()?.requestId;
+  if (requestId) response.headers.set("x-request-id", requestId);
+  return response;
 }
 
 export async function sha256(value: string) {

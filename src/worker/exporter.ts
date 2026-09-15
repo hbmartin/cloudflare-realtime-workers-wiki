@@ -1,4 +1,6 @@
 import type { WorkflowStep } from "cloudflare:workers";
+import { tracing } from "cloudflare:workers";
+import { correlationHeaders, traced } from "./observability";
 import type { DiagramContentEnvelope, DocumentContentEnvelope, ExportFormat, ProseMirrorJson } from "../shared/types";
 import { collectLinkedDiagramIds, serializeDocument } from "../shared/document-projection";
 import {
@@ -215,7 +217,7 @@ async function documentExport(
 ): Promise<SerializedExport> {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/content", {
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
     }),
   );
   if (!response.ok) throw new Error(`The latest document content could not be flushed (${response.status}).`);
@@ -293,7 +295,7 @@ async function tableExport(env: Env, page: ExportPage): Promise<SerializedExport
 async function diagramExport(env: Env, page: ExportPage): Promise<SerializedExport> {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/content", {
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
     }),
   );
   if (!response.ok) throw new Error(`The latest diagram content could not be flushed (${response.status}).`);
@@ -438,7 +440,13 @@ async function browserExportHtml(
   });
 }
 
-export async function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
+export function runExport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
+  return traced(tracing, "notes.job.export", { "notes.job_id": job.id, "notes.job_attempt": job.attempt }, () =>
+    runExportObserved(env, job, step),
+  );
+}
+
+async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   const options = exportOptions(job);
   const artifact = await step.do("render export", async () => {
     await assertExportActive(env, job);

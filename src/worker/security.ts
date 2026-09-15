@@ -8,6 +8,7 @@ import type { SecurityStatus } from "../shared/security";
 import type { Env } from "./env";
 import { HttpError, sha256 } from "./http";
 import { clearRateLimit, consumeFixedWindow } from "./rate-limit";
+import { logger } from "./observability";
 
 const TRUST_MS = 30 * 24 * 60 * 60_000;
 const FRESH_MS = 5 * 60_000;
@@ -195,7 +196,9 @@ async function stamp(
       .first();
   if (!result) throw deny("Security settings changed. Sign in again.");
   await resetAttempts(env, userId, generation);
-  console.info("account-security", { event: "verified", userId, method });
+  logger.info("account_security.verified", "account-security", "Account security verification succeeded.", {
+    method,
+  });
 }
 
 async function issueSession(
@@ -691,7 +694,9 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         );
         expireCookie(ctx, ctx.context.createAuthCookie("two_factor"));
         expireCookie(ctx, trustCookie(ctx));
-        console.info("account-security", { event: "recovery", userId: id.userId, operator: reset });
+        logger.warn("account_security.recovery.completed", "account-security", "Account recovery completed.", {
+          operatorInitiated: reset,
+        });
         return ctx.json({ success: true });
       }),
     },
@@ -826,7 +831,12 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
               const rateLimitKey = policy.notesPasswordRateLimitKey;
               if (rateLimitKey) await clearRateLimit(env, rateLimitKey);
               delete policy.notesPasswordRateLimitKey;
-              console.info("account-security", { event: "password-authenticated", outcome: "verification-required" });
+              logger.info(
+                "account_security.password_authenticated",
+                "account-security",
+                "Password accepted; additional verification is required.",
+                { outcome: "verification-required" },
+              );
             }
             return undefined;
           }),

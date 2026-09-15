@@ -114,6 +114,17 @@ Secrets set with `wrangler secret put --env production` — `BETTER_AUTH_SECRET`
 the workflow. They persist across deploys and are set once, by hand, per
 [Set secrets](DEPLOYMENT.md#3-set-secrets).
 
+The separate five-minute `observability.yml` workflow uses the same account and base URL plus
+`CLOUDFLARE_OBSERVABILITY_TOKEN` and `OBSERVABILITY_PROBE_TOKEN`. Give the observability token only
+Workers Observability Read, Analytics Engine Read, Queues Read, and D1 Read. It never deploys or writes
+Cloudflare state. Enable Actions failure email in each operator's GitHub notification settings.
+
+```sh
+gh secret set CLOUDFLARE_OBSERVABILITY_TOKEN
+gh secret set OBSERVABILITY_PROBE_TOKEN
+gh workflow run observability.yml
+```
+
 ## Concurrency and rapid pushes
 
 The deploy job uses `concurrency: deploy-production` with `cancel-in-progress: false`, so deploys
@@ -161,8 +172,11 @@ Configured for this repository it would need three changes from the defaults:
 - A deploy command that orders the migration ahead of the deploy:
 
   ```sh
-  npx wrangler d1 migrations apply DB --env production --remote && npx wrangler deploy --env production
+  pnpm run deploy
   ```
+
+  This repository command builds, applies pending D1 migrations, and uploads the Worker in order.
+  A failed build or migration prevents the upload.
 
 - **A custom API token.** The token Cloudflare generates for builds carries Workers Scripts, Workers
   KV, Workers R2, and Workers Routes edit, plus account and user reads — but no D1 permission at

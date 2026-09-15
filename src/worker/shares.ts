@@ -12,6 +12,7 @@ import { isInlineMime } from "./attachments";
 import { diagramThumbnailResponse } from "./diagram-thumbnail";
 import type { Env, MemberContext } from "./env";
 import { attachmentDisposition, HttpError } from "./http";
+import { correlationHeaders } from "./observability";
 
 const PUBLIC_DOCUMENT_FETCH_TIMEOUT_MS = 5_000;
 const PUBLIC_LINKED_DIAGRAM_LIMIT = 64;
@@ -379,7 +380,7 @@ async function publicTransclusions(
         return null;
       const response = await env.DOCUMENT.getByName(`${sourcePage.page_id}~${sourcePage.content_epoch}`).fetch(
         new Request("https://document.internal/content", {
-          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
         }),
       );
       if (!response.ok) return null;
@@ -486,7 +487,7 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
   if (share.page_kind === "document") {
     const response = await env.DOCUMENT.getByName(`${share.page_id}~${share.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
       }),
     );
     if (!response.ok) return null;
@@ -559,7 +560,7 @@ export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, s
   try {
     const response = await env.DOCUMENT.getByName(`${source.page_id}~${source.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
         signal: AbortSignal.timeout(PUBLIC_DOCUMENT_FETCH_TIMEOUT_MS),
       }),
     );

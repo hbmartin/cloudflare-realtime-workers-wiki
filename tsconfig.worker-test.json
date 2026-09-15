@@ -2,7 +2,7 @@
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "lib": ["ES2023", "WebWorker"],
-    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"]
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types", "node"]
   },
   "include": ["worker-configuration.d.ts", "src/shared/**/*.ts", "src/worker/**/*.ts", "src/worker/worker-test.d.ts"]
 }

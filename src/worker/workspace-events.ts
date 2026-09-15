@@ -3,6 +3,7 @@ import { YServer } from "y-partyserver";
 import type { Page, WorkspaceEvent } from "../shared/types";
 import { ID_PATTERN, parseWorkspaceEvent } from "../shared/validation";
 import type { Env } from "./env";
+import { correlationHeaders, logger, withDurableObjectContext } from "./observability";
 import { pageJson, type PageJsonRow } from "./page-row";
 
 export interface EventConnectionAuth {
@@ -113,8 +114,16 @@ export class WorkspaceEvents extends YServer {
   }
 
   async onRequest(request: Request) {
+    return withDurableObjectContext(this.bindings, request, () => this.onRequestObserved(request));
+  }
+
+  private async onRequestObserved(request: Request) {
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
+    }
+    if (request.method === "GET" && new URL(request.url).pathname === "/health") {
+      await this.state.storage.getAlarm();
+      return new Response(null, { status: 204 });
     }
     if (request.method !== "POST") return new Response("Not found", { status: 404 });
     const workspaceId = this.state.id.name;
@@ -148,10 +157,15 @@ export class WorkspaceEvents extends YServer {
       // connected clients stale indefinitely. Collapse all overflow into one
       // authoritative refresh after the accepted queue drains.
       if (!this.resyncRequired) {
-        console.warn("Workspace event delivery queue overflow; scheduling workspace invalidation.", {
-          workspaceId,
-          queuedDeliveries: this.queuedDeliveries,
-        });
+        logger.warn(
+          "workspace_events.delivery_queue.overflow",
+          "workspace-events",
+          "Scheduling authoritative resync.",
+          {
+            workspaceId,
+            queuedDeliveries: this.queuedDeliveries,
+          },
+        );
       }
       this.resyncRequired = true;
       return Response.json({ delivered: false, resyncScheduled: true }, { status: 202 });
@@ -179,10 +193,13 @@ export class WorkspaceEvents extends YServer {
       if (currentEvent) await this.broadcastEvent(currentEvent, workspaceId);
       return Response.json({ delivered: currentEvent !== null });
     } catch (error) {
-      console.error("Workspace event state check failed; scheduling workspace invalidation.", {
-        workspaceId,
+      logger.error(
+        "workspace_events.state_check.failed",
+        "workspace-events",
+        "Scheduling authoritative resync after state check failure.",
+        { workspaceId },
         error,
-      });
+      );
       this.resyncRequired = true;
       return Response.json({ delivered: false, resyncScheduled: true }, { status: 202 });
     }
@@ -293,12 +310,18 @@ export async function broadcastWorkspaceEvent(env: Env, workspaceId: string, eve
       method: "POST",
       headers: {
         "x-notes-internal": env.BETTER_AUTH_SECRET,
+        ...correlationHeaders(),
       },
       body: JSON.stringify(event),
     }),
   );
   if (!response.ok) throw new Error(`Workspace event delivery failed with ${response.status}`);
   if (response.status === 202) {
-    console.warn("Workspace event delivery deferred to an authoritative resync.", { workspaceId });
+    logger.warn(
+      "workspace_events.delivery.deferred",
+      "workspace-events",
+      "Delivery deferred to an authoritative resync.",
+      { workspaceId },
+    );
   }
 }

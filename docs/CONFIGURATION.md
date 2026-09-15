@@ -20,6 +20,7 @@ Set for deployment with `wrangler secret put --env production`. Never place thes
 | ---------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `BETTER_AUTH_SECRET`         | Yes                  | At least 32 random bytes. Signs sessions **and** is the `x-notes-internal` shared secret for Worker-to-Durable-Object calls. Rotation has a wider blast radius than it appears; see [Operations](OPERATIONS.md#rotating-better_auth_secret). |
 | `BOOTSTRAP_TOKEN`            | Yes, until bootstrap | One-time operator install credential, compared in constant time against a SHA-256 digest. Delete or rotate after the owner exists.                                                                                                           |
+| `OBSERVABILITY_PROBE_TOKEN`  | Yes                  | High-entropy bearer value accepted only in `X-Observability-Token` on `GET /api/health/ready`. Store the same value in GitHub Actions.                                                                                                       |
 | `DO_LOCATION_HINT`           | No                   | One of `wnam`, `enam`, `sam`, `weur`, `eeur`, `apac`, `oc`, `afr`, `me`. If unset, derived from the bootstrap request's `cf.continent`, defaulting to `wnam`.                                                                                |
 | `SLACK_CLIENT_ID`            | No                   | Slack OAuth v2 client ID. Slack remains visibly disabled unless all four Slack values are set.                                                                                                                                               |
 | `SLACK_CLIENT_SECRET`        | No                   | Slack OAuth v2 client secret.                                                                                                                                                                                                                |
@@ -52,8 +53,11 @@ Declared in `wrangler.jsonc`, typed in `src/worker/env.ts`.
 | `API_SOURCE_MINUTE_LIMIT` | Rate Limit     | Pre-authentication `/v1` throttle: 1,800 requests per source per minute   |
 | `API_BURST_LIMIT`         | Rate Limit     | Authenticated `/v1` throttle: 100 requests per integration per 10 seconds |
 | `API_MINUTE_LIMIT`        | Rate Limit     | Authenticated `/v1` throttle: 600 requests per integration per minute     |
+| `CLIENT_TELEMETRY_LIMIT`  | Rate Limit     | Same-origin browser error reports: 20 requests per source per minute      |
+| `OBSERVABILITY`           | Analytics      | Fixed-position operational metrics; production dataset retained 3 months  |
+| `CF_VERSION_METADATA`     | Version        | Active Worker version ID, tag, and deployment timestamp                   |
 
-No KV, Workers AI, Vectorize, Hyperdrive, Analytics Engine, or Containers bindings are used. Slack is
+No KV, Workers AI, Vectorize, Hyperdrive, or Containers bindings are used. Slack is
 inactive until its four secrets are configured. Verified integration webhooks can make outbound HTTPS
 requests and require `WEBHOOK_ENCRYPTION_KEY`.
 
@@ -74,17 +78,17 @@ Never rename or delete a class or binding without a Cloudflare Durable Object mi
 | --------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `compatibility_date`        | `2026-08-14`                                    | Runtime behavior baseline                                                                                                     |
 | `compatibility_flags`       | `nodejs_compat`, `global_fetch_strictly_public` | Required by Better Auth and to keep outbound webhook fetches on public network destinations                                   |
-| `observability.enabled`     | `true`                                          | Workers Logs                                                                                                                  |
+| `observability.logs`        | enabled, sampling `1`, invocation logs enabled  | 100% structured production and local Workers Logs                                                                             |
+| `observability.traces`      | production `0.05`, local/E2E `1`                | Automatic and custom Workers Traces                                                                                           |
 | `upload_source_maps`        | `true`                                          | Symbolicated stack traces in logs                                                                                             |
-| `preview_urls`              | `true`                                          | Per-version preview URLs; **inert here**, see below                                                                           |
+| `preview_urls`              | `false`                                         | Disabled; Durable Object Workers do not receive preview URLs                                                                  |
 | `assets.not_found_handling` | `single-page-application`                       | SPA fallback                                                                                                                  |
 | `assets.run_worker_first`   | `["/api/*", "/parties/*", "/v1/*", "/share/*"]` | Browser APIs, collaboration sockets, Notion-compatible APIs, and public shares invoke the Worker before static-asset fallback |
 | `triggers.crons`            | `*/15 * * * *`                                  | Outbox recovery, digests, expiry, and cleanup; **required**                                                                   |
 
 Cloudflare does not generate preview URLs for Workers that implement a Durable Object, and this
-Worker exports two classes, so `preview_urls` has no effect on this deployment. It is left enabled
-because the setting is otherwise harmless and would become correct if the classes were ever removed.
-See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md#preview-urls-do-not-exist-for-this-worker).
+The Worker exports two Durable Object classes, so per-version preview URLs are unavailable. See
+[Continuous deployment](CONTINUOUS_DEPLOYMENT.md#preview-urls-do-not-exist-for-this-worker).
 
 ## R2 key layout
 
@@ -212,16 +216,16 @@ Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:; img-sr
 
 ## Authentication policy
 
-| Property                   | Value                                                            |
-| -------------------------- | ---------------------------------------------------------------- |
-| Password minimum           | 8 characters                                                     |
-| Public sign-up             | Blocked; `/api/auth/sign-up/email` returns `registration_closed` |
-| Email verification         | Not implemented, by design                                       |
-| Password reset             | Not implemented, by design — an owner revokes and reinvites      |
-| Invites                    | One use, SHA-256 hashed, 7-day lifetime                          |
-| Roles                      | `owner`, `editor`, `viewer`                                      |
-| Connection reauthorization | Every 5 minutes                                                  |
-| Application rate limiting  | **None.** Must be provided by Cloudflare WAF                     |
+| Property                   | Value                                                                                          |
+| -------------------------- | ---------------------------------------------------------------------------------------------- |
+| Password minimum           | 8 characters                                                                                   |
+| Public sign-up             | Blocked; `/api/auth/sign-up/email` returns `registration_closed`                               |
+| Email verification         | Not implemented, by design                                                                     |
+| Password reset             | Not implemented, by design — an owner revokes and reinvites                                    |
+| Invites                    | One use, SHA-256 hashed, 7-day lifetime                                                        |
+| Roles                      | `owner`, `editor`, `viewer`                                                                    |
+| Connection reauthorization | Every 5 minutes                                                                                |
+| Application rate limiting  | `/v1` and browser telemetry use Worker Rate Limit bindings; authentication still relies on WAF |
 
 ## Environments
 

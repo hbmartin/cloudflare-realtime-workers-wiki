@@ -6,9 +6,11 @@ import type {
   Subscription,
   WatchState,
 } from "../shared/types";
+import { tracing } from "cloudflare:workers";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { sendPersonalSlackNotification, SlackRateLimitError, slackChannelFanoutStatements } from "./slack";
+import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
 
 export const NOTIFICATION_EVENT_TYPES = [
   "mention",
@@ -130,12 +132,18 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
     database
       .prepare(
         `INSERT OR IGNORE INTO outbox
-          (id, workspace_id, topic, payload_json, available_at, created_at)
-         SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
+          (id, workspace_id, topic, payload_json, available_at, created_at, correlation_id)
+         SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?, ?
            FROM notifications
           WHERE id >= ? AND id < ?`,
       )
-      .bind(fanout.createdAt, fanout.createdAt, idPrefix, `${prefix};`),
+      .bind(
+        fanout.createdAt,
+        fanout.createdAt,
+        currentObservabilityContext()?.correlationId ?? null,
+        idPrefix,
+        `${prefix};`,
+      ),
     ...(fanout.emitSlackChannel ? slackChannelFanoutStatements(database, { ...fanout, coalesceAfter }) : []),
   ];
 }
@@ -609,13 +617,15 @@ function notificationCopy(row: DeliveryRow) {
 async function sendNotificationEmail(env: Env, row: DeliveryRow, subject: string, text: string) {
   if (!env.SEND_EMAIL || !env.EMAIL_FROM) return false;
   const href = `${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(row.page_id)}`;
-  await env.SEND_EMAIL.send({
-    from: env.EMAIL_FROM,
-    to: row.recipient_email,
-    subject,
-    text: `${text}\n\nOpen ${row.page_title}: ${href}`,
-    html: `<p>${escapeHtml(text)}</p><p><a href="${escapeHtml(href)}">Open ${escapeHtml(row.page_title)}</a></p>`,
-  });
+  await traced(tracing, "notes.integration.email", { "notes.operation": "notification" }, () =>
+    env.SEND_EMAIL!.send({
+      from: env.EMAIL_FROM!,
+      to: row.recipient_email,
+      subject,
+      text: `${text}\n\nOpen ${row.page_title}: ${href}`,
+      html: `<p>${escapeHtml(text)}</p><p><a href="${escapeHtml(href)}">Open ${escapeHtml(row.page_title)}</a></p>`,
+    }),
+  );
   return true;
 }
 
@@ -939,7 +949,19 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
           "failed",
           error instanceof Error ? error.message.slice(0, 500) : "Digest delivery failed.",
         );
-        console.error("Notification digest email failed", { userId: candidate.user_id, error });
+        logger.error(
+          "notification.digest_email.failed",
+          "notifications",
+          "Notification digest email failed.",
+          {},
+          error,
+        );
+        recordMetric(env, {
+          event: "integration.call",
+          component: "notifications",
+          operation: "email",
+          outcome: "failure",
+        });
       }
     }
   }
@@ -1040,7 +1062,19 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
         );
         if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
         // One unreachable recipient must not starve the digests queued behind it.
-        console.error("Notification digest Slack message failed", { userId: candidate.user_id, error });
+        logger.error(
+          "notification.digest_slack.failed",
+          "notifications",
+          "Notification digest Slack message failed.",
+          {},
+          error,
+        );
+        recordMetric(env, {
+          event: "integration.call",
+          component: "notifications",
+          operation: "slack",
+          outcome: "failure",
+        });
       }
     }
   }

@@ -62,7 +62,7 @@ import {
   TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
 import { PAGE_KINDS } from "../shared/page-kind";
-import { errorLogFields, prefixedErrorLogFields, safeInstanceOf } from "../shared/error-log";
+import { prefixedErrorLogFields, safeInstanceOf } from "../shared/error-log";
 import {
   PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
   PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
@@ -129,6 +129,7 @@ import {
   beginJobCancellation,
   consumeDeliveryMessage,
   createJob,
+  deliveryQueueMessageBody,
   expireJobArtifacts,
   finishPendingJobCleanup,
   jobForMember,
@@ -188,6 +189,16 @@ import {
   type SlackEventPayload,
 } from "./slack";
 import { diagramThumbnailResponse } from "./diagram-thumbnail";
+import {
+  correlationHeaders,
+  logger,
+  normalizedRoute,
+  recordMetric,
+  safeTelemetryErrorMessage,
+  traced,
+  withObservabilityContext,
+} from "./observability";
+import { deploymentMetadata, readiness } from "./health";
 
 const app = new Hono<{ Bindings: Env }>();
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -198,6 +209,19 @@ const TABLE_LEASE_DURATION_MS = 60_000;
 const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple", "pink"] as const;
 const MAX_IMPORT_UPLOAD_BYTES = 24 * 1024 * 1024;
 const INVITE_CLAIM_MS = 10 * 60_000;
+const CLIENT_TELEMETRY_MAX_BYTES = 8 * 1024;
+const CLIENT_TELEMETRY_EVENTS = new Set([
+  "client.global_error",
+  "client.unhandled_rejection",
+  "client.bundle_load_failed",
+  "client.api_response_invalid",
+  "client.api_response_unreadable",
+  "client.api_response_empty",
+  "client.api_unauthorized_handler_failed",
+  "client.mutation_uncertain",
+  "client.offline_storage_failed",
+  "client.realtime_connection_failed",
+]);
 
 type PageRow = PageJsonRow & {
   created_by: string;
@@ -433,14 +457,14 @@ async function readPageMoveReceiptWithDiagnostics<T>(
     if (safeInstanceOf(error, HttpError) && context.receiptReadPhase !== "recovery") throw error;
     const fields = pageMoveReceiptLogFields(error, context);
     if (safeInstanceOf(error, HttpError)) {
-      console.error("Page move recovery found a conflicting receipt.", fields);
+      logger.error("page_move.receipt.conflict", "pages", "Recovery found a conflicting receipt.", fields, error);
       throw error;
     }
     if (safeInstanceOf(error, InvalidPageMoveReceiptError)) {
-      console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, fields);
+      logger.error("page_move.receipt.invalid", "pages", PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, fields, error);
       throw new HttpError(500, "internal_error", "Something went wrong.");
     }
-    console.error(PAGE_MOVE_RECEIPT_UNREADABLE_LOG_MESSAGE, fields);
+    logger.error("page_move.receipt.unreadable", "pages", PAGE_MOVE_RECEIPT_UNREADABLE_LOG_MESSAGE, fields, error);
     throw new HttpError(
       503,
       "page_move_unresolved",
@@ -471,7 +495,7 @@ async function pruneExpiredPageMoveReceipts(database: D1Database, timestamp = no
     .bind(expiredBefore)
     .first();
   if (!remaining) return;
-  console.warn("Page move receipt pruning reached its catch-up limit; expired receipts may remain.", {
+  logger.warn("page_move.receipt_prune.capped", "pages", "Expired receipt pruning reached its catch-up limit.", {
     batchSize: PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
     maxBatches: PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
   });
@@ -589,7 +613,13 @@ function sendWorkspaceEvent(
 ) {
   c.executionCtx.waitUntil(
     broadcastWorkspaceEvent(c.env, workspaceId, event).catch((error) => {
-      console.error("Failed to broadcast workspace event", error);
+      logger.error(
+        "workspace_event.broadcast.failed",
+        "workspace-events",
+        "Workspace event broadcast failed.",
+        {},
+        error,
+      );
     }),
   );
 }
@@ -602,7 +632,15 @@ function sendCommentMutationEvents(
   sendWorkspaceEvent(c, workspaceId, { type: "comments-invalidated", pageId });
   sendWorkspaceEvent(c, workspaceId, { type: "notifications-invalidated" });
   c.executionCtx.waitUntil(
-    sweepOutbox(c.env).catch((error) => console.error("Comment notification enqueue failed", error)),
+    sweepOutbox(c.env).catch((error) =>
+      logger.error(
+        "comment.notification_enqueue.failed",
+        "comments",
+        "Comment notification enqueue failed.",
+        {},
+        error,
+      ),
+    ),
   );
 }
 
@@ -641,6 +679,81 @@ async function optionalJsonBody(request: Request) {
   }
 }
 
+interface ClientTelemetryReport {
+  event: string;
+  errorName: string;
+  fingerprint: string;
+  source?: { path: string; line: number; column: number };
+  requestId?: string;
+  release?: string;
+  online: boolean;
+  visibility: "hidden" | "visible" | "prerender";
+}
+
+function clientTelemetryReport(body: Record<string, unknown>): ClientTelemetryReport {
+  const allowedFields = new Set([
+    "event",
+    "errorName",
+    "fingerprint",
+    "source",
+    "requestId",
+    "release",
+    "online",
+    "visibility",
+  ]);
+  if (Object.keys(body).some((key) => !allowedFields.has(key))) {
+    throw new HttpError(422, "telemetry_invalid", "The telemetry report is invalid.");
+  }
+  if (
+    typeof body.event !== "string" ||
+    !CLIENT_TELEMETRY_EVENTS.has(body.event) ||
+    typeof body.errorName !== "string" ||
+    !/^[A-Za-z][A-Za-z0-9_.:-]{0,99}$/.test(body.errorName) ||
+    typeof body.fingerprint !== "string" ||
+    !/^[a-f0-9]{64}$/.test(body.fingerprint) ||
+    typeof body.online !== "boolean" ||
+    (body.visibility !== "hidden" && body.visibility !== "visible" && body.visibility !== "prerender") ||
+    (body.requestId !== undefined &&
+      (typeof body.requestId !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/.test(body.requestId))) ||
+    (body.release !== undefined && (typeof body.release !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/.test(body.release)))
+  ) {
+    throw new HttpError(422, "telemetry_invalid", "The telemetry report is invalid.");
+  }
+  let parsedSource: ClientTelemetryReport["source"];
+  if (body.source !== undefined) {
+    let location: Record<string, unknown>;
+    try {
+      location = object(body.source);
+    } catch {
+      throw new HttpError(422, "telemetry_invalid", "The telemetry report is invalid.");
+    }
+    if (
+      Object.keys(location).some((key) => key !== "path" && key !== "line" && key !== "column") ||
+      typeof location.path !== "string" ||
+      !location.path.startsWith("/") ||
+      location.path.includes("?") ||
+      location.path.length > 200 ||
+      !Number.isSafeInteger(location.line) ||
+      Number(location.line) < 1 ||
+      !Number.isSafeInteger(location.column) ||
+      Number(location.column) < 1
+    ) {
+      throw new HttpError(422, "telemetry_invalid", "The telemetry report is invalid.");
+    }
+    parsedSource = { path: location.path, line: Number(location.line), column: Number(location.column) };
+  }
+  return {
+    event: body.event,
+    errorName: body.errorName,
+    fingerprint: body.fingerprint,
+    ...(parsedSource ? { source: parsedSource } : {}),
+    ...(typeof body.requestId === "string" && body.requestId ? { requestId: body.requestId } : {}),
+    ...(typeof body.release === "string" && body.release ? { release: body.release } : {}),
+    online: body.online,
+    visibility: body.visibility,
+  };
+}
+
 function shareOptions(body: Record<string, unknown>) {
   return {
     ...(typeof body.includeSubpages === "boolean" ? { includeSubpages: body.includeSubpages } : {}),
@@ -650,12 +763,17 @@ function shareOptions(body: Record<string, unknown>) {
   };
 }
 
-async function limitedJsonBody(request: Request, limit: number) {
+async function limitedJsonBody(
+  request: Request,
+  limit: number,
+  tooLarge = () => new HttpError(413, "bulk_too_large", "The bulk table write is larger than the request limit."),
+  invalid = () => new HttpError(400, "invalid_json", "Send a valid JSON request body."),
+) {
   const declared = Number(request.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > limit) {
-    throw new HttpError(413, "bulk_too_large", "The bulk table write is larger than the request limit.");
+    throw tooLarge();
   }
-  if (!request.body) throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
+  if (!request.body) throw invalid();
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let length = 0;
@@ -665,8 +783,8 @@ async function limitedJsonBody(request: Request, limit: number) {
       if (done) break;
       length += value.byteLength;
       if (length > limit) {
-        await reader.cancel();
-        throw new HttpError(413, "bulk_too_large", "The bulk table write is larger than the request limit.");
+        await reader.cancel().catch(() => undefined);
+        throw tooLarge();
       }
       chunks.push(value);
     }
@@ -679,7 +797,7 @@ async function limitedJsonBody(request: Request, limit: number) {
     return object(JSON.parse(new TextDecoder().decode(bytes)));
   } catch (error) {
     if (safeInstanceOf(error, HttpError)) throw error;
-    throw new HttpError(400, "invalid_json", "Send a valid JSON request body.");
+    throw invalid();
   }
 }
 
@@ -1028,6 +1146,48 @@ function tableRowBinds(query: TableRowQuery, limit: number) {
 
 app.onError((error, c) => errorResponse(c, error));
 
+app.post("/api/telemetry/client-errors", async (c) => {
+  if (!c.req.header("origin")) {
+    throw new HttpError(403, "invalid_origin", "This request is not from the application origin.");
+  }
+  assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
+  const session = await createAuth(c.env).api.getSession({ headers: c.req.raw.headers });
+  if (!session) throw new HttpError(401, "unauthorized", "Sign in to continue.");
+  const ip = c.req.header("cf-connecting-ip")?.trim().toLowerCase() || "unattributed";
+  if (c.env.CLIENT_TELEMETRY_LIMIT) {
+    const { success } = await c.env.CLIENT_TELEMETRY_LIMIT.limit({ key: await sha256(`telemetry:${ip}`) });
+    if (!success) throw new HttpError(429, "telemetry_rate_limited", "Telemetry rate limit exceeded.");
+  }
+  const body = await limitedJsonBody(
+    c.req.raw,
+    CLIENT_TELEMETRY_MAX_BYTES,
+    () => new HttpError(413, "telemetry_too_large", "The telemetry report is too large."),
+    () => new HttpError(422, "telemetry_invalid", "The telemetry report is invalid."),
+  );
+  const report = clientTelemetryReport(body);
+  logger.warn("client.error.reported", "client", "The browser reported a client failure.", {
+    eventCode: report.event,
+    errorName: report.errorName,
+    fingerprint: report.fingerprint,
+    sourcePath: report.source?.path,
+    sourceLine: report.source?.line,
+    sourceColumn: report.source?.column,
+    clientRequestId: report.requestId,
+    release: report.release,
+    online: report.online,
+    visibility: report.visibility,
+  });
+  recordMetric(c.env, {
+    event: "client.error",
+    component: "client",
+    operation: report.event,
+    outcome: report.online ? "online" : "offline",
+    code: report.errorName,
+    subtype: report.fingerprint,
+  });
+  return c.body(null, 204);
+});
+
 app.get("/api/install", async (c) => {
   const state = await c.env.DB.prepare(`SELECT 1 initialized FROM install_state WHERE id = 1`).first();
   return c.json({ initialized: Boolean(state) });
@@ -1202,7 +1362,15 @@ app.post("/api/invites/accept", async (c) => {
         WHERE id=? AND claim_token=? AND claimed_by IS NULL`)
         .bind(invite.id, claimToken)
         .run()
-        .catch((error) => console.error("Failed to release invite signup reservation", { inviteId: invite.id, error }));
+        .catch((error) =>
+          logger.warn(
+            "invite.signup_reservation.release_failed",
+            "invites",
+            "Failed to release an invite signup reservation.",
+            { inviteId: invite.id },
+            error,
+          ),
+        );
     }
   }
 });
@@ -1287,7 +1455,34 @@ app.get("/api/me", async (c) => {
 
 app.get("/api/health", async (c) => {
   const database = await c.env.DB.prepare(`SELECT 1 ok`).first<{ ok: number }>();
-  return c.json({ ok: database?.ok === 1, version: "0.1.0", time: new Date().toISOString() });
+  return c.json({
+    ok: database?.ok === 1,
+    version: "0.1.0",
+    deployment: deploymentMetadata(c.env),
+    time: new Date().toISOString(),
+  });
+});
+
+app.get("/api/health/ready", async (c) => {
+  const expected = c.env.OBSERVABILITY_PROBE_TOKEN;
+  const supplied = c.req.header("x-observability-token") ?? "";
+  if (!expected || !supplied || !constantTimeEqual(supplied, expected)) {
+    return c.json({ ok: false, code: "probe_unauthorized" }, 401);
+  }
+  const result = await readiness(c.env);
+  const response = {
+    ok: result.ok,
+    status: result.ok ? "ready" : "degraded",
+    deployment: deploymentMetadata(c.env),
+    time: new Date().toISOString(),
+    checks: result.checks,
+  };
+  if (!result.ok) {
+    logger.error("health.readiness.failed", "health", "One or more readiness checks failed.", {
+      codes: result.checks.filter((check) => !check.ok).map((check) => check.code),
+    });
+  }
+  return c.json(response, result.ok ? 200 : 503);
 });
 
 app.get("/api/members", async (c) => {
@@ -1764,7 +1959,13 @@ app.post("/api/templates", async (c) => {
   });
   c.executionCtx.waitUntil(
     startJobExecution(c.env, job).catch((error) => {
-      console.error("Failed to start template creation workflow", { jobId: job.id, error });
+      logger.error(
+        "workflow.template_create.start_failed",
+        "workflow",
+        "Template creation workflow failed to start.",
+        { jobId: job.id },
+        error,
+      );
     }),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -1804,7 +2005,13 @@ app.post("/api/templates/:id/instantiate", async (c) => {
   });
   c.executionCtx.waitUntil(
     startJobExecution(c.env, job).catch((error) => {
-      console.error("Failed to start template instantiation workflow", { jobId: job.id, error });
+      logger.error(
+        "workflow.template_instantiate.start_failed",
+        "workflow",
+        "Template instantiation workflow failed to start.",
+        { jobId: job.id },
+        error,
+      );
     }),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -1871,7 +2078,13 @@ app.post("/api/import-uploads", async (c) => {
   const uploaded = (await c.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(job.id).first<JobRow>())!;
   c.executionCtx.waitUntil(
     startJobExecution(c.env, uploaded).catch((error) => {
-      console.error("Failed to start import inspection workflow", { jobId: job.id, error });
+      logger.error(
+        "workflow.import_inspect.start_failed",
+        "workflow",
+        "Import inspection workflow failed to start.",
+        { jobId: job.id },
+        error,
+      );
     }),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -1913,11 +2126,13 @@ async function refreshImportPreview(c: Context<{ Bindings: Env }>, member: Membe
     );
   c.executionCtx.waitUntil(
     startJobExecution(c.env, refreshed).catch((error) => {
-      console.error("Failed to start import reinspection workflow", {
-        jobId: job.id,
-        attempt: refreshed.attempt,
+      logger.error(
+        "workflow.import_reinspect.start_failed",
+        "workflow",
+        "Import reinspection workflow failed to start.",
+        { jobId: job.id, attempt: refreshed.attempt },
         error,
-      });
+      );
     }),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -2006,7 +2221,13 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
   const confirmed = await jobForMember(c.env, member, job.id);
   c.executionCtx.waitUntil(
     startJobExecution(c.env, confirmed).catch((error) => {
-      console.error("Failed to start confirmed import workflow", { jobId: job.id, error });
+      logger.error(
+        "workflow.import_confirmed.start_failed",
+        "workflow",
+        "Confirmed import workflow failed to start.",
+        { jobId: job.id },
+        error,
+      );
     }),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -2051,7 +2272,13 @@ app.post("/api/jobs/search-reindex", async (c) => {
   const job = await createJob(c.env, { member, type: "search_reindex" });
   c.executionCtx.waitUntil(
     startJobExecution(c.env, job).catch((error) => {
-      console.error("Failed to start search reindex workflow", { jobId: job.id, error });
+      logger.error(
+        "workflow.search_reindex.start_failed",
+        "workflow",
+        "Search reindex workflow failed to start.",
+        { jobId: job.id },
+        error,
+      );
     }),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -2071,7 +2298,13 @@ app.post("/api/jobs/comment-migration", async (c) => {
   const job = await createJob(c.env, { member, type: "comment_migration" });
   c.executionCtx.waitUntil(
     startJobExecution(c.env, job).catch((error) => {
-      console.error("Failed to start comment migration workflow", { jobId: job.id, error });
+      logger.error(
+        "workflow.comment_migration.start_failed",
+        "workflow",
+        "Comment migration workflow failed to start.",
+        { jobId: job.id },
+        error,
+      );
     }),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -2091,7 +2324,13 @@ app.post("/api/jobs/:id/cancel", async (c) => {
   }
   c.executionCtx.waitUntil(
     finishPendingJobCleanup(c.env, job).catch((error) =>
-      console.error("Failed to terminate or clean up canceled job", { jobId: job.id, error }),
+      logger.error(
+        "workflow.canceled.cleanup_failed",
+        "workflow",
+        "Canceled job cleanup failed.",
+        { jobId: job.id },
+        error,
+      ),
     ),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -2174,7 +2413,13 @@ app.post("/api/jobs/:id/retry", async (c) => {
   if (!retried) throw new HttpError(409, "job_not_retryable", "This job was already retried.");
   c.executionCtx.waitUntil(
     startJobExecution(c.env, retried).catch((error) => {
-      console.error("Failed to restart job workflow", { jobId: job.id, error });
+      logger.error(
+        "workflow.job.restart_failed",
+        "workflow",
+        "Job workflow failed to restart.",
+        { jobId: job.id },
+        error,
+      );
     }),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -2189,7 +2434,13 @@ app.post("/api/jobs/:id/cleanup", async (c) => {
   }
   c.executionCtx.waitUntil(
     finishPendingJobCleanup(c.env, job).catch((error) =>
-      console.error("Failed to retry pending job cleanup", { jobId: job.id, error }),
+      logger.error(
+        "workflow.cleanup.retry_failed",
+        "workflow",
+        "Pending job cleanup retry failed.",
+        { jobId: job.id },
+        error,
+      ),
     ),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -2311,14 +2562,23 @@ app.post("/api/webhooks", async (c) => {
     sendWebhookVerification(c.env, created.subscription.id)
       .then((result) => {
         if (!result.ok) {
-          console.error("Webhook verification request failed", {
-            subscriptionId: created.subscription.id,
-            error: result.error,
-          });
+          logger.error(
+            "webhook.verification.failed",
+            "webhook",
+            "Webhook verification request failed.",
+            { subscriptionId: created.subscription.id },
+            result.error,
+          );
         }
       })
       .catch((error) =>
-        console.error("Webhook verification request failed", { subscriptionId: created.subscription.id, error }),
+        logger.error(
+          "webhook.verification.failed",
+          "webhook",
+          "Webhook verification request failed.",
+          { subscriptionId: created.subscription.id },
+          error,
+        ),
       ),
   );
   return c.json({ subscription: created.subscription }, 201);
@@ -2506,7 +2766,13 @@ app.post("/api/pages/:id/exports", async (c) => {
   });
   c.executionCtx.waitUntil(
     startJobExecution(c.env, job).catch((error) => {
-      console.error("Failed to start export workflow", { jobId: job.id, error });
+      logger.error(
+        "workflow.export.start_failed",
+        "workflow",
+        "Export workflow failed to start.",
+        { jobId: job.id },
+        error,
+      );
     }),
   );
   sendWorkspaceEvent(c, member.workspace.id, { type: "jobs-invalidated" });
@@ -2955,7 +3221,11 @@ app.post("/api/comment-threads/:id/anchor", async (c) => {
     const response = await c.env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
       new Request("https://document.internal/comment-anchor", {
         method: "POST",
-        headers: { "content-type": "application/json", "x-notes-internal": c.env.BETTER_AUTH_SECRET },
+        headers: {
+          "content-type": "application/json",
+          "x-notes-internal": c.env.BETTER_AUTH_SECRET,
+          ...correlationHeaders(),
+        },
         body: JSON.stringify({ operation: "add", threadId, userId: member.user.id, selection: yjs }),
       }),
     );
@@ -3182,7 +3452,7 @@ app.get("/api/pages/:id/content", async (c) => {
     projectionLocation ? { locationHint: projectionLocation } : undefined,
   ).fetch(
     new Request("https://document.internal/content", {
-      headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET },
+      headers: { "x-notes-internal": c.env.BETTER_AUTH_SECRET, ...correlationHeaders() },
     }),
   );
   if (!response.ok) throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
@@ -3377,17 +3647,26 @@ app.post("/api/pages/:id/move", async (c) => {
       moved = pageFromMoveReceipt(receipt, member.workspace.id, pageId, requestHash);
     } catch (receiptError) {
       if (!safeInstanceOf(receiptError, InvalidPageMoveReceiptError)) {
-        console.error(
+        logger.error(
+          "page_move.receipt.inconsistent",
+          "pages",
           "Committed page move receipt result was inconsistent.",
           pageMoveReceiptLogFields(receiptError, commitReceiptContext),
+          receiptError,
         );
         throw new Error("The committed page move receipt result was inconsistent.", { cause: receiptError });
       }
       const unusablePageState = (pageStateError: unknown, cause = pageStateError) => {
-        console.error(PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE, {
-          ...pageMoveReceiptLogFields(receiptError, commitReceiptContext),
-          ...prefixedErrorLogFields("pageStateError", pageStateError),
-        });
+        logger.error(
+          "page_move.receipt.invalid",
+          "pages",
+          PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE,
+          {
+            ...pageMoveReceiptLogFields(receiptError, commitReceiptContext),
+            ...prefixedErrorLogFields("pageStateError", pageStateError),
+          },
+          receiptError,
+        );
         return new Error("The committed page move receipt and fallback state were unusable.", { cause });
       };
       const committedPageRow = pageMoveStateRow(results[pageStateResultIndex]?.results[0]);
@@ -3400,12 +3679,15 @@ app.post("/api/pages/:id/move", async (c) => {
       } catch (pageStateError) {
         throw unusablePageState(pageStateError);
       }
-      console.error(
+      logger.error(
+        "page_move.receipt.invalid",
+        "pages",
         PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE,
         pageMoveReceiptLogFields(receiptError, {
           ...commitReceiptContext,
           recoveredFromPageState: true,
         }),
+        receiptError,
       );
     }
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
@@ -3423,9 +3705,12 @@ app.post("/api/pages/:id/move", async (c) => {
       );
     } finally {
       if (invalidBatchResult) {
-        console.error(
+        logger.error(
+          "page_move.batch_result.invalid",
+          "pages",
           PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE,
           pageMoveLogFields({ ...recoveryContext, recoveredFromReceipt: committed !== null }),
+          error,
         );
       }
     }
@@ -3810,7 +4095,13 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
     try {
       await c.env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ?`).bind(jobId).run();
     } catch (cleanupError) {
-      console.error("Failed to discard staged deletion job", cleanupError);
+      logger.error(
+        "deletion.staged_job.discard_failed",
+        "deletion",
+        "Staged deletion job could not be discarded.",
+        { jobId },
+        cleanupError,
+      );
     }
     throw error;
   }
@@ -3818,7 +4109,7 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: true });
   c.executionCtx.waitUntil(
     processDeletionJob(c.env, jobId).catch((error) => {
-      console.error("Immediate deletion cleanup failed", error);
+      logger.error("deletion.cleanup.failed", "deletion", "Immediate deletion cleanup failed.", { jobId }, error);
     }),
   );
   return c.json({ ok: true, pageIds, cleanupPending: true }, 202);
@@ -4408,7 +4699,13 @@ app.post("/api/pages/:id/uploads", async (c) => {
     // Nothing records this upload yet, so abandoning it here would leak parts with no
     // row for the reaper to find them by.
     await upload.abort().catch((abortError) => {
-      console.error("Failed to abort an unrecorded multipart upload", abortError);
+      logger.error(
+        "upload.multipart.abort_failed",
+        "attachments",
+        "Unrecorded multipart upload could not be aborted.",
+        { uploadId: id },
+        abortError,
+      );
     });
     const completedReplay = await attachmentById(c.env, member.workspace.id, id);
     if (completedReplay && sameAttachment(completedReplay, expected)) {
@@ -4576,7 +4873,13 @@ app.post("/api/uploads/:uploadId/complete", async (c) => {
             .bind("R2 multipart completion failed", now(), now() + UPLOAD_SESSION_TTL_MS, session.id)
             .run()
             .catch(() => undefined);
-          console.error("Failed to complete a multipart upload", error);
+          logger.error(
+            "upload.multipart.complete_failed",
+            "attachments",
+            "Multipart upload completion failed.",
+            { uploadId: session.id },
+            error,
+          );
           throw new HttpError(503, "multipart_complete_failed", "The upload could not be finalised. Retry it.");
         }
       }
@@ -4710,6 +5013,7 @@ app.post("/api/pages/:id/restore-version", async (c) => {
       headers: {
         "content-type": "application/json",
         "x-notes-internal": c.env.BETTER_AUTH_SECRET,
+        ...correlationHeaders(),
       },
       body: JSON.stringify({ versionId, userId: member.user.id }),
     }),
@@ -5740,11 +6044,17 @@ async function guardedBatch(
   // Logged explicitly because errorResponse only logs unexpected errors, and an
   // HttpError describing a violated invariant is the one exception worth seeing.
   // The lease token and session id are omitted: they authenticate the caller.
-  console.error("Table revision could not be advanced", {
+  logger.error("table.revision.invariant_failed", "table", "Table revision could not be advanced.", {
     pageId,
     expectedRevision: input.expectedRevision,
     revision: state.revision,
     leaseValid: Boolean(state.lease_valid),
+  });
+  recordMetric(env, {
+    event: "invariant.corruption",
+    component: "table",
+    operation: "revision_advance",
+    outcome: "failure",
   });
   throw new HttpError(500, "table_revision_failed", "The table revision could not be advanced.");
 }
@@ -5799,6 +6109,7 @@ async function handlePartyRequest(request: Request, env: Env) {
         headers.set("x-notes-user-id", member.user.id);
         headers.set("x-notes-role", connectionRole ?? member.role);
         headers.set("x-notes-expires-at", String(expiresAt));
+        for (const [name, value] of Object.entries(correlationHeaders())) headers.set(name, value);
         return new Request(incoming, { headers });
       },
     });
@@ -5809,98 +6120,260 @@ async function handlePartyRequest(request: Request, env: Env) {
     const { expected, status, body } = classifyError(error);
     if (!expected) {
       const party = isDocument ? "document" : "workspace-events";
-      console.error(`Failed to handle ${party} party request for ${room ?? "an undecoded room"}`, {
+      logger.error(
+        "realtime.handshake.failed",
         party,
-        room: room ?? null,
-        ...errorLogFields(error),
-      });
+        "Realtime party request failed.",
+        { party, room: room ?? null },
+        error,
+      );
     }
     return Response.json(body, { status });
   }
 }
 
+export type ScheduledTask = { name: string; run: () => Promise<unknown> };
+
+async function recordScheduledTaskStart(env: Env, taskName: string, startedAt: number) {
+  await env.DB.prepare(
+    `INSERT INTO observability_task_runs (task_name, last_started_at)
+      VALUES (?, ?)
+      ON CONFLICT(task_name) DO UPDATE SET last_started_at = excluded.last_started_at`,
+  )
+    .bind(taskName, startedAt)
+    .run();
+}
+
+async function recordScheduledTaskResult(env: Env, taskName: string, startedAt: number, error?: unknown) {
+  const finishedAt = Date.now();
+  if (error === undefined) {
+    await env.DB.prepare(
+      `UPDATE observability_task_runs
+          SET last_succeeded_at = ?, last_duration_ms = ?, last_error = NULL
+        WHERE task_name = ?`,
+    )
+      .bind(finishedAt, Math.max(0, finishedAt - startedAt), taskName)
+      .run();
+    return;
+  }
+  await env.DB.prepare(
+    `UPDATE observability_task_runs
+        SET last_failed_at = ?, last_duration_ms = ?, last_error = ?
+      WHERE task_name = ?`,
+  )
+    .bind(
+      finishedAt,
+      Math.max(0, finishedAt - startedAt),
+      safeTelemetryErrorMessage(error, "Scheduled task failed"),
+      taskName,
+    )
+    .run();
+}
+
+async function runScheduledTask(env: Env, context: ExecutionContext, task: ScheduledTask) {
+  const startedAt = Date.now();
+  try {
+    await recordScheduledTaskStart(env, task.name, startedAt);
+  } catch (error) {
+    logger.warn(
+      "scheduled.task_state.failed",
+      "scheduler",
+      "Scheduled task start state could not be recorded",
+      { taskName: task.name },
+      error,
+    );
+  }
+  try {
+    await traced(context.tracing, `notes.scheduled.${task.name}`, { "notes.task": task.name }, async () => {
+      await task.run();
+    });
+  } catch (error) {
+    try {
+      await recordScheduledTaskResult(env, task.name, startedAt, error);
+    } catch (stateError) {
+      logger.warn(
+        "scheduled.task_state.failed",
+        "scheduler",
+        "Scheduled task failure state could not be recorded",
+        { taskName: task.name },
+        stateError,
+      );
+    }
+    logger.error("scheduled.task.failed", "scheduler", "Scheduled task failed", { taskName: task.name }, error);
+    recordMetric(env, {
+      event: "scheduled.task",
+      component: "scheduler",
+      operation: task.name,
+      outcome: "failure",
+      durationMs: Date.now() - startedAt,
+    });
+    throw error;
+  }
+  try {
+    await recordScheduledTaskResult(env, task.name, startedAt);
+  } catch (error) {
+    logger.warn(
+      "scheduled.task_state.failed",
+      "scheduler",
+      "Scheduled task success state could not be recorded",
+      { taskName: task.name },
+      error,
+    );
+  }
+  recordMetric(env, {
+    event: "scheduled.task",
+    component: "scheduler",
+    operation: task.name,
+    outcome: "success",
+    durationMs: Date.now() - startedAt,
+  });
+}
+
+export async function executeScheduledTasks(env: Env, context: ExecutionContext, tasks: readonly ScheduledTask[]) {
+  const results = await Promise.allSettled(tasks.map((task) => runScheduledTask(env, context, task)));
+  const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failures.length)
+    throw new AggregateError(
+      failures.map((failure) => failure.reason),
+      "Scheduled tasks failed",
+    );
+}
+
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext) {
-    const party = await handlePartyRequest(request, env);
-    if (party) return party;
-    return app.fetch(request, env, context);
+    const requestId = crypto.randomUUID();
+    const rayId = request.headers.get("cf-ray") ?? undefined;
+    return withObservabilityContext(
+      env,
+      {
+        trigger: "fetch",
+        requestId,
+        correlationId: requestId,
+        ...(rayId ? { rayId } : {}),
+      },
+      async () => {
+        const startedAt = performance.now();
+        const route = normalizedRoute(new URL(request.url).pathname);
+        let response: Response;
+        try {
+          response = await traced(
+            context.tracing,
+            "notes.route_request",
+            { "notes.request_id": requestId, "http.route": route },
+            async () => {
+              const party = await handlePartyRequest(request, env);
+              return party ?? app.fetch(request, env, context);
+            },
+          );
+        } catch (error) {
+          logger.error(
+            "http.request.failed",
+            "http",
+            "Request handling failed outside the application router",
+            { route },
+            error,
+          );
+          recordMetric(env, {
+            event: "http.request",
+            component: "http",
+            operation: route,
+            outcome: "exception",
+            code: "500",
+            durationMs: performance.now() - startedAt,
+          });
+          throw error;
+        }
+        const headers = new Headers(response.headers);
+        headers.set("x-request-id", requestId);
+        headers.set("x-worker-version", env.CF_VERSION_METADATA?.id ?? "local");
+        const contentLength = Number(headers.get("content-length"));
+        recordMetric(env, {
+          event: "http.request",
+          component: "http",
+          operation: route,
+          outcome: response.status >= 500 ? "server_error" : response.status >= 400 ? "client_error" : "success",
+          code: String(response.status),
+          durationMs: performance.now() - startedAt,
+          ...(Number.isFinite(contentLength) ? { bytes: contentLength } : {}),
+        });
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+          webSocket: response.webSocket,
+        });
+      },
+    );
   },
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext) {
-    context.waitUntil(
-      processDueArchiveDisconnects(env).catch((error) => {
-        console.error("Scheduled archive disconnect failed", error);
-      }),
-    );
-    context.waitUntil(
-      processDueDeletionJobs(env).catch((error) => {
-        console.error("Scheduled deletion cleanup failed", error);
-      }),
-    );
-    context.waitUntil(
-      processDueUploadReaps(env).catch((error) => {
-        console.error("Scheduled upload reap failed", error);
-      }),
-    );
-    context.waitUntil(
-      pruneExpiredPageMoveReceipts(env.DB).catch((error) => {
-        console.error("Failed to prune page move receipts", error);
-      }),
-    );
-    context.waitUntil(
-      recoverQueuedJobs(env).catch((error) => {
-        console.error("Queued job recovery failed", error);
-      }),
-    );
-    context.waitUntil(
-      sweepOutbox(env).catch((error) => {
-        console.error("Outbox sweep failed", error);
-      }),
-    );
-    context.waitUntil(
-      expireJobArtifacts(env).catch((error) => {
-        console.error("Job artifact expiry failed", error);
-      }),
-    );
-    context.waitUntil(
-      sendDueNotificationDigests(env).catch((error) => {
-        console.error("Notification digest delivery failed", error);
-      }),
-    );
-    context.waitUntil(
-      sendDueSlackChannelDigests(env).catch((error) => {
-        console.error("Slack channel digest delivery failed", error);
-      }),
-    );
-    context.waitUntil(
-      pruneSlackSecurityRecords(env).catch((error) => {
-        console.error("Slack security-record pruning failed", error);
-      }),
-    );
-    context.waitUntil(
-      pruneWebhookHistory(env).catch((error) => {
-        console.error("Webhook history pruning failed", error);
-      }),
-    );
-    context.waitUntil(
-      pruneSecurityState(env).catch((error) => {
-        console.error("Security state pruning failed", error);
-      }),
-    );
+    const correlationId = crypto.randomUUID();
+    return withObservabilityContext(env, { trigger: "scheduled", correlationId }, async () => {
+      const tasks: ScheduledTask[] = [
+        { name: "archive_disconnects", run: () => processDueArchiveDisconnects(env) },
+        { name: "deletion_jobs", run: () => processDueDeletionJobs(env) },
+        { name: "upload_reaps", run: () => processDueUploadReaps(env) },
+        { name: "page_move_receipts", run: () => pruneExpiredPageMoveReceipts(env.DB) },
+        { name: "queued_jobs", run: () => recoverQueuedJobs(env) },
+        { name: "outbox", run: () => sweepOutbox(env) },
+        { name: "job_artifacts", run: () => expireJobArtifacts(env) },
+        { name: "notification_digests", run: () => sendDueNotificationDigests(env) },
+        { name: "slack_digests", run: () => sendDueSlackChannelDigests(env) },
+        { name: "slack_security_records", run: () => pruneSlackSecurityRecords(env) },
+        { name: "webhook_history", run: () => pruneWebhookHistory(env) },
+        { name: "security_state", run: () => pruneSecurityState(env) },
+      ];
+      await executeScheduledTasks(env, context, tasks);
+      logger.info("scheduled.run.completed", "scheduler", "Scheduled maintenance completed", {
+        taskCount: tasks.length,
+      });
+    });
   },
-  async queue(batch: MessageBatch<DeliveryQueueMessage>, env: Env) {
+  async queue(batch: MessageBatch<DeliveryQueueMessage>, env: Env, context?: ExecutionContext) {
     await Promise.all(
       batch.messages.map(async (message) => {
-        try {
-          await consumeDeliveryMessage(env, message);
-        } catch (error) {
-          console.error("Delivery queue message failed", { messageId: message.id, attempts: message.attempts, error });
-          message.retry({
-            delaySeconds:
-              error instanceof SlackRateLimitError || error instanceof DeliveryInProgressError
-                ? error.retryAfter
-                : Math.min(300, 2 ** Math.min(message.attempts, 8)),
-          });
-        }
+        const body = deliveryQueueMessageBody(message.body);
+        const correlationId = body?.correlationId ?? (body && "outboxId" in body ? body.outboxId : message.id);
+        await withObservabilityContext(env, { trigger: "queue", correlationId }, async () => {
+          const startedAt = performance.now();
+          try {
+            await traced(
+              context?.tracing,
+              "notes.outbox.delivery",
+              { "messaging.queue": batch.queue, "messaging.attempt": message.attempts },
+              () => consumeDeliveryMessage(env, message),
+            );
+            recordMetric(env, {
+              event: "queue.delivery",
+              component: "delivery-queue",
+              operation: batch.queue,
+              outcome: "success",
+              attempts: message.attempts,
+              durationMs: performance.now() - startedAt,
+            });
+          } catch (error) {
+            logger.error(
+              "queue.delivery.failed",
+              "delivery-queue",
+              "Delivery queue message failed",
+              { messageId: message.id, attempts: message.attempts },
+              error,
+            );
+            recordMetric(env, {
+              event: "queue.delivery",
+              component: "delivery-queue",
+              operation: batch.queue,
+              outcome: "failure",
+              attempts: message.attempts,
+              durationMs: performance.now() - startedAt,
+            });
+            message.retry({
+              delaySeconds:
+                error instanceof SlackRateLimitError || error instanceof DeliveryInProgressError
+                  ? error.retryAfter
+                  : Math.min(300, 2 ** Math.min(message.attempts, 8)),
+            });
+          }
+        });
       }),
     );
   },
