@@ -155,7 +155,9 @@ There is no supported way to invoke the deployed cron on demand. Options:
 - Locally, `pnpm wrangler dev --test-scheduled` exposes a `/__scheduled` endpoint.
 
 Confirm a tick ran with `SELECT * FROM observability_task_runs ORDER BY task_name`; every subtask records its
-last start, success/failure, duration, and bounded error. The invocation rejects only after all subtasks finish.
+real last start (`0` means not yet started), success/failure heartbeat, duration, and bounded error. The separate
+execution token prevents older overlapping results from replacing newer error or duration state. The invocation
+rejects only after all subtasks finish.
 
 ## Leases
 

@@ -27,9 +27,9 @@ function property(value: object, name: string): unknown {
   }
 }
 
-function stringProperty(value: object, name: string, limit: number) {
+function stringProperty(value: object, name: string, limit: number, sanitize: (value: string) => string) {
   const candidate = property(value, name);
-  return typeof candidate === "string" ? boundedLogString(candidate, limit) : null;
+  return typeof candidate === "string" ? boundedLogString(sanitize(candidate), limit) : null;
 }
 
 export function safeInstanceOf<Instance>(
@@ -57,18 +57,22 @@ function logPrimitive(value: unknown, stringLimit: number) {
   return undefined;
 }
 
-export function safeErrorMessage(error: unknown, fallback: string) {
+export function rawSafeErrorMessage(error: unknown, fallback: string) {
   const message =
     typeof error === "string" ? error : typeof error === "object" && error !== null ? property(error, "message") : null;
   if (typeof message === "string") {
     const trimmed = message.trim();
-    if (trimmed) return boundedLogString(trimmed, PERSISTED_ERROR_MESSAGE_LIMIT);
+    if (trimmed) return trimmed;
   }
-  return boundedLogString(fallback, PERSISTED_ERROR_MESSAGE_LIMIT);
+  return fallback;
 }
 
-function logValue(value: unknown) {
-  const primitive = logPrimitive(value, ERROR_MESSAGE_LIMIT);
+export function safeErrorMessage(error: unknown, fallback: string) {
+  return boundedLogString(rawSafeErrorMessage(error, fallback), PERSISTED_ERROR_MESSAGE_LIMIT);
+}
+
+function logValue(value: unknown, sanitize: (value: string) => string) {
+  const primitive = logPrimitive(typeof value === "string" ? sanitize(value) : value, ERROR_MESSAGE_LIMIT);
   if (primitive !== undefined) return primitive;
   if (value === undefined) return "undefined";
   if (typeof value === "object") {
@@ -85,7 +89,8 @@ function logValue(value: unknown) {
       ["syscall", ERROR_MESSAGE_LIMIT],
     ] as const;
     for (const [name, limit] of properties) {
-      const logged = logPrimitive(property(objectValue, name), limit);
+      const candidate = property(objectValue, name);
+      const logged = logPrimitive(typeof candidate === "string" ? sanitize(candidate) : candidate, limit);
       if (logged !== undefined) metadata[name] = logged;
     }
     if (Object.keys(metadata).length) return metadata;
@@ -93,26 +98,40 @@ function logValue(value: unknown) {
   return `[${typeof value} omitted]`;
 }
 
-export function prefixedErrorLogFields(prefix: string, error: unknown, includeCause = true): Record<string, unknown> {
+export function prefixedErrorLogFields(
+  prefix: string,
+  error: unknown,
+  includeCause = true,
+  sanitize: (value: string) => string = (value) => value,
+): Record<string, unknown> {
   if (isErrorLike(error)) {
     const status = property(error, "status");
     const code = property(error, "code");
     const loggedStatus = typeof status === "number" && Number.isFinite(status) ? status : undefined;
     const loggedCode =
       typeof code === "string"
-        ? boundedLogString(code, ERROR_CODE_LIMIT)
+        ? boundedLogString(sanitize(code), ERROR_CODE_LIMIT)
         : typeof code === "number" && Number.isFinite(code)
           ? String(code)
           : typeof code === "bigint"
             ? boundedLogString(String(code), ERROR_CODE_LIMIT)
             : undefined;
-    const reason = logPrimitive(property(error, "reason"), ERROR_MESSAGE_LIMIT);
-    const errno = logPrimitive(property(error, "errno"), ERROR_MESSAGE_LIMIT);
-    const syscall = logPrimitive(property(error, "syscall"), ERROR_MESSAGE_LIMIT);
+    const reasonValue = property(error, "reason");
+    const errnoValue = property(error, "errno");
+    const syscallValue = property(error, "syscall");
+    const reason = logPrimitive(
+      typeof reasonValue === "string" ? sanitize(reasonValue) : reasonValue,
+      ERROR_MESSAGE_LIMIT,
+    );
+    const errno = logPrimitive(typeof errnoValue === "string" ? sanitize(errnoValue) : errnoValue, ERROR_MESSAGE_LIMIT);
+    const syscall = logPrimitive(
+      typeof syscallValue === "string" ? sanitize(syscallValue) : syscallValue,
+      ERROR_MESSAGE_LIMIT,
+    );
     const fields: Record<string, unknown> = {
-      [`${prefix}Name`]: stringProperty(error, "name", ERROR_NAME_LIMIT),
-      [`${prefix}Message`]: stringProperty(error, "message", ERROR_MESSAGE_LIMIT),
-      [`${prefix}Stack`]: stringProperty(error, "stack", ERROR_STACK_LIMIT),
+      [`${prefix}Name`]: stringProperty(error, "name", ERROR_NAME_LIMIT, sanitize),
+      [`${prefix}Message`]: stringProperty(error, "message", ERROR_MESSAGE_LIMIT, sanitize),
+      [`${prefix}Stack`]: stringProperty(error, "stack", ERROR_STACK_LIMIT, sanitize),
       [`${prefix}Type`]: "object",
       ...(loggedStatus !== undefined ? { [`${prefix}Status`]: loggedStatus } : {}),
       ...(loggedCode !== undefined ? { [`${prefix}Code`]: loggedCode } : {}),
@@ -123,20 +142,20 @@ export function prefixedErrorLogFields(prefix: string, error: unknown, includeCa
     if (includeCause) {
       const cause = property(error, "cause");
       if (cause !== undefined && cause !== error) {
-        Object.assign(fields, prefixedErrorLogFields(`${prefix}Cause`, cause, false));
+        Object.assign(fields, prefixedErrorLogFields(`${prefix}Cause`, cause, false, sanitize));
       }
     }
     return fields;
   }
   return {
     [`${prefix}Name`]: null,
-    [`${prefix}Message`]: typeof error === "string" ? boundedLogString(error, ERROR_MESSAGE_LIMIT) : null,
+    [`${prefix}Message`]: typeof error === "string" ? boundedLogString(sanitize(error), ERROR_MESSAGE_LIMIT) : null,
     [`${prefix}Stack`]: null,
     [`${prefix}Type`]: error === null ? "null" : typeof error,
-    [`${prefix}Value`]: logValue(error),
+    [`${prefix}Value`]: logValue(error, sanitize),
   };
 }
 
-export function errorLogFields(error: unknown) {
-  return prefixedErrorLogFields("error", error);
+export function errorLogFields(error: unknown, sanitize?: (value: string) => string) {
+  return prefixedErrorLogFields("error", error, true, sanitize);
 }

@@ -1,6 +1,6 @@
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
-import { routePath } from "hono/route";
+import { matchedRoutes, routePath } from "hono/route";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { pruneSecurityState, requireSecurity } from "./security";
@@ -203,14 +203,19 @@ import {
 } from "./observability";
 import { deploymentMetadata, readiness } from "./health";
 import { SCHEDULED_TASK_NAMES, type ScheduledTaskName } from "./scheduled-task-names";
+import { sourceRateLimitKey } from "./source-rate-limit";
 
 const app = new Hono<{ Bindings: Env }>();
 app.use("*", async (c, next) => {
   try {
     await next();
   } finally {
-    const registered = routePath(c);
-    setMetricRouteTemplate(registered === "*" || registered === "/*" ? "/unmatched" : registered);
+    const current = routePath(c);
+    const registered =
+      current === "/v1/*"
+        ? matchedRoutes(c).find((route) => route.path !== "/*" && route.path !== "/v1/*")?.path
+        : current;
+    setMetricRouteTemplate(!registered || registered === "*" || registered === "/*" ? "/unmatched" : registered);
   }
 });
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -1147,9 +1152,8 @@ function tableRowBinds(query: TableRowQuery, limit: number) {
 app.onError((error, c) => errorResponse(c, error));
 
 app.post("/api/telemetry/client-errors", async (c) => {
-  const ip = c.req.header("cf-connecting-ip")?.trim().toLowerCase() || "unattributed";
   const { success: sourceAllowed } = await c.env.CLIENT_TELEMETRY_PREAUTH_LIMIT.limit({
-    key: await sha256(`telemetry-source:${ip}`),
+    key: await sourceRateLimitKey(c.req.raw),
   });
   if (!sourceAllowed) throw new HttpError(429, "telemetry_rate_limited", "Telemetry rate limit exceeded.");
   if (!c.req.header("origin")) {
@@ -5922,6 +5926,7 @@ app.get(
 app.route("/v1", notionApi);
 
 app.notFound(async (c) => {
+  setMetricRouteTemplate("/unmatched");
   if (new URL(c.req.url).pathname.startsWith("/api/")) {
     return c.json({ error: { code: "not_found", message: "API route not found." } }, 404);
   }
@@ -6072,6 +6077,7 @@ async function handlePartyRequest(request: Request, env: Env) {
   const isDocument = url.pathname.startsWith(documentPrefix);
   const isWorkspace = url.pathname.startsWith(workspacePrefix);
   if (!isDocument && !isWorkspace) return null;
+  setMetricRouteTemplate(isDocument ? "/parties/document/:room" : "/parties/workspace-events/:workspace");
   const roomNotFound = () =>
     new HttpError(404, "room_not_found", isDocument ? "Document room not found." : "Workspace event room not found.");
   // Declared outside the try so a failure log can name the room. It only stays
@@ -6142,16 +6148,18 @@ export type ScheduledTask = { name: string; run: () => Promise<unknown> };
 
 async function recordScheduledTaskStart(env: Env, taskName: string, startedAt: number) {
   const row = await env.DB.prepare(
-    `INSERT INTO observability_task_runs (task_name, last_started_at)
-      VALUES (?, ?)
+    `INSERT INTO observability_task_runs (task_name, last_started_at, execution_token, first_observed_at)
+      VALUES (?, ?, 1, ?)
       ON CONFLICT(task_name) DO UPDATE SET
-        last_started_at = MAX(observability_task_runs.last_started_at + 1, excluded.last_started_at)
-      RETURNING last_started_at`,
+        last_started_at = excluded.last_started_at,
+        execution_token = COALESCE(observability_task_runs.execution_token, observability_task_runs.last_started_at, 0) + 1,
+        first_observed_at = COALESCE(observability_task_runs.first_observed_at, observability_task_runs.last_started_at)
+      RETURNING execution_token`,
   )
-    .bind(taskName, startedAt)
-    .first<{ last_started_at: number }>();
-  if (!row || !Number.isSafeInteger(row.last_started_at)) throw new Error("Scheduled task start token unavailable");
-  return row.last_started_at;
+    .bind(taskName, startedAt, startedAt)
+    .first<{ execution_token: number }>();
+  if (!row || !Number.isSafeInteger(row.execution_token)) throw new Error("Scheduled task start token unavailable");
+  return row.execution_token;
 }
 
 async function recordScheduledTaskResult(
@@ -6165,20 +6173,33 @@ async function recordScheduledTaskResult(
   if (error === undefined) {
     await env.DB.prepare(
       `INSERT INTO observability_task_runs
-          (task_name, last_started_at, last_succeeded_at, last_duration_ms, last_error)
-        VALUES (?, ?, ?, ?, NULL)
+          (task_name, last_started_at, execution_token, first_observed_at,
+           last_succeeded_at, last_duration_ms, last_error)
+        VALUES (?, ?, ?, ?, ?, ?, NULL)
         ON CONFLICT(task_name) DO UPDATE SET
           last_succeeded_at = MAX(COALESCE(observability_task_runs.last_succeeded_at, 0), excluded.last_succeeded_at),
-          last_duration_ms = CASE WHEN observability_task_runs.last_started_at = ?
+          first_observed_at = COALESCE(observability_task_runs.first_observed_at, observability_task_runs.last_started_at),
+          last_duration_ms = CASE WHEN
+            (? IS NOT NULL AND observability_task_runs.execution_token = excluded.execution_token)
+            OR (? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at)
             THEN excluded.last_duration_ms ELSE observability_task_runs.last_duration_ms END,
-          last_error = CASE WHEN observability_task_runs.last_started_at = ?
-            THEN NULL ELSE observability_task_runs.last_error END`,
+          last_error = CASE WHEN
+            (? IS NOT NULL AND observability_task_runs.execution_token = excluded.execution_token)
+            OR (? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at)
+            THEN NULL ELSE observability_task_runs.last_error END,
+          last_started_at = CASE WHEN ? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at
+            THEN excluded.last_started_at ELSE observability_task_runs.last_started_at END`,
     )
       .bind(
         taskName,
-        executionToken ?? startedAt,
+        startedAt,
+        executionToken ?? 0,
+        startedAt,
         finishedAt,
         Math.max(0, finishedAt - startedAt),
+        executionToken,
+        executionToken,
+        executionToken,
         executionToken,
         executionToken,
       )
@@ -6187,20 +6208,35 @@ async function recordScheduledTaskResult(
   }
   await env.DB.prepare(
     `INSERT INTO observability_task_runs
-        (task_name, last_started_at, last_failed_at, last_duration_ms, last_error)
-      VALUES (?, ?, ?, ?, ?)
+        (task_name, last_started_at, execution_token, first_observed_at,
+         last_failed_at, last_duration_ms, last_error)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_name) DO UPDATE SET
-        last_failed_at = excluded.last_failed_at,
-        last_duration_ms = excluded.last_duration_ms,
-        last_error = excluded.last_error
-      WHERE observability_task_runs.last_started_at = ?`,
+        last_failed_at = MAX(COALESCE(observability_task_runs.last_failed_at, 0), excluded.last_failed_at),
+        first_observed_at = COALESCE(observability_task_runs.first_observed_at, observability_task_runs.last_started_at),
+        last_duration_ms = CASE WHEN
+          (? IS NOT NULL AND observability_task_runs.execution_token = excluded.execution_token)
+          OR (? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at)
+          THEN excluded.last_duration_ms ELSE observability_task_runs.last_duration_ms END,
+        last_error = CASE WHEN
+          (? IS NOT NULL AND observability_task_runs.execution_token = excluded.execution_token)
+          OR (? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at)
+          THEN excluded.last_error ELSE observability_task_runs.last_error END,
+        last_started_at = CASE WHEN ? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at
+          THEN excluded.last_started_at ELSE observability_task_runs.last_started_at END`,
   )
     .bind(
       taskName,
-      executionToken ?? startedAt,
+      startedAt,
+      executionToken ?? 0,
+      startedAt,
       finishedAt,
       Math.max(0, finishedAt - startedAt),
       safeTelemetryErrorMessage(error, "Scheduled task failed"),
+      executionToken,
+      executionToken,
+      executionToken,
+      executionToken,
       executionToken,
     )
     .run();
@@ -6290,10 +6326,6 @@ export default {
       },
       async () => {
         const startedAt = performance.now();
-        const pathname = new URL(request.url).pathname;
-        if (pathname.startsWith("/parties/document/")) setMetricRouteTemplate("/parties/document/:room");
-        else if (pathname.startsWith("/parties/workspace-events/"))
-          setMetricRouteTemplate("/parties/workspace-events/:workspace");
         let response: Response;
         try {
           const handle = async () => {

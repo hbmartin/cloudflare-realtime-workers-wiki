@@ -11,7 +11,6 @@ import {
   proseMirrorInlineToNotion,
   type NotionBlock,
 } from "../shared/notion-blocks";
-import { sha256Hex } from "../shared/import-integrity";
 import { constantTimeEqual, hmacSha256Hex } from "../shared/security";
 import type { Comment, CommentThread, DocumentContentEnvelope, WorkspaceEvent } from "../shared/types";
 import { PAGE_TITLE_MAX } from "../shared/validation";
@@ -30,6 +29,7 @@ import {
 import type { Env } from "./env";
 import { isInlineMime } from "./attachments";
 import { attachmentDisposition, HttpError } from "./http";
+import { sourceRateLimitKey } from "./source-rate-limit";
 import { sweepOutbox } from "./jobs";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
@@ -136,18 +136,6 @@ async function enforceApiRateLimits(burst: RateLimit | undefined, minute: RateLi
     const { success } = await minute.limit({ key });
     if (!success) throw new NotionError(429, "rate_limited", "Rate limit exceeded.", 60);
   }
-}
-
-// Cloudflare gives all cross-zone Worker subrequests this source IP. Add the
-// platform-provided originating zone so one Worker cannot drain every other
-// Worker client's pre-authentication bucket at the same colo.
-const CROSS_ZONE_WORKER_IP = "2a06:98c0:3600::103";
-
-async function sourceRateLimitKey(request: Request) {
-  const ip = request.headers.get("cf-connecting-ip")?.trim().toLowerCase() || "unattributed";
-  const workerZone =
-    ip === CROSS_ZONE_WORKER_IP ? request.headers.get("cf-worker")?.trim().toLowerCase() || "unknown" : null;
-  return sha256Hex(workerZone ? `worker:${workerZone}` : `ip:${ip}`);
 }
 
 notionApi.use("*", async (c, next) => {

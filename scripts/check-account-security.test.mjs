@@ -1,4 +1,7 @@
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { main } from "./check-account-security.mjs";
@@ -121,9 +124,16 @@ describe("account security preflight exit codes", () => {
     }
   });
 
-  it("decodes file URLs for paths containing spaces", () => {
-    expect(fileURLToPath(new URL("file:///tmp/with%20space/check-account-security.mjs"))).toBe(
-      "/tmp/with space/check-account-security.mjs",
-    );
+  it("runs the direct-run guard through a symlink in a path with spaces", () => {
+    const directory = mkdtempSync(join(tmpdir(), "account security test "));
+    const link = join(directory, "check-account-security.mjs");
+    try {
+      symlinkSync(fileURLToPath(new URL("./check-account-security.mjs", import.meta.url)), link);
+      const child = spawnSync(process.execPath, [link, "--local", "--unknown"], { encoding: "utf8" });
+      expect(child.status).toBe(2);
+      expect(child.stderr).toContain("Unknown option: --unknown");
+    } finally {
+      rmSync(directory, { recursive: true });
+    }
   });
 });

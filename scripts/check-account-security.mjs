@@ -1,7 +1,8 @@
 // Read-only deployment preflight. Never prints account identifiers or credentials.
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const USAGE =
   "Usage: node scripts/check-account-security.mjs --remote --env production (or --local [--persist-to path])";
@@ -121,7 +122,7 @@ export function main(argv, execute) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])) {
   process.exitCode = main(process.argv.slice(2), (args) => {
     const wrangler = createRequire(import.meta.url).resolve("wrangler");
     return spawnSync(process.execPath, [wrangler, ...args], { encoding: "utf8", timeout: 60_000 });

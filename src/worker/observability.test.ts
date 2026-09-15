@@ -92,12 +92,16 @@ describe("worker observability", () => {
 
   it("keeps the registered metric route template in the request context", () => {
     const env = {} as Env;
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
     withObservabilityContext(env, { trigger: "fetch" }, () => {
       expect(metricRouteTemplate()).toBe("/unmatched");
       setMetricRouteTemplate("/api/pages/:id/attachments");
       expect(metricRouteTemplate()).toBe("/api/pages/:id/attachments");
+      logger.info("test.route", "test", "route selected");
     });
     expect(metricRouteTemplate()).toBe("/unmatched");
+    expect(output.mock.calls[0]?.[0]).not.toHaveProperty("metricRouteTemplate");
+    output.mockRestore();
   });
 
   it("redacts nested data and survives hostile error objects", () => {
@@ -139,6 +143,32 @@ describe("worker observability", () => {
     expect(safeTelemetryErrorMessage(new Error("Basic Og== and basic Zm9vOmJhcg== and Basic\tOg=="), "fallback")).toBe(
       "Basic [redacted] and Basic [redacted] and Basic [redacted]",
     );
+  });
+
+  it("scrubs malformed Basic values and authorization contexts before persisted truncation", () => {
+    const message =
+      "Basic bm9jb2xvbg==; Basic not-base64!; Basic\nZm9vOmJhcg==; Authorization: Basic badtoken; Basic idea,";
+    expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(
+      "Basic [redacted]; Basic [redacted]!; Basic [redacted]; Authorization: Basic [redacted]; Basic idea,",
+    );
+    const longToken = "Ab1+".repeat(20);
+    const result = safeTelemetryErrorMessage(new Error(`${"x".repeat(974)} Basic ${longToken}`), "fallback");
+    expect(result).toContain("Basic [redacted]");
+    expect(result).not.toContain(longToken.slice(0, 20));
+    expect(result.length).toBeLessThanOrEqual(1_000);
+  });
+
+  it("scrubs normalized error strings before their log-field limits", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const token = "Ab1+".repeat(30);
+    const error = new Error(`${"x".repeat(1_969)} Basic ${token}`);
+    error.stack = `${"y".repeat(LOG_STACK_LIMIT - 31)} Basic ${token}`;
+    logger.error("test.error", "test", "failed", {}, error);
+    const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(record.errorMessage).toContain("Basic [redacted]");
+    expect(record.errorStack).toContain("Basic [redacted]");
+    expect(record.errorMessage).not.toContain(token.slice(0, 20));
+    output.mockRestore();
   });
 
   it("redacts invocation context and preserves the stack-specific size limit", () => {
