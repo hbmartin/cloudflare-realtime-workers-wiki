@@ -6,6 +6,7 @@ import {
   logger,
   metricRouteTemplate,
   recordMetric,
+  safeTelemetryErrorMessage,
   setMetricRouteTemplate,
   traced,
   withObservabilityContext,
@@ -129,6 +130,15 @@ describe("worker observability", () => {
     expect(record.nested).toBe('{"authorization":"[redacted]","value":"[redacted-email]"}');
     expect(record.hostile).toBe('"[object omitted]"');
     output.mockRestore();
+  });
+
+  it("keeps ordinary Basic prose while redacting actual short and long credentials", () => {
+    expect(safeTelemetryErrorMessage(new Error("unable to verify basic constraints or Basic idea"), "fallback")).toBe(
+      "unable to verify basic constraints or Basic idea",
+    );
+    expect(safeTelemetryErrorMessage(new Error("Basic Og== and basic Zm9vOmJhcg== and Basic\tOg=="), "fallback")).toBe(
+      "Basic [redacted] and Basic [redacted] and Basic [redacted]",
+    );
   });
 
   it("redacts invocation context and preserves the stack-specific size limit", () => {

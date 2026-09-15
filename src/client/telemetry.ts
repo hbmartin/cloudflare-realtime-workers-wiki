@@ -88,6 +88,7 @@ export async function reportClientError(event: ClientErrorEvent, error: unknown,
 
   const identity = errorIdentity(error);
   const queued = reportQueue.then(async () => {
+    let reservationHeld = true;
     try {
       const fingerprint = await sha256Hex(`${event}\n${identity.name}\n${identity.message}\n${identity.stack}`);
       const sentAt = Date.now();
@@ -113,6 +114,10 @@ export async function reportClientError(event: ClientErrorEvent, error: unknown,
         online: navigator.onLine,
         visibility: document.visibilityState,
       };
+      // Move the reservation into the sent-at budget before the POST. An in-flight
+      // request must occupy one slot, not one pending slot plus one sent slot.
+      pendingReports -= 1;
+      reservationHeld = false;
       reportTimes.push(Date.now());
       const response = await fetch("/api/telemetry/client-errors", {
         method: "POST",
@@ -127,7 +132,7 @@ export async function reportClientError(event: ClientErrorEvent, error: unknown,
     } catch {
       // Telemetry must never interfere with the user flow or recursively report itself.
     } finally {
-      pendingReports -= 1;
+      if (reservationHeld) pendingReports -= 1;
     }
   });
   reportQueue = queued;

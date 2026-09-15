@@ -29,7 +29,7 @@ type LogFields = Readonly<Record<string, unknown>>;
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
 const EMAIL_VALUE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
-const BASIC_VALUE = /\bBasic\s+[^\s]+/gi;
+const BASIC_VALUE = /\bBasic[ \t]+([A-Za-z0-9+/=]+)/gi;
 const BEARER_VALUE = /\bBearer\s+[^\s]+/gi;
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
@@ -97,7 +97,16 @@ export function withDurableObjectContext<T>(env: Env, request: Request, callback
 function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
   return boundedLogString(
     value
-      .replace(BASIC_VALUE, "Basic [redacted]")
+      .replace(BASIC_VALUE, (match, encoded: string) => {
+        try {
+          // Basic credentials encode "username:password". Do not consume ordinary
+          // prose such as "Basic constraints" or "Basic idea" as a credential.
+          if (atob(encoded).includes(":")) return "Basic [redacted]";
+        } catch {
+          // A malformed token is not valid Basic authentication.
+        }
+        return match;
+      })
       .replace(BEARER_VALUE, "Bearer [redacted]")
       .replace(SECRET_VALUE, "[redacted-secret]")
       .replace(EMAIL_VALUE, "[redacted-email]")

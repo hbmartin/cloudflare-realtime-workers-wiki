@@ -209,7 +209,7 @@ app.use("*", async (c, next) => {
   try {
     await next();
   } finally {
-    const registered = routePath(c, -1);
+    const registered = routePath(c);
     setMetricRouteTemplate(registered === "*" || registered === "/*" ? "/unmatched" : registered);
   }
 });
@@ -6141,17 +6141,26 @@ async function handlePartyRequest(request: Request, env: Env) {
 export type ScheduledTask = { name: string; run: () => Promise<unknown> };
 
 async function recordScheduledTaskStart(env: Env, taskName: string, startedAt: number) {
-  await env.DB.prepare(
+  const row = await env.DB.prepare(
     `INSERT INTO observability_task_runs (task_name, last_started_at)
       VALUES (?, ?)
-      ON CONFLICT(task_name) DO UPDATE SET last_started_at = excluded.last_started_at
-      WHERE observability_task_runs.last_started_at <= excluded.last_started_at`,
+      ON CONFLICT(task_name) DO UPDATE SET
+        last_started_at = MAX(observability_task_runs.last_started_at + 1, excluded.last_started_at)
+      RETURNING last_started_at`,
   )
     .bind(taskName, startedAt)
-    .run();
+    .first<{ last_started_at: number }>();
+  if (!row || !Number.isSafeInteger(row.last_started_at)) throw new Error("Scheduled task start token unavailable");
+  return row.last_started_at;
 }
 
-async function recordScheduledTaskResult(env: Env, taskName: string, startedAt: number, error?: unknown) {
+async function recordScheduledTaskResult(
+  env: Env,
+  taskName: string,
+  startedAt: number,
+  executionToken: number | null,
+  error?: unknown,
+) {
   const finishedAt = Date.now();
   if (error === undefined) {
     await env.DB.prepare(
@@ -6159,13 +6168,20 @@ async function recordScheduledTaskResult(env: Env, taskName: string, startedAt: 
           (task_name, last_started_at, last_succeeded_at, last_duration_ms, last_error)
         VALUES (?, ?, ?, ?, NULL)
         ON CONFLICT(task_name) DO UPDATE SET
-          last_started_at = excluded.last_started_at,
-          last_succeeded_at = excluded.last_succeeded_at,
-          last_duration_ms = excluded.last_duration_ms,
-          last_error = NULL
-        WHERE observability_task_runs.last_started_at <= excluded.last_started_at`,
+          last_succeeded_at = MAX(COALESCE(observability_task_runs.last_succeeded_at, 0), excluded.last_succeeded_at),
+          last_duration_ms = CASE WHEN observability_task_runs.last_started_at = ?
+            THEN excluded.last_duration_ms ELSE observability_task_runs.last_duration_ms END,
+          last_error = CASE WHEN observability_task_runs.last_started_at = ?
+            THEN NULL ELSE observability_task_runs.last_error END`,
     )
-      .bind(taskName, startedAt, finishedAt, Math.max(0, finishedAt - startedAt))
+      .bind(
+        taskName,
+        executionToken ?? startedAt,
+        finishedAt,
+        Math.max(0, finishedAt - startedAt),
+        executionToken,
+        executionToken,
+      )
       .run();
     return;
   }
@@ -6174,26 +6190,27 @@ async function recordScheduledTaskResult(env: Env, taskName: string, startedAt: 
         (task_name, last_started_at, last_failed_at, last_duration_ms, last_error)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(task_name) DO UPDATE SET
-        last_started_at = excluded.last_started_at,
         last_failed_at = excluded.last_failed_at,
         last_duration_ms = excluded.last_duration_ms,
         last_error = excluded.last_error
-      WHERE observability_task_runs.last_started_at <= excluded.last_started_at`,
+      WHERE observability_task_runs.last_started_at = ?`,
   )
     .bind(
       taskName,
-      startedAt,
+      executionToken ?? startedAt,
       finishedAt,
       Math.max(0, finishedAt - startedAt),
       safeTelemetryErrorMessage(error, "Scheduled task failed"),
+      executionToken,
     )
     .run();
 }
 
 async function runScheduledTask(env: Env, context: ExecutionContext, task: ScheduledTask) {
   const startedAt = Date.now();
+  let executionToken: number | null = null;
   try {
-    await recordScheduledTaskStart(env, task.name, startedAt);
+    executionToken = await recordScheduledTaskStart(env, task.name, startedAt);
   } catch (error) {
     logger.warn(
       "scheduled.task_state.failed",
@@ -6209,7 +6226,7 @@ async function runScheduledTask(env: Env, context: ExecutionContext, task: Sched
     });
   } catch (error) {
     try {
-      await recordScheduledTaskResult(env, task.name, startedAt, error);
+      await recordScheduledTaskResult(env, task.name, startedAt, executionToken, error);
     } catch (stateError) {
       logger.warn(
         "scheduled.task_state.failed",
@@ -6230,7 +6247,7 @@ async function runScheduledTask(env: Env, context: ExecutionContext, task: Sched
     throw error;
   }
   try {
-    await recordScheduledTaskResult(env, task.name, startedAt);
+    await recordScheduledTaskResult(env, task.name, startedAt, executionToken);
   } catch (error) {
     logger.warn(
       "scheduled.task_state.failed",
@@ -6279,15 +6296,20 @@ export default {
           setMetricRouteTemplate("/parties/workspace-events/:workspace");
         let response: Response;
         try {
-          response = await traced(
-            context.tracing,
-            "notes.route_request",
-            { "notes.request_id": requestId },
-            async () => {
-              const party = await handlePartyRequest(request, env);
-              return party ?? app.fetch(request, env, context);
-            },
-          );
+          const handle = async () => {
+            const party = await handlePartyRequest(request, env);
+            return party ?? app.fetch(request, env, context);
+          };
+          response = context.tracing
+            ? await context.tracing.enterSpan("notes.route_request", async (span) => {
+                span.setAttribute("notes.request_id", requestId);
+                try {
+                  return await handle();
+                } finally {
+                  span.setAttribute("http.route", metricRouteTemplate());
+                }
+              })
+            : await handle();
         } catch (error) {
           logger.error(
             "http.request.failed",

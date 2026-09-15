@@ -169,7 +169,7 @@ describe("Notion-compatible webhooks", () => {
     );
 
     await deliverWebhook(env, delivery!.id);
-    expect(receivedUserAgent).toBe("NoteFlare-Webhook/1.0");
+    expect(receivedUserAgent).toBe("Realtime-Notes-Webhook/1.0");
     expect(
       await verifyWebhookSignature({ body: receivedBody, signature: receivedSignature, verificationToken: token }),
     ).toBe(true);

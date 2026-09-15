@@ -21,7 +21,17 @@ function options(argv) {
 }
 
 function rowsFromWrangler(result) {
-  if (result.status !== 0) throw new Error("Wrangler query failed");
+  if (result.status !== 0) {
+    const details = `${result.stderr ?? ""} ${result.error?.message ?? ""}`;
+    const reason = /unauthorized|forbidden|authentication|permission|expired|invalid token/i.test(details)
+      ? "authentication or permission error"
+      : /timeout|timed out|etimedout/i.test(details)
+        ? "timeout"
+        : /network|connection|enotfound|econnreset/i.test(details)
+          ? "network error"
+          : "query error";
+    throw new Error(`Wrangler query failed (${reason}; exit ${result.status ?? "unknown"})`);
+  }
   let parsed;
   try {
     parsed = JSON.parse(result.stdout);

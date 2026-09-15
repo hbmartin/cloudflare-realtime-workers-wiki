@@ -85,29 +85,44 @@ export function analyticsQuery(minutes) {
 
 async function queueMetadata(accountId, token, fetcher = fetch) {
   const found = { delivery: null, dlq: null };
-  for (let page = 1; ; page += 1) {
+  for (let page = 1; page <= 1000; page += 1) {
     const response = await fetchJson(
       `https://api.cloudflare.com/client/v4/accounts/${accountId}/queues?per_page=100&page=${page}`,
       { headers: { authorization: `Bearer ${token}` } },
       fetcher,
     );
-    const info = response?.result_info;
-    if (
-      response?.success !== true ||
-      !Array.isArray(response.result) ||
-      !Number.isSafeInteger(info?.page) ||
-      info.page !== page ||
-      !Number.isSafeInteger(info.total_pages) ||
-      info.total_pages < page
-    ) {
-      throw new Error("Cloudflare Queue listing returned invalid pagination metadata.");
+    if (response?.success !== true || !Array.isArray(response.result)) {
+      throw new Error("Cloudflare Queue listing returned an invalid response.");
     }
     for (const queue of response.result) {
-      if (queue?.queue_name === DELIVERY_QUEUE_NAME) found.delivery = queue;
-      if (queue?.queue_name === DLQ_NAME) found.dlq = queue;
+      if (queue?.queue_name === DELIVERY_QUEUE_NAME || queue?.name === DELIVERY_QUEUE_NAME) found.delivery = queue;
+      if (queue?.queue_name === DLQ_NAME || queue?.name === DLQ_NAME) found.dlq = queue;
     }
-    if ((found.delivery && found.dlq) || page >= info.total_pages) return found;
+    if (found.delivery && found.dlq) return found;
+    const info = response.result_info;
+    if (info !== undefined && info !== null && (typeof info !== "object" || Array.isArray(info))) {
+      throw new Error("Cloudflare Queue listing returned invalid pagination metadata.");
+    }
+    if (info?.page !== undefined && (!Number.isSafeInteger(info.page) || info.page !== page)) {
+      throw new Error("Cloudflare Queue listing returned invalid pagination metadata.");
+    }
+    if (info?.total_pages !== undefined) {
+      if (!Number.isSafeInteger(info.total_pages) || info.total_pages < 0 || info.total_pages > 1000) {
+        throw new Error("Cloudflare Queue listing returned invalid pagination metadata.");
+      }
+      if (info.total_pages === 0 && page === 1 && response.result.length === 0) return found;
+      if (info.total_pages < page) {
+        throw new Error("Cloudflare Queue listing returned invalid pagination metadata.");
+      }
+      if (page >= info.total_pages) return found;
+      continue;
+    }
+    // An omitted page count can represent a single-page response. A full page
+    // leaves discovery unknowable, so alert instead of silently missing queues.
+    if (response.result.length < 100) return found;
+    throw new Error("Cloudflare Queue listing has incomplete pagination metadata.");
   }
+  throw new Error("Cloudflare Queue listing exceeded the pagination limit.");
 }
 
 async function queueMetrics(accountId, token, queueId, fetcher = fetch) {
@@ -143,12 +158,26 @@ async function staleQueuedWorkflows(accountId, token, timestamp, fetcher = fetch
   );
   url.searchParams.set("status", "queued");
   url.searchParams.set("date_end", new Date(timestamp - WORKFLOW_QUEUED_MS - 1).toISOString());
-  url.searchParams.set("per_page", "1");
-  const response = await fetchJson(url, { headers: { authorization: `Bearer ${token}` } }, fetcher);
-  if (response?.success !== true || !Array.isArray(response.result)) {
-    throw new Error("Cloudflare Workflow instance query returned an invalid response.");
+  url.searchParams.set("per_page", "100");
+  const instances = [];
+  const seenCursors = new Set();
+  for (let page = 0; page < 1000; page += 1) {
+    const response = await fetchJson(url, { headers: { authorization: `Bearer ${token}` } }, fetcher);
+    if (response?.success !== true || !Array.isArray(response.result)) {
+      throw new Error("Cloudflare Workflow instance query returned an invalid response.");
+    }
+    instances.push(...response.result);
+    const cursor = response.result_info?.cursor;
+    if (cursor === undefined || cursor === null || cursor === "") {
+      return { instances, complete: response.result.length < 100 };
+    }
+    if (typeof cursor !== "string" || seenCursors.has(cursor)) {
+      throw new Error("Cloudflare Workflow instance query returned invalid pagination metadata.");
+    }
+    seenCursors.add(cursor);
+    url.searchParams.set("cursor", cursor);
   }
-  return response.result;
+  throw new Error("Cloudflare Workflow instance query exceeded the pagination limit.");
 }
 
 async function graphqlMetrics(accountId, token, queueId, startedAt, fetcher = fetch) {
@@ -203,6 +232,7 @@ function monitoredNumber(value) {
 
 export function evaluateThresholds(snapshot) {
   const failures = [];
+  failures.push(...(snapshot.sourceFailures ?? []));
   if (
     !Array.isArray(snapshot.readiness) ||
     snapshot.readiness.length === 0 ||
@@ -277,6 +307,7 @@ export function evaluateThresholds(snapshot) {
     if (!previous || datetime >= previous.datetime) latestWorkflowEvents.set(instanceId, { eventType, datetime });
   }
   if (snapshot.staleQueuedWorkflows?.length) failures.push("workflow_queued_stale");
+  if (snapshot.staleWorkflowCountComplete === false) failures.push("workflow_count_incomplete");
   if (
     [...latestWorkflowEvents.values()].some((event) =>
       ["WORKFLOW_INTERNAL_ERROR", "ROLLBACK_FAILED", "ROLLBACK_ATTEMPT_FAILURE"].includes(event.eventType),
@@ -309,7 +340,8 @@ function markdown(snapshot, failures, windows, title = "Cloudflare observability
     `- Analytics events (${windows.analyticsMinutes}m, sampling-adjusted): ${snapshot.analytics.reduce((total, row) => total + number(row.count), 0)}`,
     `- Delivery backlog / DLQ / oldest age: ${availableNumber(deliveryBacklog)} / ${availableNumber(dlqBacklog)} / ${oldestMessageAge}${oldestMessageAge === "unavailable" ? "" : " ms"}`,
     `- D1 size: ${availableNumber(databaseSize)}${databaseSize === null || databaseSize === undefined ? "" : " bytes"}`,
-    `- Stale queued Workflows: ${snapshot.staleQueuedWorkflows?.length ?? 0}`,
+    `- Stale queued Workflows: ${snapshot.staleQueuedWorkflows === null ? "unavailable" : snapshot.staleWorkflowCountComplete === false ? `at least ${snapshot.staleQueuedWorkflows.length}` : snapshot.staleQueuedWorkflows.length}`,
+    `- Unavailable sources: ${(snapshot.sourceFailures ?? []).length ? snapshot.sourceFailures.join(", ") : "none"}`,
     `- Alert codes: ${failures === null ? "not evaluated (run observability:check)" : failures.length ? failures.join(", ") : "none"}`,
     "",
   ].join("\n");
@@ -320,13 +352,23 @@ export async function collectSnapshot(config, options = {}) {
   const graphqlMinutes = options.graphqlMinutes ?? 5;
   const analyticsMinutes = options.analyticsMinutes ?? 15;
   const timestamp = options.timestamp ?? Date.now();
-  const [readiness, queues, analytics, database, staleWorkflows] = await Promise.all([
+  const [readiness, queueSource, analytics, database, workflowSource] = await Promise.all([
     probeReadiness(config.baseUrl, config.probeToken, options),
-    queueMetadata(config.accountId, config.token, fetcher),
+    queueMetadata(config.accountId, config.token, fetcher)
+      .then((value) => ({ value }))
+      .catch(() => ({ error: true })),
     analyticsSql(config.accountId, config.token, analyticsMinutes, fetcher),
     d1Metadata(config.accountId, config.token, fetcher),
-    staleQueuedWorkflows(config.accountId, config.token, timestamp, fetcher),
+    staleQueuedWorkflows(config.accountId, config.token, timestamp, fetcher)
+      .then((value) => ({ value }))
+      .catch(() => ({ error: true })),
   ]);
+  const queues = queueSource.value ?? { delivery: null, dlq: null };
+  const staleWorkflows = workflowSource.value ?? null;
+  const sourceFailures = [
+    ...(queueSource.error ? ["queue_listing_unavailable"] : []),
+    ...(workflowSource.error ? ["workflow_metadata_unavailable"] : []),
+  ];
   const [delivery, dlq, graphql] = await Promise.all([
     queueMetrics(config.accountId, config.token, queues.delivery?.queue_id ?? queues.delivery?.id, fetcher),
     queueMetrics(config.accountId, config.token, queues.dlq?.queue_id ?? queues.dlq?.id, fetcher),
@@ -344,7 +386,9 @@ export async function collectSnapshot(config, options = {}) {
     delivery,
     dlq,
     database,
-    staleQueuedWorkflows: staleWorkflows,
+    staleQueuedWorkflows: staleWorkflows?.instances ?? null,
+    staleWorkflowCountComplete: staleWorkflows?.complete ?? null,
+    sourceFailures,
     deliveryQueueId: queues.delivery?.queue_id ?? queues.delivery?.id,
     ...graphql,
   };

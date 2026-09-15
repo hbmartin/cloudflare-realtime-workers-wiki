@@ -33,36 +33,36 @@ function evaluate(value) {
   return evaluateThresholds(value);
 }
 
-async function malformedWorkflowFetcher(url, init = {}) {
-  const target = String(url);
-  if (target.includes("/api/health/ready")) return Response.json({ ok: true });
-  if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
-  if (target.includes("/queues?"))
-    return Response.json({ success: true, result: [], result_info: { page: 1, total_pages: 1 } });
-  if (target.includes("/d1/database?")) return Response.json({ result: [] });
-  if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
-    return Response.json({ success: true });
-  }
-  if (target.endsWith("/graphql")) {
-    return Response.json({
-      data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } },
-    });
-  }
-  throw new Error(`Unexpected observability request: ${target} ${String(init.method ?? "GET")}`);
+function cloudflareFetcher(overrides = {}) {
+  return async (url, init = {}) => {
+    const target = String(url);
+    if (target.includes("/api/health/ready")) return Response.json({ ok: true });
+    if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
+    if (target.includes("/queues?"))
+      return (
+        overrides.queues?.(target, init) ??
+        Response.json({ success: true, result: [], result_info: { page: 1, total_pages: 1 } })
+      );
+    if (target.includes("/queues/") && target.endsWith("/metrics"))
+      return overrides.metrics?.(target, init) ?? Response.json({ result: { backlog_count: 0 } });
+    if (target.includes("/d1/database?")) return Response.json({ result: [] });
+    if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances"))
+      return overrides.workflows?.(target, init) ?? Response.json({ success: true, result: [] });
+    if (target.endsWith("/graphql"))
+      return (
+        overrides.graphql?.(target, init) ??
+        Response.json({ data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } } })
+      );
+    throw new Error(`Unexpected observability request: ${target} ${String(init.method ?? "GET")}`);
+  };
 }
 
-async function malformedQueuePaginationFetcher(url) {
-  const target = String(url);
-  if (target.includes("/api/health/ready")) return Response.json({ ok: true });
-  if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
-  if (target.includes("/d1/database?")) return Response.json({ result: [] });
-  if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
-    return Response.json({ success: true, result: [] });
-  }
-  if (target.includes("/queues?"))
-    return Response.json({ success: true, result: [], result_info: { page: 2, total_pages: 2 } });
-  throw new Error(`Unexpected observability request: ${target}`);
-}
+const malformedWorkflowFetcher = cloudflareFetcher({
+  workflows: () => Response.json({ success: true }),
+});
+const malformedQueuePaginationFetcher = cloudflareFetcher({
+  queues: () => Response.json({ success: true, result: [], result_info: { page: 2, total_pages: 2 } }),
+});
 
 describe("observability thresholds", () => {
   it("makes Analytics Engine counts sampling-aware", () => {
@@ -122,27 +122,18 @@ describe("observability thresholds", () => {
     let workflowQuery = "";
     let workflowInstancesUrl;
     const before = Date.now();
-    const fetcher = async (url, init = {}) => {
-      const target = String(url);
-      if (target.includes("/api/health/ready")) return Response.json({ ok: true });
-      if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
-      if (target.includes("/queues?"))
-        return Response.json({ success: true, result: [], result_info: { page: 1, total_pages: 1 } });
-      if (target.includes("/d1/database?")) return Response.json({ result: [] });
-      if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
+    const fetcher = cloudflareFetcher({
+      workflows: (target) => {
         workflowInstancesUrl = new URL(target);
         return Response.json({ success: true, result: [] });
-      }
-      if (target.endsWith("/graphql")) {
+      },
+      graphql: (_target, init) => {
         const body = JSON.parse(String(init.body));
         workflowQuery = body.query;
         workflowStart = Date.parse(body.variables.workflowStart);
-        return Response.json({
-          data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } },
-        });
-      }
-      throw new Error(`Unexpected observability request: ${target}`);
-    };
+        return Response.json({ data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } } });
+      },
+    });
 
     await collectSnapshot(
       { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
@@ -153,20 +144,20 @@ describe("observability thresholds", () => {
     expect(workflowStart).toBeGreaterThanOrEqual(before - 2 * 60 * 60_000 - 1_000);
     expect(workflowQuery).toContain("orderBy: [datetime_DESC]");
     expect(workflowInstancesUrl.searchParams.get("status")).toBe("queued");
-    expect(workflowInstancesUrl.searchParams.get("per_page")).toBe("1");
+    expect(workflowInstancesUrl.searchParams.get("per_page")).toBe("100");
     expect(Date.parse(workflowInstancesUrl.searchParams.get("date_end"))).toBeGreaterThanOrEqual(
       before - 30 * 60_000 - 1_000,
     );
     expect(Date.parse(workflowInstancesUrl.searchParams.get("date_end"))).toBeLessThanOrEqual(before - 30 * 60_000);
   });
 
-  it("rejects a malformed authoritative Workflow response", async () => {
-    await expect(
-      collectSnapshot(
-        { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
-        { fetcher: malformedWorkflowFetcher, delay: async () => undefined },
-      ),
-    ).rejects.toThrow("Cloudflare Workflow instance query returned an invalid response");
+  it("isolates a malformed authoritative Workflow response", async () => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      { fetcher: malformedWorkflowFetcher, delay: async () => undefined },
+    );
+    expect(snapshot.readiness[0].ok).toBe(true);
+    expect(evaluateThresholds(snapshot)).toContain("workflow_metadata_unavailable");
   });
 
   it("keeps an old queued Workflow paging until authoritative current state resolves it", async () => {
@@ -177,21 +168,9 @@ describe("observability thresholds", () => {
       created_on: new Date(timestamp - 3 * 60 * 60_000).toISOString(),
     };
     let currentQueued = [stale];
-    const fetcher = async (url) => {
-      const target = String(url);
-      if (target.includes("/api/health/ready")) return Response.json({ ok: true });
-      if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
-      if (target.includes("/queues?"))
-        return Response.json({ success: true, result: [], result_info: { page: 1, total_pages: 1 } });
-      if (target.includes("/d1/database?")) return Response.json({ result: [] });
-      if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
-        return Response.json({ success: true, result: currentQueued });
-      }
-      if (target.endsWith("/graphql")) {
-        return Response.json({ data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } } });
-      }
-      throw new Error(`Unexpected observability request: ${target}`);
-    };
+    const fetcher = cloudflareFetcher({
+      workflows: () => Response.json({ success: true, result: currentQueued }),
+    });
     const config = { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" };
     const options = { fetcher, delay: async () => undefined, timestamp };
 
@@ -234,15 +213,8 @@ describe("observability thresholds", () => {
 
   it("finds both named queues beyond the first Queue API page", async () => {
     const queuePages = [];
-    const fetcher = async (url) => {
-      const target = String(url);
-      if (target.includes("/api/health/ready")) return Response.json({ ok: true });
-      if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
-      if (target.includes("/d1/database?")) return Response.json({ result: [] });
-      if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances")) {
-        return Response.json({ success: true, result: [] });
-      }
-      if (target.includes("/queues?")) {
+    const fetcher = cloudflareFetcher({
+      queues: (target) => {
         const page = Number(new URL(target).searchParams.get("page"));
         queuePages.push(page);
         const result =
@@ -252,14 +224,8 @@ describe("observability thresholds", () => {
               ? [{ queue_name: "cloudflare-realtime-notes-delivery-dlq", queue_id: "dlq-id" }]
               : [];
         return Response.json({ success: true, result, result_info: { page, total_pages: 3 } });
-      }
-      if (target.includes("/queues/delivery-id/metrics")) return Response.json({ result: { backlog_count: 0 } });
-      if (target.includes("/queues/dlq-id/metrics")) return Response.json({ result: { backlog_count: 0 } });
-      if (target.endsWith("/graphql")) {
-        return Response.json({ data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } } });
-      }
-      throw new Error(`Unexpected observability request: ${target}`);
-    };
+      },
+    });
     const snapshot = await collectSnapshot(
       { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
       { fetcher, delay: async () => undefined },
@@ -269,13 +235,120 @@ describe("observability thresholds", () => {
     expect(evaluateThresholds(snapshot)).not.toContain("delivery_dlq_metadata_missing");
   });
 
-  it("rejects malformed Queue API pagination", async () => {
-    await expect(
-      collectSnapshot(
-        { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
-        { fetcher: malformedQueuePaginationFetcher, delay: async () => undefined },
-      ),
-    ).rejects.toThrow("invalid pagination metadata");
+  it("isolates malformed Queue API pagination", async () => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      { fetcher: malformedQueuePaginationFetcher, delay: async () => undefined },
+    );
+    expect(snapshot.readiness[0].ok).toBe(true);
+    expect(evaluateThresholds(snapshot)).toContain("queue_listing_unavailable");
+  });
+
+  it("accepts a single-page Queue response without pagination metadata", async () => {
+    const fetcher = cloudflareFetcher({
+      queues: () =>
+        Response.json({
+          success: true,
+          result: [
+            { name: "cloudflare-realtime-notes-delivery", id: "delivery-id" },
+            { queue_name: "cloudflare-realtime-notes-delivery-dlq", queue_id: "dlq-id" },
+          ],
+        }),
+    });
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      { fetcher, delay: async () => undefined },
+    );
+    expect(snapshot.deliveryQueueId).toBe("delivery-id");
+    expect(snapshot.sourceFailures).toEqual([]);
+  });
+
+  it("accepts zero pages for an empty Queue list but alerts on absent named queues", async () => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      {
+        fetcher: cloudflareFetcher({
+          queues: () => Response.json({ success: true, result: [], result_info: { total_pages: 0 } }),
+        }),
+        delay: async () => undefined,
+      },
+    );
+    expect(snapshot.sourceFailures).toEqual([]);
+    expect(evaluateThresholds(snapshot)).toContain("delivery_queue_metadata_missing");
+  });
+
+  it("alerts when a full Queue page has no way to continue discovery", async () => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      {
+        fetcher: cloudflareFetcher({
+          queues: () =>
+            Response.json({
+              success: true,
+              result: Array.from({ length: 100 }, (_, index) => ({ queue_name: `unrelated-${index}` })),
+            }),
+        }),
+        delay: async () => undefined,
+      },
+    );
+    expect(evaluateThresholds(snapshot)).toContain("queue_listing_unavailable");
+  });
+
+  it("keeps other probes while a legacy monitoring token receives Workflow 403", async () => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      {
+        fetcher: cloudflareFetcher({ workflows: () => new Response("Forbidden", { status: 403 }) }),
+        delay: async () => undefined,
+      },
+    );
+    expect(snapshot.readiness[0].ok).toBe(true);
+    expect(snapshot.analytics).toEqual([]);
+    expect(snapshot.staleQueuedWorkflows).toBeNull();
+    expect(evaluateThresholds(snapshot)).toContain("workflow_metadata_unavailable");
+  });
+
+  it("reports forty stale Workflow instances instead of capping the count at one", async () => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      {
+        fetcher: cloudflareFetcher({
+          workflows: () =>
+            Response.json({
+              success: true,
+              result: Array.from({ length: 40 }, (_, index) => ({ id: `stale-${index}` })),
+            }),
+        }),
+        delay: async () => undefined,
+      },
+    );
+    expect(snapshot.staleQueuedWorkflows).toHaveLength(40);
+    expect(snapshot.staleWorkflowCountComplete).toBe(true);
+    expect(evaluateThresholds(snapshot)).toContain("workflow_queued_stale");
+  });
+
+  it("follows Workflow cursors and marks an unpageable full result incomplete", async () => {
+    const config = { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" };
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({ id: `stale-${index}` }));
+    const fetcher = cloudflareFetcher({
+      workflows: (target) =>
+        new URL(target).searchParams.get("cursor") === "next"
+          ? Response.json({
+              success: true,
+              result: Array.from({ length: 40 }, (_, index) => ({ id: `later-${index}` })),
+            })
+          : Response.json({ success: true, result: firstPage, result_info: { cursor: "next" } }),
+    });
+    const paged = await collectSnapshot(config, { fetcher, delay: async () => undefined });
+    expect(paged.staleQueuedWorkflows).toHaveLength(140);
+    expect(paged.staleWorkflowCountComplete).toBe(true);
+
+    const incomplete = await collectSnapshot(config, {
+      fetcher: cloudflareFetcher({ workflows: () => Response.json({ success: true, result: firstPage }) }),
+      delay: async () => undefined,
+    });
+    expect(incomplete.staleWorkflowCountComplete).toBe(false);
+    expect(evaluateThresholds(incomplete)).toContain("workflow_count_incomplete");
   });
 
   it.each([

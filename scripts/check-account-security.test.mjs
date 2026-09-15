@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { main } from "./check-account-security.mjs";
 
@@ -68,10 +69,36 @@ describe("account security preflight exit codes", () => {
   it("uses exit 2 for CLI usage and option errors", () => {
     for (const args of [[], ["--local", "--remote"], ["--local", "--env"], ["--local", "--unknown"]]) {
       const child = spawnSync(process.execPath, [
-        new URL("./check-account-security.mjs", import.meta.url).pathname,
+        fileURLToPath(new URL("./check-account-security.mjs", import.meta.url)),
         ...args,
       ]);
       expect(child.status).toBe(2);
     }
+  });
+
+  it("distinguishes Wrangler auth and timeout failures without printing credentials or account IDs", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      expect(
+        main(["--local"], () => ({
+          status: 1,
+          stdout: "",
+          stderr: "Unauthorized for account abcdef1234567890abcdef1234567890; Bearer private-token",
+        })),
+      ).toBe(2);
+      expect(String(output.mock.calls[0][0])).toContain("authentication or permission error");
+      expect(String(output.mock.calls[0][0])).not.toContain("private-token");
+      expect(String(output.mock.calls[0][0])).not.toContain("abcdef1234567890");
+      expect(main(["--local"], () => ({ status: null, stdout: "", error: new Error("ETIMEDOUT") }))).toBe(2);
+      expect(String(output.mock.calls[1][0])).toContain("timeout");
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("decodes file URLs for paths containing spaces", () => {
+    expect(fileURLToPath(new URL("file:///tmp/with%20space/check-account-security.mjs"))).toBe(
+      "/tmp/with space/check-account-security.mjs",
+    );
   });
 });

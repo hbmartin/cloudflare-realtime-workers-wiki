@@ -105,6 +105,25 @@ beforeEach(async () => {
 });
 
 describe("Notion-compatible API", () => {
+  it("uses responding templates for overlapping users and file routes", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const writeDataPoint = vi.fn();
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "OBSERVABILITY") return { writeDataPoint };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    await worker.fetch(notionRequest(createdIntegration.token, "/users/me"), bindings, createExecutionContext());
+    await worker.fetch(new Request(await signedFileUrl(installed.pageId)), bindings, createExecutionContext());
+    const routes = writeDataPoint.mock.calls
+      .map(([point]) => point)
+      .filter((point) => point.indexes[0] === "http.request")
+      .map((point) => point.blobs[2]);
+    expect(routes).toEqual(["/v1/users/me", "/v1/files/:attachmentId"]);
+  });
+
   it("runs page, block, search, user, position, and in_trash calls through the official SDK", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);

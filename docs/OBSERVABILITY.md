@@ -30,6 +30,8 @@ Custom spans use these fixed names:
 | `notes.integration.webhook`, `notes.integration.slack`, `notes.integration.email` | outbound integration call         |
 
 Cloudflare adds automatic child spans for handlers, bindings, and outbound requests.
+`notes.route_request` sets `http.route` to the responding Hono template, a fixed Party template, or
+`/unmatched` after routing; it never attaches raw URL identifiers.
 
 ## Structured log contract
 
@@ -68,7 +70,8 @@ Browser reports are accepted only with a valid Better Auth session and contain o
 SHA-256 fingerprint, same-origin source path/line/column, request ID, release, online state, and visibility. Raw
 messages and stacks never leave the browser; pre-login failures are deliberately not ingested.
 The browser budgets five attempted telemetry POSTs per minute, including rejected and network-failed attempts,
-but deduplicates fingerprints only after an accepted report. The Worker separately limits 300 requests per
+and counts an in-flight attempt once. Fingerprint deduplication begins only after a report is accepted.
+The Worker separately limits 300 requests per
 source IP per minute before origin/session checks and 20 authenticated requests per user per minute. Both keys
 are hashed before passing them to Worker Rate Limit bindings.
 
@@ -144,6 +147,16 @@ failed attempts and evaluates:
 
 Missing external metadata reports `delivery_queue_metadata_missing`, `delivery_dlq_metadata_missing`, or
 `d1_metadata_missing` instead of interpreting an unavailable resource as zero.
+Queue discovery accepts a single-page response without pagination metadata and follows `total_pages` when present;
+a full page with no way to continue reports `queue_listing_unavailable`. A failed Workflow instances request reports
+`workflow_metadata_unavailable` without aborting the other probes. Stale Workflow counts follow cursors where
+available; a full page without a next cursor is reported as a lower bound with `workflow_count_incomplete`, never
+as an exact count. Existing monitor tokens need Workers Scripts Read (or Workers Tail Read) for Workflow instances;
+verify or rotate older tokens before relying on this probe.
+
+Cron state uses a strictly increasing start token for latest-run outcome fields. Any completed success advances
+the success heartbeat even when a newer execution has already started; an older result cannot overwrite the
+newer execution's error or duration.
 
 Run the same collector by hand:
 

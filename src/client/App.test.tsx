@@ -619,7 +619,7 @@ describe("App error handling", () => {
     expect(await screen.findByRole("heading", { name: "NoteFlare is unavailable" })).toBeInTheDocument();
     const brand = screen.getByText("NoteFlare").closest(".brand");
     expect(brand).not.toBeNull();
-    expect(brand!.querySelector('img[src="/logo.jpg"]')).toHaveAttribute("alt", "");
+    expect(brand!.querySelector('img[src="/apple-touch-icon.png"]')).toHaveAttribute("alt", "");
     expect(screen.getByText(/Check your connection/)).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("Install service unavailable.");
     expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
