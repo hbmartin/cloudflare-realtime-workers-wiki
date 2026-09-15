@@ -694,8 +694,9 @@ describe("Worker integration", () => {
     });
   });
 
-  it("ignores removed cron rows and grants only never-successful active tasks deployment grace", async () => {
+  it("anchors new-task grace at its first readiness probe across deployments", async () => {
     const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     await env.DB.batch([
       env.DB.prepare(`INSERT INTO observability_task_runs
         (task_name, last_started_at, last_succeeded_at)
@@ -726,20 +727,31 @@ describe("Worker integration", () => {
     try {
       const freshDeploy = new Date(now - 10 * 60_000).toISOString();
       expect((await probe(freshDeploy)).status).toBe(200);
-      const expired = await probe(new Date(now - 36 * 60_000).toISOString());
+      expect(
+        await env.DB.prepare(`SELECT last_started_at, execution_token, first_observed_at
+          FROM observability_task_runs WHERE task_name = 'outbox'`).first(),
+      ).toEqual({ last_started_at: 0, execution_token: 0, first_observed_at: now });
+      clock.mockReturnValue(now + 36 * 60_000);
+      await env.DB.prepare(`UPDATE observability_task_runs SET last_succeeded_at = ?
+        WHERE task_name <> 'outbox' AND task_name <> 'removed_task'`)
+        .bind(now + 36 * 60_000)
+        .run();
+      const expired = await probe(new Date(now + 35 * 60_000).toISOString());
       expect(expired.status).toBe(503);
       expect(expired.body.checks).toContainEqual(
         expect.objectContaining({ name: "cron", code: "cron_success_stale", value: 1 }),
       );
       expect((await probe(undefined)).status).toBe(503);
+      expect(
+        await env.DB.prepare(
+          `SELECT first_observed_at FROM observability_task_runs WHERE task_name = 'outbox'`,
+        ).first(),
+      ).toEqual({ first_observed_at: now });
 
-      await env.DB.prepare(`INSERT INTO observability_task_runs
-        (task_name, last_started_at, last_succeeded_at)
-        VALUES ('outbox', ?, 0)`)
-        .bind(now)
-        .run();
+      await env.DB.prepare(`UPDATE observability_task_runs SET last_succeeded_at = 0 WHERE task_name = 'outbox'`).run();
       expect((await probe(freshDeploy)).status).toBe(503);
     } finally {
+      clock.mockRestore();
       await env.DB.batch([
         env.DB.prepare(`INSERT INTO observability_task_runs
           (task_name, last_started_at, last_succeeded_at) VALUES ('outbox', ?, ?)
@@ -935,11 +947,12 @@ describe("Worker integration", () => {
         return Reflect.get(target, property, receiver);
       },
     });
-    const request = (ip: string, cookie?: string, origin?: string) =>
+    const request = (ip: string, cookie?: string, origin?: string, workerZone?: string) =>
       new Request("http://example.test/api/telemetry/client-errors", {
         method: "POST",
         headers: {
           "cf-connecting-ip": ip,
+          ...(workerZone ? { "cf-worker": workerZone } : {}),
           "content-type": "application/json",
           ...(cookie ? { cookie } : {}),
           ...(origin ? { origin } : {}),
@@ -981,6 +994,23 @@ describe("Worker integration", () => {
     expect(userKeys).toHaveLength(2);
     expect(userKeys[0]).toBe(userKeys[1]);
     expect(userKeys[0]).toMatch(/^[a-f0-9]{64}$/);
+    await worker.fetch(
+      request("2a06:98c0:3600::103", undefined, undefined, "caller-a.example"),
+      bindings,
+      createExecutionContext(),
+    );
+    await worker.fetch(
+      request("2a06:98c0:3600::103", undefined, undefined, "caller-b.example"),
+      bindings,
+      createExecutionContext(),
+    );
+    await worker.fetch(
+      request("2a06:98c0:3600::103", undefined, undefined, "caller-a.example"),
+      bindings,
+      createExecutionContext(),
+    );
+    expect(preauthKeys.at(-3)).not.toBe(preauthKeys.at(-2));
+    expect(preauthKeys.at(-3)).toBe(preauthKeys.at(-1));
   });
 
   it("distinguishes unknown response bytes from a known zero Content-Length", async () => {
@@ -1032,6 +1062,7 @@ describe("Worker integration", () => {
       `/share/${shareKey}/diagram-thumbnails/abc.svg`,
       "/api/no-such-route/short-id.svg",
       "/parties/document/abc~1",
+      "/parties/workspace-events/abc",
     ];
     for (const path of paths) {
       await worker.fetch(new Request(`http://example.test${path}`), bindings, createExecutionContext());
@@ -1046,6 +1077,7 @@ describe("Worker integration", () => {
       "/share/:key/diagram-thumbnails/:fileName",
       "/unmatched",
       "/parties/document/:room",
+      "/parties/workspace-events/:workspace",
     ]);
     expect(JSON.stringify(operations)).not.toContain(uuid);
     expect(JSON.stringify(operations)).not.toContain(shareKey);
@@ -1190,6 +1222,97 @@ describe("Worker integration", () => {
     }
   });
 
+  it("records failed-start outcomes without replacing a newer same-time result", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(200);
+    const taskNames = ["test_fallback_failure", "test_fallback_success", "test_fallback_tie"] as const;
+    await env.DB.batch(
+      taskNames.map((taskName) =>
+        env.DB.prepare(
+          `INSERT INTO observability_task_runs
+        (task_name, last_started_at, execution_token, first_observed_at, last_duration_ms, last_error)
+        VALUES (?, ?, 100, 100, 5, 'older failure')`,
+        ).bind(taskName, taskName === "test_fallback_tie" ? 200 : 100),
+      ),
+    );
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property !== "prepare") return Reflect.get(target, property, receiver);
+        return (query: string) =>
+          query.includes("RETURNING execution_token")
+            ? { bind: () => ({ first: () => Promise.reject(new Error("start write unavailable")) }) }
+            : target.prepare(query);
+      },
+    });
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DB") return database;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(
+        executeScheduledTasks(bindings, createExecutionContext(), [
+          {
+            name: taskNames[0],
+            run: async () => {
+              throw new Error("new failure");
+            },
+          },
+          { name: taskNames[1], run: async () => undefined },
+          {
+            name: taskNames[2],
+            run: async () => {
+              throw new Error("ambiguous failure");
+            },
+          },
+        ]),
+      ).rejects.toThrow("Scheduled tasks failed");
+      const rows = await env.DB.prepare(`SELECT task_name, last_started_at, execution_token,
+        last_succeeded_at, last_failed_at, last_duration_ms, last_error
+        FROM observability_task_runs WHERE task_name IN (?, ?, ?) ORDER BY task_name`)
+        .bind(...taskNames)
+        .all();
+      expect(rows.results).toEqual([
+        {
+          task_name: taskNames[0],
+          last_started_at: 200,
+          execution_token: 100,
+          last_succeeded_at: null,
+          last_failed_at: 200,
+          last_duration_ms: 0,
+          last_error: "new failure",
+        },
+        {
+          task_name: taskNames[1],
+          last_started_at: 200,
+          execution_token: 100,
+          last_succeeded_at: 200,
+          last_failed_at: null,
+          last_duration_ms: 0,
+          last_error: null,
+        },
+        {
+          task_name: taskNames[2],
+          last_started_at: 200,
+          execution_token: 100,
+          last_succeeded_at: null,
+          last_failed_at: 200,
+          last_duration_ms: 5,
+          last_error: "older failure",
+        },
+      ]);
+    } finally {
+      clock.mockRestore();
+      warning.mockRestore();
+      logged.mockRestore();
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name IN (?, ?, ?)`)
+        .bind(...taskNames)
+        .run();
+    }
+  });
+
   it("prevents an older overlapping scheduled execution from overwriting newer state", async () => {
     const taskName = "test_overlap";
     const olderFailure = new Error("older execution failed");
@@ -1232,7 +1355,7 @@ describe("Worker integration", () => {
       ).resolves.toEqual({
         last_started_at: 2_000,
         last_succeeded_at: 2_000,
-        last_failed_at: null,
+        last_failed_at: 3_000,
         last_duration_ms: 0,
         last_error: null,
       });
@@ -1328,14 +1451,15 @@ describe("Worker integration", () => {
       releaseOlder();
       await expect(older).rejects.toThrow("Scheduled tasks failed");
       await expect(
-        env.DB.prepare(`SELECT last_started_at, last_succeeded_at, last_failed_at, last_error
+        env.DB.prepare(`SELECT last_started_at, execution_token, last_succeeded_at, last_failed_at, last_error
         FROM observability_task_runs WHERE task_name = ?`)
           .bind(taskName)
           .first(),
       ).resolves.toEqual({
-        last_started_at: 1_001,
+        last_started_at: 1_000,
+        execution_token: 2,
         last_succeeded_at: 1_000,
-        last_failed_at: null,
+        last_failed_at: 1_000,
         last_error: null,
       });
     } finally {
@@ -1394,7 +1518,7 @@ describe("Worker integration", () => {
       get(target, property, receiver) {
         if (property !== "prepare") return Reflect.get(target, property, receiver);
         return (query: string) => {
-          if (query.includes("last_failed_at = excluded.last_failed_at")) {
+          if (query.includes("last_failed_at = MAX")) {
             return { bind: () => ({ run: () => Promise.reject(stateError) }) };
           }
           return target.prepare(query);

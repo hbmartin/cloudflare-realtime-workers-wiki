@@ -65,19 +65,33 @@ async function checkDurableObject(env: Env) {
 }
 
 async function checkCron(env: Env, timestamp: number) {
+  await env.DB.prepare(
+    `INSERT INTO observability_task_runs (task_name, last_started_at, execution_token, first_observed_at)
+      VALUES ${SCHEDULED_TASK_NAMES.map(() => "(?, 0, 0, ?)").join(", ")}
+      ON CONFLICT(task_name) DO UPDATE SET
+        first_observed_at = COALESCE(
+          observability_task_runs.first_observed_at,
+          observability_task_runs.last_started_at
+        )
+      WHERE observability_task_runs.first_observed_at IS NULL`,
+  )
+    .bind(...SCHEDULED_TASK_NAMES.flatMap((name) => [name, timestamp]))
+    .run();
   const rows = await env.DB.prepare(
-    `SELECT task_name, last_succeeded_at FROM observability_task_runs
+    `SELECT task_name, last_succeeded_at, first_observed_at FROM observability_task_runs
       WHERE task_name IN (${SCHEDULED_TASK_NAMES.map(() => "?").join(", ")})`,
   )
     .bind(...SCHEDULED_TASK_NAMES)
-    .all<{ task_name: string; last_succeeded_at: number | null }>();
-  const succeededAt = new Map(rows.results.map((row) => [row.task_name, row.last_succeeded_at]));
-  const deploymentAt = Date.parse(env.CF_VERSION_METADATA?.timestamp ?? "");
-  const firstSuccessGrace =
-    Number.isFinite(deploymentAt) && deploymentAt <= timestamp && timestamp - deploymentAt < CRON_STALE_MS;
+    .all<{ task_name: string; last_succeeded_at: number | null; first_observed_at: number | null }>();
+  const state = new Map(rows.results.map((row) => [row.task_name, row]));
   const stale = SCHEDULED_TASK_NAMES.filter((name) => {
-    const success = succeededAt.get(name);
-    return success === null || success === undefined ? !firstSuccessGrace : success < timestamp - CRON_STALE_MS;
+    const row = state.get(name);
+    if (row?.last_succeeded_at === null || row?.last_succeeded_at === undefined) {
+      return row?.first_observed_at === null || row?.first_observed_at === undefined
+        ? true
+        : row.first_observed_at <= timestamp - CRON_STALE_MS;
+    }
+    return row.last_succeeded_at < timestamp - CRON_STALE_MS;
   }).length;
   return stale === 0 ? { ok: true, code: "ok", value: 0 } : { ok: false, code: "cron_success_stale", value: stale };
 }

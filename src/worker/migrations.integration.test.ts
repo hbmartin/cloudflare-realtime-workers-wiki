@@ -4,6 +4,40 @@ import { beforeEach, describe, expect, it } from "vitest";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("backfills scheduler tokens without renewing grace for never-successful tasks", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0032"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO observability_task_runs (task_name, last_started_at, last_failed_at, last_error)
+        VALUES ('never_succeeded', 1000, 1100, 'failure')`),
+      env.DB.prepare(`INSERT INTO observability_task_runs (task_name, last_started_at, last_succeeded_at)
+        VALUES ('succeeded', 2000, 2100)`),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    const rows = await env.DB.prepare(`SELECT task_name, execution_token, first_observed_at
+      FROM observability_task_runs WHERE task_name IN ('never_succeeded', 'succeeded') ORDER BY task_name`).all<{
+      task_name: string;
+      execution_token: number;
+      first_observed_at: number;
+    }>();
+    expect(rows.results).toEqual([
+      { task_name: "never_succeeded", execution_token: 1000, first_observed_at: 0 },
+      { task_name: "succeeded", execution_token: 2000, first_observed_at: 2000 },
+    ]);
+    const columns = await env.DB.prepare(`PRAGMA table_info(observability_task_runs)`).all<{
+      name: string;
+      notnull: number;
+    }>();
+    expect(columns.results.filter((column) => ["execution_token", "first_observed_at"].includes(column.name))).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "execution_token", notnull: 0 }),
+        expect.objectContaining({ name: "first_observed_at", notnull: 0 }),
+      ]),
+    );
+  });
+
   it("invalidates existing password-only sessions during the mandatory protection cutover", async () => {
     await applyD1Migrations(
       env.DB,

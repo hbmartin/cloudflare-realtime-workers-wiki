@@ -60,8 +60,10 @@ and lifecycle summaries.
 
 Never add cookies, authorization headers, credentials, email addresses, request bodies, document content or
 titles, Slack/webhook payloads, or URL query strings to telemetry. The logger redacts sensitive keys, known
-credential formats, email-shaped values, Basic and Bearer authorization values, and query strings, including nested
-diagnostic values.
+credential formats, email-shaped values, Basic values in authorization contexts or with token-shaped text, Bearer
+values, and query strings, including nested diagnostic values. Redaction runs before log-length limits. A bare
+all-lowercase malformed Basic value in generic free text is indistinguishable from ordinary prose and may remain;
+never put authorization headers in diagnostic text.
 Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to
 Analytics Engine. HTTP metric operations use Hono's registered route template, fixed Party templates, or
 `/unmatched`; they never derive a route value from request path segments.
@@ -71,9 +73,9 @@ SHA-256 fingerprint, same-origin source path/line/column, request ID, release, o
 messages and stacks never leave the browser; pre-login failures are deliberately not ingested.
 The browser budgets five attempted telemetry POSTs per minute, including rejected and network-failed attempts,
 and counts an in-flight attempt once. Fingerprint deduplication begins only after a report is accepted.
-The Worker separately limits 300 requests per
-source IP per minute before origin/session checks and 20 authenticated requests per user per minute. Both keys
-are hashed before passing them to Worker Rate Limit bindings.
+The Worker separately limits 300 requests per source IP or originating Worker zone per minute before origin/session
+checks and 20 authenticated requests per user per minute. Both keys are hashed before passing them to Worker Rate
+Limit bindings.
 
 ## Analytics Engine schema
 
@@ -132,8 +134,9 @@ The monitor makes one to three readiness probes, stopping at the first success. 
 failed attempts and evaluates:
 
 - every attempted readiness probe fails, or an active scheduled task's success is more than 35 minutes old.
-  Removed tasks' historical rows are ignored. A new/renamed task without its first success gets 35 minutes
-  after the current deployment timestamp; missing deployment metadata or a previously stale success gets no grace;
+  Removed tasks' historical rows are ignored. The first readiness probe registers a missing active task in D1 and
+  gives it one durable 35-minute first-success grace period; later deploys cannot renew it. Existing never-successful
+  rows at migration time get no renewed grace;
 - three Worker exceptions in five minutes, or 5xx above 2% with at least 50 requests;
 - missing delivery Queue, DLQ, or D1 metadata; any DLQ backlog; or Queue backlog above 100 throughout 15 minutes;
   oldest message age remains diagnostic because delayed webhook retries intentionally remain queued;
@@ -146,17 +149,20 @@ failed attempts and evaluates:
   authenticated browser fingerprints in 15 minutes.
 
 Missing external metadata reports `delivery_queue_metadata_missing`, `delivery_dlq_metadata_missing`, or
-`d1_metadata_missing` instead of interpreting an unavailable resource as zero.
+`d1_metadata_missing` instead of interpreting an unavailable resource as zero. Queue listing, individual Queue
+metrics, D1, Analytics, GraphQL, and Workflow instance failures produce source-specific diagnostics; report mode
+continues with unavailable values and check mode exits nonzero after printing the partial summary.
 Queue discovery accepts a single-page response without pagination metadata and follows `total_pages` when present;
 a full page with no way to continue reports `queue_listing_unavailable`. A failed Workflow instances request reports
-`workflow_metadata_unavailable` without aborting the other probes. Stale Workflow counts follow cursors where
-available; a full page without a next cursor is reported as a lower bound with `workflow_count_incomplete`, never
-as an exact count. Existing monitor tokens need Workers Scripts Read (or Workers Tail Read) for Workflow instances;
+`workflow_metadata_unavailable` without aborting the other probes. Stale Workflow counts follow up to five cursor
+pages; a further cursor or a full page without one is reported as a lower bound with `workflow_count_incomplete`,
+never as an exact count. Existing monitor tokens need Workers Scripts Read (or Workers Tail Read) for Workflow instances;
 verify or rotate older tokens before relying on this probe.
 
-Cron state uses a strictly increasing start token for latest-run outcome fields. Any completed success advances
-the success heartbeat even when a newer execution has already started; an older result cannot overwrite the
-newer execution's error or duration.
+Cron state uses a separate, strictly increasing execution token for latest-run outcome fields while `last_started_at`
+holds the actual start time (`0` means registered but never started). Any completed success or failure advances its
+heartbeat even when a newer execution has already started; an older result cannot overwrite the newer execution's
+error or duration.
 
 Run the same collector by hand:
 

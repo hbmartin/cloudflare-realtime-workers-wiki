@@ -13,6 +13,35 @@ const READINESS_ATTEMPTS = 3;
 const READINESS_DELAY_MS = 45_000;
 const WORKFLOW_LOOKBACK_MS = 2 * 60 * 60_000;
 const WORKFLOW_QUEUED_MS = 30 * 60_000;
+const WORKFLOW_PAGE_LIMIT = 5;
+
+class ObservabilityApiError extends Error {
+  constructor(status) {
+    super(`Observability API returned HTTP ${status}.`);
+    this.status = status;
+  }
+}
+
+function sourceDiagnostic(source, code, error) {
+  const status = error instanceof ObservabilityApiError ? error.status : undefined;
+  const reason =
+    status !== undefined
+      ? "http_error"
+      : error?.name === "TimeoutError" || error?.name === "AbortError"
+        ? "timeout"
+        : error instanceof TypeError
+          ? "network_error"
+          : "invalid_response";
+  return { source, code, reason, ...(status !== undefined ? { status } : {}) };
+}
+
+async function captureSource(source, code, operation) {
+  try {
+    return { value: await operation() };
+  } catch (error) {
+    return { value: null, diagnostic: sourceDiagnostic(source, code, error) };
+  }
+}
 
 function requiredEnvironment(environment) {
   const values = {
@@ -31,7 +60,8 @@ function requiredEnvironment(environment) {
 async function fetchJson(url, init, fetcher = fetch) {
   const response = await fetcher(url, { ...init, signal: AbortSignal.timeout(15_000) });
   const body = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(`Observability API returned HTTP ${response.status}.`);
+  if (!response.ok) throw new ObservabilityApiError(response.status);
+  if (body === null) throw new Error("Observability API returned an invalid response.");
   return body;
 }
 
@@ -67,7 +97,8 @@ async function analyticsSql(accountId, token, minutes, fetcher = fetch) {
     },
     fetcher,
   );
-  return Array.isArray(response?.data) ? response.data : [];
+  if (!Array.isArray(response?.data)) throw new Error("Analytics response is invalid.");
+  return response.data;
 }
 
 export function analyticsQuery(minutes) {
@@ -132,7 +163,8 @@ async function queueMetrics(accountId, token, queueId, fetcher = fetch) {
     { headers: { authorization: `Bearer ${token}` } },
     fetcher,
   );
-  return response?.result ?? null;
+  if (!response?.result || typeof response.result !== "object") throw new Error("Queue metrics response is invalid.");
+  return response.result;
 }
 
 async function d1Metadata(accountId, token, fetcher = fetch) {
@@ -141,7 +173,8 @@ async function d1Metadata(accountId, token, fetcher = fetch) {
     { headers: { authorization: `Bearer ${token}` } },
     fetcher,
   );
-  const database = Array.isArray(listed?.result) ? listed.result.find((item) => item.name === D1_NAME) : null;
+  if (!Array.isArray(listed?.result)) throw new Error("D1 listing response is invalid.");
+  const database = listed.result.find((item) => item.name === D1_NAME);
   const id = database?.uuid ?? database?.id;
   if (!id) return null;
   const details = await fetchJson(
@@ -149,7 +182,8 @@ async function d1Metadata(accountId, token, fetcher = fetch) {
     { headers: { authorization: `Bearer ${token}` } },
     fetcher,
   );
-  return details?.result ?? null;
+  if (!details?.result || typeof details.result !== "object") throw new Error("D1 metadata response is invalid.");
+  return details.result;
 }
 
 async function staleQueuedWorkflows(accountId, token, timestamp, fetcher = fetch) {
@@ -161,7 +195,7 @@ async function staleQueuedWorkflows(accountId, token, timestamp, fetcher = fetch
   url.searchParams.set("per_page", "100");
   const instances = [];
   const seenCursors = new Set();
-  for (let page = 0; page < 1000; page += 1) {
+  for (let page = 0; page < WORKFLOW_PAGE_LIMIT; page += 1) {
     const response = await fetchJson(url, { headers: { authorization: `Bearer ${token}` } }, fetcher);
     if (response?.success !== true || !Array.isArray(response.result)) {
       throw new Error("Cloudflare Workflow instance query returned an invalid response.");
@@ -178,6 +212,7 @@ async function staleQueuedWorkflows(accountId, token, timestamp, fetcher = fetch
     if (typeof cursor !== "string" || seenCursors.has(cursor)) {
       throw new Error("Cloudflare Workflow instance query returned invalid pagination metadata.");
     }
+    if (page === WORKFLOW_PAGE_LIMIT - 1) return { instances, complete: false };
     seenCursors.add(cursor);
     url.searchParams.set("cursor", cursor);
   }
@@ -219,8 +254,11 @@ async function graphqlMetrics(accountId, token, queueId, startedAt, fetcher = fe
     fetcher,
   );
   if (Array.isArray(body?.errors) && body.errors.length) throw new Error("Cloudflare GraphQL metrics query failed.");
-  const account = body?.data?.viewer?.accounts?.[0] ?? {};
-  return { worker: account.worker ?? [], workflow: account.workflow ?? [], queue: account.queue ?? [] };
+  const account = body?.data?.viewer?.accounts?.[0];
+  if (!account || !Array.isArray(account.worker) || !Array.isArray(account.workflow) || !Array.isArray(account.queue)) {
+    throw new Error("Cloudflare GraphQL metrics response is invalid.");
+  }
+  return { worker: account.worker, workflow: account.workflow, queue: account.queue };
 }
 
 function number(value) {
@@ -324,9 +362,11 @@ export function evaluateThresholds(snapshot) {
 
 function markdown(snapshot, failures, windows, title = "Cloudflare observability monitor") {
   const latest = snapshot.readiness.at(-1);
+  const diagnostics = snapshot.sourceDiagnostics ?? [];
+  const unavailable = new Set(diagnostics.map((item) => item.source));
   const deliveryBacklog = snapshot.delivery?.backlog_count;
   const dlqBacklog = snapshot.dlq?.backlog_count;
-  const databaseSize = snapshot.database?.file_size;
+  const databaseSize = monitoredNumber(snapshot.database?.file_size);
   const oldestMessageValue = snapshot.delivery?.oldest_message_timestamp_ms;
   const oldestMessage = number(oldestMessageValue);
   const oldestMessageAge =
@@ -340,12 +380,12 @@ function markdown(snapshot, failures, windows, title = "Cloudflare observability
     `## ${title}`,
     "",
     `- Readiness: ${latest?.ok ? "ready" : "failed"} (${snapshot.readiness.map((item) => item.status).join(", ")})`,
-    `- Worker requests (${windows.graphqlMinutes}m): ${snapshot.worker.reduce((total, row) => total + number(row.sum?.requests), 0)}`,
-    `- Analytics events (${windows.analyticsMinutes}m, sampling-adjusted): ${snapshot.analytics.reduce((total, row) => total + number(row.count), 0)}`,
+    `- Worker requests (${windows.graphqlMinutes}m): ${unavailable.has("graphql") ? "unavailable" : snapshot.worker.reduce((total, row) => total + number(row.sum?.requests), 0)}`,
+    `- Analytics events (${windows.analyticsMinutes}m, sampling-adjusted): ${unavailable.has("analytics") ? "unavailable" : snapshot.analytics.reduce((total, row) => total + number(row.count), 0)}`,
     `- Delivery backlog / DLQ / oldest age: ${availableNumber(deliveryBacklog)} / ${availableNumber(dlqBacklog)} / ${oldestMessageAge}${oldestMessageAge === "unavailable" ? "" : " ms"}`,
-    `- D1 size: ${availableNumber(databaseSize)}${databaseSize === null || databaseSize === undefined ? "" : " bytes"}`,
+    `- D1 size: ${availableNumber(databaseSize)}${databaseSize === null ? "" : " bytes"}`,
     `- Stale queued Workflows: ${snapshot.staleQueuedWorkflows === null ? "unavailable" : snapshot.staleWorkflowCountComplete === false ? `at least ${snapshot.staleQueuedWorkflows.length}` : snapshot.staleQueuedWorkflows.length}`,
-    `- Unavailable sources: ${(snapshot.sourceFailures ?? []).length ? snapshot.sourceFailures.join(", ") : "none"}`,
+    `- Unavailable sources: ${diagnostics.length ? diagnostics.map((item) => `${item.source} (${item.status === undefined ? item.reason : `HTTP ${item.status}`})`).join(", ") : "none"}`,
     `- Alert codes: ${failures === null ? "not evaluated (run observability:check)" : failures.length ? failures.join(", ") : "none"}`,
     "",
   ].join("\n");
@@ -356,45 +396,62 @@ export async function collectSnapshot(config, options = {}) {
   const graphqlMinutes = options.graphqlMinutes ?? 5;
   const analyticsMinutes = options.analyticsMinutes ?? 15;
   const timestamp = options.timestamp ?? Date.now();
-  const [readiness, queueSource, analytics, database, workflowSource] = await Promise.all([
+  const [readiness, queueSource, analyticsSource, databaseSource, workflowSource] = await Promise.all([
     probeReadiness(config.baseUrl, config.probeToken, options),
-    queueMetadata(config.accountId, config.token, fetcher)
-      .then((value) => ({ value }))
-      .catch(() => ({ error: true })),
-    analyticsSql(config.accountId, config.token, analyticsMinutes, fetcher),
-    d1Metadata(config.accountId, config.token, fetcher),
-    staleQueuedWorkflows(config.accountId, config.token, timestamp, fetcher)
-      .then((value) => ({ value }))
-      .catch(() => ({ error: true })),
+    captureSource("queue_listing", "queue_listing_unavailable", () =>
+      queueMetadata(config.accountId, config.token, fetcher),
+    ),
+    captureSource("analytics", "analytics_unavailable", () =>
+      analyticsSql(config.accountId, config.token, analyticsMinutes, fetcher),
+    ),
+    captureSource("d1", "d1_source_unavailable", () => d1Metadata(config.accountId, config.token, fetcher)),
+    captureSource("workflow_instances", "workflow_metadata_unavailable", () =>
+      staleQueuedWorkflows(config.accountId, config.token, timestamp, fetcher),
+    ),
   ]);
   const queues = queueSource.value ?? { delivery: null, dlq: null };
   const staleWorkflows = workflowSource.value ?? null;
-  const sourceFailures = [
-    ...(queueSource.error ? ["queue_listing_unavailable"] : []),
-    ...(workflowSource.error ? ["workflow_metadata_unavailable"] : []),
-  ];
-  const [delivery, dlq, graphql] = await Promise.all([
-    queueMetrics(config.accountId, config.token, queues.delivery?.queue_id ?? queues.delivery?.id, fetcher),
-    queueMetrics(config.accountId, config.token, queues.dlq?.queue_id ?? queues.dlq?.id, fetcher),
-    graphqlMetrics(
-      config.accountId,
-      config.token,
-      queues.delivery?.queue_id ?? queues.delivery?.id,
-      new Date(Date.now() - graphqlMinutes * 60_000),
-      fetcher,
+  const deliveryQueueId = queues.delivery?.queue_id ?? queues.delivery?.id;
+  const [deliverySource, dlqSource, graphqlSource] = await Promise.all([
+    captureSource("delivery_queue_metrics", "delivery_queue_metrics_unavailable", () =>
+      queueMetrics(config.accountId, config.token, deliveryQueueId, fetcher),
+    ),
+    captureSource("dlq_metrics", "dlq_metrics_unavailable", () =>
+      queueMetrics(config.accountId, config.token, queues.dlq?.queue_id ?? queues.dlq?.id, fetcher),
+    ),
+    captureSource("graphql", "graphql_unavailable", () =>
+      graphqlMetrics(
+        config.accountId,
+        config.token,
+        deliveryQueueId,
+        new Date(Date.now() - graphqlMinutes * 60_000),
+        fetcher,
+      ),
     ),
   ]);
+  const sourceDiagnostics = [
+    queueSource,
+    analyticsSource,
+    databaseSource,
+    workflowSource,
+    deliverySource,
+    dlqSource,
+    graphqlSource,
+  ]
+    .map((result) => result.diagnostic)
+    .filter(Boolean);
   return {
     readiness,
-    analytics,
-    delivery,
-    dlq,
-    database,
+    analytics: analyticsSource.value ?? [],
+    delivery: deliverySource.value,
+    dlq: dlqSource.value,
+    database: databaseSource.value,
     staleQueuedWorkflows: staleWorkflows?.instances ?? null,
     staleWorkflowCountComplete: staleWorkflows?.complete ?? null,
-    sourceFailures,
-    deliveryQueueId: queues.delivery?.queue_id ?? queues.delivery?.id,
-    ...graphql,
+    sourceDiagnostics,
+    sourceFailures: sourceDiagnostics.map((item) => item.code),
+    deliveryQueueId,
+    ...(graphqlSource.value ?? { worker: [], workflow: [], queue: [] }),
   };
 }
 
@@ -409,17 +466,33 @@ export async function main(arguments_, environment = process.env) {
   let summary = markdown(snapshot, mode === "check" ? failures : null, windows);
   if (mode === "report") {
     const dailyWindows = { analyticsMinutes: 24 * 60, graphqlMinutes: 24 * 60 };
-    const [analytics, graphql] = await Promise.all([
-      analyticsSql(config.accountId, config.token, dailyWindows.analyticsMinutes),
-      graphqlMetrics(
-        config.accountId,
-        config.token,
-        snapshot.deliveryQueueId,
-        new Date(Date.now() - dailyWindows.graphqlMinutes * 60_000),
+    const [analyticsSource, graphqlSource] = await Promise.all([
+      captureSource("analytics", "analytics_unavailable", () =>
+        analyticsSql(config.accountId, config.token, dailyWindows.analyticsMinutes),
+      ),
+      captureSource("graphql", "graphql_unavailable", () =>
+        graphqlMetrics(
+          config.accountId,
+          config.token,
+          snapshot.deliveryQueueId,
+          new Date(Date.now() - dailyWindows.graphqlMinutes * 60_000),
+        ),
       ),
     ]);
+    const dailyDiagnostics = [
+      ...snapshot.sourceDiagnostics.filter((item) => item.source !== "analytics" && item.source !== "graphql"),
+      analyticsSource.diagnostic,
+      graphqlSource.diagnostic,
+    ].filter(Boolean);
+    const dailySnapshot = {
+      ...snapshot,
+      analytics: analyticsSource.value ?? [],
+      ...(graphqlSource.value ?? { worker: [], workflow: [], queue: [] }),
+      sourceDiagnostics: dailyDiagnostics,
+      sourceFailures: dailyDiagnostics.map((item) => item.code),
+    };
     summary = `${markdown(snapshot, null, windows, "Cloudflare observability — 15 minutes")}\n${markdown(
-      { ...snapshot, analytics, ...graphql },
+      dailySnapshot,
       null,
       dailyWindows,
       "Cloudflare observability — 24 hours",

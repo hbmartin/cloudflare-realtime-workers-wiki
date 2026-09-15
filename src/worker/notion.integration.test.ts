@@ -124,6 +124,38 @@ describe("Notion-compatible API", () => {
     expect(routes).toEqual(["/v1/users/me", "/v1/files/:attachmentId"]);
   });
 
+  it("labels early API errors by endpoint and unknown API paths as unmatched", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const writeDataPoint = vi.fn();
+    const rateLimited = { limit: vi.fn(async () => ({ success: false })) } as unknown as RateLimit;
+    const bindings = (limited: boolean) =>
+      new Proxy(env, {
+        get(target, property, receiver) {
+          if (property === "OBSERVABILITY") return { writeDataPoint };
+          if (property === "ASSETS") return { fetch: async () => new Response("Not found", { status: 404 }) };
+          if (limited && property === "API_SOURCE_BURST_LIMIT") return rateLimited;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+    const pagePath = `/v1/pages/${installed.pageId}`;
+    const requests = [
+      [new Request(`http://example.test${pagePath}`), 400, false],
+      [notionRequest("invalid", `/pages/${installed.pageId}`), 401, false],
+      [notionRequest(`crn_${"a".repeat(43)}`, `/pages/${installed.pageId}`), 429, true],
+      [notionRequest(createdIntegration.token, "/nope/123"), 404, false],
+    ] as const;
+    for (const [request, status, limited] of requests) {
+      const response = await worker.fetch(request, bindings(limited), createExecutionContext());
+      expect(response.status).toBe(status);
+    }
+    const routes = writeDataPoint.mock.calls
+      .map(([point]) => point)
+      .filter((point) => point.indexes[0] === "http.request")
+      .map((point) => point.blobs[2]);
+    expect(routes).toEqual(["/v1/pages/:pageId", "/v1/pages/:pageId", "/v1/pages/:pageId", "/unmatched"]);
+  });
+
   it("runs page, block, search, user, position, and in_trash calls through the official SDK", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);

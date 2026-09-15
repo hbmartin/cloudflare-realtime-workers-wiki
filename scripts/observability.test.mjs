@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { analyticsQuery, collectSnapshot, evaluateThresholds, probeReadiness } from "./observability.mjs";
+import { describe, expect, it, vi } from "vitest";
+import { analyticsQuery, collectSnapshot, evaluateThresholds, main, probeReadiness } from "./observability.mjs";
 
 function healthy() {
   const now = Date.now();
@@ -37,7 +37,8 @@ function cloudflareFetcher(overrides = {}) {
   return async (url, init = {}) => {
     const target = String(url);
     if (target.includes("/api/health/ready")) return Response.json({ ok: true });
-    if (target.includes("/analytics_engine/sql")) return Response.json({ data: [] });
+    if (target.includes("/analytics_engine/sql"))
+      return overrides.analytics?.(target, init) ?? Response.json({ data: [] });
     if (target.includes("/queues?"))
       return (
         overrides.queues?.(target, init) ??
@@ -45,7 +46,9 @@ function cloudflareFetcher(overrides = {}) {
       );
     if (target.includes("/queues/") && target.endsWith("/metrics"))
       return overrides.metrics?.(target, init) ?? Response.json({ result: { backlog_count: 0 } });
-    if (target.includes("/d1/database?")) return Response.json({ result: [] });
+    if (target.includes("/d1/database?")) return overrides.d1Listing?.(target, init) ?? Response.json({ result: [] });
+    if (target.includes("/d1/database/"))
+      return overrides.d1Details?.(target, init) ?? Response.json({ result: { file_size: 0 } });
     if (target.includes("/workflows/cloudflare-realtime-notes-jobs/instances"))
       return overrides.workflows?.(target, init) ?? Response.json({ success: true, result: [] });
     if (target.endsWith("/graphql"))
@@ -326,6 +329,128 @@ describe("observability thresholds", () => {
     expect(evaluateThresholds(snapshot)).toContain("workflow_metadata_unavailable");
   });
 
+  it.each([
+    ["queue_listing_unavailable", { queues: () => new Response("failure", { status: 503 }) }],
+    ["analytics_unavailable", { analytics: () => new Response("failure", { status: 503 }) }],
+    ["d1_source_unavailable", { d1Listing: () => new Response("failure", { status: 503 }) }],
+    ["graphql_unavailable", { graphql: () => new Response("failure", { status: 503 }) }],
+    ["workflow_metadata_unavailable", { workflows: () => new Response("failure", { status: 503 }) }],
+  ])("continues collecting when %s fails", async (code, overrides) => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      { fetcher: cloudflareFetcher(overrides), delay: async () => undefined },
+    );
+    expect(snapshot.readiness[0].ok).toBe(true);
+    expect(snapshot.sourceFailures).toContain(code);
+    expect(snapshot.sourceDiagnostics).toContainEqual(
+      expect.objectContaining({ code, reason: "http_error", status: 503 }),
+    );
+    expect(evaluateThresholds(snapshot)).toContain(code);
+  });
+
+  it("classifies an invalid D1 listing instead of treating it as an empty database", async () => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      {
+        fetcher: cloudflareFetcher({ d1Listing: () => Response.json({ result: null }) }),
+        delay: async () => undefined,
+      },
+    );
+    expect(snapshot.sourceDiagnostics).toContainEqual(
+      expect.objectContaining({ source: "d1", code: "d1_source_unavailable", reason: "invalid_response" }),
+    );
+    expect(evaluateThresholds(snapshot)).toContain("d1_source_unavailable");
+  });
+
+  it.each([
+    ["delivery-id", "delivery_queue_metrics_unavailable"],
+    ["dlq-id", "dlq_metrics_unavailable"],
+  ])("isolates failure of the %s Queue metrics source", async (id, code) => {
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      {
+        fetcher: cloudflareFetcher({
+          queues: () =>
+            Response.json({
+              success: true,
+              result: [
+                { name: "cloudflare-realtime-notes-delivery", id: "delivery-id" },
+                { name: "cloudflare-realtime-notes-delivery-dlq", id: "dlq-id" },
+              ],
+              result_info: { page: 1, total_pages: 1 },
+            }),
+          metrics: (target) =>
+            target.includes(`/queues/${id}/metrics`)
+              ? new Response("failure", { status: 503 })
+              : Response.json({ result: { backlog_count: 0 } }),
+        }),
+        delay: async () => undefined,
+      },
+    );
+    expect(snapshot.sourceFailures).toContain(code);
+    expect(snapshot.sourceDiagnostics).toContainEqual(expect.objectContaining({ code, status: 503 }));
+    expect(evaluateThresholds(snapshot)).toContain(code);
+  });
+
+  it("prints a partial summary and a source-specific check alert", async () => {
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const previousExitCode = process.exitCode;
+    vi.stubGlobal("fetch", cloudflareFetcher({ analytics: () => new Response("failure", { status: 503 }) }));
+    try {
+      const result = await main(["check"], {
+        CLOUDFLARE_ACCOUNT_ID: "account",
+        CLOUDFLARE_OBSERVABILITY_TOKEN: "token",
+        PRODUCTION_BASE_URL: "https://notes.example.test",
+        OBSERVABILITY_PROBE_TOKEN: "probe",
+      });
+      const summary = String(output.mock.calls[0][0]);
+      expect(result.failures).toContain("analytics_unavailable");
+      expect(summary).toContain("Analytics events (15m, sampling-adjusted): unavailable");
+      expect(summary).toContain("analytics (HTTP 503)");
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+      output.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("prints partial 24-hour sources and an invalid D1 size without bytes", async () => {
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    vi.stubGlobal(
+      "fetch",
+      cloudflareFetcher({
+        d1Listing: () => Response.json({ result: [{ name: "cloudflare-realtime-notes", uuid: "db" }] }),
+        d1Details: () => Response.json({ result: { file_size: "NaN" } }),
+        analytics: (_target, init) =>
+          String(init.body).includes("INTERVAL '1440' MINUTE")
+            ? new Response("failure", { status: 503 })
+            : Response.json({ data: [] }),
+        graphql: (_target, init) =>
+          Date.parse(JSON.parse(init.body).variables.start) < Date.now() - 12 * 60 * 60_000
+            ? new Response("failure", { status: 503 })
+            : Response.json({ data: { viewer: { accounts: [{ worker: [], workflow: [], queue: [] }] } } }),
+      }),
+    );
+    try {
+      await main(["report"], {
+        CLOUDFLARE_ACCOUNT_ID: "account",
+        CLOUDFLARE_OBSERVABILITY_TOKEN: "token",
+        PRODUCTION_BASE_URL: "https://notes.example.test",
+        OBSERVABILITY_PROBE_TOKEN: "probe",
+      });
+      const summary = String(output.mock.calls[0][0]);
+      expect(summary).toContain("Cloudflare observability — 24 hours");
+      expect(summary).toContain("Worker requests (1440m): unavailable");
+      expect(summary).toContain("Analytics events (1440m, sampling-adjusted): unavailable");
+      expect(summary).toContain("D1 size: unavailable");
+      expect(summary).not.toContain("unavailable bytes");
+    } finally {
+      output.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("reports forty stale Workflow instances instead of capping the count at one", async () => {
     const snapshot = await collectSnapshot(
       { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
@@ -367,6 +492,30 @@ describe("observability thresholds", () => {
     });
     expect(incomplete.staleWorkflowCountComplete).toBe(false);
     expect(evaluateThresholds(incomplete)).toContain("workflow_count_incomplete");
+  });
+
+  it("stops Workflow pagination after five pages and reports a lower bound", async () => {
+    let calls = 0;
+    const snapshot = await collectSnapshot(
+      { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+      {
+        fetcher: cloudflareFetcher({
+          workflows: () => {
+            calls += 1;
+            return Response.json({
+              success: true,
+              result: Array.from({ length: 100 }, (_, index) => ({ id: `${calls}-${index}` })),
+              result_info: { cursor: `next-${calls}`, total_count: 100_000 },
+            });
+          },
+        }),
+        delay: async () => undefined,
+      },
+    );
+    expect(calls).toBe(5);
+    expect(snapshot.staleQueuedWorkflows).toHaveLength(500);
+    expect(snapshot.staleWorkflowCountComplete).toBe(false);
+    expect(evaluateThresholds(snapshot)).toContain("workflow_count_incomplete");
   });
 
   it.each([

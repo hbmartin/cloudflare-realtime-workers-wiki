@@ -5,7 +5,7 @@ import {
   LOG_IDENTIFIER_LIMIT,
   LOG_STACK_LIMIT,
   LOG_TEXT_LIMIT,
-  safeErrorMessage,
+  rawSafeErrorMessage,
 } from "../shared/error-log.ts";
 import type { Env } from "./env";
 
@@ -29,7 +29,7 @@ type LogFields = Readonly<Record<string, unknown>>;
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
 const EMAIL_VALUE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
-const BASIC_VALUE = /\bBasic[ \t]+([A-Za-z0-9+/=]+)/gi;
+const BASIC_VALUE = /\bBasic(\s+)([^\s]+)/gi;
 const BEARER_VALUE = /\bBearer\s+[^\s]+/gi;
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
@@ -94,29 +94,30 @@ export function withDurableObjectContext<T>(env: Env, request: Request, callback
   );
 }
 
+function redactKnownValues(value: string) {
+  return value
+    .replace(BASIC_VALUE, (match, separator: string, candidate: string, offset: number, source: string) => {
+      const before = source.slice(Math.max(0, offset - 80), offset);
+      const authorizationHeader = /\b(?:proxy-)?authorization\s*:\s*$/i.test(before);
+      const terminal = candidate.match(/[.,;!?]+$/)?.[0] ?? "";
+      const core = candidate.slice(0, candidate.length - terminal.length);
+      const proseWord = /^[a-z]+$/.test(core);
+      // A plain lowercase word in free text can be prose. In a header context,
+      // after a line break, or for a token-shaped value, scrub without decoding.
+      return authorizationHeader || /[\r\n]/.test(separator) || !proseWord ? `Basic [redacted]${terminal}` : match;
+    })
+    .replace(BEARER_VALUE, "Bearer [redacted]")
+    .replace(SECRET_VALUE, "[redacted-secret]")
+    .replace(EMAIL_VALUE, "[redacted-email]")
+    .replace(URL_QUERY, "$1");
+}
+
 function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
-  return boundedLogString(
-    value
-      .replace(BASIC_VALUE, (match, encoded: string) => {
-        try {
-          // Basic credentials encode "username:password". Do not consume ordinary
-          // prose such as "Basic constraints" or "Basic idea" as a credential.
-          if (atob(encoded).includes(":")) return "Basic [redacted]";
-        } catch {
-          // A malformed token is not valid Basic authentication.
-        }
-        return match;
-      })
-      .replace(BEARER_VALUE, "Bearer [redacted]")
-      .replace(SECRET_VALUE, "[redacted-secret]")
-      .replace(EMAIL_VALUE, "[redacted-email]")
-      .replace(URL_QUERY, "$1"),
-    limit,
-  );
+  return boundedLogString(redactKnownValues(value), limit);
 }
 
 export function safeTelemetryErrorMessage(error: unknown, fallback: string) {
-  return redactedString(safeErrorMessage(error, fallback), 1_000);
+  return redactedString(rawSafeErrorMessage(error, fallback), 1_000);
 }
 
 function safeNested(value: unknown, depth: number, seen: WeakSet<object>): unknown {
@@ -129,7 +130,7 @@ function safeNested(value: unknown, depth: number, seen: WeakSet<object>): unkno
   if (depth >= 3) return "[depth omitted]";
   if (seen.has(value)) return "[circular]";
   seen.add(value);
-  if (value instanceof Error) return errorLogFields(value);
+  if (value instanceof Error) return errorLogFields(value, redactKnownValues);
   let keys: string[];
   try {
     keys = Object.keys(value).slice(0, 30);
@@ -195,6 +196,7 @@ function structuredLog(
   const safeContext: Record<string, unknown> = {};
   if (context) {
     for (const [key, value] of Object.entries(context)) {
+      if (key === "metricRouteTemplate") continue;
       const safe = safeField(key, value);
       if (safe !== undefined) safeContext[key] = safe;
     }
@@ -207,7 +209,7 @@ function structuredLog(
   }
   const normalizedError: Record<string, unknown> = {};
   if (error !== undefined) {
-    for (const [key, value] of Object.entries(errorLogFields(error))) {
+    for (const [key, value] of Object.entries(errorLogFields(error, redactKnownValues))) {
       const safe = safeField(key, value);
       if (safe !== undefined) normalizedError[key] = safe;
     }
