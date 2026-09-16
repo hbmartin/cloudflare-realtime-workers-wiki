@@ -95,6 +95,28 @@ describe("D1 migrations", () => {
     }
   });
 
+  it("fences an execution-token takeover without a newer legacy start time", async () => {
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    try {
+      await env.DB.prepare(`INSERT INTO observability_task_runs
+        (task_name, last_started_at, execution_token, run_id, first_observed_at)
+        VALUES ('legacy_token_fence', 200, NULL, 'worker-run', 200)`).run();
+
+      const legacy = await env.DB.prepare(`UPDATE observability_task_runs
+        SET execution_token = 201
+        WHERE task_name = 'legacy_token_fence'
+        RETURNING execution_token`).all();
+
+      expect(legacy.results).toEqual([]);
+      expect(
+        await env.DB.prepare(`SELECT last_started_at, run_id, execution_token
+          FROM observability_task_runs WHERE task_name = 'legacy_token_fence'`).first(),
+      ).toEqual({ last_started_at: 200, run_id: "worker-run", execution_token: null });
+    } finally {
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = 'legacy_token_fence'`).run();
+    }
+  });
+
   it("invalidates existing password-only sessions during the mandatory protection cutover", async () => {
     await applyD1Migrations(
       env.DB,

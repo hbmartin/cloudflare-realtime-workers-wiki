@@ -1,7 +1,5 @@
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
-import { matchedRoutes, routePath } from "hono/route";
-import { findTargetHandler, isMiddleware } from "hono/utils/handler";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { pruneSecurityState, requireSecurity } from "./security";
@@ -203,26 +201,18 @@ import {
   withObservabilityContext,
 } from "./observability";
 import { deploymentMetadata, readiness } from "./health";
+import { respondingMetricRoute } from "./metric-route";
 import { SCHEDULED_TASK_NAMES, type ScheduledTaskName } from "./scheduled-task-names";
 import { sourceRateLimitKey } from "./source-rate-limit";
 
 const app = new Hono<{ Bindings: Env }>();
 
-function isConcreteMetricRoute(route: string | undefined): route is string {
-  return route !== undefined && route !== "*" && route !== "/*" && !route.endsWith("/*");
-}
-
 app.use("*", async (c, next) => {
   try {
     await next();
   } finally {
-    const responding = routePath(c);
-    const registered = isConcreteMetricRoute(responding)
-      ? responding
-      : matchedRoutes(c).findLast(
-          (route) => !isMiddleware(findTargetHandler(route.handler)) && isConcreteMetricRoute(route.path),
-        )?.path;
-    if (isConcreteMetricRoute(registered)) setMetricRouteTemplate(registered);
+    const registered = respondingMetricRoute(c);
+    if (registered) setMetricRouteTemplate(registered);
   }
 });
 const DELETION_TARGET_BATCH_SIZE = 50;

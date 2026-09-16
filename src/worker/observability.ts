@@ -29,11 +29,14 @@ type LogFields = Readonly<Record<string, unknown>>;
 
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
-const BASIC_HEADER_VALUE = /\b((?:proxy-)?authorization[ \t]*:[ \t]*Basic[ \t]+)[A-Za-z0-9+/_=-]+/gi;
+const BASIC_HEADER_VALUE = /\b((?:proxy-)?authorization["']?[ \t]*:[ \t]*["']?Basic[ \t]+)[A-Za-z0-9+/_=-]+/gi;
 const BASIC_VALUE = /\bBasic[ \t]+([A-Za-z0-9+/_=-]+)/gi;
-const BEARER_VALUE = /\bBearer[ \t]+\S+/gi;
+const BEARER_HEADER_VALUE =
+  /\b((?:proxy-)?authorization["']?[ \t]*:[ \t]*["']?Bearer[ \t]+)([A-Za-z0-9._~+/=-]+)(?=$|[\s"'()[\]{},;!?])/gi;
+const BEARER_VALUE = /\bBearer[ \t]+([A-Za-z0-9._~+/=-]+)(?=$|[\s"'()[\]{},;!?])/gi;
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
+const PARTIAL_SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]*|xox[baprs]-[A-Za-z0-9-]*)$/i;
 const NESTED_VALUE_BUDGET = 100;
 const REDACTED_VALUE = "[redacted]";
 const OMITTED_ENTRIES = "[entries omitted]";
@@ -148,7 +151,7 @@ function redactEmails(value: string) {
       end += 1;
     }
 
-    const boundedLocal = start === 0 || !isAsciiWord(value.charCodeAt(start - 1));
+    const boundedLocal = start > cursor || start === 0 || !isAsciiWord(value.charCodeAt(start - 1));
     if (start < at && validEnd > 0 && boundedLocal) {
       parts.push(value.slice(cursor, start), "[redacted-email]");
       cursor = validEnd;
@@ -159,50 +162,62 @@ function redactEmails(value: string) {
   return parts.join("");
 }
 
-function redactBasicValue(match: string, encoded: string) {
+function redactBasicValue(match: string, encoded: string, atBoundary = false) {
   try {
     if (atob(encoded).includes(":")) return match.slice(0, match.length - encoded.length) + REDACTED_VALUE;
   } catch {
     // Malformed Base64 and ordinary prose are not credentials.
   }
+  if (atBoundary && encoded.length >= 16) return match.slice(0, match.length - encoded.length) + REDACTED_VALUE;
   return match;
 }
 
-function redactKnownValues(value: string) {
-  let safe = value
-    .replace(BASIC_HEADER_VALUE, `$1${REDACTED_VALUE}`)
-    .replace(BASIC_VALUE, redactBasicValue)
-    .replace(BEARER_VALUE, `Bearer ${REDACTED_VALUE}`)
+function redactBearerValue(match: string, token: string, force = false) {
+  const trailingPunctuation = token.match(/\.+$/)?.[0] ?? "";
+  const candidate = token.slice(0, token.length - trailingPunctuation.length);
+  return force || candidate.length >= 16 || /[0-9._~+/=-]/.test(candidate)
+    ? match.slice(0, match.length - token.length) + REDACTED_VALUE + trailingPunctuation
+    : match;
+}
+
+function redactPartialEmail(value: string) {
+  const at = value.lastIndexOf("@");
+  if (at < 0) return value;
+  let start = at;
+  while (start > 0 && isEmailLocal(value.charCodeAt(start - 1))) start -= 1;
+  if (start === at) return value;
+  for (let index = at + 1; index < value.length; index += 1) {
+    if (!isEmailDomain(value.charCodeAt(index))) return value;
+  }
+  return value.slice(0, start) + "[redacted-email]";
+}
+
+function redactKnownValues(value: string, atBoundary = false) {
+  let safe = value.replace(BASIC_HEADER_VALUE, `$1${REDACTED_VALUE}`);
+  safe = safe.replace(BASIC_VALUE, (match, encoded: string, offset: number) =>
+    redactBasicValue(match, encoded, atBoundary && offset + match.length === safe.length),
+  );
+  safe = safe
+    .replace(BEARER_HEADER_VALUE, (match, _prefix: string, token: string) => redactBearerValue(match, token, true))
+    .replace(BEARER_VALUE, (match, token: string) => redactBearerValue(match, token))
     .replace(SECRET_VALUE, "[redacted-secret]")
     .replace(URL_QUERY, "$1");
   safe = redactEmails(safe);
+  if (atBoundary) safe = redactPartialEmail(safe).replace(PARTIAL_SECRET_VALUE, "[redacted-secret]");
   return safe;
-}
-
-function maskTrailingRun(value: string, limit: number) {
-  const bounded = value.slice(0, Math.max(0, limit));
-  let start = bounded.length;
-  while (start > 0 && !/\s/u.test(bounded[start - 1]!)) start -= 1;
-  if (start === bounded.length) return bounded;
-  const prefixLimit = Math.max(0, limit - REDACTED_VALUE.length);
-  return bounded.slice(0, Math.min(start, prefixLimit)) + REDACTED_VALUE.slice(0, limit);
-}
-
-function truncatedRedactedString(value: string, limit: number) {
-  if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, limit);
-  const payloadLimit = limit - TRUNCATION_MARKER.length;
-  return maskTrailingRun(value, payloadLimit) + TRUNCATION_MARKER;
 }
 
 function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
   const truncated = value.length > limit;
   const payloadLimit = truncated ? Math.max(0, limit - TRUNCATION_MARKER.length) : limit;
-  const safe = redactKnownValues(value.slice(0, payloadLimit));
-  return truncated || safe.length > limit ? truncatedRedactedString(safe, limit) : safe;
+  let sliceEnd = payloadLimit;
+  const lastCodeUnit = value.charCodeAt(sliceEnd - 1);
+  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) sliceEnd -= 1;
+  const safe = redactKnownValues(value.slice(0, sliceEnd), truncated);
+  return boundedLogString(truncated ? safe + TRUNCATION_MARKER : safe, limit);
 }
 
-function uniqueSafeKey(target: Record<string, unknown>, rawKey: string) {
-  const base = redactedString(rawKey, LOG_IDENTIFIER_LIMIT) || "[empty key]";
+function uniqueKey(target: Record<string, unknown>, base: string) {
   if (!Object.hasOwn(target, base)) return base;
   for (let index = 2; ; index += 1) {
     const suffix = `#${index}`;
@@ -211,111 +226,105 @@ function uniqueSafeKey(target: Record<string, unknown>, rawKey: string) {
   }
 }
 
-function fitStringCandidate(value: string, limit: number, candidate: (value: string) => unknown): string | undefined {
-  let low = TRUNCATION_MARKER.length + REDACTED_VALUE.length;
-  let high = Math.min(value.length - 1, limit);
-  let best: string | undefined;
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2);
-    const compact = truncatedRedactedString(value, middle);
-    if (JSON.stringify(candidate(compact)).length <= limit) {
-      best = compact;
-      low = middle + 1;
-    } else {
-      high = middle - 1;
-    }
+function uniqueSafeKey(target: Record<string, unknown>, rawKey: string) {
+  return uniqueKey(target, redactedString(rawKey, LOG_IDENTIFIER_LIMIT) || "[empty key]");
+}
+
+function uniqueKeyInSet(keys: ReadonlySet<string>, base: string) {
+  if (!keys.has(base)) return base;
+  for (let index = 2; ; index += 1) {
+    const suffix = `#${index}`;
+    const candidate = base.slice(0, LOG_IDENTIFIER_LIMIT - suffix.length) + suffix;
+    if (!keys.has(candidate)) return candidate;
   }
-  return best;
 }
 
-function appendArrayOmission(result: unknown[], limit: number) {
-  while (result.length > 0 && JSON.stringify([...result, OMITTED_ENTRIES]).length > limit) result.pop();
-  if (JSON.stringify([...result, OMITTED_ENTRIES]).length <= limit) result.push(OMITTED_ENTRIES);
+function boundedFragments(
+  contentLength: number,
+  fragmentCount: number,
+  candidate: string,
+  omission: string | undefined,
+  limit: number,
+) {
+  const count = fragmentCount + 1 + (omission ? 1 : 0);
+  const nextLength = contentLength + candidate.length + (omission?.length ?? 0);
+  return 2 + nextLength + Math.max(0, count - 1) <= limit;
 }
 
-function appendObjectOmission(result: Record<string, unknown>, limit: number) {
-  let key = uniqueSafeKey(result, "omitted");
-  while (Object.keys(result).length > 0) {
-    const candidate = Object.assign(Object.create(null), result, { [key]: OMITTED_ENTRIES });
-    if (JSON.stringify(candidate).length <= limit) break;
-    delete result[Object.keys(result).at(-1)!];
-    key = uniqueSafeKey(result, "omitted");
-  }
-  result[key] = OMITTED_ENTRIES;
-}
-
-function boundedNestedJson(value: unknown, limit: number) {
-  const serialized = JSON.stringify(value);
-  if (serialized.length <= limit) return serialized;
+/** @internal Exported for focused size-boundary tests. */
+export function boundedNestedJson(value: unknown, limit: number) {
+  if (limit < 2) return "";
 
   if (Array.isArray(value)) {
-    const result: unknown[] = [];
-    for (let index = 0; index < value.length; index += 1) {
-      const hasMore = index < value.length - 1;
-      const tail = hasMore ? [OMITTED_ENTRIES] : [];
-      const item = value[index];
-      if (JSON.stringify([...result, item, ...tail]).length <= limit) {
-        result.push(item);
-        continue;
-      }
-      let retained = false;
-      if (typeof item === "string") {
-        const compact = fitStringCandidate(item, limit, (candidate) => [...result, candidate, ...tail]);
-        if (compact !== undefined) {
-          result.push(compact);
-          retained = true;
-        }
-      }
-      if (!retained && JSON.stringify([...result, OMITTED_VALUE, ...tail]).length <= limit) {
-        result.push(OMITTED_VALUE);
-        retained = true;
-      }
-      if (hasMore || !retained) appendArrayOmission(result, limit);
-      break;
+    const items: string[] = [];
+    let itemLength = 0;
+    for (const item of value) {
+      const itemJson = JSON.stringify(item) ?? "null";
+      items.push(itemJson);
+      itemLength += itemJson.length;
     }
-    return JSON.stringify(result);
+    if (2 + itemLength + Math.max(0, items.length - 1) <= limit) return `[${items.join(",")}]`;
+
+    const fragments: string[] = [];
+    let contentLength = 0;
+    const omission = JSON.stringify(OMITTED_ENTRIES);
+    const reservedOmission = 2 + omission.length <= limit ? omission : undefined;
+    const omittedValue = JSON.stringify(OMITTED_VALUE);
+    for (const itemJson of items) {
+      if (boundedFragments(contentLength, fragments.length, itemJson, reservedOmission, limit)) {
+        fragments.push(itemJson);
+        contentLength += itemJson.length;
+      } else if (boundedFragments(contentLength, fragments.length, omittedValue, reservedOmission, limit)) {
+        fragments.push(omittedValue);
+        contentLength += omittedValue.length;
+      }
+    }
+    if (reservedOmission) fragments.push(reservedOmission);
+    return `[${fragments.join(",")}]`;
   }
 
   if (value !== null && typeof value === "object") {
-    const result = Object.create(null) as Record<string, unknown>;
     const entries = Object.entries(value);
-    for (let index = 0; index < entries.length; index += 1) {
-      const [key, item] = entries[index]!;
-      const hasMore = index < entries.length - 1;
-      const candidate = Object.assign(Object.create(null), result, { [key]: item });
-      const omissionKey = hasMore ? uniqueSafeKey(candidate, "omitted") : undefined;
-      if (omissionKey) candidate[omissionKey] = OMITTED_ENTRIES;
-      if (JSON.stringify(candidate).length <= limit) {
-        result[key] = item;
+    const serializedEntries: Array<{ keyJson: string; fragment: string }> = [];
+    let entryLength = 0;
+    for (const [key, item] of entries) {
+      const itemJson = JSON.stringify(item);
+      if (itemJson === undefined) continue;
+      const keyJson = JSON.stringify(key);
+      const fragment = `${keyJson}:${itemJson}`;
+      serializedEntries.push({ keyJson, fragment });
+      entryLength += fragment.length;
+    }
+    if (2 + entryLength + Math.max(0, serializedEntries.length - 1) <= limit) {
+      return `{${serializedEntries.map(({ fragment }) => fragment).join(",")}}`;
+    }
+
+    const omissionKey = uniqueKeyInSet(new Set(entries.map(([key]) => key)), "omitted");
+    const omission = `${JSON.stringify(omissionKey)}:${JSON.stringify(OMITTED_ENTRIES)}`;
+    const reservedOmission = 2 + omission.length <= limit ? omission : undefined;
+    const omittedValue = JSON.stringify(OMITTED_VALUE);
+    const fragments: string[] = [];
+    let contentLength = 0;
+    for (const { keyJson, fragment } of serializedEntries) {
+      if (boundedFragments(contentLength, fragments.length, fragment, reservedOmission, limit)) {
+        fragments.push(fragment);
+        contentLength += fragment.length;
         continue;
       }
-      let retained = false;
-      if (typeof item === "string") {
-        const compact = fitStringCandidate(item, limit, (compacted) => {
-          const attempted = Object.assign(Object.create(null), result, { [key]: compacted });
-          if (omissionKey) attempted[omissionKey] = OMITTED_ENTRIES;
-          return attempted;
-        });
-        if (compact !== undefined) {
-          result[key] = compact;
-          retained = true;
-        }
+      const omittedCandidate = `${keyJson}:${omittedValue}`;
+      if (boundedFragments(contentLength, fragments.length, omittedCandidate, reservedOmission, limit)) {
+        fragments.push(omittedCandidate);
+        contentLength += omittedCandidate.length;
       }
-      if (!retained) {
-        const attempted = Object.assign(Object.create(null), result, { [key]: OMITTED_VALUE });
-        if (omissionKey) attempted[omissionKey] = OMITTED_ENTRIES;
-        if (JSON.stringify(attempted).length <= limit) {
-          result[key] = OMITTED_VALUE;
-          retained = true;
-        }
-      }
-      if (hasMore || !retained) appendObjectOmission(result, limit);
-      break;
     }
-    return JSON.stringify(result);
+    if (reservedOmission) fragments.push(reservedOmission);
+    return `{${fragments.join(",")}}`;
   }
 
-  return JSON.stringify(OMITTED_VALUE);
+  const serialized = JSON.stringify(value);
+  if (serialized !== undefined && serialized.length <= limit) return serialized;
+  const omitted = JSON.stringify(OMITTED_VALUE);
+  return omitted.length <= limit ? omitted : JSON.stringify("");
 }
 
 export function safeTelemetryErrorMessage(error: unknown, fallback: string) {
@@ -360,7 +369,7 @@ function safeNested(value: unknown, depth: number, seen: WeakSet<object>, budget
   const result = Object.create(null) as Record<string, unknown>;
   for (const key of keys) {
     if (budget.remaining <= 0) {
-      result[uniqueSafeKey(result, "omitted")] = OMITTED_ENTRIES;
+      result[uniqueKey(result, "omitted")] = OMITTED_ENTRIES;
       break;
     }
     const safeKey = uniqueSafeKey(result, key);

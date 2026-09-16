@@ -229,7 +229,7 @@ function envWithCapturedWorkspaceEvents(
   });
 }
 
-function envWithDatabase(bindings: Env, database: D1Database) {
+function envWithDatabase<Bindings extends Env>(bindings: Bindings, database: D1Database): Bindings {
   return new Proxy(bindings, {
     get(target, property, receiver) {
       if (property === "DB") return database;
@@ -641,15 +641,6 @@ async function clearWorkerDatabase() {
   ]);
 }
 
-function bindingsWithDatabase(database: D1Database) {
-  return new Proxy(env as Env, {
-    get(target, property, receiver) {
-      if (property === "DB") return database;
-      return Reflect.get(target, property, receiver);
-    },
-  });
-}
-
 afterEach(async () => {
   // reset() clears persisted bindings, but it does not evict an instantiated Durable
   // Object. Evict after the test has drained so appended tests cannot retain its
@@ -712,7 +703,7 @@ describe("Worker integration", () => {
         };
       },
     });
-    const bindings = bindingsWithDatabase(database);
+    const bindings = envWithDatabase(env as Env, database);
     const response = await worker.fetch(
       new Request("http://example.test/api/health/ready", {
         headers: { "x-observability-token": "worker-observability-probe-token" },
@@ -1226,7 +1217,7 @@ describe("Worker integration", () => {
         };
       },
     });
-    const bindings = bindingsWithDatabase(database);
+    const bindings = envWithDatabase(env as Env, database);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       await executeScheduledTasks(bindings, createExecutionContext(), [{ name: taskName, run: async () => undefined }]);
@@ -1272,7 +1263,7 @@ describe("Worker integration", () => {
             : target.prepare(query);
       },
     });
-    const bindings = bindingsWithDatabase(database);
+    const bindings = envWithDatabase(env as Env, database);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
@@ -1363,7 +1354,7 @@ describe("Worker integration", () => {
         };
       },
     });
-    const bindings = bindingsWithDatabase(database);
+    const bindings = envWithDatabase(env as Env, database);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       await executeScheduledTasks(bindings, createExecutionContext(), [{ name: taskName, run: async () => undefined }]);
@@ -1462,7 +1453,7 @@ describe("Worker integration", () => {
             : target.prepare(query);
       },
     });
-    const bindings = bindingsWithDatabase(database);
+    const bindings = envWithDatabase(env as Env, database);
     let older: Promise<void> | undefined;
     try {
       older = executeScheduledTasks(env, createExecutionContext(), [
@@ -1543,7 +1534,7 @@ describe("Worker integration", () => {
         };
       },
     });
-    const bindings = bindingsWithDatabase(database);
+    const bindings = envWithDatabase(env as Env, database);
     let older: Promise<void> | undefined;
     try {
       older = executeScheduledTasks(bindings, createExecutionContext(), [
@@ -1747,12 +1738,7 @@ describe("Worker integration", () => {
         };
       },
     });
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = envWithDatabase(env as Env, database);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
@@ -1955,12 +1941,7 @@ describe("Worker integration", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = envWithDatabase(env as Env, database);
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => error.mockRestore());
     const context = createExecutionContext();
@@ -2902,12 +2883,7 @@ describe("Worker integration", () => {
             };
           },
         });
-        document.bindings = new Proxy(observedBindings, {
-          get(target, property, receiver) {
-            if (property === "DB") return failingDatabase;
-            return Reflect.get(target, property, receiver);
-          },
-        });
+        document.bindings = envWithDatabase(observedBindings, failingDatabase);
         expect((await document.restoreVersion(crypto.randomUUID(), installed.userId)).status).toBe(503);
 
         expect(writeDataPoint.mock.calls.map(([point]) => point.blobs[3])).toEqual(["rejected", "rejected", "failure"]);
@@ -2956,12 +2932,7 @@ describe("Worker integration", () => {
           };
         },
       });
-      document.bindings = new Proxy(originalBindings, {
-        get(target, property, receiver) {
-          if (property === "DB") return database;
-          return Reflect.get(target, property, receiver);
-        },
-      });
+      document.bindings = envWithDatabase(originalBindings, database);
 
       const request = () =>
         new Request("https://document.internal/archive", {
@@ -3192,12 +3163,7 @@ describe("Worker integration", () => {
           return typeof value === "function" ? value.bind(target) : value;
         },
       });
-      document.bindings = new Proxy(originalBindings, {
-        get(target, property, receiver) {
-          if (property === "DB") return failingDatabase;
-          return Reflect.get(target, property, receiver);
-        },
-      });
+      document.bindings = envWithDatabase(originalBindings, failingDatabase);
       try {
         const failed = await document.restoreVersion(version!.id, installed.userId);
         expect(failed.status).toBe(503);
@@ -3263,12 +3229,7 @@ describe("Worker integration", () => {
           return typeof value === "function" ? value.bind(target) : value;
         },
       });
-      document.bindings = new Proxy(originalBindings, {
-        get(target, property, receiver) {
-          if (property === "DB") return ambiguousDatabase;
-          return Reflect.get(target, property, receiver);
-        },
-      });
+      document.bindings = envWithDatabase(originalBindings, ambiguousDatabase);
       try {
         const response = await document.restoreVersion(version!.id, installed.userId);
         expect(response.status).toBe(503);
@@ -3345,12 +3306,7 @@ describe("Worker integration", () => {
           };
         },
       });
-      document.bindings = new Proxy(originalBindings, {
-        get(target, property, receiver) {
-          if (property === "DB") return unavailableDatabase;
-          return Reflect.get(target, property, receiver);
-        },
-      });
+      document.bindings = envWithDatabase(originalBindings, unavailableDatabase);
       // Left over from an earlier pending restore: a new restore starts its
       // reconciliation backoff from scratch.
       state.storage.sql.exec(`UPDATE document_meta SET restore_attempts = 7 WHERE id = 1`);
@@ -3452,10 +3408,7 @@ describe("Worker integration", () => {
           };
         },
       });
-      document.bindings = new Proxy(originalBindings, {
-        get: (target, property, receiver) =>
-          property === "DB" ? unavailableDatabase : Reflect.get(target, property, receiver),
-      });
+      document.bindings = envWithDatabase(originalBindings, unavailableDatabase);
       const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
       try {
         // partyserver initializes before it delivers an alarm, so a cold wake
@@ -3517,10 +3470,7 @@ describe("Worker integration", () => {
           };
         },
       });
-      document.bindings = new Proxy(originalBindings, {
-        get: (target, property, receiver) =>
-          property === "DB" ? unavailableDatabase : Reflect.get(target, property, receiver),
-      });
+      document.bindings = envWithDatabase(originalBindings, unavailableDatabase);
       const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
       try {
         // A normal request starts the object, so onStart reconciles and its
