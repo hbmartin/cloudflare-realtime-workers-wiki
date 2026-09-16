@@ -206,16 +206,24 @@ import { SCHEDULED_TASK_NAMES, type ScheduledTaskName } from "./scheduled-task-n
 import { sourceRateLimitKey } from "./source-rate-limit";
 
 const app = new Hono<{ Bindings: Env }>();
+const WILDCARD_HANDLER_TEMPLATES = new Set(["/api/security/*", "/api/auth/*"]);
+
+function registeredMetricRoute(routes: readonly { path: string }[], current: string) {
+  if (WILDCARD_HANDLER_TEMPLATES.has(current)) return current;
+  if (routes.some((route) => route.path === current) && current !== "*" && current !== "/*" && !current.endsWith("/*"))
+    return current;
+  const concrete = routes.findLast(
+    (route) => route.path !== "*" && route.path !== "/*" && !route.path.endsWith("/*"),
+  )?.path;
+  if (concrete) return concrete;
+  return "/unmatched";
+}
+
 app.use("*", async (c, next) => {
   try {
     await next();
   } finally {
-    const current = routePath(c);
-    const registered =
-      current === "/v1/*"
-        ? matchedRoutes(c).find((route) => route.path !== "/*" && route.path !== "/v1/*")?.path
-        : current;
-    setMetricRouteTemplate(!registered || registered === "*" || registered === "/*" ? "/unmatched" : registered);
+    setMetricRouteTemplate(registeredMetricRoute(matchedRoutes(c), routePath(c)));
   }
 });
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -5926,7 +5934,6 @@ app.get(
 app.route("/v1", notionApi);
 
 app.notFound(async (c) => {
-  setMetricRouteTemplate("/unmatched");
   if (new URL(c.req.url).pathname.startsWith("/api/")) {
     return c.json({ error: { code: "not_found", message: "API route not found." } }, 404);
   }
@@ -6146,107 +6153,73 @@ async function handlePartyRequest(request: Request, env: Env) {
 
 export type ScheduledTask = { name: string; run: () => Promise<unknown> };
 
-async function recordScheduledTaskStart(env: Env, taskName: string, startedAt: number) {
-  const row = await env.DB.prepare(
-    `INSERT INTO observability_task_runs (task_name, last_started_at, execution_token, first_observed_at)
-      VALUES (?, ?, 1, ?)
+async function recordScheduledTaskStart(env: Env, taskName: string, startedAt: number, runId: string) {
+  await env.DB.prepare(
+    `INSERT INTO observability_task_runs (task_name, last_started_at, run_id, first_observed_at)
+      VALUES (?, ?, ?, ?)
       ON CONFLICT(task_name) DO UPDATE SET
-        last_started_at = excluded.last_started_at,
-        execution_token = COALESCE(observability_task_runs.execution_token, observability_task_runs.last_started_at, 0) + 1,
+        last_started_at = MAX(observability_task_runs.last_started_at, excluded.last_started_at),
+        run_id = CASE WHEN excluded.last_started_at >= observability_task_runs.last_started_at
+          THEN excluded.run_id ELSE observability_task_runs.run_id END,
+        execution_token = CASE WHEN excluded.last_started_at >= observability_task_runs.last_started_at
+          THEN NULL ELSE observability_task_runs.execution_token END,
         first_observed_at = COALESCE(observability_task_runs.first_observed_at, observability_task_runs.last_started_at)
-      RETURNING execution_token`,
+      `,
   )
-    .bind(taskName, startedAt, startedAt)
-    .first<{ execution_token: number }>();
-  if (!row || !Number.isSafeInteger(row.execution_token)) throw new Error("Scheduled task start token unavailable");
-  return row.execution_token;
+    .bind(taskName, startedAt, runId, startedAt)
+    .run();
 }
 
 async function recordScheduledTaskResult(
   env: Env,
   taskName: string,
   startedAt: number,
-  executionToken: number | null,
+  runId: string,
   error?: unknown,
 ) {
   const finishedAt = Date.now();
-  if (error === undefined) {
-    await env.DB.prepare(
-      `INSERT INTO observability_task_runs
-          (task_name, last_started_at, execution_token, first_observed_at,
-           last_succeeded_at, last_duration_ms, last_error)
-        VALUES (?, ?, ?, ?, ?, ?, NULL)
-        ON CONFLICT(task_name) DO UPDATE SET
-          last_succeeded_at = MAX(COALESCE(observability_task_runs.last_succeeded_at, 0), excluded.last_succeeded_at),
-          first_observed_at = COALESCE(observability_task_runs.first_observed_at, observability_task_runs.last_started_at),
-          last_duration_ms = CASE WHEN
-            (? IS NOT NULL AND observability_task_runs.execution_token = excluded.execution_token)
-            OR (? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at)
-            THEN excluded.last_duration_ms ELSE observability_task_runs.last_duration_ms END,
-          last_error = CASE WHEN
-            (? IS NOT NULL AND observability_task_runs.execution_token = excluded.execution_token)
-            OR (? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at)
-            THEN NULL ELSE observability_task_runs.last_error END,
-          last_started_at = CASE WHEN ? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at
-            THEN excluded.last_started_at ELSE observability_task_runs.last_started_at END`,
-    )
-      .bind(
-        taskName,
-        startedAt,
-        executionToken ?? 0,
-        startedAt,
-        finishedAt,
-        Math.max(0, finishedAt - startedAt),
-        executionToken,
-        executionToken,
-        executionToken,
-        executionToken,
-        executionToken,
-      )
-      .run();
-    return;
-  }
+  const ownsCurrentRun = `(excluded.last_started_at > observability_task_runs.last_started_at
+    OR (excluded.last_started_at = observability_task_runs.last_started_at
+      AND excluded.run_id = observability_task_runs.run_id))`;
   await env.DB.prepare(
     `INSERT INTO observability_task_runs
-        (task_name, last_started_at, execution_token, first_observed_at,
-         last_failed_at, last_duration_ms, last_error)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+        (task_name, last_started_at, run_id, first_observed_at,
+         last_succeeded_at, last_failed_at, last_duration_ms, last_error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_name) DO UPDATE SET
-        last_failed_at = MAX(COALESCE(observability_task_runs.last_failed_at, 0), excluded.last_failed_at),
+        last_succeeded_at = CASE WHEN excluded.last_succeeded_at IS NOT NULL
+          THEN MAX(COALESCE(observability_task_runs.last_succeeded_at, 0), excluded.last_succeeded_at)
+          ELSE observability_task_runs.last_succeeded_at END,
+        last_failed_at = CASE WHEN excluded.last_failed_at IS NOT NULL
+          THEN MAX(COALESCE(observability_task_runs.last_failed_at, 0), excluded.last_failed_at)
+          ELSE observability_task_runs.last_failed_at END,
         first_observed_at = COALESCE(observability_task_runs.first_observed_at, observability_task_runs.last_started_at),
-        last_duration_ms = CASE WHEN
-          (? IS NOT NULL AND observability_task_runs.execution_token = excluded.execution_token)
-          OR (? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at)
+        last_started_at = MAX(observability_task_runs.last_started_at, excluded.last_started_at),
+        run_id = CASE WHEN ${ownsCurrentRun} THEN excluded.run_id ELSE observability_task_runs.run_id END,
+        execution_token = CASE WHEN ${ownsCurrentRun} THEN NULL ELSE observability_task_runs.execution_token END,
+        last_duration_ms = CASE WHEN ${ownsCurrentRun}
           THEN excluded.last_duration_ms ELSE observability_task_runs.last_duration_ms END,
-        last_error = CASE WHEN
-          (? IS NOT NULL AND observability_task_runs.execution_token = excluded.execution_token)
-          OR (? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at)
-          THEN excluded.last_error ELSE observability_task_runs.last_error END,
-        last_started_at = CASE WHEN ? IS NULL AND observability_task_runs.last_started_at < excluded.last_started_at
-          THEN excluded.last_started_at ELSE observability_task_runs.last_started_at END`,
+        last_error = CASE WHEN ${ownsCurrentRun}
+          THEN excluded.last_error ELSE observability_task_runs.last_error END`,
   )
     .bind(
       taskName,
       startedAt,
-      executionToken ?? 0,
+      runId,
       startedAt,
-      finishedAt,
+      error === undefined ? finishedAt : null,
+      error === undefined ? null : finishedAt,
       Math.max(0, finishedAt - startedAt),
-      safeTelemetryErrorMessage(error, "Scheduled task failed"),
-      executionToken,
-      executionToken,
-      executionToken,
-      executionToken,
-      executionToken,
+      error === undefined ? null : safeTelemetryErrorMessage(error, "Scheduled task failed"),
     )
     .run();
 }
 
 async function runScheduledTask(env: Env, context: ExecutionContext, task: ScheduledTask) {
   const startedAt = Date.now();
-  let executionToken: number | null = null;
+  const runId = crypto.randomUUID();
   try {
-    executionToken = await recordScheduledTaskStart(env, task.name, startedAt);
+    await recordScheduledTaskStart(env, task.name, startedAt, runId);
   } catch (error) {
     logger.warn(
       "scheduled.task_state.failed",
@@ -6262,7 +6235,7 @@ async function runScheduledTask(env: Env, context: ExecutionContext, task: Sched
     });
   } catch (error) {
     try {
-      await recordScheduledTaskResult(env, task.name, startedAt, executionToken, error);
+      await recordScheduledTaskResult(env, task.name, startedAt, runId, error);
     } catch (stateError) {
       logger.warn(
         "scheduled.task_state.failed",
@@ -6283,7 +6256,7 @@ async function runScheduledTask(env: Env, context: ExecutionContext, task: Sched
     throw error;
   }
   try {
-    await recordScheduledTaskResult(env, task.name, startedAt, executionToken);
+    await recordScheduledTaskResult(env, task.name, startedAt, runId);
   } catch (error) {
     logger.warn(
       "scheduled.task_state.failed",

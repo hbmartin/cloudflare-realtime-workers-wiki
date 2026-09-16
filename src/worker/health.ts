@@ -21,6 +21,12 @@ interface CountRow {
   total: number;
 }
 
+interface CronRow {
+  task_name: string;
+  last_succeeded_at: number | null;
+  first_observed_at: number | null;
+}
+
 function timedCheck(name: ReadinessCheck["name"], check: () => Promise<Omit<ReadinessCheck, "name" | "durationMs">>) {
   const startedAt = Date.now();
   let timeoutHandle: ReturnType<typeof setTimeout>;
@@ -65,24 +71,31 @@ async function checkDurableObject(env: Env) {
 }
 
 async function checkCron(env: Env, timestamp: number) {
-  await env.DB.prepare(
-    `INSERT INTO observability_task_runs (task_name, last_started_at, execution_token, first_observed_at)
-      VALUES ${SCHEDULED_TASK_NAMES.map(() => "(?, 0, 0, ?)").join(", ")}
-      ON CONFLICT(task_name) DO UPDATE SET
-        first_observed_at = COALESCE(
-          observability_task_runs.first_observed_at,
-          observability_task_runs.last_started_at
-        )
-      WHERE observability_task_runs.first_observed_at IS NULL`,
-  )
-    .bind(...SCHEDULED_TASK_NAMES.flatMap((name) => [name, timestamp]))
-    .run();
-  const rows = await env.DB.prepare(
-    `SELECT task_name, last_succeeded_at, first_observed_at FROM observability_task_runs
-      WHERE task_name IN (${SCHEDULED_TASK_NAMES.map(() => "?").join(", ")})`,
-  )
-    .bind(...SCHEDULED_TASK_NAMES)
-    .all<{ task_name: string; last_succeeded_at: number | null; first_observed_at: number | null }>();
+  const readRows = () =>
+    env.DB.prepare(
+      `SELECT task_name, last_succeeded_at, first_observed_at FROM observability_task_runs
+        WHERE task_name IN (${SCHEDULED_TASK_NAMES.map(() => "?").join(", ")})`,
+    )
+      .bind(...SCHEDULED_TASK_NAMES)
+      .all<CronRow>();
+  let rows = await readRows();
+  const observed = new Map(rows.results.map((row) => [row.task_name, row]));
+  const missing = SCHEDULED_TASK_NAMES.filter((name) => {
+    const row = observed.get(name);
+    return !row || row.first_observed_at === null;
+  });
+  if (missing.length) {
+    await env.DB.prepare(
+      `INSERT INTO observability_task_runs (task_name, last_started_at, execution_token, first_observed_at)
+        VALUES ${missing.map(() => "(?, 0, 0, ?)").join(", ")}
+        ON CONFLICT(task_name) DO UPDATE SET
+          first_observed_at = COALESCE(observability_task_runs.first_observed_at, observability_task_runs.last_started_at)
+        WHERE observability_task_runs.first_observed_at IS NULL`,
+    )
+      .bind(...missing.flatMap((name) => [name, timestamp]))
+      .run();
+    rows = await readRows();
+  }
   const state = new Map(rows.results.map((row) => [row.task_name, row]));
   const stale = SCHEDULED_TASK_NAMES.filter((name) => {
     const row = state.get(name);

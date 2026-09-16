@@ -16,26 +16,51 @@ describe("D1 migrations", () => {
         VALUES ('succeeded', 2000, 2100)`),
     ]);
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
-    const rows = await env.DB.prepare(`SELECT task_name, execution_token, first_observed_at
+    const rows = await env.DB.prepare(`SELECT task_name, execution_token, run_id, first_observed_at
       FROM observability_task_runs WHERE task_name IN ('never_succeeded', 'succeeded') ORDER BY task_name`).all<{
       task_name: string;
       execution_token: number;
+      run_id: string | null;
       first_observed_at: number;
     }>();
     expect(rows.results).toEqual([
-      { task_name: "never_succeeded", execution_token: 1000, first_observed_at: 0 },
-      { task_name: "succeeded", execution_token: 2000, first_observed_at: 2000 },
+      { task_name: "never_succeeded", execution_token: 1000, run_id: null, first_observed_at: 0 },
+      { task_name: "succeeded", execution_token: 2000, run_id: null, first_observed_at: 2000 },
     ]);
     const columns = await env.DB.prepare(`PRAGMA table_info(observability_task_runs)`).all<{
       name: string;
       notnull: number;
     }>();
-    expect(columns.results.filter((column) => ["execution_token", "first_observed_at"].includes(column.name))).toEqual(
+    expect(
+      columns.results.filter((column) => ["execution_token", "run_id", "first_observed_at"].includes(column.name)),
+    ).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "execution_token", notnull: 0 }),
+        expect.objectContaining({ name: "run_id", notnull: 0 }),
         expect.objectContaining({ name: "first_observed_at", notnull: 0 }),
       ]),
     );
+  });
+
+  it("fences a legacy token update after a UUID run owns the row", async () => {
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    await env.DB.prepare(`INSERT INTO observability_task_runs
+      (task_name, last_started_at, execution_token) VALUES ('legacy_fence', 100, 100)`).run();
+    await env.DB.prepare(`UPDATE observability_task_runs
+      SET last_started_at = 200, run_id = 'worker-run', execution_token = NULL
+      WHERE task_name = 'legacy_fence'`).run();
+    const legacy = await env.DB.prepare(`UPDATE observability_task_runs
+      SET last_started_at = 300, execution_token = 101
+      WHERE task_name = 'legacy_fence' RETURNING execution_token`).all();
+    expect(legacy.results).toEqual([]);
+    expect(
+      await env.DB.prepare(`SELECT last_started_at, run_id, execution_token
+      FROM observability_task_runs WHERE task_name = 'legacy_fence'`).first(),
+    ).toEqual({
+      last_started_at: 200,
+      run_id: "worker-run",
+      execution_token: null,
+    });
   });
 
   it("invalidates existing password-only sessions during the mandatory protection cutover", async () => {
