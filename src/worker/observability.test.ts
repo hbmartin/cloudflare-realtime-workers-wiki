@@ -1,8 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { LOG_STACK_LIMIT } from "../shared/error-log";
+import {
+  LOG_IDENTIFIER_LIMIT,
+  LOG_STACK_LIMIT,
+  LOG_TEXT_LIMIT,
+  PERSISTED_ERROR_MESSAGE_LIMIT,
+  TRUNCATION_MARKER,
+} from "../shared/error-log";
 import type { Env } from "./env";
 import {
   OBSERVABILITY_SCHEMA,
+  boundedNestedJson,
   logger,
   metricRouteTemplate,
   recordMetric,
@@ -132,7 +139,7 @@ describe("worker observability", () => {
         logger.error(
           "test.hostile",
           "test",
-          "Bearer abc Basic Zm9vOmJhcg== crn_thismustberedacted xoxb-thismustberedacted secret_thismustberedacted person@example.com https://example.test/path?secret=yes",
+          "Bearer abc123 Basic Zm9vOmJhcg== crn_thismustberedacted xoxb-thismustberedacted secret_thismustberedacted person@example.com https://example.test/path?secret=yes",
           { nested: { authorization: "Basic credential", value: "person@example.com" }, hostile },
           hostile,
         ),
@@ -160,8 +167,23 @@ describe("worker observability", () => {
     ).toBe("Basic [redacted] and basic [redacted] and Basic\t[redacted] and Basic not-base64!");
   });
 
-  it("redacts complete Bearer values and every email shape covered by the previous policy", () => {
-    expect(safeTelemetryErrorMessage(new Error("Bearer api:key"), "fallback")).toBe("Bearer [redacted]");
+  it("redacts credential-like Bearer values without consuming punctuation or prose", () => {
+    expect(safeTelemetryErrorMessage(new Error("Authorization: Bearer abc"), "fallback")).toBe(
+      "Authorization: Bearer [redacted]",
+    );
+    expect(safeTelemetryErrorMessage(new Error('Response {"authorization":"Bearer abc"} failed'), "fallback")).toBe(
+      'Response {"authorization":"Bearer [redacted]"} failed',
+    );
+    expect(safeTelemetryErrorMessage(new Error("Bearer abc123"), "fallback")).toBe("Bearer [redacted]");
+    expect(safeTelemetryErrorMessage(new Error("Bearer abc123."), "fallback")).toBe("Bearer [redacted].");
+    expect(safeTelemetryErrorMessage(new Error(`Bearer ${"a".repeat(16)}`), "fallback")).toBe("Bearer [redacted]");
+    expect(safeTelemetryErrorMessage(new Error("Use the Bearer token scheme"), "fallback")).toBe(
+      "Use the Bearer token scheme",
+    );
+    expect(safeTelemetryErrorMessage(new Error("Bearer api:key"), "fallback")).toBe("Bearer api:key");
+  });
+
+  it("redacts every email shape covered by the previous policy", () => {
     expect(safeTelemetryErrorMessage(new Error(`${"a".repeat(65)}@example.com`), "fallback")).toBe("[redacted-email]");
     expect(safeTelemetryErrorMessage(new Error("name@example.com-foo"), "fallback")).toBe("[redacted-email]-foo");
     expect(safeTelemetryErrorMessage(new Error("name@example.co.uk"), "fallback")).toBe("[redacted-email]");
@@ -236,7 +258,44 @@ describe("worker observability", () => {
     }
   });
 
-  it("redacts authorization headers and preserves free-text Basic values", () => {
+  it("retains bounded content from long whitespace-free diagnostics and field names", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const minified = `{"message":"${"x".repeat(LOG_TEXT_LIMIT + 200)}"}`;
+      const longUrl = `https://example.test/${"p".repeat(LOG_TEXT_LIMIT + 100)}`;
+      const firstKey = `alpha-${"a".repeat(LOG_IDENTIFIER_LIMIT + 50)}`;
+      const secondKey = `beta-${"b".repeat(LOG_IDENTIFIER_LIMIT + 50)}`;
+      const error = new Error(minified);
+      error.stack = "x".repeat(LOG_STACK_LIMIT + 1_000);
+
+      logger.error("test.whitespace_free", "test", minified, { [firstKey]: 1, [secondKey]: 2, longUrl }, error);
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(record.message).toMatch(/^\{"message":"x+/);
+      expect(record.message).toMatch(/…\[truncated\]$/);
+      expect(String(record.message)).toHaveLength(LOG_TEXT_LIMIT);
+      expect(record.errorStack).toMatch(/^x+/);
+      expect(record.errorStack).toMatch(/…\[truncated\]$/);
+      expect(String(record.errorStack)).toHaveLength(LOG_STACK_LIMIT);
+      expect(record.longUrl).toMatch(/^https:\/\/example\.test\/p+/);
+      expect(record.longUrl).toMatch(/…\[truncated\]$/);
+      const retainedKeys = Object.keys(record).filter((key) => key.startsWith("alpha-") || key.startsWith("beta-"));
+      expect(retainedKeys).toHaveLength(2);
+      expect(retainedKeys.every((key) => key.length <= LOG_IDENTIFIER_LIMIT)).toBe(true);
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("does not split a surrogate pair at the sanitized truncation boundary", () => {
+    const prefix = "x".repeat(PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length - 1);
+    const result = safeTelemetryErrorMessage(new Error(`${prefix}😀${"z".repeat(LOG_TEXT_LIMIT)}`), "fallback");
+
+    expect(result).not.toContain("�");
+    expect(result).toMatch(/…\[truncated\]$/);
+  });
+
+  it("redacts authorization headers and preserves non-credential free-text Basic values", () => {
     const message =
       "Basic bm9jb2xvbg==; Basic not-base64!; Basic\nZm9vOmJhcg==; Authorization: Basic badtoken; Basic idea,";
     expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(
@@ -272,7 +331,7 @@ describe("worker observability", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
       const error = new Error("failed");
-      error.stack = `Authorization: Basic Zm9vOmJhcg== secret_thismustberedacted ${"frame ".repeat(LOG_STACK_LIMIT)}`;
+      error.stack = `Authorization: Basic Zm9vOmJhcg== secret_thismustberedacted ${"x".repeat(LOG_STACK_LIMIT + 1_000)}`;
 
       withObservabilityContext({} as Env, { trigger: "queue", correlationId: "secret_thismustberedacted" }, () =>
         logger.error("test.stack", "test", "failed", {}, error),
@@ -285,6 +344,7 @@ describe("worker observability", () => {
       expect(record.errorStack).toMatch(/…\[truncated\]$/);
       expect(record.errorStack).toContain("Basic [redacted]");
       expect(record.errorStack).not.toContain("secret_thismustberedacted");
+      expect(record.errorStack).toContain("x".repeat(1_000));
     } finally {
       output.mockRestore();
     }
@@ -341,10 +401,55 @@ describe("worker observability", () => {
         },
       });
       const childRecord = output.mock.calls[0]?.[0] as Record<string, unknown>;
-      expect(JSON.parse(String(childRecord.details))).toEqual({ child: "[value omitted]" });
+      expect(JSON.parse(String(childRecord.details))).toEqual({
+        child: "[value omitted]",
+        omitted: "[entries omitted]",
+      });
     } finally {
       output.mockRestore();
     }
+  });
+
+  it("continues bounded nested summaries after oversized values", () => {
+    const objectSummary = boundedNestedJson({ blob: "x".repeat(5_000), other: 1 }, LOG_TEXT_LIMIT);
+    expect(objectSummary.length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
+    expect(JSON.parse(objectSummary)).toEqual({
+      blob: "[value omitted]",
+      other: 1,
+      omitted: "[entries omitted]",
+    });
+
+    const childSummary = boundedNestedJson(
+      {
+        child: Object.fromEntries(Array.from({ length: 30 }, (_, index) => [`field${index}`, "word ".repeat(40)])),
+        other: 1,
+      },
+      LOG_TEXT_LIMIT,
+    );
+    expect(childSummary.length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
+    expect(JSON.parse(childSummary)).toEqual({
+      child: "[value omitted]",
+      other: 1,
+      omitted: "[entries omitted]",
+    });
+
+    const arraySummary = boundedNestedJson(["x".repeat(5_000), 1], LOG_TEXT_LIMIT);
+    expect(arraySummary.length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
+    expect(JSON.parse(arraySummary)).toEqual(["[value omitted]", 1, "[entries omitted]"]);
+  });
+
+  it("keeps bounded JSON valid when an omission marker does not fit", () => {
+    const summary = boundedNestedJson({ blob: "x".repeat(100), other: 1 }, 20);
+    expect(summary.length).toBeLessThanOrEqual(20);
+    expect(JSON.parse(summary)).toEqual({ other: 1 });
+
+    const collision = boundedNestedJson({ omitted: "kept", blob: "x".repeat(5_000), other: 1 }, LOG_TEXT_LIMIT);
+    expect(JSON.parse(collision)).toEqual({
+      omitted: "kept",
+      blob: "[value omitted]",
+      other: 1,
+      "omitted#2": "[entries omitted]",
+    });
   });
 
   it("protects required fields and treats missing tracing support as a no-op", () => {
