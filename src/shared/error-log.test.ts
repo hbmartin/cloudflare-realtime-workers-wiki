@@ -6,6 +6,7 @@ import {
   errorLogFields,
   prefixedErrorLogFields,
   safeErrorMessage,
+  wellFormedPrefix,
 } from "./error-log";
 
 describe("error log fields", () => {
@@ -146,6 +147,11 @@ describe("error log fields", () => {
 
     expect(fields.errorMessage).toBe(`${"x".repeat(payloadLimit - 1)}${TRUNCATION_MARKER}`);
     expect(fields.errorValue).toBe(fields.errorMessage);
+  });
+
+  it("returns a well-formed prefix when the limit intersects a surrogate pair", () => {
+    expect(wellFormedPrefix("x😀tail", 2)).toBe("x");
+    expect(wellFormedPrefix("x😀tail", 3)).toBe("x😀");
   });
 
   it("normalizes and bounds messages from directly thrown strings", () => {
