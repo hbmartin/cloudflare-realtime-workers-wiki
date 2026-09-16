@@ -34,6 +34,7 @@ import { sweepOutbox } from "./jobs";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
+import { metricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import { webhookEventStatements, type WebhookEventType } from "./webhooks";
 import { broadcastWorkspaceEvent } from "./workspace-events";
@@ -138,26 +139,29 @@ async function enforceApiRateLimits(burst: RateLimit | undefined, minute: RateLi
   }
 }
 
-notionApi.use("*", async (c, next) => {
-  const requestId = currentObservabilityContext()?.requestId ?? crypto.randomUUID();
-  c.set("requestId", requestId);
-  c.header("x-request-id", requestId);
-  const version = c.req.header("notion-version");
-  if (!version) throw new NotionError(400, "missing_version", `Notion-Version must be ${NOTION_VERSION}.`);
-  if (version !== NOTION_VERSION) {
-    throw new NotionError(400, "validation_error", `This API supports exactly Notion-Version ${NOTION_VERSION}.`);
-  }
-  if (!integrationBearerToken(c.req.raw)) throw new IntegrationAuthError();
-  await enforceApiRateLimits(
-    c.env.API_SOURCE_BURST_LIMIT,
-    c.env.API_SOURCE_MINUTE_LIMIT,
-    await sourceRateLimitKey(c.req.raw),
-  );
-  const principal = await authenticateIntegration(c.req.raw, c.env);
-  c.set("principal", principal);
-  await enforceApiRateLimits(c.env.API_BURST_LIMIT, c.env.API_MINUTE_LIMIT, principal.integrationId);
-  await next();
-});
+notionApi.use(
+  "*",
+  metricMiddleware(async (c, next) => {
+    const requestId = currentObservabilityContext()?.requestId ?? crypto.randomUUID();
+    c.set("requestId", requestId);
+    c.header("x-request-id", requestId);
+    const version = c.req.header("notion-version");
+    if (!version) throw new NotionError(400, "missing_version", `Notion-Version must be ${NOTION_VERSION}.`);
+    if (version !== NOTION_VERSION) {
+      throw new NotionError(400, "validation_error", `This API supports exactly Notion-Version ${NOTION_VERSION}.`);
+    }
+    if (!integrationBearerToken(c.req.raw)) throw new IntegrationAuthError();
+    await enforceApiRateLimits(
+      c.env.API_SOURCE_BURST_LIMIT,
+      c.env.API_SOURCE_MINUTE_LIMIT,
+      await sourceRateLimitKey(c.req.raw),
+    );
+    const principal = await authenticateIntegration(c.req.raw, c.env);
+    c.set("principal", principal);
+    await enforceApiRateLimits(c.env.API_BURST_LIMIT, c.env.API_MINUTE_LIMIT, principal.integrationId);
+    await next();
+  }),
+);
 
 function capability(principal: IntegrationPrincipal, name: keyof IntegrationPrincipal) {
   if (!principal[name])

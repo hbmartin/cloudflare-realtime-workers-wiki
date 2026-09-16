@@ -10,14 +10,18 @@ const ERROR_STACK_LIMIT = LOG_STACK_LIMIT;
 export const TRUNCATION_MARKER = "…[truncated]";
 export type LogSanitizer = (value: string, limit: number) => string;
 
+export function wellFormedPrefix(value: string, limit: number) {
+  let sliceEnd = Math.min(value.length, Math.max(0, limit));
+  const lastCodeUnit = value.charCodeAt(sliceEnd - 1);
+  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) sliceEnd -= 1;
+  return value.slice(0, sliceEnd);
+}
+
 export function boundedLogString(value: string, limit: number) {
   if (value.length <= limit) return value;
   if (limit <= 0) return "";
   if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, limit);
-  let sliceEnd = limit - TRUNCATION_MARKER.length;
-  const lastCodeUnit = value.charCodeAt(sliceEnd - 1);
-  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) sliceEnd -= 1;
-  return `${value.slice(0, sliceEnd)}${TRUNCATION_MARKER}`;
+  return `${wellFormedPrefix(value, limit - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`;
 }
 
 function property(value: object, name: string): unknown {

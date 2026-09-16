@@ -201,20 +201,23 @@ import {
   withObservabilityContext,
 } from "./observability";
 import { deploymentMetadata, readiness } from "./health";
-import { respondingMetricRoute } from "./metric-route";
+import { metricMiddleware, respondingMetricRoute } from "./metric-route";
 import { SCHEDULED_TASK_NAMES, type ScheduledTaskName } from "./scheduled-task-names";
 import { sourceRateLimitKey } from "./source-rate-limit";
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.use("*", async (c, next) => {
-  try {
-    await next();
-  } finally {
-    const registered = respondingMetricRoute(c);
-    if (registered) setMetricRouteTemplate(registered);
-  }
-});
+app.use(
+  "*",
+  metricMiddleware(async (c, next) => {
+    try {
+      await next();
+    } finally {
+      const registered = respondingMetricRoute(c);
+      if (registered) setMetricRouteTemplate(registered);
+    }
+  }),
+);
 const DELETION_TARGET_BATCH_SIZE = 50;
 // Each page costs three or four statements, so this stays far inside D1's per-invocation
 // query ceiling while still collapsing a tree level into one request.
@@ -1438,14 +1441,12 @@ app.post("/api/invites/complete", async (c) => {
 });
 
 app.all("/api/security/*", async (c) => {
-  setMetricRouteTemplate("/api/security/*");
   const url = new URL(c.req.url);
   url.pathname = url.pathname.replace("/api/security/", "/api/auth/security/");
   return createAuth(c.env).handler(new Request(url, c.req.raw));
 });
 
 app.all("/api/auth/*", async (c) => {
-  setMetricRouteTemplate("/api/auth/*");
   if (new URL(c.req.url).pathname.endsWith("/sign-up/email")) {
     throw new HttpError(403, "registration_closed", "Use the bootstrap screen or an invite to register.");
   }

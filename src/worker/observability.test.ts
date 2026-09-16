@@ -19,6 +19,10 @@ import {
   withObservabilityContext,
 } from "./observability";
 
+function isWellFormed(value: string) {
+  return (value as string & { isWellFormed(): boolean }).isWellFormed();
+}
+
 describe("worker observability", () => {
   it("emits one structured, correlated, redacted log object", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -176,11 +180,56 @@ describe("worker observability", () => {
     );
     expect(safeTelemetryErrorMessage(new Error("Bearer abc123"), "fallback")).toBe("Bearer [redacted]");
     expect(safeTelemetryErrorMessage(new Error("Bearer abc123."), "fallback")).toBe("Bearer [redacted].");
+    for (const delimiter of [":", "\\", ">", "`", "&", "%", "*", "|"]) {
+      expect(safeTelemetryErrorMessage(new Error(`Bearer abc123${delimiter} expired`), "fallback")).toBe(
+        `Bearer [redacted]${delimiter} expired`,
+      );
+    }
     expect(safeTelemetryErrorMessage(new Error(`Bearer ${"a".repeat(16)}`), "fallback")).toBe("Bearer [redacted]");
     expect(safeTelemetryErrorMessage(new Error("Use the Bearer token scheme"), "fallback")).toBe(
       "Use the Bearer token scheme",
     );
     expect(safeTelemetryErrorMessage(new Error("Bearer api:key"), "fallback")).toBe("Bearer api:key");
+  });
+
+  it("redacts colon, assignment, JSON, and escaped JSON authorization labels", () => {
+    for (const message of [
+      "Authorization: Bearer abc",
+      "authorization=Bearer abc",
+      'authorization = "Bearer abc"',
+      "Proxy-Authorization=Bearer abc",
+      '{"authorization":"Bearer abc"}',
+      String.raw`{\"authorization\":\"Bearer abc\"}`,
+    ]) {
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).not.toContain("Bearer abc");
+    }
+    for (const message of [
+      "Authorization: Basic badtoken",
+      "authorization=Basic badtoken",
+      'authorization = "Basic badtoken"',
+      "Proxy-Authorization=Basic badtoken",
+      '{"authorization":"Basic badtoken"}',
+      String.raw`{\"authorization\":\"Basic badtoken\"}`,
+    ]) {
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).not.toContain("Basic badtoken");
+    }
+  });
+
+  it("applies escaped authorization labels to nested fields and error stacks", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const escaped = String.raw`{\"authorization\":\"Bearer abc\"}`;
+      const error = new Error("failed");
+      error.stack = escaped;
+
+      logger.error("test.escaped_authorization", "test", "failed", { details: { diagnostic: escaped } }, error);
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(String(record.details)).not.toContain("Bearer abc");
+      expect(record.errorStack).not.toContain("Bearer abc");
+    } finally {
+      output.mockRestore();
+    }
   });
 
   it("redacts every email shape covered by the previous policy", () => {
@@ -291,8 +340,52 @@ describe("worker observability", () => {
     const prefix = "x".repeat(PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length - 1);
     const result = safeTelemetryErrorMessage(new Error(`${prefix}😀${"z".repeat(LOG_TEXT_LIMIT)}`), "fallback");
 
-    expect(result).not.toContain("�");
+    expect(result).toBe(prefix + TRUNCATION_MARKER);
+    expect(isWellFormed(result)).toBe(true);
+  });
+
+  it("keeps redaction and truncation markers atomic when sanitizing expands the payload", () => {
+    const credential = " Bearer abc123";
+    const payloadLimit = PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length;
+    const raw = `${"x".repeat(payloadLimit - credential.length)}${credential}${"tail".repeat(20)}`;
+    const result = safeTelemetryErrorMessage(new Error(raw), "fallback");
+
+    expect(result).not.toContain("abc123");
+    expect(result.replaceAll("[redacted]", "")).not.toContain("[reda");
     expect(result).toMatch(/…\[truncated\]$/);
+    expect(result.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+    expect(result.match(/…\[truncated\]/g)).toHaveLength(1);
+    expect(isWellFormed(result)).toBe(true);
+  });
+
+  it("scrubs short Basic and Bearer values cut off at the raw boundary", () => {
+    const boundaryMessage = (scheme: "Basic" | "Bearer", fragment: string, leading = "") => {
+      const label = `${scheme} `;
+      const prefixLength =
+        PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length - leading.length - label.length - fragment.length;
+      const prefix = `${leading}${"x".repeat(prefixLength - 1)} `;
+      return safeTelemetryErrorMessage(new Error(`${prefix}${label}${fragment}${"tail".repeat(30)}`), "fallback");
+    };
+
+    for (const length of [1, 5, 9, 13, 15]) {
+      const fragment = "A".repeat(length);
+      const result = boundaryMessage("Basic", fragment);
+      expect(result).not.toContain(`Basic ${fragment}`);
+      expect(result).toMatch(/…\[truncated\]$/);
+      expect(result.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+      expect(result.replaceAll("[redacted]", "")).not.toContain("[reda");
+    }
+    for (const length of [1, 15]) {
+      const fragment = "a".repeat(length);
+      const result = boundaryMessage("Bearer", fragment);
+      expect(result).not.toContain(`Bearer ${fragment}`);
+      expect(result).toMatch(/…\[truncated\]$/);
+      expect(result.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+      expect(result.replaceAll("[redacted]", "")).not.toContain("[reda");
+    }
+
+    const afterEarlierRedaction = boundaryMessage("Bearer", "a", "Authorization: Bearer abcdefghijklmnop ");
+    expect(afterEarlierRedaction).not.toContain("Bearer a");
   });
 
   it("redacts authorization headers and preserves non-credential free-text Basic values", () => {
@@ -386,10 +479,10 @@ describe("worker observability", () => {
       const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
       const serialized = String(record.details);
       expect(serialized.length).toBeLessThanOrEqual(2_000);
-      expect(JSON.parse(serialized)).toMatchObject({
-        field0: expect.stringContaining("value"),
-        omitted: "[entries omitted]",
-      });
+      const parsed = JSON.parse(serialized) as Record<string, unknown>;
+      expect(parsed.field0).toEqual(expect.stringContaining("value"));
+      expect(Object.keys(parsed)).toHaveLength(30);
+      expect(parsed).not.toHaveProperty("omitted");
       expect(serialized).not.toBe('"[object truncated]"');
 
       output.mockClear();
@@ -403,7 +496,6 @@ describe("worker observability", () => {
       const childRecord = output.mock.calls[0]?.[0] as Record<string, unknown>;
       expect(JSON.parse(String(childRecord.details))).toEqual({
         child: "[value omitted]",
-        omitted: "[entries omitted]",
       });
     } finally {
       output.mockRestore();
@@ -413,11 +505,7 @@ describe("worker observability", () => {
   it("continues bounded nested summaries after oversized values", () => {
     const objectSummary = boundedNestedJson({ blob: "x".repeat(5_000), other: 1 }, LOG_TEXT_LIMIT);
     expect(objectSummary.length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
-    expect(JSON.parse(objectSummary)).toEqual({
-      blob: "[value omitted]",
-      other: 1,
-      omitted: "[entries omitted]",
-    });
+    expect(JSON.parse(objectSummary)).toEqual({ blob: expect.stringMatching(/…\[truncated\]$/), other: 1 });
 
     const childSummary = boundedNestedJson(
       {
@@ -430,26 +518,104 @@ describe("worker observability", () => {
     expect(JSON.parse(childSummary)).toEqual({
       child: "[value omitted]",
       other: 1,
-      omitted: "[entries omitted]",
     });
 
     const arraySummary = boundedNestedJson(["x".repeat(5_000), 1], LOG_TEXT_LIMIT);
     expect(arraySummary.length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
-    expect(JSON.parse(arraySummary)).toEqual(["[value omitted]", 1, "[entries omitted]"]);
+    expect(JSON.parse(arraySummary)).toEqual([expect.stringMatching(/…\[truncated\]$/), 1]);
+
+    expect(boundedNestedJson(["abcdefghijklmnopqrstuvwxyz"], 19)).toBe('["abc…[truncated]"]');
   });
 
-  it("keeps bounded JSON valid when an omission marker does not fit", () => {
+  it("keeps sanitization markers atomic while compacting nested strings", () => {
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      logger.info("test.nested_marker", "test", "nested marker", {
+        details: { note: `${"x".repeat(1_960)} Bearer abc123 ${"z".repeat(100)}` },
+      });
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      const parsed = JSON.parse(String(record.details)) as { note: string };
+      expect(parsed.note).not.toContain("abc123");
+      expect(parsed.note.replaceAll("[redacted]", "")).not.toContain("[reda");
+      expect(parsed.note.match(/…\[truncated\]/g)).toHaveLength(1);
+      expect(isWellFormed(parsed.note)).toBe(true);
+      expect(String(record.details).length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("reruns boundary redaction after a nested string is compacted", () => {
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      logger.info("test.nested_boundary", "test", "nested boundary", {
+        details: { note: `${"x".repeat(1_966)} Bearer api:key ${"z".repeat(100)}` },
+      });
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      const parsed = JSON.parse(String(record.details)) as { note: string };
+      expect(parsed.note).not.toContain("Bearer api");
+      expect(parsed.note.replaceAll("[redacted]", "")).not.toContain("[reda");
+      expect(parsed.note.match(/…\[truncated\]/g)).toHaveLength(1);
+      expect(isWellFormed(parsed.note)).toBe(true);
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("retains a bounded nested error stack and its later metadata", () => {
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      const cause = Object.assign(new Error("nested failure"), { reason: "later metadata" });
+      cause.stack = `nested-stack:${"x".repeat(5_000)}`;
+
+      logger.info("test.nested_error", "test", "nested error", { cause });
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      const parsed = JSON.parse(String(record.cause)) as Record<string, unknown>;
+      expect(parsed.errorStack).toMatch(/^nested-stack:x+…\[truncated\]$/);
+      expect(parsed.errorReason).toBe("later metadata");
+      expect(String(record.cause).length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("marks only entries that were actually dropped", () => {
     const summary = boundedNestedJson({ blob: "x".repeat(100), other: 1 }, 20);
     expect(summary.length).toBeLessThanOrEqual(20);
-    expect(JSON.parse(summary)).toEqual({ other: 1 });
+    expect(JSON.parse(summary)).toBe("[entries omitted]");
 
-    const collision = boundedNestedJson({ omitted: "kept", blob: "x".repeat(5_000), other: 1 }, LOG_TEXT_LIMIT);
-    expect(JSON.parse(collision)).toEqual({
-      omitted: "kept",
-      blob: "[value omitted]",
-      other: 1,
-      "omitted#2": "[entries omitted]",
-    });
+    const collision = boundedNestedJson(
+      { omitted: "kept", first: "x".repeat(100), second: "y".repeat(100), third: 1 },
+      70,
+    );
+    expect(JSON.parse(collision)).toMatchObject({ omitted: "kept", third: 1, "omitted#2": "[entries omitted]" });
+
+    const arraySummary = boundedNestedJson(
+      Array.from({ length: 10 }, () => ({ long: "x".repeat(100) })),
+      50,
+    );
+    expect(JSON.parse(arraySummary).at(-1)).toBe("[entries omitted]");
+  });
+
+  it("uses truthful valid JSON fallbacks at tiny nested-value limits", () => {
+    const oversized = { value: "x".repeat(100) };
+    expect(boundedNestedJson(oversized, 0)).toBe("");
+    expect(boundedNestedJson(oversized, 1)).toBe("");
+    expect(boundedNestedJson(oversized, 2)).toBe('""');
+    expect(boundedNestedJson(oversized, 3)).toBe('""');
+    expect(boundedNestedJson(oversized, 4)).toBe("null");
+
+    const sparse: unknown[] = [];
+    sparse.length = 2;
+    for (let limit = 2; limit <= 12; limit += 1) {
+      const summary = boundedNestedJson(sparse, limit);
+      expect(summary.length).toBeLessThanOrEqual(limit);
+      expect(() => JSON.parse(summary)).not.toThrow();
+    }
+    expect(boundedNestedJson(sparse, 11)).toBe("[null,null]");
   });
 
   it("protects required fields and treats missing tracing support as a no-op", () => {

@@ -1084,6 +1084,7 @@ describe("Worker integration", () => {
       "/api/no-such-route/short-id.svg",
       "/api/auth/no-such-route",
       "/api/security/no-such-route",
+      "/v1/users/me",
       "/parties/document/abc~1",
       "/parties/workspace-events/abc",
     ];
@@ -1101,6 +1102,7 @@ describe("Worker integration", () => {
       "/unmatched",
       "/api/auth/*",
       "/api/security/*",
+      "/v1/users/me",
       "/parties/document/:room",
       "/parties/workspace-events/:workspace",
     ]);
