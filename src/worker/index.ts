@@ -1,6 +1,7 @@
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
 import { matchedRoutes, routePath } from "hono/route";
+import { findTargetHandler, isMiddleware } from "hono/utils/handler";
 import { routePartykitRequest } from "partyserver";
 import { createAuth, requireEditor, requireMember, requireOwner } from "./auth";
 import { pruneSecurityState, requireSecurity } from "./security";
@@ -206,24 +207,22 @@ import { SCHEDULED_TASK_NAMES, type ScheduledTaskName } from "./scheduled-task-n
 import { sourceRateLimitKey } from "./source-rate-limit";
 
 const app = new Hono<{ Bindings: Env }>();
-const WILDCARD_HANDLER_TEMPLATES = new Set(["/api/security/*", "/api/auth/*"]);
 
-function registeredMetricRoute(routes: readonly { path: string }[], current: string) {
-  if (WILDCARD_HANDLER_TEMPLATES.has(current)) return current;
-  if (routes.some((route) => route.path === current) && current !== "*" && current !== "/*" && !current.endsWith("/*"))
-    return current;
-  const concrete = routes.findLast(
-    (route) => route.path !== "*" && route.path !== "/*" && !route.path.endsWith("/*"),
-  )?.path;
-  if (concrete) return concrete;
-  return "/unmatched";
+function isConcreteMetricRoute(route: string | undefined): route is string {
+  return route !== undefined && route !== "*" && route !== "/*" && !route.endsWith("/*");
 }
 
 app.use("*", async (c, next) => {
   try {
     await next();
   } finally {
-    setMetricRouteTemplate(registeredMetricRoute(matchedRoutes(c), routePath(c)));
+    const responding = routePath(c);
+    const registered = isConcreteMetricRoute(responding)
+      ? responding
+      : matchedRoutes(c).findLast(
+          (route) => !isMiddleware(findTargetHandler(route.handler)) && isConcreteMetricRoute(route.path),
+        )?.path;
+    if (isConcreteMetricRoute(registered)) setMetricRouteTemplate(registered);
   }
 });
 const DELETION_TARGET_BATCH_SIZE = 50;
@@ -1449,12 +1448,14 @@ app.post("/api/invites/complete", async (c) => {
 });
 
 app.all("/api/security/*", async (c) => {
+  setMetricRouteTemplate("/api/security/*");
   const url = new URL(c.req.url);
   url.pathname = url.pathname.replace("/api/security/", "/api/auth/security/");
   return createAuth(c.env).handler(new Request(url, c.req.raw));
 });
 
 app.all("/api/auth/*", async (c) => {
+  setMetricRouteTemplate("/api/auth/*");
   if (new URL(c.req.url).pathname.endsWith("/sign-up/email")) {
     throw new HttpError(403, "registration_closed", "Use the bootstrap screen or an invite to register.");
   }

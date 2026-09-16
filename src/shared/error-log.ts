@@ -7,7 +7,7 @@ const ERROR_NAME_LIMIT = LOG_IDENTIFIER_LIMIT;
 const ERROR_CODE_LIMIT = LOG_IDENTIFIER_LIMIT;
 const ERROR_MESSAGE_LIMIT = LOG_TEXT_LIMIT;
 const ERROR_STACK_LIMIT = LOG_STACK_LIMIT;
-const TRUNCATION_MARKER = "…[truncated]";
+export const TRUNCATION_MARKER = "…[truncated]";
 export type LogSanitizer = (value: string, limit: number) => string;
 
 export function boundedLogString(value: string, limit: number) {

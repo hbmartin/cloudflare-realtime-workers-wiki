@@ -139,7 +139,7 @@ describe("worker observability", () => {
       ).not.toThrow();
       const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
       expect(record.message).toBe(
-        "Bearer [redacted] Basic Zm9vOmJhcg== [redacted-secret] [redacted-secret] [redacted-secret] [redacted-email] https://example.test/path",
+        "Bearer [redacted] Basic [redacted] [redacted-secret] [redacted-secret] [redacted-secret] [redacted-email] https://example.test/path",
       );
       expect(record.nested).toBe('{"authorization":"[redacted]","value":"[redacted-email]"}');
       expect(record.hostile).toBe('"[object omitted]"');
@@ -148,13 +148,23 @@ describe("worker observability", () => {
     }
   });
 
-  it("keeps free-text Basic prose and credentials under the header-only policy", () => {
+  it("keeps Basic prose but redacts decodable free-text credentials", () => {
     expect(safeTelemetryErrorMessage(new Error("unable to verify basic constraints or Basic idea"), "fallback")).toBe(
       "unable to verify basic constraints or Basic idea",
     );
-    expect(safeTelemetryErrorMessage(new Error("Basic Og== and basic Zm9vOmJhcg== and Basic\tOg=="), "fallback")).toBe(
-      "Basic Og== and basic Zm9vOmJhcg== and Basic\tOg==",
-    );
+    expect(
+      safeTelemetryErrorMessage(
+        new Error("Basic Og== and basic Zm9vOmJhcg== and Basic\tOg== and Basic not-base64!"),
+        "fallback",
+      ),
+    ).toBe("Basic [redacted] and basic [redacted] and Basic\t[redacted] and Basic not-base64!");
+  });
+
+  it("redacts complete Bearer values and every email shape covered by the previous policy", () => {
+    expect(safeTelemetryErrorMessage(new Error("Bearer api:key"), "fallback")).toBe("Bearer [redacted]");
+    expect(safeTelemetryErrorMessage(new Error(`${"a".repeat(65)}@example.com`), "fallback")).toBe("[redacted-email]");
+    expect(safeTelemetryErrorMessage(new Error("name@example.com-foo"), "fallback")).toBe("[redacted-email]-foo");
+    expect(safeTelemetryErrorMessage(new Error("name@example.co.uk"), "fallback")).toBe("[redacted-email]");
   });
 
   it("keeps Basic prose and later nested JSON keys intact", () => {
@@ -218,6 +228,9 @@ describe("worker observability", () => {
       expect(
         safeTelemetryErrorMessage(new Error("x".repeat(975) + " crn_abcdefghijklmnop" + "z".repeat(80)), "fallback"),
       ).not.toContain("crn_abc");
+      expect(safeTelemetryErrorMessage(new Error("local@".repeat(20_000)), "fallback").length).toBeLessThanOrEqual(
+        1_000,
+      );
     } finally {
       output.mockRestore();
     }
@@ -259,7 +272,7 @@ describe("worker observability", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
       const error = new Error("failed");
-      error.stack = `Authorization: Basic Zm9vOmJhcg== secret_thismustberedacted ${"x".repeat(LOG_STACK_LIMIT + 1_000)}`;
+      error.stack = `Authorization: Basic Zm9vOmJhcg== secret_thismustberedacted ${"frame ".repeat(LOG_STACK_LIMIT)}`;
 
       withObservabilityContext({} as Env, { trigger: "queue", correlationId: "secret_thismustberedacted" }, () =>
         logger.error("test.stack", "test", "failed", {}, error),
@@ -272,6 +285,63 @@ describe("worker observability", () => {
       expect(record.errorStack).toMatch(/…\[truncated\]$/);
       expect(record.errorStack).toContain("Basic [redacted]");
       expect(record.errorStack).not.toContain("secret_thismustberedacted");
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("sanitizes nested and top-level field names without dropping colliding fields", () => {
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      logger.info("test.keys", "test", "keys", {
+        "one@example.com": "first",
+        "two@example.com": "second",
+        details: {
+          "three@example.com": "third",
+          "four@example.com": "fourth",
+          accessToken: "secret",
+        },
+      });
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(record["[redacted-email]"]).toBe("first");
+      expect(record["[redacted-email]#2"]).toBe("second");
+      expect(JSON.parse(String(record.details))).toEqual({
+        "[redacted-email]": "third",
+        "[redacted-email]#2": "fourth",
+        accessToken: "[redacted]",
+      });
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("retains a valid bounded JSON summary for oversized nested fields", () => {
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      logger.info("test.large_nested", "test", "large nested", {
+        details: Object.fromEntries(
+          Array.from({ length: 30 }, (_, index) => [`field${index}`, `value ${"word ".repeat(40)}`]),
+        ),
+      });
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      const serialized = String(record.details);
+      expect(serialized.length).toBeLessThanOrEqual(2_000);
+      expect(JSON.parse(serialized)).toMatchObject({
+        field0: expect.stringContaining("value"),
+        omitted: "[entries omitted]",
+      });
+      expect(serialized).not.toBe('"[object truncated]"');
+
+      output.mockClear();
+      logger.info("test.large_child", "test", "large child", {
+        details: {
+          child: Object.fromEntries(
+            Array.from({ length: 30 }, (_, index) => [`field${index}`, `value ${"word ".repeat(40)}`]),
+          ),
+        },
+      });
+      const childRecord = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(JSON.parse(String(childRecord.details))).toEqual({ child: "[value omitted]" });
     } finally {
       output.mockRestore();
     }

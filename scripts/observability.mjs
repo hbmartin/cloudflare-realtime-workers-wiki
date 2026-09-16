@@ -74,7 +74,14 @@ async function fetchJson(url, init, fetcher = fetch) {
   } catch (error) {
     throw new ObservabilitySourceError(isTimeout(error) ? "timeout" : "network_error");
   }
-  if (!response.ok) throw new ObservabilityApiError(response.status);
+  if (!response.ok) {
+    try {
+      await response.body?.cancel();
+    } catch {
+      // Preserve the HTTP diagnostic even if discarding the body fails.
+    }
+    throw new ObservabilityApiError(response.status);
+  }
   let body;
   try {
     body = await response.json();
@@ -215,7 +222,7 @@ async function staleQueuedWorkflows(accountId, token, timestamp, fetcher = fetch
   url.searchParams.set("per_page", "100");
   const instances = [];
   const seenCursors = new Set();
-  for (let page = 0; page < WORKFLOW_PAGE_LIMIT; page += 1) {
+  for (let page = 0; ; page += 1) {
     const response = await fetchJson(url, { headers: { authorization: `Bearer ${token}` } }, fetcher);
     if (response?.success !== true || !Array.isArray(response.result)) {
       throw new Error("Cloudflare Workflow instance query returned an invalid response.");
@@ -236,7 +243,6 @@ async function staleQueuedWorkflows(accountId, token, timestamp, fetcher = fetch
     seenCursors.add(cursor);
     url.searchParams.set("cursor", cursor);
   }
-  return { instances, complete: false };
 }
 
 async function graphqlMetrics(accountId, token, queueId, startedAt, fetcher = fetch) {

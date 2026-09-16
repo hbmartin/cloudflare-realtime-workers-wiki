@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import * as Y from "yjs";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { joinBytes } from "../shared/bytes";
-import { LOG_IDENTIFIER_LIMIT, LOG_TEXT_LIMIT } from "../shared/error-log";
+import { LOG_IDENTIFIER_LIMIT, LOG_TEXT_LIMIT, TRUNCATION_MARKER } from "../shared/error-log";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
 import {
@@ -40,8 +40,6 @@ import { HttpError } from "./http";
 import worker, { executeScheduledTasks } from "./index";
 import { SCHEDULED_TASK_NAMES } from "./scheduled-task-names";
 import { broadcastWorkspaceEvent, eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
-
-const TRUNCATION_MARKER = "…[truncated]";
 
 function expectStructuredLog(
   spy: { mock: { calls: readonly (readonly unknown[])[] } },
@@ -643,6 +641,15 @@ async function clearWorkerDatabase() {
   ]);
 }
 
+function bindingsWithDatabase(database: D1Database) {
+  return new Proxy(env as Env, {
+    get(target, property, receiver) {
+      if (property === "DB") return database;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+}
+
 afterEach(async () => {
   // reset() clears persisted bindings, but it does not evict an instantiated Durable
   // Object. Evict after the test has drained so appended tests cannot retain its
@@ -705,12 +712,7 @@ describe("Worker integration", () => {
         };
       },
     });
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWithDatabase(database);
     const response = await worker.fetch(
       new Request("http://example.test/api/health/ready", {
         headers: { "x-observability-token": "worker-observability-probe-token" },
@@ -1224,12 +1226,7 @@ describe("Worker integration", () => {
         };
       },
     });
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWithDatabase(database);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       await executeScheduledTasks(bindings, createExecutionContext(), [{ name: taskName, run: async () => undefined }]);
@@ -1275,12 +1272,7 @@ describe("Worker integration", () => {
             : target.prepare(query);
       },
     });
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWithDatabase(database);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
@@ -1371,12 +1363,7 @@ describe("Worker integration", () => {
         };
       },
     });
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWithDatabase(database);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       await executeScheduledTasks(bindings, createExecutionContext(), [{ name: taskName, run: async () => undefined }]);
@@ -1410,8 +1397,9 @@ describe("Worker integration", () => {
     });
     const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let older: Promise<void> | undefined;
     try {
-      const older = executeScheduledTasks(env, createExecutionContext(), [
+      older = executeScheduledTasks(env, createExecutionContext(), [
         {
           name: taskName,
           run: async () => {
@@ -1444,9 +1432,10 @@ describe("Worker integration", () => {
         last_error: null,
       });
     } finally {
+      releaseOlder();
+      await older?.catch(() => undefined);
       now.mockRestore();
       logged.mockRestore();
-      releaseOlder();
       await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
     }
   });
@@ -1473,14 +1462,10 @@ describe("Worker integration", () => {
             : target.prepare(query);
       },
     });
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWithDatabase(database);
+    let older: Promise<void> | undefined;
     try {
-      const older = executeScheduledTasks(env, createExecutionContext(), [
+      older = executeScheduledTasks(env, createExecutionContext(), [
         {
           name: taskName,
           run: async () => {
@@ -1517,6 +1502,7 @@ describe("Worker integration", () => {
       });
     } finally {
       releaseOlder();
+      await older?.catch(() => undefined);
       clock.mockRestore();
       logged.mockRestore();
       warning.mockRestore();
@@ -1557,14 +1543,10 @@ describe("Worker integration", () => {
         };
       },
     });
-    const bindings = new Proxy(env, {
-      get(target, property, receiver) {
-        if (property === "DB") return database;
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    const bindings = bindingsWithDatabase(database);
+    let older: Promise<void> | undefined;
     try {
-      const older = executeScheduledTasks(bindings, createExecutionContext(), [
+      older = executeScheduledTasks(bindings, createExecutionContext(), [
         {
           name: taskName,
           run: async () => undefined,
@@ -1596,6 +1578,7 @@ describe("Worker integration", () => {
       });
     } finally {
       releaseStart();
+      await older?.catch(() => undefined);
       clock.mockRestore();
       await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
     }
@@ -1613,8 +1596,9 @@ describe("Worker integration", () => {
     });
     const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let older: Promise<void> | undefined;
     try {
-      const older = executeScheduledTasks(env, createExecutionContext(), [
+      older = executeScheduledTasks(env, createExecutionContext(), [
         {
           name: taskName,
           run: async () => {
@@ -1651,6 +1635,7 @@ describe("Worker integration", () => {
       });
     } finally {
       releaseOlder();
+      await older?.catch(() => undefined);
       now.mockRestore();
       logged.mockRestore();
       await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
@@ -1669,8 +1654,9 @@ describe("Worker integration", () => {
     });
     const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let older: Promise<void> | undefined;
     try {
-      const older = executeScheduledTasks(env, createExecutionContext(), [
+      older = executeScheduledTasks(env, createExecutionContext(), [
         {
           name: taskName,
           run: async () => {
@@ -1699,6 +1685,7 @@ describe("Worker integration", () => {
       });
     } finally {
       releaseOlder();
+      await older?.catch(() => undefined);
       now.mockRestore();
       logged.mockRestore();
       await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
