@@ -2,12 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   LOG_TEXT_LIMIT,
   PERSISTED_ERROR_MESSAGE_LIMIT,
+  TRUNCATION_MARKER,
   errorLogFields,
   prefixedErrorLogFields,
   safeErrorMessage,
 } from "./error-log";
-
-const TRUNCATION_MARKER = "…[truncated]";
 
 describe("error log fields", () => {
   it("retains bounded allowlisted fields from non-Error throw values", () => {

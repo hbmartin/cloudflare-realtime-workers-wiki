@@ -44,23 +44,55 @@ describe("D1 migrations", () => {
 
   it("fences a legacy token update after a UUID run owns the row", async () => {
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
-    await env.DB.prepare(`INSERT INTO observability_task_runs
-      (task_name, last_started_at, execution_token) VALUES ('legacy_fence', 100, 100)`).run();
-    await env.DB.prepare(`UPDATE observability_task_runs
-      SET last_started_at = 200, run_id = 'worker-run', execution_token = NULL
-      WHERE task_name = 'legacy_fence'`).run();
-    const legacy = await env.DB.prepare(`UPDATE observability_task_runs
-      SET last_started_at = 300, execution_token = 101
-      WHERE task_name = 'legacy_fence' RETURNING execution_token`).all();
-    expect(legacy.results).toEqual([]);
-    expect(
-      await env.DB.prepare(`SELECT last_started_at, run_id, execution_token
-      FROM observability_task_runs WHERE task_name = 'legacy_fence'`).first(),
-    ).toEqual({
-      last_started_at: 200,
-      run_id: "worker-run",
-      execution_token: null,
-    });
+    try {
+      await env.DB.prepare(`INSERT INTO observability_task_runs
+        (task_name, last_started_at, execution_token, run_id, first_observed_at)
+        VALUES ('legacy_fence', 200, NULL, 'worker-run', 200)`).run();
+
+      // This is the exact start statement issued by the Worker immediately
+      // before UUID run ownership was introduced.
+      const legacy = await env.DB.prepare(
+        `INSERT INTO observability_task_runs (task_name, last_started_at)
+          VALUES (?, ?)
+          ON CONFLICT(task_name) DO UPDATE SET
+            last_started_at = MAX(observability_task_runs.last_started_at + 1, excluded.last_started_at)
+          RETURNING last_started_at`,
+      )
+        .bind("legacy_fence", 300)
+        .all();
+      expect(legacy.results).toEqual([]);
+
+      const current = await env.DB.prepare(
+        `INSERT INTO observability_task_runs (task_name, last_started_at, run_id, first_observed_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(task_name) DO UPDATE SET
+            last_started_at = MAX(observability_task_runs.last_started_at, excluded.last_started_at),
+            run_id = CASE WHEN excluded.last_started_at >= observability_task_runs.last_started_at
+              THEN excluded.run_id ELSE observability_task_runs.run_id END,
+            execution_token = CASE WHEN excluded.last_started_at >= observability_task_runs.last_started_at
+              THEN NULL ELSE observability_task_runs.execution_token END,
+            first_observed_at = COALESCE(observability_task_runs.first_observed_at,
+              observability_task_runs.last_started_at)
+          RETURNING last_started_at, run_id`,
+      )
+        .bind("legacy_fence", 300, "next-run", 300)
+        .all();
+      expect(current.results).toEqual([{ last_started_at: 300, run_id: "next-run" }]);
+
+      await env.DB.prepare(`UPDATE observability_task_runs SET last_succeeded_at = 350
+        WHERE task_name = 'legacy_fence' AND run_id = 'next-run'`).run();
+      expect(
+        await env.DB.prepare(`SELECT last_started_at, run_id, execution_token, last_succeeded_at
+        FROM observability_task_runs WHERE task_name = 'legacy_fence'`).first(),
+      ).toEqual({
+        last_started_at: 300,
+        run_id: "next-run",
+        execution_token: null,
+        last_succeeded_at: 350,
+      });
+    } finally {
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = 'legacy_fence'`).run();
+    }
   });
 
   it("invalidates existing password-only sessions during the mandatory protection cutover", async () => {

@@ -149,6 +149,10 @@ failed attempts and evaluates:
 - any invariant-corruption metric, two compaction failures, two restore 5xx failures, or five identical
   authenticated browser fingerprints in 15 minutes.
 
+Migrations `0033` and `0034` install a temporary scheduler handoff fence: after a UUID run owns a task row, a Worker
+from before UUID ownership cannot advance `last_started_at` and take the row back. Keep the fence while such a Worker
+can still be restored from deployment history. A later migration may drop it only after those versions are retired.
+
 Missing external metadata reports `delivery_queue_metadata_missing`, `delivery_dlq_metadata_missing`, or
 `d1_metadata_missing` instead of interpreting an unavailable resource as zero. Queue listing, individual Queue
 metrics, D1, Analytics, GraphQL, and Workflow instance failures produce source-specific diagnostics; report mode

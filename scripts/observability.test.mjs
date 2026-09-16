@@ -408,6 +408,28 @@ describe("observability thresholds", () => {
     );
   });
 
+  it.each([false, true])(
+    "cancels an HTTP error body without losing its status (cancel rejects: %s)",
+    async (rejects) => {
+      const cancel = rejects
+        ? vi.fn().mockRejectedValue(new Error("cancel failed"))
+        : vi.fn().mockResolvedValue(undefined);
+      const snapshot = await collectSnapshot(
+        { accountId: "account", token: "token", baseUrl: "https://notes.example.test", probeToken: "probe" },
+        {
+          fetcher: cloudflareFetcher({
+            analytics: () => ({ ok: false, status: 503, body: { cancel } }),
+          }),
+          delay: async () => undefined,
+        },
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(snapshot.sourceDiagnostics).toContainEqual(
+        expect.objectContaining({ source: "analytics", reason: "http_error", status: 503 }),
+      );
+    },
+  );
+
   it("executes the monitor through a symlink as a direct script", () => {
     const directory = mkdtempSync(join(tmpdir(), "observability symlink "));
     try {
