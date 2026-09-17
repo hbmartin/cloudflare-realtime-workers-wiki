@@ -30,26 +30,29 @@ type LogFields = Readonly<Record<string, unknown>>;
 
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
-const AUTHORIZATION_LABEL = String.raw`(?:(?:REDIRECT_)*HTTP_(?:PROXY_)?AUTHORIZATION|(?:proxy[-_]?)?authorization(?:[-_]?header)?)`;
-const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:\\*["']|[\[({])[ \t]*)*`;
-const SERIALIZED_NAME_KEY = String.raw`(?:\\*["'])?name(?:\\*["'])?`;
-const SERIALIZED_VALUE_KEY = String.raw`(?:\\*["'])?value(?:\\*["'])?`;
-const SERIALIZED_AUTHORIZATION_NAME = String.raw`${SERIALIZED_NAME_KEY}[ \t\r\n]*:[ \t\r\n]*(?:\\*["'])${AUTHORIZATION_LABEL}(?:\\*["'])`;
+const SERIALIZED_QUOTE = String.raw`\\*["']`;
+const AUTHORIZATION_LABEL = String.raw`(?:proxy)?authorization(?:[-_]?header)?`;
+const SERIALIZED_AUTHORIZATION_LABEL = String.raw`[A-Za-z0-9_-]{0,64}${AUTHORIZATION_LABEL}`;
+const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:${SERIALIZED_QUOTE}|[\[({])[ \t]*)*`;
+const SERIALIZED_NAME_KEY = String.raw`name(?:${SERIALIZED_QUOTE})?`;
+const SERIALIZED_VALUE_KEY = String.raw`value(?:${SERIALIZED_QUOTE})?`;
+const SERIALIZED_AUTHORIZATION_NAME = String.raw`${SERIALIZED_NAME_KEY}[ \t\r\n]*:[ \t\r\n]*(?:${SERIALIZED_QUOTE})${SERIALIZED_AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})`;
 const SERIALIZED_AUTHORIZATION_VALUE_PREFIX = String.raw`${SERIALIZED_VALUE_KEY}[ \t\r\n]*:[ \t\r\n]*(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`;
+const SERIALIZED_HEADER_FIELD_GAP = String.raw`[\s\S]{0,256}?`;
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
-  String.raw`\b${AUTHORIZATION_LABEL}(?:\\*["'])?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`,
+  String.raw`(?<![A-Za-z0-9])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`,
   "gi",
 );
 const UNDICI_NAME_FIRST_AUTHORIZATION_PREFIX = new RegExp(
-  String.raw`(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_NAME}[ \t\r\n]*,[^{}]*?(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_VALUE_PREFIX}`,
+  String.raw`(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_NAME}[ \t\r\n]*,${SERIALIZED_HEADER_FIELD_GAP}(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_VALUE_PREFIX}`,
   "gi",
 );
 const UNDICI_VALUE_FIRST_AUTHORIZATION_PREFIX = new RegExp(
-  String.raw`(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_VALUE_PREFIX}(?=[^{}]*?,[ \t\r\n]*(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_NAME})`,
+  String.raw`(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_VALUE_PREFIX}(?=${SERIALIZED_HEADER_FIELD_GAP}(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_NAME})`,
   "gi",
 );
 const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
-const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=-]`;
+const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=!?-]`;
 const BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}+)`, "gi");
 const BEARER_VALUE = new RegExp(String.raw`\bBearer[ \t]+(${BEARER_TOKEN_CHARACTER}+)`, "gi");
 const PARTIAL_BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}*)$`, "i");
@@ -59,6 +62,7 @@ const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xo
 const PARTIAL_SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]*|xox[baprs]-[A-Za-z0-9-]*)$/i;
 const NESTED_VALUE_BUDGET = 100;
 const REDACTED_VALUE = "[redacted]";
+const EXISTING_CREDENTIAL_MARKERS = [REDACTED_VALUE, TRUNCATION_MARKER] as const;
 const OMITTED_ENTRIES = "[entries omitted]";
 const OMITTED_VALUE = "[value omitted]";
 const PROPERTY_OMITTED = "[property omitted]";
@@ -198,7 +202,7 @@ function redactBasicValue(match: string, encoded: string) {
 }
 
 function redactBearerValue(match: string, token: string) {
-  const trailingPunctuation = token.match(/\.+$/)?.[0] ?? "";
+  const trailingPunctuation = token.match(/[.!?]+$/)?.[0] ?? "";
   const candidate = token.slice(0, token.length - trailingPunctuation.length);
   return candidate.length >= 16 || /[0-9._~+/=-]/.test(candidate)
     ? match.slice(0, match.length - token.length) + REDACTED_VALUE + trailingPunctuation
@@ -260,7 +264,7 @@ function consumeOpeningValueWrappers(value: string, start: number) {
   return { cursor, delimiter: undefined };
 }
 
-const STRUCTURAL_CREDENTIAL_BOUNDARIES = ",;}])";
+const STRUCTURAL_CREDENTIAL_BOUNDARIES = ",;}])&";
 const TRAILING_CREDENTIAL_PUNCTUATION = ".!?";
 
 function isStructuralCredentialBoundary(character: string | undefined) {
@@ -269,7 +273,7 @@ function isStructuralCredentialBoundary(character: string | undefined) {
 
 function credentialBoundaryAt(value: string, index: number) {
   const character = value[index]!;
-  if (/\s/u.test(character) || STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character)) {
+  if (isStructuralCredentialBoundary(character)) {
     return { boundary: true, next: index + 1 };
   }
   if (!TRAILING_CREDENTIAL_PUNCTUATION.includes(character)) {
@@ -282,10 +286,6 @@ function credentialBoundaryAt(value: string, index: number) {
     boundary: isStructuralCredentialBoundary(next) || next === '"' || next === "'",
     next: runEnd,
   };
-}
-
-function isCredentialBoundary(value: string, index: number) {
-  return credentialBoundaryAt(value, index).boundary;
 }
 
 function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDelimiter | undefined) {
@@ -328,16 +328,15 @@ function redactAuthorizationMatches(value: string, pattern: RegExp) {
   let match = pattern.exec(value);
   while (match) {
     const opening = consumeOpeningValueWrappers(value, pattern.lastIndex);
-    const markerEnd = value.startsWith(REDACTED_VALUE, opening.cursor)
-      ? opening.cursor + REDACTED_VALUE.length
-      : undefined;
+    const existingMarker = EXISTING_CREDENTIAL_MARKERS.find((marker) => value.startsWith(marker, opening.cursor));
+    const markerEnd = existingMarker === undefined ? undefined : opening.cursor + existingMarker.length;
     const markerSuffix = markerEnd === undefined ? undefined : value[markerEnd];
     if (
       markerEnd !== undefined &&
       (markerSuffix === undefined ||
         markerSuffix === '"' ||
         markerSuffix === "'" ||
-        isCredentialBoundary(value, markerEnd))
+        credentialBoundaryAt(value, markerEnd).boundary)
     ) {
       pattern.lastIndex = markerEnd;
       match = pattern.exec(value);

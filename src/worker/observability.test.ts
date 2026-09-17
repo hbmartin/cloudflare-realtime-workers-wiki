@@ -180,6 +180,11 @@ describe("worker observability", () => {
     );
     expect(safeTelemetryErrorMessage(new Error("Bearer abc123"), "fallback")).toBe("Bearer [redacted]");
     expect(safeTelemetryErrorMessage(new Error("Bearer abc123."), "fallback")).toBe("Bearer [redacted].");
+    expect(safeTelemetryErrorMessage(new Error("Bearer abc123!secretpart"), "fallback")).toBe("Bearer [redacted]");
+    expect(safeTelemetryErrorMessage(new Error("Bearer abc!secretpartlongvalue"), "fallback")).toBe(
+      "Bearer [redacted]",
+    );
+    expect(safeTelemetryErrorMessage(new Error("Bearer abc123!?"), "fallback")).toBe("Bearer [redacted]!?");
     for (const delimiter of [":", "\\", ">", "`", "&", "%", "*", "|"]) {
       expect(safeTelemetryErrorMessage(new Error(`Bearer abc123${delimiter} expired`), "fallback")).toBe(
         `Bearer [redacted]${delimiter} expired`,
@@ -257,6 +262,9 @@ describe("worker observability", () => {
       ["proxyAuthorization: Bearer abc", "proxyAuthorization: Bearer [redacted]"],
       ["authorization_header: Bearer abc", "authorization_header: Bearer [redacted]"],
       ["proxy_authorization_header: Basic badtoken", "proxy_authorization_header: Basic [redacted]"],
+      ["X_AUTHORIZATION: Bearer abc", "X_AUTHORIZATION: Bearer [redacted]"],
+      ["HTTP_X_AUTHORIZATION: Bearer abc", "HTTP_X_AUTHORIZATION: Bearer [redacted]"],
+      ["upstream_authorization: Bearer abc", "upstream_authorization: Bearer [redacted]"],
       ["Map(1) { 'authorization' => 'Bearer abc' }", "Map(1) { 'authorization' => 'Bearer [redacted]' }"],
       ['["authorization", "Basic badtoken"]', '["authorization", "Basic [redacted]"]'],
       [
@@ -268,11 +276,20 @@ describe("worker observability", () => {
         "HeadersList { headersMap: Map(1) { 'proxy-authorization' => { name: 'proxy-authorization', value: 'Basic [redacted]' } } }",
       ],
       ['{"name":"authorization","value":"Bearer abc"}', '{"name":"authorization","value":"Bearer [redacted]"}'],
+      ['{"name":"x-authorization","value":"Bearer abc"}', '{"name":"x-authorization","value":"Bearer [redacted]"}'],
       [
         '{"name":"authorization","status":401,"value":"Bearer abc"}',
         '{"name":"authorization","status":401,"value":"Bearer [redacted]"}',
       ],
+      [
+        '{"name":"authorization","meta":{"status":401},"value":"Bearer abc"}',
+        '{"name":"authorization","meta":{"status":401},"value":"Bearer [redacted]"}',
+      ],
       ['{"value":"Bearer abc","name":"authorization"}', '{"value":"Bearer [redacted]","name":"authorization"}'],
+      [
+        '{"value":"Bearer abc","meta":{"status":401},"name":"authorization"}',
+        '{"value":"Bearer [redacted]","meta":{"status":401},"name":"authorization"}',
+      ],
       [
         '{ value: "Basic badtoken", status: 401, name: "proxy_authorization" }',
         '{ value: "Basic [redacted]", status: 401, name: "proxy_authorization" }',
@@ -342,6 +359,8 @@ describe("worker observability", () => {
       ["Authorization: Bearer abc!?secret", "Authorization: Bearer [redacted]"],
       ["Authorization: Bearer abc...secret", "Authorization: Bearer [redacted]"],
       ["Authorization: Bearer abc123.!?", "Authorization: Bearer [redacted].!?"],
+      ["authorization=Bearer word!&other=1", "authorization=Bearer [redacted]!&other=1"],
+      ["authorization=Bearer word?&other=1", "authorization=Bearer [redacted]?&other=1"],
       ['Authorization: Bearer "abc def"', 'Authorization: Bearer "[redacted] def"'],
       ["Authorization: Bearer [] after", "Authorization: Bearer [] after"],
       ["Authorization: Bearer    ", "Authorization: Bearer"],
@@ -496,6 +515,17 @@ describe("worker observability", () => {
     }
   });
 
+  it("keeps an existing truncation marker intact across repeated sanitization", () => {
+    const raw = `${"x".repeat(960)} Authorization: Bearer abc${"tail".repeat(100)}`;
+    const once = safeTelemetryErrorMessage(new Error(raw), "fallback");
+    const twice = safeTelemetryErrorMessage(new Error(once), "fallback");
+
+    expect(once).toMatch(/…\[truncated\]$/);
+    expect(once.match(/…\[truncated\]/g)).toHaveLength(1);
+    expect(twice).toBe(once);
+    expect(twice).not.toMatch(/\]\]$/);
+  });
+
   it("re-bounds raw strings that grow during redaction", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
@@ -562,24 +592,31 @@ describe("worker observability", () => {
     }
   });
 
-  it("redacts maximum-length punctuation runs in linear time", () => {
+  it("scales linearly for adversarial serialized-header inputs", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
-      const credential = `${".".repeat(15_300)}a`;
-      const diagnostic = `Authorization: Bearer ${credential} retained-context`;
-      const error = new Error("failed");
-      error.stack = diagnostic;
-      const started = performance.now();
+      const medianDuration = (diagnostic: string) => {
+        const error = new Error("failed");
+        error.stack = diagnostic;
+        const run = () => {
+          const started = performance.now();
+          logger.error("test.adversarial_headers", "test", "failed", {}, error);
+          return performance.now() - started;
+        };
+        for (let index = 0; index < 3; index += 1) run();
+        const samples = Array.from({ length: 7 }, run).sort((left, right) => left - right);
+        output.mockClear();
+        return samples[3]!;
+      };
+      const repeatedNames = (length: number) => {
+        const fragment = 'name:"authorization",';
+        return fragment.repeat(Math.ceil(length / fragment.length)).slice(0, length);
+      };
 
-      for (let index = 0; index < 8; index += 1) {
-        logger.error("test.punctuation_run", "test", "failed", {}, error);
-      }
-
-      expect(performance.now() - started).toBeLessThan(1_000);
-      for (const [record] of output.mock.calls) {
-        const stack = String((record as Record<string, unknown>).errorStack);
-        expect(stack).toBe("Authorization: Bearer [redacted] retained-context");
-        expect(stack).not.toContain(credential.slice(0, 100));
+      for (const input of [(length: number) => "\\".repeat(length), repeatedNames]) {
+        const small = medianDuration(input(4_000));
+        const large = medianDuration(input(16_000));
+        expect(large).toBeLessThanOrEqual(small * 8 + 1);
       }
     } finally {
       output.mockRestore();

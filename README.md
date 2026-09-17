@@ -37,7 +37,7 @@ Requires Node.js 22.18 or later in the Node 22 release line, or Node.js 24.2+, p
 3.13.15 for the pinned Semgrep middleware-policy check.
 
 ```sh
-python3 -m venv .venv
+python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install --disable-pip-version-check --require-hashes -r requirements-semgrep.txt
 pnpm install
