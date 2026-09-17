@@ -15,7 +15,12 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import * as Y from "yjs";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { joinBytes } from "../shared/bytes";
-import { LOG_IDENTIFIER_LIMIT, LOG_TEXT_LIMIT, TRUNCATION_MARKER } from "../shared/error-log";
+import {
+  LOG_IDENTIFIER_LIMIT,
+  LOG_TEXT_LIMIT,
+  PERSISTED_ERROR_MESSAGE_LIMIT,
+  TRUNCATION_MARKER,
+} from "../shared/error-log";
 import { canonicalJson, documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
 import {
@@ -1203,6 +1208,36 @@ describe("Worker integration", () => {
     } finally {
       logged.mockRestore();
       await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name LIKE 'test_%'`).run();
+    }
+  });
+
+  it("stores a bounded, singly redacted scheduled-task failure", async () => {
+    const taskName = "test_redacted_failure";
+    const diagnostic = `Authorization: Bearer abc retained-context ${"x".repeat(2_000)}`;
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(
+        executeScheduledTasks(env, createExecutionContext(), [
+          {
+            name: taskName,
+            run: async () => {
+              throw new Error(diagnostic);
+            },
+          },
+        ]),
+      ).rejects.toThrow("Scheduled tasks failed");
+
+      const row = await env.DB.prepare(`SELECT last_error FROM observability_task_runs WHERE task_name = ?`)
+        .bind(taskName)
+        .first<{ last_error: string }>();
+      expect(row?.last_error).toContain("Authorization: Bearer [redacted] retained-context");
+      expect(row?.last_error).toMatch(/…\[truncated]$/);
+      expect(row?.last_error.match(/\[redacted]/g)).toHaveLength(1);
+      expect(row?.last_error).not.toContain("[[redacted]]");
+      expect(row?.last_error.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+    } finally {
+      logged.mockRestore();
+      await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name = ?`).bind(taskName).run();
     }
   });
 

@@ -30,11 +30,14 @@ type LogFields = Readonly<Record<string, unknown>>;
 
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
+const AUTHORIZATION_LABEL = String.raw`(?:HTTP_(?:PROXY_)?AUTHORIZATION|(?:proxy-)?authorization|(?:proxy)?authorizationHeader)`;
 const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:\\*["']|[\[({])[ \t]*)*`;
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
-  String.raw`\b(?:proxy-)?authorization(?:\\*["'])?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`,
+  String.raw`\b${AUTHORIZATION_LABEL}(?:\\*["'])?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`,
   "gi",
 );
+const UNDICI_AUTHORIZATION_PREFIX =
+  /\bname[ \t\r\n]*:[ \t\r\n]*(?:\\*["'])(?:proxy-)?authorization(?:\\*["'])[ \t\r\n]*,[ \t\r\n]*value[ \t\r\n]*:[ \t\r\n]*((?:\\*["']))(?:Basic|Bearer)[ \t]+/gi;
 const BASIC_VALUE = /\bBasic[ \t]+([A-Za-z0-9+/_=-]+)/gi;
 const BEARER_VALUE = /\bBearer[ \t]+([A-Za-z0-9._~+/=-]+)/gi;
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
@@ -189,28 +192,32 @@ function redactBearerValue(match: string, token: string, force = false) {
     : match;
 }
 
-function redactPartialEmail(value: string) {
+function partialEmailStart(value: string) {
   const at = value.lastIndexOf("@");
-  if (at < 0) return value;
+  if (at < 0) return -1;
   let start = at;
   while (start > 0 && isEmailLocal(value.charCodeAt(start - 1))) start -= 1;
-  if (start === at) return value;
+  if (start === at) return -1;
   for (let index = at + 1; index < value.length; index += 1) {
-    if (!isEmailDomain(value.charCodeAt(index))) return value;
+    if (!isEmailDomain(value.charCodeAt(index))) return -1;
   }
-  return value.slice(0, start) + "[redacted-email]";
+  return start;
 }
 
 type QuoteDelimiter = { backslashes: number; quote: '"' | "'" };
+
+function precedingBackslashes(value: string, index: number, lowerBound = 0) {
+  let start = index;
+  while (start > lowerBound && value[start - 1] === "\\") start -= 1;
+  return index - start;
+}
 
 function lastQuoteDelimiter(value: string): QuoteDelimiter | undefined {
   let delimiter: QuoteDelimiter | undefined;
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index];
     if (character !== '"' && character !== "'") continue;
-    let slashStart = index;
-    while (slashStart > 0 && value[slashStart - 1] === "\\") slashStart -= 1;
-    delimiter = { backslashes: index - slashStart, quote: character };
+    delimiter = { backslashes: precedingBackslashes(value, index), quote: character };
   }
   return delimiter;
 }
@@ -219,12 +226,15 @@ function consumeOpeningValueWrappers(value: string, start: number) {
   let cursor = start;
   while (cursor < value.length) {
     while (value[cursor] === " " || value[cursor] === "\t") cursor += 1;
-    if ("[({".includes(value[cursor] ?? "")) {
+    if (cursor >= value.length || value.startsWith(REDACTED_VALUE, cursor)) {
+      return { cursor, delimiter: undefined };
+    }
+    if ("[({".includes(value[cursor]!)) {
       cursor += 1;
       continue;
     }
     const slashStart = cursor;
-    while (value[cursor] === "\\") cursor += 1;
+    while (cursor < value.length && value[cursor] === "\\") cursor += 1;
     const character = value[cursor];
     if (character === '"' || character === "'") {
       return {
@@ -237,61 +247,96 @@ function consumeOpeningValueWrappers(value: string, start: number) {
   return { cursor, delimiter: undefined };
 }
 
+function isCredentialBoundary(value: string, index: number) {
+  const character = value[index]!;
+  if (/\s/u.test(character) || ",;}])!?".includes(character)) return true;
+  if (character !== ".") return false;
+  let runEnd = index + 1;
+  while (value[runEnd] === ".") runEnd += 1;
+  const next = value[runEnd];
+  return next === undefined || /\s/u.test(next) || ",;}])!?\"'".includes(next);
+}
+
 function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDelimiter | undefined) {
   for (let index = start; index < value.length; index += 1) {
     const character = value[index]!;
+    if (isCredentialBoundary(value, index)) return index;
     if (delimiter) {
-      if (character !== delimiter.quote) continue;
-      let slashStart = index;
-      while (slashStart > start && value[slashStart - 1] === "\\") slashStart -= 1;
-      if (index - slashStart === delimiter.backslashes) return slashStart;
+      if (character !== '"' && character !== "'") continue;
+      const backslashes = precedingBackslashes(value, index, start);
+      if (
+        character !== delimiter.quote ||
+        (backslashes % 2 === delimiter.backslashes % 2 &&
+          (delimiter.backslashes === 0 || backslashes <= delimiter.backslashes))
+      ) {
+        return index - backslashes;
+      }
       continue;
     }
-    if (/\s/u.test(character) || ",;}])".includes(character)) return index;
     if (character === '"' || character === "'") {
-      let slashStart = index;
-      while (slashStart > start && value[slashStart - 1] === "\\") slashStart -= 1;
-      return slashStart;
+      return index - precedingBackslashes(value, index, start);
     }
   }
   return value.length;
 }
 
-function redactLabeledAuthorizationValues(value: string) {
+function redactAuthorizationMatches(
+  value: string,
+  pattern: RegExp,
+  delimiterForMatch: (match: RegExpExecArray) => QuoteDelimiter | undefined,
+) {
   const parts: string[] = [];
   let cursor = 0;
-  LABELED_AUTHORIZATION_PREFIX.lastIndex = 0;
-  let match = LABELED_AUTHORIZATION_PREFIX.exec(value);
+  pattern.lastIndex = 0;
+  let match = pattern.exec(value);
   while (match) {
-    const opening = consumeOpeningValueWrappers(value, LABELED_AUTHORIZATION_PREFIX.lastIndex);
-    const delimiter = opening.delimiter ?? lastQuoteDelimiter(match[1] ?? "");
-    const end = labeledCredentialEnd(value, opening.cursor, delimiter);
+    const opening = consumeOpeningValueWrappers(value, pattern.lastIndex);
+    const markerEnd = value.startsWith(REDACTED_VALUE, opening.cursor)
+      ? opening.cursor + REDACTED_VALUE.length
+      : undefined;
+    const markerSuffix = markerEnd === undefined ? undefined : value[markerEnd];
+    if (
+      markerEnd !== undefined &&
+      (markerSuffix === undefined ||
+        markerSuffix === '"' ||
+        markerSuffix === "'" ||
+        isCredentialBoundary(value, markerEnd))
+    ) {
+      pattern.lastIndex = markerEnd;
+      match = pattern.exec(value);
+      continue;
+    }
+    const delimiter = opening.delimiter ?? delimiterForMatch(match);
+    const end = labeledCredentialEnd(value, markerEnd ?? opening.cursor, delimiter);
     if (end > opening.cursor) {
       parts.push(value.slice(cursor, opening.cursor), REDACTED_VALUE);
       cursor = end;
-      LABELED_AUTHORIZATION_PREFIX.lastIndex = end;
+      pattern.lastIndex = end;
     }
-    match = LABELED_AUTHORIZATION_PREFIX.exec(value);
+    match = pattern.exec(value);
   }
   if (parts.length === 0) return value;
   parts.push(value.slice(cursor));
   return parts.join("");
 }
 
-function redactKnownValues(value: string, atBoundary = false) {
-  let safe = redactLabeledAuthorizationValues(value);
-  safe = safe.replace(BASIC_VALUE, (match, encoded: string, offset: number) =>
-    redactBasicValue(match, encoded, atBoundary && offset + match.length === safe.length),
+function redactLabeledAuthorizationValues(value: string) {
+  const labeled = redactAuthorizationMatches(value, LABELED_AUTHORIZATION_PREFIX, (match) =>
+    lastQuoteDelimiter(match[1] ?? ""),
   );
+  return redactAuthorizationMatches(labeled, UNDICI_AUTHORIZATION_PREFIX, (match) =>
+    lastQuoteDelimiter(match[1] ?? ""),
+  );
+}
+
+function redactKnownValues(value: string) {
+  let safe = redactLabeledAuthorizationValues(value);
+  safe = safe.replace(BASIC_VALUE, (match, encoded: string) => redactBasicValue(match, encoded));
   safe = safe
-    .replace(BEARER_VALUE, (match, token: string, offset: number) =>
-      redactBearerValue(match, token, atBoundary && offset + match.length === safe.length),
-    )
+    .replace(BEARER_VALUE, (match, token: string) => redactBearerValue(match, token))
     .replace(SECRET_VALUE, "[redacted-secret]")
     .replace(URL_QUERY, "$1");
-  safe = redactEmails(safe);
-  if (atBoundary) safe = redactPartialEmail(safe).replace(PARTIAL_SECRET_VALUE, "[redacted-secret]");
-  return safe;
+  return redactEmails(safe);
 }
 
 const ATOMIC_SANITIZATION_MARKERS = [
@@ -325,26 +370,35 @@ function atomicRedactionPrefix(value: string, limit: number) {
   return wellFormedPrefix(value, end);
 }
 
-function fitRedactedPayload(value: string, limit: number) {
-  let candidate = value;
-  while (candidate.length > limit) {
-    const prefix = atomicRedactionPrefix(candidate, limit);
-    const redacted = redactKnownValues(prefix, true);
-    if (redacted.length < candidate.length) {
-      candidate = redacted;
-      continue;
-    }
-    candidate = redactKnownValues(atomicRedactionPrefix(prefix, prefix.length - 1), true);
+function boundaryReplacement(value: string) {
+  for (const pattern of [/\bBasic[ \t]+([A-Za-z0-9+/_=-]*)$/i, /\bBearer[ \t]+([A-Za-z0-9._~+/=-]*)$/i]) {
+    const match = pattern.exec(value);
+    if (match) return { marker: REDACTED_VALUE, start: value.length - (match[1]?.length ?? 0) };
   }
-  return candidate;
+  const secret = PARTIAL_SECRET_VALUE.exec(value);
+  if (secret) return { marker: "[redacted-secret]", start: secret.index };
+  const emailStart = partialEmailStart(value);
+  return emailStart >= 0 ? { marker: "[redacted-email]", start: emailStart } : undefined;
+}
+
+function redactTruncationBoundary(value: string, limit: number) {
+  const replacement = boundaryReplacement(value);
+  if (!replacement) return value;
+  const prefix = value.slice(0, replacement.start);
+  const redacted = prefix + replacement.marker;
+  return redacted.length <= limit ? redacted : prefix;
+}
+
+function boundedSanitizedPayload(value: string, limit: number, scrubBoundary: boolean) {
+  const prefix = value.length <= limit ? value : atomicRedactionPrefix(value, limit);
+  return scrubBoundary ? redactTruncationBoundary(prefix, limit) : prefix;
 }
 
 function boundedSanitizedString(value: string, limit: number) {
   if (value.length <= limit) return value;
   if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, Math.max(0, limit));
   const payloadLimit = limit - TRUNCATION_MARKER.length;
-  const prefix = atomicRedactionPrefix(value, payloadLimit);
-  return fitRedactedPayload(redactKnownValues(prefix, true), payloadLimit) + TRUNCATION_MARKER;
+  return boundedSanitizedPayload(value, payloadLimit, true) + TRUNCATION_MARKER;
 }
 
 function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
@@ -352,8 +406,8 @@ function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
   if (!truncated) return boundedSanitizedString(redactKnownValues(value), limit);
   if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, Math.max(0, limit));
   const payloadLimit = limit - TRUNCATION_MARKER.length;
-  const safe = redactKnownValues(wellFormedPrefix(value, payloadLimit), true);
-  return fitRedactedPayload(safe, payloadLimit) + TRUNCATION_MARKER;
+  const safe = redactKnownValues(wellFormedPrefix(value, payloadLimit));
+  return boundedSanitizedPayload(safe, payloadLimit, true) + TRUNCATION_MARKER;
 }
 
 function uniqueKey(base: string, occupied: (candidate: string) => boolean) {
@@ -413,7 +467,7 @@ function compactNestedFragment(
   const valueLimit = limit - wrap("").length;
   if (valueLimit < 2) return undefined;
   const compacted = boundedNestedJsonFromSerialization(value, valueLimit, serialized);
-  if (compacted !== JSON.stringify(OMITTED_ENTRIES) && !compacted.startsWith("[") && !compacted.startsWith("{")) {
+  if (!compacted.startsWith("[") && !compacted.startsWith("{")) {
     return undefined;
   }
   const candidate = wrap(compacted);

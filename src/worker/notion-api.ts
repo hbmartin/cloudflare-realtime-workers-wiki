@@ -65,6 +65,7 @@ class NotionError extends Error {
   }
 }
 
+// nosemgrep: worker-hono-construction -- Reviewed Notion subapp covered by the middleware registration policy.
 const notionApi = new Hono<ApiContext>();
 const NOTION_BODY_MAX_BYTES = 500 * 1024;
 const PAGE_ICON_MAX = 20;
