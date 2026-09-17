@@ -33,9 +33,13 @@ CSS builds target that same matrix. Because build targets do not polyfill runtim
 
 ## Local development
 
-Requires Node.js 22.18 or later in the Node 22 release line, or Node.js 24.2+, and pnpm 11.18.0.
+Requires Node.js 22.18 or later in the Node 22 release line, or Node.js 24.2+, pnpm 11.18.0, and Python
+3.13.15 for the pinned Semgrep middleware-policy check.
 
 ```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --disable-pip-version-check --require-hashes -r requirements-semgrep.txt
 pnpm install
 cp .dev.vars.example .dev.vars
 pnpm db:local
@@ -61,7 +65,8 @@ pnpm load:realtime         # 30 authenticated local realtime connections
 Fallow for unused dependencies and dead code. `pnpm analyze:audit` adds a changed-code review of duplication and
 maintainability findings without treating the repository's inherited complexity as a new gate. TypeScript is checked
 separately for the browser, Worker, unit tests, Worker integration tests, and build configuration. Coverage thresholds are
-enforced by `pnpm test:coverage` and `pnpm test:worker:coverage`.
+enforced by `pnpm test:coverage` and `pnpm test:worker:coverage`. Semgrep and its Python dependencies are version- and
+hash-locked in `requirements-semgrep.txt`; keep the virtual environment active when running `pnpm check`.
 
 The E2E server deletes only `.wrangler/e2e`, reapplies every D1 migration, and injects dedicated local test bindings.
 Fresh local realtime load checks enroll their own authenticator automatically. To run the realtime load check against a

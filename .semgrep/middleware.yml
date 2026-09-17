@@ -4,8 +4,7 @@ rules:
     message: Register Worker middleware through registerMetricMiddleware so metric route attribution remains correct.
     severity: ERROR
     pattern-either:
-      - pattern: app.use(...)
-      - pattern: notionApi.use(...)
+      - pattern: $TARGET.use(...)
       - pattern: app.on(...)
       - pattern: notionApi.on(...)
       - pattern: app.all(...)
@@ -28,8 +27,30 @@ rules:
     message: Do not hide Worker route or middleware registration behind computed property access.
     severity: ERROR
     pattern-either:
+      - pattern: $TARGET["use"](...)
       - pattern: app[$METHOD](...)
       - pattern: notionApi[$METHOD](...)
+
+  - id: worker-hono-use-alias
+    languages: [typescript]
+    message: Do not alias, bind, or destructure .use; register Worker middleware through registerMetricMiddleware.
+    severity: ERROR
+    pattern-either:
+      - pattern: const $ALIAS = $TARGET.use
+      - pattern: let $ALIAS = $TARGET.use
+      - pattern: $ALIAS = $TARGET.use
+      - pattern: const $ALIAS = $TARGET["use"]
+      - pattern: let $ALIAS = $TARGET["use"]
+      - pattern: $ALIAS = $TARGET["use"]
+      - pattern: const $ALIAS = $TARGET.use.bind(...)
+      - pattern: let $ALIAS = $TARGET.use.bind(...)
+      - pattern: $ALIAS = $TARGET.use.bind(...)
+      - pattern: |
+          const { use: $ALIAS } = $TARGET
+      - pattern: |
+          let { use: $ALIAS } = $TARGET
+      - pattern: const { use } = $TARGET
+      - pattern: let { use } = $TARGET
 
   - id: worker-hono-registration-alias
     languages: [typescript]
@@ -45,7 +66,7 @@ rules:
           - pattern: $ALIAS = notionApi.$METHOD
       - metavariable-regex:
           metavariable: $METHOD
-          regex: ^(use|on|all|get|post|put|delete|patch|options|head|connect|trace)$
+          regex: ^(on|all|get|post|put|delete|patch|options|head|connect|trace)$
 
   - id: worker-hono-registration-destructure
     languages: [typescript]
@@ -69,6 +90,22 @@ rules:
           - pattern: const $ALIAS = notionApi
           - pattern: let $ALIAS = notionApi
           - pattern: $ALIAS = notionApi
+          - pattern: const $ALIAS = $MODULE.app
+          - pattern: let $ALIAS = $MODULE.app
+          - pattern: $ALIAS = $MODULE.app
+          - pattern: const $ALIAS = $MODULE.notionApi
+          - pattern: let $ALIAS = $MODULE.notionApi
+          - pattern: $ALIAS = $MODULE.notionApi
+          - pattern: |
+              const { app: $ALIAS } = $MODULE
+          - pattern: |
+              let { app: $ALIAS } = $MODULE
+          - pattern: |
+              const { notionApi: $ALIAS } = $MODULE
+          - pattern: |
+              let { notionApi: $ALIAS } = $MODULE
+          - pattern: export { app as $ALIAS }
+          - pattern: export { notionApi as $ALIAS }
       - metavariable-regex:
           metavariable: $ALIAS
           regex: ^[A-Za-z_$][A-Za-z0-9_$]*$
@@ -91,6 +128,32 @@ rules:
     pattern-either:
       - pattern: new Hono(...)
       - pattern: new $MODULE.Hono(...)
+      - pattern: Reflect.construct(Hono, ...)
+      - pattern: Reflect.construct($MODULE.Hono, ...)
+
+  - id: worker-hono-constructor-alias
+    languages: [typescript]
+    message: Do not alias the Hono constructor; new Worker Hono apps must remain visible to the middleware policy.
+    severity: ERROR
+    pattern-either:
+      - pattern: const $ALIAS = Hono
+      - pattern: let $ALIAS = Hono
+      - pattern: $ALIAS = Hono
+      - pattern: const $ALIAS = $MODULE.Hono
+      - pattern: let $ALIAS = $MODULE.Hono
+      - pattern: $ALIAS = $MODULE.Hono
+      - pattern: |
+          const { Hono: $ALIAS } = $MODULE
+      - pattern: |
+          let { Hono: $ALIAS } = $MODULE
+
+  - id: worker-hono-subclass
+    languages: [typescript]
+    message: Hono subclasses require explicit review because they can construct apps outside the reviewed identifiers.
+    severity: ERROR
+    pattern-either:
+      - pattern: class $APP extends Hono { ... }
+      - pattern: class $APP extends $MODULE.Hono { ... }
 
   - id: worker-hono-import-alias
     languages: [typescript]

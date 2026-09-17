@@ -30,16 +30,30 @@ type LogFields = Readonly<Record<string, unknown>>;
 
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
-const AUTHORIZATION_LABEL = String.raw`(?:HTTP_(?:PROXY_)?AUTHORIZATION|(?:proxy-)?authorization|(?:proxy)?authorizationHeader)`;
+const AUTHORIZATION_LABEL = String.raw`(?:(?:REDIRECT_)*HTTP_(?:PROXY_)?AUTHORIZATION|(?:proxy[-_]?)?authorization(?:[-_]?header)?)`;
 const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:\\*["']|[\[({])[ \t]*)*`;
+const SERIALIZED_NAME_KEY = String.raw`(?:\\*["'])?name(?:\\*["'])?`;
+const SERIALIZED_VALUE_KEY = String.raw`(?:\\*["'])?value(?:\\*["'])?`;
+const SERIALIZED_AUTHORIZATION_NAME = String.raw`${SERIALIZED_NAME_KEY}[ \t\r\n]*:[ \t\r\n]*(?:\\*["'])${AUTHORIZATION_LABEL}(?:\\*["'])`;
+const SERIALIZED_AUTHORIZATION_VALUE_PREFIX = String.raw`${SERIALIZED_VALUE_KEY}[ \t\r\n]*:[ \t\r\n]*(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`;
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
   String.raw`\b${AUTHORIZATION_LABEL}(?:\\*["'])?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`,
   "gi",
 );
-const UNDICI_AUTHORIZATION_PREFIX =
-  /\bname[ \t\r\n]*:[ \t\r\n]*(?:\\*["'])(?:proxy-)?authorization(?:\\*["'])[ \t\r\n]*,[ \t\r\n]*value[ \t\r\n]*:[ \t\r\n]*((?:\\*["']))(?:Basic|Bearer)[ \t]+/gi;
-const BASIC_VALUE = /\bBasic[ \t]+([A-Za-z0-9+/_=-]+)/gi;
-const BEARER_VALUE = /\bBearer[ \t]+([A-Za-z0-9._~+/=-]+)/gi;
+const UNDICI_NAME_FIRST_AUTHORIZATION_PREFIX = new RegExp(
+  String.raw`(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_NAME}[ \t\r\n]*,[^{}]*?(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_VALUE_PREFIX}`,
+  "gi",
+);
+const UNDICI_VALUE_FIRST_AUTHORIZATION_PREFIX = new RegExp(
+  String.raw`(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_VALUE_PREFIX}(?=[^{}]*?,[ \t\r\n]*(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_NAME})`,
+  "gi",
+);
+const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
+const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=-]`;
+const BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}+)`, "gi");
+const BEARER_VALUE = new RegExp(String.raw`\bBearer[ \t]+(${BEARER_TOKEN_CHARACTER}+)`, "gi");
+const PARTIAL_BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}*)$`, "i");
+const PARTIAL_BEARER_VALUE = new RegExp(String.raw`\bBearer[ \t]+(${BEARER_TOKEN_CHARACTER}*)$`, "i");
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
 const PARTIAL_SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]*|xox[baprs]-[A-Za-z0-9-]*)$/i;
@@ -174,20 +188,19 @@ function redactEmails(value: string) {
   return parts.join("");
 }
 
-function redactBasicValue(match: string, encoded: string, atBoundary = false) {
+function redactBasicValue(match: string, encoded: string) {
   try {
     if (atob(encoded).includes(":")) return match.slice(0, match.length - encoded.length) + REDACTED_VALUE;
   } catch {
     // Malformed Base64 and ordinary prose are not credentials.
   }
-  if (atBoundary) return match.slice(0, match.length - encoded.length) + REDACTED_VALUE;
   return match;
 }
 
-function redactBearerValue(match: string, token: string, force = false) {
+function redactBearerValue(match: string, token: string) {
   const trailingPunctuation = token.match(/\.+$/)?.[0] ?? "";
   const candidate = token.slice(0, token.length - trailingPunctuation.length);
-  return force || candidate.length >= 16 || /[0-9._~+/=-]/.test(candidate)
+  return candidate.length >= 16 || /[0-9._~+/=-]/.test(candidate)
     ? match.slice(0, match.length - token.length) + REDACTED_VALUE + trailingPunctuation
     : match;
 }
@@ -247,22 +260,48 @@ function consumeOpeningValueWrappers(value: string, start: number) {
   return { cursor, delimiter: undefined };
 }
 
-function isCredentialBoundary(value: string, index: number) {
+const STRUCTURAL_CREDENTIAL_BOUNDARIES = ",;}])";
+const TRAILING_CREDENTIAL_PUNCTUATION = ".!?";
+
+function isStructuralCredentialBoundary(character: string | undefined) {
+  return character === undefined || /\s/u.test(character) || STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character);
+}
+
+function credentialBoundaryAt(value: string, index: number) {
   const character = value[index]!;
-  if (/\s/u.test(character) || ",;}])!?".includes(character)) return true;
-  if (character !== ".") return false;
+  if (/\s/u.test(character) || STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character)) {
+    return { boundary: true, next: index + 1 };
+  }
+  if (!TRAILING_CREDENTIAL_PUNCTUATION.includes(character)) {
+    return { boundary: false, next: index + 1 };
+  }
   let runEnd = index + 1;
-  while (value[runEnd] === ".") runEnd += 1;
+  while (value[runEnd] !== undefined && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[runEnd]!)) runEnd += 1;
   const next = value[runEnd];
-  return next === undefined || /\s/u.test(next) || ",;}])!?\"'".includes(next);
+  return {
+    boundary: isStructuralCredentialBoundary(next) || next === '"' || next === "'",
+    next: runEnd,
+  };
+}
+
+function isCredentialBoundary(value: string, index: number) {
+  return credentialBoundaryAt(value, index).boundary;
 }
 
 function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDelimiter | undefined) {
-  for (let index = start; index < value.length; index += 1) {
+  for (let index = start; index < value.length;) {
     const character = value[index]!;
-    if (isCredentialBoundary(value, index)) return index;
+    const boundary = credentialBoundaryAt(value, index);
+    if (boundary.boundary) return index;
+    if (boundary.next > index + 1) {
+      index = boundary.next;
+      continue;
+    }
     if (delimiter) {
-      if (character !== '"' && character !== "'") continue;
+      if (character !== '"' && character !== "'") {
+        index += 1;
+        continue;
+      }
       const backslashes = precedingBackslashes(value, index, start);
       if (
         character !== delimiter.quote ||
@@ -271,20 +310,18 @@ function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDeli
       ) {
         return index - backslashes;
       }
+      index += 1;
       continue;
     }
     if (character === '"' || character === "'") {
       return index - precedingBackslashes(value, index, start);
     }
+    index += 1;
   }
   return value.length;
 }
 
-function redactAuthorizationMatches(
-  value: string,
-  pattern: RegExp,
-  delimiterForMatch: (match: RegExpExecArray) => QuoteDelimiter | undefined,
-) {
+function redactAuthorizationMatches(value: string, pattern: RegExp) {
   const parts: string[] = [];
   let cursor = 0;
   pattern.lastIndex = 0;
@@ -306,7 +343,7 @@ function redactAuthorizationMatches(
       match = pattern.exec(value);
       continue;
     }
-    const delimiter = opening.delimiter ?? delimiterForMatch(match);
+    const delimiter = opening.delimiter ?? lastQuoteDelimiter(match[1] ?? "");
     const end = labeledCredentialEnd(value, markerEnd ?? opening.cursor, delimiter);
     if (end > opening.cursor) {
       parts.push(value.slice(cursor, opening.cursor), REDACTED_VALUE);
@@ -321,12 +358,9 @@ function redactAuthorizationMatches(
 }
 
 function redactLabeledAuthorizationValues(value: string) {
-  const labeled = redactAuthorizationMatches(value, LABELED_AUTHORIZATION_PREFIX, (match) =>
-    lastQuoteDelimiter(match[1] ?? ""),
-  );
-  return redactAuthorizationMatches(labeled, UNDICI_AUTHORIZATION_PREFIX, (match) =>
-    lastQuoteDelimiter(match[1] ?? ""),
-  );
+  const labeled = redactAuthorizationMatches(value, LABELED_AUTHORIZATION_PREFIX);
+  const nameFirst = redactAuthorizationMatches(labeled, UNDICI_NAME_FIRST_AUTHORIZATION_PREFIX);
+  return redactAuthorizationMatches(nameFirst, UNDICI_VALUE_FIRST_AUTHORIZATION_PREFIX);
 }
 
 function redactKnownValues(value: string) {
@@ -371,7 +405,7 @@ function atomicRedactionPrefix(value: string, limit: number) {
 }
 
 function boundaryReplacement(value: string) {
-  for (const pattern of [/\bBasic[ \t]+([A-Za-z0-9+/_=-]*)$/i, /\bBearer[ \t]+([A-Za-z0-9._~+/=-]*)$/i]) {
+  for (const pattern of [PARTIAL_BASIC_VALUE, PARTIAL_BEARER_VALUE]) {
     const match = pattern.exec(value);
     if (match) return { marker: REDACTED_VALUE, start: value.length - (match[1]?.length ?? 0) };
   }
@@ -389,16 +423,16 @@ function redactTruncationBoundary(value: string, limit: number) {
   return redacted.length <= limit ? redacted : prefix;
 }
 
-function boundedSanitizedPayload(value: string, limit: number, scrubBoundary: boolean) {
+function boundedSanitizedPayload(value: string, limit: number) {
   const prefix = value.length <= limit ? value : atomicRedactionPrefix(value, limit);
-  return scrubBoundary ? redactTruncationBoundary(prefix, limit) : prefix;
+  return redactTruncationBoundary(prefix, limit);
 }
 
 function boundedSanitizedString(value: string, limit: number) {
   if (value.length <= limit) return value;
   if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, Math.max(0, limit));
   const payloadLimit = limit - TRUNCATION_MARKER.length;
-  return boundedSanitizedPayload(value, payloadLimit, true) + TRUNCATION_MARKER;
+  return boundedSanitizedPayload(value, payloadLimit) + TRUNCATION_MARKER;
 }
 
 function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
@@ -407,7 +441,7 @@ function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
   if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, Math.max(0, limit));
   const payloadLimit = limit - TRUNCATION_MARKER.length;
   const safe = redactKnownValues(wellFormedPrefix(value, payloadLimit));
-  return boundedSanitizedPayload(safe, payloadLimit, true) + TRUNCATION_MARKER;
+  return boundedSanitizedPayload(safe, payloadLimit) + TRUNCATION_MARKER;
 }
 
 function uniqueKey(base: string, occupied: (candidate: string) => boolean) {

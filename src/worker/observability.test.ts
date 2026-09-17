@@ -247,8 +247,16 @@ describe("worker observability", () => {
     const cases = new Map([
       ["HTTP_AUTHORIZATION: Bearer abc", "HTTP_AUTHORIZATION: Bearer [redacted]"],
       ["HTTP_PROXY_AUTHORIZATION: Basic badtoken", "HTTP_PROXY_AUTHORIZATION: Basic [redacted]"],
+      ["REDIRECT_HTTP_AUTHORIZATION: Bearer abc", "REDIRECT_HTTP_AUTHORIZATION: Bearer [redacted]"],
+      [
+        "REDIRECT_REDIRECT_HTTP_PROXY_AUTHORIZATION: Basic badtoken",
+        "REDIRECT_REDIRECT_HTTP_PROXY_AUTHORIZATION: Basic [redacted]",
+      ],
       ["authorizationHeader: Bearer abc", "authorizationHeader: Bearer [redacted]"],
       ["proxyAuthorizationHeader: Basic badtoken", "proxyAuthorizationHeader: Basic [redacted]"],
+      ["proxyAuthorization: Bearer abc", "proxyAuthorization: Bearer [redacted]"],
+      ["authorization_header: Bearer abc", "authorization_header: Bearer [redacted]"],
+      ["proxy_authorization_header: Basic badtoken", "proxy_authorization_header: Basic [redacted]"],
       ["Map(1) { 'authorization' => 'Bearer abc' }", "Map(1) { 'authorization' => 'Bearer [redacted]' }"],
       ['["authorization", "Basic badtoken"]', '["authorization", "Basic [redacted]"]'],
       [
@@ -258,6 +266,24 @@ describe("worker observability", () => {
       [
         "HeadersList { headersMap: Map(1) { 'proxy-authorization' => { name: 'proxy-authorization', value: 'Basic badtoken' } } }",
         "HeadersList { headersMap: Map(1) { 'proxy-authorization' => { name: 'proxy-authorization', value: 'Basic [redacted]' } } }",
+      ],
+      ['{"name":"authorization","value":"Bearer abc"}', '{"name":"authorization","value":"Bearer [redacted]"}'],
+      [
+        '{"name":"authorization","status":401,"value":"Bearer abc"}',
+        '{"name":"authorization","status":401,"value":"Bearer [redacted]"}',
+      ],
+      ['{"value":"Bearer abc","name":"authorization"}', '{"value":"Bearer [redacted]","name":"authorization"}'],
+      [
+        '{ value: "Basic badtoken", status: 401, name: "proxy_authorization" }',
+        '{ value: "Basic [redacted]", status: 401, name: "proxy_authorization" }',
+      ],
+      [
+        String.raw`{\"name\":\"authorization\",\"value\":\"Bearer abc\"}`,
+        String.raw`{\"name\":\"authorization\",\"value\":\"Bearer [redacted]\"}`,
+      ],
+      [
+        String.raw`{\"value\":\"Bearer abc\",\"name\":\"authorization\"}`,
+        String.raw`{\"value\":\"Bearer [redacted]\",\"name\":\"authorization\"}`,
       ],
     ]);
 
@@ -311,6 +337,12 @@ describe("worker observability", () => {
       ["Authorization: Bearer abc.def", "Authorization: Bearer [redacted]"],
       ["Authorization: Bearer abc123!", "Authorization: Bearer [redacted]!"],
       ["Authorization: Bearer abc123?", "Authorization: Bearer [redacted]?"],
+      ["Authorization: Bearer abc!secret", "Authorization: Bearer [redacted]"],
+      ["Authorization: Bearer abc?secret", "Authorization: Bearer [redacted]"],
+      ["Authorization: Bearer abc!?secret", "Authorization: Bearer [redacted]"],
+      ["Authorization: Bearer abc...secret", "Authorization: Bearer [redacted]"],
+      ["Authorization: Bearer abc123.!?", "Authorization: Bearer [redacted].!?"],
+      ['Authorization: Bearer "abc def"', 'Authorization: Bearer "[redacted] def"'],
       ["Authorization: Bearer [] after", "Authorization: Bearer [] after"],
       ["Authorization: Bearer    ", "Authorization: Bearer"],
     ]);
@@ -450,51 +482,51 @@ describe("worker observability", () => {
   });
 
   it("keeps redaction and truncation markers atomic when sanitizing expands the payload", () => {
-    const credential = " Authorization: Bearer abc123";
-    const payloadLimit = PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length;
-    const raw = `${"x".repeat(payloadLimit - credential.length)}${credential}${"tail".repeat(20)}`;
-    const result = safeTelemetryErrorMessage(new Error(raw), "fallback");
+    for (const credential of [" Bearer abc123", " Authorization: Bearer abc123"]) {
+      const payloadLimit = PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length;
+      const raw = `${"x".repeat(payloadLimit - credential.length)}${credential}${"tail".repeat(20)}`;
+      const result = safeTelemetryErrorMessage(new Error(raw), "fallback");
 
-    expect(result).not.toContain("abc123");
-    expect(result.replaceAll("[redacted]", "")).not.toContain("[reda");
-    expect(result).toMatch(/…\[truncated\]$/);
-    expect(result.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
-    expect(result.match(/…\[truncated\]/g)).toHaveLength(1);
-    expect(isWellFormed(result)).toBe(true);
+      expect(result).not.toContain("abc123");
+      expect(result.replaceAll("[redacted]", "")).not.toContain("[reda");
+      expect(result).toMatch(/…\[truncated\]$/);
+      expect(result.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+      expect(result.match(/…\[truncated\]/g)).toHaveLength(1);
+      expect(isWellFormed(result)).toBe(true);
+    }
   });
 
   it("re-bounds raw strings that grow during redaction", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const expanding = (limit: number) => {
-      const credential = " Authorization: Bearer abc123";
-      return "x".repeat(limit - credential.length) + credential;
-    };
     try {
-      const persisted = safeTelemetryErrorMessage(new Error(expanding(PERSISTED_ERROR_MESSAGE_LIMIT)), "fallback");
-      const error = new Error(expanding(LOG_TEXT_LIMIT));
-      error.stack = expanding(LOG_STACK_LIMIT);
+      for (const credential of [" Bearer abc123", " Authorization: Bearer abc123"]) {
+        const expanding = (limit: number) => "x".repeat(limit - credential.length) + credential;
+        const persisted = safeTelemetryErrorMessage(new Error(expanding(PERSISTED_ERROR_MESSAGE_LIMIT)), "fallback");
+        const error = new Error(expanding(LOG_TEXT_LIMIT));
+        error.stack = expanding(LOG_STACK_LIMIT);
 
-      logger.error(
-        "test.redaction_growth",
-        "test",
-        expanding(LOG_TEXT_LIMIT),
-        { otherId: expanding(LOG_IDENTIFIER_LIMIT), note: expanding(LOG_TEXT_LIMIT) },
-        error,
-      );
+        logger.error(
+          "test.redaction_growth",
+          "test",
+          expanding(LOG_TEXT_LIMIT),
+          { otherId: expanding(LOG_IDENTIFIER_LIMIT), note: expanding(LOG_TEXT_LIMIT) },
+          error,
+        );
 
-      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
-      for (const [value, limit] of [
-        [persisted, PERSISTED_ERROR_MESSAGE_LIMIT],
-        [String(record.otherId), LOG_IDENTIFIER_LIMIT],
-        [String(record.note), LOG_TEXT_LIMIT],
-        [String(record.message), LOG_TEXT_LIMIT],
-        [String(record.errorMessage), LOG_TEXT_LIMIT],
-        [String(record.errorStack), LOG_STACK_LIMIT],
-      ] as const) {
-        expect(value.length).toBeLessThanOrEqual(limit);
-        expect(value).toContain(TRUNCATION_MARKER);
-        expect(value.replaceAll("[redacted]", "")).not.toContain("[reda");
-        expect(isWellFormed(value)).toBe(true);
+        const record = output.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+        for (const [value, limit] of [
+          [persisted, PERSISTED_ERROR_MESSAGE_LIMIT],
+          [String(record.otherId), LOG_IDENTIFIER_LIMIT],
+          [String(record.note), LOG_TEXT_LIMIT],
+          [String(record.message), LOG_TEXT_LIMIT],
+          [String(record.errorMessage), LOG_TEXT_LIMIT],
+          [String(record.errorStack), LOG_STACK_LIMIT],
+        ] as const) {
+          expect(value.length).toBeLessThanOrEqual(limit);
+          expect(value).toContain(TRUNCATION_MARKER);
+          expect(value.replaceAll("[redacted]", "")).not.toContain("[reda");
+          expect(isWellFormed(value)).toBe(true);
+        }
       }
     } finally {
       output.mockRestore();
@@ -524,6 +556,30 @@ describe("worker observability", () => {
         expect(value).toMatch(/…\[truncated]$/);
         expect(value.match(/\[redacted]/g)).toHaveLength(1);
         expect(value).not.toContain("[[redacted]]");
+      }
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("redacts maximum-length punctuation runs in linear time", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const credential = `${".".repeat(15_300)}a`;
+      const diagnostic = `Authorization: Bearer ${credential} retained-context`;
+      const error = new Error("failed");
+      error.stack = diagnostic;
+      const started = performance.now();
+
+      for (let index = 0; index < 8; index += 1) {
+        logger.error("test.punctuation_run", "test", "failed", {}, error);
+      }
+
+      expect(performance.now() - started).toBeLessThan(1_000);
+      for (const [record] of output.mock.calls) {
+        const stack = String((record as Record<string, unknown>).errorStack);
+        expect(stack).toBe("Authorization: Bearer [redacted] retained-context");
+        expect(stack).not.toContain(credential.slice(0, 100));
       }
     } finally {
       output.mockRestore();
