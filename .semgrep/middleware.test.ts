@@ -7,7 +7,12 @@ declare const method: any;
 declare const Hono: any;
 declare const honoModule: any;
 declare const appModule: any;
+declare const holder: any;
+declare const c: any;
+declare const admin: any;
 declare function registerMetricMiddleware(target: any, path: string, middleware: any): void;
+declare function consumeUse(target: any): void;
+declare function inspect(target: any): void;
 
 function install(target: any) {
   // ruleid: worker-hono-direct-middleware-registration
@@ -52,6 +57,13 @@ void computedRegister;
 // ruleid: worker-hono-use-alias
 const { use: destructuredUse } = other;
 void destructuredUse;
+// ruleid: worker-hono-use-alias
+(0, app.use)("*", middleware);
+// ruleid: worker-hono-use-alias
+const methodHolder = { register: notionApi.use };
+void methodHolder;
+// ruleid: worker-hono-use-alias
+consumeUse(app.use);
 // ruleid: worker-hono-registration-destructure
 const { get } = notionApi;
 void get;
@@ -80,14 +92,42 @@ void DestructuredHono;
 // ruleid: worker-hono-subclass
 class HonoSubclass extends Hono {}
 void HonoSubclass;
-// ruleid: worker-hono-app-alias
+// ruleid: worker-hono-subclass
+const AnonymousHonoSubclass = new (class extends Hono {})();
+void AnonymousHonoSubclass;
+// ruleid: worker-hono-constructor-escape
+inspect(Hono);
+// ruleid: worker-hono-constructor-escape
+const constructorHolder = { constructor: Hono };
+void constructorHolder;
+// ruleid: worker-hono-constructor-array
+const constructorArray = [Hono];
+void constructorArray;
+// ok: worker-hono-app-alias
 const memberAppAlias = appModule.notionApi;
 void memberAppAlias;
-// ruleid: worker-hono-app-alias
+// ok: worker-hono-app-alias
 const { notionApi: destructuredAppAlias } = appModule;
 void destructuredAppAlias;
-// ruleid: worker-hono-app-alias
+// ruleid: worker-hono-app-container
 export { notionApi as exportedAppAlias };
+let assignedApp: any;
+// ruleid: worker-hono-app-assignment
+assignedApp = app;
+void assignedApp;
+// ruleid: worker-hono-app-container
+holder.ref = app;
+// ruleid: worker-hono-app-container
+const appHolder = { ref: app };
+void appHolder;
+// ruleid: worker-hono-app-container
+const shorthandAppHolder = { app };
+void shorthandAppHolder;
+// ruleid: worker-hono-app-array
+const appArray = [app];
+void appArray;
+// ruleid: worker-hono-app-container
+export default app;
 
 // ok: worker-hono-direct-middleware-registration
 // ok: worker-hono-multiple-handlers
@@ -101,6 +141,12 @@ other.use(middleware);
 other.on("event", handler);
 // ok: worker-hono-direct-middleware-registration
 other.all();
+// ok: worker-hono-app-alias
+const requestApp = c.req.app;
+void requestApp;
+// ok: worker-hono-app-alias
+const adminApp = admin.app;
+void adminApp;
 // ok: worker-hono-app-escape
 registerMetricMiddleware(app, "*", middleware);
 // ok: worker-hono-app-escape

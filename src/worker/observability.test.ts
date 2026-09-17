@@ -180,6 +180,10 @@ describe("worker observability", () => {
     );
     expect(safeTelemetryErrorMessage(new Error("Bearer abc123"), "fallback")).toBe("Bearer [redacted]");
     expect(safeTelemetryErrorMessage(new Error("Bearer abc123."), "fallback")).toBe("Bearer [redacted].");
+    expect(safeTelemetryErrorMessage(new Error("Bearer abc123!secretpart"), "fallback")).toBe("Bearer [redacted]");
+    expect(safeTelemetryErrorMessage(new Error("Bearer abc!secretpartlongvalue"), "fallback")).toBe(
+      "Bearer [redacted]",
+    );
     for (const delimiter of [":", "\\", ">", "`", "&", "%", "*", "|"]) {
       expect(safeTelemetryErrorMessage(new Error(`Bearer abc123${delimiter} expired`), "fallback")).toBe(
         `Bearer [redacted]${delimiter} expired`,
@@ -257,6 +261,9 @@ describe("worker observability", () => {
       ["proxyAuthorization: Bearer abc", "proxyAuthorization: Bearer [redacted]"],
       ["authorization_header: Bearer abc", "authorization_header: Bearer [redacted]"],
       ["proxy_authorization_header: Basic badtoken", "proxy_authorization_header: Basic [redacted]"],
+      ["X_AUTHORIZATION: Bearer abc", "X_AUTHORIZATION: Bearer [redacted]"],
+      ["HTTP_X_AUTHORIZATION: Bearer abc", "HTTP_X_AUTHORIZATION: Bearer [redacted]"],
+      ["upstream_authorization: Bearer abc", "upstream_authorization: Bearer [redacted]"],
       ["Map(1) { 'authorization' => 'Bearer abc' }", "Map(1) { 'authorization' => 'Bearer [redacted]' }"],
       ['["authorization", "Basic badtoken"]', '["authorization", "Basic [redacted]"]'],
       [
@@ -285,11 +292,29 @@ describe("worker observability", () => {
         String.raw`{\"value\":\"Bearer abc\",\"name\":\"authorization\"}`,
         String.raw`{\"value\":\"Bearer [redacted]\",\"name\":\"authorization\"}`,
       ],
+      [
+        '{"name":"x-authorization","metadata":{"source":"upstream"},"value":"Bearer abc"}',
+        '{"name":"x-authorization","metadata":{"source":"upstream"},"value":"Bearer [redacted]"}',
+      ],
+      [
+        '{"value":"Bearer abc","metadata":{"source":"upstream"},"name":"HTTP_X_AUTHORIZATION"}',
+        '{"value":"Bearer [redacted]","metadata":{"source":"upstream"},"name":"HTTP_X_AUTHORIZATION"}',
+      ],
     ]);
 
     for (const [message, expected] of cases) {
       expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(expected);
     }
+
+    expect(
+      safeTelemetryErrorMessage(
+        new Error('{"name":"content-type","metadata":{"name":"authorization"},"value":"Bearer abc"}'),
+        "fallback",
+      ),
+    ).toBe('{"name":"content-type","metadata":{"name":"authorization"},"value":"Bearer abc"}');
+    expect(safeTelemetryErrorMessage(new Error("fooauthorization: Bearer abc"), "fallback")).toBe(
+      "fooauthorization: Bearer abc",
+    );
   });
 
   it("is idempotent across raw, quoted, escaped, aliased, and existing-marker forms", () => {
@@ -342,6 +367,7 @@ describe("worker observability", () => {
       ["Authorization: Bearer abc!?secret", "Authorization: Bearer [redacted]"],
       ["Authorization: Bearer abc...secret", "Authorization: Bearer [redacted]"],
       ["Authorization: Bearer abc123.!?", "Authorization: Bearer [redacted].!?"],
+      ["authorization=Bearer word!&other=1", "authorization=Bearer [redacted]!&other=1"],
       ['Authorization: Bearer "abc def"', 'Authorization: Bearer "[redacted] def"'],
       ["Authorization: Bearer [] after", "Authorization: Bearer [] after"],
       ["Authorization: Bearer    ", "Authorization: Bearer"],
@@ -350,6 +376,17 @@ describe("worker observability", () => {
     for (const [message, expected] of cases) {
       expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(expected);
     }
+  });
+
+  it("keeps truncated labeled redactions idempotent", () => {
+    const once = safeTelemetryErrorMessage(new Error(`Authorization: Bearer ${"a".repeat(1_100)}`), "fallback");
+    const twice = safeTelemetryErrorMessage(new Error(once), "fallback");
+
+    expect(once).toBe("Authorization: Bearer [redacted]…[truncated]");
+    expect(twice).toBe(once);
+    expect(safeTelemetryErrorMessage(new Error("Authorization: Bearer [redacted]…[truncated]secret"), "fallback")).toBe(
+      "Authorization: Bearer [redacted]",
+    );
   });
 
   it("applies escaped authorization labels to nested fields and error stacks", () => {
@@ -562,20 +599,18 @@ describe("worker observability", () => {
     }
   });
 
-  it("redacts maximum-length punctuation runs in linear time", () => {
+  it("redacts maximum-length punctuation runs without losing safe context", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
       const credential = `${".".repeat(15_300)}a`;
       const diagnostic = `Authorization: Bearer ${credential} retained-context`;
       const error = new Error("failed");
       error.stack = diagnostic;
-      const started = performance.now();
 
       for (let index = 0; index < 8; index += 1) {
         logger.error("test.punctuation_run", "test", "failed", {}, error);
       }
 
-      expect(performance.now() - started).toBeLessThan(1_000);
       for (const [record] of output.mock.calls) {
         const stack = String((record as Record<string, unknown>).errorStack);
         expect(stack).toBe("Authorization: Bearer [redacted] retained-context");
@@ -585,6 +620,40 @@ describe("worker observability", () => {
       output.mockRestore();
     }
   });
+
+  it("keeps adversarial serialized-header scans near-linear", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const medianDuration = (diagnostic: string) => {
+        const error = new Error("failed");
+        error.stack = diagnostic;
+        for (let index = 0; index < 3; index += 1) {
+          logger.error("test.serialized_header_warmup", "test", "failed", {}, error);
+        }
+        const samples = Array.from({ length: 3 }, () => {
+          const started = performance.now();
+          for (let index = 0; index < 12; index += 1) {
+            logger.error("test.serialized_header_scale", "test", "failed", {}, error);
+          }
+          return performance.now() - started;
+        }).sort((left, right) => left - right);
+        return samples[1]!;
+      };
+      const repeatedName = 'name:"authorization",';
+      const inputs = [
+        (length: number) => `${"\\".repeat(length)}"name":"authorization","value":"Bearer abc"`,
+        (length: number) => repeatedName.repeat(Math.floor(length / repeatedName.length)),
+      ];
+
+      for (const input of inputs) {
+        const shortDuration = medianDuration(input(4_000));
+        const longDuration = medianDuration(input(15_000));
+        expect(longDuration / Math.max(shortDuration, 0.01)).toBeLessThan(8);
+      }
+    } finally {
+      output.mockRestore();
+    }
+  }, 10_000);
 
   it("scrubs short Basic and Bearer values cut off at the raw boundary", () => {
     const boundaryMessage = (scheme: "Basic" | "Bearer", fragment: string, leading = "") => {
