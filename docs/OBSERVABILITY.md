@@ -38,6 +38,8 @@ Cloudflare adds automatic child spans for handlers, bindings, and outbound reque
 Each application log call emits one JSON object. Required fields are `schema`, `event`, `severity`,
 `component`, and `message`. Invocation context adds `requestId`, `correlationId`, `rayId`, `trigger`,
 `versionId`, and `versionTag` when available. Errors are normalized and bounded.
+Nested diagnostic objects, arrays, and errors are recursively summarized as valid bounded JSON. Complete omission
+markers identify values, entries, depth, circular references, or properties that could not be retained.
 
 Stable event families include:
 
@@ -60,8 +62,10 @@ and lifecycle summaries.
 
 Never add cookies, authorization headers, credentials, email addresses, request bodies, document content or
 titles, Slack/webhook payloads, or URL query strings to telemetry. The logger redacts sensitive keys, known
-credential formats, email-shaped values, Basic and Bearer values in colon- or equals-labeled authorization fields
-and plain or singly escaped JSON, decodable free-text Basic credentials, token-like free-text Bearer values, and
+credential formats, email-shaped values, and labeled Basic and Bearer values in raw headers, maps, tuples, quoted or
+multiply escaped JSON, and colon, equals, arrow, comma, or whitespace-separated fields. Once an authorization label
+and scheme are recognized, malformed or custom credential punctuation is redacted through the next structural
+delimiter. The logger also redacts decodable free-text Basic credentials, token-like free-text Bearer values, and
 query strings, including nested diagnostic values. Raw fields are bounded before scanning, and recognizable partial
 Basic or Bearer credentials, emails, and secret prefixes at a truncation boundary are scrubbed. Complete unlabeled
 malformed Basic values, ordinary Basic prose, and short alphabetic Bearer prose remain unchanged, so never put
