@@ -75,11 +75,17 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements-semgrep.txt
       - if: github.event_name == 'workflow_dispatch'
         run: pnpm install --frozen-lockfile
       - name: Install Semgrep
         if: github.event_name == 'workflow_dispatch'
-        run: python -m pip install --disable-pip-version-check semgrep==1.151.0
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-semgrep.txt
 
       # format:check, lint, middleware policy, typecheck, unit and Worker coverage, analyze,
       # cf-typegen:check, and both builds. Successful CI completion covers the

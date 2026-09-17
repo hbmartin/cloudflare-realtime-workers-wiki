@@ -25,7 +25,7 @@
     "test:watch": "vitest",
     "lint": "oxlint --deny-warnings --report-unused-disable-directives .",
     "lint:fix": "oxlint --fix .",
-    "check:middleware": "semgrep scan --error --config .semgrep/middleware.yml --exclude='**/*.test.ts' --exclude='**/*.integration.test.ts' src/worker && semgrep test --config .semgrep/middleware.yml .semgrep/middleware.test.ts",
+    "check:middleware": "semgrep scan --strict --no-git-ignore --error --config .semgrep/middleware.yml --exclude='**/*.test.ts' --exclude='**/*.integration.test.ts' src/worker && semgrep test --strict --config .semgrep/middleware.yml .semgrep/middleware.test.ts",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
     "typecheck": "pnpm typecheck:client && pnpm typecheck:worker && pnpm typecheck:unit && pnpm typecheck:worker-tests && pnpm typecheck:config",

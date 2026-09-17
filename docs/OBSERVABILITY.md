@@ -32,8 +32,9 @@ Custom spans use these fixed names:
 Cloudflare adds automatic child spans for handlers, bindings, and outbound requests.
 `notes.route_request` sets `http.route` to the responding Hono template, a fixed Party template, or
 `/unmatched` after routing; it never attaches raw URL identifiers.
-Worker Hono middleware must be registered through `registerMetricMiddleware`. `pnpm check:middleware` enforces that
-boundary for the reviewed Worker apps while allowing ordinary endpoint registration and unrelated `.use` methods.
+Worker Hono middleware must be registered through `registerMetricMiddleware`. `pnpm check:middleware` rejects direct,
+computed, aliased, or destructured `.use` registration in production Worker code and requires review for new or renamed
+Hono apps, while allowing ordinary endpoint registration and unrelated `.on` or `.all` methods.
 
 ## Structured log contract
 
@@ -67,10 +68,13 @@ titles, Slack/webhook payloads, or URL query strings to telemetry. The logger re
 credential formats, email-shaped values, and labeled Basic and Bearer values in raw headers, maps, tuples, quoted or
 multiply escaped JSON, and colon, equals, arrow, comma, or whitespace-separated fields. Once an authorization label
 and scheme are recognized, malformed or custom credential punctuation is redacted through the next whitespace or
-structural delimiter, even when a malformed quote is left open. CGI `HTTP_AUTHORIZATION`/`HTTP_PROXY_AUTHORIZATION`,
-camelCase `authorizationHeader` aliases, and the bounded `HeadersList.headersMap` `name`/`value` representation are
-recognized as labeled forms. The logger also redacts decodable free-text Basic credentials, token-like free-text
-Bearer values, and query strings, including nested diagnostic values. Raw fields are bounded before one full
+structural delimiter, even when a malformed quote is left open. Periods, exclamation points, and question marks are
+preserved only when they form trailing punctuation before a delimiter or the end of the value; internal punctuation
+remains part of the redacted credential. CGI authorization labels, including repeated `REDIRECT_` prefixes, plus
+camelCase, snake_case, and hyphenated proxy/header aliases are recognized. The bounded `HeadersList.headersMap`
+`name`/`value` representation accepts bare, quoted, or escaped keys in either property order. The logger also redacts
+decodable free-text Basic credentials, token-like free-text Bearer values, and query strings, including nested diagnostic
+values. Raw fields are bounded before one full
 redaction scan; later truncation and nested compaction operate on already-sanitized text and scrub only recognizable
 partial Basic or Bearer credentials, emails, and secret prefixes at the cut boundary. Complete redaction and omission
 markers are atomic, so sanitizing an already-sanitized value is idempotent. Complete unlabeled malformed Basic values,
