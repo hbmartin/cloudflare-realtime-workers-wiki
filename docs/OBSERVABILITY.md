@@ -32,6 +32,8 @@ Custom spans use these fixed names:
 Cloudflare adds automatic child spans for handlers, bindings, and outbound requests.
 `notes.route_request` sets `http.route` to the responding Hono template, a fixed Party template, or
 `/unmatched` after routing; it never attaches raw URL identifiers.
+Worker Hono middleware must be registered through `registerMetricMiddleware`. `pnpm check:middleware` enforces that
+boundary for the reviewed Worker apps while allowing ordinary endpoint registration and unrelated `.use` methods.
 
 ## Structured log contract
 
@@ -64,12 +66,16 @@ Never add cookies, authorization headers, credentials, email addresses, request 
 titles, Slack/webhook payloads, or URL query strings to telemetry. The logger redacts sensitive keys, known
 credential formats, email-shaped values, and labeled Basic and Bearer values in raw headers, maps, tuples, quoted or
 multiply escaped JSON, and colon, equals, arrow, comma, or whitespace-separated fields. Once an authorization label
-and scheme are recognized, malformed or custom credential punctuation is redacted through the next structural
-delimiter. The logger also redacts decodable free-text Basic credentials, token-like free-text Bearer values, and
-query strings, including nested diagnostic values. Raw fields are bounded before scanning, and recognizable partial
-Basic or Bearer credentials, emails, and secret prefixes at a truncation boundary are scrubbed. Complete unlabeled
-malformed Basic values, ordinary Basic prose, and short alphabetic Bearer prose remain unchanged, so never put
-authorization headers or credentials in diagnostic text.
+and scheme are recognized, malformed or custom credential punctuation is redacted through the next whitespace or
+structural delimiter, even when a malformed quote is left open. CGI `HTTP_AUTHORIZATION`/`HTTP_PROXY_AUTHORIZATION`,
+camelCase `authorizationHeader` aliases, and the bounded `HeadersList.headersMap` `name`/`value` representation are
+recognized as labeled forms. The logger also redacts decodable free-text Basic credentials, token-like free-text
+Bearer values, and query strings, including nested diagnostic values. Raw fields are bounded before one full
+redaction scan; later truncation and nested compaction operate on already-sanitized text and scrub only recognizable
+partial Basic or Bearer credentials, emails, and secret prefixes at the cut boundary. Complete redaction and omission
+markers are atomic, so sanitizing an already-sanitized value is idempotent. Complete unlabeled malformed Basic values,
+ordinary Basic prose, and short alphabetic Bearer prose remain unchanged, so never put authorization headers or
+credentials in diagnostic text.
 Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to
 Analytics Engine. HTTP metric operations use Hono's registered route template, fixed Party templates, or
 `/unmatched`; they never derive a route value from request path segments.

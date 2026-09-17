@@ -205,6 +205,7 @@ import { registerMetricMiddleware, respondingMetricRoute } from "./metric-route"
 import { SCHEDULED_TASK_NAMES, type ScheduledTaskName } from "./scheduled-task-names";
 import { sourceRateLimitKey } from "./source-rate-limit";
 
+// nosemgrep: worker-hono-construction -- Primary Worker app covered by the middleware registration policy.
 const app = new Hono<{ Bindings: Env }>();
 
 registerMetricMiddleware(app, "*", async (c, next) => {
@@ -1437,12 +1438,14 @@ app.post("/api/invites/complete", async (c) => {
   return c.json({ success: true });
 });
 
+// nosemgrep: worker-hono-direct-middleware-registration -- Terminal wildcard endpoint, not middleware.
 app.all("/api/security/*", async (c) => {
   const url = new URL(c.req.url);
   url.pathname = url.pathname.replace("/api/security/", "/api/auth/security/");
   return createAuth(c.env).handler(new Request(url, c.req.raw));
 });
 
+// nosemgrep: worker-hono-direct-middleware-registration -- Terminal wildcard endpoint, not middleware.
 app.all("/api/auth/*", async (c) => {
   if (new URL(c.req.url).pathname.endsWith("/sign-up/email")) {
     throw new HttpError(403, "registration_closed", "Use the bootstrap screen or an invite to register.");

@@ -243,6 +243,83 @@ describe("worker observability", () => {
     expect(safeTelemetryErrorMessage(new Error("Bearer api:key"), "fallback")).toBe("Bearer api:key");
   });
 
+  it("redacts CGI, camelCase, tuple, map, and Undici authorization labels", () => {
+    const cases = new Map([
+      ["HTTP_AUTHORIZATION: Bearer abc", "HTTP_AUTHORIZATION: Bearer [redacted]"],
+      ["HTTP_PROXY_AUTHORIZATION: Basic badtoken", "HTTP_PROXY_AUTHORIZATION: Basic [redacted]"],
+      ["authorizationHeader: Bearer abc", "authorizationHeader: Bearer [redacted]"],
+      ["proxyAuthorizationHeader: Basic badtoken", "proxyAuthorizationHeader: Basic [redacted]"],
+      ["Map(1) { 'authorization' => 'Bearer abc' }", "Map(1) { 'authorization' => 'Bearer [redacted]' }"],
+      ['["authorization", "Basic badtoken"]', '["authorization", "Basic [redacted]"]'],
+      [
+        "HeadersList { headersMap: Map(1) { 'authorization' => { name: 'authorization', value: 'Bearer abc' } } }",
+        "HeadersList { headersMap: Map(1) { 'authorization' => { name: 'authorization', value: 'Bearer [redacted]' } } }",
+      ],
+      [
+        "HeadersList { headersMap: Map(1) { 'proxy-authorization' => { name: 'proxy-authorization', value: 'Basic badtoken' } } }",
+        "HeadersList { headersMap: Map(1) { 'proxy-authorization' => { name: 'proxy-authorization', value: 'Basic [redacted]' } } }",
+      ],
+    ]);
+
+    for (const [message, expected] of cases) {
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(expected);
+    }
+  });
+
+  it("is idempotent across raw, quoted, escaped, aliased, and existing-marker forms", () => {
+    for (const message of [
+      "Authorization: Bearer abc",
+      'authorization = "Bearer abc"',
+      String.raw`{\"authorization\":\"Bearer abc\"}`,
+      "HTTP_AUTHORIZATION: Basic badtoken",
+      "authorizationHeader: Bearer abc",
+      "Authorization: Bearer [redacted]",
+      'Authorization: Bearer "[redacted]"',
+    ]) {
+      const once = safeTelemetryErrorMessage(new Error(message), "fallback");
+      const twice = safeTelemetryErrorMessage(new Error(once), "fallback");
+      expect(twice).toBe(once);
+      expect(once.match(/\[redacted]/g)).toHaveLength(1);
+    }
+  });
+
+  it("does not trust a redaction marker that only prefixes a labeled credential", () => {
+    for (const message of [
+      "Authorization: Bearer [redacted]secret",
+      'Authorization: Bearer "[redacted]secret"',
+      "HTTP_AUTHORIZATION: Basic [redacted]secret",
+      "authorizationHeader: Bearer [redacted]:secret",
+      "name: 'authorization', value: 'Bearer [redacted]secret'",
+    ]) {
+      const result = safeTelemetryErrorMessage(new Error(message), "fallback");
+      expect(result).not.toContain("secret");
+      expect(result.match(/\[redacted]/g)).toHaveLength(1);
+    }
+  });
+
+  it("keeps malformed quote recovery token-bounded and preserves punctuation", () => {
+    const cases = new Map([
+      [
+        "Authorization: Bearer 'abc don't erase this, later' after",
+        "Authorization: Bearer '[redacted] don't erase this, later' after",
+      ],
+      ['Authorization: Bearer "abc unrelated tail', 'Authorization: Bearer "[redacted] unrelated tail'],
+      ["Authorization: Bearer 'abc\" unrelated tail", "Authorization: Bearer '[redacted]\" unrelated tail"],
+      [String.raw`Authorization: Bearer "abc\\" later`, String.raw`Authorization: Bearer "[redacted]\\" later`],
+      ["Authorization: Bearer (abc] tail", "Authorization: Bearer ([redacted]] tail"],
+      ["Authorization: Bearer abc123.", "Authorization: Bearer [redacted]."],
+      ["Authorization: Bearer abc.def", "Authorization: Bearer [redacted]"],
+      ["Authorization: Bearer abc123!", "Authorization: Bearer [redacted]!"],
+      ["Authorization: Bearer abc123?", "Authorization: Bearer [redacted]?"],
+      ["Authorization: Bearer [] after", "Authorization: Bearer [] after"],
+      ["Authorization: Bearer    ", "Authorization: Bearer"],
+    ]);
+
+    for (const [message, expected] of cases) {
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(expected);
+    }
+  });
+
   it("applies escaped authorization labels to nested fields and error stacks", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
@@ -373,7 +450,7 @@ describe("worker observability", () => {
   });
 
   it("keeps redaction and truncation markers atomic when sanitizing expands the payload", () => {
-    const credential = " Bearer abc123";
+    const credential = " Authorization: Bearer abc123";
     const payloadLimit = PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length;
     const raw = `${"x".repeat(payloadLimit - credential.length)}${credential}${"tail".repeat(20)}`;
     const result = safeTelemetryErrorMessage(new Error(raw), "fallback");
@@ -389,7 +466,7 @@ describe("worker observability", () => {
   it("re-bounds raw strings that grow during redaction", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const expanding = (limit: number) => {
-      const credential = " Bearer abc123";
+      const credential = " Authorization: Bearer abc123";
       return "x".repeat(limit - credential.length) + credential;
     };
     try {
@@ -418,6 +495,35 @@ describe("worker observability", () => {
         expect(value).toContain(TRUNCATION_MARKER);
         expect(value.replaceAll("[redacted]", "")).not.toContain("[reda");
         expect(isWellFormed(value)).toBe(true);
+      }
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("bounds long labeled credentials in near-linear time without losing safe context", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const diagnostic = `trace Authorization: Bearer abc retained-context ${"x".repeat(17_000)}`;
+      const error = new Error(diagnostic);
+      error.stack = diagnostic;
+      const started = performance.now();
+
+      const persisted = safeTelemetryErrorMessage(error, "fallback");
+      logger.error("test.long_labeled", "test", diagnostic, {}, error);
+
+      expect(performance.now() - started).toBeLessThan(1_000);
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      for (const [value, limit] of [
+        [persisted, PERSISTED_ERROR_MESSAGE_LIMIT],
+        [String(record.message), LOG_TEXT_LIMIT],
+        [String(record.errorStack), LOG_STACK_LIMIT],
+      ] as const) {
+        expect(value.length).toBeLessThanOrEqual(limit);
+        expect(value).toContain("retained-context");
+        expect(value).toMatch(/…\[truncated]$/);
+        expect(value.match(/\[redacted]/g)).toHaveLength(1);
+        expect(value).not.toContain("[[redacted]]");
       }
     } finally {
       output.mockRestore();
@@ -790,6 +896,12 @@ describe("worker observability", () => {
       50,
     );
     expect(JSON.parse(arraySummary).at(-1)).toBe("[entries omitted]");
+
+    for (const limit of [23, 25]) {
+      expect(JSON.parse(boundedNestedJson({ a: { long: "x".repeat(100) } }, limit))).toEqual({
+        a: "[value omitted]",
+      });
+    }
   });
 
   it("uses truthful valid JSON fallbacks at tiny nested-value limits", () => {

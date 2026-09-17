@@ -10,7 +10,7 @@ function metricMiddleware<Handler extends object>(handler: Handler): Handler {
 }
 
 export function registerMetricMiddleware<E extends Env>(app: Hono<E>, path: string, handler: MiddlewareHandler<E>) {
-  // eslint-disable-next-line no-restricted-properties -- This helper is the metric-aware registration boundary.
+  // nosemgrep: worker-hono-direct-middleware-registration -- This helper is the metric-aware registration boundary.
   app.use(path, metricMiddleware(handler));
 }
 

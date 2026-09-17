@@ -48,18 +48,6 @@
   },
   "overrides": [
     {
-      "files": ["src/worker/**/*.ts"],
-      "rules": {
-        "no-restricted-properties": [
-          "error",
-          {
-            "property": "use",
-            "message": "Register Worker middleware through registerMetricMiddleware so metric route attribution remains correct."
-          }
-        ]
-      }
-    },
-    {
       "files": ["src/**/*.test.ts", "src/**/*.test.tsx", "tests/**/*.ts"],
       "rules": {
         "typescript/no-extraneous-class": "off",
