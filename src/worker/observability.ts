@@ -30,14 +30,13 @@ type LogFields = Readonly<Record<string, unknown>>;
 
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
-const AUTHORIZATION_LABEL = String.raw`\b((?:proxy-)?authorization(?:\\?["'])?[ \t]*[:=][ \t]*(?:\\?["'])?`;
-const BASIC_HEADER_VALUE = new RegExp(`${AUTHORIZATION_LABEL}Basic[ \\t]+)[A-Za-z0-9+/_=-]+`, "gi");
-const BASIC_VALUE = /\bBasic[ \t]+([A-Za-z0-9+/_=-]+)/gi;
-const BEARER_HEADER_VALUE = new RegExp(
-  `${AUTHORIZATION_LABEL}Bearer[ \\t]+)([A-Za-z0-9._~+/=-]+)(?=$|[^A-Za-z0-9._~+/=-])`,
+const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:\\*["']|[\[({])[ \t]*)*`;
+const LABELED_AUTHORIZATION_PREFIX = new RegExp(
+  String.raw`\b(?:proxy-)?authorization(?:\\*["'])?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`,
   "gi",
 );
-const BEARER_VALUE = /\bBearer[ \t]+([A-Za-z0-9._~+/=-]+)(?=$|[^A-Za-z0-9._~+/=-])/gi;
+const BASIC_VALUE = /\bBasic[ \t]+([A-Za-z0-9+/_=-]+)/gi;
+const BEARER_VALUE = /\bBearer[ \t]+([A-Za-z0-9._~+/=-]+)/gi;
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
 const PARTIAL_SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]*|xox[baprs]-[A-Za-z0-9-]*)$/i;
@@ -45,6 +44,13 @@ const NESTED_VALUE_BUDGET = 100;
 const REDACTED_VALUE = "[redacted]";
 const OMITTED_ENTRIES = "[entries omitted]";
 const OMITTED_VALUE = "[value omitted]";
+const PROPERTY_OMITTED = "[property omitted]";
+const DEPTH_OMITTED = "[depth omitted]";
+const CIRCULAR_VALUE = "[circular]";
+const OBJECT_OMITTED = "[object omitted]";
+const EMPTY_KEY = "[empty key]";
+const FUNCTION_OMITTED = "[function omitted]";
+const SYMBOL_OMITTED = "[symbol omitted]";
 const RESERVED_LOG_FIELDS = new Set([
   "schema",
   "event",
@@ -195,13 +201,87 @@ function redactPartialEmail(value: string) {
   return value.slice(0, start) + "[redacted-email]";
 }
 
+type QuoteDelimiter = { backslashes: number; quote: '"' | "'" };
+
+function lastQuoteDelimiter(value: string): QuoteDelimiter | undefined {
+  let delimiter: QuoteDelimiter | undefined;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character !== '"' && character !== "'") continue;
+    let slashStart = index;
+    while (slashStart > 0 && value[slashStart - 1] === "\\") slashStart -= 1;
+    delimiter = { backslashes: index - slashStart, quote: character };
+  }
+  return delimiter;
+}
+
+function consumeOpeningValueWrappers(value: string, start: number) {
+  let cursor = start;
+  while (cursor < value.length) {
+    while (value[cursor] === " " || value[cursor] === "\t") cursor += 1;
+    if ("[({".includes(value[cursor] ?? "")) {
+      cursor += 1;
+      continue;
+    }
+    const slashStart = cursor;
+    while (value[cursor] === "\\") cursor += 1;
+    const character = value[cursor];
+    if (character === '"' || character === "'") {
+      return {
+        cursor: cursor + 1,
+        delimiter: { backslashes: cursor - slashStart, quote: character } satisfies QuoteDelimiter,
+      };
+    }
+    return { cursor: slashStart, delimiter: undefined };
+  }
+  return { cursor, delimiter: undefined };
+}
+
+function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDelimiter | undefined) {
+  for (let index = start; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (delimiter) {
+      if (character !== delimiter.quote) continue;
+      let slashStart = index;
+      while (slashStart > start && value[slashStart - 1] === "\\") slashStart -= 1;
+      if (index - slashStart === delimiter.backslashes) return slashStart;
+      continue;
+    }
+    if (/\s/u.test(character) || ",;}])".includes(character)) return index;
+    if (character === '"' || character === "'") {
+      let slashStart = index;
+      while (slashStart > start && value[slashStart - 1] === "\\") slashStart -= 1;
+      return slashStart;
+    }
+  }
+  return value.length;
+}
+
+function redactLabeledAuthorizationValues(value: string) {
+  const parts: string[] = [];
+  let cursor = 0;
+  LABELED_AUTHORIZATION_PREFIX.lastIndex = 0;
+  let match = LABELED_AUTHORIZATION_PREFIX.exec(value);
+  while (match) {
+    const opening = consumeOpeningValueWrappers(value, LABELED_AUTHORIZATION_PREFIX.lastIndex);
+    const delimiter = opening.delimiter ?? lastQuoteDelimiter(match[1] ?? "");
+    const end = labeledCredentialEnd(value, opening.cursor, delimiter);
+    if (end > opening.cursor) {
+      parts.push(value.slice(cursor, opening.cursor), REDACTED_VALUE);
+      cursor = end;
+      LABELED_AUTHORIZATION_PREFIX.lastIndex = end;
+    }
+    match = LABELED_AUTHORIZATION_PREFIX.exec(value);
+  }
+  if (parts.length === 0) return value;
+  parts.push(value.slice(cursor));
+  return parts.join("");
+}
+
 function redactKnownValues(value: string, atBoundary = false) {
-  let safe = value.replace(BASIC_HEADER_VALUE, `$1${REDACTED_VALUE}`);
+  let safe = redactLabeledAuthorizationValues(value);
   safe = safe.replace(BASIC_VALUE, (match, encoded: string, offset: number) =>
     redactBasicValue(match, encoded, atBoundary && offset + match.length === safe.length),
-  );
-  safe = safe.replace(BEARER_HEADER_VALUE, (match, _prefix: string, token: string) =>
-    redactBearerValue(match, token, true),
   );
   safe = safe
     .replace(BEARER_VALUE, (match, token: string, offset: number) =>
@@ -219,7 +299,18 @@ const ATOMIC_SANITIZATION_MARKERS = [
   "[redacted-email]",
   "[redacted-secret]",
   TRUNCATION_MARKER,
+  OMITTED_ENTRIES,
+  OMITTED_VALUE,
+  PROPERTY_OMITTED,
+  DEPTH_OMITTED,
+  CIRCULAR_VALUE,
+  OBJECT_OMITTED,
+  EMPTY_KEY,
+  FUNCTION_OMITTED,
+  SYMBOL_OMITTED,
 ] as const;
+
+const EXACT_SANITIZATION_MARKERS = new Set<string>(ATOMIC_SANITIZATION_MARKERS);
 
 function atomicRedactionPrefix(value: string, limit: number) {
   let end = wellFormedPrefix(value, limit).length;
@@ -258,7 +349,7 @@ function boundedSanitizedString(value: string, limit: number) {
 
 function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
   const truncated = value.length > limit;
-  if (!truncated) return redactKnownValues(value);
+  if (!truncated) return boundedSanitizedString(redactKnownValues(value), limit);
   if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, Math.max(0, limit));
   const payloadLimit = limit - TRUNCATION_MARKER.length;
   const safe = redactKnownValues(wellFormedPrefix(value, payloadLimit), true);
@@ -269,13 +360,21 @@ function uniqueKey(base: string, occupied: (candidate: string) => boolean) {
   if (!occupied(base)) return base;
   for (let index = 2; ; index += 1) {
     const suffix = `#${index}`;
-    const candidate = base.slice(0, LOG_IDENTIFIER_LIMIT - suffix.length) + suffix;
+    const trailingMarker = ATOMIC_SANITIZATION_MARKERS.find((marker) => base.endsWith(marker));
+    const candidate = trailingMarker
+      ? atomicRedactionPrefix(
+          base.slice(0, -trailingMarker.length),
+          LOG_IDENTIFIER_LIMIT - trailingMarker.length - suffix.length,
+        ) +
+        trailingMarker +
+        suffix
+      : atomicRedactionPrefix(base, LOG_IDENTIFIER_LIMIT - suffix.length) + suffix;
     if (!occupied(candidate)) return candidate;
   }
 }
 
 function uniqueSafeKey(target: Record<string, unknown>, rawKey: string) {
-  return uniqueKey(redactedString(rawKey, LOG_IDENTIFIER_LIMIT) || "[empty key]", (key) => Object.hasOwn(target, key));
+  return uniqueKey(redactedString(rawKey, LOG_IDENTIFIER_LIMIT) || EMPTY_KEY, (key) => Object.hasOwn(target, key));
 }
 
 type BoundedFragment = {
@@ -290,7 +389,7 @@ function containerLength(fragments: readonly string[]) {
 
 function compactStringFragment(value: string, wrap: (valueJson: string) => string, limit: number) {
   let low = TRUNCATION_MARKER.length;
-  let high = value.length - 1;
+  let high = Math.min(value.length - 1, limit);
   let best: string | undefined;
   while (low <= high) {
     const middle = Math.floor((low + high) / 2);
@@ -305,18 +404,40 @@ function compactStringFragment(value: string, wrap: (valueJson: string) => strin
   return best;
 }
 
-function boundedFragment(value: unknown, keyJson?: string): BoundedFragment {
+function compactNestedFragment(
+  value: object,
+  serialized: string | undefined,
+  wrap: (valueJson: string) => string,
+  limit: number,
+) {
+  const valueLimit = limit - wrap("").length;
+  if (valueLimit < 2) return undefined;
+  const compacted = boundedNestedJsonFromSerialization(value, valueLimit, serialized);
+  if (compacted !== JSON.stringify(OMITTED_ENTRIES) && !compacted.startsWith("[") && !compacted.startsWith("{")) {
+    return undefined;
+  }
+  const candidate = wrap(compacted);
+  return candidate.length <= limit ? candidate : undefined;
+}
+
+function boundedFragment(
+  value: unknown,
+  keyJson?: string,
+  serialized = JSON.stringify(value) ?? "null",
+): BoundedFragment {
   const wrap = (valueJson: string) => (keyJson === undefined ? valueJson : `${keyJson}:${valueJson}`);
-  const valueJson = JSON.stringify(value) ?? "null";
-  const full = wrap(valueJson);
+  const full = wrap(serialized);
   const omitted = wrap(JSON.stringify(OMITTED_VALUE));
-  const minimum = full.length <= omitted.length ? full : omitted;
+  const atomic = typeof value === "string" && EXACT_SANITIZATION_MARKERS.has(value);
+  const minimum = atomic || full.length <= omitted.length ? full : omitted;
   return {
     full,
     minimum,
-    ...(typeof value === "string" && full !== minimum
+    ...(!atomic && typeof value === "string" && full !== minimum
       ? { compact: (limit: number) => compactStringFragment(value, wrap, limit) }
-      : {}),
+      : value !== null && typeof value === "object" && full !== minimum
+        ? { compact: (limit: number) => compactNestedFragment(value, serialized, wrap, limit) }
+        : {}),
   };
 }
 
@@ -365,15 +486,16 @@ function packBoundedFragments(
   return `${opening}${rendered().join(",")}${closing}`;
 }
 
-/** @internal Exported for focused size-boundary tests. */
-export function boundedNestedJson(value: unknown, limit: number) {
+function boundedNestedJsonFromSerialization(value: unknown, limit: number, serialized: string | undefined) {
   if (limit < 2) return "";
-  const serialized = JSON.stringify(value);
   if (serialized !== undefined && serialized.length <= limit) return serialized;
 
   if (Array.isArray(value)) {
     return packBoundedFragments(
-      Array.from(value, (item) => boundedFragment(item)),
+      Array.from(value, (item) => {
+        const itemJson = JSON.stringify(item) ?? "null";
+        return boundedFragment(item, undefined, itemJson);
+      }),
       "[",
       "]",
       JSON.stringify(OMITTED_ENTRIES),
@@ -382,11 +504,14 @@ export function boundedNestedJson(value: unknown, limit: number) {
   }
 
   if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value).filter(([, item]) => JSON.stringify(item) !== undefined);
-    const keys = new Set(entries.map(([key]) => key));
+    const entries = Object.entries(value).flatMap(([key, item]) => {
+      const itemJson = JSON.stringify(item);
+      return itemJson === undefined ? [] : [{ item, itemJson, key }];
+    });
+    const keys = new Set(entries.map(({ key }) => key));
     const omissionKey = uniqueKey("omitted", (key) => keys.has(key));
     return packBoundedFragments(
-      entries.map(([key, item]) => boundedFragment(item, JSON.stringify(key))),
+      entries.map(({ item, itemJson, key }) => boundedFragment(item, JSON.stringify(key), itemJson)),
       "{",
       "}",
       `${JSON.stringify(omissionKey)}:${JSON.stringify(OMITTED_ENTRIES)}`,
@@ -395,6 +520,11 @@ export function boundedNestedJson(value: unknown, limit: number) {
   }
 
   return unavailableJson(limit, OMITTED_VALUE);
+}
+
+/** @internal Exported for focused size-boundary tests. */
+export function boundedNestedJson(value: unknown, limit: number) {
+  return boundedNestedJsonFromSerialization(value, limit, JSON.stringify(value));
 }
 
 export function safeTelemetryErrorMessage(error: unknown, fallback: string) {
@@ -410,36 +540,41 @@ function safeNested(value: unknown, depth: number, seen: WeakSet<object>, budget
   if (typeof value === "string") return redactedString(value);
   if (typeof value === "bigint") return boundedLogString(String(value), LOG_IDENTIFIER_LIMIT);
   if (value === undefined) return undefined;
-  if (typeof value !== "object") return "[" + typeof value + " omitted]";
-  if (depth >= 3) return "[depth omitted]";
-  if (seen.has(value)) return "[circular]";
+  if (typeof value !== "object") return typeof value === "function" ? FUNCTION_OMITTED : SYMBOL_OMITTED;
+  if (depth >= 3) return DEPTH_OMITTED;
+  if (seen.has(value)) return CIRCULAR_VALUE;
   seen.add(value);
   if (value instanceof Error) return errorLogFields(value, redactedString);
-  let keys: string[];
+  let allKeys: string[];
   try {
-    keys = Object.keys(value).slice(0, 30);
+    allKeys = Object.keys(value);
   } catch {
-    return "[object omitted]";
+    return OBJECT_OMITTED;
   }
+  const keys = allKeys.slice(0, 30);
+  const keysTruncated = keys.length < allKeys.length;
   if (Array.isArray(value)) {
     const result: unknown[] = [];
+    let omitted = keysTruncated;
     for (const key of keys) {
       if (budget.remaining <= 0) {
-        result.push(OMITTED_ENTRIES);
+        omitted = true;
         break;
       }
       try {
         result.push(safeNested(Reflect.get(value, key), depth + 1, seen, budget));
       } catch {
-        result.push("[property omitted]");
+        result.push(PROPERTY_OMITTED);
       }
     }
+    if (omitted) result.push(OMITTED_ENTRIES);
     return result;
   }
   const result = Object.create(null) as Record<string, unknown>;
+  let omitted = keysTruncated;
   for (const key of keys) {
     if (budget.remaining <= 0) {
-      result[uniqueKey("omitted", (candidate) => Object.hasOwn(result, candidate))] = OMITTED_ENTRIES;
+      omitted = true;
       break;
     }
     const safeKey = uniqueSafeKey(result, key);
@@ -450,9 +585,10 @@ function safeNested(value: unknown, depth: number, seen: WeakSet<object>, budget
     try {
       result[safeKey] = safeNested(Reflect.get(value, key), depth + 1, seen, budget);
     } catch {
-      result[safeKey] = "[property omitted]";
+      result[safeKey] = PROPERTY_OMITTED;
     }
   }
+  if (omitted) result[uniqueKey("omitted", (candidate) => Object.hasOwn(result, candidate))] = OMITTED_ENTRIES;
   return result;
 }
 
@@ -474,7 +610,7 @@ function safeField(key: string, value: unknown): string | number | boolean | nul
   try {
     return boundedNestedJson(safeNested(value, 0, new WeakSet(), { remaining: NESTED_VALUE_BUDGET }), LOG_TEXT_LIMIT);
   } catch {
-    return "[" + typeof value + " omitted]";
+    return typeof value === "function" ? FUNCTION_OMITTED : OBJECT_OMITTED;
   }
 }
 
@@ -507,9 +643,9 @@ function structuredLog(
       if (value === undefined) continue;
       if (value !== null && typeof value === "object") {
         try {
-          normalizedError[key] = boundedLogString(JSON.stringify(value), LOG_TEXT_LIMIT);
+          normalizedError[key] = boundedNestedJson(value, LOG_TEXT_LIMIT);
         } catch {
-          normalizedError[key] = "[object omitted]";
+          normalizedError[key] = OBJECT_OMITTED;
         }
       } else {
         normalizedError[key] = value;

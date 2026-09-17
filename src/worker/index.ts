@@ -201,23 +201,20 @@ import {
   withObservabilityContext,
 } from "./observability";
 import { deploymentMetadata, readiness } from "./health";
-import { metricMiddleware, respondingMetricRoute } from "./metric-route";
+import { registerMetricMiddleware, respondingMetricRoute } from "./metric-route";
 import { SCHEDULED_TASK_NAMES, type ScheduledTaskName } from "./scheduled-task-names";
 import { sourceRateLimitKey } from "./source-rate-limit";
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.use(
-  "*",
-  metricMiddleware(async (c, next) => {
-    try {
-      await next();
-    } finally {
-      const registered = respondingMetricRoute(c);
-      if (registered) setMetricRouteTemplate(registered);
-    }
-  }),
-);
+registerMetricMiddleware(app, "*", async (c, next) => {
+  try {
+    await next();
+  } finally {
+    const registered = respondingMetricRoute(c);
+    if (registered) setMetricRouteTemplate(registered);
+  }
+});
 const DELETION_TARGET_BATCH_SIZE = 50;
 // Each page costs three or four statements, so this stays far inside D1's per-invocation
 // query ceiling while still collapsing a tree level into one request.

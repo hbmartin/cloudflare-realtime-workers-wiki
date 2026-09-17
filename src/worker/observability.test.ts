@@ -215,6 +215,34 @@ describe("worker observability", () => {
     }
   });
 
+  it("redacts labeled credentials across serialized formats and malformed token punctuation", () => {
+    const cases = new Map([
+      ["Authorization: Bearer abc:key, status=bad", "Authorization: Bearer [redacted], status=bad"],
+      ['Authorization: Bearer "abc:key" later', 'Authorization: Bearer "[redacted]" later'],
+      ["Authorization: Basic 'user:pass' later", "Authorization: Basic '[redacted]' later"],
+      ['"authorization" => "Bearer abc:key" later', '"authorization" => "Bearer [redacted]" later'],
+      ['["authorization","Bearer abc:key"] later', '["authorization","Bearer [redacted]"] later'],
+      ['{"authorization":["Bearer abc:key"]} later', '{"authorization":["Bearer [redacted]"]} later'],
+      [String.raw`{"authorization":"Bearer abc\/def"} later`, String.raw`{"authorization":"Bearer [redacted]"} later`],
+      [
+        String.raw`{\"authorization\":\"Bearer abc\\\"def\"} later`,
+        String.raw`{\"authorization\":\"Bearer [redacted]\"} later`,
+      ],
+      [
+        String.raw`{\\\"authorization\\\":\\\"Bearer abc:key\\\"} later`,
+        String.raw`{\\\"authorization\\\":\\\"Bearer [redacted]\\\"} later`,
+      ],
+      ["Authorization Bearer abc:key done", "Authorization Bearer [redacted] done"],
+      ["Proxy-Authorization: Basic user:pass; done", "Proxy-Authorization: Basic [redacted]; done"],
+    ]);
+
+    for (const [message, expected] of cases) {
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(expected);
+    }
+
+    expect(safeTelemetryErrorMessage(new Error("Bearer api:key"), "fallback")).toBe("Bearer api:key");
+  });
+
   it("applies escaped authorization labels to nested fields and error stacks", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
@@ -358,6 +386,44 @@ describe("worker observability", () => {
     expect(isWellFormed(result)).toBe(true);
   });
 
+  it("re-bounds raw strings that grow during redaction", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const expanding = (limit: number) => {
+      const credential = " Bearer abc123";
+      return "x".repeat(limit - credential.length) + credential;
+    };
+    try {
+      const persisted = safeTelemetryErrorMessage(new Error(expanding(PERSISTED_ERROR_MESSAGE_LIMIT)), "fallback");
+      const error = new Error(expanding(LOG_TEXT_LIMIT));
+      error.stack = expanding(LOG_STACK_LIMIT);
+
+      logger.error(
+        "test.redaction_growth",
+        "test",
+        expanding(LOG_TEXT_LIMIT),
+        { otherId: expanding(LOG_IDENTIFIER_LIMIT), note: expanding(LOG_TEXT_LIMIT) },
+        error,
+      );
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      for (const [value, limit] of [
+        [persisted, PERSISTED_ERROR_MESSAGE_LIMIT],
+        [String(record.otherId), LOG_IDENTIFIER_LIMIT],
+        [String(record.note), LOG_TEXT_LIMIT],
+        [String(record.message), LOG_TEXT_LIMIT],
+        [String(record.errorMessage), LOG_TEXT_LIMIT],
+        [String(record.errorStack), LOG_STACK_LIMIT],
+      ] as const) {
+        expect(value.length).toBeLessThanOrEqual(limit);
+        expect(value).toContain(TRUNCATION_MARKER);
+        expect(value.replaceAll("[redacted]", "")).not.toContain("[reda");
+        expect(isWellFormed(value)).toBe(true);
+      }
+    } finally {
+      output.mockRestore();
+    }
+  });
+
   it("scrubs short Basic and Bearer values cut off at the raw boundary", () => {
     const boundaryMessage = (scheme: "Basic" | "Bearer", fragment: string, leading = "") => {
       const label = `${scheme} `;
@@ -468,6 +534,33 @@ describe("worker observability", () => {
     }
   });
 
+  it("keeps colliding key suffixes Unicode-safe and sanitization markers atomic", () => {
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      const surrogateFirst = `one@example.com${"x".repeat(181)}😀`;
+      const surrogateSecond = `two@example.com${"x".repeat(181)}😀`;
+      const truncatedPrefix = "k".repeat(LOG_IDENTIFIER_LIMIT);
+
+      logger.info("test.key_boundaries", "test", "key boundaries", {
+        [surrogateFirst]: 1,
+        [surrogateSecond]: 2,
+        [`${truncatedPrefix}one`]: 3,
+        [`${truncatedPrefix}two`]: 4,
+      });
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      const keys = Object.keys(record).filter((key) => key.startsWith("[redacted-email]") || key.startsWith("k"));
+      expect(keys).toHaveLength(4);
+      expect(keys.every(isWellFormed)).toBe(true);
+      expect(keys.some((key) => key.endsWith("😀"))).toBe(true);
+      expect(keys.some((key) => key.endsWith("#2"))).toBe(true);
+      expect(keys.some((key) => key.endsWith(`${TRUNCATION_MARKER}#2`))).toBe(true);
+      expect(keys.every((key) => !key.replaceAll(TRUNCATION_MARKER, "").includes("…["))).toBe(true);
+    } finally {
+      output.mockRestore();
+    }
+  });
+
   it("retains a valid bounded JSON summary for oversized nested fields", () => {
     const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
     try {
@@ -494,9 +587,34 @@ describe("worker observability", () => {
         },
       });
       const childRecord = output.mock.calls[0]?.[0] as Record<string, unknown>;
-      expect(JSON.parse(String(childRecord.details))).toEqual({
-        child: "[value omitted]",
+      const childParsed = JSON.parse(String(childRecord.details)) as { child: Record<string, unknown> };
+      expect(Object.keys(childParsed.child)).toHaveLength(30);
+      expect(childParsed.child.field0).toEqual(expect.stringContaining("value"));
+      expect(childParsed.child.field29).toEqual(expect.stringMatching(/…\[truncated\]$/));
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("marks object and array entries omitted by the safe nesting key cap", () => {
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      logger.info("test.key_cap", "test", "key cap", {
+        details: {
+          omitted: "kept",
+          ...Object.fromEntries(Array.from({ length: 30 }, (_, index) => [`field${index}`, index])),
+        },
+        items: Array.from({ length: 31 }, (_, index) => index),
       });
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      const details = JSON.parse(String(record.details)) as Record<string, unknown>;
+      const items = JSON.parse(String(record.items)) as unknown[];
+      expect(details.omitted).toBe("kept");
+      expect(details["omitted#2"]).toBe("[entries omitted]");
+      expect(details).not.toHaveProperty("field29");
+      expect(items).toHaveLength(31);
+      expect(items.at(-1)).toBe("[entries omitted]");
     } finally {
       output.mockRestore();
     }
@@ -515,10 +633,11 @@ describe("worker observability", () => {
       LOG_TEXT_LIMIT,
     );
     expect(childSummary.length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
-    expect(JSON.parse(childSummary)).toEqual({
-      child: "[value omitted]",
-      other: 1,
-    });
+    const childParsed = JSON.parse(childSummary) as { child: Record<string, unknown>; other: number };
+    expect(childParsed.other).toBe(1);
+    expect(Object.keys(childParsed.child)).toHaveLength(30);
+    expect(childParsed.child.field0).toEqual(expect.stringContaining("word"));
+    expect(childParsed.child.field29).toEqual(expect.stringMatching(/…\[truncated\]$/));
 
     const arraySummary = boundedNestedJson(["x".repeat(5_000), 1], LOG_TEXT_LIMIT);
     expect(arraySummary.length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
@@ -543,6 +662,24 @@ describe("worker observability", () => {
       expect(String(record.details).length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
     } finally {
       output.mockRestore();
+    }
+  });
+
+  it("never compacts safe-nesting placeholders into partial markers", () => {
+    for (const marker of [
+      "[property omitted]",
+      "[entries omitted]",
+      "[depth omitted]",
+      "[circular]",
+      "[object omitted]",
+      "[empty key]",
+      "[function omitted]",
+      "[symbol omitted]",
+    ]) {
+      const summary = boundedNestedJson([marker], 19);
+      expect(summary.length).toBeLessThanOrEqual(19);
+      expect(() => JSON.parse(summary)).not.toThrow();
+      expect(summary).not.toContain(TRUNCATION_MARKER);
     }
   });
 
@@ -577,6 +714,61 @@ describe("worker observability", () => {
       expect(parsed.errorStack).toMatch(/^nested-stack:x+…\[truncated\]$/);
       expect(parsed.errorReason).toBe("later metadata");
       expect(String(record.cause).length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("recursively retains nested containers, Errors, and later siblings", () => {
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      const cause = Object.assign(new Error("nested failure"), { reason: "later metadata" });
+      cause.stack = `nested-stack:${"x".repeat(5_000)}`;
+
+      logger.info("test.recursive_nested", "test", "recursive nested", {
+        details: {
+          cause,
+          sibling: "retained",
+        },
+        items: [{ note: "y".repeat(5_000), later: 1 }, "array sibling"],
+      });
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      const parsed = JSON.parse(String(record.details)) as {
+        cause: Record<string, unknown>;
+        sibling: string;
+      };
+      const items = JSON.parse(String(record.items)) as Array<Record<string, unknown> | string>;
+      expect(parsed.cause.errorStack).toMatch(/^nested-stack:x+…\[truncated\]$/);
+      expect(parsed.cause.errorReason).toBe("later metadata");
+      expect((items[0] as Record<string, unknown>).note).toMatch(/^y+…\[truncated\]$/);
+      expect((items[0] as Record<string, unknown>).later).toBe(1);
+      expect(items[1]).toBe("array sibling");
+      expect(parsed.sibling).toBe("retained");
+      expect(String(record.details).length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
+      expect(String(record.items).length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it("keeps object-valued normalized error fields as valid bounded JSON", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      logger.error(
+        "test.object_error",
+        "test",
+        "object error",
+        {},
+        { status: "x".repeat(5_000), reason: "later metadata" },
+      );
+
+      const record = output.mock.calls[0]?.[0] as Record<string, unknown>;
+      const serialized = String(record.errorValue);
+      const parsed = JSON.parse(serialized) as Record<string, unknown>;
+      expect(serialized.length).toBeLessThanOrEqual(LOG_TEXT_LIMIT);
+      expect(parsed.status).toMatch(/^x+…\[truncated\]$/);
+      expect(parsed.reason).toBe("later metadata");
     } finally {
       output.mockRestore();
     }
