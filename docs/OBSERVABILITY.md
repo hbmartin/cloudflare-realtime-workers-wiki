@@ -32,9 +32,10 @@ Custom spans use these fixed names:
 Cloudflare adds automatic child spans for handlers, bindings, and outbound requests.
 `notes.route_request` sets `http.route` to the responding Hono template, a fixed Party template, or
 `/unmatched` after routing; it never attaches raw URL identifiers.
-Worker Hono middleware must be registered through `registerMetricMiddleware`. `pnpm check:middleware` rejects direct,
-computed, aliased, or destructured `.use` registration in production Worker code and requires review for new or renamed
-Hono apps, while allowing ordinary endpoint registration and unrelated `.on` or `.all` methods.
+Worker Hono middleware must be registered through `registerMetricMiddleware`. `pnpm check:middleware` is a syntactic
+guardrail that rejects direct or computed `.use` calls, extracted `.use` references, Hono constructor escapes, and known
+Worker app values outside direct receiver calls, the sanctioned helper, and reviewed route composition. It allows ordinary
+endpoint registration and unrelated `.on` or `.all` methods; it does not attempt dynamic or interprocedural dataflow analysis.
 
 ## Structured log contract
 
