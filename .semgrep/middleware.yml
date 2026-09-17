@@ -35,22 +35,18 @@ rules:
     languages: [typescript]
     message: Do not alias, bind, or destructure .use; register Worker middleware through registerMetricMiddleware.
     severity: ERROR
-    pattern-either:
-      - pattern: const $ALIAS = $TARGET.use
-      - pattern: let $ALIAS = $TARGET.use
-      - pattern: $ALIAS = $TARGET.use
-      - pattern: const $ALIAS = $TARGET["use"]
-      - pattern: let $ALIAS = $TARGET["use"]
-      - pattern: $ALIAS = $TARGET["use"]
-      - pattern: const $ALIAS = $TARGET.use.bind(...)
-      - pattern: let $ALIAS = $TARGET.use.bind(...)
-      - pattern: $ALIAS = $TARGET.use.bind(...)
-      - pattern: |
-          const { use: $ALIAS } = $TARGET
-      - pattern: |
-          let { use: $ALIAS } = $TARGET
-      - pattern: const { use } = $TARGET
-      - pattern: let { use } = $TARGET
+    patterns:
+      - pattern-either:
+          - pattern: $TARGET.use
+          - pattern: $TARGET["use"]
+          - pattern: |
+              const { use: $ALIAS } = $TARGET
+          - pattern: |
+              let { use: $ALIAS } = $TARGET
+          - pattern: const { use } = $TARGET
+          - pattern: let { use } = $TARGET
+      - pattern-not-inside: $TARGET.use(...)
+      - pattern-not-inside: $TARGET["use"](...)
 
   - id: worker-hono-registration-alias
     languages: [typescript]
@@ -86,29 +82,61 @@ rules:
       - pattern-either:
           - pattern: const $ALIAS = app
           - pattern: let $ALIAS = app
-          - pattern: $ALIAS = app
           - pattern: const $ALIAS = notionApi
           - pattern: let $ALIAS = notionApi
-          - pattern: $ALIAS = notionApi
-          - pattern: const $ALIAS = $MODULE.app
-          - pattern: let $ALIAS = $MODULE.app
-          - pattern: $ALIAS = $MODULE.app
-          - pattern: const $ALIAS = $MODULE.notionApi
-          - pattern: let $ALIAS = $MODULE.notionApi
-          - pattern: $ALIAS = $MODULE.notionApi
-          - pattern: |
-              const { app: $ALIAS } = $MODULE
-          - pattern: |
-              let { app: $ALIAS } = $MODULE
-          - pattern: |
-              const { notionApi: $ALIAS } = $MODULE
-          - pattern: |
-              let { notionApi: $ALIAS } = $MODULE
-          - pattern: export { app as $ALIAS }
-          - pattern: export { notionApi as $ALIAS }
+      - pattern-not-inside: export default app
+      - pattern-not-inside: export default notionApi
+      - pattern-not-inside: export { app as $EXPORTED }
+      - pattern-not-inside: export { notionApi as $EXPORTED }
       - metavariable-regex:
           metavariable: $ALIAS
           regex: ^[A-Za-z_$][A-Za-z0-9_$]*$
+
+  - id: worker-hono-app-assignment
+    languages: [typescript]
+    message: Do not assign a known Worker Hono app to another identifier.
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: $ALIAS = app
+          - pattern: $ALIAS = notionApi
+      - pattern-not-inside: const $ALIAS = app
+      - pattern-not-inside: let $ALIAS = app
+      - pattern-not-inside: const $ALIAS = notionApi
+      - pattern-not-inside: let $ALIAS = notionApi
+      - pattern-not-inside: export default app
+      - pattern-not-inside: export default notionApi
+      - metavariable-regex:
+          metavariable: $ALIAS
+          regex: ^[A-Za-z_$][A-Za-z0-9_$]*$
+
+  - id: worker-hono-app-container
+    languages: [typescript]
+    message: Do not store or export a known Worker Hono app through an unreviewed container.
+    severity: ERROR
+    pattern-either:
+      - pattern: $OBJECT.$PROPERTY = app
+      - pattern: $OBJECT.$PROPERTY = notionApi
+      - pattern: "({ ..., $KEY: app, ... })"
+      - pattern: "({ ..., $KEY: notionApi, ... })"
+      - pattern: ({ ..., app, ... })
+      - pattern: ({ ..., notionApi, ... })
+      - pattern: return app
+      - pattern: return notionApi
+      - pattern: export { app as $ALIAS }
+      - pattern: export { notionApi as $ALIAS }
+      - pattern: export default app
+      - pattern: export default notionApi
+
+  - id: worker-hono-app-array
+    languages: [typescript]
+    message: Do not store a known Worker Hono app in an array.
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: app
+          - pattern: notionApi
+      - pattern-inside: "[...]"
 
   - id: worker-hono-app-escape
     languages: [typescript]
@@ -154,6 +182,29 @@ rules:
     pattern-either:
       - pattern: class $APP extends Hono { ... }
       - pattern: class $APP extends $MODULE.Hono { ... }
+      - pattern: class extends Hono { ... }
+      - pattern: class extends $MODULE.Hono { ... }
+
+  - id: worker-hono-constructor-escape
+    languages: [typescript]
+    message: Do not pass or store the Hono constructor as an unreviewed runtime value.
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: $CALLEE(..., Hono, ...)
+          - pattern: "({ ..., $KEY: Hono, ... })"
+          - pattern: ({ ..., Hono, ... })
+          - pattern: return Hono
+          - pattern: export default Hono
+      - pattern-not: Reflect.construct(Hono, ...)
+
+  - id: worker-hono-constructor-array
+    languages: [typescript]
+    message: Do not store the Hono constructor in an array.
+    severity: ERROR
+    patterns:
+      - pattern: Hono
+      - pattern-inside: "[...]"
 
   - id: worker-hono-import-alias
     languages: [typescript]

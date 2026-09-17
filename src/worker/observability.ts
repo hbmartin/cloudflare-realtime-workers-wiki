@@ -30,28 +30,19 @@ type LogFields = Readonly<Record<string, unknown>>;
 
 const contextStorage = new AsyncLocalStorage<ObservabilityContext>();
 const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|payload|email/i;
-const AUTHORIZATION_LABEL = String.raw`(?:(?:REDIRECT_)*HTTP_(?:PROXY_)?AUTHORIZATION|(?:proxy[-_]?)?authorization(?:[-_]?header)?)`;
-const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:\\*["']|[\[({])[ \t]*)*`;
-const SERIALIZED_NAME_KEY = String.raw`(?:\\*["'])?name(?:\\*["'])?`;
-const SERIALIZED_VALUE_KEY = String.raw`(?:\\*["'])?value(?:\\*["'])?`;
-const SERIALIZED_AUTHORIZATION_NAME = String.raw`${SERIALIZED_NAME_KEY}[ \t\r\n]*:[ \t\r\n]*(?:\\*["'])${AUTHORIZATION_LABEL}(?:\\*["'])`;
-const SERIALIZED_AUTHORIZATION_VALUE_PREFIX = String.raw`${SERIALIZED_VALUE_KEY}[ \t\r\n]*:[ \t\r\n]*(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`;
+const AUTHORIZATION_LABEL = String.raw`(?:[A-Za-z0-9]+[-_])*(?:proxy[-_]?)?authorization(?:[-_]?header)?`;
+const SERIALIZED_QUOTE = String.raw`\\*["']`;
+const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:${SERIALIZED_QUOTE}|[\[({])[ \t]*)*`;
+const AUTHORIZATION_LABEL_VALUE = new RegExp(String.raw`^${AUTHORIZATION_LABEL}$`, "i");
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
-  String.raw`\b${AUTHORIZATION_LABEL}(?:\\*["'])?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`,
-  "gi",
-);
-const UNDICI_NAME_FIRST_AUTHORIZATION_PREFIX = new RegExp(
-  String.raw`(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_NAME}[ \t\r\n]*,[^{}]*?(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_VALUE_PREFIX}`,
-  "gi",
-);
-const UNDICI_VALUE_FIRST_AUTHORIZATION_PREFIX = new RegExp(
-  String.raw`(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_VALUE_PREFIX}(?=[^{}]*?,[ \t\r\n]*(?<![A-Za-z0-9_])${SERIALIZED_AUTHORIZATION_NAME})`,
+  String.raw`(?<![A-Za-z0-9])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`,
   "gi",
 );
 const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
 const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=-]`;
 const BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}+)`, "gi");
-const BEARER_VALUE = new RegExp(String.raw`\bBearer[ \t]+(${BEARER_TOKEN_CHARACTER}+)`, "gi");
+const BEARER_VALUE_PREFIX = /\bBearer[ \t]+/gi;
+const BEARER_TOKEN_CHARACTER_VALUE = new RegExp(String.raw`^${BEARER_TOKEN_CHARACTER}$`);
 const PARTIAL_BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}*)$`, "i");
 const PARTIAL_BEARER_VALUE = new RegExp(String.raw`\bBearer[ \t]+(${BEARER_TOKEN_CHARACTER}*)$`, "i");
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
@@ -197,12 +188,45 @@ function redactBasicValue(match: string, encoded: string) {
   return match;
 }
 
-function redactBearerValue(match: string, token: string) {
-  const trailingPunctuation = token.match(/\.+$/)?.[0] ?? "";
-  const candidate = token.slice(0, token.length - trailingPunctuation.length);
-  return candidate.length >= 16 || /[0-9._~+/=-]/.test(candidate)
-    ? match.slice(0, match.length - token.length) + REDACTED_VALUE + trailingPunctuation
-    : match;
+function isBearerTokenCharacter(character: string | undefined) {
+  return character !== undefined && BEARER_TOKEN_CHARACTER_VALUE.test(character);
+}
+
+function bearerCandidateEnd(value: string, start: number) {
+  let cursor = start;
+  while (isBearerTokenCharacter(value[cursor])) cursor += 1;
+  while (value[cursor] === "!" || value[cursor] === "?") {
+    let punctuationEnd = cursor + 1;
+    while (value[punctuationEnd] === "!" || value[punctuationEnd] === "?") punctuationEnd += 1;
+    let tokenEnd = punctuationEnd;
+    while (isBearerTokenCharacter(value[tokenEnd])) tokenEnd += 1;
+    if (tokenEnd === punctuationEnd) break;
+    cursor = tokenEnd;
+  }
+  return cursor;
+}
+
+function redactBearerValues(value: string) {
+  const parts: string[] = [];
+  let cursor = 0;
+  BEARER_VALUE_PREFIX.lastIndex = 0;
+  let match = BEARER_VALUE_PREFIX.exec(value);
+  while (match) {
+    const tokenStart = BEARER_VALUE_PREFIX.lastIndex;
+    const tokenEnd = bearerCandidateEnd(value, tokenStart);
+    const token = value.slice(tokenStart, tokenEnd);
+    const trailingPunctuation = token.match(/[.!?]+$/)?.[0] ?? "";
+    const candidate = token.slice(0, token.length - trailingPunctuation.length);
+    if (candidate.length >= 16 || /[0-9._~+/=-]/.test(candidate)) {
+      parts.push(value.slice(cursor, tokenStart), REDACTED_VALUE, trailingPunctuation);
+      cursor = tokenEnd;
+    }
+    BEARER_VALUE_PREFIX.lastIndex = Math.max(tokenEnd, BEARER_VALUE_PREFIX.lastIndex);
+    match = BEARER_VALUE_PREFIX.exec(value);
+  }
+  if (parts.length === 0) return value;
+  parts.push(value.slice(cursor));
+  return parts.join("");
 }
 
 function partialEmailStart(value: string) {
@@ -260,15 +284,12 @@ function consumeOpeningValueWrappers(value: string, start: number) {
   return { cursor, delimiter: undefined };
 }
 
-const STRUCTURAL_CREDENTIAL_BOUNDARIES = ",;}])";
+const STRUCTURAL_CREDENTIAL_BOUNDARIES = ",;}])&";
 const TRAILING_CREDENTIAL_PUNCTUATION = ".!?";
 
-function isStructuralCredentialBoundary(character: string | undefined) {
-  return character === undefined || /\s/u.test(character) || STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character);
-}
-
 function credentialBoundaryAt(value: string, index: number) {
-  const character = value[index]!;
+  const character = value[index];
+  if (character === undefined) return { boundary: true, next: index };
   if (/\s/u.test(character) || STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character)) {
     return { boundary: true, next: index + 1 };
   }
@@ -279,13 +300,14 @@ function credentialBoundaryAt(value: string, index: number) {
   while (value[runEnd] !== undefined && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[runEnd]!)) runEnd += 1;
   const next = value[runEnd];
   return {
-    boundary: isStructuralCredentialBoundary(next) || next === '"' || next === "'",
+    boundary:
+      next === undefined ||
+      /\s/u.test(next) ||
+      STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(next) ||
+      next === '"' ||
+      next === "'",
     next: runEnd,
   };
-}
-
-function isCredentialBoundary(value: string, index: number) {
-  return credentialBoundaryAt(value, index).boundary;
 }
 
 function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDelimiter | undefined) {
@@ -321,35 +343,48 @@ function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDeli
   return value.length;
 }
 
+type RedactionRange = { start: number; end: number };
+
+function completeSanitizationMarkerEnd(value: string, markerEnd: number) {
+  const completeEnd = value.startsWith(TRUNCATION_MARKER, markerEnd) ? markerEnd + TRUNCATION_MARKER.length : markerEnd;
+  const suffix = value[completeEnd];
+  return suffix === '"' || suffix === "'" || credentialBoundaryAt(value, completeEnd).boundary
+    ? completeEnd
+    : undefined;
+}
+
+function authorizationValueAt(value: string, start: number, inheritedDelimiter?: QuoteDelimiter) {
+  const opening = consumeOpeningValueWrappers(value, start);
+  const markerEnd = value.startsWith(REDACTED_VALUE, opening.cursor)
+    ? opening.cursor + REDACTED_VALUE.length
+    : undefined;
+  if (markerEnd !== undefined) {
+    const completeMarkerEnd = completeSanitizationMarkerEnd(value, markerEnd);
+    if (completeMarkerEnd !== undefined) return { resumeAt: completeMarkerEnd };
+  }
+  const delimiter = opening.delimiter ?? inheritedDelimiter;
+  const scanStart =
+    markerEnd !== undefined && value.startsWith(TRUNCATION_MARKER, markerEnd)
+      ? markerEnd + TRUNCATION_MARKER.length
+      : (markerEnd ?? opening.cursor);
+  const end = labeledCredentialEnd(value, scanStart, delimiter);
+  return end > opening.cursor
+    ? { range: { start: opening.cursor, end } satisfies RedactionRange, resumeAt: end }
+    : { resumeAt: opening.cursor };
+}
+
 function redactAuthorizationMatches(value: string, pattern: RegExp) {
   const parts: string[] = [];
   let cursor = 0;
   pattern.lastIndex = 0;
   let match = pattern.exec(value);
   while (match) {
-    const opening = consumeOpeningValueWrappers(value, pattern.lastIndex);
-    const markerEnd = value.startsWith(REDACTED_VALUE, opening.cursor)
-      ? opening.cursor + REDACTED_VALUE.length
-      : undefined;
-    const markerSuffix = markerEnd === undefined ? undefined : value[markerEnd];
-    if (
-      markerEnd !== undefined &&
-      (markerSuffix === undefined ||
-        markerSuffix === '"' ||
-        markerSuffix === "'" ||
-        isCredentialBoundary(value, markerEnd))
-    ) {
-      pattern.lastIndex = markerEnd;
-      match = pattern.exec(value);
-      continue;
+    const scanned = authorizationValueAt(value, pattern.lastIndex, lastQuoteDelimiter(match[1] ?? ""));
+    if (scanned.range) {
+      parts.push(value.slice(cursor, scanned.range.start), REDACTED_VALUE);
+      cursor = scanned.range.end;
     }
-    const delimiter = opening.delimiter ?? lastQuoteDelimiter(match[1] ?? "");
-    const end = labeledCredentialEnd(value, markerEnd ?? opening.cursor, delimiter);
-    if (end > opening.cursor) {
-      parts.push(value.slice(cursor, opening.cursor), REDACTED_VALUE);
-      cursor = end;
-      pattern.lastIndex = end;
-    }
+    pattern.lastIndex = Math.max(pattern.lastIndex, scanned.resumeAt);
     match = pattern.exec(value);
   }
   if (parts.length === 0) return value;
@@ -357,19 +392,182 @@ function redactAuthorizationMatches(value: string, pattern: RegExp) {
   return parts.join("");
 }
 
+type SerializedProperty = { key: "name" | "value"; valueStart: number };
+type SerializedValue = { propertyIndex: number; range: RedactionRange; segment: number };
+type SerializedFrame = {
+  authorizationNames: Array<{ propertyIndex: number; segment: number }>;
+  values: SerializedValue[];
+  root: boolean;
+};
+
+function isSerializedIdentifierCharacter(character: string | undefined) {
+  if (character === undefined) return false;
+  const code = character.charCodeAt(0);
+  return isAsciiLetter(code) || isAsciiDigit(code) || character === "_";
+}
+
+function serializedPropertyAt(value: string, index: number): SerializedProperty | undefined {
+  if (isSerializedIdentifierCharacter(value[index - 1])) return undefined;
+  const key = value.startsWith("name", index) ? "name" : value.startsWith("value", index) ? "value" : undefined;
+  if (!key || isSerializedIdentifierCharacter(value[index + key.length])) return undefined;
+  let cursor = index + key.length;
+  const quoteStart = cursor;
+  while (value[cursor] === "\\") cursor += 1;
+  if (value[cursor] === '"' || value[cursor] === "'") cursor += 1;
+  else if (cursor !== quoteStart) return undefined;
+  while (/\s/u.test(value[cursor] ?? "")) cursor += 1;
+  if (value[cursor] !== ":") return undefined;
+  cursor += 1;
+  while (/\s/u.test(value[cursor] ?? "")) cursor += 1;
+  return { key, valueStart: cursor };
+}
+
+function quoteCloses(delimiter: QuoteDelimiter, value: string, index: number) {
+  if (value[index] !== delimiter.quote) return false;
+  const backslashes = precedingBackslashes(value, index);
+  return (
+    backslashes % 2 === delimiter.backslashes % 2 &&
+    (delimiter.backslashes === 0 || backslashes <= delimiter.backslashes)
+  );
+}
+
+function serializedAuthorizationNameAt(value: string, start: number) {
+  let cursor = start;
+  const slashStart = cursor;
+  while (value[cursor] === "\\") cursor += 1;
+  const quote = value[cursor];
+  if (quote === '"' || quote === "'") {
+    const delimiter = { backslashes: cursor - slashStart, quote } satisfies QuoteDelimiter;
+    const contentStart = cursor + 1;
+    for (cursor = contentStart; cursor < value.length; cursor += 1) {
+      if (!quoteCloses(delimiter, value, cursor)) continue;
+      const contentEnd = cursor - precedingBackslashes(value, cursor, contentStart);
+      return AUTHORIZATION_LABEL_VALUE.test(value.slice(contentStart, contentEnd));
+    }
+    return false;
+  }
+  const contentStart = cursor;
+  while (/[A-Za-z0-9_-]/.test(value[cursor] ?? "")) cursor += 1;
+  return cursor > contentStart && AUTHORIZATION_LABEL_VALUE.test(value.slice(contentStart, cursor));
+}
+
+function serializedAuthorizationValueAt(value: string, start: number): RedactionRange | undefined {
+  const wrapper = consumeOpeningValueWrappers(value, start);
+  const scheme = value.slice(wrapper.cursor, wrapper.cursor + 6).toLowerCase();
+  const schemeLength = scheme.startsWith("basic") ? 5 : scheme === "bearer" ? 6 : 0;
+  if (schemeLength === 0) return undefined;
+  let cursor = wrapper.cursor + schemeLength;
+  if (value[cursor] !== " " && value[cursor] !== "\t") return undefined;
+  while (value[cursor] === " " || value[cursor] === "\t") cursor += 1;
+  return authorizationValueAt(value, cursor, wrapper.delimiter).range;
+}
+
+function canOpenSerializedQuote(value: string, index: number) {
+  let cursor = index - precedingBackslashes(value, index) - 1;
+  while (cursor >= 0 && /\s/u.test(value[cursor]!)) cursor -= 1;
+  return cursor < 0 || "[{(,:=>".includes(value[cursor]!);
+}
+
+function appendSerializedFrameRanges(frame: SerializedFrame, ranges: RedactionRange[]) {
+  if (!frame.root) {
+    if (frame.authorizationNames.length > 0) ranges.push(...frame.values.map((candidate) => candidate.range));
+    return;
+  }
+  let nameIndex = 0;
+  for (const candidate of frame.values) {
+    while (nameIndex < frame.authorizationNames.length) {
+      const name = frame.authorizationNames[nameIndex]!;
+      if (
+        name.segment < candidate.segment ||
+        (name.segment === candidate.segment && name.propertyIndex < candidate.propertyIndex - 256)
+      ) {
+        nameIndex += 1;
+        continue;
+      }
+      break;
+    }
+    const name = frame.authorizationNames[nameIndex];
+    if (
+      name?.segment === candidate.segment &&
+      name.propertyIndex <= candidate.propertyIndex + 256 &&
+      name.propertyIndex >= candidate.propertyIndex - 256
+    ) {
+      ranges.push(candidate.range);
+    }
+  }
+}
+
+function applyRedactionRanges(value: string, ranges: RedactionRange[]) {
+  if (ranges.length === 0) return value;
+  const endAt = new Uint32Array(value.length + 1);
+  for (const range of ranges) endAt[range.start] = Math.max(endAt[range.start]!, range.end);
+  const parts: string[] = [];
+  let sourceCursor = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const end = endAt[index]!;
+    if (end <= index || index < sourceCursor) continue;
+    parts.push(value.slice(sourceCursor, index), REDACTED_VALUE);
+    sourceCursor = end;
+    index = end - 1;
+  }
+  parts.push(value.slice(sourceCursor));
+  return parts.join("");
+}
+
+function redactSerializedAuthorizationObjects(value: string) {
+  const ranges: RedactionRange[] = [];
+  const frames: SerializedFrame[] = [{ authorizationNames: [], values: [], root: true }];
+  let segment = 0;
+  let delimiter: (QuoteDelimiter & { contentStart: number }) | undefined;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (delimiter) {
+      if (quoteCloses(delimiter, value, index)) delimiter = undefined;
+    } else if ((character === '"' || character === "'") && canOpenSerializedQuote(value, index)) {
+      delimiter = {
+        backslashes: precedingBackslashes(value, index),
+        quote: character,
+        contentStart: index + 1,
+      };
+    }
+
+    const property =
+      delimiter === undefined || delimiter.contentStart === index ? serializedPropertyAt(value, index) : undefined;
+    if (property) {
+      const frame = frames.at(-1)!;
+      const frameSegment = frame.root ? segment : 0;
+      if (property.key === "name" && serializedAuthorizationNameAt(value, property.valueStart)) {
+        frame.authorizationNames.push({ propertyIndex: index, segment: frameSegment });
+      } else if (property.key === "value") {
+        const range = serializedAuthorizationValueAt(value, property.valueStart);
+        if (range) frame.values.push({ propertyIndex: index, range, segment: frameSegment });
+      }
+    }
+
+    if (delimiter) continue;
+    if (character === "{") {
+      frames.push({ authorizationNames: [], values: [], root: false });
+    } else if (character === "}" && frames.length > 1) {
+      appendSerializedFrameRanges(frames.pop()!, ranges);
+    } else if (frames.length === 1 && (character === "\n" || character === ";")) {
+      segment += 1;
+    }
+  }
+  while (frames.length > 1) appendSerializedFrameRanges(frames.pop()!, ranges);
+  appendSerializedFrameRanges(frames[0]!, ranges);
+  return applyRedactionRanges(value, ranges);
+}
+
 function redactLabeledAuthorizationValues(value: string) {
   const labeled = redactAuthorizationMatches(value, LABELED_AUTHORIZATION_PREFIX);
-  const nameFirst = redactAuthorizationMatches(labeled, UNDICI_NAME_FIRST_AUTHORIZATION_PREFIX);
-  return redactAuthorizationMatches(nameFirst, UNDICI_VALUE_FIRST_AUTHORIZATION_PREFIX);
+  return redactSerializedAuthorizationObjects(labeled);
 }
 
 function redactKnownValues(value: string) {
   let safe = redactLabeledAuthorizationValues(value);
   safe = safe.replace(BASIC_VALUE, (match, encoded: string) => redactBasicValue(match, encoded));
-  safe = safe
-    .replace(BEARER_VALUE, (match, token: string) => redactBearerValue(match, token))
-    .replace(SECRET_VALUE, "[redacted-secret]")
-    .replace(URL_QUERY, "$1");
+  safe = redactBearerValues(safe).replace(SECRET_VALUE, "[redacted-secret]").replace(URL_QUERY, "$1");
   return redactEmails(safe);
 }
 

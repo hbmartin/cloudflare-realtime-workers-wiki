@@ -68,18 +68,20 @@ titles, Slack/webhook payloads, or URL query strings to telemetry. The logger re
 credential formats, email-shaped values, and labeled Basic and Bearer values in raw headers, maps, tuples, quoted or
 multiply escaped JSON, and colon, equals, arrow, comma, or whitespace-separated fields. Once an authorization label
 and scheme are recognized, malformed or custom credential punctuation is redacted through the next whitespace or
-structural delimiter, even when a malformed quote is left open. Periods, exclamation points, and question marks are
-preserved only when they form trailing punctuation before a delimiter or the end of the value; internal punctuation
-remains part of the redacted credential. CGI authorization labels, including repeated `REDIRECT_` prefixes, plus
-camelCase, snake_case, and hyphenated proxy/header aliases are recognized. The bounded `HeadersList.headersMap`
-`name`/`value` representation accepts bare, quoted, or escaped keys in either property order. The logger also redacts
-decodable free-text Basic credentials, token-like free-text Bearer values, and query strings, including nested diagnostic
-values. Raw fields are bounded before one full
+structural delimiter, including an ampersand-separated field, even when a malformed quote is left open. Periods,
+exclamation points, and question marks are preserved only when they form trailing punctuation before a delimiter or the
+end of the value; internal punctuation remains part of the redacted credential. Authorization labels accept arbitrary
+hyphen- or underscore-delimited prefixes, including CGI `HTTP_`/`REDIRECT_`, upstream, and `x-` forms, while rejecting
+labels embedded inside an ordinary word. The bounded `HeadersList.headersMap` `name`/`value` representation accepts
+bare, quoted, or escaped keys in either property order and pairs only fields in the same containing object, even when
+nested metadata appears between them. The logger also redacts decodable free-text Basic credentials, credential-like
+free-text Bearer values (including malformed values with internal `!` or `?`), and query strings, including nested
+diagnostic values. Raw fields are bounded before one full
 redaction scan; later truncation and nested compaction operate on already-sanitized text and scrub only recognizable
 partial Basic or Bearer credentials, emails, and secret prefixes at the cut boundary. Complete redaction and omission
-markers are atomic, so sanitizing an already-sanitized value is idempotent. Complete unlabeled malformed Basic values,
-ordinary Basic prose, and short alphabetic Bearer prose remain unchanged, so never put authorization headers or
-credentials in diagnostic text.
+markers, including a following truncation marker, are atomic, so sanitizing an already-sanitized value is idempotent.
+Complete unlabeled malformed Basic values, ordinary Basic prose, and short alphabetic Bearer prose remain unchanged, so
+never put authorization headers or credentials in diagnostic text.
 Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to
 Analytics Engine. HTTP metric operations use Hono's registered route template, fixed Party templates, or
 `/unmatched`; they never derive a route value from request path segments.
