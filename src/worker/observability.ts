@@ -357,7 +357,9 @@ function authorizationValueAt(value: string, start: number, inheritedDelimiter?:
   const opening = consumeOpeningValueWrappers(value, start);
   const markerEnd = value.startsWith(REDACTED_VALUE, opening.cursor)
     ? opening.cursor + REDACTED_VALUE.length
-    : undefined;
+    : value.startsWith(TRUNCATION_MARKER, opening.cursor)
+      ? opening.cursor + TRUNCATION_MARKER.length
+      : undefined;
   if (markerEnd !== undefined) {
     const completeMarkerEnd = completeSanitizationMarkerEnd(value, markerEnd);
     if (completeMarkerEnd !== undefined) return { resumeAt: completeMarkerEnd };

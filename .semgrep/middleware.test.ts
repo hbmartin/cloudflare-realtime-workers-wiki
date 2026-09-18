@@ -10,9 +10,8 @@ declare const appModule: any;
 declare const holder: any;
 declare const c: any;
 declare const admin: any;
+declare function register(value: any): void;
 declare function registerMetricMiddleware(target: any, path: string, middleware: any): void;
-declare function consumeUse(target: any): void;
-declare function inspect(target: any): void;
 
 function install(target: any) {
   // ruleid: worker-hono-direct-middleware-registration
@@ -40,9 +39,9 @@ notionApi[method]("/v1/pages", handler);
 other["use"]("*", middleware);
 
 // ruleid: worker-hono-use-alias
-const register = app.use;
-void register;
-// ruleid: worker-hono-registration-alias
+const useAlias = app.use;
+void useAlias;
+// ruleid: worker-hono-app-escape
 const onRegister = app.on;
 void onRegister;
 // ruleid: worker-hono-use-alias
@@ -60,14 +59,14 @@ void destructuredUse;
 // ruleid: worker-hono-use-alias
 (0, app.use)("*", middleware);
 // ruleid: worker-hono-use-alias
-const methodHolder = { register: notionApi.use };
-void methodHolder;
+const useObject = { register: notionApi.use };
+void useObject;
 // ruleid: worker-hono-use-alias
-consumeUse(app.use);
-// ruleid: worker-hono-registration-destructure
+register(app.use);
+// ruleid: worker-hono-app-escape
 const { get } = notionApi;
 void get;
-// ruleid: worker-hono-app-alias
+// ruleid: worker-hono-app-escape
 const appAlias = app;
 void appAlias;
 
@@ -93,41 +92,39 @@ void DestructuredHono;
 class HonoSubclass extends Hono {}
 void HonoSubclass;
 // ruleid: worker-hono-subclass
-const AnonymousHonoSubclass = new (class extends Hono {})();
-void AnonymousHonoSubclass;
-// ruleid: worker-hono-constructor-escape
-inspect(Hono);
-// ruleid: worker-hono-constructor-escape
-const constructorHolder = { constructor: Hono };
-void constructorHolder;
-// ruleid: worker-hono-constructor-array
+const anonymousSubclass = new (class extends Hono {})();
+void anonymousSubclass;
+// ruleid: worker-hono-constructor-alias
+register(Hono);
+// ruleid: worker-hono-constructor-alias
+const constructorObject = { value: Hono };
+void constructorObject;
+// ruleid: worker-hono-constructor-alias
 const constructorArray = [Hono];
 void constructorArray;
-// ok: worker-hono-app-alias
-const memberAppAlias = appModule.notionApi;
-void memberAppAlias;
-// ok: worker-hono-app-alias
-const { notionApi: destructuredAppAlias } = appModule;
-void destructuredAppAlias;
-// ruleid: worker-hono-app-container
-export { notionApi as exportedAppAlias };
-let assignedApp: any;
-// ruleid: worker-hono-app-assignment
-assignedApp = app;
-void assignedApp;
-// ruleid: worker-hono-app-container
+
+// ruleid: worker-hono-app-escape
 holder.ref = app;
-// ruleid: worker-hono-app-container
-const appHolder = { ref: app };
-void appHolder;
-// ruleid: worker-hono-app-container
-const shorthandAppHolder = { app };
-void shorthandAppHolder;
-// ruleid: worker-hono-app-array
+// ruleid: worker-hono-app-escape
+const appObject = { ref: app };
+void appObject;
+// ruleid: worker-hono-app-escape
 const appArray = [app];
 void appArray;
-// ruleid: worker-hono-app-container
+// ruleid: worker-hono-app-escape
+export { notionApi as exportedAppAlias };
+// ruleid: worker-hono-app-escape
 export default app;
+
+// ok: worker-hono-app-escape
+const requestApp = c.req.app;
+void requestApp;
+// ok: worker-hono-app-escape
+const adminApp = admin.app;
+void adminApp;
+// ok: worker-hono-app-escape
+const unrelatedMember = appModule.notionApi;
+void unrelatedMember;
 
 // ok: worker-hono-direct-middleware-registration
 // ok: worker-hono-multiple-handlers
@@ -141,19 +138,17 @@ other.use(middleware);
 other.on("event", handler);
 // ok: worker-hono-direct-middleware-registration
 other.all();
-// ok: worker-hono-app-alias
-const requestApp = c.req.app;
-void requestApp;
-// ok: worker-hono-app-alias
-const adminApp = admin.app;
-void adminApp;
 // ok: worker-hono-app-escape
 registerMetricMiddleware(app, "*", middleware);
 // ok: worker-hono-app-escape
 app.route("/v1", notionApi);
 // ruleid: worker-hono-import-alias
 import { Hono as RenamedHono } from "hono";
+// ruleid: worker-hono-constructor-alias
 void RenamedHono;
 // ruleid: worker-hono-known-app-import-alias
 import { notionApi as renamedNotionApi } from "./notion-api";
 void renamedNotionApi;
+// ruleid: worker-hono-known-app-import-alias
+import * as notionModule from "./notion-api";
+void notionModule;

@@ -184,6 +184,7 @@ describe("worker observability", () => {
     expect(safeTelemetryErrorMessage(new Error("Bearer abc!secretpartlongvalue"), "fallback")).toBe(
       "Bearer [redacted]",
     );
+    expect(safeTelemetryErrorMessage(new Error("Bearer abc123!?"), "fallback")).toBe("Bearer [redacted]!?");
     for (const delimiter of [":", "\\", ">", "`", "&", "%", "*", "|"]) {
       expect(safeTelemetryErrorMessage(new Error(`Bearer abc123${delimiter} expired`), "fallback")).toBe(
         `Bearer [redacted]${delimiter} expired`,
@@ -275,11 +276,20 @@ describe("worker observability", () => {
         "HeadersList { headersMap: Map(1) { 'proxy-authorization' => { name: 'proxy-authorization', value: 'Basic [redacted]' } } }",
       ],
       ['{"name":"authorization","value":"Bearer abc"}', '{"name":"authorization","value":"Bearer [redacted]"}'],
+      ['{"name":"x-authorization","value":"Bearer abc"}', '{"name":"x-authorization","value":"Bearer [redacted]"}'],
       [
         '{"name":"authorization","status":401,"value":"Bearer abc"}',
         '{"name":"authorization","status":401,"value":"Bearer [redacted]"}',
       ],
+      [
+        '{"name":"authorization","meta":{"status":401},"value":"Bearer abc"}',
+        '{"name":"authorization","meta":{"status":401},"value":"Bearer [redacted]"}',
+      ],
       ['{"value":"Bearer abc","name":"authorization"}', '{"value":"Bearer [redacted]","name":"authorization"}'],
+      [
+        '{"value":"Bearer abc","meta":{"status":401},"name":"authorization"}',
+        '{"value":"Bearer [redacted]","meta":{"status":401},"name":"authorization"}',
+      ],
       [
         '{ value: "Basic badtoken", status: 401, name: "proxy_authorization" }',
         '{ value: "Basic [redacted]", status: 401, name: "proxy_authorization" }',
@@ -400,6 +410,7 @@ describe("worker observability", () => {
       ["Authorization: Bearer abc...secret", "Authorization: Bearer [redacted]"],
       ["Authorization: Bearer abc123.!?", "Authorization: Bearer [redacted].!?"],
       ["authorization=Bearer word!&other=1", "authorization=Bearer [redacted]!&other=1"],
+      ["authorization=Bearer word?&other=1", "authorization=Bearer [redacted]?&other=1"],
       ['Authorization: Bearer "abc def"', 'Authorization: Bearer "[redacted] def"'],
       ["Authorization: Bearer [] after", "Authorization: Bearer [] after"],
       ["Authorization: Bearer    ", "Authorization: Bearer"],
@@ -563,6 +574,20 @@ describe("worker observability", () => {
       expect(result.match(/…\[truncated\]/g)).toHaveLength(1);
       expect(isWellFormed(result)).toBe(true);
     }
+  });
+
+  it("keeps an existing truncation marker intact across repeated sanitization", () => {
+    const raw = `${"x".repeat(960)} Authorization: Bearer abc${"tail".repeat(100)}`;
+    const once = safeTelemetryErrorMessage(new Error(raw), "fallback");
+    const twice = safeTelemetryErrorMessage(new Error(once), "fallback");
+
+    expect(once).toMatch(/…\[truncated\]$/);
+    expect(once.match(/…\[truncated\]/g)).toHaveLength(1);
+    expect(twice).toBe(once);
+    expect(twice).not.toMatch(/\]\]$/);
+    expect(safeTelemetryErrorMessage(new Error("Authorization: Bearer …[truncated]secret"), "fallback")).toBe(
+      "Authorization: Bearer [redacted]",
+    );
   });
 
   it("re-bounds raw strings that grow during redaction", () => {
