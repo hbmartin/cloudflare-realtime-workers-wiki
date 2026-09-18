@@ -478,3 +478,59 @@ test("enforces viewer UI permissions and table edit leases", async ({ browser, p
     await editorContext.close();
   }
 });
+
+test("scrolls overflowing sidebar page collections while keeping its chrome fixed @mobile-sidebar", async ({
+  page,
+}) => {
+  await signIn(page);
+  const spaceId = await page.getByLabel("Current space").inputValue();
+  const overflowPages = Array.from({ length: 12 }, (_, index) => ({
+    id: `5d1ebad0-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    kind: "document",
+    parentId: null,
+    spaceId,
+    title: `Sidebar overflow ${String(index + 1).padStart(2, "0")}`,
+  }));
+  const batch = await page.request.post("/api/pages/batch", { data: { pages: overflowPages } });
+  expect(batch.ok()).toBe(true);
+  for (const overflowPage of overflowPages) {
+    const favorite = await page.request.post(`/api/favorites/${overflowPage.id}`);
+    expect(favorite.ok()).toBe(true);
+    const pin = await page.request.post(`/api/spaces/${spaceId}/pins/${overflowPage.id}`);
+    expect(pin.ok()).toBe(true);
+  }
+
+  await page.reload({ waitUntil: "networkidle" });
+  await expect(page.getByLabel("Page title")).toBeVisible();
+  await openSidebar(page);
+
+  const sidebar = page.getByLabel("Workspace navigation");
+  const scrollRegion = sidebar.locator(".sidebar-scroll-region");
+  const header = sidebar.locator(".workspace-header");
+  const footer = sidebar.locator(".sidebar-footer");
+  await expect.poll(() => scrollRegion.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+  const initialChrome = await Promise.all([header.boundingBox(), footer.boundingBox()]);
+  expect(initialChrome[0]).not.toBeNull();
+  expect(initialChrome[1]).not.toBeNull();
+
+  await scrollRegion.hover();
+  const initialScrollTop = await scrollRegion.evaluate((element) => element.scrollTop);
+  await page.mouse.wheel(0, 600);
+  await expect.poll(() => scrollRegion.evaluate((element) => element.scrollTop)).toBeGreaterThan(initialScrollTop);
+  const scrolledChrome = await Promise.all([header.boundingBox(), footer.boundingBox()]);
+  expect(Math.abs(scrolledChrome[0]!.y - initialChrome[0]!.y)).toBeLessThan(1);
+  expect(Math.abs(scrolledChrome[1]!.y - initialChrome[1]!.y)).toBeLessThan(1);
+
+  const favorites = page.getByLabel("Favorites");
+  const pins = page.getByLabel("Pinned");
+  const tree = sidebar.locator(".tree-root");
+  const trash = sidebar.getByRole("button", { name: /Trash/ });
+  for (const target of [favorites, pins, tree, trash]) {
+    await target.scrollIntoViewIfNeeded();
+    await expect(target).toBeInViewport();
+  }
+  const tailPage = treeLink(page, "Sidebar overflow 12");
+  await tailPage.scrollIntoViewIfNeeded();
+  await expect(tailPage).toBeInViewport();
+  expect(await scrollRegion.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+});

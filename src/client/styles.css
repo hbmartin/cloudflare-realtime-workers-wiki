@@ -271,15 +271,25 @@ select:focus-visible {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   position: relative;
   z-index: 10;
 }
 .workspace-header {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 8px;
   min-height: 52px;
+}
+.sidebar-scroll-region {
+  min-height: 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
 }
 .workspace-header > div {
   min-width: 0;
@@ -469,8 +479,8 @@ select:focus-visible {
 }
 .tree-root {
   min-height: 70px;
-  overflow-y: auto;
-  flex: 1;
+  overflow: visible;
+  flex: 1 0 auto;
 }
 .tree-row {
   min-height: 30px;
@@ -539,6 +549,7 @@ select:focus-visible {
   color: var(--muted);
 }
 .sidebar-footer {
+  flex: 0 0 auto;
   border-top: 1px solid #ddd9d0;
   margin-top: 8px;
   padding: 8px 2px 0;
