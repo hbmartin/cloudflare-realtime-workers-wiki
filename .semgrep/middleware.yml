@@ -58,21 +58,33 @@ rules:
           - pattern: app
           - pattern-not-inside: const app = ...
           - pattern-not-inside: let app = ...
-          - pattern-not-inside: app.$METHOD(...)
-          - pattern-not-inside: app[$METHOD](...)
+          - pattern-not-inside: app.$METHOD
+          - pattern-not-inside: app[$METHOD]
           - pattern-not-inside: registerMetricMiddleware(app, ...)
-          - pattern-not-inside: app.use
-          - pattern-not-inside: app["use"]
       - patterns:
           - pattern: notionApi
           - pattern-not-inside: const notionApi = ...
           - pattern-not-inside: let notionApi = ...
-          - pattern-not-inside: notionApi.$METHOD(...)
-          - pattern-not-inside: notionApi[$METHOD](...)
+          - pattern-not-inside: notionApi.$METHOD
+          - pattern-not-inside: notionApi[$METHOD]
           - pattern-not-inside: registerMetricMiddleware(notionApi, ...)
           - pattern-not-inside: app.route(..., notionApi, ...)
-          - pattern-not-inside: notionApi.use
-          - pattern-not-inside: notionApi["use"]
+      - patterns:
+          - pattern-either:
+              - pattern: app.$METHOD
+              - pattern: app[$METHOD]
+          - pattern-not-inside: app.$METHOD(...)
+          - pattern-not-inside: app[$METHOD](...)
+          - pattern-not: app.use
+          - pattern-not: app["use"]
+      - patterns:
+          - pattern-either:
+              - pattern: notionApi.$METHOD
+              - pattern: notionApi[$METHOD]
+          - pattern-not-inside: notionApi.$METHOD(...)
+          - pattern-not-inside: notionApi[$METHOD](...)
+          - pattern-not: notionApi.use
+          - pattern-not: notionApi["use"]
 
   - id: worker-hono-construction
     languages: [typescript]

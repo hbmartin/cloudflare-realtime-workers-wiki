@@ -11,6 +11,7 @@ declare const holder: any;
 declare const c: any;
 declare const admin: any;
 declare function register(value: any): void;
+declare function leak(value: any): void;
 declare function registerMetricMiddleware(target: any, path: string, middleware: any): void;
 
 function install(target: any) {
@@ -30,10 +31,10 @@ app.get("/api/pages", middleware, handler);
 // ruleid: worker-hono-multiple-handlers
 notionApi.post("/v1/pages", middleware, handler);
 
-// ruleid: worker-hono-computed-registration
-app[method]("/api/pages", handler);
-// ruleid: worker-hono-computed-registration
-notionApi[method]("/v1/pages", handler);
+// ruleid: worker-hono-computed-registration, worker-hono-app-escape
+app[method]("/api/pages", () => leak(app));
+// ruleid: worker-hono-computed-registration, worker-hono-app-escape
+notionApi[method]("/v1/pages", () => leak(notionApi));
 
 // ruleid: worker-hono-computed-registration
 other["use"]("*", middleware);
@@ -132,6 +133,14 @@ app.get("/api/pages", handler);
 // ok: worker-hono-direct-middleware-registration
 // ok: worker-hono-multiple-handlers
 notionApi.post("/v1/pages", handler);
+// ok: worker-hono-direct-middleware-registration
+// ok: worker-hono-multiple-handlers
+// ruleid: worker-hono-app-escape
+app.get("/api/leak", () => leak(app));
+// ok: worker-hono-direct-middleware-registration
+// ok: worker-hono-multiple-handlers
+// ruleid: worker-hono-app-escape
+notionApi.get("/v1/leak", () => leak(notionApi));
 // ruleid: worker-hono-direct-middleware-registration
 other.use(middleware);
 // ok: worker-hono-direct-middleware-registration

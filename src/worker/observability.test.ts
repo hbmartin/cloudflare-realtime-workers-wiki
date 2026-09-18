@@ -432,6 +432,38 @@ describe("worker observability", () => {
     );
   });
 
+  it("preserves complete atomic markers after labeled credentials without trusting suffixed markers", () => {
+    const markers = [
+      "[redacted]",
+      "[redacted-email]",
+      "[redacted-secret]",
+      "…[truncated]",
+      "[entries omitted]",
+      "[value omitted]",
+      "[property omitted]",
+      "[depth omitted]",
+      "[circular]",
+      "[object omitted]",
+      "[empty key]",
+      "[function omitted]",
+      "[symbol omitted]",
+    ];
+
+    for (const marker of markers) {
+      const expected = `Authorization: Bearer [redacted]${marker}`;
+      const once = safeTelemetryErrorMessage(new Error(`Authorization: Bearer abc${marker}`), "fallback");
+      expect(once).toBe(expected);
+      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(expected);
+      expect(safeTelemetryErrorMessage(new Error(`Authorization: Bearer abc${marker}secret`), "fallback")).toBe(
+        "Authorization: Bearer [redacted]",
+      );
+    }
+
+    expect(safeTelemetryErrorMessage(new Error("Authorization: Bearer abc…[truncated]"), "fallback")).toBe(
+      "Authorization: Bearer [redacted]…[truncated]",
+    );
+  });
+
   it("applies escaped authorization labels to nested fields and error stacks", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {

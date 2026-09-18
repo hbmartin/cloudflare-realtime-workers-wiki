@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { resolve } from "node:path";
 import AxeBuilder from "@axe-core/playwright";
@@ -482,26 +481,31 @@ test("enforces viewer UI permissions and table edit leases", async ({ browser, p
 
 test("scrolls overflowing sidebar page collections while keeping its chrome fixed @mobile-sidebar", async ({
   page,
-}) => {
+}, testInfo) => {
   await signIn(page);
   const spaceId = await page.getByLabel("Current space").inputValue();
   const overflowPages = Array.from({ length: 12 }, (_, index) => ({
-    id: randomUUID(),
+    id: `5d1ebad0-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
     kind: "document",
     parentId: null,
     spaceId,
     title: `Sidebar overflow ${String(index + 1).padStart(2, "0")}`,
   }));
+  let testFailure: unknown;
   try {
     const batch = await page.request.post("/api/pages/batch", { data: { pages: overflowPages } });
     expect(batch.ok()).toBe(true);
-    const relationships = await Promise.all(
+    const relationships = await Promise.allSettled(
       overflowPages.flatMap((overflowPage) => [
         page.request.post(`/api/favorites/${overflowPage.id}`),
         page.request.post(`/api/spaces/${spaceId}/pins/${overflowPage.id}`),
       ]),
     );
-    for (const response of relationships) expect(response.ok()).toBe(true);
+    const relationshipFailures = relationships.flatMap((result, index) => {
+      if (result.status === "rejected") return [`request ${index + 1}: ${String(result.reason)}`];
+      return result.value.ok() ? [] : [`request ${index + 1}: HTTP ${result.value.status()}`];
+    });
+    expect(relationshipFailures, "sidebar overflow relationship setup failed").toEqual([]);
 
     await page.reload();
     await expect(page.getByLabel("Page title")).toBeVisible();
@@ -520,20 +524,56 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
     const pins = page.getByLabel("Pinned");
     const tree = sidebar.locator(".tree-root");
     const trash = sidebar.getByRole("button", { name: /Trash/ });
+    const currentSpace = page.getByLabel("Current space");
     const focusTargets = [
+      currentSpace,
+      sidebar.getByRole("button", { name: "Create space" }),
       sidebar.getByRole("button", { name: /Search/ }),
       favorites.getByRole("button").first(),
       pins.getByRole("button").first(),
       trash,
     ];
+    const minimumFocusClearance = 3.5;
     for (const target of focusTargets) {
+      await scrollRegion.evaluate((element) => {
+        element.scrollLeft = 0;
+      });
       await target.scrollIntoViewIfNeeded();
-      const [regionBox, targetBox] = await Promise.all([scrollRegion.boundingBox(), target.boundingBox()]);
+      expect(await scrollRegion.evaluate((element) => element.scrollLeft)).toBe(0);
+      const [regionBox, targetBox, clientWidth] = await Promise.all([
+        scrollRegion.boundingBox(),
+        target.boundingBox(),
+        scrollRegion.evaluate((element) => element.clientWidth),
+      ]);
       expect(regionBox).not.toBeNull();
       expect(targetBox).not.toBeNull();
-      expect(targetBox!.x - regionBox!.x).toBeGreaterThanOrEqual(4);
-      expect(regionBox!.x + regionBox!.width - targetBox!.x - targetBox!.width).toBeGreaterThanOrEqual(4);
+      expect(targetBox!.x - regionBox!.x).toBeGreaterThanOrEqual(minimumFocusClearance);
+      expect(regionBox!.x + clientWidth - targetBox!.x - targetBox!.width).toBeGreaterThanOrEqual(
+        minimumFocusClearance,
+      );
     }
+
+    await scrollRegion.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    const [topRegionBox, currentSpaceBox] = await Promise.all([scrollRegion.boundingBox(), currentSpace.boundingBox()]);
+    expect(topRegionBox).not.toBeNull();
+    expect(currentSpaceBox).not.toBeNull();
+    expect(currentSpaceBox!.y - topRegionBox!.y).toBeGreaterThanOrEqual(minimumFocusClearance);
+
+    await scrollRegion.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+    });
+    const [bottomRegionBox, trashBox, clientHeight] = await Promise.all([
+      scrollRegion.boundingBox(),
+      trash.boundingBox(),
+      scrollRegion.evaluate((element) => element.clientHeight),
+    ]);
+    expect(bottomRegionBox).not.toBeNull();
+    expect(trashBox).not.toBeNull();
+    expect(bottomRegionBox!.y + clientHeight - trashBox!.y - trashBox!.height).toBeGreaterThanOrEqual(
+      minimumFocusClearance,
+    );
 
     await scrollRegion.evaluate((element) => {
       element.scrollTop = 0;
@@ -554,30 +594,38 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
     await tailPage.scrollIntoViewIfNeeded();
     await expect(tailPage).toBeInViewport();
     expect(await scrollRegion.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  } catch (error) {
+    testFailure = error;
+    throw error;
   } finally {
     const cleanupFailures: string[] = [];
-    const relationshipCleanup = await Promise.all(
-      overflowPages.flatMap((overflowPage) => [
-        page.request.delete(`/api/favorites/${overflowPage.id}`),
-        page.request.delete(`/api/spaces/${spaceId}/pins/${overflowPage.id}`),
-      ]),
-    );
-    for (const response of relationshipCleanup) {
-      if (!response.ok() && response.status() !== 404) cleanupFailures.push(`relationship: ${response.status()}`);
-    }
-    const archiveResponses = await Promise.all(
+    const archiveResponses = await Promise.allSettled(
       overflowPages.map((overflowPage) => page.request.delete(`/api/pages/${overflowPage.id}`)),
     );
-    const archivedPages = overflowPages.filter((_, index) => archiveResponses[index]!.ok());
-    for (const response of archiveResponses) {
-      if (!response.ok() && response.status() !== 404) cleanupFailures.push(`archive: ${response.status()}`);
-    }
-    const deleteResponses = await Promise.all(
+    const archivedPages = overflowPages.filter((_, index) => {
+      const result = archiveResponses[index]!;
+      if (result.status === "rejected") {
+        cleanupFailures.push(`archive: ${String(result.reason)}`);
+        return false;
+      }
+      if (result.value.ok()) return true;
+      if (result.value.status() !== 404) cleanupFailures.push(`archive: HTTP ${result.value.status()}`);
+      return false;
+    });
+    const deleteResponses = await Promise.allSettled(
       archivedPages.map((overflowPage) => page.request.post(`/api/pages/${overflowPage.id}/permanent-delete`)),
     );
-    for (const response of deleteResponses) {
-      if (!response.ok() && response.status() !== 404) cleanupFailures.push(`permanent delete: ${response.status()}`);
+    for (const result of deleteResponses) {
+      if (result.status === "rejected") {
+        cleanupFailures.push(`permanent delete: ${String(result.reason)}`);
+      } else if (!result.value.ok() && result.value.status() !== 404) {
+        cleanupFailures.push(`permanent delete: HTTP ${result.value.status()}`);
+      }
     }
-    expect(cleanupFailures, "sidebar overflow test cleanup failed").toEqual([]);
+    if (cleanupFailures.length > 0 && testFailure !== undefined) {
+      testInfo.annotations.push({ type: "cleanup failure", description: cleanupFailures.join("; ") });
+    } else {
+      expect(cleanupFailures, "sidebar overflow test cleanup failed").toEqual([]);
+    }
   }
 });
