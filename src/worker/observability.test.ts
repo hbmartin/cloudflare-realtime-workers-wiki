@@ -8,6 +8,7 @@ import {
 } from "../shared/error-log";
 import type { Env } from "./env";
 import {
+  ATOMIC_SANITIZATION_MARKERS,
   OBSERVABILITY_SCHEMA,
   boundedNestedJson,
   logger,
@@ -429,6 +430,41 @@ describe("worker observability", () => {
     expect(twice).toBe(once);
     expect(safeTelemetryErrorMessage(new Error("Authorization: Bearer [redacted]…[truncated]secret"), "fallback")).toBe(
       "Authorization: Bearer [redacted]",
+    );
+  });
+
+  it("does not expose plain Bearer suffixes appended to sanitization markers", () => {
+    expect(safeTelemetryErrorMessage(new Error("Bearer [redacted]abcdefghijklmnopqrstuvwxyz0123"), "fallback")).toBe(
+      "Bearer [redacted]",
+    );
+    expect(safeTelemetryErrorMessage(new Error("Bearer [redacted]"), "fallback")).toBe("Bearer [redacted]");
+    expect(
+      safeTelemetryErrorMessage(new Error("Bearer [redacted]…[truncated]abcdefghijklmnopqrstuvwxyz0123"), "fallback"),
+    ).toBe("Bearer [redacted]");
+  });
+
+  it("preserves truncated redactions through serialized JSON layers", () => {
+    const message = "Authorization: Bearer [redacted]…[truncated]";
+    const serialized = JSON.stringify({ message });
+    const doubleSerialized = JSON.stringify(serialized);
+
+    expect(safeTelemetryErrorMessage(new Error(serialized), "fallback")).toBe(serialized);
+    expect(safeTelemetryErrorMessage(new Error(doubleSerialized), "fallback")).toBe(doubleSerialized);
+  });
+
+  it("preserves complete atomic markers after labeled credentials without trusting suffixed markers", () => {
+    for (const marker of ATOMIC_SANITIZATION_MARKERS) {
+      const expected = `Authorization: Bearer [redacted]${marker}`;
+      const once = safeTelemetryErrorMessage(new Error(`Authorization: Bearer abc${marker}`), "fallback");
+      expect(once).toBe(expected);
+      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(expected);
+      expect(safeTelemetryErrorMessage(new Error(`Authorization: Bearer abc${marker}secret`), "fallback")).toBe(
+        "Authorization: Bearer [redacted]",
+      );
+    }
+
+    expect(safeTelemetryErrorMessage(new Error("Authorization: Bearer abc…[truncated]"), "fallback")).toBe(
+      "Authorization: Bearer [redacted]…[truncated]",
     );
   });
 

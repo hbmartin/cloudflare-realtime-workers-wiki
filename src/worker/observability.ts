@@ -59,6 +59,22 @@ const OBJECT_OMITTED = "[object omitted]";
 const EMPTY_KEY = "[empty key]";
 const FUNCTION_OMITTED = "[function omitted]";
 const SYMBOL_OMITTED = "[symbol omitted]";
+/** @internal Exported so focused tests cover every production sanitization marker. */
+export const ATOMIC_SANITIZATION_MARKERS = [
+  REDACTED_VALUE,
+  "[redacted-email]",
+  "[redacted-secret]",
+  TRUNCATION_MARKER,
+  OMITTED_ENTRIES,
+  OMITTED_VALUE,
+  PROPERTY_OMITTED,
+  DEPTH_OMITTED,
+  CIRCULAR_VALUE,
+  OBJECT_OMITTED,
+  EMPTY_KEY,
+  FUNCTION_OMITTED,
+  SYMBOL_OMITTED,
+] as const;
 const RESERVED_LOG_FIELDS = new Set([
   "schema",
   "event",
@@ -213,11 +229,22 @@ function redactBearerValues(value: string) {
   let match = BEARER_VALUE_PREFIX.exec(value);
   while (match) {
     const tokenStart = BEARER_VALUE_PREFIX.lastIndex;
-    const tokenEnd = bearerCandidateEnd(value, tokenStart);
-    const token = value.slice(tokenStart, tokenEnd);
+    const marker = sanitizationMarkerAt(value, tokenStart);
+    if (marker?.trusted) {
+      BEARER_VALUE_PREFIX.lastIndex = marker.end;
+      match = BEARER_VALUE_PREFIX.exec(value);
+      continue;
+    }
+    const candidateStart = marker?.end ?? tokenStart;
+    const tokenEnd = bearerCandidateEnd(value, candidateStart);
+    const token = value.slice(candidateStart, tokenEnd);
     const trailingPunctuation = token.match(/[.!?]+$/)?.[0] ?? "";
     const candidate = token.slice(0, token.length - trailingPunctuation.length);
-    if (candidate.length >= 16 || /[0-9._~+/=-]/.test(candidate)) {
+    if (
+      (marker !== undefined && tokenEnd > candidateStart) ||
+      candidate.length >= 16 ||
+      /[0-9._~+/=-]/.test(candidate)
+    ) {
       parts.push(value.slice(cursor, tokenStart), REDACTED_VALUE, trailingPunctuation);
       cursor = tokenEnd;
     }
@@ -263,7 +290,7 @@ function consumeOpeningValueWrappers(value: string, start: number) {
   let cursor = start;
   while (cursor < value.length) {
     while (value[cursor] === " " || value[cursor] === "\t") cursor += 1;
-    if (cursor >= value.length || value.startsWith(REDACTED_VALUE, cursor)) {
+    if (cursor >= value.length || ATOMIC_SANITIZATION_MARKERS.some((marker) => value.startsWith(marker, cursor))) {
       return { cursor, delimiter: undefined };
     }
     if ("[({".includes(value[cursor]!)) {
@@ -310,11 +337,38 @@ function credentialBoundaryAt(value: string, index: number) {
   };
 }
 
+function sanitizationMarkerAt(value: string, index: number, delimiter?: QuoteDelimiter) {
+  const marker = ATOMIC_SANITIZATION_MARKERS.find((candidate) => value.startsWith(candidate, index));
+  if (!marker) return undefined;
+  let end = index + marker.length;
+  if (marker !== TRUNCATION_MARKER && value.startsWith(TRUNCATION_MARKER, end)) end += TRUNCATION_MARKER.length;
+  const suffix = value[end];
+  let quoteIndex = end;
+  while (value[quoteIndex] === "\\") quoteIndex += 1;
+  const escapedClosingQuote = quoteIndex > end && quoteEndsCredentialAt(value, quoteIndex, delimiter);
+  return {
+    end,
+    trusted: suffix === '"' || suffix === "'" || escapedClosingQuote || credentialBoundaryAt(value, end).boundary,
+  };
+}
+
+function quoteEndsCredentialAt(value: string, index: number, delimiter: QuoteDelimiter | undefined) {
+  const character = value[index];
+  if (character !== '"' && character !== "'") return false;
+  return delimiter === undefined || character !== delimiter.quote || quoteCloses(delimiter, value, index);
+}
+
 function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDelimiter | undefined) {
   for (let index = start; index < value.length;) {
+    const marker = sanitizationMarkerAt(value, index, delimiter);
+    if (marker) {
+      if (marker.trusted) return { end: index, resumeAt: marker.end };
+      index = marker.end;
+      continue;
+    }
     const character = value[index]!;
     const boundary = credentialBoundaryAt(value, index);
-    if (boundary.boundary) return index;
+    if (boundary.boundary) return { end: index, resumeAt: index };
     if (boundary.next > index + 1) {
       index = boundary.next;
       continue;
@@ -325,54 +379,31 @@ function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDeli
         continue;
       }
       const backslashes = precedingBackslashes(value, index, start);
-      if (
-        character !== delimiter.quote ||
-        (backslashes % 2 === delimiter.backslashes % 2 &&
-          (delimiter.backslashes === 0 || backslashes <= delimiter.backslashes))
-      ) {
-        return index - backslashes;
+      if (quoteEndsCredentialAt(value, index, delimiter)) {
+        const end = index - backslashes;
+        return { end, resumeAt: end };
       }
       index += 1;
       continue;
     }
     if (character === '"' || character === "'") {
-      return index - precedingBackslashes(value, index, start);
+      const end = index - precedingBackslashes(value, index, start);
+      return { end, resumeAt: end };
     }
     index += 1;
   }
-  return value.length;
+  return { end: value.length, resumeAt: value.length };
 }
 
 type RedactionRange = { start: number; end: number };
 
-function completeSanitizationMarkerEnd(value: string, markerEnd: number) {
-  const completeEnd = value.startsWith(TRUNCATION_MARKER, markerEnd) ? markerEnd + TRUNCATION_MARKER.length : markerEnd;
-  const suffix = value[completeEnd];
-  return suffix === '"' || suffix === "'" || credentialBoundaryAt(value, completeEnd).boundary
-    ? completeEnd
-    : undefined;
-}
-
 function authorizationValueAt(value: string, start: number, inheritedDelimiter?: QuoteDelimiter) {
   const opening = consumeOpeningValueWrappers(value, start);
-  const markerEnd = value.startsWith(REDACTED_VALUE, opening.cursor)
-    ? opening.cursor + REDACTED_VALUE.length
-    : value.startsWith(TRUNCATION_MARKER, opening.cursor)
-      ? opening.cursor + TRUNCATION_MARKER.length
-      : undefined;
-  if (markerEnd !== undefined) {
-    const completeMarkerEnd = completeSanitizationMarkerEnd(value, markerEnd);
-    if (completeMarkerEnd !== undefined) return { resumeAt: completeMarkerEnd };
-  }
   const delimiter = opening.delimiter ?? inheritedDelimiter;
-  const scanStart =
-    markerEnd !== undefined && value.startsWith(TRUNCATION_MARKER, markerEnd)
-      ? markerEnd + TRUNCATION_MARKER.length
-      : (markerEnd ?? opening.cursor);
-  const end = labeledCredentialEnd(value, scanStart, delimiter);
-  return end > opening.cursor
-    ? { range: { start: opening.cursor, end } satisfies RedactionRange, resumeAt: end }
-    : { resumeAt: opening.cursor };
+  const scanned = labeledCredentialEnd(value, opening.cursor, delimiter);
+  return scanned.end > opening.cursor
+    ? { range: { start: opening.cursor, end: scanned.end } satisfies RedactionRange, resumeAt: scanned.resumeAt }
+    : { resumeAt: scanned.resumeAt };
 }
 
 function redactAuthorizationMatches(value: string, pattern: RegExp) {
@@ -548,22 +579,6 @@ function redactKnownValues(value: string) {
   safe = redactBearerValues(safe).replace(SECRET_VALUE, "[redacted-secret]").replace(URL_QUERY, "$1");
   return redactEmails(safe);
 }
-
-const ATOMIC_SANITIZATION_MARKERS = [
-  REDACTED_VALUE,
-  "[redacted-email]",
-  "[redacted-secret]",
-  TRUNCATION_MARKER,
-  OMITTED_ENTRIES,
-  OMITTED_VALUE,
-  PROPERTY_OMITTED,
-  DEPTH_OMITTED,
-  CIRCULAR_VALUE,
-  OBJECT_OMITTED,
-  EMPTY_KEY,
-  FUNCTION_OMITTED,
-  SYMBOL_OMITTED,
-] as const;
 
 const EXACT_SANITIZATION_MARKERS = new Set<string>(ATOMIC_SANITIZATION_MARKERS);
 

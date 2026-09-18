@@ -3,9 +3,19 @@ import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { resolve } from "node:path";
 import AxeBuilder from "@axe-core/playwright";
-import { expect, test, type BrowserContext, type Page } from "@playwright/test";
+import { expect, test, type APIResponse, type BrowserContext, type Page } from "@playwright/test";
 
 import { signInOwner as signIn, completeEnrollment } from "./security-helpers";
+
+function settledRequestFailure(
+  result: PromiseSettledResult<APIResponse>,
+  label: string,
+  acceptedStatuses: readonly number[] = [],
+) {
+  if (result.status === "rejected") return `${label}: ${String(result.reason)}`;
+  const status = result.value.status();
+  return result.value.ok() || acceptedStatuses.includes(status) ? undefined : `${label}: HTTP ${status}`;
+}
 
 async function openSidebar(page: Page) {
   // Below the 760px breakpoint the sidebar is an off-canvas drawer. Decide from
@@ -482,26 +492,37 @@ test("enforces viewer UI permissions and table edit leases", async ({ browser, p
 
 test("scrolls overflowing sidebar page collections while keeping its chrome fixed @mobile-sidebar", async ({
   page,
-}) => {
+}, testInfo) => {
   await signIn(page);
   const spaceId = await page.getByLabel("Current space").inputValue();
+  const runId = randomUUID().slice(0, 8);
   const overflowPages = Array.from({ length: 12 }, (_, index) => ({
     id: randomUUID(),
     kind: "document",
     parentId: null,
     spaceId,
-    title: `Sidebar overflow ${String(index + 1).padStart(2, "0")}`,
+    title: `Sidebar overflow ${String(index + 1).padStart(2, "0")} ${runId}`,
   }));
+  let testFailure: unknown;
   try {
     const batch = await page.request.post("/api/pages/batch", { data: { pages: overflowPages } });
     expect(batch.ok()).toBe(true);
-    const relationships = await Promise.all(
-      overflowPages.flatMap((overflowPage) => [
-        page.request.post(`/api/favorites/${overflowPage.id}`),
-        page.request.post(`/api/spaces/${spaceId}/pins/${overflowPage.id}`),
-      ]),
-    );
-    for (const response of relationships) expect(response.ok()).toBe(true);
+    const relationshipRequests = overflowPages.flatMap((overflowPage) => [
+      {
+        label: `favorite setup ${overflowPage.id}`,
+        request: page.request.post(`/api/favorites/${overflowPage.id}`),
+      },
+      {
+        label: `pin setup ${overflowPage.id}`,
+        request: page.request.post(`/api/spaces/${spaceId}/pins/${overflowPage.id}`),
+      },
+    ]);
+    const relationships = await Promise.allSettled(relationshipRequests.map(({ request }) => request));
+    const relationshipFailures = relationships.flatMap((result, index) => {
+      const failure = settledRequestFailure(result, relationshipRequests[index]!.label);
+      return failure === undefined ? [] : [failure];
+    });
+    expect(relationshipFailures, "sidebar overflow relationship setup failed").toEqual([]);
 
     await page.reload();
     await expect(page.getByLabel("Page title")).toBeVisible();
@@ -520,20 +541,56 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
     const pins = page.getByLabel("Pinned");
     const tree = sidebar.locator(".tree-root");
     const trash = sidebar.getByRole("button", { name: /Trash/ });
+    const currentSpace = page.getByLabel("Current space");
     const focusTargets = [
+      currentSpace,
+      sidebar.getByRole("button", { name: "Create space" }),
       sidebar.getByRole("button", { name: /Search/ }),
-      favorites.getByRole("button").first(),
-      pins.getByRole("button").first(),
+      favorites.getByRole("button", { name: overflowPages[0]!.title, exact: true }),
+      pins.getByRole("button", { name: overflowPages[0]!.title, exact: true }),
       trash,
     ];
+    const minimumFocusClearance = 4;
     for (const target of focusTargets) {
+      await scrollRegion.evaluate((element) => {
+        element.scrollLeft = 0;
+      });
       await target.scrollIntoViewIfNeeded();
-      const [regionBox, targetBox] = await Promise.all([scrollRegion.boundingBox(), target.boundingBox()]);
+      expect(await scrollRegion.evaluate((element) => element.scrollLeft)).toBe(0);
+      const [regionBox, targetBox, clientWidth] = await Promise.all([
+        scrollRegion.boundingBox(),
+        target.boundingBox(),
+        scrollRegion.evaluate((element) => element.clientWidth),
+      ]);
       expect(regionBox).not.toBeNull();
       expect(targetBox).not.toBeNull();
-      expect(targetBox!.x - regionBox!.x).toBeGreaterThanOrEqual(4);
-      expect(regionBox!.x + regionBox!.width - targetBox!.x - targetBox!.width).toBeGreaterThanOrEqual(4);
+      expect(targetBox!.x - regionBox!.x).toBeGreaterThanOrEqual(minimumFocusClearance);
+      expect(regionBox!.x + clientWidth - targetBox!.x - targetBox!.width).toBeGreaterThanOrEqual(
+        minimumFocusClearance,
+      );
     }
+
+    await scrollRegion.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    const [topRegionBox, currentSpaceBox] = await Promise.all([scrollRegion.boundingBox(), currentSpace.boundingBox()]);
+    expect(topRegionBox).not.toBeNull();
+    expect(currentSpaceBox).not.toBeNull();
+    expect(currentSpaceBox!.y - topRegionBox!.y).toBeGreaterThanOrEqual(minimumFocusClearance);
+
+    await scrollRegion.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+    });
+    const [bottomRegionBox, trashBox, clientHeight] = await Promise.all([
+      scrollRegion.boundingBox(),
+      trash.boundingBox(),
+      scrollRegion.evaluate((element) => element.clientHeight),
+    ]);
+    expect(bottomRegionBox).not.toBeNull();
+    expect(trashBox).not.toBeNull();
+    expect(bottomRegionBox!.y + clientHeight - trashBox!.y - trashBox!.height).toBeGreaterThanOrEqual(
+      minimumFocusClearance,
+    );
 
     await scrollRegion.evaluate((element) => {
       element.scrollTop = 0;
@@ -550,34 +607,52 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
       await target.scrollIntoViewIfNeeded();
       await expect(target).toBeInViewport();
     }
-    const tailPage = treeLink(page, "Sidebar overflow 12");
+    const tailPage = treeLink(page, overflowPages.at(-1)!.title);
     await tailPage.scrollIntoViewIfNeeded();
     await expect(tailPage).toBeInViewport();
     expect(await scrollRegion.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  } catch (error) {
+    testFailure = error;
+    throw error;
   } finally {
     const cleanupFailures: string[] = [];
-    const relationshipCleanup = await Promise.all(
-      overflowPages.flatMap((overflowPage) => [
-        page.request.delete(`/api/favorites/${overflowPage.id}`),
-        page.request.delete(`/api/spaces/${spaceId}/pins/${overflowPage.id}`),
-      ]),
+    const relationshipCleanupRequests = overflowPages.flatMap((overflowPage) => [
+      {
+        label: `favorite cleanup ${overflowPage.id}`,
+        request: page.request.delete(`/api/favorites/${overflowPage.id}`),
+      },
+      {
+        label: `pin cleanup ${overflowPage.id}`,
+        request: page.request.delete(`/api/spaces/${spaceId}/pins/${overflowPage.id}`),
+      },
+    ]);
+    const relationshipCleanupResponses = await Promise.allSettled(
+      relationshipCleanupRequests.map(({ request }) => request),
     );
-    for (const response of relationshipCleanup) {
-      if (!response.ok() && response.status() !== 404) cleanupFailures.push(`relationship: ${response.status()}`);
+    for (const [index, result] of relationshipCleanupResponses.entries()) {
+      const failure = settledRequestFailure(result, relationshipCleanupRequests[index]!.label, [404]);
+      if (failure !== undefined) cleanupFailures.push(failure);
     }
-    const archiveResponses = await Promise.all(
+    const archiveResponses = await Promise.allSettled(
       overflowPages.map((overflowPage) => page.request.delete(`/api/pages/${overflowPage.id}`)),
     );
-    const archivedPages = overflowPages.filter((_, index) => archiveResponses[index]!.ok());
-    for (const response of archiveResponses) {
-      if (!response.ok() && response.status() !== 404) cleanupFailures.push(`archive: ${response.status()}`);
-    }
-    const deleteResponses = await Promise.all(
+    const archivedPages = overflowPages.filter((overflowPage, index) => {
+      const result = archiveResponses[index]!;
+      const failure = settledRequestFailure(result, `archive ${overflowPage.id}`, [404]);
+      if (failure !== undefined) cleanupFailures.push(failure);
+      return result.status === "fulfilled" && result.value.ok();
+    });
+    const deleteResponses = await Promise.allSettled(
       archivedPages.map((overflowPage) => page.request.post(`/api/pages/${overflowPage.id}/permanent-delete`)),
     );
-    for (const response of deleteResponses) {
-      if (!response.ok() && response.status() !== 404) cleanupFailures.push(`permanent delete: ${response.status()}`);
+    for (const [index, result] of deleteResponses.entries()) {
+      const failure = settledRequestFailure(result, `permanent delete ${archivedPages[index]!.id}`, [404]);
+      if (failure !== undefined) cleanupFailures.push(failure);
     }
-    expect(cleanupFailures, "sidebar overflow test cleanup failed").toEqual([]);
+    if (cleanupFailures.length > 0 && testFailure !== undefined) {
+      testInfo.annotations.push({ type: "cleanup failure", description: cleanupFailures.join("; ") });
+    } else {
+      expect(cleanupFailures, "sidebar overflow test cleanup failed").toEqual([]);
+    }
   }
 });
