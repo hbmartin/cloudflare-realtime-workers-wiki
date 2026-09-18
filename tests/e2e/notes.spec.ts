@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { resolve } from "node:path";
 import AxeBuilder from "@axe-core/playwright";
@@ -485,52 +486,98 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
   await signIn(page);
   const spaceId = await page.getByLabel("Current space").inputValue();
   const overflowPages = Array.from({ length: 12 }, (_, index) => ({
-    id: `5d1ebad0-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    id: randomUUID(),
     kind: "document",
     parentId: null,
     spaceId,
     title: `Sidebar overflow ${String(index + 1).padStart(2, "0")}`,
   }));
-  const batch = await page.request.post("/api/pages/batch", { data: { pages: overflowPages } });
-  expect(batch.ok()).toBe(true);
-  for (const overflowPage of overflowPages) {
-    const favorite = await page.request.post(`/api/favorites/${overflowPage.id}`);
-    expect(favorite.ok()).toBe(true);
-    const pin = await page.request.post(`/api/spaces/${spaceId}/pins/${overflowPage.id}`);
-    expect(pin.ok()).toBe(true);
+  try {
+    const batch = await page.request.post("/api/pages/batch", { data: { pages: overflowPages } });
+    expect(batch.ok()).toBe(true);
+    const relationships = await Promise.all(
+      overflowPages.flatMap((overflowPage) => [
+        page.request.post(`/api/favorites/${overflowPage.id}`),
+        page.request.post(`/api/spaces/${spaceId}/pins/${overflowPage.id}`),
+      ]),
+    );
+    for (const response of relationships) expect(response.ok()).toBe(true);
+
+    await page.reload();
+    await expect(page.getByLabel("Page title")).toBeVisible();
+    await openSidebar(page);
+
+    const sidebar = page.getByLabel("Workspace navigation");
+    const scrollRegion = sidebar.locator(".sidebar-scroll-region");
+    const header = sidebar.locator(".workspace-header");
+    const footer = sidebar.locator(".sidebar-footer");
+    await expect.poll(() => scrollRegion.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+    const initialChrome = await Promise.all([header.boundingBox(), footer.boundingBox()]);
+    expect(initialChrome[0]).not.toBeNull();
+    expect(initialChrome[1]).not.toBeNull();
+
+    const favorites = page.getByLabel("Favorites");
+    const pins = page.getByLabel("Pinned");
+    const tree = sidebar.locator(".tree-root");
+    const trash = sidebar.getByRole("button", { name: /Trash/ });
+    const focusTargets = [
+      sidebar.getByRole("button", { name: /Search/ }),
+      favorites.getByRole("button").first(),
+      pins.getByRole("button").first(),
+      trash,
+    ];
+    for (const target of focusTargets) {
+      await target.scrollIntoViewIfNeeded();
+      const [regionBox, targetBox] = await Promise.all([scrollRegion.boundingBox(), target.boundingBox()]);
+      expect(regionBox).not.toBeNull();
+      expect(targetBox).not.toBeNull();
+      expect(targetBox!.x - regionBox!.x).toBeGreaterThanOrEqual(4);
+      expect(regionBox!.x + regionBox!.width - targetBox!.x - targetBox!.width).toBeGreaterThanOrEqual(4);
+    }
+
+    await scrollRegion.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    await scrollRegion.hover();
+    const initialScrollTop = await scrollRegion.evaluate((element) => element.scrollTop);
+    await page.mouse.wheel(0, 600);
+    await expect.poll(() => scrollRegion.evaluate((element) => element.scrollTop)).toBeGreaterThan(initialScrollTop);
+    const scrolledChrome = await Promise.all([header.boundingBox(), footer.boundingBox()]);
+    expect(Math.abs(scrolledChrome[0]!.y - initialChrome[0]!.y)).toBeLessThan(1);
+    expect(Math.abs(scrolledChrome[1]!.y - initialChrome[1]!.y)).toBeLessThan(1);
+
+    for (const target of [favorites, pins, tree, trash]) {
+      await target.scrollIntoViewIfNeeded();
+      await expect(target).toBeInViewport();
+    }
+    const tailPage = treeLink(page, "Sidebar overflow 12");
+    await tailPage.scrollIntoViewIfNeeded();
+    await expect(tailPage).toBeInViewport();
+    expect(await scrollRegion.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  } finally {
+    const cleanupFailures: string[] = [];
+    const relationshipCleanup = await Promise.all(
+      overflowPages.flatMap((overflowPage) => [
+        page.request.delete(`/api/favorites/${overflowPage.id}`),
+        page.request.delete(`/api/spaces/${spaceId}/pins/${overflowPage.id}`),
+      ]),
+    );
+    for (const response of relationshipCleanup) {
+      if (!response.ok() && response.status() !== 404) cleanupFailures.push(`relationship: ${response.status()}`);
+    }
+    const archiveResponses = await Promise.all(
+      overflowPages.map((overflowPage) => page.request.delete(`/api/pages/${overflowPage.id}`)),
+    );
+    const archivedPages = overflowPages.filter((_, index) => archiveResponses[index]!.ok());
+    for (const response of archiveResponses) {
+      if (!response.ok() && response.status() !== 404) cleanupFailures.push(`archive: ${response.status()}`);
+    }
+    const deleteResponses = await Promise.all(
+      archivedPages.map((overflowPage) => page.request.post(`/api/pages/${overflowPage.id}/permanent-delete`)),
+    );
+    for (const response of deleteResponses) {
+      if (!response.ok() && response.status() !== 404) cleanupFailures.push(`permanent delete: ${response.status()}`);
+    }
+    expect(cleanupFailures, "sidebar overflow test cleanup failed").toEqual([]);
   }
-
-  await page.reload({ waitUntil: "networkidle" });
-  await expect(page.getByLabel("Page title")).toBeVisible();
-  await openSidebar(page);
-
-  const sidebar = page.getByLabel("Workspace navigation");
-  const scrollRegion = sidebar.locator(".sidebar-scroll-region");
-  const header = sidebar.locator(".workspace-header");
-  const footer = sidebar.locator(".sidebar-footer");
-  await expect.poll(() => scrollRegion.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
-  const initialChrome = await Promise.all([header.boundingBox(), footer.boundingBox()]);
-  expect(initialChrome[0]).not.toBeNull();
-  expect(initialChrome[1]).not.toBeNull();
-
-  await scrollRegion.hover();
-  const initialScrollTop = await scrollRegion.evaluate((element) => element.scrollTop);
-  await page.mouse.wheel(0, 600);
-  await expect.poll(() => scrollRegion.evaluate((element) => element.scrollTop)).toBeGreaterThan(initialScrollTop);
-  const scrolledChrome = await Promise.all([header.boundingBox(), footer.boundingBox()]);
-  expect(Math.abs(scrolledChrome[0]!.y - initialChrome[0]!.y)).toBeLessThan(1);
-  expect(Math.abs(scrolledChrome[1]!.y - initialChrome[1]!.y)).toBeLessThan(1);
-
-  const favorites = page.getByLabel("Favorites");
-  const pins = page.getByLabel("Pinned");
-  const tree = sidebar.locator(".tree-root");
-  const trash = sidebar.getByRole("button", { name: /Trash/ });
-  for (const target of [favorites, pins, tree, trash]) {
-    await target.scrollIntoViewIfNeeded();
-    await expect(target).toBeInViewport();
-  }
-  const tailPage = treeLink(page, "Sidebar overflow 12");
-  await tailPage.scrollIntoViewIfNeeded();
-  await expect(tailPage).toBeInViewport();
-  expect(await scrollRegion.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
 });

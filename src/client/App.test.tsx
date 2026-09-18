@@ -6272,8 +6272,12 @@ describe("App error handling", () => {
     expect(scrollRegion).toContainElement(pinnedSection);
     expect(scrollRegion).toContainElement(document.querySelector(".tree-root"));
     expect(scrollRegion).toContainElement(screen.getByRole("button", { name: /Trash/ }));
-    expect(scrollRegion).not.toContainElement(document.querySelector(".workspace-header"));
-    expect(scrollRegion).not.toContainElement(document.querySelector(".sidebar-footer"));
+    const workspaceHeader = document.querySelector<HTMLElement>(".workspace-header");
+    const sidebarFooter = document.querySelector<HTMLElement>(".sidebar-footer");
+    expect(workspaceHeader).toBeInTheDocument();
+    expect(sidebarFooter).toBeInTheDocument();
+    expect(scrollRegion).not.toContainElement(workspaceHeader);
+    expect(scrollRegion).not.toContainElement(sidebarFooter);
     fireEvent.change(screen.getByLabelText("Add tag"), { target: { value: researchTag.id } });
     expect(await screen.findByRole("button", { name: "Remove Research tag" })).toBeInTheDocument();
     await act(async () => initialPageTags.resolve({ tags: [] }));
