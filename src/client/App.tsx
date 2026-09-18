@@ -3006,121 +3006,123 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             ×
           </button>
         </header>
-        <div className="space-switcher">
-          <label>
-            <span className="visually-hidden">Current space</span>
-            <select
-              aria-label="Current space"
-              value={currentSpaceId}
-              disabled={organizationLoading || spaces.length === 0}
-              onChange={(event) => selectSpace(event.target.value)}
-            >
-              {spaces.length === 0 && currentSpaceId && (
-                <option value={currentSpaceId}>{organizationLoading ? "Loading spaces…" : "Unknown space"}</option>
-              )}
-              {spaces.map((space) => (
-                <option key={space.id} value={space.id}>
-                  {space.visibility === "private" ? "Private · " : ""}
-                  {space.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          {member.role === "owner" && (
-            <button
-              className="space-create-trigger"
-              aria-label="Create space"
-              aria-expanded={spaceFormOpen}
-              onClick={() => setSpaceFormOpen((open) => !open)}
-            >
-              +
-            </button>
-          )}
-        </div>
-        {spaceFormOpen && (
-          <form className="space-create-form" onSubmit={createSpace}>
+        <div className="sidebar-scroll-region">
+          <div className="space-switcher">
             <label>
-              <span>Space name</span>
-              <input name="name" maxLength={100} required autoFocus />
-            </label>
-            <label>
-              <span>Access</span>
-              <select name="visibility" defaultValue="workspace">
-                <option value="workspace">Everyone</option>
-                <option value="private">Private</option>
+              <span className="visually-hidden">Current space</span>
+              <select
+                aria-label="Current space"
+                value={currentSpaceId}
+                disabled={organizationLoading || spaces.length === 0}
+                onChange={(event) => selectSpace(event.target.value)}
+              >
+                {spaces.length === 0 && currentSpaceId && (
+                  <option value={currentSpaceId}>{organizationLoading ? "Loading spaces…" : "Unknown space"}</option>
+                )}
+                {spaces.map((space) => (
+                  <option key={space.id} value={space.id}>
+                    {space.visibility === "private" ? "Private · " : ""}
+                    {space.name}
+                  </option>
+                ))}
               </select>
             </label>
-            <div>
-              <button className="primary-small" disabled={pendingOrganizationAction === "space:create"}>
-                Create
-              </button>
-              <button type="button" className="quiet-button" onClick={() => setSpaceFormOpen(false)}>
-                Cancel
-              </button>
-            </div>
-          </form>
-        )}
-        {organizationLoadError && (
-          <p className="sidebar-load-error">Organization unavailable. Core pages remain usable.</p>
-        )}
-        <nav className="sidebar-nav">
-          <button className={view === "search" ? "active" : ""} onClick={() => showView("search")}>
-            <span>⌕</span> Search
-          </button>
-          <button className={view === "mentions" ? "active" : ""} onClick={() => showView("mentions")}>
-            <span>@</span> Mentions {unreadMentions > 0 && <b className="mention-badge">{unreadMentions}</b>}
-          </button>
-          <button className={view === "templates" ? "active" : ""} onClick={() => showView("templates")}>
-            <span>◇</span> Templates
-          </button>
-          <button className={view === "settings" ? "active" : ""} onClick={() => showView("settings")}>
-            <span>⚙</span> Members &amp; settings
-          </button>
-        </nav>
-        {favorites.length > 0 && (
-          <SidebarPageLinks label="Favorites" pages={favorites} icon="★" onSelect={navigateToPage} />
-        )}
-        {pins.length > 0 && <SidebarPageLinks label="Pinned" pages={pins} icon="⌖" onSelect={navigateToPage} />}
-        <div className="sidebar-section-title">
-          <span>{activeSpace?.name ?? "Pages"}</span>
-          <span className="sidebar-section-actions">
-            {activeSpace && (
-              <WatchControl key={activeSpace.id} resourceType="space" resourceId={activeSpace.id} compact />
-            )}
-            {canEditActiveSpace && (
+            {member.role === "owner" && (
               <button
-                aria-label="Create a root page"
-                disabled={!canCreatePage}
-                onClick={() => void createPage("document", null)}
+                className="space-create-trigger"
+                aria-label="Create space"
+                aria-expanded={spaceFormOpen}
+                onClick={() => setSpaceFormOpen((open) => !open)}
               >
                 +
               </button>
             )}
-          </span>
+          </div>
+          {spaceFormOpen && (
+            <form className="space-create-form" onSubmit={createSpace}>
+              <label>
+                <span>Space name</span>
+                <input name="name" maxLength={100} required autoFocus />
+              </label>
+              <label>
+                <span>Access</span>
+                <select name="visibility" defaultValue="workspace">
+                  <option value="workspace">Everyone</option>
+                  <option value="private">Private</option>
+                </select>
+              </label>
+              <div>
+                <button className="primary-small" disabled={pendingOrganizationAction === "space:create"}>
+                  Create
+                </button>
+                <button type="button" className="quiet-button" onClick={() => setSpaceFormOpen(false)}>
+                  Cancel
+                </button>
+              </div>
+            </form>
+          )}
+          {organizationLoadError && (
+            <p className="sidebar-load-error">Organization unavailable. Core pages remain usable.</p>
+          )}
+          <nav className="sidebar-nav">
+            <button className={view === "search" ? "active" : ""} onClick={() => showView("search")}>
+              <span>⌕</span> Search
+            </button>
+            <button className={view === "mentions" ? "active" : ""} onClick={() => showView("mentions")}>
+              <span>@</span> Mentions {unreadMentions > 0 && <b className="mention-badge">{unreadMentions}</b>}
+            </button>
+            <button className={view === "templates" ? "active" : ""} onClick={() => showView("templates")}>
+              <span>◇</span> Templates
+            </button>
+            <button className={view === "settings" ? "active" : ""} onClick={() => showView("settings")}>
+              <span>⚙</span> Members &amp; settings
+            </button>
+          </nav>
+          {favorites.length > 0 && (
+            <SidebarPageLinks label="Favorites" pages={favorites} icon="★" onSelect={navigateToPage} />
+          )}
+          {pins.length > 0 && <SidebarPageLinks label="Pinned" pages={pins} icon="⌖" onSelect={navigateToPage} />}
+          <div className="sidebar-section-title">
+            <span>{activeSpace?.name ?? "Pages"}</span>
+            <span className="sidebar-section-actions">
+              {activeSpace && (
+                <WatchControl key={activeSpace.id} resourceType="space" resourceId={activeSpace.id} compact />
+              )}
+              {canEditActiveSpace && (
+                <button
+                  aria-label="Create a root page"
+                  disabled={!canCreatePage}
+                  onClick={() => void createPage("document", null)}
+                >
+                  +
+                </button>
+              )}
+            </span>
+          </div>
+          <div
+            className="tree-root"
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => {
+              const id = event.dataTransfer.getData("text/page-id");
+              if (id) void move(id, null);
+            }}
+          >
+            <PageTree
+              nodes={tree}
+              selectedId={resolvedSelectedId}
+              editable={canEditActiveSpace}
+              canCreate={canCreatePage}
+              onSelect={navigateToPage}
+              onCreate={(parentId) => void createPage("document", parentId)}
+              onArchive={(page) => void archive(page)}
+              onDropPage={(id, parentId) => void move(id, parentId)}
+              onMove={(id, parentId, beforeId, afterId) => void move(id, parentId, beforeId, afterId)}
+            />
+          </div>
+          <button className="trash-link" onClick={showTrash}>
+            ♲ Trash
+          </button>
         </div>
-        <div
-          className="tree-root"
-          onDragOver={(event) => event.preventDefault()}
-          onDrop={(event) => {
-            const id = event.dataTransfer.getData("text/page-id");
-            if (id) void move(id, null);
-          }}
-        >
-          <PageTree
-            nodes={tree}
-            selectedId={resolvedSelectedId}
-            editable={canEditActiveSpace}
-            canCreate={canCreatePage}
-            onSelect={navigateToPage}
-            onCreate={(parentId) => void createPage("document", parentId)}
-            onArchive={(page) => void archive(page)}
-            onDropPage={(id, parentId) => void move(id, parentId)}
-            onMove={(id, parentId, beforeId, afterId) => void move(id, parentId, beforeId, afterId)}
-          />
-        </div>
-        <button className="trash-link" onClick={showTrash}>
-          ♲ Trash
-        </button>
         <footer className="sidebar-footer">
           <button
             onClick={async () => {

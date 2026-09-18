@@ -393,17 +393,16 @@ function redactAuthorizationMatches(value: string, pattern: RegExp) {
 }
 
 type SerializedProperty = { key: "name" | "value"; valueStart: number };
-type SerializedValue = { propertyIndex: number; range: RedactionRange; segment: number };
+type SerializedValue = { range: RedactionRange; segment: number };
 type SerializedFrame = {
-  authorizationNames: Array<{ propertyIndex: number; segment: number }>;
+  authorizationNameSegments: Set<number>;
   values: SerializedValue[];
-  root: boolean;
 };
 
 function isSerializedIdentifierCharacter(character: string | undefined) {
   if (character === undefined) return false;
   const code = character.charCodeAt(0);
-  return isAsciiLetter(code) || isAsciiDigit(code) || character === "_";
+  return isAsciiLetter(code) || isAsciiDigit(code) || character === "_" || character === "-";
 }
 
 function serializedPropertyAt(value: string, index: number): SerializedProperty | undefined {
@@ -469,31 +468,8 @@ function canOpenSerializedQuote(value: string, index: number) {
 }
 
 function appendSerializedFrameRanges(frame: SerializedFrame, ranges: RedactionRange[]) {
-  if (!frame.root) {
-    if (frame.authorizationNames.length > 0) ranges.push(...frame.values.map((candidate) => candidate.range));
-    return;
-  }
-  let nameIndex = 0;
   for (const candidate of frame.values) {
-    while (nameIndex < frame.authorizationNames.length) {
-      const name = frame.authorizationNames[nameIndex]!;
-      if (
-        name.segment < candidate.segment ||
-        (name.segment === candidate.segment && name.propertyIndex < candidate.propertyIndex - 256)
-      ) {
-        nameIndex += 1;
-        continue;
-      }
-      break;
-    }
-    const name = frame.authorizationNames[nameIndex];
-    if (
-      name?.segment === candidate.segment &&
-      name.propertyIndex <= candidate.propertyIndex + 256 &&
-      name.propertyIndex >= candidate.propertyIndex - 256
-    ) {
-      ranges.push(candidate.range);
-    }
+    if (frame.authorizationNameSegments.has(candidate.segment)) ranges.push(candidate.range);
   }
 }
 
@@ -516,7 +492,7 @@ function applyRedactionRanges(value: string, ranges: RedactionRange[]) {
 
 function redactSerializedAuthorizationObjects(value: string) {
   const ranges: RedactionRange[] = [];
-  const frames: SerializedFrame[] = [{ authorizationNames: [], values: [], root: true }];
+  const frames: SerializedFrame[] = [{ authorizationNameSegments: new Set(), values: [] }];
   let segment = 0;
   let delimiter: (QuoteDelimiter & { contentStart: number }) | undefined;
 
@@ -536,18 +512,18 @@ function redactSerializedAuthorizationObjects(value: string) {
       delimiter === undefined || delimiter.contentStart === index ? serializedPropertyAt(value, index) : undefined;
     if (property) {
       const frame = frames.at(-1)!;
-      const frameSegment = frame.root ? segment : 0;
+      const frameSegment = frames.length === 1 ? segment : 0;
       if (property.key === "name" && serializedAuthorizationNameAt(value, property.valueStart)) {
-        frame.authorizationNames.push({ propertyIndex: index, segment: frameSegment });
+        frame.authorizationNameSegments.add(frameSegment);
       } else if (property.key === "value") {
         const range = serializedAuthorizationValueAt(value, property.valueStart);
-        if (range) frame.values.push({ propertyIndex: index, range, segment: frameSegment });
+        if (range) frame.values.push({ range, segment: frameSegment });
       }
     }
 
     if (delimiter) continue;
     if (character === "{") {
-      frames.push({ authorizationNames: [], values: [], root: false });
+      frames.push({ authorizationNameSegments: new Set(), values: [] });
     } else if (character === "}" && frames.length > 1) {
       appendSerializedFrameRanges(frames.pop()!, ranges);
     } else if (frames.length === 1 && (character === "\n" || character === ";")) {

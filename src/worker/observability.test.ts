@@ -317,6 +317,38 @@ describe("worker observability", () => {
     );
   });
 
+  it("associates distant unbraced serialized header fields within one segment", () => {
+    const metadata = `metadata:"${"x".repeat(300)}"`;
+    const cases = new Map([
+      [
+        `name:"authorization",${metadata},value:"Bearer abc"`,
+        `name:"authorization",${metadata},value:"Bearer [redacted]"`,
+      ],
+      [
+        `value:"Bearer abc",${metadata},name:"authorization"`,
+        `value:"Bearer [redacted]",${metadata},name:"authorization"`,
+      ],
+    ]);
+
+    for (const [message, expected] of cases) {
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(expected);
+    }
+
+    for (const separator of [";", "\n"]) {
+      const message = `name:"authorization"${separator}${metadata},value:"Bearer abc"`;
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(message);
+    }
+  });
+
+  it("does not treat suffixed serialized property names as header fields", () => {
+    for (const message of [
+      '{display-name:"authorization",value:"Bearer abc"}',
+      '{name:"authorization",display-value:"Bearer abc"}',
+    ]) {
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(message);
+    }
+  });
+
   it("is idempotent across raw, quoted, escaped, aliased, and existing-marker forms", () => {
     for (const message of [
       "Authorization: Bearer abc",
@@ -637,18 +669,23 @@ describe("worker observability", () => {
           }
           return performance.now() - started;
         }).sort((left, right) => left - right);
-        return samples[1]!;
+        const record = output.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+        return { duration: samples[1]!, stack: String(record.errorStack) };
       };
       const repeatedName = 'name:"authorization",';
       const inputs = [
         (length: number) => `${"\\".repeat(length)}"name":"authorization","value":"Bearer abc"`,
-        (length: number) => repeatedName.repeat(Math.floor(length / repeatedName.length)),
+        (length: number) => `${repeatedName.repeat(Math.floor(length / repeatedName.length))}value:"Bearer abc"`,
       ];
 
       for (const input of inputs) {
-        const shortDuration = medianDuration(input(4_000));
-        const longDuration = medianDuration(input(15_000));
-        expect(longDuration / Math.max(shortDuration, 0.01)).toBeLessThan(8);
+        const shortResult = medianDuration(input(4_000));
+        const longResult = medianDuration(input(15_000));
+        expect(longResult.duration / Math.max(shortResult.duration, 0.01)).toBeLessThan(8);
+        for (const result of [shortResult, longResult]) {
+          expect(result.stack).toContain("[redacted]");
+          expect(result.stack).not.toContain("Bearer abc");
+        }
       }
     } finally {
       output.mockRestore();
