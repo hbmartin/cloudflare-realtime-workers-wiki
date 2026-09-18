@@ -36,6 +36,46 @@ app[method]("/api/pages", () => leak(app));
 // ruleid: worker-hono-computed-registration, worker-hono-app-escape
 notionApi[method]("/v1/pages", () => leak(notionApi));
 
+app.get("/api/same-name-alias", () => {
+  // ruleid: worker-hono-app-escape
+  holder.fn = app.get;
+});
+
+// ruleid: worker-hono-computed-registration
+app[method]("/api/computed-alias", () => {
+  // ruleid: worker-hono-app-escape
+  holder.fn = app[method];
+});
+
+registerMetricMiddleware(app, "*", () => {
+  // ruleid: worker-hono-app-escape
+  holder.ref = app;
+  // ruleid: worker-hono-app-escape
+  leak(app);
+});
+
+app.route("/v1", notionApi, () => {
+  // ruleid: worker-hono-app-escape
+  holder.ref = notionApi;
+  // ruleid: worker-hono-app-escape
+  leak(notionApi);
+});
+
+// ruleid: worker-hono-app-escape
+holder.returned = app.get("/api/returned", handler);
+// ruleid: worker-hono-app-escape
+const v2 = app.basePath("/v2");
+v2.get("/pages", middleware, handler);
+
+function returnedApp() {
+  // ruleid: worker-hono-app-escape
+  return notionApi.post("/v1/returned", handler);
+}
+void returnedApp;
+
+// ruleid: worker-hono-app-escape
+register(app.get("/api/passed-return", handler));
+
 // ruleid: worker-hono-computed-registration
 other["use"]("*", middleware);
 

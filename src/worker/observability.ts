@@ -59,7 +59,8 @@ const OBJECT_OMITTED = "[object omitted]";
 const EMPTY_KEY = "[empty key]";
 const FUNCTION_OMITTED = "[function omitted]";
 const SYMBOL_OMITTED = "[symbol omitted]";
-const ATOMIC_SANITIZATION_MARKERS = [
+/** @internal Exported so focused tests cover every production sanitization marker. */
+export const ATOMIC_SANITIZATION_MARKERS = [
   REDACTED_VALUE,
   "[redacted-email]",
   "[redacted-secret]",
@@ -228,11 +229,22 @@ function redactBearerValues(value: string) {
   let match = BEARER_VALUE_PREFIX.exec(value);
   while (match) {
     const tokenStart = BEARER_VALUE_PREFIX.lastIndex;
-    const tokenEnd = bearerCandidateEnd(value, tokenStart);
-    const token = value.slice(tokenStart, tokenEnd);
+    const marker = sanitizationMarkerAt(value, tokenStart);
+    if (marker?.trusted) {
+      BEARER_VALUE_PREFIX.lastIndex = marker.end;
+      match = BEARER_VALUE_PREFIX.exec(value);
+      continue;
+    }
+    const candidateStart = marker?.end ?? tokenStart;
+    const tokenEnd = bearerCandidateEnd(value, candidateStart);
+    const token = value.slice(candidateStart, tokenEnd);
     const trailingPunctuation = token.match(/[.!?]+$/)?.[0] ?? "";
     const candidate = token.slice(0, token.length - trailingPunctuation.length);
-    if (candidate.length >= 16 || /[0-9._~+/=-]/.test(candidate)) {
+    if (
+      (marker !== undefined && tokenEnd > candidateStart) ||
+      candidate.length >= 16 ||
+      /[0-9._~+/=-]/.test(candidate)
+    ) {
       parts.push(value.slice(cursor, tokenStart), REDACTED_VALUE, trailingPunctuation);
       cursor = tokenEnd;
     }
@@ -325,21 +337,30 @@ function credentialBoundaryAt(value: string, index: number) {
   };
 }
 
-function sanitizationMarkerAt(value: string, index: number) {
+function sanitizationMarkerAt(value: string, index: number, delimiter?: QuoteDelimiter) {
   const marker = ATOMIC_SANITIZATION_MARKERS.find((candidate) => value.startsWith(candidate, index));
   if (!marker) return undefined;
   let end = index + marker.length;
   if (marker !== TRUNCATION_MARKER && value.startsWith(TRUNCATION_MARKER, end)) end += TRUNCATION_MARKER.length;
   const suffix = value[end];
+  let quoteIndex = end;
+  while (value[quoteIndex] === "\\") quoteIndex += 1;
+  const escapedClosingQuote = quoteIndex > end && quoteEndsCredentialAt(value, quoteIndex, delimiter);
   return {
     end,
-    trusted: suffix === '"' || suffix === "'" || credentialBoundaryAt(value, end).boundary,
+    trusted: suffix === '"' || suffix === "'" || escapedClosingQuote || credentialBoundaryAt(value, end).boundary,
   };
+}
+
+function quoteEndsCredentialAt(value: string, index: number, delimiter: QuoteDelimiter | undefined) {
+  const character = value[index];
+  if (character !== '"' && character !== "'") return false;
+  return delimiter === undefined || character !== delimiter.quote || quoteCloses(delimiter, value, index);
 }
 
 function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDelimiter | undefined) {
   for (let index = start; index < value.length;) {
-    const marker = sanitizationMarkerAt(value, index);
+    const marker = sanitizationMarkerAt(value, index, delimiter);
     if (marker) {
       if (marker.trusted) return { end: index, resumeAt: marker.end };
       index = marker.end;
@@ -358,11 +379,7 @@ function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDeli
         continue;
       }
       const backslashes = precedingBackslashes(value, index, start);
-      if (
-        character !== delimiter.quote ||
-        (backslashes % 2 === delimiter.backslashes % 2 &&
-          (delimiter.backslashes === 0 || backslashes <= delimiter.backslashes))
-      ) {
+      if (quoteEndsCredentialAt(value, index, delimiter)) {
         const end = index - backslashes;
         return { end, resumeAt: end };
       }
