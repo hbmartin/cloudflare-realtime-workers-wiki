@@ -551,6 +551,16 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
       trash,
     ];
     const minimumFocusClearance = 4;
+    // clientWidth/clientHeight are integer-rounded while bounding boxes preserve subpixel coordinates.
+    const layoutRoundingTolerance = 0.5;
+    const minimumMeasuredClearance = minimumFocusClearance - layoutRoundingTolerance;
+    const computedPadding = await scrollRegion.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return [style.paddingTop, style.paddingRight, style.paddingBottom, style.paddingLeft].map((value) =>
+        Number.parseFloat(value),
+      );
+    });
+    for (const padding of computedPadding) expect(padding).toBeGreaterThanOrEqual(minimumFocusClearance);
     for (const target of focusTargets) {
       await scrollRegion.evaluate((element) => {
         element.scrollLeft = 0;
@@ -564,9 +574,9 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
       ]);
       expect(regionBox).not.toBeNull();
       expect(targetBox).not.toBeNull();
-      expect(targetBox!.x - regionBox!.x).toBeGreaterThanOrEqual(minimumFocusClearance);
+      expect(targetBox!.x - regionBox!.x).toBeGreaterThanOrEqual(minimumMeasuredClearance);
       expect(regionBox!.x + clientWidth - targetBox!.x - targetBox!.width).toBeGreaterThanOrEqual(
-        minimumFocusClearance,
+        minimumMeasuredClearance,
       );
     }
 
@@ -576,7 +586,7 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
     const [topRegionBox, currentSpaceBox] = await Promise.all([scrollRegion.boundingBox(), currentSpace.boundingBox()]);
     expect(topRegionBox).not.toBeNull();
     expect(currentSpaceBox).not.toBeNull();
-    expect(currentSpaceBox!.y - topRegionBox!.y).toBeGreaterThanOrEqual(minimumFocusClearance);
+    expect(currentSpaceBox!.y - topRegionBox!.y).toBeGreaterThanOrEqual(minimumMeasuredClearance);
 
     await scrollRegion.evaluate((element) => {
       element.scrollTop = element.scrollHeight;
@@ -589,7 +599,7 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
     expect(bottomRegionBox).not.toBeNull();
     expect(trashBox).not.toBeNull();
     expect(bottomRegionBox!.y + clientHeight - trashBox!.y - trashBox!.height).toBeGreaterThanOrEqual(
-      minimumFocusClearance,
+      minimumMeasuredClearance,
     );
 
     await scrollRegion.evaluate((element) => {
