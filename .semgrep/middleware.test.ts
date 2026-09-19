@@ -52,6 +52,14 @@ registerMetricMiddleware(app, "*", () => {
   holder.ref = app;
   // ruleid: worker-hono-app-escape
   leak(app);
+  // ruleid: worker-hono-app-escape
+  holder.object = { value: app };
+  // ruleid: worker-hono-app-escape
+  holder.shorthand = { app };
+  // ruleid: worker-hono-app-escape
+  holder.array = [app];
+  // ruleid: worker-hono-app-escape
+  holder.nested = { value: { app } };
 });
 
 app.route("/v1", notionApi, () => {
@@ -59,6 +67,14 @@ app.route("/v1", notionApi, () => {
   holder.ref = notionApi;
   // ruleid: worker-hono-app-escape
   leak(notionApi);
+  // ruleid: worker-hono-app-escape
+  holder.object = { value: notionApi };
+  // ruleid: worker-hono-app-escape
+  holder.shorthand = { notionApi };
+  // ruleid: worker-hono-app-escape
+  holder.array = [notionApi];
+  // ruleid: worker-hono-app-escape
+  holder.nested = { value: { notionApi } };
 });
 
 // ruleid: worker-hono-app-escape

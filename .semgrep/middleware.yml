@@ -112,6 +112,18 @@ rules:
               regex: ^(?!registerMetricMiddleware$|app\.route$).+
       - patterns:
           - pattern-either:
+              - pattern-inside: registerMetricMiddleware(app, ...)
+              - pattern-inside: registerMetricMiddleware(notionApi, ...)
+              - pattern-inside: app.route(..., notionApi, ...)
+          - pattern-either:
+              - pattern: "{ ..., $KEY: app, ... }"
+              - pattern: "{ ..., $KEY: notionApi, ... }"
+              - pattern: "{ ..., app, ... }"
+              - pattern: "{ ..., notionApi, ... }"
+              - pattern: "[ ..., app, ... ]"
+              - pattern: "[ ..., notionApi, ... ]"
+      - patterns:
+          - pattern-either:
               - pattern-inside: app.$OUTER(...)
               - pattern-inside: app[$OUTER](...)
               - pattern-inside: notionApi.$OUTER(...)
