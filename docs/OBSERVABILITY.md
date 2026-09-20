@@ -36,6 +36,8 @@ Worker Hono middleware must be registered through `registerMetricMiddleware`. `p
 guardrail that rejects direct or computed `.use` calls, extracted `.use` references, Hono constructor escapes, and known
 Worker app values outside direct receiver calls, the sanctioned helper, and reviewed route composition. It allows ordinary
 endpoint registration and unrelated `.on` or `.all` methods; it does not attempt dynamic or interprocedural dataflow analysis.
+The reviewed `app` and `notionApi` identifiers are reserved in Worker policy scope, so unrelated callback values must use a
+different local name such as `requestApp`.
 
 ## Structured log contract
 
@@ -80,7 +82,9 @@ free-text Bearer values (including malformed values with internal `!` or `?`), a
 diagnostic values. Raw fields are bounded before one full
 redaction scan; later truncation and nested compaction operate on already-sanitized text and scrub only recognizable
 partial Basic or Bearer credentials, emails, and secret prefixes at the cut boundary. Complete redaction and omission
-markers, including a following truncation marker, are atomic, so sanitizing an already-sanitized value is idempotent.
+markers, including a following truncation marker, are atomic. Free-text Bearer scanning crosses untrusted marker runs and
+internal malformed credential punctuation without consuming trailing delimiters, so sanitizing an already-sanitized value
+is idempotent.
 Complete unlabeled malformed Basic values, ordinary Basic prose, and short alphabetic Bearer prose remain unchanged, so
 never put authorization headers or credentials in diagnostic text.
 Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to

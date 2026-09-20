@@ -443,8 +443,39 @@ describe("worker observability", () => {
     ).toBe("Bearer [redacted]");
   });
 
+  it("redacts malformed internal Bearer punctuation without consuming trailing delimiters or prose", () => {
+    for (const separator of ["*", "|", "%", "$", "@", "\\", ">", "`", "^", "#"]) {
+      const message = `Bearer abc${separator}def`;
+      const once = safeTelemetryErrorMessage(new Error(message), "fallback");
+      expect(once).toBe("Bearer [redacted]");
+      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(once);
+    }
+
+    expect(safeTelemetryErrorMessage(new Error("Bearer abc123* expired"), "fallback")).toBe(
+      "Bearer [redacted]* expired",
+    );
+    expect(safeTelemetryErrorMessage(new Error("Bearer api:key"), "fallback")).toBe("Bearer api:key");
+    expect(safeTelemetryErrorMessage(new Error("Use the Bearer token scheme"), "fallback")).toBe(
+      "Use the Bearer token scheme",
+    );
+  });
+
+  it("redacts nested Bearer prefixes without advancing past the nested credential", () => {
+    for (const message of [
+      "Bearer [redacted]Bearer abc123",
+      "Bearer abc123[redacted]Bearer def456",
+      "Bearer Bearer abc123",
+    ]) {
+      const once = safeTelemetryErrorMessage(new Error(message), "fallback");
+      expect(once).not.toContain("abc123");
+      expect(once).not.toContain("def456");
+      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(once);
+    }
+  });
+
   it("handles every ordered pair of sanitization markers without exposing appended Bearer suffixes", () => {
     const tokenSuffix = "abcdefghijklmnopqrstuvwxyz0123";
+    const separators = ["-", "~", "_", "+", "/", "=", ".", "!", "?", "*", "|", "%", "$", "@", "\\", ":"];
 
     for (const firstMarker of ATOMIC_SANITIZATION_MARKERS) {
       for (const secondMarker of ATOMIC_SANITIZATION_MARKERS) {
@@ -463,6 +494,25 @@ describe("worker observability", () => {
         const sanitizedLabeled = `Authorization: Bearer [redacted]${markerRun}`;
         expect(safeTelemetryErrorMessage(new Error(rawLabeled), "fallback")).toBe(sanitizedLabeled);
         expect(safeTelemetryErrorMessage(new Error(sanitizedLabeled), "fallback")).toBe(sanitizedLabeled);
+
+        const rawPlain = `Bearer abc123${markerRun}${tokenSuffix}`;
+        const sanitizedRawPlain = safeTelemetryErrorMessage(new Error(rawPlain), "fallback");
+        expect(sanitizedRawPlain).toBe("Bearer [redacted]");
+        expect(safeTelemetryErrorMessage(new Error(sanitizedRawPlain), "fallback")).toBe(sanitizedRawPlain);
+
+        const longRun = `Bearer ${firstMarker}${secondMarker}${firstMarker}${tokenSuffix}`;
+        const sanitizedLongRun = safeTelemetryErrorMessage(new Error(longRun), "fallback");
+        expect(sanitizedLongRun).toBe("Bearer [redacted]");
+        expect(safeTelemetryErrorMessage(new Error(sanitizedLongRun), "fallback")).toBe(sanitizedLongRun);
+
+        for (const separator of separators) {
+          for (const label of ["", "Authorization: "]) {
+            const separated = `${label}Bearer ${firstMarker}${separator}${secondMarker}${tokenSuffix}`;
+            const once = safeTelemetryErrorMessage(new Error(separated), "fallback");
+            expect(once).toBe(`${label}Bearer [redacted]`);
+            expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(once);
+          }
+        }
       }
     }
   });
