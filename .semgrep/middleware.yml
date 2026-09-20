@@ -91,37 +91,12 @@ rules:
               - pattern-inside: registerMetricMiddleware(notionApi, ...)
               - pattern-inside: app.route(..., notionApi, ...)
           - pattern-either:
-              - pattern: $DEST = app
-              - pattern: $DEST = notionApi
-              - pattern: const $DEST = app
-              - pattern: const $DEST = notionApi
-              - pattern: let $DEST = app
-              - pattern: let $DEST = notionApi
-              - pattern: return app
-              - pattern: return notionApi
-      - patterns:
+              - pattern-inside: (...) => ...
+              - pattern-inside: function (...) { ... }
+              - pattern-inside: function $NAME(...) { ... }
           - pattern-either:
-              - pattern-inside: registerMetricMiddleware(app, ...)
-              - pattern-inside: registerMetricMiddleware(notionApi, ...)
-              - pattern-inside: app.route(..., notionApi, ...)
-          - pattern-either:
-              - pattern: $CALL(..., app, ...)
-              - pattern: $CALL(..., notionApi, ...)
-          - metavariable-regex:
-              metavariable: $CALL
-              regex: ^(?!registerMetricMiddleware$|app\.route$).+
-      - patterns:
-          - pattern-either:
-              - pattern-inside: registerMetricMiddleware(app, ...)
-              - pattern-inside: registerMetricMiddleware(notionApi, ...)
-              - pattern-inside: app.route(..., notionApi, ...)
-          - pattern-either:
-              - pattern: "{ ..., $KEY: app, ... }"
-              - pattern: "{ ..., $KEY: notionApi, ... }"
-              - pattern: "{ ..., app, ... }"
-              - pattern: "{ ..., notionApi, ... }"
-              - pattern: "[ ..., app, ... ]"
-              - pattern: "[ ..., notionApi, ... ]"
+              - pattern: app
+              - pattern: notionApi
       - patterns:
           - pattern-either:
               - pattern-inside: app.$OUTER(...)
@@ -149,27 +124,43 @@ rules:
               - pattern: $CALL(..., app[$METHOD], ...)
               - pattern: $CALL(..., notionApi.$METHOD, ...)
               - pattern: $CALL(..., notionApi[$METHOD], ...)
+      - patterns:
+          - pattern-either:
+              - pattern-inside: $DEST = ...
+              - pattern-inside: const $DEST = ...
+              - pattern-inside: let $DEST = ...
+              - pattern-inside: return ...
+              - pattern-inside: throw ...
+          - pattern-either:
+              - pattern: app.$METHOD(...)
+              - pattern: notionApi.$METHOD(...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(all|basePath|connect|delete|get|head|mount|notFound|on|onError|options|patch|post|put|query|route|trace|use)$
+      - patterns:
+          - pattern-either:
+              - pattern-inside: $DEST = ...
+              - pattern-inside: const $DEST = ...
+              - pattern-inside: let $DEST = ...
+              - pattern-inside: return ...
+              - pattern-inside: throw ...
+          - pattern-either:
+              - pattern: app[$METHOD](...)
+              - pattern: notionApi[$METHOD](...)
+      - patterns:
+          - pattern-either:
+              - pattern: $CALL(..., app.$METHOD(...), ...)
+              - pattern: $CALL(..., notionApi.$METHOD(...), ...)
+              - pattern: new $CLASS(..., app.$METHOD(...), ...)
+              - pattern: new $CLASS(..., notionApi.$METHOD(...), ...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(all|basePath|connect|delete|get|head|mount|notFound|on|onError|options|patch|post|put|query|route|trace|use)$
       - pattern-either:
-          - pattern: $DEST = app.$METHOD(...)
-          - pattern: $DEST = app[$METHOD](...)
-          - pattern: $DEST = notionApi.$METHOD(...)
-          - pattern: $DEST = notionApi[$METHOD](...)
-          - pattern: const $DEST = app.$METHOD(...)
-          - pattern: const $DEST = app[$METHOD](...)
-          - pattern: const $DEST = notionApi.$METHOD(...)
-          - pattern: const $DEST = notionApi[$METHOD](...)
-          - pattern: let $DEST = app.$METHOD(...)
-          - pattern: let $DEST = app[$METHOD](...)
-          - pattern: let $DEST = notionApi.$METHOD(...)
-          - pattern: let $DEST = notionApi[$METHOD](...)
-          - pattern: return app.$METHOD(...)
-          - pattern: return app[$METHOD](...)
-          - pattern: return notionApi.$METHOD(...)
-          - pattern: return notionApi[$METHOD](...)
-          - pattern: $CALL(..., app.$METHOD(...), ...)
           - pattern: $CALL(..., app[$METHOD](...), ...)
-          - pattern: $CALL(..., notionApi.$METHOD(...), ...)
           - pattern: $CALL(..., notionApi[$METHOD](...), ...)
+          - pattern: new $CLASS(..., app[$METHOD](...), ...)
+          - pattern: new $CLASS(..., notionApi[$METHOD](...), ...)
 
   - id: worker-hono-construction
     languages: [typescript]

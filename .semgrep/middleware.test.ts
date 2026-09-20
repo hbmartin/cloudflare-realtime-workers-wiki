@@ -10,6 +10,9 @@ declare const appModule: any;
 declare const holder: any;
 declare const c: any;
 declare const admin: any;
+declare const condition: any;
+declare const Box: any;
+declare const request: any;
 declare function register(value: any): void;
 declare function leak(value: any): void;
 declare function registerMetricMiddleware(target: any, path: string, middleware: any): void;
@@ -78,10 +81,71 @@ app.route("/v1", notionApi, () => {
 });
 
 // ruleid: worker-hono-app-escape
+registerMetricMiddleware(app, "*", () => (condition ? app : other));
+// ruleid: worker-hono-app-escape
+registerMetricMiddleware(app, "*", () => app ?? other);
+// ruleid: worker-hono-app-escape
+registerMetricMiddleware(app, "*", () => app || other);
+// ruleid: worker-hono-app-escape
+registerMetricMiddleware(app, "*", () => app && other);
+// ruleid: worker-hono-app-escape
+registerMetricMiddleware(app, "*", () => ({ ...app }));
+// ruleid: worker-hono-app-escape
+registerMetricMiddleware(app, "*", () => new Box(app));
+// ruleid: worker-hono-app-escape
+registerMetricMiddleware(app, "*", () => (0, app));
+registerMetricMiddleware(app, "*", () => {
+  let assigned: any;
+  // ruleid: worker-hono-app-escape
+  assigned ??= app;
+  void assigned;
+});
+// ruleid: worker-hono-app-escape
+registerMetricMiddleware(app, "*", () => () => app);
+// ruleid: worker-hono-app-escape
+registerMetricMiddleware(app, "*", () => ({ on: app.on }));
+registerMetricMiddleware(app, "*", () => {
+  // ruleid: worker-hono-app-escape
+  const { app } = c.var; // oxlint-disable-line no-shadow -- The policy fixture intentionally shadows the reviewed app.
+  // ruleid: worker-hono-app-escape
+  return app;
+});
+registerMetricMiddleware(app, "*", () => {
+  // ruleid: worker-hono-app-escape
+  throw app;
+});
+registerMetricMiddleware(app, "*", function () {
+  // ruleid: worker-hono-app-escape
+  return app;
+});
+registerMetricMiddleware(
+  app,
+  "*",
+  {
+    handle(this: void) {
+      // ruleid: worker-hono-app-escape
+      return app;
+    },
+  }.handle,
+);
+
+// ruleid: worker-hono-app-escape
 holder.returned = app.get("/api/returned", handler);
 // ruleid: worker-hono-app-escape
 const v2 = app.basePath("/v2");
 v2.get("/pages", middleware, handler);
+// ruleid: worker-hono-app-escape
+const routedObject = { value: app.basePath("/object") };
+void routedObject;
+// ruleid: worker-hono-app-escape
+const routedArray = [app.route("/array", notionApi)];
+void routedArray;
+// ruleid: worker-hono-app-escape
+const routedConditional = condition ? app.basePath("/conditional") : other;
+void routedConditional;
+// ok: worker-hono-app-escape
+const responses = [app.fetch(request), notionApi.request("/health")];
+void responses;
 
 function returnedApp() {
   // ruleid: worker-hono-app-escape
@@ -115,6 +179,8 @@ const { use: destructuredUse } = other;
 void destructuredUse;
 // ruleid: worker-hono-use-alias
 (0, app.use)("*", middleware);
+// ruleid: worker-hono-direct-middleware-registration, worker-hono-app-escape
+({ ...app }).use(middleware);
 // ruleid: worker-hono-use-alias
 const useObject = { register: notionApi.use };
 void useObject;

@@ -208,18 +208,69 @@ function isBearerTokenCharacter(character: string | undefined) {
   return character !== undefined && BEARER_TOKEN_CHARACTER_VALUE.test(character);
 }
 
-function bearerCandidateEnd(value: string, start: number) {
+function bearerValuePrefixAt(value: string, index: number) {
+  if (value.slice(index, index + 6).toLowerCase() !== "bearer") return false;
+  if (/[A-Za-z0-9_]/.test(value[index - 1] ?? "")) return false;
+  return value[index + 6] === " " || value[index + 6] === "\t";
+}
+
+function sanitizationMarkerLengthAt(value: string, index: number) {
+  const first = value[index];
+  if (first !== "[" && first !== "…") return 0;
+  return ATOMIC_SANITIZATION_MARKERS.find((marker) => value.startsWith(marker, index))?.length ?? 0;
+}
+
+function bearerCandidate(value: string, start: number) {
   let cursor = start;
-  while (isBearerTokenCharacter(value[cursor])) cursor += 1;
-  while (value[cursor] === "!" || value[cursor] === "?") {
-    let punctuationEnd = cursor + 1;
-    while (value[punctuationEnd] === "!" || value[punctuationEnd] === "?") punctuationEnd += 1;
-    let tokenEnd = punctuationEnd;
-    while (isBearerTokenCharacter(value[tokenEnd])) tokenEnd += 1;
-    if (tokenEnd === punctuationEnd) break;
-    cursor = tokenEnd;
+  let candidate = "";
+  let crossedMarker = false;
+  let malformedCredentialPunctuation = false;
+  let sawTokenCharacter = false;
+  while (cursor < value.length) {
+    if (bearerValuePrefixAt(value, cursor)) {
+      return { candidate, crossedMarker, end: cursor, malformedCredentialPunctuation, resumeAt: cursor };
+    }
+    const marker = sanitizationMarkerAt(value, cursor);
+    if (marker) {
+      if (marker.trusted)
+        return { candidate, crossedMarker, end: cursor, malformedCredentialPunctuation, resumeAt: marker.end };
+      crossedMarker = true;
+      cursor = marker.end;
+      continue;
+    }
+
+    const character = value[cursor]!;
+    const boundary = credentialBoundaryAt(value, cursor);
+    if (boundary.boundary || character === '"' || character === "'") {
+      return { candidate, crossedMarker, end: cursor, malformedCredentialPunctuation, resumeAt: cursor };
+    }
+    if (isBearerTokenCharacter(character)) {
+      candidate += character;
+      sawTokenCharacter = true;
+      cursor += 1;
+      continue;
+    }
+
+    let continuation = boundary.next;
+    while (continuation < value.length) {
+      if (sanitizationMarkerLengthAt(value, continuation) > 0 || isBearerTokenCharacter(value[continuation])) break;
+      const nextCharacter = value[continuation]!;
+      const nextBoundary = credentialBoundaryAt(value, continuation);
+      if (nextBoundary.boundary || nextCharacter === '"' || nextCharacter === "'") break;
+      continuation = nextBoundary.next;
+    }
+    if (
+      continuation >= value.length ||
+      (sanitizationMarkerLengthAt(value, continuation) === 0 && !isBearerTokenCharacter(value[continuation]))
+    ) {
+      return { candidate, crossedMarker, end: cursor, malformedCredentialPunctuation, resumeAt: cursor };
+    }
+    const separator = value.slice(cursor, continuation);
+    malformedCredentialPunctuation ||= sawTokenCharacter && /[^:]/.test(separator);
+    candidate += separator;
+    cursor = continuation;
   }
-  return cursor;
+  return { candidate, crossedMarker, end: cursor, malformedCredentialPunctuation, resumeAt: cursor };
 }
 
 function redactBearerValues(value: string) {
@@ -229,26 +280,17 @@ function redactBearerValues(value: string) {
   let match = BEARER_VALUE_PREFIX.exec(value);
   while (match) {
     const tokenStart = BEARER_VALUE_PREFIX.lastIndex;
-    const marker = sanitizationMarkerAt(value, tokenStart);
-    if (marker?.trusted) {
-      BEARER_VALUE_PREFIX.lastIndex = marker.end;
-      match = BEARER_VALUE_PREFIX.exec(value);
-      continue;
-    }
-    const candidateStart = marker?.end ?? tokenStart;
-    const tokenEnd = bearerCandidateEnd(value, candidateStart);
-    const token = value.slice(candidateStart, tokenEnd);
-    const trailingPunctuation = token.match(/[.!?]+$/)?.[0] ?? "";
-    const candidate = token.slice(0, token.length - trailingPunctuation.length);
+    const scanned = bearerCandidate(value, tokenStart);
     if (
-      (marker !== undefined && tokenEnd > candidateStart) ||
-      candidate.length >= 16 ||
-      /[0-9._~+/=-]/.test(candidate)
+      (scanned.crossedMarker && scanned.candidate.length > 0) ||
+      scanned.malformedCredentialPunctuation ||
+      scanned.candidate.length >= 16 ||
+      /[0-9._~+/=-]/.test(scanned.candidate)
     ) {
-      parts.push(value.slice(cursor, tokenStart), REDACTED_VALUE, trailingPunctuation);
-      cursor = tokenEnd;
+      parts.push(value.slice(cursor, tokenStart), REDACTED_VALUE);
+      cursor = scanned.end;
     }
-    BEARER_VALUE_PREFIX.lastIndex = Math.max(tokenEnd, BEARER_VALUE_PREFIX.lastIndex);
+    BEARER_VALUE_PREFIX.lastIndex = Math.max(scanned.resumeAt, BEARER_VALUE_PREFIX.lastIndex);
     match = BEARER_VALUE_PREFIX.exec(value);
   }
   if (parts.length === 0) return value;
@@ -290,7 +332,7 @@ function consumeOpeningValueWrappers(value: string, start: number) {
   let cursor = start;
   while (cursor < value.length) {
     while (value[cursor] === " " || value[cursor] === "\t") cursor += 1;
-    if (cursor >= value.length || ATOMIC_SANITIZATION_MARKERS.some((marker) => value.startsWith(marker, cursor))) {
+    if (cursor >= value.length || sanitizationMarkerLengthAt(value, cursor) > 0) {
       return { cursor, delimiter: undefined };
     }
     if ("[({".includes(value[cursor]!)) {
@@ -339,14 +381,12 @@ function credentialBoundaryAt(value: string, index: number) {
 
 function sanitizationMarkerAt(value: string, index: number, delimiter?: QuoteDelimiter) {
   let end = index;
-  let matched = false;
   while (true) {
-    const marker = ATOMIC_SANITIZATION_MARKERS.find((candidate) => value.startsWith(candidate, end));
-    if (!marker) break;
-    matched = true;
-    end += marker.length;
+    const markerLength = sanitizationMarkerLengthAt(value, end);
+    if (markerLength === 0) break;
+    end += markerLength;
   }
-  if (!matched) return undefined;
+  if (end === index) return undefined;
   const suffix = value[end];
   let quoteIndex = end;
   while (value[quoteIndex] === "\\") quoteIndex += 1;
