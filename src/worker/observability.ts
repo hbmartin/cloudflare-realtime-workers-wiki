@@ -5,6 +5,7 @@ import {
   LOG_IDENTIFIER_LIMIT,
   LOG_STACK_LIMIT,
   LOG_TEXT_LIMIT,
+  PERSISTED_ERROR_MESSAGE_LIMIT,
   TRUNCATION_MARKER,
   rawSafeErrorMessage,
   wellFormedPrefix,
@@ -35,19 +36,22 @@ const SERIALIZED_QUOTE = String.raw`\\*["']`;
 const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:${SERIALIZED_QUOTE}|[\[({])[ \t]*)*`;
 const BEARER_VALUE_WHITESPACE = String.raw`\s`;
 const BEARER_VALUE_WHITESPACE_VALUE = new RegExp(String.raw`^${BEARER_VALUE_WHITESPACE}$`, "u");
+const UNLABELED_BEARER_BOUNDARY = String.raw`(?<![A-Za-z0-9_])`;
 const AUTHORIZATION_LABEL_VALUE = new RegExp(String.raw`^${AUTHORIZATION_LABEL}$`, "i");
+// These boundary patterns deliberately omit `u`: with `iu`, long s and Kelvin sign fold into ASCII word characters.
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
   String.raw`(?<![A-Za-z0-9])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic[ \t]+|Bearer${BEARER_VALUE_WHITESPACE}+)`,
   "gi",
 );
 const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
 const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=-]`;
+const PARTIAL_BEARER_TOKEN_CHARACTER = String.raw`(?:${BEARER_TOKEN_CHARACTER}|[\u017F\u212A])`;
 const BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}+)`, "gi");
-const BEARER_VALUE_PREFIX = new RegExp(String.raw`\bBearer${BEARER_VALUE_WHITESPACE}+`, "gi");
+const BEARER_VALUE_PREFIX = new RegExp(String.raw`${UNLABELED_BEARER_BOUNDARY}Bearer${BEARER_VALUE_WHITESPACE}+`, "gi");
 const BEARER_TOKEN_CHARACTER_VALUE = new RegExp(String.raw`^${BEARER_TOKEN_CHARACTER}$`);
 const PARTIAL_BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}*)$`, "i");
 const PARTIAL_BEARER_VALUE = new RegExp(
-  String.raw`\bBearer${BEARER_VALUE_WHITESPACE}+(${BEARER_TOKEN_CHARACTER}*)$`,
+  String.raw`${UNLABELED_BEARER_BOUNDARY}Bearer${BEARER_VALUE_WHITESPACE}+(${PARTIAL_BEARER_TOKEN_CHARACTER}*)$`,
   "i",
 );
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
@@ -80,6 +84,7 @@ export const ATOMIC_SANITIZATION_MARKERS = [
   FUNCTION_OMITTED,
   SYMBOL_OMITTED,
 ] as const;
+const SANITIZATION_MARKER_FIRST_CHARACTERS = new Set(ATOMIC_SANITIZATION_MARKERS.map((marker) => marker.charAt(0)));
 const RESERVED_LOG_FIELDS = new Set([
   "schema",
   "event",
@@ -220,8 +225,7 @@ function bearerValuePrefixAt(value: string, index: number) {
 }
 
 function sanitizationMarkerLengthAt(value: string, index: number) {
-  const first = value[index];
-  if (first !== "[" && first !== "…") return 0;
+  if (!SANITIZATION_MARKER_FIRST_CHARACTERS.has(value.charAt(index))) return 0;
   return ATOMIC_SANITIZATION_MARKERS.find((marker) => value.startsWith(marker, index))?.length ?? 0;
 }
 
@@ -857,7 +861,7 @@ export function boundedNestedJson(value: unknown, limit: number) {
 }
 
 export function safeTelemetryErrorMessage(error: unknown, fallback: string) {
-  return redactedString(rawSafeErrorMessage(error, fallback), 1_000);
+  return redactedString(rawSafeErrorMessage(error, fallback), PERSISTED_ERROR_MESSAGE_LIMIT);
 }
 
 function safeNested(value: unknown, depth: number, seen: WeakSet<object>, budget: { remaining: number }): unknown {
