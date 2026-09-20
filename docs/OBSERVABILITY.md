@@ -79,7 +79,8 @@ labels embedded inside an ordinary word. The bounded `HeadersList.headersMap` `n
 bare, quoted, or escaped keys in either property order and pairs only fields in the same containing object, even when
 nested metadata appears between them. The logger also redacts decodable free-text Basic credentials, credential-like
 free-text Bearer values (including malformed values with internal `!` or `?`), and query strings, including nested
-diagnostic values. Raw fields are bounded before one full
+diagnostic values. Bearer scheme/value separation recognizes JavaScript whitespace, including line breaks and Unicode
+space characters. Raw fields are bounded before one full
 redaction scan; later truncation and nested compaction operate on already-sanitized text and scrub only recognizable
 partial Basic or Bearer credentials, emails, and secret prefixes at the cut boundary. Complete redaction and omission
 markers, including a following truncation marker, are atomic. Free-text Bearer scanning crosses untrusted marker runs and

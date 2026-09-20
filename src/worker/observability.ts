@@ -33,18 +33,23 @@ const SENSITIVE_KEY = /authorization|cookie|password|secret|token|body|content|p
 const AUTHORIZATION_LABEL = String.raw`(?:[A-Za-z0-9]+[-_])*(?:proxy[-_]?)?authorization(?:[-_]?header)?`;
 const SERIALIZED_QUOTE = String.raw`\\*["']`;
 const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:${SERIALIZED_QUOTE}|[\[({])[ \t]*)*`;
+const BEARER_VALUE_WHITESPACE = String.raw`\s`;
+const BEARER_VALUE_WHITESPACE_VALUE = new RegExp(String.raw`^${BEARER_VALUE_WHITESPACE}$`, "u");
 const AUTHORIZATION_LABEL_VALUE = new RegExp(String.raw`^${AUTHORIZATION_LABEL}$`, "i");
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
-  String.raw`(?<![A-Za-z0-9])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic|Bearer)[ \t]+`,
-  "gi",
+  String.raw`(?<![A-Za-z0-9])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic[ \t]+|Bearer${BEARER_VALUE_WHITESPACE}+)`,
+  "giu",
 );
 const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
 const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=-]`;
 const BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}+)`, "gi");
-const BEARER_VALUE_PREFIX = /\bBearer[ \t]+/gi;
+const BEARER_VALUE_PREFIX = new RegExp(String.raw`\bBearer${BEARER_VALUE_WHITESPACE}+`, "giu");
 const BEARER_TOKEN_CHARACTER_VALUE = new RegExp(String.raw`^${BEARER_TOKEN_CHARACTER}$`);
 const PARTIAL_BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}*)$`, "i");
-const PARTIAL_BEARER_VALUE = new RegExp(String.raw`\bBearer[ \t]+(${BEARER_TOKEN_CHARACTER}*)$`, "i");
+const PARTIAL_BEARER_VALUE = new RegExp(
+  String.raw`\bBearer${BEARER_VALUE_WHITESPACE}+(${BEARER_TOKEN_CHARACTER}*)$`,
+  "iu",
+);
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
 const PARTIAL_SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]*|xox[baprs]-[A-Za-z0-9-]*)$/i;
@@ -75,6 +80,7 @@ export const ATOMIC_SANITIZATION_MARKERS = [
   FUNCTION_OMITTED,
   SYMBOL_OMITTED,
 ] as const;
+const SANITIZATION_MARKER_FIRST_CHARACTERS = new Set(ATOMIC_SANITIZATION_MARKERS.map((marker) => marker.charAt(0)));
 const RESERVED_LOG_FIELDS = new Set([
   "schema",
   "event",
@@ -211,12 +217,11 @@ function isBearerTokenCharacter(character: string | undefined) {
 function bearerValuePrefixAt(value: string, index: number) {
   if (value.slice(index, index + 6).toLowerCase() !== "bearer") return false;
   if (/[A-Za-z0-9_]/.test(value[index - 1] ?? "")) return false;
-  return value[index + 6] === " " || value[index + 6] === "\t";
+  return BEARER_VALUE_WHITESPACE_VALUE.test(value[index + 6] ?? "");
 }
 
 function sanitizationMarkerLengthAt(value: string, index: number) {
-  const first = value[index];
-  if (first !== "[" && first !== "…") return 0;
+  if (!SANITIZATION_MARKER_FIRST_CHARACTERS.has(value.charAt(index))) return 0;
   return ATOMIC_SANITIZATION_MARKERS.find((marker) => value.startsWith(marker, index))?.length ?? 0;
 }
 

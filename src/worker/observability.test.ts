@@ -198,6 +198,48 @@ describe("worker observability", () => {
     expect(safeTelemetryErrorMessage(new Error("Bearer api:key"), "fallback")).toBe("Bearer api:key");
   });
 
+  it("redacts Bearer values separated by JavaScript whitespace", () => {
+    const separators = [
+      " ",
+      "\t",
+      "\n",
+      "\v",
+      "\f",
+      "\r",
+      "\r\n",
+      "\u00a0",
+      "\u1680",
+      ...Array.from({ length: 11 }, (_, offset) => String.fromCodePoint(0x2000 + offset)),
+      "\u2028",
+      "\u2029",
+      "\u202f",
+      "\u205f",
+      "\u3000",
+      "\ufeff",
+    ];
+
+    for (const separator of separators) {
+      for (const [prefix, credential] of [
+        ["Bearer", "abc123"],
+        ["Authorization: Bearer", "abc"],
+      ] as const) {
+        const message = `${prefix}${separator}${credential}`;
+        const expected = `${prefix}${separator}[redacted]`;
+        const once = safeTelemetryErrorMessage(new Error(message), "fallback");
+        expect(once).toBe(expected);
+        expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(expected);
+      }
+    }
+
+    const nested = safeTelemetryErrorMessage(new Error("Bearer abc123*Bearer\u00a0def456"), "fallback");
+    expect(nested).toBe("Bearer [redacted]Bearer\u00a0[redacted]");
+    expect(safeTelemetryErrorMessage(new Error(nested), "fallback")).toBe(nested);
+
+    for (const message of ["Basic\u00a0Zm9vOmJhcg==", "Authorization: Basic\u00a0badtoken"]) {
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(message);
+    }
+  });
+
   it("redacts colon, assignment, JSON, and escaped JSON authorization labels", () => {
     for (const message of [
       "Authorization: Bearer abc",
@@ -828,8 +870,8 @@ describe("worker observability", () => {
   }, 10_000);
 
   it("scrubs short Basic and Bearer values cut off at the raw boundary", () => {
-    const boundaryMessage = (scheme: "Basic" | "Bearer", fragment: string, leading = "") => {
-      const label = `${scheme} `;
+    const boundaryMessage = (scheme: "Basic" | "Bearer", fragment: string, leading = "", separator = " ") => {
+      const label = `${scheme}${separator}`;
       const prefixLength =
         PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length - leading.length - label.length - fragment.length;
       const prefix = `${leading}${"x".repeat(prefixLength - 1)} `;
@@ -855,6 +897,11 @@ describe("worker observability", () => {
 
     const afterEarlierRedaction = boundaryMessage("Bearer", "a", "Authorization: Bearer abcdefghijklmnop ");
     expect(afterEarlierRedaction).not.toContain("Bearer a");
+
+    const unicodeWhitespace = boundaryMessage("Bearer", "a", "", "\u00a0");
+    expect(unicodeWhitespace).not.toContain("Bearer\u00a0a");
+    expect(unicodeWhitespace).toMatch(/…\[truncated\]$/);
+    expect(unicodeWhitespace.replaceAll("[redacted]", "")).not.toContain("[reda");
   });
 
   it("redacts authorization headers and preserves non-credential free-text Basic values", () => {
