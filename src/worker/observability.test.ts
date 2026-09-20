@@ -198,6 +198,17 @@ describe("worker observability", () => {
     expect(safeTelemetryErrorMessage(new Error("Bearer api:key"), "fallback")).toBe("Bearer api:key");
   });
 
+  it("treats Unicode simple-fold characters as Bearer boundaries", () => {
+    for (const boundary of ["ſ", "K"]) {
+      expect(safeTelemetryErrorMessage(new Error(`${boundary}Bearer abc123`), "fallback")).toBe(
+        `${boundary}Bearer [redacted]`,
+      );
+      expect(safeTelemetryErrorMessage(new Error(`${boundary}Authorization: Bearer abc`), "fallback")).toBe(
+        `${boundary}Authorization: Bearer [redacted]`,
+      );
+    }
+  });
+
   it("redacts Bearer values separated by JavaScript whitespace", () => {
     const separators = [
       " ",
@@ -870,11 +881,17 @@ describe("worker observability", () => {
   }, 10_000);
 
   it("scrubs short Basic and Bearer values cut off at the raw boundary", () => {
-    const boundaryMessage = (scheme: "Basic" | "Bearer", fragment: string, leading = "", separator = " ") => {
+    const boundaryMessage = (
+      scheme: "Basic" | "Bearer",
+      fragment: string,
+      leading = "",
+      separator = " ",
+      schemeBoundary = " ",
+    ) => {
       const label = `${scheme}${separator}`;
       const prefixLength =
         PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length - leading.length - label.length - fragment.length;
-      const prefix = `${leading}${"x".repeat(prefixLength - 1)} `;
+      const prefix = `${leading}${"x".repeat(prefixLength - schemeBoundary.length)}${schemeBoundary}`;
       return safeTelemetryErrorMessage(new Error(`${prefix}${label}${fragment}${"tail".repeat(30)}`), "fallback");
     };
 
@@ -901,7 +918,16 @@ describe("worker observability", () => {
     const unicodeWhitespace = boundaryMessage("Bearer", "a", "", "\u00a0");
     expect(unicodeWhitespace).not.toContain("Bearer\u00a0a");
     expect(unicodeWhitespace).toMatch(/…\[truncated\]$/);
+    expect(unicodeWhitespace.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
     expect(unicodeWhitespace.replaceAll("[redacted]", "")).not.toContain("[reda");
+
+    for (const boundary of ["ſ", "K"]) {
+      const unicodeCaseFoldBoundary = boundaryMessage("Bearer", "a", "", " ", boundary);
+      expect(unicodeCaseFoldBoundary).not.toContain(`${boundary}Bearer a`);
+      expect(unicodeCaseFoldBoundary).toMatch(/…\[truncated\]$/);
+      expect(unicodeCaseFoldBoundary.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+      expect(unicodeCaseFoldBoundary.replaceAll("[redacted]", "")).not.toContain("[reda");
+    }
   });
 
   it("redacts authorization headers and preserves non-credential free-text Basic values", () => {

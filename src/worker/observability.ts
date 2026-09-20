@@ -38,17 +38,17 @@ const BEARER_VALUE_WHITESPACE_VALUE = new RegExp(String.raw`^${BEARER_VALUE_WHIT
 const AUTHORIZATION_LABEL_VALUE = new RegExp(String.raw`^${AUTHORIZATION_LABEL}$`, "i");
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
   String.raw`(?<![A-Za-z0-9])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic[ \t]+|Bearer${BEARER_VALUE_WHITESPACE}+)`,
-  "giu",
+  "gi",
 );
 const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
 const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=-]`;
 const BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}+)`, "gi");
-const BEARER_VALUE_PREFIX = new RegExp(String.raw`\bBearer${BEARER_VALUE_WHITESPACE}+`, "giu");
+const BEARER_VALUE_PREFIX = new RegExp(String.raw`\bBearer${BEARER_VALUE_WHITESPACE}+`, "gi");
 const BEARER_TOKEN_CHARACTER_VALUE = new RegExp(String.raw`^${BEARER_TOKEN_CHARACTER}$`);
 const PARTIAL_BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}*)$`, "i");
 const PARTIAL_BEARER_VALUE = new RegExp(
   String.raw`\bBearer${BEARER_VALUE_WHITESPACE}+(${BEARER_TOKEN_CHARACTER}*)$`,
-  "iu",
+  "i",
 );
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
@@ -80,7 +80,6 @@ export const ATOMIC_SANITIZATION_MARKERS = [
   FUNCTION_OMITTED,
   SYMBOL_OMITTED,
 ] as const;
-const SANITIZATION_MARKER_FIRST_CHARACTERS = new Set(ATOMIC_SANITIZATION_MARKERS.map((marker) => marker.charAt(0)));
 const RESERVED_LOG_FIELDS = new Set([
   "schema",
   "event",
@@ -221,7 +220,8 @@ function bearerValuePrefixAt(value: string, index: number) {
 }
 
 function sanitizationMarkerLengthAt(value: string, index: number) {
-  if (!SANITIZATION_MARKER_FIRST_CHARACTERS.has(value.charAt(index))) return 0;
+  const first = value[index];
+  if (first !== "[" && first !== "…") return 0;
   return ATOMIC_SANITIZATION_MARKERS.find((marker) => value.startsWith(marker, index))?.length ?? 0;
 }
 
