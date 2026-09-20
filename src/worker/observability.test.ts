@@ -24,6 +24,8 @@ function isWellFormed(value: string) {
   return (value as string & { isWellFormed(): boolean }).isWellFormed();
 }
 
+const UNICODE_SIMPLE_FOLD_BEARER_CHARACTERS = ["\u017f", "\u212a"] as const;
+
 describe("worker observability", () => {
   it("emits one structured, correlated, redacted log object", () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -199,7 +201,7 @@ describe("worker observability", () => {
   });
 
   it("treats Unicode simple-fold characters as Bearer boundaries", () => {
-    for (const boundary of ["ſ", "K"]) {
+    for (const boundary of UNICODE_SIMPLE_FOLD_BEARER_CHARACTERS) {
       expect(safeTelemetryErrorMessage(new Error(`${boundary}Bearer abc123`), "fallback")).toBe(
         `${boundary}Bearer [redacted]`,
       );
@@ -207,6 +209,7 @@ describe("worker observability", () => {
         `${boundary}Authorization: Bearer [redacted]`,
       );
     }
+    expect(safeTelemetryErrorMessage(new Error("_Bearer abc123"), "fallback")).toBe("_Bearer abc123");
   });
 
   it("redacts Bearer values separated by JavaScript whitespace", () => {
@@ -921,12 +924,20 @@ describe("worker observability", () => {
     expect(unicodeWhitespace.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
     expect(unicodeWhitespace.replaceAll("[redacted]", "")).not.toContain("[reda");
 
-    for (const boundary of ["ſ", "K"]) {
+    for (const boundary of UNICODE_SIMPLE_FOLD_BEARER_CHARACTERS) {
       const unicodeCaseFoldBoundary = boundaryMessage("Bearer", "a", "", " ", boundary);
       expect(unicodeCaseFoldBoundary).not.toContain(`${boundary}Bearer a`);
       expect(unicodeCaseFoldBoundary).toMatch(/…\[truncated\]$/);
       expect(unicodeCaseFoldBoundary.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
       expect(unicodeCaseFoldBoundary.replaceAll("[redacted]", "")).not.toContain("[reda");
+
+      for (const fragment of [boundary, `a${boundary}`]) {
+        const unicodeCaseFoldFragment = boundaryMessage("Bearer", fragment);
+        expect(unicodeCaseFoldFragment).not.toContain(`Bearer ${fragment}`);
+        expect(unicodeCaseFoldFragment).toMatch(/…\[truncated\]$/);
+        expect(unicodeCaseFoldFragment.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+        expect(unicodeCaseFoldFragment.replaceAll("[redacted]", "")).not.toContain("[reda");
+      }
     }
   });
 
