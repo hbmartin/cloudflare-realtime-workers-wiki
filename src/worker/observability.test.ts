@@ -443,6 +443,30 @@ describe("worker observability", () => {
     ).toBe("Bearer [redacted]");
   });
 
+  it("handles every ordered pair of sanitization markers without exposing appended Bearer suffixes", () => {
+    const tokenSuffix = "abcdefghijklmnopqrstuvwxyz0123";
+
+    for (const firstMarker of ATOMIC_SANITIZATION_MARKERS) {
+      for (const secondMarker of ATOMIC_SANITIZATION_MARKERS) {
+        const markerRun = `${firstMarker}${secondMarker}`;
+        const plain = `Bearer ${markerRun}`;
+        expect(safeTelemetryErrorMessage(new Error(plain), "fallback")).toBe(plain);
+        expect(safeTelemetryErrorMessage(new Error(`${plain}${tokenSuffix}`), "fallback")).toBe("Bearer [redacted]");
+
+        const labeled = `Authorization: Bearer ${markerRun}`;
+        expect(safeTelemetryErrorMessage(new Error(labeled), "fallback")).toBe(labeled);
+        expect(safeTelemetryErrorMessage(new Error(`${labeled}${tokenSuffix}`), "fallback")).toBe(
+          "Authorization: Bearer [redacted]",
+        );
+
+        const rawLabeled = `Authorization: Bearer abc${markerRun}`;
+        const sanitizedLabeled = `Authorization: Bearer [redacted]${markerRun}`;
+        expect(safeTelemetryErrorMessage(new Error(rawLabeled), "fallback")).toBe(sanitizedLabeled);
+        expect(safeTelemetryErrorMessage(new Error(sanitizedLabeled), "fallback")).toBe(sanitizedLabeled);
+      }
+    }
+  });
+
   it("preserves truncated redactions through serialized JSON layers", () => {
     const message = "Authorization: Bearer [redacted]…[truncated]";
     const serialized = JSON.stringify({ message });

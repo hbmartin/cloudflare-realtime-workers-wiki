@@ -338,10 +338,15 @@ function credentialBoundaryAt(value: string, index: number) {
 }
 
 function sanitizationMarkerAt(value: string, index: number, delimiter?: QuoteDelimiter) {
-  const marker = ATOMIC_SANITIZATION_MARKERS.find((candidate) => value.startsWith(candidate, index));
-  if (!marker) return undefined;
-  let end = index + marker.length;
-  if (marker !== TRUNCATION_MARKER && value.startsWith(TRUNCATION_MARKER, end)) end += TRUNCATION_MARKER.length;
+  let end = index;
+  let matched = false;
+  while (true) {
+    const marker = ATOMIC_SANITIZATION_MARKERS.find((candidate) => value.startsWith(candidate, end));
+    if (!marker) break;
+    matched = true;
+    end += marker.length;
+  }
+  if (!matched) return undefined;
   const suffix = value[end];
   let quoteIndex = end;
   while (value[quoteIndex] === "\\") quoteIndex += 1;
