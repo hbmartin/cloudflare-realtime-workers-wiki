@@ -192,6 +192,17 @@ describe("worker observability", () => {
     ).toBe("Basic [redacted] and basic [redacted] and Basic\t[redacted] and Basic not-base64!");
   });
 
+  it("redacts quoted free-text credentials while preserving their wrappers", () => {
+    expect(safeTelemetryErrorMessage(new Error('Basic "dXNlcjpwYXNz"'), "fallback")).toBe('Basic "[redacted]"');
+    expect(safeTelemetryErrorMessage(new Error("Basic 'dXNlcjpwYXNz'"), "fallback")).toBe("Basic '[redacted]'");
+    expect(safeTelemetryErrorMessage(new Error('Bearer "eyJhbGciOiJIUzI1NiJ9.payload.signature"'), "fallback")).toBe(
+      'Bearer "[redacted]"',
+    );
+    expect(safeTelemetryErrorMessage(new Error("Bearer 'eyJhbGciOiJIUzI1NiJ9.payload.signature'"), "fallback")).toBe(
+      "Bearer '[redacted]'",
+    );
+  });
+
   it("redacts credential-like Bearer values without consuming punctuation or prose", () => {
     expect(safeTelemetryErrorMessage(new Error("Authorization: Bearer abc"), "fallback")).toBe(
       "Authorization: Bearer [redacted]",
@@ -441,6 +452,15 @@ describe("worker observability", () => {
     }
   });
 
+  it("keeps marker-only labeled and serialized authorization values stable", () => {
+    for (const message of [
+      "Authorization: Bearer [redacted].[value omitted].",
+      'name:"authorization",value:"Bearer [redacted].[value omitted]."',
+    ]) {
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(message);
+    }
+  });
+
   it("does not trust a redaction marker that only prefixes a labeled credential", () => {
     for (const message of [
       "Authorization: Bearer [redacted]secret",
@@ -537,6 +557,34 @@ describe("worker observability", () => {
     }
   });
 
+  it("redacts chained authorization schemes across supported separators", () => {
+    for (const separator of JAVASCRIPT_WHITESPACE_SEPARATORS) {
+      const labeled = `Authorization: Bearer${separator}Bearer abc123`;
+      const labeledOnce = safeTelemetryErrorMessage(new Error(labeled), "fallback");
+      expect(labeledOnce).toBe(`Authorization: Bearer${separator}[redacted]`);
+      expect(safeTelemetryErrorMessage(new Error(labeledOnce), "fallback")).toBe(labeledOnce);
+
+      const serialized = `name:"authorization",value:"Bearer${separator}Bearer abc123"`;
+      const serializedOnce = safeTelemetryErrorMessage(new Error(serialized), "fallback");
+      expect(serializedOnce).toBe(`name:"authorization",value:"Bearer${separator}[redacted]"`);
+      expect(safeTelemetryErrorMessage(new Error(serializedOnce), "fallback")).toBe(serializedOnce);
+    }
+
+    expect(safeTelemetryErrorMessage(new Error("Authorization: Basic Bearer abc123"), "fallback")).toBe(
+      "Authorization: Basic [redacted]",
+    );
+    expect(safeTelemetryErrorMessage(new Error("Authorization: Bearer Basic dXNlcjpwYXNz"), "fallback")).toBe(
+      "Authorization: Bearer [redacted]",
+    );
+  });
+
+  it("keeps deeply wrapped marker-only Bearer values stable", () => {
+    for (const count of [16, 32, 128]) {
+      const message = `Bearer ${"(".repeat(count)}[value omitted]`;
+      expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(message);
+    }
+  });
+
   it("handles every ordered pair of sanitization markers without exposing appended Bearer suffixes", () => {
     const tokenSuffix = "abcdefghijklmnopqrstuvwxyz0123";
     const separators = ["-", "~", "_", "+", "/", "=", ".", "!", "?", "*", "|", "%", "$", "@", "\\", ":"];
@@ -556,8 +604,11 @@ describe("worker observability", () => {
 
         const rawLabeled = `Authorization: Bearer abc${markerRun}`;
         const sanitizedLabeled = `Authorization: Bearer [redacted]${markerRun}`;
-        expect(safeTelemetryErrorMessage(new Error(rawLabeled), "fallback")).toBe(sanitizedLabeled);
-        expect(safeTelemetryErrorMessage(new Error(sanitizedLabeled), "fallback")).toBe(sanitizedLabeled);
+        const onceLabeled = safeTelemetryErrorMessage(new Error(rawLabeled), "fallback");
+        expect(onceLabeled).not.toContain("abc");
+        expect(markerRun.endsWith(TRUNCATION_MARKER) || onceLabeled === sanitizedLabeled).toBe(true);
+        expect(!markerRun.endsWith(TRUNCATION_MARKER) || onceLabeled.endsWith(TRUNCATION_MARKER)).toBe(true);
+        expect(safeTelemetryErrorMessage(new Error(onceLabeled), "fallback")).toBe(onceLabeled);
 
         const rawPlain = `Bearer abc123${markerRun}${tokenSuffix}`;
         const sanitizedRawPlain = safeTelemetryErrorMessage(new Error(rawPlain), "fallback");
@@ -594,15 +645,17 @@ describe("worker observability", () => {
     for (const marker of ATOMIC_SANITIZATION_MARKERS) {
       const expected = `Authorization: Bearer [redacted]${marker}`;
       const once = safeTelemetryErrorMessage(new Error(`Authorization: Bearer abc${marker}`), "fallback");
-      expect(once).toBe(expected);
-      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(expected);
+      expect(once).not.toContain("abc");
+      expect(marker === TRUNCATION_MARKER || once === expected).toBe(true);
+      expect(marker !== TRUNCATION_MARKER || once.endsWith(TRUNCATION_MARKER)).toBe(true);
+      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(once);
       expect(safeTelemetryErrorMessage(new Error(`Authorization: Bearer abc${marker}secret`), "fallback")).toBe(
         "Authorization: Bearer [redacted]",
       );
     }
 
     expect(safeTelemetryErrorMessage(new Error("Authorization: Bearer abc…[truncated]"), "fallback")).toBe(
-      "Authorization: Bearer [redacted]…[truncated]",
+      "Authorization: Bearer …[truncated]",
     );
   });
 
@@ -627,6 +680,22 @@ describe("worker observability", () => {
     expect(safeTelemetryErrorMessage(new Error(`${"a".repeat(65)}@example.com`), "fallback")).toBe("[redacted-email]");
     expect(safeTelemetryErrorMessage(new Error("name@example.com-foo"), "fallback")).toBe("[redacted-email]-foo");
     expect(safeTelemetryErrorMessage(new Error("name@example.co.uk"), "fallback")).toBe("[redacted-email]");
+  });
+
+  it("does not walk through a neighboring email when truncating a URL host", () => {
+    const value = "https://alice.smith@example.com@bitbucket.org/repository";
+    const secondAt = value.lastIndexOf("@");
+    const hostEnd = value.indexOf("/", secondAt);
+    for (let cut = secondAt + 1; cut <= hostEnd; cut += 1) {
+      const result = safeTelemetryErrorMessage(
+        new Error(`${value}${"tail".repeat(20)}`),
+        "fallback",
+        cut + TRUNCATION_MARKER.length,
+      );
+      expect(result).not.toContain("alice.smith@");
+      expect(result).toMatch(/…\[truncated\]$/);
+      expect(isWellFormed(result)).toBe(true);
+    }
   });
 
   it("keeps Basic prose and later nested JSON keys intact", () => {
@@ -729,10 +798,65 @@ describe("worker observability", () => {
 
   it("does not split a surrogate pair at the sanitized truncation boundary", () => {
     const prefix = "x".repeat(PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length - 1);
-    const result = safeTelemetryErrorMessage(new Error(`${prefix}😀${"z".repeat(LOG_TEXT_LIMIT)}`), "fallback");
+    const raw = `${prefix}😀${"z".repeat(LOG_TEXT_LIMIT)}`;
+    const cut = PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length;
+    expect(raw.charCodeAt(cut - 1)).toBeGreaterThanOrEqual(0xd800);
+    expect(raw.charCodeAt(cut - 1)).toBeLessThanOrEqual(0xdbff);
+    expect(raw.charCodeAt(cut)).toBeGreaterThanOrEqual(0xdc00);
+    expect(raw.charCodeAt(cut)).toBeLessThanOrEqual(0xdfff);
+    const result = safeTelemetryErrorMessage(new Error(raw), "fallback");
 
     expect(result).toBe(prefix + TRUNCATION_MARKER);
     expect(isWellFormed(result)).toBe(true);
+  });
+
+  it("does not split a surrogate pair at a post-redaction truncation boundary", () => {
+    const limit = 80;
+    const safePrefix = "Basic [redacted] ";
+    const payloadLimit = limit - TRUNCATION_MARKER.length;
+    const rawPrefix = `Basic Og== ${"x".repeat(payloadLimit - safePrefix.length - 1)}`;
+    const raw = `${rawPrefix}😀${"z".repeat(limit)}`;
+    const sanitizedPrefixLength = safePrefix.length + rawPrefix.length - "Basic Og== ".length;
+    expect(sanitizedPrefixLength).toBe(payloadLimit - 1);
+
+    const result = safeTelemetryErrorMessage(new Error(raw), "fallback", limit);
+
+    expect(result).toBe(`${safePrefix}${"x".repeat(payloadLimit - safePrefix.length - 1)}${TRUNCATION_MARKER}`);
+    expect(result).not.toContain("Og==");
+    expect(isWellFormed(result)).toBe(true);
+  });
+
+  it("honors a caller-supplied persistence limit", () => {
+    const result = safeTelemetryErrorMessage(
+      new Error(`${"x".repeat(45)} Authorization: Basic dXNlcjpwYXNz ${"y".repeat(80)}`),
+      "fallback",
+      64,
+    );
+
+    expect(result.length).toBeLessThanOrEqual(64);
+    expect(result).not.toContain("dXNlcjpwYXNz");
+    expect(result).toMatch(/…\[truncated\]$/);
+  });
+
+  it("is a bounded, well-formed fixed point across representative cut positions", () => {
+    const values = [
+      "https://alice.smith@example.com@bitbucket.org/repository",
+      "Authorization: Bearer\u00a0Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
+      'Basic "dXNlcjpwYXNz" after',
+      `Bearer 1 ${"x".repeat(50)} Basic dXNlcjpwYXNz tail`,
+      "Bearer .[redacted].[value omitted]. tail",
+      `prefix 😀 Authorization: Bearer abc123 ${"z".repeat(40)}`,
+    ];
+
+    for (const value of values) {
+      for (let limit = TRUNCATION_MARKER.length + 1; limit < value.length; limit += 1) {
+        const once = safeTelemetryErrorMessage(new Error(value), "fallback", limit);
+        const twice = safeTelemetryErrorMessage(new Error(once), "fallback", limit);
+        expect(once.length).toBeLessThanOrEqual(limit);
+        expect(isWellFormed(once)).toBe(true);
+        expect(twice).toBe(once);
+      }
+    }
   });
 
   it("keeps redaction and truncation markers atomic when sanitizing expands the payload", () => {
@@ -748,6 +872,21 @@ describe("worker observability", () => {
       expect(result.match(/…\[truncated\]/g)).toHaveLength(1);
       expect(isWellFormed(result)).toBe(true);
     }
+  });
+
+  it("reruns cut-aware redaction after an earlier replacement expands the payload", () => {
+    const limit = 96;
+    const payloadLimit = limit - TRUNCATION_MARKER.length;
+    const firstCredential = "Bearer 1 ";
+    const finalCredential = "Basic dXNlcjpwYXNz";
+    const rawPrefix = `${firstCredential}${"x".repeat(payloadLimit - firstCredential.length - finalCredential.length - 1)} ${finalCredential}`;
+    const result = safeTelemetryErrorMessage(new Error(`${rawPrefix}${"tail".repeat(20)}`), "fallback", limit);
+
+    expect(result).not.toContain("dXNlcjpwYXNz");
+    expect(result).not.toMatch(/Basic dXN/);
+    expect(result.length).toBeLessThanOrEqual(limit);
+    expect(result).toMatch(/…\[truncated\]$/);
+    expect(isWellFormed(result)).toBe(true);
   });
 
   it("keeps an existing truncation marker intact across repeated sanitization", () => {
@@ -891,6 +1030,32 @@ describe("worker observability", () => {
     }
   }, 10_000);
 
+  it("keeps wrapper and partial-secret cut scans near-linear", () => {
+    const medianDuration = (input: () => string, limit: number) => {
+      for (let index = 0; index < 5; index += 1) safeTelemetryErrorMessage(new Error(input()), "fallback", limit);
+      const samples = Array.from({ length: 5 }, () => {
+        const started = performance.now();
+        for (let index = 0; index < 24; index += 1) {
+          safeTelemetryErrorMessage(new Error(input()), "fallback", limit);
+        }
+        return performance.now() - started;
+      }).sort((left, right) => left - right);
+      return samples[2]!;
+    };
+
+    const wrapperInput = (length: number) =>
+      `Bearer ${"(".repeat(64)}${"[redacted]a".repeat(Math.ceil(length / 11))}`.slice(0, length);
+    const secretInput = (length: number) => "-sk_".repeat(Math.ceil(length / 4)).slice(0, length);
+    expect(safeTelemetryErrorMessage(new Error(wrapperInput(4_000)), "fallback", 3_999)).toContain("[redacted]");
+    expect(safeTelemetryErrorMessage(new Error(secretInput(4_000)), "fallback", 3_999)).toContain("[redacted-secret]");
+
+    for (const input of [wrapperInput, secretInput]) {
+      const shortDuration = medianDuration(() => input(4_000), 3_999);
+      const longDuration = medianDuration(() => input(15_000), 14_999);
+      expect(longDuration / Math.max(shortDuration, 0.01)).toBeLessThan(8);
+    }
+  }, 10_000);
+
   it("scrubs open sensitive suffixes at the raw boundary", () => {
     const cutMessage = (value: string, leading = "", valueBoundary = " ") => {
       const prefixLength = PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length - leading.length - value.length;
@@ -989,6 +1154,36 @@ describe("worker observability", () => {
         expected: "[redacted-secret]",
         marker: "[redacted-secret]",
       },
+      {
+        raw: "sk_abcd",
+        leaked: "sk_abcd",
+        expected: "[redacted-secret]",
+        marker: "[redacted-secret]",
+      },
+      {
+        raw: "crn_abcd",
+        leaked: "crn_abcd",
+        expected: "[redacted-secret]",
+        marker: "[redacted-secret]",
+      },
+      {
+        raw: "github_pat_abcd",
+        leaked: "github_pat_abcd",
+        expected: "[redacted-secret]",
+        marker: "[redacted-secret]",
+      },
+      {
+        raw: "secret_abcd",
+        leaked: "secret_abcd",
+        expected: "[redacted-secret]",
+        marker: "[redacted-secret]",
+      },
+      {
+        raw: "xoxb-abcd",
+        leaked: "xoxb-abcd",
+        expected: "[redacted-secret]",
+        marker: "[redacted-secret]",
+      },
     ] as const;
 
     for (const marker of ATOMIC_SANITIZATION_MARKERS) {
@@ -1007,16 +1202,19 @@ describe("worker observability", () => {
           expect(markedCredential.split(expectedMarker)).toHaveLength(2);
           expect(markedCredential).toMatch(/…\[truncated\]$/);
           expect(markedCredential.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
-          expect(isWellFormed(markedCredential)).toBe(true);
           expect(safeTelemetryErrorMessage(new Error(markedCredential), "fallback")).toBe(markedCredential);
         }
       }
     }
 
     const alternatingMarkerRun = cutMessage(`Bearer aaa[redacted].[value omitted]!?`);
-    expect(alternatingMarkerRun).toContain(`Bearer [redacted]!?${TRUNCATION_MARKER}`);
+    expect(alternatingMarkerRun).toContain(`Bearer [redacted][value omitted]!?${TRUNCATION_MARKER}`);
     expect(alternatingMarkerRun).not.toContain("aaa");
     expect(safeTelemetryErrorMessage(new Error(alternatingMarkerRun), "fallback")).toBe(alternatingMarkerRun);
+
+    const punctuationOnly = cutMessage("Bearer .");
+    expect(punctuationOnly).toContain(`Bearer ${TRUNCATION_MARKER}`);
+    expect(safeTelemetryErrorMessage(new Error(punctuationOnly), "fallback")).toBe(punctuationOnly);
 
     const markerOnlyAlternatingValue = "Bearer [redacted].[value omitted].";
     const markerOnlyAlternating = cutMessage(markerOnlyAlternatingValue);

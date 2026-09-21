@@ -1983,7 +1983,10 @@ describe("Worker integration", () => {
     onTestFinished(() => error.mockRestore());
     const context = createExecutionContext();
 
-    const requestedPath = `/api/pages/${"p".repeat(3_000)}`;
+    const pathPrefix = "/api/pages/";
+    const visibleEmailPrefix = "alice.smith@example.com@bitb";
+    const fillerLength = LOG_TEXT_LIMIT - TRUNCATION_MARKER.length - pathPrefix.length - visibleEmailPrefix.length - 1;
+    const requestedPath = `${pathPrefix}${"p".repeat(fillerLength)}:alice.smith@example.com@bitbucket.org${"z".repeat(3_000)}`;
     const response = await worker.fetch(
       authenticatedRequest(installed.cookie, `${requestedPath}?private=omitted`, {
         headers: { "cf-ray": "r".repeat(300) },
@@ -1998,7 +2001,7 @@ describe("Worker integration", () => {
     expect(error).toHaveBeenCalledOnce();
     expectStructuredLog(error, "http.request.unhandled_error", {
       requestMethod: "GET",
-      requestPath: `${requestedPath.slice(0, LOG_TEXT_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
+      requestPath: `${pathPrefix}${"p".repeat(fillerLength)}:[redacted-email]@bitb${TRUNCATION_MARKER}`,
       requestRayId: `${"r".repeat(LOG_IDENTIFIER_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
       errorName: databaseError.name,
       errorMessage: databaseError.message,

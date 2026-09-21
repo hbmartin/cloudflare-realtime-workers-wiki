@@ -8,7 +8,6 @@ import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { migrateLegacyComments, type CommentPage } from "./comments";
 import { HttpError, safeHttpError } from "./http";
-import { safeErrorMessage } from "../shared/error-log";
 import { deliverNotification } from "./notifications";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Keys, deleteR2Prefix } from "./r2";
@@ -23,6 +22,7 @@ import {
   currentObservabilityContext,
   logger,
   recordMetric,
+  safeTelemetryErrorMessage,
   traced,
   withObservabilityContext,
 } from "./observability";
@@ -873,7 +873,7 @@ export async function finishPendingJobCleanup(
 
 async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
   const httpError = safeHttpError(error);
-  const message = (httpError?.message ?? safeErrorMessage(error, "The job failed.")).slice(0, 500);
+  const message = safeTelemetryErrorMessage(httpError ?? error, "The job failed.", 500);
   const errorCode = httpError?.code ?? "job_failed";
   if (!httpError)
     logger.error(
@@ -1194,7 +1194,7 @@ export async function recoverQueuedJobs(env: Env) {
       await env.DB.prepare(
         `UPDATE jobs SET error_code = 'workflow_start_failed', error_message = ?, updated_at = ? WHERE id = ?`,
       )
-        .bind(error instanceof Error ? error.message.slice(0, 500) : "Workflow start failed.", Date.now(), job.id)
+        .bind(safeTelemetryErrorMessage(error, "Workflow start failed.", 500), Date.now(), job.id)
         .run();
     }
   }
@@ -1233,7 +1233,7 @@ async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: st
         WHERE id = ? RETURNING attempts, last_error`,
     )
       .bind(
-        error instanceof Error ? error.message.slice(0, 500) : "Queue enqueue failed.",
+        safeTelemetryErrorMessage(error, "Queue enqueue failed.", 500),
         Date.now(),
         OUTBOX_RETRY_MAX_MS,
         OUTBOX_RETRY_BASE_MS,

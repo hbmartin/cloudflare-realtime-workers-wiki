@@ -1,5 +1,5 @@
 import type { Context } from "hono";
-import { LOG_IDENTIFIER_LIMIT, LOG_TEXT_LIMIT, boundedLogString, safeInstanceOf } from "../shared/error-log";
+import { LOG_IDENTIFIER_LIMIT, boundedLogString, safeInstanceOf } from "../shared/error-log";
 import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
 import { logger } from "./observability";
@@ -124,7 +124,7 @@ export function errorResponse(c: Context, error: unknown) {
       "Unhandled request error",
       {
         requestMethod: c.req.method,
-        requestPath: boundedLogString(new URL(c.req.url).pathname, LOG_TEXT_LIMIT),
+        requestPath: new URL(c.req.url).pathname,
         requestRayId: rayId ? boundedLogString(rayId, LOG_IDENTIFIER_LIMIT) : null,
       },
       error,
