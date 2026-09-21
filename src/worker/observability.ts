@@ -47,9 +47,10 @@ const LABELED_AUTHORIZATION_PREFIX = new RegExp(
 );
 const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
 const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=-]`;
-const BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}+)`, "gi");
+const BASIC_VALUE_PREFIX = /\bBasic[ \t]+/gi;
 // Keep this non-`u` for the same Unicode simple-fold boundary behavior described above.
 const BEARER_VALUE_PREFIX = new RegExp(String.raw`${UNLABELED_BEARER_BOUNDARY}Bearer${BEARER_VALUE_WHITESPACE}+`, "gi");
+const BASIC_TOKEN_CHARACTER_VALUE = new RegExp(String.raw`^${BASIC_TOKEN_CHARACTER}$`);
 const BEARER_TOKEN_CHARACTER_VALUE = new RegExp(String.raw`^${BEARER_TOKEN_CHARACTER}$`);
 const PARTIAL_BASIC_VALUE = new RegExp(
   String.raw`\bBasic[ \t]+(${AUTHORIZATION_VALUE_WRAPPERS})(${BASIC_TOKEN_CHARACTER}+)$`,
@@ -57,7 +58,6 @@ const PARTIAL_BASIC_VALUE = new RegExp(
 );
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
-const PARTIAL_SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]*|xox[baprs]-[A-Za-z0-9-]*)$/i;
 const NESTED_VALUE_BUDGET = 100;
 const REDACTED_VALUE = "[redacted]";
 const OMITTED_ENTRIES = "[entries omitted]";
@@ -206,13 +206,34 @@ function redactEmails(value: string) {
   return parts.join("");
 }
 
-function redactBasicValue(match: string, encoded: string) {
+function isBasicCredential(encoded: string) {
   try {
-    if (atob(encoded).includes(":")) return match.slice(0, match.length - encoded.length) + REDACTED_VALUE;
+    return atob(encoded).includes(":");
   } catch {
     // Malformed Base64 and ordinary prose are not credentials.
+    return false;
   }
-  return match;
+}
+
+function redactBasicValues(value: string) {
+  const parts: string[] = [];
+  let cursor = 0;
+  BASIC_VALUE_PREFIX.lastIndex = 0;
+  let match = BASIC_VALUE_PREFIX.exec(value);
+  while (match) {
+    const opening = consumeOpeningValueWrappers(value, BASIC_VALUE_PREFIX.lastIndex);
+    let end = opening.cursor;
+    while (BASIC_TOKEN_CHARACTER_VALUE.test(value[end] ?? "")) end += 1;
+    if (end > opening.cursor && isBasicCredential(value.slice(opening.cursor, end))) {
+      parts.push(value.slice(cursor, opening.cursor), REDACTED_VALUE);
+      cursor = end;
+      BASIC_VALUE_PREFIX.lastIndex = end;
+    }
+    match = BASIC_VALUE_PREFIX.exec(value);
+  }
+  if (parts.length === 0) return value;
+  parts.push(value.slice(cursor));
+  return parts.join("");
 }
 
 function isBearerTokenCharacter(character: string | undefined) {
@@ -226,6 +247,27 @@ function authorizationValueStartAfterScheme(value: string, start: number, scheme
   let cursor = start + 1;
   while (isSeparator(value[cursor])) cursor += 1;
   return cursor;
+}
+
+function authorizationSchemeAt(value: string, start: number) {
+  const scheme =
+    value.slice(start, start + 5).toLowerCase() === "basic"
+      ? "basic"
+      : value.slice(start, start + 6).toLowerCase() === "bearer"
+        ? "bearer"
+        : undefined;
+  if (!scheme) return undefined;
+  const valueStart = authorizationValueStartAfterScheme(value, start + scheme.length, scheme);
+  return valueStart < 0 ? undefined : { scheme, valueStart };
+}
+
+function skipNestedAuthorizationSchemes(value: string, start: number) {
+  let cursor = start;
+  while (true) {
+    const nested = authorizationSchemeAt(value, cursor);
+    if (!nested) return cursor;
+    cursor = nested.valueStart;
+  }
 }
 
 function bearerValuePrefixAt(value: string, index: number) {
@@ -251,7 +293,7 @@ function bearerCandidate(value: string, start: number) {
     }
     const marker = sanitizationMarkerAt(value, cursor);
     if (marker) {
-      const markerOnlyValue = consumeOpeningValueWrappers(value, start).cursor === cursor;
+      const markerOnlyValue = start === cursor;
       if (marker.trusted || (markerOnlyValue && atomicMarkerSuffixAt(value, marker.end)))
         return { candidate, crossedMarker, end: cursor, malformedCredentialPunctuation, resumeAt: marker.end };
       crossedMarker = true;
@@ -300,14 +342,16 @@ function redactBearerValues(value: string) {
   let match = BEARER_VALUE_PREFIX.exec(value);
   while (match) {
     const tokenStart = BEARER_VALUE_PREFIX.lastIndex;
-    const scanned = bearerCandidate(value, tokenStart);
+    const opening = consumeOpeningValueWrappers(value, tokenStart);
+    const credentialStart = skipNestedAuthorizationSchemes(value, opening.cursor);
+    const scanned = bearerCandidate(value, credentialStart);
     if (
       (scanned.crossedMarker && scanned.candidate.length > 0) ||
       scanned.malformedCredentialPunctuation ||
       scanned.candidate.length >= 16 ||
       /[0-9._~+/=-]/.test(scanned.candidate)
     ) {
-      parts.push(value.slice(cursor, tokenStart), REDACTED_VALUE);
+      parts.push(value.slice(cursor, opening.cursor), REDACTED_VALUE);
       cursor = scanned.end;
     }
     BEARER_VALUE_PREFIX.lastIndex = Math.max(scanned.resumeAt, BEARER_VALUE_PREFIX.lastIndex);
@@ -428,12 +472,15 @@ function sanitizationMarkerAt(value: string, index: number, delimiter?: QuoteDel
   };
 }
 
-function atomicMarkerSuffixAt(value: string, start: number) {
+function atomicMarkerSuffixAt(value: string, start: number, delimiter?: QuoteDelimiter) {
   let cursor = start;
   let sawMarker = false;
   while (cursor < value.length) {
     while (cursor < value.length && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[cursor]!)) cursor += 1;
     if (cursor === value.length) return sawMarker;
+    let quoteIndex = cursor;
+    while (value[quoteIndex] === "\\") quoteIndex += 1;
+    if (sawMarker && quoteEndsCredentialAt(value, quoteIndex, delimiter)) return true;
     const markerLength = sanitizationMarkerLengthAt(value, cursor);
     if (markerLength === 0) return false;
     sawMarker = true;
@@ -442,7 +489,7 @@ function atomicMarkerSuffixAt(value: string, start: number) {
   return sawMarker;
 }
 
-function partialBearerValueStart(value: string) {
+function partialBearerValueStart(value: string, allowEmpty = false) {
   BEARER_VALUE_PREFIX.lastIndex = 0;
   try {
     let match = BEARER_VALUE_PREFIX.exec(value);
@@ -461,7 +508,7 @@ function partialBearerValueStart(value: string) {
         if (isHardCredentialDelimiter(character)) break;
         cursor += 1;
       }
-      if (cursor === value.length && cursor > credentialStart) return credentialStart;
+      if (cursor === value.length && (allowEmpty || cursor > credentialStart)) return credentialStart;
       match = BEARER_VALUE_PREFIX.exec(value);
     }
     return -1;
@@ -480,7 +527,9 @@ function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDeli
   for (let index = start; index < value.length;) {
     const marker = sanitizationMarkerAt(value, index, delimiter);
     if (marker) {
-      if (marker.trusted) return { end: index, resumeAt: marker.end };
+      if (marker.trusted || (index === start && atomicMarkerSuffixAt(value, marker.end, delimiter))) {
+        return { end: index, resumeAt: marker.end };
+      }
       index = marker.end;
       continue;
     }
@@ -518,9 +567,11 @@ type RedactionRange = { start: number; end: number };
 function authorizationValueAt(value: string, start: number, inheritedDelimiter?: QuoteDelimiter) {
   const opening = consumeOpeningValueWrappers(value, start);
   const delimiter = opening.delimiter ?? inheritedDelimiter;
-  const scanned = labeledCredentialEnd(value, opening.cursor, delimiter);
-  return scanned.end > opening.cursor
-    ? { range: { start: opening.cursor, end: scanned.end } satisfies RedactionRange, resumeAt: scanned.resumeAt }
+  const credentialStart = skipNestedAuthorizationSchemes(value, opening.cursor);
+  const scanned = labeledCredentialEnd(value, credentialStart, delimiter);
+  const end = credentialStart > opening.cursor && scanned.end === credentialStart ? scanned.resumeAt : scanned.end;
+  return end > opening.cursor
+    ? { range: { start: opening.cursor, end } satisfies RedactionRange, resumeAt: scanned.resumeAt }
     : { resumeAt: scanned.resumeAt };
 }
 
@@ -603,16 +654,8 @@ function serializedAuthorizationNameAt(value: string, start: number) {
 
 function serializedAuthorizationValueAt(value: string, start: number): RedactionRange | undefined {
   const wrapper = consumeOpeningValueWrappers(value, start);
-  const scheme =
-    value.slice(wrapper.cursor, wrapper.cursor + 5).toLowerCase() === "basic"
-      ? "basic"
-      : value.slice(wrapper.cursor, wrapper.cursor + 6).toLowerCase() === "bearer"
-        ? "bearer"
-        : undefined;
-  if (!scheme) return undefined;
-  const cursor = authorizationValueStartAfterScheme(value, wrapper.cursor + scheme.length, scheme);
-  if (cursor < 0) return undefined;
-  return authorizationValueAt(value, cursor, wrapper.delimiter).range;
+  const scheme = authorizationSchemeAt(value, wrapper.cursor);
+  return scheme ? authorizationValueAt(value, scheme.valueStart, wrapper.delimiter).range : undefined;
 }
 
 function canOpenSerializedQuote(value: string, index: number) {
@@ -696,7 +739,7 @@ function redactLabeledAuthorizationValues(value: string) {
 
 function redactKnownValues(value: string) {
   let safe = redactLabeledAuthorizationValues(value);
-  safe = safe.replace(BASIC_VALUE, (match, encoded: string) => redactBasicValue(match, encoded));
+  safe = redactBasicValues(safe);
   safe = redactBearerValues(safe).replace(SECRET_VALUE, "[redacted-secret]").replace(URL_QUERY, "$1");
   return redactEmails(safe);
 }
@@ -704,7 +747,9 @@ function redactKnownValues(value: string) {
 const EXACT_SANITIZATION_MARKERS = new Set<string>(ATOMIC_SANITIZATION_MARKERS);
 
 function atomicRedactionPrefix(value: string, limit: number) {
-  let end = wellFormedPrefix(value, limit).length;
+  const prefix = wellFormedPrefix(value, limit);
+  if (prefix.length === value.length) return value;
+  let end = prefix.length;
   let previousEnd: number;
   do {
     previousEnd = end;
@@ -720,25 +765,55 @@ function artificialCutProbe(value: string) {
   let end = value.length;
   while (end > 0 && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[end - 1]!)) end -= 1;
   const punctuation = value.slice(end);
+  let sawMarker = false;
   let previousEnd: number;
   do {
     previousEnd = end;
     const marker = ATOMIC_SANITIZATION_MARKERS.find((candidate) => value.endsWith(candidate, end));
-    if (marker) end -= marker.length;
+    if (marker) {
+      sawMarker = true;
+      end -= marker.length;
+    }
     while (end > 0 && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[end - 1]!)) end -= 1;
   } while (end < previousEnd);
-  return { prefix: value.slice(0, end), punctuation };
+  return { prefix: value.slice(0, end), punctuation, sawMarker };
+}
+
+function partialSecretStart(value: string) {
+  let runStart = value.length;
+  while (runStart > 0) {
+    const code = value.charCodeAt(runStart - 1);
+    if (!isAsciiWord(code) && code !== 45) break;
+    runStart -= 1;
+  }
+
+  const genericPrefixes = ["sk_", "crn_", "ghp_", "github_pat_", "secret_"] as const;
+  const lastUnderscore = value.lastIndexOf("_");
+  for (let index = runStart; index < value.length; index += 1) {
+    if (index > 0 && isAsciiWord(value.charCodeAt(index - 1))) continue;
+    const candidate = value.slice(index, index + 11).toLowerCase();
+    if (genericPrefixes.some((prefix) => candidate.startsWith(prefix))) return index;
+    if (
+      candidate.startsWith("xox") &&
+      "baprs".includes(candidate[3] ?? "") &&
+      candidate[4] === "-" &&
+      lastUnderscore < index + 5
+    ) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function openSensitiveSuffixAtCut(value: string) {
-  const { prefix, punctuation } = artificialCutProbe(value);
+  const { prefix, punctuation, sawMarker } = artificialCutProbe(value);
   const basic = PARTIAL_BASIC_VALUE.exec(prefix);
   const basicLength = basic?.[2]?.length ?? 0;
   if (basicLength > 0) return { marker: REDACTED_VALUE, punctuation, start: prefix.length - basicLength };
-  const bearerStart = partialBearerValueStart(prefix);
+  const bearerStart = partialBearerValueStart(prefix, punctuation.length > 0 && !sawMarker);
   if (bearerStart >= 0) return { marker: REDACTED_VALUE, punctuation, start: bearerStart };
-  const secret = PARTIAL_SECRET_VALUE.exec(prefix);
-  if (secret) return { marker: "[redacted-secret]", punctuation, start: secret.index };
+  const secretStart = partialSecretStart(prefix);
+  if (secretStart >= 0) return { marker: "[redacted-secret]", punctuation, start: secretStart };
   const emailStart = partialEmailStart(prefix);
   return emailStart >= 0 ? { marker: "[redacted-email]", punctuation, start: emailStart } : undefined;
 }
@@ -766,13 +841,14 @@ function boundedSanitizedString(value: string, limit: number) {
 }
 
 function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
-  const truncated = value.length > limit;
-  if (!truncated) return boundedSanitizedString(redactKnownValues(value), limit);
+  const existingCut = value.endsWith(TRUNCATION_MARKER);
+  if (!existingCut && value.length <= limit) return boundedSanitizedString(redactKnownValues(value), limit);
   if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, Math.max(0, limit));
   const payloadLimit = limit - TRUNCATION_MARKER.length;
-  const cutAwarePrefix = redactTruncationBoundary(wellFormedPrefix(value, payloadLimit), payloadLimit);
-  const safe = redactKnownValues(cutAwarePrefix);
-  return atomicRedactionPrefix(safe, payloadLimit) + TRUNCATION_MARKER;
+  const rawPayload = existingCut ? value.slice(0, -TRUNCATION_MARKER.length) : value;
+  const originalPayloadLimit = existingCut ? Math.min(rawPayload.length, payloadLimit) : payloadLimit;
+  const safe = redactKnownValues(wellFormedPrefix(rawPayload, originalPayloadLimit));
+  return boundedSanitizedPayload(safe, originalPayloadLimit) + TRUNCATION_MARKER;
 }
 
 function uniqueKey(base: string, occupied: (candidate: string) => boolean) {
@@ -946,8 +1022,8 @@ export function boundedNestedJson(value: unknown, limit: number) {
   return boundedNestedJsonFromSerialization(value, limit, JSON.stringify(value));
 }
 
-export function safeTelemetryErrorMessage(error: unknown, fallback: string) {
-  return redactedString(rawSafeErrorMessage(error, fallback), PERSISTED_ERROR_MESSAGE_LIMIT);
+export function safeTelemetryErrorMessage(error: unknown, fallback: string, limit = PERSISTED_ERROR_MESSAGE_LIMIT) {
+  return redactedString(rawSafeErrorMessage(error, fallback), limit);
 }
 
 function safeNested(value: unknown, depth: number, seen: WeakSet<object>, budget: { remaining: number }): unknown {

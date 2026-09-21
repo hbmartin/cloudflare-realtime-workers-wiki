@@ -4306,7 +4306,7 @@ describe("delivery outbox", () => {
     ).toBe("retried");
   });
 
-  it("logs a diagnostic when an outbox row becomes persistently poisoned", async () => {
+  it("sanitizes a persisted outbox failure before logging a poison diagnostic", async () => {
     const installed = await bootstrap();
     const outboxId = crypto.randomUUID();
     const timestamp = Date.now();
@@ -4320,21 +4320,24 @@ describe("delivery outbox", () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     onTestFinished(() => log.mockRestore());
 
+    const failureMessage = `Queue Authorization: Basic dXNlcjpwYXNz ${"x".repeat(600)}`;
     await sweepOutbox(
-      bindingsWith({ DELIVERY_QUEUE: { send: vi.fn(async () => Promise.reject(new Error("poison"))) } }),
+      bindingsWith({ DELIVERY_QUEUE: { send: vi.fn(async () => Promise.reject(new Error(failureMessage))) } }),
     );
 
     expectStructuredLog(log, "outbox.enqueue.persistent_failure", {
       outboxId,
       attempts: 10,
-      errorValue: "poison",
+      errorValue: expect.stringContaining("Basic [redacted]"),
     });
-    expect(await env.DB.prepare(`SELECT attempts, last_error FROM outbox WHERE id = ?`).bind(outboxId).first()).toEqual(
-      {
-        attempts: 10,
-        last_error: "poison",
-      },
-    );
+    const failed = await env.DB.prepare(`SELECT attempts, last_error FROM outbox WHERE id = ?`)
+      .bind(outboxId)
+      .first<{ attempts: number; last_error: string }>();
+    expect(failed?.attempts).toBe(10);
+    expect(failed?.last_error).toContain("Basic [redacted]");
+    expect(failed?.last_error).not.toContain("dXNlcjpwYXNz");
+    expect(failed?.last_error).toMatch(/…\[truncated\]$/);
+    expect(failed?.last_error.length).toBeLessThanOrEqual(500);
   });
 
   it("keeps retrying an outbox row after ten transient enqueue failures", async () => {
