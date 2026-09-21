@@ -551,8 +551,8 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
       trash,
     ];
     const minimumFocusClearance = 4;
-    // Integer-rounded client dimensions can differ from subpixel bounding boxes by up to half a CSS pixel.
-    const clientDimensionRoundingTolerance = 0.5;
+    // Pixel-snapped client dimensions can differ from subpixel bounding boxes by almost one CSS pixel.
+    const clientDimensionRoundingTolerance = 1;
     const minimumClientMeasuredClearance = minimumFocusClearance - clientDimensionRoundingTolerance;
     const computedPadding = await scrollRegion.evaluate((element) => {
       const style = getComputedStyle(element);
