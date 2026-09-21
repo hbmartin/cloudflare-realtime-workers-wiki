@@ -209,6 +209,9 @@ describe("worker observability", () => {
         `${boundary}Authorization: Bearer [redacted]`,
       );
     }
+  });
+
+  it("keeps Bearer schemes embedded in ASCII identifiers", () => {
     expect(safeTelemetryErrorMessage(new Error("_Bearer abc123"), "fallback")).toBe("_Bearer abc123");
   });
 
@@ -938,6 +941,32 @@ describe("worker observability", () => {
         expect(unicodeCaseFoldFragment.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
         expect(unicodeCaseFoldFragment.replaceAll("[redacted]", "")).not.toContain("[reda");
       }
+
+      const longUnicodeCaseFoldFragment = boundaryMessage("Bearer", `${"a".repeat(15)}${boundary}`);
+      expect(longUnicodeCaseFoldFragment).toMatch(/Bearer \[redacted\]…\[truncated\]$/);
+      expect(longUnicodeCaseFoldFragment.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+    }
+
+    for (const punctuation of ["!", "?", "*", "|", "%", "$", "@", "\\", ">", "`", "^", "#", ":"]) {
+      const shortMalformedFragment = boundaryMessage("Bearer", `a${punctuation}`);
+      expect(shortMalformedFragment).toMatch(/Bearer …\[truncated\]$/);
+      expect(shortMalformedFragment).not.toContain(`Bearer a${punctuation}`);
+
+      const longMalformedFragment = boundaryMessage("Bearer", `${"a".repeat(15)}${punctuation}`);
+      expect(longMalformedFragment).toMatch(/Bearer \[redacted\]…\[truncated\]$/);
+      expect(longMalformedFragment.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+    }
+
+    for (const delimiter of [",", ";", "}", "]", ")", "&", " ", "\t", '"', "'"]) {
+      const delimitedFragment = boundaryMessage("Bearer", `a${delimiter}`);
+      expect(delimitedFragment).toContain(`Bearer a${delimiter}${TRUNCATION_MARKER}`);
+      expect(delimitedFragment).not.toContain("[redacted]");
+    }
+
+    for (const marker of ATOMIC_SANITIZATION_MARKERS) {
+      const markedFragment = boundaryMessage("Bearer", marker);
+      expect(markedFragment).toContain(`Bearer ${marker}${TRUNCATION_MARKER}`);
+      expect(safeTelemetryErrorMessage(new Error(markedFragment), "fallback")).toBe(markedFragment);
     }
   });
 
