@@ -37,10 +37,10 @@ const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:${SERIALIZED_QUOTE}|[\[({]
 const BEARER_VALUE_WHITESPACE = String.raw`\s`;
 const BEARER_VALUE_WHITESPACE_VALUE = new RegExp(String.raw`^${BEARER_VALUE_WHITESPACE}$`, "u");
 const ASCII_WORD_CHARACTER = String.raw`[A-Za-z0-9_]`;
-const ASCII_WORD_CHARACTER_VALUE = new RegExp(String.raw`^${ASCII_WORD_CHARACTER}$`);
 const UNLABELED_BEARER_BOUNDARY = String.raw`(?<!${ASCII_WORD_CHARACTER})`;
 const AUTHORIZATION_LABEL_VALUE = new RegExp(String.raw`^${AUTHORIZATION_LABEL}$`, "i");
-// This boundary deliberately omits `u`: with `iu`, long s and Kelvin sign fold into ASCII word characters.
+// These case-insensitive boundary patterns deliberately omit `u`: with `iu`, long s and Kelvin sign fold into
+// ASCII word characters.
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
   String.raw`(?<![A-Za-z0-9])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic[ \t]+|Bearer${BEARER_VALUE_WHITESPACE}+)`,
   "gi",
@@ -48,9 +48,13 @@ const LABELED_AUTHORIZATION_PREFIX = new RegExp(
 const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
 const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=-]`;
 const BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}+)`, "gi");
+// Keep this non-`u` for the same Unicode simple-fold boundary behavior described above.
 const BEARER_VALUE_PREFIX = new RegExp(String.raw`${UNLABELED_BEARER_BOUNDARY}Bearer${BEARER_VALUE_WHITESPACE}+`, "gi");
 const BEARER_TOKEN_CHARACTER_VALUE = new RegExp(String.raw`^${BEARER_TOKEN_CHARACTER}$`);
-const PARTIAL_BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}*)$`, "i");
+const PARTIAL_BASIC_VALUE = new RegExp(
+  String.raw`\bBasic[ \t]+(${AUTHORIZATION_VALUE_WRAPPERS})(${BASIC_TOKEN_CHARACTER}+)$`,
+  "i",
+);
 const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
 const SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/gi;
 const PARTIAL_SECRET_VALUE = /\b(?:(?:sk|crn|ghp|github_pat|secret)_[A-Za-z0-9_-]*|xox[baprs]-[A-Za-z0-9-]*)$/i;
@@ -81,6 +85,7 @@ export const ATOMIC_SANITIZATION_MARKERS = [
   FUNCTION_OMITTED,
   SYMBOL_OMITTED,
 ] as const;
+const SANITIZATION_MARKER_FIRST_CHARACTERS = new Set(ATOMIC_SANITIZATION_MARKERS.map((marker) => marker.charAt(0)));
 const RESERVED_LOG_FIELDS = new Set([
   "schema",
   "event",
@@ -214,15 +219,23 @@ function isBearerTokenCharacter(character: string | undefined) {
   return character !== undefined && BEARER_TOKEN_CHARACTER_VALUE.test(character);
 }
 
+function authorizationValueStartAfterScheme(value: string, start: number, scheme: "basic" | "bearer") {
+  const isSeparator = (character: string | undefined) =>
+    scheme === "bearer" ? BEARER_VALUE_WHITESPACE_VALUE.test(character ?? "") : character === " " || character === "\t";
+  if (!isSeparator(value[start])) return -1;
+  let cursor = start + 1;
+  while (isSeparator(value[cursor])) cursor += 1;
+  return cursor;
+}
+
 function bearerValuePrefixAt(value: string, index: number) {
   if (value.slice(index, index + 6).toLowerCase() !== "bearer") return false;
-  if (ASCII_WORD_CHARACTER_VALUE.test(value.charAt(index - 1))) return false;
-  return BEARER_VALUE_WHITESPACE_VALUE.test(value[index + 6] ?? "");
+  if (isAsciiWord(value.charCodeAt(index - 1))) return false;
+  return authorizationValueStartAfterScheme(value, index + 6, "bearer") >= 0;
 }
 
 function sanitizationMarkerLengthAt(value: string, index: number) {
-  const first = value[index];
-  if (first !== "[" && first !== "…") return 0;
+  if (!SANITIZATION_MARKER_FIRST_CHARACTERS.has(value.charAt(index))) return 0;
   return ATOMIC_SANITIZATION_MARKERS.find((marker) => value.startsWith(marker, index))?.length ?? 0;
 }
 
@@ -238,7 +251,8 @@ function bearerCandidate(value: string, start: number) {
     }
     const marker = sanitizationMarkerAt(value, cursor);
     if (marker) {
-      if (marker.trusted)
+      const markerOnlyValue = consumeOpeningValueWrappers(value, start).cursor === cursor;
+      if (marker.trusted || (markerOnlyValue && atomicMarkerSuffixAt(value, marker.end)))
         return { candidate, crossedMarker, end: cursor, malformedCredentialPunctuation, resumeAt: marker.end };
       crossedMarker = true;
       cursor = marker.end;
@@ -247,7 +261,7 @@ function bearerCandidate(value: string, start: number) {
 
     const character = value[cursor]!;
     const boundary = credentialBoundaryAt(value, cursor);
-    if (boundary.boundary || character === '"' || character === "'") {
+    if (boundary.boundary || isCredentialQuote(character)) {
       return { candidate, crossedMarker, end: cursor, malformedCredentialPunctuation, resumeAt: cursor };
     }
     if (isBearerTokenCharacter(character)) {
@@ -262,7 +276,7 @@ function bearerCandidate(value: string, start: number) {
       if (sanitizationMarkerLengthAt(value, continuation) > 0 || isBearerTokenCharacter(value[continuation])) break;
       const nextCharacter = value[continuation]!;
       const nextBoundary = credentialBoundaryAt(value, continuation);
-      if (nextBoundary.boundary || nextCharacter === '"' || nextCharacter === "'") break;
+      if (nextBoundary.boundary || isCredentialQuote(nextCharacter)) break;
       continuation = nextBoundary.next;
     }
     if (
@@ -328,7 +342,7 @@ function lastQuoteDelimiter(value: string): QuoteDelimiter | undefined {
   let delimiter: QuoteDelimiter | undefined;
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index];
-    if (character !== '"' && character !== "'") continue;
+    if (!isCredentialQuote(character)) continue;
     delimiter = { backslashes: precedingBackslashes(value, index), quote: character };
   }
   return delimiter;
@@ -348,7 +362,7 @@ function consumeOpeningValueWrappers(value: string, start: number) {
     const slashStart = cursor;
     while (cursor < value.length && value[cursor] === "\\") cursor += 1;
     const character = value[cursor];
-    if (character === '"' || character === "'") {
+    if (isCredentialQuote(character)) {
       return {
         cursor: cursor + 1,
         delimiter: { backslashes: cursor - slashStart, quote: character } satisfies QuoteDelimiter,
@@ -362,10 +376,26 @@ function consumeOpeningValueWrappers(value: string, start: number) {
 const STRUCTURAL_CREDENTIAL_BOUNDARIES = ",;}])&";
 const TRAILING_CREDENTIAL_PUNCTUATION = ".!?";
 
+function isCredentialQuote(character: string | undefined): character is '"' | "'" {
+  return character === '"' || character === "'";
+}
+
+function isStructuralCredentialDelimiter(character: string | undefined) {
+  return (
+    character !== undefined &&
+    character !== "" &&
+    (/\s/u.test(character) || STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character))
+  );
+}
+
+function isHardCredentialDelimiter(character: string | undefined) {
+  return isStructuralCredentialDelimiter(character) || isCredentialQuote(character);
+}
+
 function credentialBoundaryAt(value: string, index: number) {
   const character = value[index];
   if (character === undefined) return { boundary: true, next: index };
-  if (/\s/u.test(character) || STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character)) {
+  if (isStructuralCredentialDelimiter(character)) {
     return { boundary: true, next: index + 1 };
   }
   if (!TRAILING_CREDENTIAL_PUNCTUATION.includes(character)) {
@@ -375,12 +405,7 @@ function credentialBoundaryAt(value: string, index: number) {
   while (value[runEnd] !== undefined && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[runEnd]!)) runEnd += 1;
   const next = value[runEnd];
   return {
-    boundary:
-      next === undefined ||
-      /\s/u.test(next) ||
-      STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(next) ||
-      next === '"' ||
-      next === "'",
+    boundary: next === undefined || isHardCredentialDelimiter(next),
     next: runEnd,
   };
 }
@@ -399,44 +424,55 @@ function sanitizationMarkerAt(value: string, index: number, delimiter?: QuoteDel
   const escapedClosingQuote = quoteIndex > end && quoteEndsCredentialAt(value, quoteIndex, delimiter);
   return {
     end,
-    trusted: suffix === '"' || suffix === "'" || escapedClosingQuote || credentialBoundaryAt(value, end).boundary,
+    trusted: isCredentialQuote(suffix) || escapedClosingQuote || credentialBoundaryAt(value, end).boundary,
   };
+}
+
+function atomicMarkerSuffixAt(value: string, start: number) {
+  let cursor = start;
+  let sawMarker = false;
+  while (cursor < value.length) {
+    while (cursor < value.length && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[cursor]!)) cursor += 1;
+    if (cursor === value.length) return sawMarker;
+    const markerLength = sanitizationMarkerLengthAt(value, cursor);
+    if (markerLength === 0) return false;
+    sawMarker = true;
+    cursor += markerLength;
+  }
+  return sawMarker;
 }
 
 function partialBearerValueStart(value: string) {
   BEARER_VALUE_PREFIX.lastIndex = 0;
-  let match = BEARER_VALUE_PREFIX.exec(value);
-  while (match) {
-    const tokenStart = BEARER_VALUE_PREFIX.lastIndex;
-    let cursor = tokenStart;
-    while (cursor < value.length) {
-      const marker = sanitizationMarkerAt(value, cursor);
-      if (marker) {
-        if (marker.trusted) break;
-        cursor = marker.end;
-        continue;
-      }
+  try {
+    let match = BEARER_VALUE_PREFIX.exec(value);
+    while (match) {
+      const credentialStart = consumeOpeningValueWrappers(value, BEARER_VALUE_PREFIX.lastIndex).cursor;
+      let cursor = credentialStart;
+      while (cursor < value.length) {
+        const marker = sanitizationMarkerAt(value, cursor);
+        if (marker) {
+          if (marker.trusted) break;
+          cursor = marker.end;
+          continue;
+        }
 
-      const character = value[cursor]!;
-      if (
-        /\s/u.test(character) ||
-        STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character) ||
-        character === '"' ||
-        character === "'"
-      ) {
-        break;
+        const character = value[cursor]!;
+        if (isHardCredentialDelimiter(character)) break;
+        cursor += 1;
       }
-      cursor += 1;
+      if (cursor === value.length && cursor > credentialStart) return credentialStart;
+      match = BEARER_VALUE_PREFIX.exec(value);
     }
-    if (cursor === value.length) return tokenStart;
-    match = BEARER_VALUE_PREFIX.exec(value);
+    return -1;
+  } finally {
+    BEARER_VALUE_PREFIX.lastIndex = 0;
   }
-  return -1;
 }
 
 function quoteEndsCredentialAt(value: string, index: number, delimiter: QuoteDelimiter | undefined) {
   const character = value[index];
-  if (character !== '"' && character !== "'") return false;
+  if (!isCredentialQuote(character)) return false;
   return delimiter === undefined || character !== delimiter.quote || quoteCloses(delimiter, value, index);
 }
 
@@ -456,7 +492,7 @@ function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDeli
       continue;
     }
     if (delimiter) {
-      if (character !== '"' && character !== "'") {
+      if (!isCredentialQuote(character)) {
         index += 1;
         continue;
       }
@@ -468,7 +504,7 @@ function labeledCredentialEnd(value: string, start: number, delimiter: QuoteDeli
       index += 1;
       continue;
     }
-    if (character === '"' || character === "'") {
+    if (isCredentialQuote(character)) {
       const end = index - precedingBackslashes(value, index, start);
       return { end, resumeAt: end };
     }
@@ -567,12 +603,15 @@ function serializedAuthorizationNameAt(value: string, start: number) {
 
 function serializedAuthorizationValueAt(value: string, start: number): RedactionRange | undefined {
   const wrapper = consumeOpeningValueWrappers(value, start);
-  const scheme = value.slice(wrapper.cursor, wrapper.cursor + 6).toLowerCase();
-  const schemeLength = scheme.startsWith("basic") ? 5 : scheme === "bearer" ? 6 : 0;
-  if (schemeLength === 0) return undefined;
-  let cursor = wrapper.cursor + schemeLength;
-  if (value[cursor] !== " " && value[cursor] !== "\t") return undefined;
-  while (value[cursor] === " " || value[cursor] === "\t") cursor += 1;
+  const scheme =
+    value.slice(wrapper.cursor, wrapper.cursor + 5).toLowerCase() === "basic"
+      ? "basic"
+      : value.slice(wrapper.cursor, wrapper.cursor + 6).toLowerCase() === "bearer"
+        ? "bearer"
+        : undefined;
+  if (!scheme) return undefined;
+  const cursor = authorizationValueStartAfterScheme(value, wrapper.cursor + scheme.length, scheme);
+  if (cursor < 0) return undefined;
   return authorizationValueAt(value, cursor, wrapper.delimiter).range;
 }
 
@@ -615,7 +654,7 @@ function redactSerializedAuthorizationObjects(value: string) {
     const character = value[index]!;
     if (delimiter) {
       if (quoteCloses(delimiter, value, index)) delimiter = undefined;
-    } else if ((character === '"' || character === "'") && canOpenSerializedQuote(value, index)) {
+    } else if (isCredentialQuote(character) && canOpenSerializedQuote(value, index)) {
       delimiter = {
         backslashes: precedingBackslashes(value, index),
         quote: character,
@@ -677,23 +716,41 @@ function atomicRedactionPrefix(value: string, limit: number) {
   return wellFormedPrefix(value, end);
 }
 
-function boundaryReplacement(value: string) {
-  const basic = PARTIAL_BASIC_VALUE.exec(value);
-  if (basic) return { marker: REDACTED_VALUE, start: value.length - (basic[1]?.length ?? 0) };
-  const bearerStart = partialBearerValueStart(value);
-  if (bearerStart >= 0) return { marker: REDACTED_VALUE, start: bearerStart };
-  const secret = PARTIAL_SECRET_VALUE.exec(value);
-  if (secret) return { marker: "[redacted-secret]", start: secret.index };
-  const emailStart = partialEmailStart(value);
-  return emailStart >= 0 ? { marker: "[redacted-email]", start: emailStart } : undefined;
+function artificialCutProbe(value: string) {
+  let end = value.length;
+  while (end > 0 && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[end - 1]!)) end -= 1;
+  const punctuation = value.slice(end);
+  let previousEnd: number;
+  do {
+    previousEnd = end;
+    const marker = ATOMIC_SANITIZATION_MARKERS.find((candidate) => value.endsWith(candidate, end));
+    if (marker) end -= marker.length;
+    while (end > 0 && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[end - 1]!)) end -= 1;
+  } while (end < previousEnd);
+  return { prefix: value.slice(0, end), punctuation };
+}
+
+function openSensitiveSuffixAtCut(value: string) {
+  const { prefix, punctuation } = artificialCutProbe(value);
+  const basic = PARTIAL_BASIC_VALUE.exec(prefix);
+  const basicLength = basic?.[2]?.length ?? 0;
+  if (basicLength > 0) return { marker: REDACTED_VALUE, punctuation, start: prefix.length - basicLength };
+  const bearerStart = partialBearerValueStart(prefix);
+  if (bearerStart >= 0) return { marker: REDACTED_VALUE, punctuation, start: bearerStart };
+  const secret = PARTIAL_SECRET_VALUE.exec(prefix);
+  if (secret) return { marker: "[redacted-secret]", punctuation, start: secret.index };
+  const emailStart = partialEmailStart(prefix);
+  return emailStart >= 0 ? { marker: "[redacted-email]", punctuation, start: emailStart } : undefined;
 }
 
 function redactTruncationBoundary(value: string, limit: number) {
-  const replacement = boundaryReplacement(value);
+  const replacement = openSensitiveSuffixAtCut(value);
   if (!replacement) return value;
   const prefix = value.slice(0, replacement.start);
   const redacted = prefix + replacement.marker;
-  return redacted.length <= limit ? redacted : prefix;
+  if (redacted.length > limit) return prefix;
+  const withPunctuation = redacted + replacement.punctuation;
+  return withPunctuation.length <= limit ? withPunctuation : redacted;
 }
 
 function boundedSanitizedPayload(value: string, limit: number) {
@@ -713,8 +770,9 @@ function redactedString(value: string, limit = LOG_TEXT_LIMIT) {
   if (!truncated) return boundedSanitizedString(redactKnownValues(value), limit);
   if (limit <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, Math.max(0, limit));
   const payloadLimit = limit - TRUNCATION_MARKER.length;
-  const safe = redactKnownValues(wellFormedPrefix(value, payloadLimit));
-  return boundedSanitizedPayload(safe, payloadLimit) + TRUNCATION_MARKER;
+  const cutAwarePrefix = redactTruncationBoundary(wellFormedPrefix(value, payloadLimit), payloadLimit);
+  const safe = redactKnownValues(cutAwarePrefix);
+  return atomicRedactionPrefix(safe, payloadLimit) + TRUNCATION_MARKER;
 }
 
 function uniqueKey(base: string, occupied: (candidate: string) => boolean) {
