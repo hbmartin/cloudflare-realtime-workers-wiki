@@ -25,6 +25,24 @@ function isWellFormed(value: string) {
 }
 
 const UNICODE_SIMPLE_FOLD_BEARER_CHARACTERS = ["\u017f", "\u212a"] as const;
+const JAVASCRIPT_WHITESPACE_SEPARATORS = [
+  " ",
+  "\t",
+  "\n",
+  "\v",
+  "\f",
+  "\r",
+  "\r\n",
+  "\u00a0",
+  "\u1680",
+  ...Array.from({ length: 11 }, (_, offset) => String.fromCodePoint(0x2000 + offset)),
+  "\u2028",
+  "\u2029",
+  "\u202f",
+  "\u205f",
+  "\u3000",
+  "\ufeff",
+] as const;
 
 describe("worker observability", () => {
   it("emits one structured, correlated, redacted log object", () => {
@@ -216,32 +234,15 @@ describe("worker observability", () => {
   });
 
   it("redacts Bearer values separated by JavaScript whitespace", () => {
-    const separators = [
-      " ",
-      "\t",
-      "\n",
-      "\v",
-      "\f",
-      "\r",
-      "\r\n",
-      "\u00a0",
-      "\u1680",
-      ...Array.from({ length: 11 }, (_, offset) => String.fromCodePoint(0x2000 + offset)),
-      "\u2028",
-      "\u2029",
-      "\u202f",
-      "\u205f",
-      "\u3000",
-      "\ufeff",
-    ];
-
-    for (const separator of separators) {
-      for (const [prefix, credential] of [
-        ["Bearer", "abc123"],
-        ["Authorization: Bearer", "abc"],
+    for (const separator of JAVASCRIPT_WHITESPACE_SEPARATORS) {
+      for (const [message, expected] of [
+        [`Bearer${separator}abc123`, `Bearer${separator}[redacted]`],
+        [`Authorization: Bearer${separator}abc`, `Authorization: Bearer${separator}[redacted]`],
+        [
+          `{"name":"authorization","value":"Bearer${separator}abc"}`,
+          `{"name":"authorization","value":"Bearer${separator}[redacted]"}`,
+        ],
       ] as const) {
-        const message = `${prefix}${separator}${credential}`;
-        const expected = `${prefix}${separator}[redacted]`;
         const once = safeTelemetryErrorMessage(new Error(message), "fallback");
         expect(once).toBe(expected);
         expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(expected);
@@ -252,7 +253,11 @@ describe("worker observability", () => {
     expect(nested).toBe("Bearer [redacted]Bearer\u00a0[redacted]");
     expect(safeTelemetryErrorMessage(new Error(nested), "fallback")).toBe(nested);
 
-    for (const message of ["Basic\u00a0Zm9vOmJhcg==", "Authorization: Basic\u00a0badtoken"]) {
+    for (const message of [
+      "Basic\u00a0Zm9vOmJhcg==",
+      "Authorization: Basic\u00a0badtoken",
+      '{"name":"authorization","value":"Basic\u00a0badtoken"}',
+    ]) {
       expect(safeTelemetryErrorMessage(new Error(message), "fallback")).toBe(message);
     }
   });
@@ -886,20 +891,19 @@ describe("worker observability", () => {
     }
   }, 10_000);
 
-  it("scrubs short Basic and Bearer values cut off at the raw boundary", () => {
+  it("scrubs open sensitive suffixes at the raw boundary", () => {
+    const cutMessage = (value: string, leading = "", valueBoundary = " ") => {
+      const prefixLength = PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length - leading.length - value.length;
+      const prefix = `${leading}${"x".repeat(prefixLength - valueBoundary.length)}${valueBoundary}`;
+      return safeTelemetryErrorMessage(new Error(`${prefix}${value}${"tail".repeat(30)}`), "fallback");
+    };
     const boundaryMessage = (
       scheme: "Basic" | "Bearer",
       fragment: string,
       leading = "",
       separator = " ",
       schemeBoundary = " ",
-    ) => {
-      const label = `${scheme}${separator}`;
-      const prefixLength =
-        PERSISTED_ERROR_MESSAGE_LIMIT - TRUNCATION_MARKER.length - leading.length - label.length - fragment.length;
-      const prefix = `${leading}${"x".repeat(prefixLength - schemeBoundary.length)}${schemeBoundary}`;
-      return safeTelemetryErrorMessage(new Error(`${prefix}${label}${fragment}${"tail".repeat(30)}`), "fallback");
-    };
+    ) => cutMessage(`${scheme}${separator}${fragment}`, leading, schemeBoundary);
 
     for (const length of [1, 5, 9, 13, 15]) {
       const fragment = "A".repeat(length);
@@ -953,7 +957,8 @@ describe("worker observability", () => {
       expect(shortMalformedFragment).not.toContain(`Bearer a${punctuation}`);
 
       const longMalformedFragment = boundaryMessage("Bearer", `${"a".repeat(15)}${punctuation}`);
-      expect(longMalformedFragment).toMatch(/Bearer \[redacted\]…\[truncated\]$/);
+      const preservedPunctuation = punctuation === "!" || punctuation === "?" ? punctuation : "";
+      expect(longMalformedFragment).toContain(`Bearer [redacted]${preservedPunctuation}${TRUNCATION_MARKER}`);
       expect(longMalformedFragment.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
     }
 
@@ -963,23 +968,79 @@ describe("worker observability", () => {
       expect(delimitedFragment).not.toContain("[redacted]");
     }
 
-    for (const marker of ATOMIC_SANITIZATION_MARKERS) {
-      const markedFragment = boundaryMessage("Bearer", marker);
-      expect(markedFragment).toContain(`Bearer ${marker}${TRUNCATION_MARKER}`);
-      expect(markedFragment.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
-      expect(safeTelemetryErrorMessage(new Error(markedFragment), "fallback")).toBe(markedFragment);
+    const terminalPunctuation = ["", ".", "!", "?", "!?"] as const;
+    const sensitiveSuffixes = [
+      { raw: "Bearer aaa", leaked: "Bearer aaa", expected: "Bearer [redacted]", marker: "[redacted]" },
+      {
+        raw: "Basic dXNlcm5hbWU",
+        leaked: "Basic dXNlcm5hbWU",
+        expected: "Basic [redacted]",
+        marker: "[redacted]",
+      },
+      {
+        raw: "first.last@exampl",
+        leaked: "first.last@exampl",
+        expected: "[redacted-email]",
+        marker: "[redacted-email]",
+      },
+      {
+        raw: "ghp_abcd",
+        leaked: "ghp_abcd",
+        expected: "[redacted-secret]",
+        marker: "[redacted-secret]",
+      },
+    ] as const;
 
-      for (const length of [1, 3, 10, 15]) {
-        const fragment = "a".repeat(length);
-        const markedCredential = boundaryMessage("Bearer", `${fragment}${marker}`);
-        expect(markedCredential).toContain(`Bearer [redacted]${TRUNCATION_MARKER}`);
-        expect(markedCredential).not.toContain(`Bearer ${fragment}`);
-        expect(markedCredential).toMatch(/…\[truncated\]$/);
-        expect(markedCredential.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
-        expect(markedCredential.match(/\[redacted]/g)).toHaveLength(1);
-        expect(markedCredential.replaceAll("[redacted]", "")).not.toContain("[reda");
-        expect(safeTelemetryErrorMessage(new Error(markedCredential), "fallback")).toBe(markedCredential);
+    for (const marker of ATOMIC_SANITIZATION_MARKERS) {
+      for (const punctuation of terminalPunctuation) {
+        const markerOnlyValue = `Bearer ${marker}${punctuation}`;
+        const markerOnly = cutMessage(markerOnlyValue);
+        expect(markerOnly).toContain(`${markerOnlyValue}${TRUNCATION_MARKER}`);
+        expect(markerOnly.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+        expect(isWellFormed(markerOnly)).toBe(true);
+        expect(safeTelemetryErrorMessage(new Error(markerOnly), "fallback")).toBe(markerOnly);
+
+        for (const { raw, leaked, expected, marker: expectedMarker } of sensitiveSuffixes) {
+          const markedCredential = cutMessage(`${raw}${marker}${punctuation}`);
+          expect(markedCredential).not.toContain(leaked);
+          expect(markedCredential).toContain(`${expected}${punctuation}${TRUNCATION_MARKER}`);
+          expect(markedCredential.split(expectedMarker)).toHaveLength(2);
+          expect(markedCredential).toMatch(/…\[truncated\]$/);
+          expect(markedCredential.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+          expect(isWellFormed(markedCredential)).toBe(true);
+          expect(safeTelemetryErrorMessage(new Error(markedCredential), "fallback")).toBe(markedCredential);
+        }
       }
+    }
+
+    const alternatingMarkerRun = cutMessage(`Bearer aaa[redacted].[value omitted]!?`);
+    expect(alternatingMarkerRun).toContain(`Bearer [redacted]!?${TRUNCATION_MARKER}`);
+    expect(alternatingMarkerRun).not.toContain("aaa");
+    expect(safeTelemetryErrorMessage(new Error(alternatingMarkerRun), "fallback")).toBe(alternatingMarkerRun);
+
+    const markerOnlyAlternatingValue = "Bearer [redacted].[value omitted].";
+    const markerOnlyAlternating = cutMessage(markerOnlyAlternatingValue);
+    expect(markerOnlyAlternating).toContain(`${markerOnlyAlternatingValue}${TRUNCATION_MARKER}`);
+    expect(safeTelemetryErrorMessage(new Error(markerOnlyAlternating), "fallback")).toBe(markerOnlyAlternating);
+    expect(safeTelemetryErrorMessage(new Error(markerOnlyAlternatingValue), "fallback")).toBe(
+      markerOnlyAlternatingValue,
+    );
+
+    for (const wrapper of ["[", "(", '"', "'"]) {
+      const markerOnlyValue = `Bearer ${wrapper}[value omitted].`;
+      const markerOnly = cutMessage(markerOnlyValue);
+      expect(markerOnly).toContain(`${markerOnlyValue}${TRUNCATION_MARKER}`);
+      expect(safeTelemetryErrorMessage(new Error(markerOnly), "fallback")).toBe(markerOnly);
+
+      const wrappedCredential = cutMessage(`Bearer ${wrapper}aaa[value omitted].`);
+      expect(wrappedCredential).toContain(`Bearer ${wrapper}[redacted].${TRUNCATION_MARKER}`);
+      expect(wrappedCredential).not.toContain("aaa");
+      expect(safeTelemetryErrorMessage(new Error(wrappedCredential), "fallback")).toBe(wrappedCredential);
+
+      const wrappedBasic = cutMessage(`Basic ${wrapper}dXNlcm5hbWU`);
+      expect(wrappedBasic).toContain(`Basic ${wrapper}[redacted]${TRUNCATION_MARKER}`);
+      expect(wrappedBasic).not.toContain("dXNlcm5hbWU");
+      expect(safeTelemetryErrorMessage(new Error(wrappedBasic), "fallback")).toBe(wrappedBasic);
     }
   });
 

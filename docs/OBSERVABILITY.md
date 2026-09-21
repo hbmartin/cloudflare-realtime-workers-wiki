@@ -81,14 +81,19 @@ nested metadata appears between them. The logger also redacts decodable free-tex
 free-text Bearer values (including malformed values with internal `!` or `?`), and query strings, including nested
 diagnostic values. Bearer scheme/value separation recognizes JavaScript whitespace, including line breaks and Unicode
 space characters. Unlabeled Bearer schemes use ASCII identifier boundaries: an underscore keeps the scheme embedded in
-an identifier, while adjacent non-ASCII characters do not suppress redaction. Raw fields are bounded before one full
-redaction scan; later truncation and nested compaction operate on already-sanitized text and scrub only recognizable
-partial Basic or Bearer credentials, emails, and secret prefixes at the cut boundary. At an artificial cut, Bearer
-credential material continues until whitespace, a quote, or one of `,;}])&`; this conservative policy can redact
-prose-like forms such as `Bearer token(s)`. Complete redaction and omission marker runs, including a following truncation
-marker, remain atomic when they are the entire Bearer value, but they cannot make preceding credential material trusted.
-Free-text Bearer scanning crosses untrusted marker runs and internal malformed credential punctuation without consuming
-trailing delimiters, so sanitizing an already-sanitized value is idempotent.
+an identifier, while adjacent non-ASCII characters do not suppress redaction. The full malformed-punctuation heuristic
+is deliberately conservative and can redact prose-like forms such as `Bearer token(s)`.
+
+Raw fields are bounded before one full redaction scan; later truncation and nested compaction operate on already-sanitized
+text. At an artificial cut, one shared pass checks for an open partial Basic or Bearer credential, email, or secret prefix.
+It temporarily looks through a terminal alternating run of complete sanitization markers and `.`, `!`, or `?` punctuation
+while deciding whether sensitive material is still open. Those markers are lexical atoms, not proof that preceding input
+was sanitized: raw credential material and adjacent marker runs collapse to one class-appropriate marker. A marker-only
+value remains unchanged, including when it follows an opening bracket, parenthesis, or quote. Opening wrappers around a
+real credential remain visible, and safe terminal punctuation is preserved when the field budget can hold it; the
+redaction marker takes priority when it cannot hold both. The truncation marker is always complete. These rules make
+sanitization a fixed point: sanitizing an already-sanitized value produces exactly the same value.
+
 Complete unlabeled malformed Basic values, ordinary Basic prose, and short alphabetic Bearer prose remain unchanged, so
 never put authorization headers or credentials in diagnostic text.
 Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to
