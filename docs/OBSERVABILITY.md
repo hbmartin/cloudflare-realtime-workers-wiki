@@ -80,12 +80,15 @@ bare, quoted, or escaped keys in either property order and pairs only fields in 
 nested metadata appears between them. The logger also redacts decodable free-text Basic credentials, credential-like
 free-text Bearer values (including malformed values with internal `!` or `?`), and query strings, including nested
 diagnostic values. Bearer scheme/value separation recognizes JavaScript whitespace, including line breaks and Unicode
-space characters. Raw fields are bounded before one full redaction scan; later truncation and nested compaction operate on
-already-sanitized text and scrub only recognizable partial Basic or Bearer credentials, emails, and secret prefixes at the
-cut boundary. Partial Bearer fragments remain credential material through non-delimiter punctuation and Unicode
-simple-fold characters such as long s and Kelvin sign. Complete redaction and omission markers, including a following
-truncation marker, are atomic. Free-text Bearer scanning crosses untrusted marker runs and internal malformed credential
-punctuation without consuming trailing delimiters, so sanitizing an already-sanitized value is idempotent.
+space characters. Unlabeled Bearer schemes use ASCII identifier boundaries: an underscore keeps the scheme embedded in
+an identifier, while adjacent non-ASCII characters do not suppress redaction. Raw fields are bounded before one full
+redaction scan; later truncation and nested compaction operate on already-sanitized text and scrub only recognizable
+partial Basic or Bearer credentials, emails, and secret prefixes at the cut boundary. At an artificial cut, Bearer
+credential material continues until whitespace, a quote, or one of `,;}])&`; this conservative policy can redact
+prose-like forms such as `Bearer token(s)`. Complete redaction and omission marker runs, including a following truncation
+marker, remain atomic when they are the entire Bearer value, but they cannot make preceding credential material trusted.
+Free-text Bearer scanning crosses untrusted marker runs and internal malformed credential punctuation without consuming
+trailing delimiters, so sanitizing an already-sanitized value is idempotent.
 Complete unlabeled malformed Basic values, ordinary Basic prose, and short alphabetic Bearer prose remain unchanged, so
 never put authorization headers or credentials in diagnostic text.
 Opaque workspace, page, job, and outbox IDs are allowed only in short-lived logs and spans. Do not write them to

@@ -966,7 +966,20 @@ describe("worker observability", () => {
     for (const marker of ATOMIC_SANITIZATION_MARKERS) {
       const markedFragment = boundaryMessage("Bearer", marker);
       expect(markedFragment).toContain(`Bearer ${marker}${TRUNCATION_MARKER}`);
+      expect(markedFragment.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
       expect(safeTelemetryErrorMessage(new Error(markedFragment), "fallback")).toBe(markedFragment);
+
+      for (const length of [1, 3, 10, 15]) {
+        const fragment = "a".repeat(length);
+        const markedCredential = boundaryMessage("Bearer", `${fragment}${marker}`);
+        expect(markedCredential).toContain(`Bearer [redacted]${TRUNCATION_MARKER}`);
+        expect(markedCredential).not.toContain(`Bearer ${fragment}`);
+        expect(markedCredential).toMatch(/…\[truncated\]$/);
+        expect(markedCredential.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+        expect(markedCredential.match(/\[redacted]/g)).toHaveLength(1);
+        expect(markedCredential.replaceAll("[redacted]", "")).not.toContain("[reda");
+        expect(safeTelemetryErrorMessage(new Error(markedCredential), "fallback")).toBe(markedCredential);
+      }
     }
   });
 

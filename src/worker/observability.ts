@@ -37,10 +37,10 @@ const AUTHORIZATION_VALUE_WRAPPERS = String.raw`(?:(?:${SERIALIZED_QUOTE}|[\[({]
 const BEARER_VALUE_WHITESPACE = String.raw`\s`;
 const BEARER_VALUE_WHITESPACE_VALUE = new RegExp(String.raw`^${BEARER_VALUE_WHITESPACE}$`, "u");
 const ASCII_WORD_CHARACTER = String.raw`[A-Za-z0-9_]`;
-const ASCII_WORD_CHARACTER_VALUE = new RegExp(String.raw`^${ASCII_WORD_CHARACTER}$`);
 const UNLABELED_BEARER_BOUNDARY = String.raw`(?<!${ASCII_WORD_CHARACTER})`;
 const AUTHORIZATION_LABEL_VALUE = new RegExp(String.raw`^${AUTHORIZATION_LABEL}$`, "i");
-// This boundary deliberately omits `u`: with `iu`, long s and Kelvin sign fold into ASCII word characters.
+// These case-insensitive boundary patterns deliberately omit `u`: with `iu`, long s and Kelvin sign fold into
+// ASCII word characters.
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
   String.raw`(?<![A-Za-z0-9])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic[ \t]+|Bearer${BEARER_VALUE_WHITESPACE}+)`,
   "gi",
@@ -48,6 +48,7 @@ const LABELED_AUTHORIZATION_PREFIX = new RegExp(
 const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
 const BEARER_TOKEN_CHARACTER = String.raw`[A-Za-z0-9._~+/=-]`;
 const BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}+)`, "gi");
+// Keep this non-`u` for the same Unicode simple-fold boundary behavior described above.
 const BEARER_VALUE_PREFIX = new RegExp(String.raw`${UNLABELED_BEARER_BOUNDARY}Bearer${BEARER_VALUE_WHITESPACE}+`, "gi");
 const BEARER_TOKEN_CHARACTER_VALUE = new RegExp(String.raw`^${BEARER_TOKEN_CHARACTER}$`);
 const PARTIAL_BASIC_VALUE = new RegExp(String.raw`\bBasic[ \t]+(${BASIC_TOKEN_CHARACTER}*)$`, "i");
@@ -81,6 +82,7 @@ export const ATOMIC_SANITIZATION_MARKERS = [
   FUNCTION_OMITTED,
   SYMBOL_OMITTED,
 ] as const;
+const SANITIZATION_MARKER_FIRST_CHARACTERS = new Set(ATOMIC_SANITIZATION_MARKERS.map((marker) => marker.charAt(0)));
 const RESERVED_LOG_FIELDS = new Set([
   "schema",
   "event",
@@ -216,13 +218,12 @@ function isBearerTokenCharacter(character: string | undefined) {
 
 function bearerValuePrefixAt(value: string, index: number) {
   if (value.slice(index, index + 6).toLowerCase() !== "bearer") return false;
-  if (ASCII_WORD_CHARACTER_VALUE.test(value.charAt(index - 1))) return false;
+  if (isAsciiWord(value.charCodeAt(index - 1))) return false;
   return BEARER_VALUE_WHITESPACE_VALUE.test(value[index + 6] ?? "");
 }
 
 function sanitizationMarkerLengthAt(value: string, index: number) {
-  const first = value[index];
-  if (first !== "[" && first !== "…") return 0;
+  if (!SANITIZATION_MARKER_FIRST_CHARACTERS.has(value.charAt(index))) return 0;
   return ATOMIC_SANITIZATION_MARKERS.find((marker) => value.startsWith(marker, index))?.length ?? 0;
 }
 
@@ -362,10 +363,22 @@ function consumeOpeningValueWrappers(value: string, start: number) {
 const STRUCTURAL_CREDENTIAL_BOUNDARIES = ",;}])&";
 const TRAILING_CREDENTIAL_PUNCTUATION = ".!?";
 
+function isCredentialQuote(character: string | undefined): character is '"' | "'" {
+  return character === '"' || character === "'";
+}
+
+function isStructuralCredentialDelimiter(character: string | undefined) {
+  return character !== undefined && (/\s/u.test(character) || STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character));
+}
+
+function isHardCredentialDelimiter(character: string | undefined) {
+  return isStructuralCredentialDelimiter(character) || isCredentialQuote(character);
+}
+
 function credentialBoundaryAt(value: string, index: number) {
   const character = value[index];
   if (character === undefined) return { boundary: true, next: index };
-  if (/\s/u.test(character) || STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character)) {
+  if (isStructuralCredentialDelimiter(character)) {
     return { boundary: true, next: index + 1 };
   }
   if (!TRAILING_CREDENTIAL_PUNCTUATION.includes(character)) {
@@ -375,12 +388,7 @@ function credentialBoundaryAt(value: string, index: number) {
   while (value[runEnd] !== undefined && TRAILING_CREDENTIAL_PUNCTUATION.includes(value[runEnd]!)) runEnd += 1;
   const next = value[runEnd];
   return {
-    boundary:
-      next === undefined ||
-      /\s/u.test(next) ||
-      STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(next) ||
-      next === '"' ||
-      next === "'",
+    boundary: next === undefined || isHardCredentialDelimiter(next),
     next: runEnd,
   };
 }
@@ -405,33 +413,35 @@ function sanitizationMarkerAt(value: string, index: number, delimiter?: QuoteDel
 
 function partialBearerValueStart(value: string) {
   BEARER_VALUE_PREFIX.lastIndex = 0;
-  let match = BEARER_VALUE_PREFIX.exec(value);
-  while (match) {
-    const tokenStart = BEARER_VALUE_PREFIX.lastIndex;
-    let cursor = tokenStart;
-    while (cursor < value.length) {
-      const marker = sanitizationMarkerAt(value, cursor);
-      if (marker) {
-        if (marker.trusted) break;
-        cursor = marker.end;
-        continue;
-      }
+  try {
+    let match = BEARER_VALUE_PREFIX.exec(value);
+    while (match) {
+      const tokenStart = BEARER_VALUE_PREFIX.lastIndex;
+      let cursor = tokenStart;
+      let sawCredentialMaterial = false;
+      while (cursor < value.length) {
+        const marker = sanitizationMarkerAt(value, cursor);
+        if (marker) {
+          if (marker.trusted) {
+            if (marker.end === value.length && sawCredentialMaterial) return tokenStart;
+            break;
+          }
+          cursor = marker.end;
+          continue;
+        }
 
-      const character = value[cursor]!;
-      if (
-        /\s/u.test(character) ||
-        STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character) ||
-        character === '"' ||
-        character === "'"
-      ) {
-        break;
+        const character = value[cursor]!;
+        if (isHardCredentialDelimiter(character)) break;
+        sawCredentialMaterial = true;
+        cursor += 1;
       }
-      cursor += 1;
+      if (cursor === value.length) return tokenStart;
+      match = BEARER_VALUE_PREFIX.exec(value);
     }
-    if (cursor === value.length) return tokenStart;
-    match = BEARER_VALUE_PREFIX.exec(value);
+    return -1;
+  } finally {
+    BEARER_VALUE_PREFIX.lastIndex = 0;
   }
-  return -1;
 }
 
 function quoteEndsCredentialAt(value: string, index: number, delimiter: QuoteDelimiter | undefined) {
