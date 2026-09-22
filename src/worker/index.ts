@@ -179,15 +179,19 @@ import {
   finishSlackOAuth,
   handleSlackCommand,
   handleSlackEvent,
+  handleSlackInteraction,
   listSlackChannelSubscriptions,
   pruneSlackSecurityRecords,
   sendDueSlackChannelDigests,
   SlackRateLimitError,
   slackConfigurationStatus,
+  slackIdentityAvailability,
+  slackScopeHealth,
   slackWorkspaceStatus,
   upsertSlackChannelSubscription,
   verifySlackRequest,
   type SlackEventPayload,
+  type SlackInteractionPayload,
 } from "./slack";
 import { diagramThumbnailResponse } from "./diagram-thumbnail";
 import {
@@ -1198,7 +1202,7 @@ app.post("/api/telemetry/client-errors", async (c) => {
 
 app.get("/api/install", async (c) => {
   const state = await c.env.DB.prepare(`SELECT 1 initialized FROM install_state WHERE id = 1`).first();
-  return c.json({ initialized: Boolean(state) });
+  return c.json({ initialized: Boolean(state), slackIdentityAvailable: await slackIdentityAvailability(c.env) });
 });
 
 app.post("/api/install/bootstrap", async (c) => {
@@ -1379,6 +1383,78 @@ app.post("/api/invites/accept", async (c) => {
             error,
           ),
         );
+    }
+  }
+});
+
+app.post("/api/slack/identity/invite/start", async (c) => {
+  assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
+  const body = await jsonBody(c.req.raw);
+  const rawToken = text(body.token, "token", 500);
+  const tokenHash = await sha256(rawToken);
+  const timestamp = now();
+  const invite = await c.env.DB.prepare(
+    `SELECT invite.id, invite.workspace_id, installation.team_id, installation.scopes
+       FROM invites invite
+       JOIN slack_installations installation ON installation.workspace_id = invite.workspace_id
+      WHERE invite.token_hash = ? AND invite.used_at IS NULL AND invite.expires_at > ?
+        AND installation.disconnected_at IS NULL`,
+  )
+    .bind(tokenHash, timestamp)
+    .first<{ id: string; workspace_id: string; team_id: string; scopes: string }>();
+  if (!invite) throw new HttpError(404, "invite_invalid", "This invite is invalid, expired, or already used.");
+  if (!slackScopeHealth(invite.scopes).capabilities.identity.available) {
+    throw new HttpError(
+      409,
+      "slack_scope_missing",
+      "The workspace owner must reauthorize Slack before it can be used.",
+    );
+  }
+  const reservationToken = crypto.randomUUID();
+  const reserved = await c.env.DB.prepare(
+    `UPDATE invites SET claimed_email = NULL, claimed_by = NULL, claim_token = ?, claim_expires_at = ?
+      WHERE id = ? AND used_at IS NULL AND expires_at > ? AND claimed_by IS NULL
+        AND (claim_token IS NULL OR claim_expires_at <= ?) RETURNING id`,
+  )
+    .bind(reservationToken, timestamp + INVITE_CLAIM_MS, invite.id, timestamp, timestamp)
+    .first();
+  if (!reserved) throw new HttpError(409, "invite_claimed", "This invite is already reserved for another account.");
+  let handedOff = false;
+  try {
+    const headers = new Headers(c.req.raw.headers);
+    headers.set("content-type", "application/json");
+    headers.set("origin", new URL(c.env.BETTER_AUTH_URL).origin);
+    const response = await createAuth(c.env).handler(
+      new Request(new URL("/api/auth/sign-in/social", c.env.BETTER_AUTH_URL), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          provider: "slack",
+          requestSignUp: true,
+          disableRedirect: true,
+          callbackURL: "/",
+          newUserCallbackURL: "/",
+          errorCallbackURL: "/?slackAuth=callback",
+          additionalData: {
+            slackInviteId: invite.id,
+            slackReservationToken: reservationToken,
+          },
+        }),
+      }),
+    );
+    if (!response.ok) return response;
+    const result = await response.json<{ url?: string }>();
+    if (!result.url) throw new HttpError(502, "slack_oauth_failed", "Slack sign-up could not be started.");
+    handedOff = true;
+    return c.json({ url: result.url });
+  } finally {
+    if (!handedOff) {
+      await c.env.DB.prepare(
+        `UPDATE invites SET claim_token = NULL, claim_expires_at = NULL
+          WHERE id = ? AND claim_token = ? AND claimed_by IS NULL`,
+      )
+        .bind(invite.id, reservationToken)
+        .run();
     }
   }
 });
@@ -2689,6 +2765,31 @@ app.post("/api/slack/events", async (c) => {
     throw new HttpError(422, "invalid_slack_event", "Slack event payload is invalid.");
   }
   return c.json(await handleSlackEvent(c.env, payload));
+});
+
+app.post("/api/slack/interactions", async (c) => {
+  const rawBody = await c.req.raw.text();
+  const verified = await verifySlackRequest(c.env, c.req.raw, rawBody);
+  if (verified.duplicate) return c.json({ ok: true });
+  const form = new URLSearchParams(rawBody);
+  let payload: SlackInteractionPayload;
+  try {
+    payload = JSON.parse(form.get("payload") ?? "") as SlackInteractionPayload;
+  } catch {
+    throw new HttpError(422, "invalid_slack_interaction", "Slack interaction payload is invalid.");
+  }
+  c.executionCtx.waitUntil(
+    handleSlackInteraction(c.env, payload).catch((error) =>
+      logger.error(
+        "slack.interaction.failed",
+        "slack",
+        "Slack interaction placeholder failed.",
+        { callbackId: typeof payload.callback_id === "string" ? payload.callback_id : undefined },
+        error,
+      ),
+    ),
+  );
+  return c.json({ ok: true });
 });
 
 app.get("/api/slack/channels", async (c) => {

@@ -9,6 +9,7 @@ import { SlackSettings } from "./SlackSettings";
 vi.mock("./api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./api")>()),
   api: vi.fn(),
+  authClient: { linkSocial: vi.fn() },
 }));
 
 const space: Space = {
@@ -127,5 +128,75 @@ describe("SlackSettings", () => {
       expect.objectContaining({ method: "POST", body: '{"token":"single-use-token"}' }),
     );
     expect(window.location.search).toBe("?view=settings");
+  });
+
+  it("distinguishes legacy identity migration and bot reauthorization health", async () => {
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/slack/status") {
+        return {
+          available: true,
+          missing: [],
+          installation: {
+            teamId: "T123",
+            teamName: "Product Slack",
+            botUserId: "B123",
+            scopes: ["commands", "users:read"],
+            connected: true,
+            createdAt: 1,
+            updatedAt: 1,
+            scopeHealth: {
+              required: ["commands", "chat:write"],
+              granted: ["commands", "users:read"],
+              missing: ["chat:write"],
+              reauthorizationRequired: true,
+            },
+            capabilities: {
+              identity: { available: true, requiredScopes: ["users:read"], missingScopes: [] },
+            },
+          },
+          linked: true,
+          identity: { state: "legacy", slackUserId: "U123", verifiedAt: null },
+          reauthorization: { required: true, available: true },
+        };
+      }
+      if (path === "/api/slack/channels") return { subscriptions: [] };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    expect(await screen.findByText(/legacy Slack delivery link still works/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Verify Slack identity" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reauthorize Slack" })).toBeInTheDocument();
+    expect(screen.getByText("Missing: chat:write")).toBeInTheDocument();
+  });
+
+  it("confirms a verified Slack identity without offering migration", async () => {
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/slack/status") {
+        return {
+          available: true,
+          missing: [],
+          installation: {
+            teamId: "T123",
+            teamName: "Product Slack",
+            botUserId: "B123",
+            scopes: ["users:read"],
+            connected: true,
+            createdAt: 1,
+            updatedAt: 1,
+            scopeHealth: { required: [], granted: ["users:read"], missing: [], reauthorizationRequired: false },
+            capabilities: {
+              identity: { available: true, requiredScopes: ["users:read"], missingScopes: [] },
+            },
+          },
+          linked: true,
+          identity: { state: "verified", slackUserId: "U123", verifiedAt: 1 },
+          reauthorization: { required: false, available: true },
+        };
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
+    expect(await screen.findByText("Your Slack identity is verified.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Slack identity/ })).not.toBeInTheDocument();
   });
 });

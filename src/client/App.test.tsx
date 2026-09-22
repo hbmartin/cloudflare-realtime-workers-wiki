@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   invalidatePagePreview: vi.fn(),
   invokeRealApi: vi.fn(),
   signInEmail: vi.fn(),
+  signInSocial: vi.fn(),
   signOut: vi.fn(),
   waitForReconciliationRetry: vi.fn(),
   waitForWorkspaceInvalidationRetry: vi.fn(),
@@ -33,7 +34,7 @@ vi.mock("./api", async (importOriginal) => {
     ...original,
     api: vi.fn(),
     authClient: {
-      signIn: { email: mocks.signInEmail },
+      signIn: { email: mocks.signInEmail, social: mocks.signInSocial },
       signOut: mocks.signOut,
     },
   };
@@ -197,6 +198,7 @@ describe("App error handling", () => {
     mocks.invalidatePagePreview.mockReset();
     mocks.invokeRealApi.mockClear();
     mocks.signInEmail.mockReset();
+    mocks.signInSocial.mockReset();
     mocks.signOut.mockReset();
     mocks.waitForReconciliationRetry.mockReset();
     mocks.waitForReconciliationRetry.mockResolvedValue(undefined);
@@ -273,6 +275,51 @@ describe("App error handling", () => {
     expect(name).toHaveValue("Guest");
     expect(email).toHaveValue("guest@example.test");
     expect(password).toHaveValue("incorrect");
+  });
+
+  it("offers Slack only when identity health is available and starts the invite flow", async () => {
+    history.replaceState(null, "", "/?invite=invite-token");
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true, slackIdentityAvailable: true };
+      if (path === "/api/security/status") return { state: "signed_out" };
+      if (path === "/api/slack/identity/invite/start") throw new Error("redirect captured");
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Continue with Slack" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        "/api/slack/identity/invite/start",
+        expect.objectContaining({ method: "POST", body: '{"token":"invite-token"}' }),
+      ),
+    );
+    expect(sessionStorage.getItem("pending-invite")).toBeNull();
+    expect(await screen.findByText("Slack sign-up could not be started.")).toBeInTheDocument();
+  });
+
+  it("starts returning-user Slack sign-in and scrubs bounded OAuth errors", async () => {
+    history.replaceState(
+      null,
+      "",
+      "/?slackAuth=callback&error=account_not_linked&error_description=provider-secret-detail",
+    );
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true, slackIdentityAvailable: true };
+      if (path === "/api/security/status") return { state: "signed_out" };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    mocks.signInSocial.mockResolvedValue({ data: null, error: null });
+    render(<App />);
+    expect(await screen.findByText("Sign in normally, then connect Slack from Settings.")).toBeInTheDocument();
+    expect(window.location.search).toBe("");
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in with Slack" }));
+    await waitFor(() =>
+      expect(mocks.signInSocial).toHaveBeenCalledWith({
+        provider: "slack",
+        callbackURL: "/",
+        errorCallbackURL: "/?slackAuth=callback",
+      }),
+    );
   });
 
   it("falls back from a stale explicit token to the server-owned pending claim", async () => {

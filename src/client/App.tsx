@@ -557,6 +557,48 @@ function clearPendingInvite() {
   history.replaceState(null, "", url.pathname + url.search + url.hash);
 }
 
+const SLACK_AUTH_ERRORS: Record<string, string> = {
+  access_denied: "Slack sign-in was cancelled.",
+  account_not_linked: "Sign in normally, then connect Slack from Settings.",
+  oauth_account_not_linked: "Sign in normally, then connect Slack from Settings.",
+  registration_closed: "Open a valid invitation before creating an account with Slack.",
+  invite_required: "Open a valid invitation before creating an account with Slack.",
+  invite_reservation_expired: "The invitation reservation expired. Open the invitation again.",
+  slack_team_mismatch: "Use an account from the connected Slack workspace.",
+  slack_scope_missing: "The workspace owner must reauthorize Slack before it can be used.",
+  slack_guest_forbidden: "Slack guest accounts cannot sign in to NoteFlare.",
+  slack_external_forbidden: "Slack Connect members cannot sign in to NoteFlare.",
+  slack_member_removed: "This Slack member is no longer active.",
+};
+
+function consumeSlackAuthError() {
+  const url = new URL(window.location.href);
+  const raw = url.searchParams.get("error")?.toLowerCase() ?? "";
+  if (!raw && !url.searchParams.has("slackAuth")) return "";
+  const message = SLACK_AUTH_ERRORS[raw] ?? "Slack sign-in could not be completed. Try again or sign in normally.";
+  url.searchParams.delete("error");
+  url.searchParams.delete("error_description");
+  url.searchParams.delete("slackAuth");
+  history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  return message;
+}
+
+function useSlackIdentityAvailable() {
+  const [available, setAvailable] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void api<{ slackIdentityAvailable?: boolean }>("/api/install")
+      .then((result) => {
+        if (active) setAvailable(result.slackIdentityAvailable === true);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
+  return available;
+}
+
 const SECURITY_REQUIRED_CODES = new Set(["enrollment_required", "challenge_required", "recovery_required"]);
 
 function startupError(cause: unknown, fallback: string): AppState {
@@ -829,8 +871,9 @@ function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
 }
 
 function InviteScreen({ token, onComplete }: { token: string; onComplete: () => Promise<void> }) {
-  const [error, setError] = useState("");
+  const [error, setError] = useState(() => consumeSlackAuthError());
   const [busy, setBusy] = useState(false);
+  const slackAvailable = useSlackIdentityAvailable();
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
@@ -855,6 +898,29 @@ function InviteScreen({ token, onComplete }: { token: string; onComplete: () => 
     >
       <form className="auth-form" onSubmit={submit}>
         <h2>Join workspace</h2>
+        {slackAvailable && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              setError("");
+              sessionStorage.setItem("pending-invite", token);
+              void api<{ url: string }>("/api/slack/identity/invite/start", {
+                method: "POST",
+                body: json({ token }),
+              })
+                .then((result) => window.location.assign(result.url))
+                .catch((cause) => {
+                  sessionStorage.removeItem("pending-invite");
+                  setError(apiErrorMessage(cause, "Slack sign-up could not be started."));
+                  setBusy(false);
+                });
+            }}
+          >
+            Continue with Slack
+          </button>
+        )}
         <label>
           Your name
           <input name="name" required autoFocus />
@@ -877,8 +943,9 @@ function InviteScreen({ token, onComplete }: { token: string; onComplete: () => 
 }
 
 function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Promise<void>; initialError?: string }) {
-  const [error, setError] = useState(initialError);
+  const [error, setError] = useState(() => consumeSlackAuthError() || initialError);
   const [busy, setBusy] = useState(false);
+  const slackAvailable = useSlackIdentityAvailable();
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
@@ -906,6 +973,27 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
     >
       <form className="auth-form" onSubmit={submit}>
         <h2>Sign in</h2>
+        {slackAvailable && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              setError("");
+              void authClient.signIn
+                .social({ provider: "slack", callbackURL: "/", errorCallbackURL: "/?slackAuth=callback" })
+                .then((result) => {
+                  if (result.error) throw new Error(result.error.message || "Slack sign-in failed.");
+                })
+                .catch((cause) => {
+                  setError(apiErrorMessage(cause, "Slack sign-in failed."));
+                  setBusy(false);
+                });
+            }}
+          >
+            Sign in with Slack
+          </button>
+        )}
         <button
           type="button"
           disabled={busy}

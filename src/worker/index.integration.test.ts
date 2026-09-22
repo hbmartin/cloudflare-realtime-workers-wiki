@@ -260,6 +260,17 @@ function databaseWithBatchInterceptor(
   });
 }
 
+function isPageMoveBatch(statements: D1PreparedStatement[]) {
+  return statements.some((statement) => {
+    try {
+      const sql: unknown = Reflect.get(statement, "statement");
+      return typeof sql === "string" && sql.includes("INSERT INTO page_move_receipts");
+    } catch {
+      return false;
+    }
+  });
+}
+
 function envWithPageCreateBatchIntercepted(
   bindings: Env,
   delivered: Array<{ workspaceId: string; event: WorkspaceEvent }>,
@@ -303,6 +314,7 @@ function envArchivingPageBeforeNextBatch(
   let intercepted = false;
   const replayError = new Error("D1 unavailable during archive-race receipt lookup");
   const batchDatabase = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
+    if (!isPageMoveBatch(_statements)) return run();
     if (!intercepted) {
       intercepted = true;
       await options.beforeBatch?.();
@@ -355,7 +367,8 @@ function envFailingMoveBatchAndReplay(
   const batchError = options ? options.batchError : new Error("D1 move batch failed");
   const replayError = new Error("D1 move receipt lookup failed");
   let batchFailed = false;
-  const batchDatabase = databaseWithBatchInterceptor(bindings.DB, async () => {
+  const batchDatabase = databaseWithBatchInterceptor(bindings.DB, async (statements, run) => {
+    if (!isPageMoveBatch(statements)) return run();
     batchFailed = true;
     throw batchError;
   });
@@ -414,6 +427,7 @@ function envRejectingNextBatchAfterCommit(
 ) {
   let intercepted = false;
   const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
+    if (!isPageMoveBatch(_statements)) return run();
     const results = await run();
     if (!intercepted) {
       intercepted = true;
@@ -440,6 +454,7 @@ function envMutatingNextMoveBatchResult(
   let mutateFailure: { error: unknown } | undefined;
   let mutateInOrder = Promise.resolve();
   const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
+    if (!isPageMoveBatch(_statements)) return run();
     const results = await run();
     if (intercepted || mutateFailure) return results;
     let returnedResults = results;
@@ -474,6 +489,7 @@ function envMutatingNextMoveBatchResult(
 function envRunningBeforeNextBatch(bindings: Env, beforeBatch: () => Promise<void>) {
   let intercepted = false;
   const database = databaseWithBatchInterceptor(bindings.DB, async (_statements, run) => {
+    if (!isPageMoveBatch(_statements)) return run();
     if (!intercepted) {
       intercepted = true;
       await beforeBatch();
@@ -665,7 +681,7 @@ describe("Worker integration", () => {
     expect(await health.json()).toMatchObject({ ok: true, version: "0.1.0" });
     expect(health.headers.get("x-request-id")).toMatch(/^[0-9a-f-]{36}$/);
     expect(health.headers.get("x-worker-version")).toBeTruthy();
-    expect(await install.json()).toEqual({ initialized: false });
+    expect(await install.json()).toEqual({ initialized: false, slackIdentityAvailable: false });
   });
 
   it("protects readiness and reports sanitized dependency results", async () => {

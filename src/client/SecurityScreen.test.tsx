@@ -56,6 +56,22 @@ describe("account protection screens", () => {
     expect(screen.getByRole("button", { name: "Set up authenticator app" })).toBeEnabled();
   });
 
+  it("uses a fresh Slack primary proof without asking a password for TOTP setup", async () => {
+    const slackStatus = {
+      ...status,
+      slackPrimary: { available: true, expiresAt: Date.now() + 60_000 },
+    };
+    vi.mocked(api).mockImplementation(async (path) =>
+      path === "/api/security/setup-totp" ? { totpURI: "otpauth://totp/NoteFlare?secret=SLACKPRIMARY" } : slackStatus,
+    );
+    render(<SecurityScreen initialStatus={slackStatus} />);
+    expect(screen.queryByLabelText("Account password")).not.toBeInTheDocument();
+    expect(screen.getByText(/recent Slack sign-in confirms the primary factor/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Set up authenticator app" }));
+    await screen.findByLabelText("Setup key");
+    expect(api).toHaveBeenCalledWith("/api/security/setup-totp", { method: "POST", body: "{}" });
+  });
+
   it("requires acknowledgment of the displayed recovery-code batch", async () => {
     vi.mocked(api).mockImplementation(async (path) =>
       path === "/api/security/recovery-codes"

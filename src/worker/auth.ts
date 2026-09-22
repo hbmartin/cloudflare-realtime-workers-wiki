@@ -1,12 +1,105 @@
 import { betterAuth } from "better-auth";
+import type { GenericEndpointContext } from "@better-auth/core";
 import { passkey } from "@better-auth/passkey";
-import { APIError } from "better-auth/api";
-import { twoFactor } from "better-auth/plugins";
+import {
+  addOAuthServerContext,
+  APIError,
+  createAuthMiddleware,
+  getOAuthState,
+  getSessionFromCtx,
+} from "better-auth/api";
+import { genericOAuth, twoFactor } from "better-auth/plugins";
 import { authorizePasskeyRegistration, mandatorySecurity, requireSecurity } from "./security";
 import type { MemberContext } from "./env";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import { consumeFixedWindow } from "./rate-limit";
+import { recordVerifiedSlackIdentity, validateSlackIdentity, type VerifiedSlackIdentity } from "./slack";
+
+type SlackInviteContext = {
+  inviteId: string;
+  reservationToken: string;
+  workspaceId: string;
+  teamId: string;
+};
+
+type SlackAuthPolicyContext = {
+  notesSlackIdentity?: VerifiedSlackIdentity;
+  notesSlackInvite?: SlackInviteContext;
+  notesSlackInviteClaimed?: boolean;
+};
+
+function slackInviteContext(value: unknown): SlackInviteContext | null {
+  if (!value || typeof value !== "object") return null;
+  const source = value as Record<string, unknown>;
+  if (
+    typeof source.inviteId !== "string" ||
+    typeof source.reservationToken !== "string" ||
+    typeof source.workspaceId !== "string" ||
+    typeof source.teamId !== "string"
+  ) {
+    return null;
+  }
+  return {
+    inviteId: source.inviteId,
+    reservationToken: source.reservationToken,
+    workspaceId: source.workspaceId,
+    teamId: source.teamId,
+  };
+}
+
+async function trustedSlackInvite() {
+  return slackInviteContext((await getOAuthState())?.serverContext?.slackInvite);
+}
+
+async function claimSlackInvite(env: Env, userId: string, invite: SlackInviteContext) {
+  const user = await env.DB.prepare(`SELECT email FROM user WHERE id = ?`).bind(userId).first<{ email: string }>();
+  if (!user) throw new APIError("UNAUTHORIZED", { code: "SLACK_IDENTITY_INVALID", message: "Sign in again." });
+  const claimed = await env.DB.prepare(
+    `UPDATE invites SET claimed_email = ?, claimed_by = ?, claim_token = NULL, claim_expires_at = expires_at
+      WHERE id = ? AND workspace_id = ? AND claim_token = ? AND claimed_by IS NULL
+        AND used_at IS NULL AND expires_at > ? AND claim_expires_at > ? RETURNING id`,
+  )
+    .bind(
+      user.email.toLowerCase(),
+      userId,
+      invite.inviteId,
+      invite.workspaceId,
+      invite.reservationToken,
+      Date.now(),
+      Date.now(),
+    )
+    .first();
+  if (!claimed) {
+    throw new APIError("CONFLICT", {
+      code: "INVITE_RESERVATION_EXPIRED",
+      message: "The invitation reservation expired. Open the invitation again.",
+    });
+  }
+  await env.DB.prepare(`DELETE FROM invites WHERE workspace_id = ? AND id <> ? AND claimed_by = ? AND used_at IS NULL`)
+    .bind(invite.workspaceId, invite.inviteId, userId)
+    .run();
+}
+
+async function finishSlackAuthentication(env: Env, ctx: GenericEndpointContext, userId: string, sessionId: string) {
+  const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
+  const identity = policy.notesSlackIdentity;
+  if (!identity) return;
+  const account = await env.DB.prepare(
+    `SELECT id FROM account WHERE providerId = 'slack' AND accountId = ? AND userId = ?`,
+  )
+    .bind(identity.accountSubject, userId)
+    .first<{ id: string }>();
+  if (!account) {
+    throw new APIError("UNAUTHORIZED", { code: "SLACK_IDENTITY_INVALID", message: "Slack identity linking failed." });
+  }
+  await recordVerifiedSlackIdentity(env, userId, sessionId, account.id, identity);
+  const invite = policy.notesSlackInvite ?? (await trustedSlackInvite());
+  if (invite) {
+    await claimSlackInvite(env, userId, invite);
+    policy.notesSlackInviteClaimed = true;
+  }
+}
 
 export function createAuth(env: Env, allowRegistration = false) {
   return betterAuth({
@@ -26,7 +119,180 @@ export function createAuth(env: Env, allowRegistration = false) {
       },
     },
     session: { cookieCache: { enabled: false } },
+    account: {
+      encryptOAuthTokens: true,
+      accountLinking: {
+        enabled: true,
+        disableImplicitLinking: true,
+        trustedProviders: ["slack"],
+        allowDifferentEmails: true,
+      },
+    },
+    user: {
+      validateUserInfo: async ({ source }, ctx) => {
+        if (source.oauth?.providerId !== "slack") return undefined;
+        const profile = source.oauth.profile;
+        if (!profile) return { error: "slack_identity_invalid", errorDescription: "Slack identity is unavailable." };
+        const state = await getOAuthState();
+        const invite = slackInviteContext(state?.serverContext?.slackInvite);
+        if (source.action === "create-user" && !invite) {
+          return { error: "registration_closed", errorDescription: "Open a valid invitation to create an account." };
+        }
+        let workspaceId = invite?.workspaceId;
+        let teamId = invite?.teamId;
+        const linkedUserId = typeof state?.link?.userId === "string" ? state.link.userId : null;
+        if (!workspaceId && linkedUserId) {
+          const installation = await env.DB.prepare(
+            `SELECT installation.workspace_id, installation.team_id
+               FROM workspace_members member
+               JOIN slack_installations installation ON installation.workspace_id = member.workspace_id
+              WHERE member.user_id = ? AND installation.disconnected_at IS NULL LIMIT 1`,
+          )
+            .bind(linkedUserId)
+            .first<{ workspace_id: string; team_id: string }>();
+          workspaceId = installation?.workspace_id;
+          teamId = installation?.team_id;
+        }
+        try {
+          const identity = await validateSlackIdentity(env, profile, {
+            ...(workspaceId ? { workspaceId } : {}),
+            ...(teamId ? { teamId } : {}),
+          });
+          const existingLink = await env.DB.prepare(
+            `SELECT user_id FROM slack_user_links
+              WHERE installation_id = ? AND slack_user_id = ?`,
+          )
+            .bind(identity.installationId, identity.slackUserId)
+            .first<{ user_id: string }>();
+          if (
+            (source.action === "create-user" && existingLink) ||
+            (source.action === "link-account" && existingLink && existingLink.user_id !== linkedUserId)
+          ) {
+            return {
+              error: "account_not_linked",
+              errorDescription: "Sign in normally, then connect Slack from Settings.",
+            };
+          }
+          const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
+          policy.notesSlackIdentity = identity;
+          if (invite) policy.notesSlackInvite = invite;
+        } catch (error) {
+          if (error instanceof HttpError) return { error: error.code, errorDescription: error.message };
+          return {
+            error: "slack_unavailable",
+            errorDescription: "Slack identity validation is temporarily unavailable.",
+          };
+        }
+        return undefined;
+      },
+    },
+    databaseHooks: {
+      account: {
+        create: {
+          after: async (account, ctx) => {
+            if (!ctx || account.providerId !== "slack") return;
+            const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
+            if (!policy.notesSlackIdentity || account.accountId !== policy.notesSlackIdentity.accountSubject) return;
+            const current = await getSessionFromCtx(ctx, { disableRefresh: true });
+            if (current?.user.id === account.userId) {
+              await finishSlackAuthentication(env, ctx, account.userId, current.session.id);
+            }
+          },
+        },
+      },
+      session: {
+        create: {
+          after: async (session, ctx) => {
+            if (!ctx) return;
+            await finishSlackAuthentication(env, ctx, session.userId, session.id);
+          },
+        },
+      },
+    },
+    hooks: {
+      before: createAuthMiddleware(async (ctx) => {
+        if (ctx.path !== "/sign-in/social" || ctx.body?.provider !== "slack" || ctx.body?.requestSignUp !== true) {
+          return;
+        }
+        const inviteId: unknown = ctx.body?.additionalData?.slackInviteId;
+        const reservationToken: unknown = ctx.body?.additionalData?.slackReservationToken;
+        if (typeof inviteId !== "string" || typeof reservationToken !== "string") {
+          throw new APIError("FORBIDDEN", {
+            code: "INVITE_REQUIRED",
+            message: "Open a valid invitation to create an account with Slack.",
+          });
+        }
+        const reservation = await env.DB.prepare(
+          `SELECT invite.workspace_id, installation.team_id
+             FROM invites invite
+             JOIN slack_installations installation ON installation.workspace_id = invite.workspace_id
+            WHERE invite.id = ? AND invite.claim_token = ? AND invite.claimed_by IS NULL
+              AND invite.used_at IS NULL AND invite.expires_at > ? AND invite.claim_expires_at > ?
+              AND installation.disconnected_at IS NULL`,
+        )
+          .bind(inviteId, reservationToken, Date.now(), Date.now())
+          .first<{ workspace_id: string; team_id: string }>();
+        if (!reservation) {
+          throw new APIError("FORBIDDEN", {
+            code: "INVITE_RESERVATION_EXPIRED",
+            message: "The invitation reservation expired. Open the invitation again.",
+          });
+        }
+        await addOAuthServerContext({
+          slackInvite: {
+            inviteId,
+            reservationToken,
+            workspaceId: reservation.workspace_id,
+            teamId: reservation.team_id,
+          } satisfies SlackInviteContext,
+        });
+      }),
+      after: createAuthMiddleware(async (ctx) => {
+        if (ctx.path !== "/callback/slack") return;
+        const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
+        if (policy.notesSlackInviteClaimed) return;
+        const invite = policy.notesSlackInvite ?? (await trustedSlackInvite());
+        if (!invite) return;
+        await env.DB.prepare(
+          `UPDATE invites SET claimed_email = NULL, claim_token = NULL, claim_expires_at = NULL
+            WHERE id = ? AND workspace_id = ? AND claim_token = ? AND claimed_by IS NULL AND used_at IS NULL`,
+        )
+          .bind(invite.inviteId, invite.workspaceId, invite.reservationToken)
+          .run();
+      }),
+    },
     plugins: [
+      ...(env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET
+        ? [
+            genericOAuth({
+              config: [
+                {
+                  providerId: "slack",
+                  name: "Slack",
+                  discoveryUrl: "https://slack.com/.well-known/openid-configuration",
+                  requireIdTokenVerification: true,
+                  clientId: env.SLACK_CLIENT_ID,
+                  clientSecret: env.SLACK_CLIENT_SECRET,
+                  scopes: ["openid", "profile", "email"],
+                  pkce: true,
+                  disableImplicitSignUp: true,
+                  disableProviderLogout: true,
+                  accountSubject: ({ profile }) => {
+                    const teamId = profile["https://slack.com/team_id"];
+                    const userId = profile["https://slack.com/user_id"];
+                    return typeof teamId === "string" && typeof userId === "string" ? `${teamId}:${userId}` : "";
+                  },
+                  mapProfileToUser: (profile) => ({
+                    name: typeof profile.name === "string" ? profile.name : "Slack member",
+                    email: typeof profile.email === "string" ? profile.email : "",
+                    emailVerified: profile.email_verified === true,
+                    ...(typeof profile.picture === "string" ? { image: profile.picture } : {}),
+                  }),
+                },
+              ],
+            }),
+          ]
+        : []),
       twoFactor(),
       passkey({
         rpID: new URL(env.BETTER_AUTH_URL).hostname,

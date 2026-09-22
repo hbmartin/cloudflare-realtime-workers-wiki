@@ -124,6 +124,7 @@ export function SecurityScreen({
   const enrollment = status.state === "enrollment_required" && !status.totp && !status.passkeys;
   const recoveryEnrollment = status.state === "recovery_required";
   const canManage = status.fresh || enrollment || recoveryEnrollment;
+  const slackPrimary = status.slackPrimary?.available === true;
   return (
     <section className={settings ? "security-settings" : "security-gate"} aria-label="Account protection">
       <h2>{settings ? "Security" : "Protect your account"}</h2>
@@ -139,7 +140,7 @@ export function SecurityScreen({
           <>
             <h3>Save your recovery codes</h3>
             <p>
-              Each code works once with your account password. These codes are shown only here; store them somewhere
+              Each code works once after a fresh primary sign-in. These codes are shown only here; store them somewhere
               safe.
             </p>
             <pre className="recovery-codes">{codes.join("\n")}</pre>
@@ -184,7 +185,7 @@ export function SecurityScreen({
                 className="auth-form"
                 onSubmit={(event) =>
                   submit(event, async (values) => {
-                    await securityAction("resume-recovery", { password: values.get("password") });
+                    await securityAction("resume-recovery", slackPrimary ? {} : { password: values.get("password") });
                     setUri("");
                     await reload();
                     setNotice("Recovery resumed. Finish restoring an authenticator or passkey.");
@@ -192,10 +193,14 @@ export function SecurityScreen({
                 }
               >
                 <p>If your ten-minute setup session expires, resume here within 24 hours of recovery.</p>
-                <label>
-                  Password to resume recovery
-                  <input name="password" type="password" autoComplete="current-password" required />
-                </label>
+                {slackPrimary ? (
+                  <p>Your recent Slack sign-in confirms the primary factor for this recovery step.</p>
+                ) : (
+                  <label>
+                    Password to resume recovery
+                    <input name="password" type="password" autoComplete="current-password" required />
+                  </label>
+                )}
                 <button>Resume recovery</button>
               </form>
             )}
@@ -210,17 +215,22 @@ export function SecurityScreen({
                     className="auth-form"
                     onSubmit={(event) =>
                       submit(event, async (values) => {
-                        const result = await securityAction<{ totpURI: string }>("setup-totp", {
-                          password: values.get("password"),
-                        });
+                        const result = await securityAction<{ totpURI: string }>(
+                          "setup-totp",
+                          slackPrimary ? {} : { password: values.get("password") },
+                        );
                         setUri(result.totpURI);
                       })
                     }
                   >
-                    <label>
-                      Account password
-                      <input name="password" type="password" autoComplete="current-password" required />
-                    </label>
+                    {slackPrimary ? (
+                      <p>Your recent Slack sign-in confirms the primary factor for authenticator setup.</p>
+                    ) : (
+                      <label>
+                        Account password
+                        <input name="password" type="password" autoComplete="current-password" required />
+                      </label>
+                    )}
                     <button>Set up authenticator app</button>
                   </form>
                 ) : (
@@ -360,7 +370,7 @@ export function SecurityScreen({
                     onSubmit={(event) =>
                       submit(event, async (values) => {
                         await securityAction("recover", {
-                          password: values.get("password"),
+                          ...(slackPrimary ? {} : { password: values.get("password") }),
                           code: values.get("code"),
                           reset,
                         });
@@ -369,10 +379,14 @@ export function SecurityScreen({
                       })
                     }
                   >
-                    <label>
-                      Account password
-                      <input name="password" type="password" autoComplete="current-password" required />
-                    </label>
+                    {slackPrimary ? (
+                      <p>Your recent Slack sign-in confirms the primary factor for recovery.</p>
+                    ) : (
+                      <label>
+                        Account password
+                        <input name="password" type="password" autoComplete="current-password" required />
+                      </label>
+                    )}
                     <label>
                       {reset ? "Operator reset token" : "Recovery code"}
                       <input name="code" autoComplete="off" required />

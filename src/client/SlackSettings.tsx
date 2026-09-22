@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
-import type { NotificationEventType, Page, Space } from "../shared/types";
-import { api, apiErrorMessage, json } from "./api";
+import type { NotificationEventType, Page, SlackStatus, Space } from "../shared/types";
+import { api, apiErrorMessage, authClient, json } from "./api";
 
 const EVENT_OPTIONS: Array<{ value: NotificationEventType; label: string }> = [
   { value: "mention", label: "Mentions" },
@@ -10,21 +10,6 @@ const EVENT_OPTIONS: Array<{ value: NotificationEventType; label: string }> = [
   { value: "page_edit", label: "Page edits" },
 ];
 
-type SlackStatus = {
-  available: boolean;
-  missing: string[];
-  installation: {
-    teamId: string;
-    teamName: string;
-    botUserId: string;
-    scopes: string[];
-    connected: boolean;
-    createdAt: number;
-    updatedAt: number;
-  } | null;
-  linked: boolean;
-};
-
 type ChannelSubscription = {
   id: string;
   spaceId: string;
@@ -33,19 +18,41 @@ type ChannelSubscription = {
   channelName: string;
   eventTypes: NotificationEventType[];
   cadence: "immediate" | "digest";
+  channelType?: "public_channel" | "private_channel" | "im" | "mpim" | null;
+  validationState?: "unvalidated" | "valid" | "invalid";
+  validatedAt?: number | null;
+  validationError?: string | null;
+  botIsMember?: boolean | null;
+  mirrorEnabled?: boolean;
+  mutedAt?: number | null;
+  snoozedUntil?: number | null;
 };
 
 function removeLinkToken() {
   const url = new URL(window.location.href);
   url.searchParams.delete("slackLink");
   url.searchParams.delete("slack");
+  url.searchParams.delete("error");
+  url.searchParams.delete("error_description");
+  url.searchParams.delete("slackAuth");
   history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function initialSlackOAuthError() {
+  const params = new URLSearchParams(window.location.search);
+  const oauthError = params.get("error");
+  if (!oauthError) return "";
+  const message = oauthError.toLowerCase().includes("link")
+    ? "Slack could not be connected to this account. Sign in normally and try again."
+    : "Slack authorization could not be completed.";
+  removeLinkToken();
+  return message;
 }
 
 export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces: Space[]; pages: Page[] }) {
   const [status, setStatus] = useState<SlackStatus | null>(null);
   const [subscriptions, setSubscriptions] = useState<ChannelSubscription[]>([]);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(initialSlackOAuthError);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(() => new URLSearchParams(window.location.search).has("slackLink"));
   const [spaceId, setSpaceId] = useState(spaces[0]?.id ?? "");
@@ -61,7 +68,6 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
       } else {
         setSubscriptions([]);
       }
-      setError("");
     } catch (cause) {
       setError(apiErrorMessage(cause, "Slack settings could not be loaded."));
     }
@@ -120,6 +126,22 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
     }
   }
 
+  async function linkIdentity() {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await authClient.linkSocial({
+        provider: "slack",
+        callbackURL: "/?view=settings&slack=verified",
+        errorCallbackURL: "/?view=settings&slackAuth=callback",
+      });
+      if (result.error) throw new Error(result.error.message || "Slack identity linking failed.");
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "Verify a security factor, then connect Slack again."));
+      setBusy(false);
+    }
+  }
+
   async function addSubscription(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -164,6 +186,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
   }
 
   const connected = status?.installation?.connected === true;
+  const identityState = status?.identity?.state ?? (status?.linked ? "legacy" : "unlinked");
   return (
     <section className="slack-settings" aria-labelledby="slack-settings-title">
       <div className="slack-settings-heading">
@@ -177,9 +200,16 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
           </button>
         )}
         {owner && connected && (
-          <button className="quiet-button" disabled={busy} onClick={() => void disconnect()}>
-            Disconnect
-          </button>
+          <div>
+            {status.reauthorization?.required && (
+              <button className="primary-small" disabled={busy} onClick={() => void install()}>
+                Reauthorize Slack
+              </button>
+            )}
+            <button className="quiet-button" disabled={busy} onClick={() => void disconnect()}>
+              Disconnect
+            </button>
+          </div>
         )}
       </div>
 
@@ -202,14 +232,40 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
           <span aria-hidden="true">✓</span>
           <div>
             <strong>{status.installation!.teamName}</strong>
-            <p>{status.linked ? "Your Slack account is linked." : "In Slack, run /notes link to link your account."}</p>
+            {identityState === "verified" ? (
+              <p>Your Slack identity is verified.</p>
+            ) : identityState === "legacy" ? (
+              <p>Your legacy Slack delivery link still works. Verify it to enable Slack sign-in.</p>
+            ) : (
+              <p>Connect your Slack identity, or run /notes link for legacy personal delivery.</p>
+            )}
           </div>
+        </div>
+      )}
+      {connected && status?.installation?.capabilities?.identity.available && identityState !== "verified" && (
+        <button className="primary-small" disabled={busy} onClick={() => void linkIdentity()}>
+          {identityState === "legacy" ? "Verify Slack identity" : "Connect Slack identity"}
+        </button>
+      )}
+      {owner && connected && status.installation?.scopeHealth && (
+        <div className="slack-scope-health">
+          <h3>Bot scope health</h3>
+          <p>Granted: {status.installation!.scopeHealth.granted.join(", ") || "none"}</p>
+          <p>Missing: {status.installation!.scopeHealth.missing.join(", ") || "none"}</p>
         </div>
       )}
       {notice && <output className="slack-notice">{notice}</output>}
       {error && (
         <div className="activity-job-error" role="alert">
-          {error} <button onClick={() => void load()}>Retry</button>
+          {error}{" "}
+          <button
+            onClick={() => {
+              setError("");
+              void load();
+            }}
+          >
+            Retry
+          </button>
         </div>
       )}
 

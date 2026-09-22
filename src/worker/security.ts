@@ -57,14 +57,17 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
     ${pendingInvite} pending_invite,
     EXISTS(SELECT 1 FROM twoFactor WHERE userId=a.user_id AND verified=1) totp,
     (SELECT COUNT(*) FROM passkey WHERE userId=a.user_id) passkeys,
-    s.method,s.verified_at,s.expires_at
+    s.method,s.verified_at,s.expires_at,
+    (SELECT primary_proof.expires_at FROM slack_primary_factor_proofs primary_proof
+      WHERE primary_proof.session_id=live.id AND primary_proof.user_id=a.user_id
+        AND primary_proof.expires_at>?) slack_primary_expires_at
     FROM account_security a
     LEFT JOIN session live ON live.id=? AND live.userId=a.user_id AND live.expiresAt>?
     LEFT JOIN session_security s ON s.session_id=live.id AND s.user_id=a.user_id AND s.generation=a.generation
       AND (s.method!='trust' OR EXISTS(SELECT 1 FROM trusted_browsers t
         WHERE t.id=s.trust_id AND t.user_id=a.user_id AND t.generation=a.generation AND t.expires_at>?))
     WHERE a.user_id=?`)
-    .bind(...(includePendingInvite ? [time] : []), sessionId, new Date(time).toISOString(), time, userId)
+    .bind(...(includePendingInvite ? [time] : []), time, sessionId, new Date(time).toISOString(), time, userId)
     .first<
       SecurityAccount & {
         pending_invite: number;
@@ -73,6 +76,7 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
         method: Grant["method"] | null;
         verified_at: number | null;
         expires_at: number | null;
+        slack_primary_expires_at: number | null;
       }
     >();
   if (!row) throw deny("Sign in again.");
@@ -96,6 +100,9 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
           recoveryCanResume:
             row.method === "recovery" && row.verified_at !== null && row.verified_at > time - RECOVERY_RESUME_MS,
         }
+      : {}),
+    ...(row.slack_primary_expires_at
+      ? { slackPrimary: { available: true, expiresAt: row.slack_primary_expires_at } }
       : {}),
   };
   return { account: row, proof, status };
@@ -168,12 +175,27 @@ async function resetAttempts(env: Env, userId: string, generation: number) {
     .run();
 }
 
-async function password(ctx: GenericEndpointContext, userId: string) {
-  const value = field(ctx, "password");
-  const accounts = await ctx.context.internalAdapter.findAccounts(userId);
+async function primaryFactor(ctx: GenericEndpointContext, env: Env, id: Identity) {
+  const value: unknown = ctx.body?.password;
+  if (typeof value !== "string" || !value) {
+    const slack = id.sessionId
+      ? await env.DB.prepare(
+          `SELECT 1 FROM slack_primary_factor_proofs proof
+            JOIN session live ON live.id=proof.session_id AND live.userId=proof.user_id
+           WHERE proof.session_id=? AND proof.user_id=? AND proof.expires_at>?
+             AND live.expiresAt>?`,
+        )
+          .bind(id.sessionId, id.userId, Date.now(), new Date().toISOString())
+          .first()
+      : null;
+    if (slack) return;
+    throw deny("Enter your password or sign in with Slack again.");
+  }
+  if (value.length > 1000) throw deny("The password or Slack sign-in is invalid.");
+  const accounts = await ctx.context.internalAdapter.findAccounts(id.userId);
   const credential = accounts.find((account) => account.providerId === "credential");
   if (!credential?.password || !(await ctx.context.password.verify({ hash: credential.password, password: value }))) {
-    throw deny("The password or recovery credential is invalid.");
+    throw deny("The password or Slack sign-in is invalid.");
   }
 }
 
@@ -417,7 +439,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
       setupTotp: post("/security/setup-totp", async (ctx) => {
         const id = await requireEnrollment(ctx, env);
         await attempt(env, id.userId);
-        await password(ctx, id.userId);
+        await primaryFactor(ctx, env, id);
         const secret = Array.from(
           crypto.getRandomValues(new Uint8Array(32)),
           (byte) => "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"[byte & 31],
@@ -605,7 +627,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         const { account, status } = await readSecurity(env, id.userId, id.sessionId);
         if (!status.recoveryCanResume) throw deny("Use a recovery code or operator reset token first.");
         await attempt(env, id.userId);
-        await password(ctx, id.userId);
+        await primaryFactor(ctx, env, id);
         // Keep verified_at unchanged: password re-entry cannot extend the absolute deadline.
         const resumed = await env.DB.prepare(`UPDATE session_security SET expires_at=MIN(?,verified_at+?)
           WHERE session_id=? AND user_id=? AND method='recovery' AND generation=? AND verified_at>?
@@ -630,7 +652,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         const id = await requireIdentity(ctx);
         const account = await securityAccount(env, id.userId);
         await attempt(env, id.userId);
-        await password(ctx, id.userId);
+        await primaryFactor(ctx, env, id);
         const hash = await sha256(field(ctx, "code"));
         const reset = ctx.body?.reset === true;
         const receipt = crypto.randomUUID();
@@ -767,6 +789,8 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
               "/security/status",
               "/passkey/generate-authenticate-options",
               "/passkey/verify-authentication",
+              "/sign-in/social",
+              "/callback/slack",
             ]);
             if (publicPaths.has(ctx.path)) return;
             if (ctx.path.startsWith("/security/")) return;
