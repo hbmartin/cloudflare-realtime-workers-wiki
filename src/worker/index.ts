@@ -1443,10 +1443,10 @@ app.post("/api/slack/identity/invite/start", async (c) => {
       }),
     );
     if (!response.ok) return response;
-    const result = await response.json<{ url?: string }>();
+    const result = await response.clone().json<{ url?: string }>();
     if (!result.url) throw new HttpError(502, "slack_oauth_failed", "Slack sign-up could not be started.");
     handedOff = true;
-    return c.json({ url: result.url });
+    return response;
   } finally {
     if (!handedOff) {
       await c.env.DB.prepare(

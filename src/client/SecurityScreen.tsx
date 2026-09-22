@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import QRCode from "react-qr-code";
 import type { SecurityStatus } from "../shared/security";
-import { api, apiErrorMessage, authClient, json } from "./api";
+import { ApiClientError, api, apiErrorMessage, authClient, json } from "./api";
 
 async function securityAction<T = { success: boolean }>(path: string, body: object = {}): Promise<T> {
   return api<T>(`/api/security/${path}`, { method: "POST", body: json(body) });
@@ -39,10 +39,13 @@ export function SecurityScreen({
   const [trust, setTrust] = useState(false);
   const [recover, setRecover] = useState(false);
   const [reset, setReset] = useState(false);
+  const [proofExpired, setProofExpired] = useState(false);
+  const [hadSlackPrimary, setHadSlackPrimary] = useState(initialStatus?.slackPrimary?.available === true);
 
   const reload = useCallback(async () => {
     const next = await api<SecurityStatus>("/api/security/status");
     setStatus(next);
+    if (next.slackPrimary?.available) setHadSlackPrimary(true);
     if (settings && next.state === "ready") setMethods(await api<Methods>("/api/security/methods"));
     return next;
   }, [settings]);
@@ -52,6 +55,7 @@ export function SecurityScreen({
       .then(async (loaded) => {
         if (!active) return;
         setStatus(loaded);
+        if (loaded.slackPrimary?.available) setHadSlackPrimary(true);
         if (settings && loaded.state === "ready") {
           const currentMethods = await api<Methods>("/api/security/methods");
           if (active) setMethods(currentMethods);
@@ -64,6 +68,18 @@ export function SecurityScreen({
       active = false;
     };
   }, [settings, initialStatus]);
+  useEffect(() => {
+    const expiresAt = status?.slackPrimary?.expiresAt;
+    if (!expiresAt) return undefined;
+    const timer = window.setTimeout(
+      () => {
+        setProofExpired(true);
+        void reload().catch((cause) => setError(apiErrorMessage(cause, "Unable to refresh security settings.")));
+      },
+      Math.max(0, expiresAt - Date.now() + 1),
+    );
+    return () => window.clearTimeout(timer);
+  }, [status?.slackPrimary?.expiresAt, reload]);
 
   async function run(action: () => Promise<void>) {
     setBusy(true);
@@ -72,6 +88,10 @@ export function SecurityScreen({
     try {
       await action();
     } catch (cause) {
+      if (hadSlackPrimary && cause instanceof ApiClientError && cause.code === "SECURITY_REQUIRED") {
+        await reload().catch(() => undefined);
+        setProofExpired(true);
+      }
       setError(cause instanceof Error ? cause.message : "Security request failed.");
     } finally {
       setBusy(false);
@@ -124,7 +144,12 @@ export function SecurityScreen({
   const enrollment = status.state === "enrollment_required" && !status.totp && !status.passkeys;
   const recoveryEnrollment = status.state === "recovery_required";
   const canManage = status.fresh || enrollment || recoveryEnrollment;
-  const slackPrimary = status.slackPrimary?.available === true;
+  const slackPrimary = status.slackPrimary?.available === true && !proofExpired;
+  const primaryFactorFormVisible =
+    codes.length === 0 &&
+    ((recoveryEnrollment && status.recoveryCanResume) ||
+      ((enrollment || setup || recoveryEnrollment) && !uri) ||
+      (!settings && !enrollment && recover));
   return (
     <section className={settings ? "security-settings" : "security-gate"} aria-label="Account protection">
       <h2>{settings ? "Security" : "Protect your account"}</h2>
@@ -136,6 +161,26 @@ export function SecurityScreen({
         </p>
       )}
       <fieldset disabled={busy} className="security-controls">
+        {!slackPrimary && hadSlackPrimary && primaryFactorFormVisible && (
+          <div>
+            <p>Your recent Slack sign-in expired. Enter your password below or sign in with Slack again.</p>
+            <button
+              type="button"
+              onClick={() =>
+                void run(async () => {
+                  const result = await authClient.signIn.social({
+                    provider: "slack",
+                    callbackURL: settings ? "/?view=settings" : "/",
+                    errorCallbackURL: settings ? "/?view=settings&slackAuth=callback" : "/?slackAuth=callback",
+                  });
+                  if (result.error) throw new Error(result.error.message || "Slack sign-in failed.");
+                })
+              }
+            >
+              Sign in with Slack again
+            </button>
+          </div>
+        )}
         {codes.length > 0 ? (
           <>
             <h3>Save your recovery codes</h3>

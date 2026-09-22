@@ -1,34 +1,16 @@
 -- Secure Slack identity and inert foundations for the later Slack milestones.
 -- All newly introduced product behavior defaults off or unvalidated.
 
--- Better Auth 1.7.3 restored the pre-1.7 account schema. The application upgrades
--- before enabling social OAuth, so remove the short-lived issuer migration added
--- for 1.7.0-1.7.2 while preserving every account and token.
-DROP INDEX IF EXISTS idx_account_issuer_account;
-CREATE TABLE account_without_temporary_issuer (
-  id TEXT PRIMARY KEY,
-  accountId TEXT NOT NULL,
-  providerId TEXT NOT NULL,
-  userId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
-  accessToken TEXT,
-  refreshToken TEXT,
-  idToken TEXT,
-  accessTokenExpiresAt INTEGER,
-  refreshTokenExpiresAt INTEGER,
-  scope TEXT,
-  password TEXT,
-  createdAt INTEGER NOT NULL,
-  updatedAt INTEGER NOT NULL
-);
-INSERT INTO account_without_temporary_issuer
-  (id, accountId, providerId, userId, accessToken, refreshToken, idToken,
-   accessTokenExpiresAt, refreshTokenExpiresAt, scope, password, createdAt, updatedAt)
-SELECT id, accountId, providerId, userId, accessToken, refreshToken, idToken,
-       accessTokenExpiresAt, refreshTokenExpiresAt, scope, password, createdAt, updatedAt
-  FROM account;
-DROP TABLE account;
-ALTER TABLE account_without_temporary_issuer RENAME TO account;
-CREATE INDEX idx_account_user ON account(userId);
+-- Retain account.issuer and its index while Workers using Better Auth 1.7.2
+-- may still serve traffic or be restored by a code-only rollback. Better Auth
+-- 1.7.5 does not write issuer, but the existing column has a database default.
+-- Populate the legacy value for accounts created after this migration too.
+CREATE TRIGGER account_issuer_rollback_compatibility
+AFTER INSERT ON account
+WHEN NEW.issuer = ''
+BEGIN
+  UPDATE account SET issuer = 'local:' || NEW.providerId WHERE id = NEW.id;
+END;
 
 ALTER TABLE slack_oauth_states ADD COLUMN expected_team_id TEXT;
 

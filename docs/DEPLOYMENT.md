@@ -132,7 +132,11 @@ pnpm wrangler secret put SLACK_TOKEN_ENCRYPTION_KEY --env production
 Use an independently generated high-entropy encryption key. If any value is absent, the application
 keeps in-app notifications active and clearly reports Slack as unavailable.
 
-Deploy the Worker and additive D1 migration before importing the updated manifest. Then have the
+Migration `0035_slack_secure_foundation.sql` retains the `account.issuer` column and index and
+populates `issuer` on new accounts so the previous Better Auth 1.7.2 Worker remains compatible
+between migration and deployment, and after a code-only rollback. Keep this compatibility until
+that Worker is outside the rollback window. Deploy the Worker and additive D1 migration before
+importing the updated manifest. Then have the
 workspace owner use **Reauthorize Slack** once and confirm that Settings reports no missing bot scopes.
 The bot install callback and Better Auth OpenID callback are intentionally separate. Reauthorization
 must use the Slack team already bound to the NoteFlare workspace; changing teams requires a future

@@ -1,5 +1,7 @@
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import type { Env } from "./env";
+import { createAuth } from "./auth";
 
 beforeEach(() => reset());
 
@@ -240,7 +242,8 @@ describe("D1 migrations", () => {
       ]),
     );
     const accountColumns = await env.DB.prepare(`PRAGMA table_info(account)`).all<{ name: string }>();
-    expect(accountColumns.results.map((column) => column.name)).not.toContain("issuer");
+    expect(accountColumns.results.map((column) => column.name)).toContain("issuer");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_account_issuer_account");
     const channelEventColumns = await env.DB.prepare(`PRAGMA table_info(slack_channel_events)`).all<{ name: string }>();
     expect(channelEventColumns.results.map((column) => column.name)).toEqual(
       expect.arrayContaining(["claimed_at", "claim_token"]),
@@ -718,6 +721,26 @@ describe("D1 migrations", () => {
 
     await applyD1Migrations(env.DB, [foundation!]);
 
+    expect(await env.DB.prepare(`SELECT issuer FROM account WHERE id = 'slack-account'`).first()).toEqual({
+      issuer: "slack",
+    });
+    const auth = createAuth(env as unknown as Env, true);
+    const authRequest = (path: string, body: object) =>
+      new Request(`http://example.test/api/auth/${path}`, {
+        method: "POST",
+        headers: { origin: "http://example.test", "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const email = "new-password-user@example.test";
+    const password = "password123";
+    expect((await auth.handler(authRequest("sign-up/email", { name: "New User", email, password }))).status).toBe(200);
+    expect((await auth.handler(authRequest("sign-in/email", { email, password }))).status).toBe(200);
+    expect(
+      await env.DB.prepare(
+        `SELECT issuer FROM account WHERE providerId = 'credential' AND accountId != 'owner'`,
+      ).first(),
+    ).toEqual({ issuer: "local:credential" });
+
     expect(
       await env.DB.prepare(
         `SELECT verification_method, migration_state, verified_at, better_auth_account_id
@@ -852,10 +875,7 @@ describe("D1 migrations", () => {
   it("adopts legacy uploads and discards receipts that cannot be bound to a request", async () => {
     const reliability = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0005_import_reliability.sql");
     expect(reliability).toBeTruthy();
-    await applyD1Migrations(
-      env.DB,
-      env.TEST_MIGRATIONS!.filter((migration) => migration !== reliability),
-    );
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, env.TEST_MIGRATIONS!.indexOf(reliability!)));
     const timestamp = Date.now();
     await env.DB.batch([
       env.DB.prepare(
