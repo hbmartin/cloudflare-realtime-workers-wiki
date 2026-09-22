@@ -82,7 +82,7 @@ vi.mock("@blocknote/react", () => ({
 
 vi.mock("./BacklinksPanel", () => ({ BacklinksPanel: () => null }));
 vi.mock("./editor-blocks", () => ({ editorBlockFactories: [] }));
-vi.mock("./mentions", () => ({ notesSchema: {} }));
+vi.mock("./mentions", () => ({ notesSchema: {}, notesCommentSchema: {} }));
 
 const page: Page = {
   id: "page-1",

@@ -24,6 +24,7 @@ type ChannelSubscription = {
   validationError?: string | null;
   botIsMember?: boolean | null;
   mirrorEnabled?: boolean;
+  blockedDeliveries?: number;
   mutedAt?: number | null;
   snoozedUntil?: number | null;
 };
@@ -166,6 +167,25 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
       await load();
     } catch (cause) {
       setError(apiErrorMessage(cause, "The Slack channel mapping could not be saved."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleMirror(subscription: ChannelSubscription) {
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/slack/channels/${encodeURIComponent(subscription.id)}/mirror`, {
+        method: "PATCH",
+        body: json({ mirrorEnabled: !subscription.mirrorEnabled }),
+      });
+      setNotice(
+        subscription.mirrorEnabled ? "Thread mirroring disabled." : "Channel validated and thread mirroring enabled.",
+      );
+      await load();
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "Thread mirroring could not be changed."));
     } finally {
       setBusy(false);
     }
@@ -339,7 +359,24 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       {space?.name ?? "Unavailable space"}
                       {page ? ` / ${page.title}` : " / all pages"} · {subscription.cadence}
                     </p>
+                    <p>{subscription.mirrorEnabled ? "Thread mirror enabled" : "One-way notifications"}</p>
+                    {subscription.validationState === "invalid" && (
+                      <p>Channel validation failed. Check bot membership and channel access.</p>
+                    )}
+                    {Boolean(subscription.blockedDeliveries) && (
+                      <output>
+                        {subscription.blockedDeliveries} thread deliveries need reconciliation. Sending is paused to
+                        prevent duplicates.
+                      </output>
+                    )}
                   </div>
+                  <button
+                    disabled={busy || (!subscription.mirrorEnabled && status?.identity?.state !== "verified")}
+                    aria-label={`${subscription.mirrorEnabled ? "Disable" : "Enable"} thread mirror for #${subscription.channelName || subscription.channelId}`}
+                    onClick={() => void toggleMirror(subscription)}
+                  >
+                    {subscription.mirrorEnabled ? "Disable mirror" : "Validate and enable mirror"}
+                  </button>
                   <button
                     className="text-danger"
                     disabled={busy}

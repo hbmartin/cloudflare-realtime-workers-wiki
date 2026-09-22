@@ -1,3 +1,5 @@
+import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror } from "./slack-threads";
+import { pageForMember, effectiveSpaceRole, type PageRow } from "./page-access";
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
 import { routePartykitRequest } from "partyserver";
@@ -230,15 +232,6 @@ const MAX_IMPORT_UPLOAD_BYTES = 24 * 1024 * 1024;
 const INVITE_CLAIM_MS = 10 * 60_000;
 const CLIENT_TELEMETRY_MAX_BYTES = 8 * 1024;
 const CLIENT_TELEMETRY_EVENTS = new Set<string>(CLIENT_ERROR_EVENTS);
-
-type PageRow = PageJsonRow & {
-  created_by: string;
-  plain_text: string;
-  indexed_seq: number;
-  visibility?: "workspace" | "private";
-  space_role?: Exclude<Role, "owner"> | null;
-  effective_role?: Role;
-};
 
 type RequestedPageCreate = Pick<PageRow, "id" | "kind"> & {
   spaceId: string;
@@ -836,22 +829,6 @@ async function signUp(env: Env, request: Request, body: { name: string; email: s
   return authEmail(env, request, "/api/auth/sign-up/email", body);
 }
 
-async function pageForMember(env: Env, member: MemberContext, pageId: string, includeArchived = false) {
-  const row = await env.DB.prepare(
-    `SELECT p.*, s.visibility, sm.role space_role
-       FROM pages p
-       JOIN spaces s ON s.id = p.space_id AND s.workspace_id = p.workspace_id
-       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
-      WHERE p.id = ? AND p.workspace_id = ? ${includeArchived ? "" : "AND p.archived_at IS NULL"}
-        AND p.import_job_id IS NULL
-        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
-  )
-    .bind(member.user.id, pageId, member.workspace.id, member.role)
-    .first<PageRow>();
-  if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
-  return { ...row, effective_role: effectiveSpaceRole(member.role, row.visibility!, row.space_role ?? null)! };
-}
-
 function commentPage(page: PageRow): CommentPage {
   return {
     id: page.id,
@@ -881,17 +858,6 @@ async function pageForComment(env: Env, member: MemberContext, commentId: string
     .first<{ thread_id: string; page_id: string }>();
   if (!located) throw new HttpError(404, "comment_not_found", "Comment not found.");
   return { threadId: located.thread_id, page: await pageForMember(env, member, located.page_id) };
-}
-
-function effectiveSpaceRole(
-  workspaceRole: Role,
-  visibility: "workspace" | "private",
-  grant: Exclude<Role, "owner"> | null,
-): Role | null {
-  if (workspaceRole === "owner") return "owner";
-  if (visibility === "private" && !grant) return null;
-  if (workspaceRole === "viewer" || grant === "viewer") return "viewer";
-  return "editor";
 }
 
 function requirePageEditor(page: PageRow) {
@@ -2756,27 +2722,31 @@ app.post("/api/slack/commands", async (c) => {
 
 app.post("/api/slack/events", async (c) => {
   const rawBody = await c.req.raw.text();
-  const verified = await verifySlackRequest(c.env, c.req.raw, rawBody);
-  if (verified.duplicate) return c.json({ ok: true });
+  await verifySlackRequest(c.env, c.req.raw, rawBody);
   let payload: SlackEventPayload;
   try {
     payload = JSON.parse(rawBody) as SlackEventPayload;
   } catch {
     throw new HttpError(422, "invalid_slack_event", "Slack event payload is invalid.");
   }
-  return c.json(await handleSlackEvent(c.env, payload));
+  const result = (await acceptSlackReply(c.env, payload)) ? { ok: true } : await handleSlackEvent(c.env, payload);
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json(result);
 });
 
 app.post("/api/slack/interactions", async (c) => {
   const rawBody = await c.req.raw.text();
-  const verified = await verifySlackRequest(c.env, c.req.raw, rawBody);
-  if (verified.duplicate) return c.json({ ok: true });
+  await verifySlackRequest(c.env, c.req.raw, rawBody);
   const form = new URLSearchParams(rawBody);
   let payload: SlackInteractionPayload;
   try {
     payload = JSON.parse(form.get("payload") ?? "") as SlackInteractionPayload;
   } catch {
     throw new HttpError(422, "invalid_slack_interaction", "Slack interaction payload is invalid.");
+  }
+  if (await acceptSlackThreadAction(c.env, payload)) {
+    c.executionCtx.waitUntil(sweepOutbox(c.env));
+    return c.json({ ok: true });
   }
   c.executionCtx.waitUntil(
     handleSlackInteraction(c.env, payload).catch((error) =>
@@ -2843,6 +2813,18 @@ app.post("/api/slack/channels", async (c) => {
     },
     201,
   );
+});
+
+app.patch("/api/slack/channels/:id/mirror", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  if (typeof body.mirrorEnabled !== "boolean")
+    throw new HttpError(422, "invalid_slack_mirror", "Choose whether to enable mirroring.");
+  await setSlackMirror(c.env, member, c.req.param("id"), body.mirrorEnabled);
+  return c.json({
+    subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
+  });
 });
 
 app.delete("/api/slack/channels/:id", async (c) => {

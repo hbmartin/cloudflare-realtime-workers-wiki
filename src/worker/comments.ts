@@ -1,3 +1,4 @@
+import { slackThreadFanoutStatements } from "./slack-thread-fanout";
 import type { Comment, CommentAnchor, CommentBody, CommentThread, Role } from "../shared/types";
 import { ID_PATTERN } from "../shared/validation";
 import type { Env } from "./env";
@@ -315,6 +316,15 @@ export async function createCommentThread(
        VALUES (?, ?, NULL, ?, ?, ?, ?, ?)`,
     ).bind(commentId, threadId, member.user.id, body.json, body.plainText, timestamp, timestamp),
     watchPageStatement(env.DB, page, member.user.id, timestamp),
+    ...slackThreadFanoutStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      pageId: page.id,
+      threadId,
+      actorId: member.user.id,
+      commentId,
+      sourceId: commentId,
+      createdAt: timestamp,
+    }),
     ...notificationFanoutStatements(env.DB, {
       workspaceId: page.workspace_id,
       spaceId: page.space_id,
@@ -350,6 +360,7 @@ export async function addCommentReply(
   threadId: string,
   bodyValue: unknown,
   requestedParentId?: unknown,
+  source?: { receiptId: string; commentId: string; guard: D1PreparedStatement },
 ) {
   const thread = await threadRow(env, page, threadId);
   const body = validatedCommentBody(bodyValue);
@@ -368,18 +379,38 @@ export async function addCommentReply(
           .first<{ id: string }>()
       )?.id ?? null;
   }
-  const commentId = crypto.randomUUID();
+  const commentId = source?.commentId ?? crypto.randomUUID();
   const timestamp = Date.now();
   const mentionedUserIds = commentMentionUserIds(body.body);
   const participantIds = (await threadParticipantIds(env, threadId)).filter((id) => !mentionedUserIds.includes(id));
   await env.DB.batch([
+    ...(source ? [source.guard] : []),
     env.DB.prepare(
       `INSERT INTO comments
-        (id, thread_id, parent_id, user_id, body_json, plain_text, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(commentId, threadId, parentId, member.user.id, body.json, body.plainText, timestamp, timestamp),
+        (id, thread_id, parent_id, user_id, body_json, plain_text, created_at, updated_at, slack_source_receipt_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      commentId,
+      threadId,
+      parentId,
+      member.user.id,
+      body.json,
+      body.plainText,
+      timestamp,
+      timestamp,
+      source?.receiptId ?? null,
+    ),
     env.DB.prepare(`UPDATE comment_threads SET updated_at = ? WHERE id = ?`).bind(timestamp, thread.id),
     watchPageStatement(env.DB, page, member.user.id, timestamp),
+    ...slackThreadFanoutStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      pageId: page.id,
+      threadId,
+      actorId: member.user.id,
+      commentId,
+      sourceId: commentId,
+      createdAt: timestamp,
+    }),
     ...notificationFanoutStatements(env.DB, {
       workspaceId: page.workspace_id,
       spaceId: page.space_id,
@@ -416,6 +447,13 @@ export async function addCommentReply(
       sourceKey: `comment:${commentId}:created`,
       createdAt: timestamp,
     }),
+    ...(source
+      ? [
+          env.DB.prepare(
+            `UPDATE slack_inbound_receipts SET comment_id = ?, processed_at = ?, outcome = 'accepted', payload_json = NULL WHERE id = ?`,
+          ).bind(commentId, timestamp, source.receiptId),
+        ]
+      : []),
     ...refreshPageSearchV2Statements(env.DB, page.id),
   ]);
   return commentThread(env, member, page, threadId);
@@ -523,21 +561,48 @@ export async function setThreadResolved(
   page: CommentPage,
   threadId: string,
   resolved: boolean,
+  source?: { receiptId: string; guard: D1PreparedStatement },
 ) {
   const thread = await threadRow(env, page, threadId);
   if (!canResolve(member, page, thread)) {
     throw new HttpError(403, "comment_resolve_forbidden", "You cannot change this thread's resolution state.");
   }
-  if (Boolean(thread.resolved_at) === resolved) return commentThread(env, member, page, threadId);
+  if (Boolean(thread.resolved_at) === resolved) {
+    if (source)
+      await env.DB.batch([
+        source.guard,
+        env.DB.prepare(
+          `UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'accepted', payload_json = NULL WHERE id = ?`,
+        ).bind(Date.now(), source.receiptId),
+      ]);
+    return commentThread(env, member, page, threadId);
+  }
   const timestamp = Date.now();
   const participantIds = await threadParticipantIds(env, threadId);
   await env.DB.batch([
+    ...(source ? [source.guard] : []),
     env.DB.prepare(`UPDATE comment_threads SET resolved_at = ?, resolved_by = ?, updated_at = ? WHERE id = ?`).bind(
       resolved ? timestamp : null,
       resolved ? member.user.id : null,
       timestamp,
       threadId,
     ),
+    ...slackThreadFanoutStatements(env.DB, {
+      workspaceId: page.workspace_id,
+      pageId: page.id,
+      threadId,
+      actorId: member.user.id,
+      sourceId: source?.receiptId ?? `${threadId}:${timestamp}`,
+      refresh: true,
+      createdAt: timestamp,
+    }),
+    ...(source
+      ? [
+          env.DB.prepare(
+            `UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'accepted', payload_json = NULL WHERE id = ?`,
+          ).bind(timestamp, source.receiptId),
+        ]
+      : []),
     ...notificationFanoutStatements(env.DB, {
       workspaceId: page.workspace_id,
       spaceId: page.space_id,
@@ -545,7 +610,7 @@ export async function setThreadResolved(
       threadId,
       actorId: member.user.id,
       eventType: resolved ? "thread_resolved" : "thread_reopened",
-      sourceId: `${threadId}:${timestamp}`,
+      sourceId: source?.receiptId ?? `${threadId}:${timestamp}`,
       recipientIds: participantIds,
       emitSlackChannel: true,
       createdAt: timestamp,

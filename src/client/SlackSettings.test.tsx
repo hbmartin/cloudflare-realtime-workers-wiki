@@ -200,3 +200,85 @@ describe("SlackSettings", () => {
     expect(screen.queryByRole("button", { name: /Slack identity/ })).not.toBeInTheDocument();
   });
 });
+
+describe("Slack thread mirror controls", () => {
+  function setupMirror(identity = "verified", mirrorEnabled = false, blockedDeliveries = 0) {
+    let enabled = mirrorEnabled;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/slack/status")
+        return {
+          available: true,
+          missing: [],
+          linked: true,
+          identity: { state: identity, slackUserId: "UOWNER", verifiedAt: 1 },
+          installation: {
+            teamId: "T123",
+            teamName: "Slack",
+            botUserId: "UBOT",
+            scopes: [],
+            connected: true,
+            createdAt: 1,
+            updatedAt: 1,
+          },
+        };
+      if (path === "/api/slack/channels/mapping/mirror" && init?.method === "PATCH") {
+        enabled = (JSON.parse(String(init.body)) as { mirrorEnabled: boolean }).mirrorEnabled;
+        return {};
+      }
+      if (path === "/api/slack/channels")
+        return {
+          subscriptions: [
+            {
+              id: "mapping",
+              spaceId: space.id,
+              pageId: null,
+              channelId: "C123",
+              channelName: "product",
+              eventTypes: ["reply"],
+              cadence: "immediate",
+              mirrorEnabled: enabled,
+              blockedDeliveries,
+              validationState: "valid",
+            },
+          ],
+        };
+      return {};
+    });
+  }
+  it("requires explicit owner opt-in and supports disabling an enabled mapping", async () => {
+    setupMirror();
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Enable thread mirror for #product" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        "/api/slack/channels/mapping/mirror",
+        expect.objectContaining({ method: "PATCH", body: JSON.stringify({ mirrorEnabled: true }) }),
+      ),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Disable thread mirror for #product" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        "/api/slack/channels/mapping/mirror",
+        expect.objectContaining({ method: "PATCH", body: JSON.stringify({ mirrorEnabled: false }) }),
+      ),
+    );
+  });
+  it("keeps enabling disabled for legacy identities", async () => {
+    setupMirror("legacy");
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    expect(await screen.findByRole("button", { name: "Enable thread mirror for #product" })).toBeDisabled();
+  });
+  it("shows uncertain delivery health while allowing the owner to disable mirroring", async () => {
+    setupMirror("verified", true, 2);
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    expect(await screen.findByText(/2 thread deliveries need reconciliation/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Disable thread mirror for #product" })).toBeEnabled();
+  });
+  it("does not expose mapping controls to non-owners", async () => {
+    setupMirror();
+    render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
+    await screen.findByText("Your Slack identity is verified.");
+    expect(screen.queryByRole("button", { name: /thread mirror/ })).not.toBeInTheDocument();
+    expect(api).not.toHaveBeenCalledWith("/api/slack/channels");
+  });
+});

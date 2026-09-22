@@ -601,6 +601,7 @@ describe("Slack security and integration", () => {
       .first<{ id: string }>();
     await recordVerifiedSlackIdentity(slackEnv(), installed.member.user.id, session!.id, "verified-slack-account", {
       installationId: "slack-installation",
+      installationGeneration: 0,
       workspaceId: installed.member.workspace.id,
       teamId: "T123",
       slackUserId: "UOWNER",

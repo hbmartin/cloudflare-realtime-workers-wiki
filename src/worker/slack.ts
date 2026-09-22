@@ -40,7 +40,8 @@ const SLACK_CAPABILITY_SCOPES: Record<SlackCapability, readonly string[]> = {
   files: ["files:write"],
 };
 
-type SlackInstallation = {
+export type SlackInstallation = {
+  generation: number;
   id: string;
   workspace_id: string;
   team_id: string;
@@ -65,6 +66,12 @@ export type SlackEventPayload = {
     message_ts?: unknown;
     event_ts?: unknown;
     subtype?: unknown;
+    ts?: unknown;
+    thread_ts?: unknown;
+    text?: unknown;
+    bot_id?: unknown;
+    app_id?: unknown;
+    channel_type?: unknown;
     links?: Array<{ url?: unknown }>;
   };
 };
@@ -74,6 +81,9 @@ export type SlackInteractionPayload = {
   callback_id?: unknown;
   trigger_id?: unknown;
   action_ts?: unknown;
+  channel?: { id?: unknown };
+  message?: { ts?: unknown };
+  actions?: Array<{ action_id?: unknown; action_ts?: unknown; value?: unknown }>;
   team?: { id?: unknown };
   user?: { id?: unknown };
 };
@@ -88,7 +98,7 @@ export class SlackRateLimitError extends Error {
   }
 }
 
-class SlackApiError extends Error {
+export class SlackApiError extends Error {
   constructor(
     readonly method: string,
     readonly code: string,
@@ -99,7 +109,7 @@ class SlackApiError extends Error {
   }
 }
 
-type SlackUser = {
+export type SlackUser = {
   id: string;
   team_id?: string;
   deleted?: boolean;
@@ -110,11 +120,67 @@ type SlackUser = {
   is_stranger?: boolean;
 };
 
-type SlackApiContracts = {
+export type SlackApiContracts = {
+  "conversations.info": {
+    input: { channel: string };
+    output: {
+      channel: {
+        id: string;
+        name: string;
+        is_channel?: boolean;
+        is_group?: boolean;
+        is_private?: boolean;
+        is_im?: boolean;
+        is_mpim?: boolean;
+        is_member?: boolean;
+        is_archived?: boolean;
+        is_ext_shared?: boolean;
+        is_shared?: boolean;
+        is_org_shared?: boolean;
+        pending_shared?: unknown[];
+      };
+    };
+  };
+  "conversations.members": {
+    input: { channel: string; cursor?: string; limit: number };
+    output: { members: string[]; response_metadata?: { next_cursor?: string } };
+  };
+  "conversations.history": {
+    input: { channel: string; oldest: string; cursor?: string; limit: number; include_all_metadata: boolean };
+    output: { messages: SlackHistoryMessage[]; has_more?: boolean; response_metadata?: { next_cursor?: string } };
+  };
+  "conversations.replies": {
+    input: {
+      channel: string;
+      ts: string;
+      oldest: string;
+      cursor?: string;
+      limit: number;
+      include_all_metadata: boolean;
+    };
+    output: { messages: SlackHistoryMessage[]; has_more?: boolean; response_metadata?: { next_cursor?: string } };
+  };
+  "chat.update": {
+    input: { channel: string; ts: string; text: string; blocks: unknown[] };
+    output: { channel: string; ts: string };
+  };
+  "chat.postEphemeral": {
+    input: { channel: string; user: string; text: string; thread_ts?: string };
+    output: { message_ts: string };
+  };
   "users.info": { input: { user: string }; output: { user: SlackUser } };
   "auth.revoke": { input: Record<string, never>; output: { revoked?: boolean } };
   "chat.postMessage": {
-    input: { channel: string; text: string; blocks?: unknown[]; thread_ts?: string };
+    input: {
+      channel: string;
+      text: string;
+      blocks?: unknown[];
+      thread_ts?: string;
+      metadata?: { event_type: string; event_payload: { delivery_id: string } };
+      unfurl_links?: boolean;
+      unfurl_media?: boolean;
+      parse?: "none";
+    };
     output: { channel: string; ts: string; message?: { ts?: string } };
   };
   "chat.unfurl": {
@@ -131,7 +197,15 @@ type SlackApiContracts = {
   };
 };
 
-type SlackApiMethod = keyof SlackApiContracts;
+export type SlackHistoryMessage = {
+  ts: string;
+  user?: string;
+  bot_id?: string;
+  thread_ts?: string;
+  metadata?: { event_type?: string; event_payload?: { delivery_id?: string } };
+};
+
+export type SlackApiMethod = keyof SlackApiContracts;
 
 function normalizeScopes(scopes: string | readonly string[]) {
   return [
@@ -387,6 +461,21 @@ export async function disconnectSlack(env: Env, member: MemberContext) {
   )
     .bind(member.workspace.id)
     .first<SlackInstallation>();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE slack_installations SET generation = generation + 1, disconnected_at = ?, updated_at = ? WHERE workspace_id = ? AND disconnected_at IS NULL`,
+    ).bind(Date.now(), Date.now(), member.workspace.id),
+    env.DB.prepare(
+      `UPDATE slack_channel_subscriptions SET mirror_enabled = 0, validation_state = 'unvalidated' WHERE installation_id IN (SELECT id FROM slack_installations WHERE workspace_id = ?)`,
+    ).bind(member.workspace.id),
+    env.DB.prepare(`UPDATE slack_thread_links SET state = 'retired' WHERE workspace_id = ?`).bind(member.workspace.id),
+    env.DB.prepare(
+      `DELETE FROM slack_primary_factor_proofs WHERE team_id IN (SELECT team_id FROM slack_installations WHERE workspace_id = ?)`,
+    ).bind(member.workspace.id),
+    env.DB.prepare(
+      `UPDATE slack_user_links SET migration_state = 'legacy', verification_method = 'legacy_command', verified_at = NULL WHERE installation_id IN (SELECT id FROM slack_installations WHERE workspace_id = ?)`,
+    ).bind(member.workspace.id),
+  ]);
   if (installation) {
     try {
       await slackApi(env, installation, "auth.revoke", {});
@@ -409,7 +498,7 @@ export async function disconnectSlack(env: Env, member: MemberContext) {
   await env.DB.prepare(
     `UPDATE slack_installations SET bot_token_ciphertext = '', bot_refresh_token_ciphertext = NULL,
       token_expires_at = NULL, disconnected_at = ?, updated_at = ?
-      WHERE workspace_id = ?`,
+      WHERE workspace_id = ? AND disconnected_at IS NOT NULL`,
   )
     .bind(Date.now(), Date.now(), member.workspace.id)
     .run();
@@ -487,6 +576,7 @@ export async function listSlackChannelSubscriptions(env: Env, member: MemberCont
             subscription.channel_type, subscription.validation_state, subscription.validated_at,
             subscription.validation_error, subscription.bot_is_member, subscription.mirror_enabled,
             subscription.muted_at, subscription.snoozed_until,
+            (SELECT COUNT(*) FROM slack_thread_deliveries d JOIN slack_thread_links l ON l.id = d.link_id WHERE l.subscription_id = subscription.id AND d.state = 'blocked') blocked_deliveries,
             subscription.created_at, subscription.updated_at
        FROM slack_channel_subscriptions subscription
        JOIN slack_installations installation ON installation.id = subscription.installation_id
@@ -508,6 +598,7 @@ export async function listSlackChannelSubscriptions(env: Env, member: MemberCont
       validation_error: string | null;
       bot_is_member: number | null;
       mirror_enabled: number;
+      blocked_deliveries: number;
       muted_at: number | null;
       snoozed_until: number | null;
       created_at: number;
@@ -527,6 +618,7 @@ export async function listSlackChannelSubscriptions(env: Env, member: MemberCont
     validationError: row.validation_error,
     botIsMember: row.bot_is_member === null ? null : Boolean(row.bot_is_member),
     mirrorEnabled: Boolean(row.mirror_enabled),
+    blockedDeliveries: row.blocked_deliveries,
     mutedAt: row.muted_at,
     snoozedUntil: row.snoozed_until,
     createdAt: row.created_at,
@@ -691,7 +783,7 @@ async function usableBotToken(env: Env, installation: SlackInstallation) {
   return result.access_token;
 }
 
-async function slackApi<Method extends SlackApiMethod>(
+export async function slackApi<Method extends SlackApiMethod>(
   env: Env,
   installation: SlackInstallation,
   method: Method,
@@ -701,7 +793,7 @@ async function slackApi<Method extends SlackApiMethod>(
     return fetch(`https://slack.com/api/${method}`, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${await usableBotToken(env, installation)}`,
+        authorization: `Bearer ${method === "auth.revoke" ? await decryptSlackToken(env, installation.bot_token_ciphertext) : await usableBotToken(env, installation)}`,
         "content-type": "application/json; charset=utf-8",
       },
       body: JSON.stringify(payload),
@@ -732,6 +824,7 @@ async function slackApi<Method extends SlackApiMethod>(
 }
 
 export type VerifiedSlackIdentity = {
+  installationGeneration: number;
   installationId: string;
   workspaceId: string;
   teamId: string;
@@ -798,6 +891,7 @@ export async function validateSlackIdentity(
   }
   return {
     installationId: installation.id,
+    installationGeneration: installation.generation,
     workspaceId: installation.workspace_id,
     teamId,
     slackUserId,
@@ -818,19 +912,30 @@ export async function recordVerifiedSlackIdentity(
     env.DB.prepare(
       `INSERT INTO slack_user_links
         (installation_id, user_id, slack_user_id, linked_at, better_auth_account_id,
-         verification_method, verified_at, migration_state)
-       VALUES (?, ?, ?, ?, ?, 'slack_openid', ?, 'verified')
+         verification_method, verified_at, migration_state, installation_generation)
+       SELECT ?, ?, ?, ?, ?, 'slack_openid', ?, 'verified', generation FROM slack_installations WHERE id = ? AND disconnected_at IS NULL AND generation = ?
        ON CONFLICT(installation_id, user_id) DO UPDATE SET
          slack_user_id = excluded.slack_user_id,
          better_auth_account_id = excluded.better_auth_account_id,
          verification_method = 'slack_openid', verified_at = excluded.verified_at,
-         migration_state = 'verified', linked_at = excluded.linked_at`,
-    ).bind(identity.installationId, userId, identity.slackUserId, timestamp, accountId, timestamp),
+         migration_state = 'verified', linked_at = excluded.linked_at, installation_generation = excluded.installation_generation`,
+    ).bind(
+      identity.installationId,
+      userId,
+      identity.slackUserId,
+      timestamp,
+      accountId,
+      timestamp,
+      identity.installationId,
+      identity.installationGeneration,
+    ),
     env.DB.prepare(
       `INSERT INTO slack_primary_factor_proofs
         (session_id, user_id, account_id, team_id, slack_user_id, verified_at, expires_at)
        SELECT ?, ?, ?, ?, ?, ?, ?
         WHERE EXISTS(SELECT 1 FROM session WHERE id = ? AND userId = ? AND expiresAt > ?)
+          AND EXISTS (SELECT 1 FROM slack_user_links l JOIN slack_installations i ON i.id = l.installation_id
+            WHERE l.installation_id = ? AND l.user_id = ? AND l.verified_at = ? AND l.installation_generation = i.generation AND i.disconnected_at IS NULL)
        ON CONFLICT(session_id) DO UPDATE SET account_id = excluded.account_id,
          team_id = excluded.team_id, slack_user_id = excluded.slack_user_id,
          verified_at = excluded.verified_at, expires_at = excluded.expires_at`,
@@ -845,6 +950,9 @@ export async function recordVerifiedSlackIdentity(
       sessionId,
       userId,
       new Date(timestamp).toISOString(),
+      identity.installationId,
+      userId,
+      timestamp,
     ),
   ]);
   return { expiresAt: proofExpiresAt };
@@ -1020,6 +1128,9 @@ export function slackChannelFanoutStatements(
            JOIN slack_installations installation ON installation.id = subscription.installation_id
           WHERE installation.workspace_id = ? AND installation.disconnected_at IS NULL
             AND subscription.space_id = ? AND (subscription.page_id IS NULL OR subscription.page_id = ?)
+            AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
+            AND NOT EXISTS (SELECT 1 FROM slack_thread_links mirror WHERE mirror.installation_id = installation.id
+              AND mirror.thread_id = ? AND mirror.channel_id = subscription.channel_id AND mirror.state IN ('pending', 'active'))
             AND EXISTS (SELECT 1 FROM json_each(subscription.event_types_json) WHERE value = ?)
             AND NOT EXISTS (
               SELECT 1 FROM slack_channel_events recent
@@ -1037,6 +1148,8 @@ export function slackChannelFanoutStatements(
         fanout.workspaceId,
         fanout.spaceId,
         fanout.pageId,
+        fanout.createdAt,
+        fanout.threadId,
         fanout.eventType,
         coalesceAfter,
         fanout.pageId,
@@ -1115,7 +1228,12 @@ async function channelEvent(env: Env, eventId: string) {
        JOIN slack_installations installation ON installation.id = subscription.installation_id
        JOIN pages page ON page.id = event.page_id AND page.import_job_id IS NULL AND page.archived_at IS NULL
        LEFT JOIN user actor ON actor.id = event.actor_id
-      WHERE event.id = ? AND event.delivered_at IS NULL AND installation.disconnected_at IS NULL`,
+      WHERE event.id = ? AND event.delivered_at IS NULL AND installation.disconnected_at IS NULL
+        AND page.space_id = subscription.space_id AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
+        AND EXISTS (SELECT 1 FROM workspace_members wm JOIN spaces sp ON sp.workspace_id = wm.workspace_id AND sp.id = page.space_id
+          LEFT JOIN space_members sm ON sm.space_id = sp.id AND sm.user_id = wm.user_id
+          WHERE wm.workspace_id = page.workspace_id AND wm.user_id = event.actor_id AND (wm.role = 'owner' OR sp.visibility = 'workspace' OR sm.user_id IS NOT NULL))
+        AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= unixepoch('subsec') * 1000)`,
   )
     .bind(eventId)
     .first<
@@ -1537,6 +1655,11 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
          LEFT JOIN user actor ON actor.id = event.actor_id
         WHERE event.subscription_id = ? AND event.cadence = 'digest'
           AND event.delivered_at IS NULL AND event.created_at < ? AND installation.disconnected_at IS NULL
+          AND page.space_id = subscription.space_id AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
+          AND EXISTS (SELECT 1 FROM workspace_members wm JOIN spaces sp ON sp.workspace_id = wm.workspace_id AND sp.id = page.space_id
+            LEFT JOIN space_members sm ON sm.space_id = sp.id AND sm.user_id = wm.user_id
+            WHERE wm.workspace_id = page.workspace_id AND wm.user_id = event.actor_id AND (wm.role = 'owner' OR sp.visibility = 'workspace' OR sm.user_id IS NOT NULL))
+          AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= unixepoch('subsec') * 1000)
         ORDER BY event.created_at LIMIT 40`,
       )
         .bind(subscriptionId, cutoff)

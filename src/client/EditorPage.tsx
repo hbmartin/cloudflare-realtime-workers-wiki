@@ -20,7 +20,7 @@ import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
 import { createDocumentCloseReconciler } from "./document-connection";
 import { editorBlockFactories } from "./editor-blocks";
-import { notesSchema } from "./mentions";
+import { notesCommentSchema, notesSchema } from "./mentions";
 import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 import { useEffectiveColorScheme } from "./ThemeControl";
@@ -474,6 +474,7 @@ function editorOptions(
     extensions: [
       CommentsExtension({
         threadStore,
+        schema: notesCommentSchema,
         resolveUsers: async (ids: string[]) =>
           threadStore.resolveUsers(ids).map((user) => ({ ...user, color: userColor(user.id) })),
       }),
