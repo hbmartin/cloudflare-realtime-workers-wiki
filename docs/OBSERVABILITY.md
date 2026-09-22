@@ -80,7 +80,11 @@ bare, quoted, or escaped keys in either property order and pairs only fields in 
 nested metadata appears between them. The logger also redacts decodable free-text Basic credentials, credential-like
 free-text Bearer values (including malformed values with internal `!` or `?`), and query strings, including nested
 diagnostic values. Bearer scheme/value separation recognizes JavaScript whitespace, including line breaks and Unicode
-space characters. Unlabeled Bearer schemes use ASCII identifier boundaries: an underscore keeps the scheme embedded in
+space characters, consistently across labeled, serialized, free-text, and repeated-scheme forms. Basic accepts only a
+space or tab as the scheme separator. Authorization URLs use one scanner in labeled and free-text forms: the full URL,
+including query strings, semicolon paths, IPv6 host brackets, and existing sanitizer markers, is treated as the
+credential. A closing quote or whitespace ends the URL, so diagnostic text after an unclosed quote remains available.
+Unlabeled Bearer schemes use ASCII identifier boundaries: an underscore keeps the scheme embedded in
 an identifier, while adjacent non-ASCII characters do not suppress redaction. The full malformed-punctuation heuristic
 is deliberately conservative and can redact prose-like forms such as `Bearer token(s)`.
 
@@ -93,6 +97,11 @@ value remains unchanged, including when it follows an opening bracket, parenthes
 real credential remain visible, and safe terminal punctuation is preserved when the field budget can hold it; the
 redaction marker takes priority when it cannot hold both. The truncation marker is always complete. These rules make
 sanitization a fixed point: sanitizing an already-sanitized value produces exactly the same value.
+
+Persisted operational error fields use the same 500-character boundary across jobs, notifications, webhooks, outbox,
+cleanup, and scheduled-task records. `jobs.error_message` and the corresponding client-visible `Job.error.message` are
+user-facing product data rather than telemetry: typed `HttpError` messages are intentionally preserved there. Any copy
+of those messages written to logs must still go through the structured logger and its redaction rules.
 
 Complete unlabeled malformed Basic values, ordinary Basic prose, and short alphabetic Bearer prose remain unchanged, so
 never put authorization headers or credentials in diagnostic text.

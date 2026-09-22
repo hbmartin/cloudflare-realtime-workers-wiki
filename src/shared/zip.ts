@@ -13,6 +13,7 @@ export class ZipValidationError extends Error {
     readonly kind: "invalid" | "limit",
   ) {
     super(message);
+    this.name = "ZipValidationError";
   }
 }
 
@@ -109,8 +110,9 @@ export function createZip(entries: ZipEntry[]) {
 
 // The pre-decompression guards can only weigh the sizes the archive declares, so a
 // entry that lies about them would otherwise be buffered in full before the integrity
-// check rejects it. `limit` is the real ceiling, enforced as the output is produced.
-async function inflateRaw(bytes: Uint8Array, limit: number) {
+// check rejects it. Both ceilings are enforced as the output is produced so a
+// dishonest declaration cannot consume the rest of the archive budget.
+async function inflateRaw(bytes: Uint8Array, declaredSize: number, remainingArchiveBudget: number) {
   const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
   const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
   const reader = stream.getReader();
@@ -121,7 +123,12 @@ async function inflateRaw(bytes: Uint8Array, limit: number) {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > limit) throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
+      if (total > remainingArchiveBudget) {
+        throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
+      }
+      if (total > declaredSize) {
+        throw new ZipValidationError("The ZIP entry failed its integrity check.", "invalid");
+      }
       chunks.push(value);
     }
   } finally {
@@ -187,6 +194,7 @@ export async function readZip(
     offset = nameEnd + extraLength + commentLength;
     if (offset > endOffset) throw new ZipValidationError("The ZIP central directory is truncated.", "invalid");
     if (path.endsWith("/")) continue;
+    const expandedBefore = expanded;
     expanded += uncompressedSize;
     if (expanded > maxExpandedBytes || (compressedSize > 0 && uncompressedSize / compressedSize > 200)) {
       throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
@@ -202,10 +210,16 @@ export async function readZip(
     const compressed = bytes.subarray(dataOffset, dataOffset + compressedSize);
     let contents: Uint8Array;
     try {
-      contents = method === 0 ? compressed.slice() : await inflateRaw(compressed, uncompressedSize);
+      contents =
+        method === 0
+          ? compressed.slice()
+          : await inflateRaw(compressed, uncompressedSize, maxExpandedBytes - expandedBefore);
     } catch (error) {
       if (error instanceof ZipValidationError) throw error;
       throw new ZipValidationError("The ZIP entry could not be decompressed.", "invalid");
+    }
+    if (contents.byteLength > maxExpandedBytes - expandedBefore) {
+      throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
     }
     if (contents.byteLength !== uncompressedSize || crc32(contents) !== checksum) {
       throw new ZipValidationError("The ZIP entry failed its integrity check.", "invalid");

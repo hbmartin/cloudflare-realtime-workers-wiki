@@ -2,6 +2,7 @@ import { enrollAccount } from "../../tests/helpers/security";
 import { abortAllDurableObjects, applyD1Migrations, env, reset, runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
+import { PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import type { CommentThread, Notification, NotificationPreference, Page } from "../shared/types";
 import type { Env } from "./env";
 import { deliverNotification, digestCandidates, sendDueNotificationDigests } from "./notifications";
@@ -392,7 +393,7 @@ describe("notification feed and subscriptions", () => {
     expect(delivery?.last_error).toContain("Basic [redacted]");
     expect(delivery?.last_error).not.toContain("dXNlcjpwYXNz");
     expect(delivery?.last_error).toMatch(/…\[truncated\]$/);
-    expect(delivery?.last_error.length).toBeLessThanOrEqual(500);
+    expect(delivery?.last_error.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
   });
 
   it("does not let a stale delivery claimant finish a newer email lease", async () => {

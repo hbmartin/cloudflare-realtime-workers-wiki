@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createZip, readZip } from "./zip";
+import { createZip, readZip, ZipValidationError } from "./zip";
 
 describe("ZIP utilities", () => {
   it("round-trips portable stored archives", async () => {
@@ -35,6 +35,20 @@ describe("ZIP utilities", () => {
     output.setUint32(nextEnd + 16, nextCentral, true);
     await expect(readZip(resized)).resolves.toEqual([{ path: "safe.txt", bytes: plain }]);
 
+    const understatedEntry = resized.slice();
+    new DataView(understatedEntry.buffer).setUint32(nextCentral + 24, plain.byteLength - 1, true);
+    await expect(readZip(understatedEntry)).rejects.toMatchObject({
+      name: "ZipValidationError",
+      kind: "invalid",
+    } satisfies Partial<ZipValidationError>);
+
+    const archiveLimitBreach = resized.slice();
+    new DataView(archiveLimitBreach.buffer).setUint32(nextCentral + 24, 5, true);
+    await expect(readZip(archiveLimitBreach, { maxExpandedBytes: 5 })).rejects.toMatchObject({
+      name: "ZipValidationError",
+      kind: "limit",
+    } satisfies Partial<ZipValidationError>);
+
     expect(() => createZip([{ path: "../secret", bytes: plain }])).toThrow(/unsafe path/);
     const bomb = resized.slice();
     new DataView(bomb.buffer).setUint32(nextCentral + 24, compressed.byteLength * 201, true);
@@ -54,5 +68,12 @@ describe("ZIP utilities", () => {
     ]);
     await expect(readZip(zip, { maxEntries: 1 })).rejects.toThrow(/too many files/);
     await expect(readZip(zip, { maxExpandedBytes: 5 })).rejects.toThrow(/expands beyond/);
+  });
+
+  it("names validation failures", async () => {
+    await expect(readZip(new Uint8Array())).rejects.toMatchObject({
+      name: "ZipValidationError",
+      kind: "invalid",
+    } satisfies Partial<ZipValidationError>);
   });
 });

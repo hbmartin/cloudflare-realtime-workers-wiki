@@ -105,7 +105,7 @@ pnpm wrangler d1 execute DB --env production --remote --command \
      FROM deletion_targets WHERE completed_at IS NULL ORDER BY job_id;"
 ```
 
-`kind` is one of `document_do`, `r2_object`, or `r2_prefix`. `last_error` is truncated to 1000
+`kind` is one of `document_do`, `r2_object`, or `r2_prefix`. `last_error` is truncated to 500
 characters. A healthy installation has zero rows in both queries.
 
 ### Abandoned uploads
