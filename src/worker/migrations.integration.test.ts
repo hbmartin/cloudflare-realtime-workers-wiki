@@ -174,6 +174,15 @@ describe("D1 migrations", () => {
         "slack_channel_subscriptions",
         "slack_unfurls",
         "slack_request_replays",
+        "slack_primary_factor_proofs",
+        "slack_thread_links",
+        "slack_inbound_receipts",
+        "slack_interaction_receipts",
+        "slack_captures",
+        "slack_share_references",
+        "slack_file_artifacts",
+        "slack_operations_destinations",
+        "slack_incidents",
         "share_links",
         "integrations",
         "integration_tokens",
@@ -203,11 +212,35 @@ describe("D1 migrations", () => {
     expect(indexes.results.map((index) => index.name)).toContain("idx_comment_threads_page_block");
     expect(indexes.results.map((index) => index.name)).toContain("idx_rate_limit_last_request");
     expect(indexes.results.map((index) => index.name)).toContain("idx_pending_recovery_expiry");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_slack_user_links_verified_account");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_slack_space_mirror_enabled");
+    expect(indexes.results.map((index) => index.name)).toContain("idx_slack_page_mirror_enabled");
 
     const slackColumns = await env.DB.prepare(`PRAGMA table_info(slack_installations)`).all<{ name: string }>();
     expect(slackColumns.results.map((column) => column.name)).toEqual(
       expect.arrayContaining(["bot_token_ciphertext", "bot_refresh_token_ciphertext", "token_expires_at"]),
     );
+    const slackLinkColumns = await env.DB.prepare(`PRAGMA table_info(slack_user_links)`).all<{ name: string }>();
+    expect(slackLinkColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["better_auth_account_id", "verification_method", "verified_at", "migration_state"]),
+    );
+    const slackChannelColumns = await env.DB.prepare(`PRAGMA table_info(slack_channel_subscriptions)`).all<{
+      name: string;
+    }>();
+    expect(slackChannelColumns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        "channel_type",
+        "validation_state",
+        "validated_at",
+        "validation_error",
+        "bot_is_member",
+        "mirror_enabled",
+        "muted_at",
+        "snoozed_until",
+      ]),
+    );
+    const accountColumns = await env.DB.prepare(`PRAGMA table_info(account)`).all<{ name: string }>();
+    expect(accountColumns.results.map((column) => column.name)).not.toContain("issuer");
     const channelEventColumns = await env.DB.prepare(`PRAGMA table_info(slack_channel_events)`).all<{ name: string }>();
     expect(channelEventColumns.results.map((column) => column.name)).toEqual(
       expect.arrayContaining(["claimed_at", "claim_token"]),
@@ -639,6 +672,79 @@ describe("D1 migrations", () => {
         `SELECT installation_id, event_types_json, cadence FROM slack_channel_subscriptions`,
       ).first(),
     ).toEqual({ installation_id: "workspace", event_types_json: '["page_edit"]', cadence: "digest" });
+  });
+
+  it("backfills Slack links as legacy and keeps future behavior inert", async () => {
+    const foundation = env.TEST_MIGRATIONS!.find((migration) => migration.name === "0035_slack_secure_foundation.sql");
+    expect(foundation).toBeTruthy();
+    const foundationIndex = env.TEST_MIGRATIONS!.indexOf(foundation!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!.slice(0, foundationIndex));
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, createdAt, updatedAt)
+         VALUES ('owner', 'Owner', 'owner@example.test', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO account (id, accountId, providerId, userId, createdAt, updatedAt, issuer)
+         VALUES ('slack-account', 'T123:U123', 'slack', 'owner', ?, ?, 'slack')`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO session (id, expiresAt, token, createdAt, updatedAt, userId)
+         VALUES ('session', ?, 'token', ?, ?, 'owner')`,
+      ).bind(new Date(timestamp + 60_000).toISOString(), timestamp, timestamp),
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('workspace', 'Notes', ?)`).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES ('workspace', 'owner', 'owner', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
+          (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
+           installed_by, created_at, updated_at)
+         VALUES ('installation', 'workspace', 'T123', 'Slack', 'B123', 'ciphertext', 'commands',
+                 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at)
+         VALUES ('installation', 'owner', 'U123', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_channel_subscriptions
+          (id, installation_id, space_id, channel_id, channel_name, created_by, created_at, updated_at)
+         VALUES ('mapping', 'installation', 'workspace-general', 'C123', 'notes', 'owner', ?, ?)`,
+      ).bind(timestamp, timestamp),
+    ]);
+
+    await applyD1Migrations(env.DB, [foundation!]);
+
+    expect(
+      await env.DB.prepare(
+        `SELECT verification_method, migration_state, verified_at, better_auth_account_id
+           FROM slack_user_links WHERE user_id = 'owner'`,
+      ).first(),
+    ).toEqual({
+      verification_method: "legacy_command",
+      migration_state: "legacy",
+      verified_at: null,
+      better_auth_account_id: null,
+    });
+    expect(
+      await env.DB.prepare(
+        `SELECT validation_state, mirror_enabled, muted_at, snoozed_until
+           FROM slack_channel_subscriptions WHERE id = 'mapping'`,
+      ).first(),
+    ).toEqual({ validation_state: "unvalidated", mirror_enabled: 0, muted_at: null, snoozed_until: null });
+
+    await env.DB.prepare(
+      `INSERT INTO slack_primary_factor_proofs
+        (session_id, user_id, account_id, team_id, slack_user_id, verified_at, expires_at)
+       VALUES ('session', 'owner', 'slack-account', 'T123', 'U123', ?, ?)`,
+    )
+      .bind(timestamp, timestamp + 60_000)
+      .run();
+    await env.DB.prepare(`DELETE FROM session WHERE id = 'session'`).run();
+    expect(await env.DB.prepare(`SELECT 1 FROM slack_primary_factor_proofs`).first()).toBeNull();
   });
 
   it("backfills every legacy page into a General space and guards cross-space parents", async () => {

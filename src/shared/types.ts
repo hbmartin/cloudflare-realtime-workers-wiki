@@ -202,6 +202,53 @@ export type NotificationPreference = {
   timezone: string;
 };
 
+export type SlackCapability =
+  | "search"
+  | "unfurls"
+  | "notifications"
+  | "identity"
+  | "messageEvents"
+  | "capture"
+  | "files";
+
+export type SlackCapabilityHealth = {
+  available: boolean;
+  requiredScopes: string[];
+  missingScopes: string[];
+};
+
+export type SlackStatus = {
+  available: boolean;
+  missing: string[];
+  installation: {
+    teamId: string;
+    teamName: string;
+    botUserId: string;
+    scopes: string[];
+    connected: boolean;
+    createdAt: number;
+    updatedAt: number;
+    scopeHealth?: {
+      required: string[];
+      granted: string[];
+      missing: string[];
+      reauthorizationRequired: boolean;
+    };
+    capabilities?: Record<SlackCapability, SlackCapabilityHealth>;
+  } | null;
+  /** @deprecated Use identity.state during the rolling deployment. */
+  linked: boolean;
+  identity?: {
+    state: "unlinked" | "legacy" | "verified";
+    slackUserId: string | null;
+    verifiedAt: number | null;
+  };
+  reauthorization?: {
+    required: boolean;
+    available: boolean;
+  };
+};
+
 export type Subscription = {
   id: string;
   resourceType: "page" | "space";

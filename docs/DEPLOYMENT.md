@@ -132,6 +132,13 @@ pnpm wrangler secret put SLACK_TOKEN_ENCRYPTION_KEY --env production
 Use an independently generated high-entropy encryption key. If any value is absent, the application
 keeps in-app notifications active and clearly reports Slack as unavailable.
 
+Deploy the Worker and additive D1 migration before importing the updated manifest. Then have the
+workspace owner use **Reauthorize Slack** once and confirm that Settings reports no missing bot scopes.
+The bot install callback and Better Auth OpenID callback are intentionally separate. Reauthorization
+must use the Slack team already bound to the NoteFlare workspace; changing teams requires a future
+explicit reset flow. Existing slash search, unfurls, notifications, and legacy `/notes link` delivery
+continue to use only their original scopes during the rollout.
+
 ## 4. Configure rate limiting
 
 The `/v1` API uses `API_SOURCE_BURST_LIMIT` / `API_SOURCE_MINUTE_LIMIT` bindings before token lookup, keyed

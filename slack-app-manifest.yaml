@@ -4,6 +4,10 @@ display_information:
   background_color: "#5452a8"
 # The installed production Worker keeps its existing hostname through the NoteFlare rebrand.
 features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: true
   bot_user:
     display_name: NoteFlare
     always_online: false
@@ -13,22 +17,43 @@ features:
       description: Search your accessible NoteFlare pages
       usage_hint: <query> or link
       should_escape: false
+  shortcuts:
+    - name: Save to Notes
+      type: message
+      callback_id: noteflare_save_to_notes
+      description: Save this message to NoteFlare
+    - name: New page from thread
+      type: message
+      callback_id: noteflare_new_page_from_thread
+      description: Create a NoteFlare page from this thread
 oauth_config:
   redirect_urls:
     - https://cloudflare-realtime-notes.harold-martin.workers.dev/api/slack/oauth/callback
+    - https://cloudflare-realtime-notes.harold-martin.workers.dev/api/auth/callback/slack
   scopes:
     bot:
       - commands
       - chat:write
       - links:read
       - links:write
+      - channels:read
+      - channels:history
+      - groups:read
+      - groups:history
+      - users:read
+      - reactions:read
+      - files:write
 settings:
   event_subscriptions:
     request_url: https://cloudflare-realtime-notes.harold-martin.workers.dev/api/slack/events
     bot_events:
       - link_shared
+      - message.channels
+      - message.groups
+      - app_home_opened
   interactivity:
-    is_enabled: false
+    is_enabled: true
+    request_url: https://cloudflare-realtime-notes.harold-martin.workers.dev/api/slack/interactions
   org_deploy_enabled: false
   socket_mode_enabled: false
   token_rotation_enabled: true

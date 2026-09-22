@@ -16,7 +16,7 @@ import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { cleanupExport, runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
-import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
+import { deliverSlackChannelEvent, deliverSlackHome, deliverSlackUnfurl } from "./slack";
 import { deliverWebhook, fanoutWebhookEvent } from "./webhooks";
 import {
   correlationHeaders,
@@ -1461,6 +1461,13 @@ export async function consumeDeliveryMessage(
     const unfurlId = payload.unfurlId;
     if (typeof unfurlId !== "string") return await rejectPayload("Slack unfurl outbox payload is invalid.");
     await deliverSlackUnfurl(env, unfurlId, outboxId);
+  } else if (row.topic === "slack_home_publish") {
+    const installationId = payload.installationId;
+    const userId = payload.userId;
+    if (typeof installationId !== "string" || typeof userId !== "string") {
+      return await rejectPayload("Slack Home outbox payload is invalid.");
+    }
+    await deliverSlackHome(env, installationId, userId);
   } else if (row.topic === "webhook_event") {
     const eventId = payload.eventId;
     if (typeof eventId !== "string") return await rejectPayload("Webhook event outbox payload is invalid.");

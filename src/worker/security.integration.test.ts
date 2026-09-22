@@ -650,7 +650,7 @@ describe("security lifecycle regressions", () => {
     );
     expect(
       (await auth.handler(authRequest(pending, "recover", { password: "password123", code: codes[0] }))).status,
-    ).toBe(403);
+    ).toBe(401);
     expect(await env.DB.prepare("SELECT COUNT(*) count FROM recovery_codes").first()).toEqual({ count: 10 });
     expect((await request(cookie, "/api/me")).status).toBe(200);
   });
@@ -667,8 +667,10 @@ describe("security lifecycle regressions", () => {
         .bind(hash, user!.id, Date.now() + 60_000)
         .run(),
     );
+    // Better Auth 1.7.5 reports a session invalidated by the racing reset as
+    // unauthenticated; the important invariant is that no factor is committed.
     expect((await auth.handler(authRequest(cookie, "confirm-totp", { code: await otpFromUri(totpURI) }))).status).toBe(
-      403,
+      401,
     );
     expect(await env.DB.prepare("SELECT twoFactorEnabled FROM user").first()).toEqual({ twoFactorEnabled: 0 });
     expect(await env.DB.prepare("SELECT 1 FROM twoFactor").first()).toBeNull();

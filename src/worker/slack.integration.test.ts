@@ -1,8 +1,9 @@
 import { enrollAccount } from "../../tests/helpers/security";
-import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
+import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
 import type { Env, MemberContext } from "./env";
+import worker from "./index";
 import { consumeDeliveryMessage } from "./jobs";
 import { notificationFanoutStatements } from "./notifications";
 import {
@@ -10,15 +11,20 @@ import {
   createSlackOAuthUrl,
   decryptSlackToken,
   deliverSlackChannelEvent,
+  deliverSlackHome,
   deliverSlackUnfurl,
   disconnectSlack,
   encryptSlackToken,
   finishSlackOAuth,
   handleSlackCommand,
   handleSlackEvent,
+  recordVerifiedSlackIdentity,
   sendPersonalSlackNotification,
   sendDueSlackChannelDigests,
   SlackRateLimitError,
+  slackScopeHealth,
+  slackWorkspaceStatus,
+  validateSlackIdentity,
   verifySlackRequest,
 } from "./slack";
 
@@ -127,6 +133,232 @@ afterEach(() => {
 });
 
 describe("Slack security and integration", () => {
+  it("reports capability-specific scope health without disabling legacy features", () => {
+    const legacy = slackScopeHealth("links:write,commands,chat:write,links:read,commands");
+    expect(legacy.granted).toEqual(["chat:write", "commands", "links:read", "links:write"]);
+    expect(legacy.reauthorizationRequired).toBe(true);
+    expect(legacy.capabilities.search.available).toBe(true);
+    expect(legacy.capabilities.unfurls.available).toBe(true);
+    expect(legacy.capabilities.notifications.available).toBe(true);
+    expect(legacy.capabilities.identity).toMatchObject({ available: false, missingScopes: ["users:read"] });
+    expect(legacy.capabilities.capture.available).toBe(false);
+  });
+
+  it("verifies team-scoped human identities and records a session-bound primary proof", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    const profile = {
+      "https://slack.com/team_id": "T123",
+      "https://slack.com/user_id": "UOWNER",
+      email: "untrusted-profile@example.test",
+    };
+    await expect(validateSlackIdentity(slackEnv(), profile)).rejects.toMatchObject({
+      code: "slack_scope_missing",
+    });
+    await env.DB.prepare(
+      `UPDATE slack_installations SET scopes = scopes || ',users:read' WHERE id = 'slack-installation'`,
+    ).run();
+    const fetchMock = vi.fn(async () =>
+      Response.json({ ok: true, user: { id: "UOWNER", team_id: "T123", deleted: false } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const identity = await validateSlackIdentity(slackEnv(), profile);
+    expect(identity.accountSubject).toBe("T123:UOWNER");
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO account (id, accountId, providerId, userId, createdAt, updatedAt)
+       VALUES ('slack-account', ?, 'slack', ?, ?, ?)`,
+    )
+      .bind(identity.accountSubject, installed.member.user.id, timestamp, timestamp)
+      .run();
+    const session = await env.DB.prepare(`SELECT id FROM session WHERE userId = ? ORDER BY createdAt DESC LIMIT 1`)
+      .bind(installed.member.user.id)
+      .first<{ id: string }>();
+    await recordVerifiedSlackIdentity(slackEnv(), installed.member.user.id, session!.id, "slack-account", identity);
+    expect(await slackWorkspaceStatus(slackEnv(), memberContext(installed.member))).toMatchObject({
+      identity: { state: "verified", slackUserId: "UOWNER" },
+      linked: true,
+    });
+    expect(
+      await env.DB.prepare(
+        `SELECT user_id, team_id, slack_user_id, expires_at > verified_at active
+           FROM slack_primary_factor_proofs WHERE session_id = ?`,
+      )
+        .bind(session!.id)
+        .first(),
+    ).toEqual({ user_id: installed.member.user.id, team_id: "T123", slack_user_id: "UOWNER", active: 1 });
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM session_security WHERE session_id = ?`).bind(session!.id),
+      env.DB.prepare(`DELETE FROM twoFactor WHERE userId = ?`).bind(installed.member.user.id),
+      env.DB.prepare(`DELETE FROM passkey WHERE userId = ?`).bind(installed.member.user.id),
+      env.DB.prepare(`UPDATE user SET twoFactorEnabled = 0 WHERE id = ?`).bind(installed.member.user.id),
+      env.DB.prepare(`UPDATE account_security SET codes_saved = 0 WHERE user_id = ?`).bind(installed.member.user.id),
+    ]);
+    expect(await (await SELF.fetch(request(installed.cookie, "/api/security/status"))).json()).toMatchObject({
+      state: "enrollment_required",
+      slackPrimary: { available: true },
+    });
+    expect(
+      (
+        await SELF.fetch(
+          request(installed.cookie, "/api/security/setup-totp", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}",
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    expect((await SELF.fetch(request(installed.cookie, "/api/me"))).status).toBe(401);
+    await env.DB.prepare(`DELETE FROM session WHERE id = ?`).bind(session!.id).run();
+    expect(await env.DB.prepare(`SELECT 1 FROM slack_primary_factor_proofs`).first()).toBeNull();
+
+    await expect(
+      validateSlackIdentity(slackEnv(), { ...profile, "https://slack.com/team_id": "T999" }, { teamId: "T123" }),
+    ).rejects.toMatchObject({ code: "slack_team_mismatch" });
+    for (const [user, code] of [
+      [{ id: "UOWNER", team_id: "T123", deleted: true }, "slack_member_removed"],
+      [{ id: "UOWNER", team_id: "T123", is_bot: true }, "slack_bot_forbidden"],
+      [{ id: "UOWNER", team_id: "T123", is_restricted: true }, "slack_guest_forbidden"],
+      [{ id: "UOWNER", team_id: "T123", is_stranger: true }, "slack_external_forbidden"],
+    ] as const) {
+      fetchMock.mockResolvedValueOnce(Response.json({ ok: true, user }));
+      await expect(validateSlackIdentity(slackEnv(), profile)).rejects.toMatchObject({ code });
+    }
+  });
+
+  it("starts Slack sign-up only from a live server-owned invite reservation", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    await env.DB.prepare(
+      `UPDATE slack_installations SET scopes = scopes || ',users:read' WHERE id = 'slack-installation'`,
+    ).run();
+    const invitation = await SELF.fetch(
+      request(installed.cookie, "/api/invites", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role: "editor" }),
+      }),
+    );
+    const token = (await invitation.json<{ invite: { token: string } }>()).invite.token;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        if (String(input).includes(".well-known/openid-configuration")) {
+          return Response.json({
+            issuer: "https://slack.com",
+            authorization_endpoint: "https://slack.com/openid/connect/authorize",
+            token_endpoint: "https://slack.com/api/openid.connect.token",
+            userinfo_endpoint: "https://slack.com/api/openid.connect.userInfo",
+            jwks_uri: "https://slack.com/openid/connect/keys",
+            id_token_signing_alg_values_supported: ["RS256"],
+          });
+        }
+        return Response.json({ ok: true });
+      }),
+    );
+    const start = () =>
+      worker.fetch(
+        request(installed.cookie, "/api/slack/identity/invite/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token }),
+        }),
+        slackEnv(),
+        createExecutionContext(),
+      );
+    const started = await start();
+    expect(started.status).toBe(200);
+    expect(await started.json<{ url: string }>()).toMatchObject({ url: expect.stringContaining("slack.com") });
+    expect(await start()).toMatchObject({ status: 409 });
+
+    const direct = await worker.fetch(
+      request(installed.cookie, "/api/auth/sign-in/social", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider: "slack", requestSignUp: true, disableRedirect: true }),
+      }),
+      slackEnv(),
+      createExecutionContext(),
+    );
+    expect(direct.status).toBe(403);
+
+    await env.DB.prepare(`UPDATE invites SET claim_expires_at = 0`).run();
+    expect((await start()).status).toBe(200);
+  });
+
+  it("acknowledges signed shortcuts before opening the placeholder modal", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    const payload = {
+      type: "message_action",
+      callback_id: "noteflare_save_to_notes",
+      trigger_id: "trigger-123",
+      action_ts: "1700000000.000100",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+    };
+    const body = new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const fetchMock = vi.fn(async () => Response.json({ ok: true, view: { id: "V123", hash: "hash" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const context = createExecutionContext();
+    const startedAt = performance.now();
+    const response = await worker.fetch(
+      new Request("http://example.test/api/slack/interactions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "x-slack-request-timestamp": String(timestamp),
+          "x-slack-signature": await slackSignature(timestamp, body),
+        },
+        body,
+      }),
+      slackEnv(),
+      context,
+    );
+    expect(response.status).toBe(200);
+    expect(performance.now() - startedAt).toBeLessThan(3_000);
+    await waitOnExecutionContext(context);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://slack.com/api/views.open",
+      expect.objectContaining({ body: expect.stringContaining("not available yet") }),
+    );
+    expect(
+      await env.DB.prepare(`SELECT processed_at IS NOT NULL processed FROM slack_interaction_receipts`).first(),
+    ).toEqual({ processed: 1 });
+  });
+
+  it("publishes one durable empty App Home placeholder and ignores message events", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    const home = {
+      type: "event_callback",
+      event_id: "Ev-home",
+      team_id: "T123",
+      event: { type: "app_home_opened", user: "UOWNER" },
+    };
+    await handleSlackEvent(slackEnv(), home);
+    await handleSlackEvent(slackEnv(), home);
+    expect(
+      await env.DB.prepare(`SELECT COUNT(*) count FROM outbox WHERE topic = 'slack_home_publish'`).first(),
+    ).toEqual({ count: 1 });
+    await handleSlackEvent(slackEnv(), {
+      type: "event_callback",
+      event_id: "Ev-message",
+      team_id: "T123",
+      event: { type: "message", user: "UOWNER", channel: "C123", event_ts: "1700000000.1" },
+    });
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM slack_inbound_receipts`).first()).toEqual({ count: 0 });
+    const fetchMock = vi.fn(async () => Response.json({ ok: true, view: { id: "VHOME", hash: "hash" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await deliverSlackHome(slackEnv(), "slack-installation", "UOWNER");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://slack.com/api/views.publish",
+      expect.objectContaining({ body: expect.stringContaining('"blocks":[]') }),
+    );
+  });
+
   it("encrypts tokens and rejects stale, forged, and replayed requests", async () => {
     const configured = slackEnv();
     const ciphertext = await encryptSlackToken(configured, "xoxb-sensitive");
@@ -209,6 +441,43 @@ describe("Slack security and integration", () => {
     const installation = await env.DB.prepare(`SELECT id FROM slack_installations WHERE team_id = 'T123'`).first<{
       id: string;
     }>();
+    const mismatchState = new URL(
+      await createSlackOAuthUrl(configured, memberContext(installed.member)),
+    ).searchParams.get("state")!;
+    fetchMock.mockResolvedValueOnce(
+      Response.json({
+        ok: true,
+        access_token: "xoxb-wrong-team",
+        scope: "commands",
+        bot_user_id: "B999",
+        team: { id: "T999", name: "Wrong Slack" },
+      }),
+    );
+    await expect(
+      finishSlackOAuth(configured, memberContext(installed.member), "oauth-code", mismatchState),
+    ).rejects.toMatchObject({ code: "slack_team_mismatch" });
+    expect(await env.DB.prepare(`SELECT id, team_id FROM slack_installations`).first()).toEqual({
+      id: installation!.id,
+      team_id: "T123",
+    });
+    const reauthorizeState = new URL(
+      await createSlackOAuthUrl(configured, memberContext(installed.member)),
+    ).searchParams.get("state")!;
+    fetchMock.mockResolvedValueOnce(
+      Response.json({
+        ok: true,
+        access_token: "xoxb-reauthorized",
+        refresh_token: "xoxe-refresh-reauthorized",
+        expires_in: 3600,
+        scope: "commands,chat:write,links:read,links:write,users:read",
+        bot_user_id: "B123",
+        team: { id: "T123", name: "Test Slack" },
+      }),
+    );
+    await finishSlackOAuth(configured, memberContext(installed.member), "oauth-code", reauthorizeState);
+    expect(await env.DB.prepare(`SELECT id FROM slack_installations WHERE team_id = 'T123'`).first()).toEqual({
+      id: installation!.id,
+    });
     await env.DB.batch([
       env.DB.prepare(`UPDATE slack_installations SET token_expires_at = 0 WHERE team_id = 'T123'`),
       env.DB.prepare(
@@ -571,7 +840,10 @@ describe("Slack security and integration", () => {
         Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "17" } }),
       ),
     );
-    await expect(deliverSlackChannelEvent(slackEnv(), event!.id)).rejects.toEqual(new SlackRateLimitError(17));
+    await expect(deliverSlackChannelEvent(slackEnv(), event!.id)).rejects.toMatchObject({
+      retryAfter: 17,
+      method: "chat.postMessage",
+    } satisfies Partial<SlackRateLimitError>);
     expect(
       await env.DB.prepare(`SELECT delivered_at FROM slack_channel_events WHERE id = ?`).bind(event!.id).first(),
     ).toEqual({ delivered_at: null });

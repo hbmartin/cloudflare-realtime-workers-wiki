@@ -50,8 +50,8 @@
     "observability:check": "node scripts/observability.mjs check"
   },
   "dependencies": {
-    "@better-auth/core": "1.7.2",
-    "@better-auth/passkey": "1.7.2",
+    "@better-auth/core": "1.7.5",
+    "@better-auth/passkey": "1.7.5",
     "@better-auth/utils": "0.4.2",
     "@blocknote/core": "0.54.0",
     "@blocknote/mantine": "0.54.0",
@@ -59,7 +59,7 @@
     "@mantine/core": "9.6.0",
     "@mantine/hooks": "9.6.0",
     "@xyflow/react": "12.11.6",
-    "better-auth": "1.7.2",
+    "better-auth": "1.7.5",
     "fractional-indexing-jittered": "1.0.0",
     "hono": "4.13.5",
     "katex": "0.18.5",

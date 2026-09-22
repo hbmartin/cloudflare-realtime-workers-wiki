@@ -42,4 +42,5 @@ export interface SecurityStatus {
   fresh: boolean;
   recoveryCanResume?: boolean;
   pendingInvite?: boolean;
+  slackPrimary?: { available: boolean; expiresAt: number };
 }
