@@ -1,9 +1,10 @@
 import { sha256Hex } from "../shared/import-integrity";
+import { PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import { tracing } from "cloudflare:workers";
 import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256Hex } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { publicPageId } from "./integrations";
-import { HttpError } from "./http";
+import { HttpError, safeHttpError } from "./http";
 import { currentObservabilityContext, logger, safeTelemetryErrorMessage, traced } from "./observability";
 
 const WEBHOOK_EVENT_TYPES = [
@@ -56,9 +57,7 @@ const RETRY_DELAYS = [
   12 * 60 * 60_000,
   24 * 60 * 60_000,
 ];
-const WEBHOOK_ERROR_MESSAGE_LIMIT = 500;
 const WEBHOOK_VERIFICATION_FAILURE = "Webhook verification request failed.";
-const WEBHOOK_URL_FAILURE = "Webhook URL is invalid";
 const WEBHOOK_REQUEST_FAILURE = "Webhook request failed";
 
 function verificationToken() {
@@ -289,7 +288,7 @@ export async function sendWebhookVerification(env: Env, subscriptionId: string) 
     if (!response.ok) return { ok: false as const, error: `Webhook endpoint returned HTTP ${response.status}.` };
     return { ok: true as const };
   } catch (error) {
-    logger.error(
+    logger.warn(
       "webhook.verification.failed",
       "webhook",
       "Webhook verification request failed.",
@@ -575,6 +574,8 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
     destination = await storedWebhookUrl(env, subscription.id, subscription.url);
   } catch (error) {
     const timestamp = Date.now();
+    const httpError = safeHttpError(error);
+    const failure = httpError?.code === "invalid_webhook_url" ? httpError.message : "Webhook URL is invalid";
     logger.error(
       "webhook.delivery.url_failed",
       "webhook",
@@ -586,7 +587,7 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
       `UPDATE webhook_deliveries SET status = 'failed', attempts = ?, next_attempt_at = NULL,
        last_error = ?, updated_at = ? WHERE id = ?`,
     )
-      .bind(attempt, WEBHOOK_URL_FAILURE, timestamp, deliveryId)
+      .bind(attempt, failure, timestamp, deliveryId)
       .run();
     return;
   }
@@ -609,9 +610,12 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
   let headers: Record<string, string> = {};
   let received = "";
   let failure: string | null = null;
+  let requestAttempted = false;
+  let requestError: unknown;
   try {
     const token = await decryptToken(env, subscription.encrypted_verification_token);
     const signature = `sha256=${await hmacSha256Hex(token, payload)}`;
+    requestAttempted = true;
     const response = await traced(tracing, "notes.integration.webhook", { "notes.operation": "delivery" }, () => {
       return fetch(destination, {
         method: "POST",
@@ -635,17 +639,21 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
     if (status < 200 || status >= 300) failure = `HTTP ${status}`;
   } catch (error) {
     failure = WEBHOOK_REQUEST_FAILURE;
-    logger.error(
-      "webhook.delivery.request_failed",
-      "webhook",
-      "Webhook delivery request failed.",
-      { deliveryId, subscriptionId: subscription.id, attempt },
-      error,
-    );
+    requestError = error;
   } finally {
     clearTimeout(timer);
   }
   const timestamp = Date.now();
+  if (requestError) {
+    const log = requestAttempted && attempt < RETRY_DELAYS.length ? logger.warn : logger.error;
+    log(
+      "webhook.delivery.request_failed",
+      "webhook",
+      "Webhook delivery request failed.",
+      { deliveryId, subscriptionId: subscription.id, attempt },
+      requestError,
+    );
+  }
   if (!failure) {
     await env.DB.prepare(
       `UPDATE webhook_deliveries SET status = 'sent', attempts = ?, next_attempt_at = NULL,
@@ -694,7 +702,7 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
       .run();
   } catch (error) {
     await env.DB.prepare(`UPDATE outbox SET last_error = ? WHERE id = ?`)
-      .bind(safeTelemetryErrorMessage(error, "Queue enqueue failed.", WEBHOOK_ERROR_MESSAGE_LIMIT), outboxId)
+      .bind(safeTelemetryErrorMessage(error, "Queue enqueue failed.", PERSISTED_ERROR_MESSAGE_LIMIT), outboxId)
       .run();
   }
 }

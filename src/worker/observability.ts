@@ -230,11 +230,9 @@ function redactBasicValues(value: string) {
     const opening = consumeOpeningValueWrappers(value, BASIC_VALUE_PREFIX.lastIndex);
     let end = opening.cursor;
     let encoded = "";
-    let sawMarker = false;
     while (end < value.length) {
       const markerLength = sanitizationMarkerLengthAt(value, end);
       if (markerLength > 0) {
-        sawMarker = true;
         end += markerLength;
         continue;
       }
@@ -242,7 +240,7 @@ function redactBasicValues(value: string) {
       encoded += value[end];
       end += 1;
     }
-    if (encoded.length > 0 && (sawMarker || isBasicCredential(encoded))) {
+    if (encoded.length > 0 && isBasicCredential(encoded)) {
       parts.push(value.slice(cursor, opening.cursor), REDACTED_VALUE);
       cursor = end;
       BASIC_VALUE_PREFIX.lastIndex = end;
@@ -258,23 +256,16 @@ function isBearerTokenCharacter(character: string | undefined) {
   return character !== undefined && BEARER_TOKEN_CHARACTER_VALUE.test(character);
 }
 
-function authorizationValueStartAfterScheme(
-  value: string,
-  start: number,
-  scheme: "basic" | "bearer",
-  broadBearerWhitespace = false,
-) {
+function authorizationValueStartAfterScheme(value: string, start: number, scheme: "basic" | "bearer") {
   const isSeparator = (character: string | undefined) =>
-    scheme === "bearer" && broadBearerWhitespace
-      ? /\s/u.test(character ?? "")
-      : character === " " || character === "\t";
+    scheme === "bearer" ? /\s/u.test(character ?? "") : character === " " || character === "\t";
   if (!isSeparator(value[start])) return -1;
   let cursor = start + 1;
   while (isSeparator(value[cursor])) cursor += 1;
   return cursor;
 }
 
-function authorizationSchemeAt(value: string, start: number, broadBearerWhitespace = false) {
+function authorizationSchemeAt(value: string, start: number) {
   const scheme =
     value.slice(start, start + 5).toLowerCase() === "basic"
       ? "basic"
@@ -282,7 +273,7 @@ function authorizationSchemeAt(value: string, start: number, broadBearerWhitespa
         ? "bearer"
         : undefined;
   if (!scheme) return undefined;
-  const valueStart = authorizationValueStartAfterScheme(value, start + scheme.length, scheme, broadBearerWhitespace);
+  const valueStart = authorizationValueStartAfterScheme(value, start + scheme.length, scheme);
   return valueStart < 0 ? undefined : { scheme, valueStart };
 }
 
@@ -303,7 +294,7 @@ function skipNestedAuthorizationSchemes(value: string, start: number, inheritedD
 function bearerValuePrefixAt(value: string, index: number) {
   if (value.slice(index, index + 6).toLowerCase() !== "bearer") return false;
   if (isAsciiWord(value.charCodeAt(index - 1))) return false;
-  return authorizationValueStartAfterScheme(value, index + 6, "bearer", true) >= 0;
+  return authorizationValueStartAfterScheme(value, index + 6, "bearer") >= 0;
 }
 
 function sanitizationMarkerLengthAt(value: string, index: number) {
@@ -365,7 +356,7 @@ function bearerCandidate(value: string, start: number, delimiter?: QuoteDelimite
   return { candidate, crossedMarker, end: cursor, malformedCredentialPunctuation, resumeAt: cursor };
 }
 
-function bearerUrlEnd(value: string, start: number, delimiter?: QuoteDelimiter) {
+function credentialUrlEnd(value: string, start: number, delimiter?: QuoteDelimiter) {
   if (!/^https?:\/\//i.test(value.slice(start))) return undefined;
   for (let cursor = start; cursor < value.length; cursor += 1) {
     const character = value[cursor];
@@ -373,13 +364,10 @@ function bearerUrlEnd(value: string, start: number, delimiter?: QuoteDelimiter) 
       if (quoteEndsCredentialAt(value, cursor, delimiter)) {
         return cursor - precedingBackslashes(value, cursor, start);
       }
+      if (/\s/u.test(character ?? "")) return cursor;
       continue;
     }
-    if (
-      isCredentialQuote(character) ||
-      /\s/u.test(character ?? "") ||
-      (character !== "&" && STRUCTURAL_CREDENTIAL_BOUNDARIES.includes(character ?? ""))
-    ) {
+    if (isCredentialQuote(character) || /\s/u.test(character ?? "")) {
       return cursor;
     }
   }
@@ -397,7 +385,7 @@ function redactBearerValues(value: string) {
     const nested = skipNestedAuthorizationSchemes(value, opening.cursor, opening.delimiter);
     const credentialStart = nested.cursor;
     const redactionStart = nested.wrappedNested ? credentialStart : opening.cursor;
-    const urlEnd = bearerUrlEnd(value, credentialStart, nested.delimiter);
+    const urlEnd = credentialUrlEnd(value, credentialStart, nested.delimiter);
     if (urlEnd !== undefined) {
       parts.push(value.slice(cursor, redactionStart), REDACTED_VALUE);
       cursor = urlEnd;
@@ -630,7 +618,11 @@ function authorizationValueAt(value: string, start: number, inheritedDelimiter?:
   const nested = skipNestedAuthorizationSchemes(value, opening.cursor, opening.delimiter ?? inheritedDelimiter);
   const credentialStart = nested.cursor;
   const rangeStart = nested.wrappedNested ? credentialStart : opening.cursor;
-  const scanned = labeledCredentialEnd(value, credentialStart, nested.delimiter);
+  const urlEnd = credentialUrlEnd(value, credentialStart, nested.delimiter);
+  const scanned =
+    urlEnd === undefined
+      ? labeledCredentialEnd(value, credentialStart, nested.delimiter)
+      : { end: urlEnd, resumeAt: urlEnd };
   const end = credentialStart > opening.cursor && scanned.end === credentialStart ? scanned.resumeAt : scanned.end;
   return end > rangeStart
     ? { range: { start: rangeStart, end } satisfies RedactionRange, resumeAt: scanned.resumeAt }
@@ -716,7 +708,7 @@ function serializedAuthorizationNameAt(value: string, start: number) {
 
 function serializedAuthorizationValueAt(value: string, start: number): RedactionRange | undefined {
   const wrapper = consumeOpeningValueWrappers(value, start);
-  const scheme = authorizationSchemeAt(value, wrapper.cursor, true);
+  const scheme = authorizationSchemeAt(value, wrapper.cursor);
   return scheme ? authorizationValueAt(value, scheme.valueStart, wrapper.delimiter).range : undefined;
 }
 

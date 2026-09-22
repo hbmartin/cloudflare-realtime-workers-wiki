@@ -3,6 +3,7 @@ import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionC
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
+import { PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import { sha256Hex } from "../shared/import-integrity";
 import type { DiagramContentEnvelope, Job, Page } from "../shared/types";
 import { NOTION_GROUPING_VERSION } from "../shared/import-space-mapping";
@@ -653,6 +654,81 @@ describe("job execution", () => {
       errorMessage: "Workflow unavailable Authorization: Basic [redacted]",
     });
     expect(JSON.stringify(log.mock.calls)).not.toContain("dXNlcjpwYXNz");
+  });
+
+  it("does not overwrite a specific inline failure while recovering queued jobs", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now() - 60_000;
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, space_id, type, status, requested_by, workflow_instance_id, input_key,
+         options_json, progress_label, created_at, updated_at)
+       VALUES (?, ?, ?, 'import', 'queued', ?, ?, ?, ?, 'Queued', ?, ?)`,
+    )
+      .bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        jobId,
+        `jobs/${jobId}/input/missing.md`,
+        JSON.stringify({ filename: "missing.md", format: "markdown", confirmed: false }),
+        timestamp,
+        timestamp,
+      )
+      .run();
+
+    await recoverQueuedJobs(bindingsWith({ WORKFLOW_INLINE: "true" }));
+
+    expect(
+      await env.DB.prepare(`SELECT status, error_code, error_message FROM jobs WHERE id = ?`).bind(jobId).first(),
+    ).toEqual({
+      status: "failed",
+      error_code: "import_upload_missing",
+      error_message: "The import upload is missing or expired. Upload the file again.",
+    });
+  });
+
+  it("does not overwrite a newer attempt while recovering queued jobs", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now() - 60_000;
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, workflow_instance_id, progress_label, created_at, updated_at)
+       VALUES (?, ?, 'search_reindex', 'queued', ?, ?, 'Queued', ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, jobId, timestamp, timestamp)
+      .run();
+    const failure = new Error("lost workflow create response");
+    const bindings = bindingsWith({
+      NOTES_WORKFLOW: {
+        create: vi.fn(async () => {
+          await env.DB.prepare(
+            `UPDATE jobs SET attempt = 2, error_code = 'newer_attempt', error_message = 'Keep this message.'
+              WHERE id = ?`,
+          )
+            .bind(jobId)
+            .run();
+          throw failure;
+        }),
+        get: vi.fn(async () => ({ status: vi.fn(async () => ({ status: "unknown" })) })),
+      },
+    });
+
+    await recoverQueuedJobs(bindings);
+
+    expect(
+      await env.DB.prepare(`SELECT status, attempt, error_code, error_message FROM jobs WHERE id = ?`)
+        .bind(jobId)
+        .first(),
+    ).toEqual({
+      status: "queued",
+      attempt: 2,
+      error_code: "newer_attempt",
+      error_message: "Keep this message.",
+    });
   });
 
   it("rejects a retry while cancellation cleanup is still running", async () => {
@@ -3135,7 +3211,7 @@ describe("job execution", () => {
     const bounded = await env.DB.prepare("SELECT error_message FROM jobs WHERE id = ?")
       .bind(longJobId)
       .first<string>("error_message");
-    expect(bounded).toHaveLength(500);
+    expect(bounded).toHaveLength(PERSISTED_ERROR_MESSAGE_LIMIT);
     expect(bounded).toMatch(/^Expected failure x+/);
     expect(bounded).toMatch(/…\[truncated\]$/);
   });
@@ -4490,7 +4566,7 @@ describe("delivery outbox", () => {
     expect(failed?.last_error).toContain("Basic [redacted]");
     expect(failed?.last_error).not.toContain("dXNlcjpwYXNz");
     expect(failed?.last_error).toMatch(/…\[truncated\]$/);
-    expect(failed?.last_error.length).toBeLessThanOrEqual(500);
+    expect(failed?.last_error.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
   });
 
   it("keeps retrying an outbox row after ten transient enqueue failures", async () => {

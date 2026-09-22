@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import type { Env } from "./env";
 import { inlineImageMime, isInlineMime, isUnsafeMime, processDueUploadReaps } from "./attachments";
 
@@ -67,7 +68,7 @@ describe("multipart upload cleanup", () => {
     expect(message).toContain("Basic [redacted]");
     expect(message).not.toContain("dXNlcjpwYXNz");
     expect(message).toMatch(/…\[truncated\]$/);
-    expect(message.length).toBeLessThanOrEqual(1_000);
+    expect(message.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
   });
 
   it("promotes stale completion to r2_complete when the object exists", async () => {

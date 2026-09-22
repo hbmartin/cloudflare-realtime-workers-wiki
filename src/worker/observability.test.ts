@@ -568,6 +568,16 @@ describe("worker observability", () => {
       const serializedOnce = safeTelemetryErrorMessage(new Error(serialized), "fallback");
       expect(serializedOnce).toBe(`name:"authorization",value:"Bearer${separator}[redacted]"`);
       expect(safeTelemetryErrorMessage(new Error(serializedOnce), "fallback")).toBe(serializedOnce);
+
+      const nestedLabeled = `Authorization: Bearer Bearer${separator}abc123`;
+      const nestedLabeledOnce = safeTelemetryErrorMessage(new Error(nestedLabeled), "fallback");
+      expect(nestedLabeledOnce).toBe("Authorization: Bearer [redacted]");
+      expect(safeTelemetryErrorMessage(new Error(nestedLabeledOnce), "fallback")).toBe(nestedLabeledOnce);
+
+      const nestedSerialized = `name:"authorization",value:"Bearer Bearer${separator}abc123"`;
+      const nestedSerializedOnce = safeTelemetryErrorMessage(new Error(nestedSerialized), "fallback");
+      expect(nestedSerializedOnce).toBe('name:"authorization",value:"Bearer [redacted]"');
+      expect(safeTelemetryErrorMessage(new Error(nestedSerializedOnce), "fallback")).toBe(nestedSerializedOnce);
     }
 
     expect(safeTelemetryErrorMessage(new Error("Authorization: Basic Bearer abc123"), "fallback")).toBe(
@@ -1019,6 +1029,45 @@ describe("worker observability", () => {
     }
   }, 10_000);
 
+  it("keeps adversarial serialized-header scans near-linear", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const medianDuration = (diagnostic: string) => {
+        const error = new Error("failed");
+        error.stack = diagnostic;
+        for (let index = 0; index < 3; index += 1) {
+          logger.error("test.serialized_header_warmup", "test", "failed", {}, error);
+        }
+        const samples = Array.from({ length: 3 }, () => {
+          const started = performance.now();
+          for (let index = 0; index < 12; index += 1) {
+            logger.error("test.serialized_header_scale", "test", "failed", {}, error);
+          }
+          return performance.now() - started;
+        }).sort((left, right) => left - right);
+        const record = output.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+        return { duration: samples[1]!, stack: String(record.errorStack) };
+      };
+      const repeatedName = 'name:"authorization",';
+      const inputs = [
+        (length: number) => `${"\\".repeat(length)}"name":"authorization","value":"Bearer abc"`,
+        (length: number) => `${repeatedName.repeat(Math.floor(length / repeatedName.length))}value:"Bearer abc"`,
+      ];
+
+      for (const input of inputs) {
+        const shortResult = medianDuration(input(4_000));
+        const longResult = medianDuration(input(15_000));
+        expect(longResult.duration / Math.max(shortResult.duration, 0.01)).toBeLessThan(8);
+        for (const result of [shortResult, longResult]) {
+          expect(result.stack).toContain("[redacted]");
+          expect(result.stack).not.toContain("Bearer abc");
+        }
+      }
+    } finally {
+      output.mockRestore();
+    }
+  }, 10_000);
+
   it("safely handles large adversarial wrapper and partial-secret cuts", () => {
     const wrapperInput = (length: number) =>
       `Bearer ${"(".repeat(64)}${"[redacted]a".repeat(Math.ceil(length / 11))}`.slice(0, length);
@@ -1032,6 +1081,32 @@ describe("worker observability", () => {
       expect(once.match(/…\[truncated\]/g)).toHaveLength(1);
       expect(isWellFormed(once)).toBe(true);
       expect(safeTelemetryErrorMessage(new Error(once), "fallback", limit)).toBe(once);
+    }
+  }, 10_000);
+
+  it("keeps wrapper and partial-secret cut scans near-linear", () => {
+    const medianDuration = (input: () => string, limit: number) => {
+      for (let index = 0; index < 5; index += 1) safeTelemetryErrorMessage(new Error(input()), "fallback", limit);
+      const samples = Array.from({ length: 5 }, () => {
+        const started = performance.now();
+        for (let index = 0; index < 24; index += 1) {
+          safeTelemetryErrorMessage(new Error(input()), "fallback", limit);
+        }
+        return performance.now() - started;
+      }).sort((left, right) => left - right);
+      return samples[2]!;
+    };
+
+    const wrapperInput = (length: number) =>
+      `Bearer ${"(".repeat(64)}${"[redacted]a".repeat(Math.ceil(length / 11))}`.slice(0, length);
+    const secretInput = (length: number) => "-sk_".repeat(Math.ceil(length / 4)).slice(0, length);
+    expect(safeTelemetryErrorMessage(new Error(wrapperInput(4_000)), "fallback", 3_999)).toContain("[redacted]");
+    expect(safeTelemetryErrorMessage(new Error(secretInput(4_000)), "fallback", 3_999)).toContain("[redacted-secret]");
+
+    for (const input of [wrapperInput, secretInput]) {
+      const shortDuration = medianDuration(() => input(4_000), 3_999);
+      const longDuration = medianDuration(() => input(15_000), 14_999);
+      expect(longDuration / Math.max(shortDuration, 0.01)).toBeLessThan(8);
     }
   }, 10_000);
 
@@ -1055,12 +1130,52 @@ describe("worker observability", () => {
     }
   });
 
-  it("does not scan repeated authorization schemes across stack-trace line breaks", () => {
-    const raw = "Authorization: Bearer Bearer\n  at handler (worker.ts:10:2)";
-    const once = safeTelemetryErrorMessage(new Error(raw), "fallback");
-    expect(once).toContain("\n  at handler (worker.ts:10:2)");
-    expect(once.split("\n")).toHaveLength(2);
-    expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(once);
+  it("redacts authorization URLs through queries and URL punctuation", () => {
+    const cases = [
+      ["Authorization: Bearer https://x.io/cb?a=1&token=SECRET", "Authorization: Bearer [redacted]"],
+      ['Authorization: Bearer "https://x.io/cb?a=1&token=SECRET"', 'Authorization: Bearer "[redacted]"'],
+      ["Bearer https://x.io/a;b?token=SECRET", "Bearer [redacted]"],
+      ["Authorization: Bearer https://[::1]/cb?token=SECRET", "Authorization: Bearer [redacted]"],
+      ["Authorization: Bearer https://x.io/[redacted-email]?token=SECRET", "Authorization: Bearer [redacted]"],
+      ['Bearer "https://x.io/cb?token=SECRET diagnostic text', 'Bearer "[redacted] diagnostic text'],
+    ] as const;
+
+    for (const [raw, expected] of cases) {
+      const once = safeTelemetryErrorMessage(new Error(raw), "fallback");
+      expect(once).toBe(expected);
+      expect(once).not.toContain("SECRET");
+      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(once);
+    }
+  });
+
+  it("keeps marker-prefixed Basic URLs for query scrubbing and makes Basic redaction a fixed point", () => {
+    const cases = [
+      ["Basic …[truncated]https://x.io/cb?t=secret", "Basic …[truncated]https://x.io/cb"],
+      ["Basic [redacted]https://x.io/cb?t=secret", "Basic [redacted]https://x.io/cb"],
+      ["Basic a@b.co=1 failed", "Basic [redacted-email]=1 failed"],
+    ] as const;
+
+    for (const [raw, expected] of cases) {
+      const once = safeTelemetryErrorMessage(new Error(raw), "fallback");
+      expect(once).toBe(expected);
+      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(once);
+    }
+  });
+
+  it("keeps the conservative Bearer newline behavior", () => {
+    const direct = safeTelemetryErrorMessage(
+      new Error("Authorization: Bearer\n  at handler (worker.ts:10:2)"),
+      "fallback",
+    );
+    expect(direct).toBe("Authorization: Bearer\n  [redacted] handler (worker.ts:10:2)");
+
+    const repeated = safeTelemetryErrorMessage(
+      new Error("Authorization: Bearer Bearer\n  at handler (worker.ts:10:2)"),
+      "fallback",
+    );
+    expect(repeated).toBe("Authorization: Bearer [redacted] handler (worker.ts:10:2)");
+    expect(safeTelemetryErrorMessage(new Error(direct), "fallback")).toBe(direct);
+    expect(safeTelemetryErrorMessage(new Error(repeated), "fallback")).toBe(repeated);
   });
 
   it("uses the same canonical secret prefixes for full values and truncation boundaries", () => {
@@ -1299,12 +1414,12 @@ describe("worker observability", () => {
     );
     const longToken = "Ab1+".repeat(20);
     const result = safeTelemetryErrorMessage(
-      new Error(`${"x".repeat(954)} Authorization: Basic ${longToken}`),
+      new Error(`${"x".repeat(PERSISTED_ERROR_MESSAGE_LIMIT - 46)} Authorization: Basic ${longToken}`),
       "fallback",
     );
     expect(result).toContain("Basic [redacted]");
     expect(result).not.toContain(longToken.slice(0, 20));
-    expect(result.length).toBeLessThanOrEqual(1_000);
+    expect(result.length).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
   });
 
   it("scrubs normalized error strings before their log-field limits", () => {

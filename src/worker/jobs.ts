@@ -2,7 +2,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import * as Y from "yjs";
 import { DIAGRAM_EDGES_ROOT, DIAGRAM_META_ROOT, DIAGRAM_NODES_ROOT } from "../shared/diagram";
-import { boundedLogString } from "../shared/error-log";
+import { boundedLogString, PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import { sha256Hex } from "../shared/import-integrity";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
@@ -40,7 +40,6 @@ const OUTBOX_RETRY_MAX_MS = 60 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
-const JOB_ERROR_MESSAGE_LIMIT = 500;
 
 export type JobWorkflowParams = { jobId: string; attempt?: number; correlationId?: string };
 export type DeliveryQueueMessage =
@@ -877,7 +876,9 @@ export async function finishPendingJobCleanup(
 
 async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
   const httpError = safeHttpError(error);
-  const message = httpError ? boundedLogString(httpError.message, JOB_ERROR_MESSAGE_LIMIT) : "The job failed.";
+  // Typed job failures are user-facing product data, not telemetry. Keep their
+  // specific message here; structured logging still sanitizes any later copy.
+  const message = httpError ? boundedLogString(httpError.message, PERSISTED_ERROR_MESSAGE_LIMIT) : "The job failed.";
   const errorCode = httpError?.code ?? "job_failed";
   if (!httpError)
     logger.error(
@@ -1203,9 +1204,10 @@ export async function recoverQueuedJobs(env: Env) {
         error,
       );
       await env.DB.prepare(
-        `UPDATE jobs SET error_code = 'workflow_start_failed', error_message = ?, updated_at = ? WHERE id = ?`,
+        `UPDATE jobs SET error_code = 'workflow_start_failed', error_message = ?, updated_at = ?
+          WHERE id = ? AND attempt = ? AND status = 'queued'`,
       )
-        .bind("Workflow start failed.", Date.now(), job.id)
+        .bind("Workflow start failed.", Date.now(), job.id, job.attempt)
         .run();
     }
   }
@@ -1244,7 +1246,7 @@ async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: st
         WHERE id = ? RETURNING attempts, last_error`,
     )
       .bind(
-        safeTelemetryErrorMessage(error, "Queue enqueue failed.", JOB_ERROR_MESSAGE_LIMIT),
+        safeTelemetryErrorMessage(error, "Queue enqueue failed.", PERSISTED_ERROR_MESSAGE_LIMIT),
         Date.now(),
         OUTBOX_RETRY_MAX_MS,
         OUTBOX_RETRY_BASE_MS,

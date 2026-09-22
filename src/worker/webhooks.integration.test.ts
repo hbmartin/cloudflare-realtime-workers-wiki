@@ -66,6 +66,7 @@ afterEach(() => {
 describe("Notion-compatible webhooks", () => {
   it("accepts public HTTPS hosts and rejects local or literal-IP destinations", () => {
     expect(safeWebhookUrl("https://hooks.example.test/notion#ignored")).toBe("https://hooks.example.test/notion");
+    expect(() => safeWebhookUrl("not a URL")).toThrow("Enter a valid HTTPS webhook URL.");
     for (const url of [
       "http://hooks.example.test/notion",
       "https://localhost/notion",
@@ -78,7 +79,7 @@ describe("Notion-compatible webhooks", () => {
       "https://[fe80::1]/notion",
       "https://[::ffff:7f00:1]/notion",
     ]) {
-      expect(() => safeWebhookUrl(url)).toThrow(/public HTTPS/);
+      expect(() => safeWebhookUrl(url)).toThrow("Webhook URLs must be public HTTPS endpoints.");
     }
   });
 
@@ -275,7 +276,7 @@ describe("Notion-compatible webhooks", () => {
       .run();
 
     const networkDelivery = await createDelivery("webhook-test-network-event", 6);
-    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const networkFailure = "network Authorization: Basic dXNlcjpwYXNz";
     vi.mocked(fetch).mockRejectedValueOnce(new Error(networkFailure));
     const deliveryEnv = new Proxy(env, {
@@ -306,8 +307,25 @@ describe("Notion-compatible webhooks", () => {
       .first<{ last_error: string }>();
     expect(retryOutbox?.last_error).toContain("Queue Bearer [redacted]");
     expect(retryOutbox?.last_error).not.toContain("secret_webhook_queue_12345");
-    expect(JSON.stringify(log.mock.calls)).toContain("network Authorization: Basic [redacted]");
-    expect(JSON.stringify(log.mock.calls)).not.toContain("dXNlcjpwYXNz");
+    expect(JSON.stringify(warning.mock.calls)).toContain("network Authorization: Basic [redacted]");
+    expect(JSON.stringify(warning.mock.calls)).not.toContain("dXNlcjpwYXNz");
+
+    const terminalDelivery = await createDelivery("webhook-test-terminal-network-event", 7);
+    await env.DB.prepare(`UPDATE webhook_deliveries SET attempts = 7 WHERE id = ?`).bind(terminalDelivery.id).run();
+    const terminalLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.mocked(fetch).mockRejectedValueOnce(new Error("terminal network failure"));
+    await deliverWebhook(env, terminalDelivery.id);
+    await expect(
+      env.DB.prepare(`SELECT status, attempts, next_attempt_at, last_error FROM webhook_deliveries WHERE id = ?`)
+        .bind(terminalDelivery.id)
+        .first(),
+    ).resolves.toEqual({
+      status: "failed",
+      attempts: 8,
+      next_attempt_at: null,
+      last_error: "Webhook request failed",
+    });
+    expect(JSON.stringify(terminalLog.mock.calls)).toContain("terminal network failure");
 
     await env.DB.batch(
       webhookEventStatements(env.DB, {
@@ -350,7 +368,7 @@ describe("Notion-compatible webhooks", () => {
       status: "failed",
       attempts: 1,
       next_attempt_at: null,
-      last_error: "Webhook URL is invalid",
+      last_error: "Webhook URLs must be public HTTPS endpoints.",
     });
     await expect(
       env.DB.prepare(`SELECT status FROM webhook_subscriptions WHERE id = ?`).bind(subscription.id).first(),
@@ -366,6 +384,20 @@ describe("Notion-compatible webhooks", () => {
     expect(fetch).not.toHaveBeenCalled();
 
     await env.DB.prepare(
+      `UPDATE webhook_subscriptions SET url = 'https://hooks.example.test/notion', status = 'active' WHERE id = ?`,
+    )
+      .bind(subscription.id)
+      .run();
+    const malformedUrlDelivery = await createDelivery("webhook-test-malformed-url-event", 8);
+    await env.DB.prepare(`UPDATE webhook_subscriptions SET url = 'not a URL' WHERE id = ?`).bind(subscription.id).run();
+    await deliverWebhook(env, malformedUrlDelivery.id);
+    await expect(
+      env.DB.prepare(`SELECT status, last_error FROM webhook_deliveries WHERE id = ?`)
+        .bind(malformedUrlDelivery.id)
+        .first(),
+    ).resolves.toEqual({ status: "failed", last_error: "Enter a valid HTTPS webhook URL." });
+
+    await env.DB.prepare(
       `UPDATE webhook_subscriptions SET url = 'https://hooks.example.test/notion', status = 'pending_verification'
         WHERE id = ?`,
     )
@@ -377,10 +409,12 @@ describe("Notion-compatible webhooks", () => {
       error: "Webhook endpoint returned HTTP 500.",
     });
     vi.mocked(fetch).mockRejectedValueOnce(new Error("network unavailable"));
+    const verificationWarning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await expect(sendWebhookVerification(env, subscription.id)).resolves.toEqual({
       ok: false,
       error: "Webhook verification request failed.",
     });
+    expect(JSON.stringify(verificationWarning.mock.calls)).toContain("network unavailable");
     vi.mocked(fetch).mockClear();
     await env.DB.prepare(`UPDATE webhook_subscriptions SET url = 'https://[::1]/notion' WHERE id = ?`)
       .bind(subscription.id)
