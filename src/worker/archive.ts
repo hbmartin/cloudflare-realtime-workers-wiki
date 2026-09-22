@@ -1,7 +1,6 @@
 import type { Env } from "./env";
 import { locationHint } from "./http";
-import { safeErrorMessage } from "../shared/error-log";
-import { correlationHeaders, logger } from "./observability";
+import { correlationHeaders, logger, safeTelemetryErrorMessage } from "./observability";
 
 export interface ArchiveDisconnectTarget {
   page_id: string;
@@ -73,7 +72,7 @@ async function processArchiveDisconnectTarget(env: Env, target: ArchiveDisconnec
   } catch (error) {
     const recordedAttempts = Math.max(1, attempts);
     const delay = Math.min(60 * 60_000, 10_000 * 2 ** Math.min(recordedAttempts - 1, 8));
-    const message = safeErrorMessage(error, "Unknown document archive failure");
+    const message = safeTelemetryErrorMessage(error, "Unknown document archive failure");
     try {
       await env.DB.prepare(
         `UPDATE archive_disconnect_targets

@@ -1,5 +1,5 @@
 import type { Context } from "hono";
-import { LOG_IDENTIFIER_LIMIT, boundedLogString, safeInstanceOf } from "../shared/error-log";
+import { safeInstanceOf } from "../shared/error-log";
 import { normalizeFilename } from "../shared/filename";
 import { ValidationError } from "../shared/validation";
 import { logger } from "./observability";
@@ -125,7 +125,7 @@ export function errorResponse(c: Context, error: unknown) {
       {
         requestMethod: c.req.method,
         requestPath: new URL(c.req.url).pathname,
-        requestRayId: rayId ? boundedLogString(rayId, LOG_IDENTIFIER_LIMIT) : null,
+        requestRayId: rayId ?? null,
       },
       error,
     );

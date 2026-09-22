@@ -355,6 +355,46 @@ describe("notification feed and subscriptions", () => {
     ).toMatchObject({ status: "failed", last_error: "access_revoked" });
   });
 
+  it("redacts and bounds persisted notification delivery exceptions", async () => {
+    const installed = await bootstrap();
+    const viewer = await invite(installed.cookie, "delivery-errors");
+    await SELF.fetch(
+      request(viewer.cookie, `/api/pages/${installed.page.id}/comments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          initialComment: { body: commentBody("Please review ", { id: installed.userId, label: "Owner" }) },
+        }),
+      }),
+    );
+    const notification = await env.DB.prepare(
+      `SELECT id FROM notifications WHERE user_id = ? AND event_type = 'mention'`,
+    )
+      .bind(installed.userId)
+      .first<{ id: string }>();
+    const diagnostic = `Email Authorization: Basic dXNlcjpwYXNz ${"x".repeat(600)}`;
+    const bindings = new Proxy(env as Env, {
+      get(target, property, receiver) {
+        if (property === "SEND_EMAIL") {
+          return { send: vi.fn(async () => Promise.reject(new Error(diagnostic))) };
+        }
+        if (property === "EMAIL_FROM") return "notes@example.test";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    await expect(deliverNotification(bindings, notification!.id)).rejects.toThrow(diagnostic);
+
+    const delivery = await env.DB.prepare(`SELECT status, last_error FROM deliveries WHERE idempotency_key = ?`)
+      .bind(`outbox:${notification!.id}:email`)
+      .first<{ status: string; last_error: string }>();
+    expect(delivery?.status).toBe("failed");
+    expect(delivery?.last_error).toContain("Basic [redacted]");
+    expect(delivery?.last_error).not.toContain("dXNlcjpwYXNz");
+    expect(delivery?.last_error).toMatch(/…\[truncated\]$/);
+    expect(delivery?.last_error.length).toBeLessThanOrEqual(500);
+  });
+
   it("does not let a stale delivery claimant finish a newer email lease", async () => {
     const installed = await bootstrap();
     const viewer = await invite(installed.cookie, "delivery-lease");

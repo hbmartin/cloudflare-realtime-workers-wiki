@@ -189,4 +189,37 @@ describe("archive disconnect processing", () => {
     expect(reschedule?.args.at(-1)).toBe(lease);
     expect(run).toHaveBeenCalledOnce();
   });
+
+  it("redacts credential-bearing errors before persisting retry diagnostics", async () => {
+    const diagnostic = `Archive Authorization: Basic dXNlcjpwYXNz ${"x".repeat(1_200)}`;
+    const fetch = vi.fn(async () => Promise.reject(new Error(diagnostic)));
+    const binds: Array<{ query: string; args: unknown[] }> = [];
+    const prepare = vi.fn((query: string) => ({
+      bind: vi.fn((...args: unknown[]) => {
+        binds.push({ query, args });
+        return {
+          first: vi.fn(async () =>
+            query.includes("RETURNING workspace_id")
+              ? { workspace_id: "workspace", room: "page~1", attempts: 1 }
+              : { content_epoch: 1, archived_at: Date.now(), location_hint: null },
+          ),
+          run: vi.fn(async () => undefined),
+        };
+      }),
+    }));
+    const env = {
+      BETTER_AUTH_SECRET: "test-secret",
+      DB: { prepare },
+      DOCUMENT: { getByName: vi.fn(() => ({ fetch })) },
+    } as unknown as Env;
+
+    await processArchiveDisconnectTargets(env, [{ page_id: "page", content_epoch: 1 }]);
+
+    const retry = binds.find(({ query }) => query.includes("SET attempts = ?"));
+    const message = String(retry?.args[2]);
+    expect(message).toContain("Basic [redacted]");
+    expect(message).not.toContain("dXNlcjpwYXNz");
+    expect(message).toMatch(/…\[truncated\]$/);
+    expect(message.length).toBeLessThanOrEqual(1_000);
+  });
 });

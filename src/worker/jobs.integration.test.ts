@@ -620,6 +620,41 @@ describe("job execution", () => {
     ).toEqual({ status: "canceled", cleanup_target: null, cleanup_token: null });
   });
 
+  it("stores a generic workflow-start recovery failure and logs a redacted diagnostic", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now() - 60_000;
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, type, status, requested_by, workflow_instance_id, progress_label, created_at, updated_at)
+       VALUES (?, ?, 'search_reindex', 'queued', ?, ?, 'Queued', ?, ?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, jobId, timestamp, timestamp)
+      .run();
+    const diagnostic = "Workflow unavailable Authorization: Basic dXNlcjpwYXNz";
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => log.mockRestore());
+    const failure = new Error(diagnostic);
+    const bindings = bindingsWith({
+      NOTES_WORKFLOW: {
+        create: vi.fn(async () => Promise.reject(failure)),
+        get: vi.fn(async () => ({ status: vi.fn(async () => ({ status: "unknown" })) })),
+      },
+    });
+
+    await recoverQueuedJobs(bindings);
+
+    expect(await env.DB.prepare(`SELECT error_code, error_message FROM jobs WHERE id = ?`).bind(jobId).first()).toEqual(
+      { error_code: "workflow_start_failed", error_message: "Workflow start failed." },
+    );
+    expectStructuredLog(log, "workflow.start_recovery.failed", {
+      jobId,
+      attempt: 1,
+      errorMessage: "Workflow unavailable Authorization: Basic [redacted]",
+    });
+    expect(JSON.stringify(log.mock.calls)).not.toContain("dXNlcjpwYXNz");
+  });
+
   it("rejects a retry while cancellation cleanup is still running", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
@@ -892,10 +927,12 @@ describe("job execution", () => {
 
   it("reports an inline job failure as failed while its cleanup remains pending", async () => {
     const installed = await bootstrap();
-    const unavailable = new Error("R2 unavailable");
+    const unavailable = new Error("R2 unavailable Authorization: Basic dXNlcjpwYXNz");
     const bucket = { list: vi.fn(async () => Promise.reject(unavailable)) };
     const bindings = bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: bucket });
     const context = createExecutionContext();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => log.mockRestore());
 
     const response = await worker.fetch(
       request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
@@ -918,8 +955,59 @@ describe("job execution", () => {
     expect((await failed.json<{ job: Job }>()).job).toMatchObject({
       status: "failed",
       cleanupPending: true,
-      error: { code: "job_failed", message: "R2 unavailable" },
+      error: { code: "job_failed", message: "The job failed." },
     });
+    expectStructuredLog(log, "workflow.job.failed", {
+      jobId: queued.id,
+      attempt: 1,
+      errorMessage: "R2 unavailable Authorization: Basic [redacted]",
+    });
+    expect(JSON.stringify(log.mock.calls)).not.toContain("dXNlcjpwYXNz");
+  });
+
+  it("keeps an unexpected D1 job failure generic while logging its redacted diagnostic", async () => {
+    const installed = await bootstrap();
+    const diagnostic = new Error("D1 unavailable Bearer secret_database_token_12345");
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property === "prepare") {
+          return (query: string) => {
+            if (query.includes("SELECT id, workspace_id, content_epoch, kind, title FROM pages")) {
+              return { bind: () => ({ first: async () => Promise.reject(diagnostic) }) };
+            }
+            return target.prepare(query);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => log.mockRestore());
+    const context = createExecutionContext();
+
+    const response = await worker.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "markdown", portable: false }),
+      }),
+      bindingsWith({ WORKFLOW_INLINE: "true", DB: database }),
+      context,
+    );
+    const queued = (await response.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+
+    const failed = await env.DB.prepare(`SELECT error_code, error_message FROM jobs WHERE id = ?`)
+      .bind(queued.id)
+      .first();
+    expect(failed).toEqual({ error_code: "job_failed", error_message: "The job failed." });
+    expectStructuredLog(log, "workflow.job.failed", {
+      jobId: queued.id,
+      attempt: 1,
+      errorMessage: "D1 unavailable Bearer [redacted]",
+    });
+    expect(JSON.stringify(log.mock.calls)).not.toContain("secret_database_token_12345");
   });
 
   it("keeps failed export cleanup recoverable, non-retryable, and scoped through its attempt", async () => {
@@ -1588,7 +1676,7 @@ describe("job execution", () => {
     );
     expect((await invalidResult.json<{ job: Job }>()).job).toMatchObject({
       status: "failed",
-      error: { code: "job_failed", message: "A linked diagram thumbnail has invalid size metadata." },
+      error: { code: "job_failed", message: "The job failed." },
     });
   });
 
@@ -2967,7 +3055,8 @@ describe("job execution", () => {
         timestamp,
       )
       .run();
-    const original = new HttpError(409, "import_upload_missing", "Upload the file again.");
+    const publicMessage = "Upload for owner@example.test at https://api.io/cb?a=1&token=keep.";
+    const original = new HttpError(409, "import_upload_missing", publicMessage);
     const transported = Object.assign(new Error(original.message), Object.fromEntries(Object.entries(original)));
     const bucket = new Proxy(env.BUCKET, {
       get(target, property) {
@@ -2990,8 +3079,65 @@ describe("job execution", () => {
       attempt: 2,
       status: "failed",
       error_code: "import_upload_missing",
-      error_message: "Upload the file again.",
+      error_message: publicMessage,
     });
+    const publicJob = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${jobId}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await publicJob.json<{ job: Job }>()).job.error).toEqual({
+      code: "import_upload_missing",
+      message: publicMessage,
+    });
+
+    const longJobId = crypto.randomUUID();
+    const longInstanceId = crypto.randomUUID();
+    const longMessage = `Expected failure ${"x".repeat(600)}`;
+    await env.DB.prepare(`INSERT INTO jobs
+      (id,workspace_id,space_id,type,status,requested_by,workflow_instance_id,attempt,options_json,input_key,created_at,updated_at)
+      VALUES (?,?,?,'import','queued',?,?,1,?,?,?,?)`)
+      .bind(
+        longJobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        longInstanceId,
+        JSON.stringify({
+          filename: "long.zip",
+          format: "notion_zip",
+          confirmed: true,
+          previewId: "obsolete",
+          previewGroupingVersion: NOTION_GROUPING_VERSION - 1,
+        }),
+        `jobs/${longJobId}/input/long.zip`,
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const longError = new HttpError(409, "job_failed", longMessage);
+    const transportedLong = Object.assign(new Error(longError.message), Object.fromEntries(Object.entries(longError)));
+    const longBucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "get") return async () => Promise.reject(transportedLong);
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    await expect(
+      startJobExecution(bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: longBucket }), {
+        id: longJobId,
+        workflow_instance_id: longInstanceId,
+        attempt: 1,
+      }),
+    ).rejects.toBe(transportedLong);
+    const bounded = await env.DB.prepare("SELECT error_message FROM jobs WHERE id = ?")
+      .bind(longJobId)
+      .first<string>("error_message");
+    expect(bounded).toHaveLength(500);
+    expect(bounded).toMatch(/^Expected failure x+/);
+    expect(bounded).toMatch(/…\[truncated\]$/);
   });
 
   it("does not attribute an obsolete workflow failure to an externally superseding attempt", async () => {
@@ -3104,14 +3250,21 @@ describe("job execution", () => {
           typeof record === "object" &&
           (record as Record<string, unknown>).event === "workflow.job.failed",
       );
-      expect(executionLogs).toHaveLength(failure === "missing" ? 0 : 1);
+      expect(executionLogs).toHaveLength(failure === "storage" ? 1 : 0);
       expect(failed.error_message?.includes("Upload the file again")).toBe(failure === "missing");
+      expect(failed.error_message).toBe(
+        failure === "missing"
+          ? "The import upload is missing or expired. Upload the file again."
+          : failure === "parser"
+            ? "The ZIP central directory is missing."
+            : "The job failed.",
+      );
       expect(
         executionLogs.map(([details]) => ({
           jobId: (details as Record<string, unknown>).jobId,
           attempt: (details as Record<string, unknown>).attempt,
         })),
-      ).toEqual(failure === "missing" ? [] : [{ jobId, attempt: 2 }]);
+      ).toEqual(failure === "storage" ? [{ jobId, attempt: 2 }] : []);
     },
   );
 

@@ -8,6 +8,7 @@ import {
   createWebhookSubscription,
   deliverWebhook,
   fanoutWebhookEvent,
+  listWebhookDeliveries,
   safeWebhookUrl,
   sendWebhookVerification,
   verifyWebhookSubscription,
@@ -57,7 +58,10 @@ beforeEach(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 describe("Notion-compatible webhooks", () => {
   it("accepts public HTTPS hosts and rejects local or literal-IP destinations", () => {
@@ -264,11 +268,46 @@ describe("Notion-compatible webhooks", () => {
       status: "pending",
       attempts: 1,
       next_attempt_at: expect.any(Number),
-      last_error: expect.any(String),
+      last_error: "Webhook request failed",
     });
     await env.DB.prepare(`UPDATE webhook_subscriptions SET encrypted_verification_token = ? WHERE id = ?`)
       .bind(stored!.encrypted_verification_token, subscription.id)
       .run();
+
+    const networkDelivery = await createDelivery("webhook-test-network-event", 6);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const networkFailure = "network Authorization: Basic dXNlcjpwYXNz";
+    vi.mocked(fetch).mockRejectedValueOnce(new Error(networkFailure));
+    const deliveryEnv = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DELIVERY_QUEUE") {
+          return {
+            send: vi.fn(async () => Promise.reject(new Error("Queue Bearer secret_webhook_queue_12345"))),
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    await deliverWebhook(deliveryEnv, networkDelivery.id);
+    await expect(
+      env.DB.prepare(`SELECT last_error FROM webhook_deliveries WHERE id = ?`).bind(networkDelivery.id).first(),
+    ).resolves.toEqual({ last_error: "Webhook request failed" });
+    const history = await listWebhookDeliveries(env, member, subscription.id);
+    const networkHistory = history.find((entry) => (entry as Record<string, unknown>).id === networkDelivery.id) as
+      | Record<string, unknown>
+      | undefined;
+    expect(networkHistory?.lastError).toBe("Webhook request failed");
+    const retryOutbox = await env.DB.prepare(
+      `SELECT last_error FROM outbox
+        WHERE topic = 'webhook_delivery' AND json_extract(payload_json, '$.deliveryId') = ?
+        ORDER BY created_at DESC LIMIT 1`,
+    )
+      .bind(networkDelivery.id)
+      .first<{ last_error: string }>();
+    expect(retryOutbox?.last_error).toContain("Queue Bearer [redacted]");
+    expect(retryOutbox?.last_error).not.toContain("secret_webhook_queue_12345");
+    expect(JSON.stringify(log.mock.calls)).toContain("network Authorization: Basic [redacted]");
+    expect(JSON.stringify(log.mock.calls)).not.toContain("dXNlcjpwYXNz");
 
     await env.DB.batch(
       webhookEventStatements(env.DB, {
@@ -304,10 +343,15 @@ describe("Notion-compatible webhooks", () => {
     vi.mocked(fetch).mockClear();
     await deliverWebhook(env, queuedDelivery!.id);
     await expect(
-      env.DB.prepare(`SELECT status, attempts, next_attempt_at FROM webhook_deliveries WHERE id = ?`)
+      env.DB.prepare(`SELECT status, attempts, next_attempt_at, last_error FROM webhook_deliveries WHERE id = ?`)
         .bind(queuedDelivery!.id)
         .first(),
-    ).resolves.toEqual({ status: "failed", attempts: 1, next_attempt_at: null });
+    ).resolves.toEqual({
+      status: "failed",
+      attempts: 1,
+      next_attempt_at: null,
+      last_error: "Webhook URL is invalid",
+    });
     await expect(
       env.DB.prepare(`SELECT status FROM webhook_subscriptions WHERE id = ?`).bind(subscription.id).first(),
     ).resolves.toEqual({ status: "paused" });
@@ -335,7 +379,7 @@ describe("Notion-compatible webhooks", () => {
     vi.mocked(fetch).mockRejectedValueOnce(new Error("network unavailable"));
     await expect(sendWebhookVerification(env, subscription.id)).resolves.toEqual({
       ok: false,
-      error: "network unavailable",
+      error: "Webhook verification request failed.",
     });
     vi.mocked(fetch).mockClear();
     await env.DB.prepare(`UPDATE webhook_subscriptions SET url = 'https://[::1]/notion' WHERE id = ?`)

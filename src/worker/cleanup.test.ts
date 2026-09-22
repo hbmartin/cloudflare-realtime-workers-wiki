@@ -97,4 +97,43 @@ describe("deletion job cleanup", () => {
     expect(env.BUCKET.delete).toHaveBeenCalledWith("attachments/file");
     expect(queries.some((query) => query.includes("SELECT location_hint FROM workspaces"))).toBe(false);
   });
+
+  it("redacts credential-bearing target failures before persistence", async () => {
+    const diagnostic = `R2 cleanup Authorization: Basic dXNlcjpwYXNz ${"x".repeat(1_200)}`;
+    const binds: Array<{ query: string; args: unknown[] }> = [];
+    const prepare = vi.fn((query: string) => ({
+      bind: vi.fn((...args: unknown[]) => {
+        binds.push({ query, args });
+        return {
+          first: vi.fn(async () => {
+            if (query.includes("RETURNING id, attempts, workspace_id")) {
+              return { id: "job-1", attempts: 0, workspace_id: "workspace-1" };
+            }
+            if (query.includes("SELECT COUNT(*) count")) return { count: 1 };
+            if (query.includes("SELECT last_error")) return { last_error: "retry pending" };
+            return null;
+          }),
+          all: vi.fn(async () =>
+            query.includes("FROM deletion_targets")
+              ? { results: [{ kind: "r2_object", target: "attachments/file" }] }
+              : { results: [] },
+          ),
+          run: vi.fn(async () => undefined),
+        };
+      }),
+    }));
+    const env = {
+      DB: { prepare },
+      BUCKET: { delete: vi.fn(async () => Promise.reject(new Error(diagnostic))) },
+    } as unknown as Env;
+
+    await processDeletionJob(env, "job-1");
+
+    const failed = binds.find(({ query }) => query.includes("SET attempts = attempts + 1, last_error = ?"));
+    const message = String(failed?.args[0]);
+    expect(message).toContain("Basic [redacted]");
+    expect(message).not.toContain("dXNlcjpwYXNz");
+    expect(message).toMatch(/…\[truncated\]$/);
+    expect(message.length).toBeLessThanOrEqual(1_000);
+  });
 });

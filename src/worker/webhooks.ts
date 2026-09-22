@@ -4,7 +4,7 @@ import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256Hex } 
 import type { Env, MemberContext } from "./env";
 import { publicPageId } from "./integrations";
 import { HttpError } from "./http";
-import { currentObservabilityContext, traced } from "./observability";
+import { currentObservabilityContext, logger, safeTelemetryErrorMessage, traced } from "./observability";
 
 const WEBHOOK_EVENT_TYPES = [
   "page.created",
@@ -56,6 +56,10 @@ const RETRY_DELAYS = [
   12 * 60 * 60_000,
   24 * 60 * 60_000,
 ];
+const WEBHOOK_ERROR_MESSAGE_LIMIT = 500;
+const WEBHOOK_VERIFICATION_FAILURE = "Webhook verification request failed.";
+const WEBHOOK_URL_FAILURE = "Webhook URL is invalid";
+const WEBHOOK_REQUEST_FAILURE = "Webhook request failed";
 
 function verificationToken() {
   return `secret_${bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
@@ -285,9 +289,16 @@ export async function sendWebhookVerification(env: Env, subscriptionId: string) 
     if (!response.ok) return { ok: false as const, error: `Webhook endpoint returned HTTP ${response.status}.` };
     return { ok: true as const };
   } catch (error) {
+    logger.error(
+      "webhook.verification.failed",
+      "webhook",
+      "Webhook verification request failed.",
+      { subscriptionId },
+      error,
+    );
     return {
       ok: false as const,
-      error: error instanceof Error ? error.message.slice(0, 500) : "Webhook verification request failed.",
+      error: WEBHOOK_VERIFICATION_FAILURE,
     };
   } finally {
     clearTimeout(timer);
@@ -564,16 +575,18 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
     destination = await storedWebhookUrl(env, subscription.id, subscription.url);
   } catch (error) {
     const timestamp = Date.now();
+    logger.error(
+      "webhook.delivery.url_failed",
+      "webhook",
+      "Stored webhook URL validation failed.",
+      { deliveryId, subscriptionId: subscription.id, attempt },
+      error,
+    );
     await env.DB.prepare(
       `UPDATE webhook_deliveries SET status = 'failed', attempts = ?, next_attempt_at = NULL,
        last_error = ?, updated_at = ? WHERE id = ?`,
     )
-      .bind(
-        attempt,
-        error instanceof Error ? error.message.slice(0, 500) : "Webhook URL is invalid",
-        timestamp,
-        deliveryId,
-      )
+      .bind(attempt, WEBHOOK_URL_FAILURE, timestamp, deliveryId)
       .run();
     return;
   }
@@ -621,7 +634,14 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
     received = await responseBody(response);
     if (status < 200 || status >= 300) failure = `HTTP ${status}`;
   } catch (error) {
-    failure = error instanceof Error ? error.message.slice(0, 500) : "Webhook request failed";
+    failure = WEBHOOK_REQUEST_FAILURE;
+    logger.error(
+      "webhook.delivery.request_failed",
+      "webhook",
+      "Webhook delivery request failed.",
+      { deliveryId, subscriptionId: subscription.id, attempt },
+      error,
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -674,7 +694,7 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
       .run();
   } catch (error) {
     await env.DB.prepare(`UPDATE outbox SET last_error = ? WHERE id = ?`)
-      .bind(error instanceof Error ? error.message.slice(0, 500) : "Queue enqueue failed.", outboxId)
+      .bind(safeTelemetryErrorMessage(error, "Queue enqueue failed.", WEBHOOK_ERROR_MESSAGE_LIMIT), outboxId)
       .run();
   }
 }

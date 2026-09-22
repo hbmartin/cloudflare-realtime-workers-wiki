@@ -2001,7 +2001,7 @@ describe("Worker integration", () => {
     expect(error).toHaveBeenCalledOnce();
     expectStructuredLog(error, "http.request.unhandled_error", {
       requestMethod: "GET",
-      requestPath: `${pathPrefix}${"p".repeat(fillerLength)}:[redacted-email]@bitb${TRUNCATION_MARKER}`,
+      requestPath: `${pathPrefix}${"p".repeat(fillerLength)}:[redacted-email]${TRUNCATION_MARKER}`,
       requestRayId: `${"r".repeat(LOG_IDENTIFIER_LIMIT - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`,
       errorName: databaseError.name,
       errorMessage: databaseError.message,
