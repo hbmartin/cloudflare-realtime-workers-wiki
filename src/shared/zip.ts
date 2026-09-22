@@ -194,11 +194,15 @@ export async function readZip(
     offset = nameEnd + extraLength + commentLength;
     if (offset > endOffset) throw new ZipValidationError("The ZIP central directory is truncated.", "invalid");
     if (path.endsWith("/")) continue;
+    if (method === 0 && compressedSize !== uncompressedSize) {
+      throw new ZipValidationError("The ZIP entry failed its integrity check.", "invalid");
+    }
     const expandedBefore = expanded;
-    expanded += uncompressedSize;
-    if (expanded > maxExpandedBytes || (compressedSize > 0 && uncompressedSize / compressedSize > 200)) {
+    const remainingArchiveBudget = maxExpandedBytes - expandedBefore;
+    if (uncompressedSize > remainingArchiveBudget || (compressedSize > 0 && uncompressedSize / compressedSize > 200)) {
       throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
     }
+    expanded += uncompressedSize;
     if (localOffset + 30 > centralOffset || view.getUint32(localOffset, true) !== LOCAL_FILE_HEADER) {
       throw new ZipValidationError("The ZIP local header is invalid.", "invalid");
     }
@@ -210,15 +214,19 @@ export async function readZip(
     const compressed = bytes.subarray(dataOffset, dataOffset + compressedSize);
     let contents: Uint8Array;
     try {
-      contents =
-        method === 0
-          ? compressed.slice()
-          : await inflateRaw(compressed, uncompressedSize, maxExpandedBytes - expandedBefore);
+      if (method === 0) {
+        if (compressedSize > remainingArchiveBudget) {
+          throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
+        }
+        contents = compressed.slice();
+      } else {
+        contents = await inflateRaw(compressed, uncompressedSize, remainingArchiveBudget);
+      }
     } catch (error) {
       if (error instanceof ZipValidationError) throw error;
       throw new ZipValidationError("The ZIP entry could not be decompressed.", "invalid");
     }
-    if (contents.byteLength > maxExpandedBytes - expandedBefore) {
+    if (contents.byteLength > remainingArchiveBudget) {
       throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
     }
     if (contents.byteLength !== uncompressedSize || crc32(contents) !== checksum) {

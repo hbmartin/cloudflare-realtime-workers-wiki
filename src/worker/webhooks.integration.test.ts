@@ -310,6 +310,29 @@ describe("Notion-compatible webhooks", () => {
     expect(JSON.stringify(warning.mock.calls)).toContain("network Authorization: Basic [redacted]");
     expect(JSON.stringify(warning.mock.calls)).not.toContain("dXNlcjpwYXNz");
 
+    const warningCount = warning.mock.calls.filter(
+      ([record]) =>
+        record !== null &&
+        typeof record === "object" &&
+        (record as Record<string, unknown>).event === "webhook.delivery.request_failed",
+    ).length;
+    const falseyRetryDelivery = await createDelivery("webhook-test-falsey-retry-event", 60);
+    vi.mocked(fetch).mockRejectedValueOnce(undefined);
+    await deliverWebhook(env, falseyRetryDelivery.id);
+    const warningsAfterFalseyRetry = warning.mock.calls.filter(
+      ([record]) =>
+        record !== null &&
+        typeof record === "object" &&
+        (record as Record<string, unknown>).event === "webhook.delivery.request_failed",
+    );
+    expect(warningsAfterFalseyRetry).toHaveLength(warningCount + 1);
+    expect(warningsAfterFalseyRetry.at(-1)?.[0]).toMatchObject({ severity: "warn", attempt: 1 });
+    await expect(
+      env.DB.prepare(`SELECT status, attempts, last_error FROM webhook_deliveries WHERE id = ?`)
+        .bind(falseyRetryDelivery.id)
+        .first(),
+    ).resolves.toEqual({ status: "pending", attempts: 1, last_error: "Webhook request failed" });
+
     const terminalDelivery = await createDelivery("webhook-test-terminal-network-event", 7);
     await env.DB.prepare(`UPDATE webhook_deliveries SET attempts = 7 WHERE id = ?`).bind(terminalDelivery.id).run();
     const terminalLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -326,6 +349,32 @@ describe("Notion-compatible webhooks", () => {
       last_error: "Webhook request failed",
     });
     expect(JSON.stringify(terminalLog.mock.calls)).toContain("terminal network failure");
+
+    const terminalErrorCount = terminalLog.mock.calls.filter(
+      ([record]) =>
+        record !== null &&
+        typeof record === "object" &&
+        (record as Record<string, unknown>).event === "webhook.delivery.request_failed",
+    ).length;
+    const falseyTerminalDelivery = await createDelivery("webhook-test-falsey-terminal-event", 61);
+    await env.DB.prepare(`UPDATE webhook_deliveries SET attempts = 7 WHERE id = ?`)
+      .bind(falseyTerminalDelivery.id)
+      .run();
+    vi.mocked(fetch).mockRejectedValueOnce(null);
+    await deliverWebhook(env, falseyTerminalDelivery.id);
+    const errorsAfterFalseyTerminal = terminalLog.mock.calls.filter(
+      ([record]) =>
+        record !== null &&
+        typeof record === "object" &&
+        (record as Record<string, unknown>).event === "webhook.delivery.request_failed",
+    );
+    expect(errorsAfterFalseyTerminal).toHaveLength(terminalErrorCount + 1);
+    expect(errorsAfterFalseyTerminal.at(-1)?.[0]).toMatchObject({ severity: "error", attempt: 8 });
+    await expect(
+      env.DB.prepare(`SELECT status, attempts, next_attempt_at FROM webhook_deliveries WHERE id = ?`)
+        .bind(falseyTerminalDelivery.id)
+        .first(),
+    ).resolves.toEqual({ status: "failed", attempts: 8, next_attempt_at: null });
 
     await env.DB.batch(
       webhookEventStatements(env.DB, {

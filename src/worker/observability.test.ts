@@ -24,6 +24,23 @@ function isWellFormed(value: string) {
   return (value as string & { isWellFormed(): boolean }).isWellFormed();
 }
 
+function warmedMedianPerOperation(operation: () => void) {
+  for (let index = 0; index < 5; index += 1) operation();
+  let iterations = 1;
+  while (iterations < 16_384) {
+    const started = performance.now();
+    for (let index = 0; index < iterations; index += 1) operation();
+    if (performance.now() - started >= 20) break;
+    iterations *= 2;
+  }
+  const samples = Array.from({ length: 5 }, () => {
+    const started = performance.now();
+    for (let index = 0; index < iterations; index += 1) operation();
+    return (performance.now() - started) / iterations;
+  }).sort((left, right) => left - right);
+  return samples[2]!;
+}
+
 const UNICODE_SIMPLE_FOLD_BEARER_CHARACTERS = ["\u017f", "\u212a"] as const;
 const JAVASCRIPT_WHITESPACE_SEPARATORS = [
   " ",
@@ -1035,18 +1052,11 @@ describe("worker observability", () => {
       const medianDuration = (diagnostic: string) => {
         const error = new Error("failed");
         error.stack = diagnostic;
-        for (let index = 0; index < 3; index += 1) {
+        const duration = warmedMedianPerOperation(() => {
           logger.error("test.serialized_header_warmup", "test", "failed", {}, error);
-        }
-        const samples = Array.from({ length: 3 }, () => {
-          const started = performance.now();
-          for (let index = 0; index < 12; index += 1) {
-            logger.error("test.serialized_header_scale", "test", "failed", {}, error);
-          }
-          return performance.now() - started;
-        }).sort((left, right) => left - right);
+        });
         const record = output.mock.calls.at(-1)?.[0] as Record<string, unknown>;
-        return { duration: samples[1]!, stack: String(record.errorStack) };
+        return { duration, stack: String(record.errorStack) };
       };
       const repeatedName = 'name:"authorization",';
       const inputs = [
@@ -1086,15 +1096,9 @@ describe("worker observability", () => {
 
   it("keeps wrapper and partial-secret cut scans near-linear", () => {
     const medianDuration = (input: () => string, limit: number) => {
-      for (let index = 0; index < 5; index += 1) safeTelemetryErrorMessage(new Error(input()), "fallback", limit);
-      const samples = Array.from({ length: 5 }, () => {
-        const started = performance.now();
-        for (let index = 0; index < 24; index += 1) {
-          safeTelemetryErrorMessage(new Error(input()), "fallback", limit);
-        }
-        return performance.now() - started;
-      }).sort((left, right) => left - right);
-      return samples[2]!;
+      return warmedMedianPerOperation(() => {
+        safeTelemetryErrorMessage(new Error(input()), "fallback", limit);
+      });
     };
 
     const wrapperInput = (length: number) =>
@@ -1108,6 +1112,22 @@ describe("worker observability", () => {
       const longDuration = medianDuration(() => input(15_000), 14_999);
       expect(longDuration / Math.max(shortDuration, 0.01)).toBeLessThan(8);
     }
+  }, 10_000);
+
+  it("keeps semantic authorization-boundary scans near-linear", () => {
+    const measure = (length: number) => {
+      const diagnostic = `Bearer https://x/${"a-".repeat(Math.ceil(length / 2))}`.slice(0, length);
+      const error = new Error(diagnostic);
+      const duration = warmedMedianPerOperation(() => {
+        safeTelemetryErrorMessage(error, "fallback", LOG_STACK_LIMIT);
+      });
+      return { duration, result: safeTelemetryErrorMessage(error, "fallback", LOG_STACK_LIMIT) };
+    };
+
+    const shortResult = measure(4_000);
+    const longResult = measure(15_000);
+    expect(longResult.duration / Math.max(shortResult.duration, 0.01)).toBeLessThan(8);
+    for (const result of [shortResult, longResult]) expect(result.result).toBe("Bearer [redacted]");
   }, 10_000);
 
   it("redacts quoted URLs, repeated quoted schemes, and fake Basic markers", () => {
@@ -1137,6 +1157,8 @@ describe("worker observability", () => {
       ["Bearer https://x.io/a;b?token=SECRET", "Bearer [redacted]"],
       ["Authorization: Bearer https://[::1]/cb?token=SECRET", "Authorization: Bearer [redacted]"],
       ["Authorization: Bearer https://x.io/[redacted-email]?token=SECRET", "Authorization: Bearer [redacted]"],
+      ["Bearer https://x.io/o'brien/cb?token=SECRET", "Bearer [redacted]"],
+      [`Bearer "https://x.io/o'brien/cb?token=SECRET"`, `Bearer "[redacted]"`],
       ['Bearer "https://x.io/cb?token=SECRET diagnostic text', 'Bearer "[redacted] diagnostic text'],
     ] as const;
 
@@ -1148,11 +1170,102 @@ describe("worker observability", () => {
     }
   });
 
+  it("stops authorization URLs only at semantic authorization restarts", () => {
+    const cases = [
+      ["tokens=[Bearer https://x.io/cb,Bearer eyJhbGciOi.payload.sig]", "tokens=[Bearer [redacted],Bearer [redacted]]"],
+      ...["|", ":", "/", "?", "#", "+", "[", "{", "("].map(
+        (separator) =>
+          [
+            `Bearer https://x.io/cb${separator}Bearer eyJhbGciOi.payload.sig`,
+            `Bearer [redacted]${separator}Bearer [redacted]`,
+          ] as const,
+      ),
+      [
+        "authorization=Bearer https://x.io/cb;proxy-authorization=Basic user:pass;status=401;request_id=abc",
+        "authorization=Bearer [redacted];proxy-authorization=Basic [redacted];status=401;request_id=abc",
+      ],
+      [
+        "Authorization: Bearer https://x.io/cb;proxy-authorization=Basic user:pass;status=401;request_id=abc",
+        "Authorization: Bearer [redacted];proxy-authorization=Basic [redacted];status=401;request_id=abc",
+      ],
+      [
+        '{"name":"authorization","value":"Bearer https://x.io/cb;proxy-authorization=Basic user:pass;status=401;request_id=abc"}',
+        '{"name":"authorization","value":"Bearer [redacted];proxy-authorization=Basic [redacted];status=401;request_id=abc"}',
+      ],
+      ["Bearer https://x.io/a;b?token=SECRET", "Bearer [redacted]"],
+      ["Bearer https://x.io/cb?a=1&token=SECRET", "Bearer [redacted]"],
+      ["Bearer HTTPS://x.io/cb?a=1&token=SECRET", "Bearer [redacted]"],
+    ] as const;
+
+    for (const [raw, expected] of cases) {
+      const once = safeTelemetryErrorMessage(new Error(raw), "fallback");
+      expect(once).toBe(expected);
+      expect(once).not.toContain("payload.sig");
+      expect(once).not.toContain("user:pass");
+      expect(once).not.toContain("SECRET");
+      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(once);
+    }
+  });
+
+  it("redacts URL authority userinfo before preserving the URL base", () => {
+    for (const [raw, expected] of [
+      [
+        "request https://alice:secret@example.test/path?trace=1 failed",
+        "request https://[redacted]@example.test/path failed",
+      ],
+      [
+        "request https://alice:secret@localhost/path?trace=1 failed",
+        "request https://[redacted]@localhost/path failed",
+      ],
+      [
+        "request https://alice:secret@127.0.0.1/path?trace=1 failed",
+        "request https://[redacted]@127.0.0.1/path failed",
+      ],
+      [
+        "request HTTPS://alice:secret@example.test/path?trace=1 failed",
+        "request HTTPS://[redacted]@example.test/path failed",
+      ],
+      [
+        String.raw`request https://example.test\docs@v1/file?trace=1 failed`,
+        String.raw`request https://example.test\docs@v1/file failed`,
+      ],
+      [
+        String.raw`request https://alice:secret@example.test\docs@v1/file?trace=1 failed`,
+        String.raw`request https://[redacted]@example.test\docs@v1/file failed`,
+      ],
+      ["request https://alice:p@ss@localhost/path?trace=1 failed", "request https://[redacted]@localhost/path failed"],
+    ] as const) {
+      const once = safeTelemetryErrorMessage(new Error(raw), "fallback");
+      expect(once).toBe(expected);
+      expect(once).not.toContain("alice");
+      expect(once).not.toContain("secret");
+      expect(safeTelemetryErrorMessage(new Error(once), "fallback")).toBe(once);
+    }
+
+    for (const whitespace of ["\t", "\r", "\n"]) {
+      const raw = `request https://alice:secret${whitespace}@example.test/path?trace=1 failed`;
+      const once = safeTelemetryErrorMessage(new Error(raw), "fallback");
+      expect(once).toBe("request https://[redacted]@example.test/path failed");
+      expect(once).not.toContain("alice");
+      expect(once).not.toContain("secret");
+      expect(once).not.toContain("trace");
+    }
+
+    for (const diagnostic of [
+      '{"url":"https://example.test","peer":"user@localhost"}',
+      "url=https://example.test;peer=user@localhost;status=500",
+      "url=https://example.test,peer=user@localhost,status=500",
+    ]) {
+      expect(safeTelemetryErrorMessage(new Error(diagnostic), "fallback")).toBe(diagnostic);
+    }
+  });
+
   it("keeps marker-prefixed Basic URLs for query scrubbing and makes Basic redaction a fixed point", () => {
     const cases = [
       ["Basic …[truncated]https://x.io/cb?t=secret", "Basic …[truncated]https://x.io/cb"],
       ["Basic [redacted]https://x.io/cb?t=secret", "Basic [redacted]https://x.io/cb"],
       ["Basic a@b.co=1 failed", "Basic [redacted-email]=1 failed"],
+      ["Basic dXNl[redacted]YXNz", "Basic dXNl[redacted]YXNz"],
     ] as const;
 
     for (const [raw, expected] of cases) {

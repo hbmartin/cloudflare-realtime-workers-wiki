@@ -1196,19 +1196,21 @@ export async function recoverQueuedJobs(env: Env) {
     try {
       await startJobExecution(env, job);
     } catch (error) {
-      logger.error(
-        "workflow.start_recovery.failed",
-        "workflow",
-        "Queued job workflow start failed.",
-        { jobId: job.id, attempt: job.attempt },
-        error,
-      );
-      await env.DB.prepare(
+      const failed = await env.DB.prepare(
         `UPDATE jobs SET error_code = 'workflow_start_failed', error_message = ?, updated_at = ?
           WHERE id = ? AND attempt = ? AND status = 'queued'`,
       )
         .bind("Workflow start failed.", Date.now(), job.id, job.attempt)
         .run();
+      if (failed.meta.changes) {
+        logger.error(
+          "workflow.start_recovery.failed",
+          "workflow",
+          "Queued job workflow start failed.",
+          { jobId: job.id, attempt: job.attempt },
+          error,
+        );
+      }
     }
   }
   const cleanups = await env.DB.prepare(
@@ -1246,7 +1248,7 @@ async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: st
         WHERE id = ? RETURNING attempts, last_error`,
     )
       .bind(
-        safeTelemetryErrorMessage(error, "Queue enqueue failed.", PERSISTED_ERROR_MESSAGE_LIMIT),
+        safeTelemetryErrorMessage(error, "Queue enqueue failed."),
         Date.now(),
         OUTBOX_RETRY_MAX_MS,
         OUTBOX_RETRY_BASE_MS,

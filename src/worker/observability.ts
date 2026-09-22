@@ -41,7 +41,7 @@ const AUTHORIZATION_LABEL_VALUE = new RegExp(String.raw`^${AUTHORIZATION_LABEL}$
 // These case-insensitive boundary patterns deliberately omit `u`: with `iu`, long s and Kelvin sign fold into
 // ASCII word characters.
 const LABELED_AUTHORIZATION_PREFIX = new RegExp(
-  String.raw`(?<![A-Za-z0-9])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic[ \t]+|Bearer${BEARER_VALUE_WHITESPACE}+)`,
+  String.raw`(?<![A-Za-z0-9_-])${AUTHORIZATION_LABEL}(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic[ \t]+|Bearer${BEARER_VALUE_WHITESPACE}+)`,
   "gi",
 );
 const BASIC_TOKEN_CHARACTER = String.raw`[A-Za-z0-9+/_=-]`;
@@ -55,7 +55,8 @@ const PARTIAL_BASIC_VALUE = new RegExp(
   String.raw`\bBasic[ \t]+(${AUTHORIZATION_VALUE_WRAPPERS})(${BASIC_TOKEN_CHARACTER}+)$`,
   "i",
 );
-const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/g;
+const URL_USERINFO = /(https?:\/\/)(?:[^\s/?#\\,;|"'{}()[\]]|[\t\r\n])*@/gi;
+const URL_QUERY = /(https?:\/\/[^\s?#]+)[?#][^\s]*/gi;
 const GENERIC_SECRET_PREFIXES = ["sk_", "crn_", "ghp_", "github_pat_", "secret_"] as const;
 const XOX_SECRET_PREFIXES = ["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"] as const;
 const SECRET_PREFIXES = [...GENERIC_SECRET_PREFIXES, ...XOX_SECRET_PREFIXES] as const;
@@ -277,6 +278,35 @@ function authorizationSchemeAt(value: string, start: number) {
   return valueStart < 0 ? undefined : { scheme, valueStart };
 }
 
+const LABELED_AUTHORIZATION_RESTART = new RegExp(
+  String.raw`((?:proxy[-_]?)?authorization(?:[-_]?header)?)(?:${SERIALIZED_QUOTE})?(?:[ \t]*(?::|=>|=|,)[ \t]*|[ \t]+)(${AUTHORIZATION_VALUE_WRAPPERS})(?:Basic[ \t]+|Bearer${BEARER_VALUE_WHITESPACE}+)`,
+  "iy",
+);
+
+function labeledAuthorizationRestartAt(value: string, start: number) {
+  if (isAsciiWord(value.charCodeAt(start - 1))) return -1;
+  LABELED_AUTHORIZATION_RESTART.lastIndex = start;
+  const match = LABELED_AUTHORIZATION_RESTART.exec(value);
+  LABELED_AUTHORIZATION_RESTART.lastIndex = 0;
+  if (!match) return -1;
+  let labelStart = start;
+  while (labelStart > 0) {
+    const previous = value[labelStart - 1];
+    if (!isAsciiWord(value.charCodeAt(labelStart - 1)) && previous !== "-" && previous !== "_") break;
+    labelStart -= 1;
+  }
+  const labelEnd = start + match[1]!.length;
+  return AUTHORIZATION_LABEL_VALUE.test(value.slice(labelStart, labelEnd)) ? labelStart : -1;
+}
+
+function authorizationRestartBoundary(value: string, start: number, index: number) {
+  if (isAsciiWord(value.charCodeAt(index - 1))) return -1;
+  const restart = authorizationSchemeAt(value, index) ? index : labeledAuthorizationRestartAt(value, index);
+  if (restart < start) return -1;
+  const separator = restart - 1;
+  return separator >= start && !isAsciiWord(value.charCodeAt(separator)) ? separator : restart;
+}
+
 function skipNestedAuthorizationSchemes(value: string, start: number, inheritedDelimiter?: QuoteDelimiter) {
   let cursor = start;
   let delimiter = inheritedDelimiter;
@@ -357,19 +387,20 @@ function bearerCandidate(value: string, start: number, delimiter?: QuoteDelimite
 }
 
 function credentialUrlEnd(value: string, start: number, delimiter?: QuoteDelimiter) {
-  if (!/^https?:\/\//i.test(value.slice(start))) return undefined;
+  const prefix = value.slice(start, start + 8).toLowerCase();
+  if (!prefix.startsWith("http://") && !prefix.startsWith("https://")) return undefined;
   for (let cursor = start; cursor < value.length; cursor += 1) {
+    const restart = cursor > start ? authorizationRestartBoundary(value, start, cursor) : -1;
+    if (restart >= 0) return restart;
     const character = value[cursor];
     if (delimiter) {
-      if (quoteEndsCredentialAt(value, cursor, delimiter)) {
+      if (character === delimiter.quote && quoteCloses(delimiter, value, cursor)) {
         return cursor - precedingBackslashes(value, cursor, start);
       }
       if (/\s/u.test(character ?? "")) return cursor;
       continue;
     }
-    if (isCredentialQuote(character) || /\s/u.test(character ?? "")) {
-      return cursor;
-    }
+    if (/\s/u.test(character ?? "")) return cursor;
   }
   return value.length;
 }
@@ -515,9 +546,14 @@ function sanitizationMarkerAt(value: string, index: number, delimiter?: QuoteDel
   let quoteIndex = end;
   while (value[quoteIndex] === "\\") quoteIndex += 1;
   const escapedClosingQuote = quoteIndex > end && quoteEndsCredentialAt(value, quoteIndex, delimiter);
+  const authorizationRestart = authorizationRestartBoundary(value, index, end + 1) === end;
   return {
     end,
-    trusted: isCredentialQuote(suffix) || escapedClosingQuote || credentialBoundaryAt(value, end).boundary,
+    trusted:
+      isCredentialQuote(suffix) ||
+      escapedClosingQuote ||
+      authorizationRestart ||
+      credentialBoundaryAt(value, end).boundary,
   };
 }
 
@@ -794,7 +830,10 @@ function redactLabeledAuthorizationValues(value: string) {
 function redactKnownValues(value: string) {
   let safe = redactLabeledAuthorizationValues(value);
   safe = redactBasicValues(safe);
-  safe = redactBearerValues(safe).replace(SECRET_VALUE, "[redacted-secret]").replace(URL_QUERY, "$1");
+  safe = redactBearerValues(safe)
+    .replace(SECRET_VALUE, "[redacted-secret]")
+    .replace(URL_USERINFO, "$1[redacted]@")
+    .replace(URL_QUERY, "$1");
   return redactEmails(safe);
 }
 

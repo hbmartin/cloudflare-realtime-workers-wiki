@@ -83,8 +83,10 @@ diagnostic values. Bearer scheme/value separation recognizes JavaScript whitespa
 space characters, consistently across labeled, serialized, free-text, and repeated-scheme forms. Basic accepts only a
 space or tab as the scheme separator. Authorization URLs use one scanner in labeled and free-text forms: the full URL,
 including query strings, semicolon paths, IPv6 host brackets, and existing sanitizer markers, is treated as the
-credential. A closing quote or whitespace ends the URL, so diagnostic text after an unclosed quote remains available.
-Unlabeled Bearer schemes use ASCII identifier boundaries: an underscore keeps the scheme embedded in
+credential. Whitespace, a matching closing quote, or a structurally separated authorization label or scheme ends the
+URL. Semantic authorization boundaries preserve their separator and are scanned again, while punctuation inside the URL
+remains part of the credential. General URL bases redact authority userinfo through the last `@` before removing query
+strings or fragments. Unlabeled Bearer schemes use ASCII identifier boundaries: an underscore keeps the scheme embedded in
 an identifier, while adjacent non-ASCII characters do not suppress redaction. The full malformed-punctuation heuristic
 is deliberately conservative and can redact prose-like forms such as `Bearer token(s)`.
 
