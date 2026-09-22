@@ -2,6 +2,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import * as Y from "yjs";
 import { DIAGRAM_EDGES_ROOT, DIAGRAM_META_ROOT, DIAGRAM_NODES_ROOT } from "../shared/diagram";
+import { boundedLogString } from "../shared/error-log";
 import { sha256Hex } from "../shared/import-integrity";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
@@ -39,6 +40,7 @@ const OUTBOX_RETRY_MAX_MS = 60 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
+const JOB_ERROR_MESSAGE_LIMIT = 500;
 
 export type JobWorkflowParams = { jobId: string; attempt?: number; correlationId?: string };
 export type DeliveryQueueMessage =
@@ -247,7 +249,8 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
   if (existing) {
     if (existing.import_job_id === null && existing.created_by === job.requested_by)
       return { published: true, page: existing };
-    if (existing.import_job_id !== job.id) throw new Error("The template target id is already in use.");
+    if (existing.import_job_id !== job.id)
+      throw new HttpError(409, "job_failed", "The template target id is already in use.");
     if (existing.content_epoch !== job.attempt) {
       // A retry must not reuse the purged document room of the previous attempt.
       const updated = await env.DB.prepare(
@@ -275,7 +278,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
   )
     .bind(options.sourcePageId, job.workspace_id, options.targetSpaceId)
     .first<TemplateSourceRow>();
-  if (!source) throw new Error("The template source is no longer available.");
+  if (!source) throw new HttpError(409, "job_failed", "The template source is no longer available.");
   if (source.kind === "document" || source.kind === "diagram") {
     const response = await env.DOCUMENT.getByName(`${source.id}~${source.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
@@ -292,7 +295,8 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
         .bind(options.parentId, job.workspace_id, options.targetSpaceId)
         .first<{ id: string }>()
     : null;
-  if (options.parentId && !parent) throw new Error("The template destination is no longer available.");
+  if (options.parentId && !parent)
+    throw new HttpError(409, "job_failed", "The template destination is no longer available.");
   const last = await env.DB.prepare(
     `SELECT position FROM pages WHERE space_id = ? AND parent_id IS ? AND archived_at IS NULL
       AND import_job_id IS NULL AND is_template = ? ORDER BY position DESC, id DESC LIMIT 1`,
@@ -391,7 +395,7 @@ async function cloneTemplateAttachments(env: Env, job: JobRow, options: Template
       .first<{ page_id: string; r2_key: string }>();
     if (!existing) {
       const object = await env.BUCKET.get(attachment.r2_key);
-      if (!object) throw new Error(`Template attachment ${attachment.id} is missing.`);
+      if (!object) throw new HttpError(409, "job_failed", `Template attachment ${attachment.id} is missing.`);
       await env.BUCKET.put(key, object.body, {
         ...(object.httpMetadata && { httpMetadata: object.httpMetadata }),
         customMetadata: { ...object.customMetadata, attachmentId: targetId },
@@ -418,7 +422,7 @@ async function cloneTemplateAttachments(env: Env, job: JobRow, options: Template
       throw new Error("A cloned attachment id is already in use.");
     } else if (existing.r2_key !== key) {
       const object = await env.BUCKET.get(attachment.r2_key);
-      if (!object) throw new Error(`Template attachment ${attachment.id} is missing.`);
+      if (!object) throw new HttpError(409, "job_failed", `Template attachment ${attachment.id} is missing.`);
       await env.BUCKET.put(key, object.body, {
         ...(object.httpMetadata && { httpMetadata: object.httpMetadata }),
         customMetadata: { ...object.customMetadata, attachmentId: targetId },
@@ -459,7 +463,7 @@ async function initializeTemplateDocument(
   const source = await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id = ? AND workspace_id = ?`)
     .bind(options.sourcePageId, job.workspace_id)
     .first<{ content_epoch: number }>();
-  if (!source) throw new Error("The template source is no longer available.");
+  if (!source) throw new HttpError(409, "job_failed", "The template source is no longer available.");
   const prefix = page.kind === "diagram" ? "diagrams" : "documents";
   const snapshot = await env.BUCKET.get(`${prefix}/${options.sourcePageId}/epochs/${source.content_epoch}/current.bin`);
   const sourceUpdate = snapshot ? new Uint8Array(await snapshot.arrayBuffer()) : Y.encodeStateAsUpdate(new Y.Doc());
@@ -873,7 +877,7 @@ export async function finishPendingJobCleanup(
 
 async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
   const httpError = safeHttpError(error);
-  const message = safeTelemetryErrorMessage(httpError ?? error, "The job failed.", 500);
+  const message = httpError ? boundedLogString(httpError.message, JOB_ERROR_MESSAGE_LIMIT) : "The job failed.";
   const errorCode = httpError?.code ?? "job_failed";
   if (!httpError)
     logger.error(
@@ -1191,10 +1195,17 @@ export async function recoverQueuedJobs(env: Env) {
     try {
       await startJobExecution(env, job);
     } catch (error) {
+      logger.error(
+        "workflow.start_recovery.failed",
+        "workflow",
+        "Queued job workflow start failed.",
+        { jobId: job.id, attempt: job.attempt },
+        error,
+      );
       await env.DB.prepare(
         `UPDATE jobs SET error_code = 'workflow_start_failed', error_message = ?, updated_at = ? WHERE id = ?`,
       )
-        .bind(safeTelemetryErrorMessage(error, "Workflow start failed.", 500), Date.now(), job.id)
+        .bind("Workflow start failed.", Date.now(), job.id)
         .run();
     }
   }
@@ -1233,7 +1244,7 @@ async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: st
         WHERE id = ? RETURNING attempts, last_error`,
     )
       .bind(
-        safeTelemetryErrorMessage(error, "Queue enqueue failed.", 500),
+        safeTelemetryErrorMessage(error, "Queue enqueue failed.", JOB_ERROR_MESSAGE_LIMIT),
         Date.now(),
         OUTBOX_RETRY_MAX_MS,
         OUTBOX_RETRY_BASE_MS,

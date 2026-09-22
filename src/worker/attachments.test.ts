@@ -52,13 +52,22 @@ describe("multipart upload cleanup", () => {
   });
 
   it("keeps an ambiguously failed abort fenced for terminal retry", async () => {
-    const { env, queries, abort } = cleanupEnv("active", null, new Error("connection lost"));
+    const { env, queries, abort } = cleanupEnv(
+      "active",
+      null,
+      new Error(`connection lost Authorization: Basic dXNlcjpwYXNz ${"x".repeat(1_200)}`),
+    );
 
     await processDueUploadReaps(env);
 
     expect(abort).toHaveBeenCalledOnce();
     const reschedule = queries.find(({ sql }) => sql.includes("SET state = ?"));
     expect(reschedule?.args[0]).toBe("reaping");
+    const message = String(reschedule?.args[3]);
+    expect(message).toContain("Basic [redacted]");
+    expect(message).not.toContain("dXNlcjpwYXNz");
+    expect(message).toMatch(/…\[truncated\]$/);
+    expect(message.length).toBeLessThanOrEqual(1_000);
   });
 
   it("promotes stale completion to r2_complete when the object exists", async () => {

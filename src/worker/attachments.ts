@@ -1,6 +1,5 @@
 import type { Env } from "./env";
-import { safeErrorMessage } from "../shared/error-log.ts";
-import { logger } from "./observability.ts";
+import { logger, safeTelemetryErrorMessage } from "./observability.ts";
 
 /**
  * Attachment upload policy, shared by both upload paths, plus the reaper that
@@ -148,7 +147,7 @@ async function rescheduleUpload(
       state,
       Math.max(1, row.attempts),
       timestamp + uploadRetryDelay(row.attempts),
-      safeErrorMessage(error, "Unknown upload cleanup failure"),
+      safeTelemetryErrorMessage(error, "Unknown upload cleanup failure"),
       timestamp,
       row.id,
       leaseUntil,

@@ -9,11 +9,11 @@ import {
   renderDiagramSvg,
   renderEmptyDiagramSvg,
 } from "../shared/diagram";
-import { createZip, type ZipEntry } from "../shared/zip";
+import { createZip, ZipValidationError, type ZipEntry } from "../shared/zip";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
 import { inlineImageMime } from "./attachments";
-import { normalizeFilename } from "./http";
+import { HttpError, normalizeFilename } from "./http";
 import { deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
@@ -106,7 +106,11 @@ async function linkedDiagramAssets(
     thumbnailByteLimit === null ? Number.POSITIVE_INFINITY : LINKED_DIAGRAM_ASSET_LIMIT,
   );
   if (thumbnailByteLimit !== null && collected.truncated) {
-    throw new Error(`The export contains more than ${LINKED_DIAGRAM_ASSET_LIMIT} linked diagrams.`);
+    throw new HttpError(
+      413,
+      "job_failed",
+      `The export contains more than ${LINKED_DIAGRAM_ASSET_LIMIT} linked diagrams.`,
+    );
   }
   const ids = [...collected.ids];
   if (!ids.length) return [];
@@ -141,14 +145,18 @@ async function linkedDiagramAssets(
     for (const diagram of rows.results) diagramById.set(diagram.id, diagram);
   }
   if (ids.some((id) => !diagramById.has(id))) {
-    throw new Error("A linked diagram is unavailable for export.");
+    throw new HttpError(409, "job_failed", "A linked diagram is unavailable for export.");
   }
   const diagrams = ids.map((id) => diagramById.get(id)!);
   const baseUrl = env.BETTER_AUTH_URL.replace(/\/$/, "");
   const assets: LinkedDiagramAsset[] = [];
   const placeholderBytes = new Map<string, Uint8Array>();
   const budgetError = () =>
-    new Error(`Linked diagram thumbnails exceed the ${thumbnailByteLimit! / 1024 / 1024} MiB export asset limit.`);
+    new HttpError(
+      413,
+      "job_failed",
+      `Linked diagram thumbnails exceed the ${thumbnailByteLimit! / 1024 / 1024} MiB export asset limit.`,
+    );
   if (thumbnailByteLimit !== null) {
     let plannedBytes = 0;
     for (const diagram of diagrams) {
@@ -366,7 +374,7 @@ async function portableExport(
     if (referencedAssetIds && !referencedAssetIds.has(attachment.id)) continue;
     await assertExportActive(env, job);
     const object = await env.BUCKET.get(attachment.r2_key);
-    if (!object) throw new Error(`Attachment ${attachment.name} is missing.`);
+    if (!object) throw new HttpError(409, "job_failed", `Attachment ${attachment.name} is missing.`);
     const name = uniqueAssetName(attachment.name, used);
     const relative = format === "json" ? `assets/${attachment.id}/${name}` : `assets/${name}`;
     rewritten = replaceAttachmentReference(
@@ -388,7 +396,14 @@ async function portableExport(
     path: `${fileStem(page.title)}.${format === "markdown" ? "md" : format}`,
     bytes: new TextEncoder().encode(rewritten),
   });
-  return createZip(entries);
+  try {
+    return createZip(entries);
+  } catch (error) {
+    if (error instanceof ZipValidationError && error.kind === "limit") {
+      throw new HttpError(413, "job_failed", error.message);
+    }
+    throw error;
+  }
 }
 
 function base64(bytes: Uint8Array) {
@@ -425,9 +440,9 @@ async function browserExportHtml(
     const imageMime = inlineImageMime(attachment.mime);
     if (imageMime) {
       const object = await env.BUCKET.get(attachment.r2_key);
-      if (!object) throw new Error(`Attachment ${attachment.name} is missing.`);
+      if (!object) throw new HttpError(409, "job_failed", `Attachment ${attachment.name} is missing.`);
       if (inlined + object.size > PDF_INLINE_ASSET_LIMIT) {
-        throw new Error("PDF images exceed the 24 MiB inline asset limit.");
+        throw new HttpError(413, "job_failed", "PDF images exceed the 24 MiB inline asset limit.");
       }
       inlined += object.size;
       replacement = `data:${imageMime};base64,${base64(new Uint8Array(await object.arrayBuffer()))}`;
@@ -457,7 +472,7 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
     )
       .bind(options.pageId, job.workspace_id, job.space_id)
       .first<ExportPage>();
-    if (!page) throw new Error("The page is no longer available for export.");
+    if (!page) throw new HttpError(409, "job_failed", "The page is no longer available for export.");
     const serialized =
       page.kind === "document"
         ? await documentExport(
@@ -518,7 +533,7 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
               : options.format === "svg" && "svg" in serialized
                 ? serialized.svg
                 : "";
-      if (!content) throw new Error("That format is not available for this page kind.");
+      if (!content) throw new HttpError(422, "job_failed", "That format is not available for this page kind.");
       if (options.portable) {
         bytes = await portableExport(
           env,
@@ -545,7 +560,8 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
       }
     }
     if (!bytes.byteLength) throw new Error("The export produced an empty file.");
-    if (bytes.byteLength > EXPORT_MAX_BYTES) throw new Error("The export exceeds the 64 MiB limit.");
+    if (bytes.byteLength > EXPORT_MAX_BYTES)
+      throw new HttpError(413, "job_failed", "The export exceeds the 64 MiB limit.");
     const outputKey = `jobs/${job.id}/attempts/${job.attempt}/output/${encodeURIComponent(filename)}`;
     await env.BUCKET.put(outputKey, bytes, {
       httpMetadata: { contentType },

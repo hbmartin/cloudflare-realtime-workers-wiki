@@ -10,7 +10,9 @@ import { tracing } from "cloudflare:workers";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { sendPersonalSlackNotification, SlackRateLimitError, slackChannelFanoutStatements } from "./slack";
-import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
+import { currentObservabilityContext, logger, recordMetric, safeTelemetryErrorMessage, traced } from "./observability";
+
+const DELIVERY_ERROR_MESSAGE_LIMIT = 500;
 
 export const NOTIFICATION_EVENT_TYPES = [
   "mention",
@@ -666,7 +668,7 @@ export async function deliverNotification(env: Env, notificationId: string, outb
         "email",
         emailClaim.token,
         "failed",
-        error instanceof Error ? error.message.slice(0, 500) : "Email delivery failed.",
+        safeTelemetryErrorMessage(error, "Email delivery failed.", DELIVERY_ERROR_MESSAGE_LIMIT),
       );
       throw error;
     }
@@ -693,7 +695,7 @@ export async function deliverNotification(env: Env, notificationId: string, outb
         "slack",
         slackClaim.token,
         "failed",
-        error instanceof Error ? error.message.slice(0, 500) : "Slack delivery failed.",
+        safeTelemetryErrorMessage(error, "Slack delivery failed.", DELIVERY_ERROR_MESSAGE_LIMIT),
       );
       throw error;
     }
@@ -947,7 +949,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
           "email",
           claim.token,
           "failed",
-          error instanceof Error ? error.message.slice(0, 500) : "Digest delivery failed.",
+          safeTelemetryErrorMessage(error, "Digest delivery failed.", DELIVERY_ERROR_MESSAGE_LIMIT),
         );
         logger.error(
           "notification.digest_email.failed",
@@ -1058,7 +1060,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           "slack",
           claim.token,
           "failed",
-          error instanceof Error ? error.message.slice(0, 500) : "Slack digest failed.",
+          safeTelemetryErrorMessage(error, "Slack digest failed.", DELIVERY_ERROR_MESSAGE_LIMIT),
         );
         if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
         // One unreachable recipient must not starve the digests queued behind it.

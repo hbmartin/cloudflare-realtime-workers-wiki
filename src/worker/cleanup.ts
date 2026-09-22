@@ -1,7 +1,6 @@
 import type { Env } from "./env";
 import { locationHint } from "./http";
-import { safeErrorMessage } from "../shared/error-log";
-import { correlationHeaders } from "./observability";
+import { correlationHeaders, safeTelemetryErrorMessage } from "./observability";
 
 type DeletionTargetKind = "document_do" | "r2_object" | "r2_prefix";
 
@@ -91,7 +90,7 @@ export async function processDeletionJob(env: Env, jobId: string) {
         .bind(Date.now(), job.id, target.kind, target.target, job.id, leaseUntil)
         .run();
     } catch (error) {
-      const message = safeErrorMessage(error, "Unknown cleanup failure");
+      const message = safeTelemetryErrorMessage(error, "Unknown cleanup failure");
       await env.DB.prepare(
         `UPDATE deletion_targets
             SET attempts = attempts + 1, last_error = ?

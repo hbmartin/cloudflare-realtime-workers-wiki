@@ -7,6 +7,15 @@ const MAX_EXPANDED_BYTES = 64 * 1024 * 1024;
 
 export type ZipEntry = { path: string; bytes: Uint8Array };
 
+export class ZipValidationError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "invalid" | "limit",
+  ) {
+    super(message);
+  }
+}
+
 function crc32(bytes: Uint8Array) {
   let crc = 0xffffffff;
   for (const byte of bytes) {
@@ -37,7 +46,7 @@ function safeArchivePath(path: string) {
     normalized.includes("\0") ||
     segments.some((segment) => segment === ".." || segment === "")
   ) {
-    throw new Error("The archive contains an unsafe path.");
+    throw new ZipValidationError("The archive contains an unsafe path.", "invalid");
   }
   return normalized;
 }
@@ -48,21 +57,21 @@ function header(size: number) {
 }
 
 export function createZip(entries: ZipEntry[]) {
-  if (entries.length > MAX_ZIP_ENTRIES) throw new Error("The archive contains too many files.");
+  if (entries.length > MAX_ZIP_ENTRIES) throw new ZipValidationError("The archive contains too many files.", "limit");
   const encoder = new TextEncoder();
   const files = entries.map((entry) => {
     const path = safeArchivePath(entry.path);
     return { ...entry, path, name: encoder.encode(path) };
   });
   if (files.reduce((total, entry) => total + entry.bytes.byteLength, 0) > MAX_EXPANDED_BYTES) {
-    throw new Error("The archive expands beyond the supported size.");
+    throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
   }
   const localParts: Uint8Array[] = [];
   const centralParts: Uint8Array[] = [];
   let localOffset = 0;
   for (const file of files) {
     if (file.bytes.byteLength > 0xffffffff || file.name.byteLength > 0xffff) {
-      throw new Error("The archive file is too large.");
+      throw new ZipValidationError("The archive file is too large.", "limit");
     }
     const checksum = crc32(file.bytes);
     const local = header(30);
@@ -112,7 +121,7 @@ async function inflateRaw(bytes: Uint8Array, limit: number) {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > limit) throw new Error("The archive expands beyond the supported size.");
+      if (total > limit) throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
       chunks.push(value);
     }
   } finally {
@@ -132,7 +141,7 @@ function findEnd(view: DataView) {
   for (let offset = view.byteLength - 22; offset >= minimum; offset -= 1) {
     if (view.getUint32(offset, true) === END_OF_CENTRAL_DIRECTORY) return offset;
   }
-  throw new Error("The ZIP central directory is missing.");
+  throw new ZipValidationError("The ZIP central directory is missing.", "invalid");
 }
 
 export async function readZip(
@@ -142,22 +151,23 @@ export async function readZip(
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const endOffset = findEnd(view);
   if (view.getUint16(endOffset + 4, true) !== 0 || view.getUint16(endOffset + 6, true) !== 0) {
-    throw new Error("Multi-disk ZIP archives are not supported.");
+    throw new ZipValidationError("Multi-disk ZIP archives are not supported.", "invalid");
   }
   const entries = view.getUint16(endOffset + 10, true);
   const maxEntries = Math.min(MAX_ZIP_ENTRIES, limits.maxEntries ?? MAX_ZIP_ENTRIES);
   const maxExpandedBytes = Math.min(MAX_EXPANDED_BYTES, limits.maxExpandedBytes ?? MAX_EXPANDED_BYTES);
-  if (entries > maxEntries) throw new Error("The archive contains too many files.");
+  if (entries > maxEntries) throw new ZipValidationError("The archive contains too many files.", "limit");
   const centralSize = view.getUint32(endOffset + 12, true);
   const centralOffset = view.getUint32(endOffset + 16, true);
-  if (centralOffset + centralSize > endOffset) throw new Error("The ZIP central directory is invalid.");
+  if (centralOffset + centralSize > endOffset)
+    throw new ZipValidationError("The ZIP central directory is invalid.", "invalid");
   const decoder = new TextDecoder();
   const output: ZipEntry[] = [];
   let offset = centralOffset;
   let expanded = 0;
   for (let index = 0; index < entries; index += 1) {
     if (offset + 46 > endOffset || view.getUint32(offset, true) !== CENTRAL_DIRECTORY_HEADER) {
-      throw new Error("The ZIP central directory is invalid.");
+      throw new ZipValidationError("The ZIP central directory is invalid.", "invalid");
     }
     const flags = view.getUint16(offset + 8, true);
     const method = view.getUint16(offset + 10, true);
@@ -168,29 +178,37 @@ export async function readZip(
     const extraLength = view.getUint16(offset + 30, true);
     const commentLength = view.getUint16(offset + 32, true);
     const localOffset = view.getUint32(offset + 42, true);
-    if (flags & 1) throw new Error("Encrypted ZIP entries are not supported.");
-    if (method !== 0 && method !== 8) throw new Error("The ZIP uses an unsupported compression method.");
+    if (flags & 1) throw new ZipValidationError("Encrypted ZIP entries are not supported.", "invalid");
+    if (method !== 0 && method !== 8)
+      throw new ZipValidationError("The ZIP uses an unsupported compression method.", "invalid");
     const nameEnd = offset + 46 + nameLength;
-    if (nameEnd > endOffset) throw new Error("The ZIP entry name is truncated.");
+    if (nameEnd > endOffset) throw new ZipValidationError("The ZIP entry name is truncated.", "invalid");
     const path = safeArchivePath(decoder.decode(bytes.subarray(offset + 46, nameEnd)));
     offset = nameEnd + extraLength + commentLength;
-    if (offset > endOffset) throw new Error("The ZIP central directory is truncated.");
+    if (offset > endOffset) throw new ZipValidationError("The ZIP central directory is truncated.", "invalid");
     if (path.endsWith("/")) continue;
     expanded += uncompressedSize;
     if (expanded > maxExpandedBytes || (compressedSize > 0 && uncompressedSize / compressedSize > 200)) {
-      throw new Error("The archive expands beyond the supported size.");
+      throw new ZipValidationError("The archive expands beyond the supported size.", "limit");
     }
     if (localOffset + 30 > centralOffset || view.getUint32(localOffset, true) !== LOCAL_FILE_HEADER) {
-      throw new Error("The ZIP local header is invalid.");
+      throw new ZipValidationError("The ZIP local header is invalid.", "invalid");
     }
     const localNameLength = view.getUint16(localOffset + 26, true);
     const localExtraLength = view.getUint16(localOffset + 28, true);
     const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
-    if (dataOffset + compressedSize > centralOffset) throw new Error("The ZIP entry data is truncated.");
+    if (dataOffset + compressedSize > centralOffset)
+      throw new ZipValidationError("The ZIP entry data is truncated.", "invalid");
     const compressed = bytes.subarray(dataOffset, dataOffset + compressedSize);
-    const contents = method === 0 ? compressed.slice() : await inflateRaw(compressed, uncompressedSize);
+    let contents: Uint8Array;
+    try {
+      contents = method === 0 ? compressed.slice() : await inflateRaw(compressed, uncompressedSize);
+    } catch (error) {
+      if (error instanceof ZipValidationError) throw error;
+      throw new ZipValidationError("The ZIP entry could not be decompressed.", "invalid");
+    }
     if (contents.byteLength !== uncompressedSize || crc32(contents) !== checksum) {
-      throw new Error("The ZIP entry failed its integrity check.");
+      throw new ZipValidationError("The ZIP entry failed its integrity check.", "invalid");
     }
     output.push({ path, bytes: contents });
   }

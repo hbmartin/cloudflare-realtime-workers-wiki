@@ -18,7 +18,7 @@ import {
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import { projectDocument } from "../shared/document-projection";
 import type { DocumentContentEnvelope, ImportPreview, ProseMirrorJson } from "../shared/types";
-import { readZip, type ZipEntry } from "../shared/zip";
+import { readZip, ZipValidationError, type ZipEntry } from "../shared/zip";
 import { isUnsafeMime } from "./attachments";
 import type { Env } from "./env";
 import type { JobRow } from "./jobs";
@@ -245,18 +245,26 @@ function assertPreviewGroups(options: ImportOptions, groupKeys: string[]) {
   const expected = [...options.previewGroupKeys].sort();
   const actual = [...groupKeys].sort();
   if (expected.length !== actual.length || expected.some((key, index) => key !== actual[index])) {
-    throw new Error("The import groups changed after preview. Inspect the import again before confirming it.");
+    throw new HttpError(
+      409,
+      "job_failed",
+      "The import groups changed after preview. Inspect the import again before confirming it.",
+    );
   }
 }
 
 function destinationSpaceId(job: JobRow, options: ImportOptions, groupKey: string) {
   if (options.groupSpaceIds) {
     if (!Object.hasOwn(options.groupSpaceIds, groupKey)) {
-      throw new Error("The import groups no longer match their destination spaces. Inspect the import again.");
+      throw new HttpError(
+        409,
+        "job_failed",
+        "The import groups no longer match their destination spaces. Inspect the import again.",
+      );
     }
     return options.groupSpaceIds[groupKey]!;
   }
-  if (!job.space_id) throw new Error("The import destination space is missing.");
+  if (!job.space_id) throw new HttpError(409, "job_failed", "The import destination space is missing.");
   return job.space_id;
 }
 
@@ -311,11 +319,20 @@ async function nestedEntries(
   budget: ArchiveBudget = { entries: 0, bytes: 0 },
   output: ZipEntry[] = [],
 ): Promise<ZipEntry[]> {
-  if (depth > MAX_NESTED_ZIP_DEPTH) throw new Error("The Notion export contains too many nested ZIP levels.");
-  const entries = await readZip(bytes, {
-    maxEntries: MAX_ARCHIVE_ENTRIES - budget.entries,
-    maxExpandedBytes: MAX_EXPANDED_BYTES - budget.bytes,
-  });
+  if (depth > MAX_NESTED_ZIP_DEPTH)
+    throw new HttpError(422, "job_failed", "The Notion export contains too many nested ZIP levels.");
+  let entries: ZipEntry[];
+  try {
+    entries = await readZip(bytes, {
+      maxEntries: MAX_ARCHIVE_ENTRIES - budget.entries,
+      maxExpandedBytes: MAX_EXPANDED_BYTES - budget.bytes,
+    });
+  } catch (error) {
+    if (error instanceof ZipValidationError) {
+      throw new HttpError(error.kind === "limit" ? 413 : 422, "job_failed", error.message);
+    }
+    throw error;
+  }
   budget.entries += entries.length;
   budget.bytes += entries.reduce((total, entry) => total + entry.bytes.byteLength, 0);
   for (const entry of entries) {
@@ -583,9 +600,9 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   }
   const csvEntries = [...csvByDatabase.values()];
   if (!pageEntries.length && !csvEntries.length)
-    throw new Error("The ZIP does not contain any importable Notion pages or databases.");
+    throw new HttpError(422, "job_failed", "The ZIP does not contain any importable Notion pages or databases.");
   if (pageEntries.length + csvEntries.length > MAX_IMPORT_PAGES)
-    throw new Error(`Imports are limited to ${MAX_IMPORT_PAGES} pages.`);
+    throw new HttpError(413, "job_failed", `Imports are limited to ${MAX_IMPORT_PAGES} pages.`);
   const pageIds = new Map<string, string>();
   for (const entry of pageEntries) pageIds.set(entry.path, await stableId(job.id, "page", entry.path));
   const parsedPages = new Map<string, ReturnType<typeof markdownToDocument> & { title?: string }>();
