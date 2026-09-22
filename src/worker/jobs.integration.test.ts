@@ -678,6 +678,8 @@ describe("job execution", () => {
         timestamp,
       )
       .run();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => log.mockRestore());
 
     await recoverQueuedJobs(bindingsWith({ WORKFLOW_INLINE: "true" }));
 
@@ -688,6 +690,67 @@ describe("job execution", () => {
       error_code: "import_upload_missing",
       error_message: "The import upload is missing or expired. Upload the file again.",
     });
+    expect(
+      log.mock.calls.filter(
+        ([record]) =>
+          record !== null &&
+          typeof record === "object" &&
+          (record as Record<string, unknown>).event === "workflow.start_recovery.failed",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("logs an unexpected inline failure once without calling it a workflow-start failure", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now() - 60_000;
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id, workspace_id, space_id, type, status, requested_by, workflow_instance_id, input_key,
+         options_json, progress_label, created_at, updated_at)
+       VALUES (?, ?, ?, 'import', 'queued', ?, ?, ?, ?, 'Queued', ?, ?)`,
+    )
+      .bind(
+        jobId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        jobId,
+        `jobs/${jobId}/input/failure.md`,
+        JSON.stringify({ filename: "failure.md", format: "markdown", confirmed: false }),
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const diagnostic = "R2 unavailable Authorization: Basic dXNlcjpwYXNz";
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "get") return async () => Promise.reject(new Error(diagnostic));
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => log.mockRestore());
+
+    await recoverQueuedJobs(bindingsWith({ WORKFLOW_INLINE: "true", BUCKET: bucket }));
+
+    expect(
+      await env.DB.prepare(`SELECT status, error_code, error_message FROM jobs WHERE id = ?`).bind(jobId).first(),
+    ).toEqual({ status: "failed", error_code: "job_failed", error_message: "The job failed." });
+    expectStructuredLog(log, "workflow.job.failed", {
+      jobId,
+      attempt: 1,
+      errorMessage: "R2 unavailable Authorization: Basic [redacted]",
+    });
+    expect(
+      log.mock.calls.filter(
+        ([record]) =>
+          record !== null &&
+          typeof record === "object" &&
+          (record as Record<string, unknown>).event === "workflow.start_recovery.failed",
+      ),
+    ).toHaveLength(0);
   });
 
   it("does not overwrite a newer attempt while recovering queued jobs", async () => {

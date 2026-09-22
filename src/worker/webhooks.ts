@@ -1,5 +1,4 @@
 import { sha256Hex } from "../shared/import-integrity";
-import { PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import { tracing } from "cloudflare:workers";
 import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256Hex } from "../shared/security";
 import type { Env, MemberContext } from "./env";
@@ -611,6 +610,7 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
   let received = "";
   let failure: string | null = null;
   let requestAttempted = false;
+  let requestFailed = false;
   let requestError: unknown;
   try {
     const token = await decryptToken(env, subscription.encrypted_verification_token);
@@ -639,12 +639,13 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
     if (status < 200 || status >= 300) failure = `HTTP ${status}`;
   } catch (error) {
     failure = WEBHOOK_REQUEST_FAILURE;
+    requestFailed = true;
     requestError = error;
   } finally {
     clearTimeout(timer);
   }
   const timestamp = Date.now();
-  if (requestError) {
+  if (requestFailed) {
     const log = requestAttempted && attempt < RETRY_DELAYS.length ? logger.warn : logger.error;
     log(
       "webhook.delivery.request_failed",
@@ -702,7 +703,7 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
       .run();
   } catch (error) {
     await env.DB.prepare(`UPDATE outbox SET last_error = ? WHERE id = ?`)
-      .bind(safeTelemetryErrorMessage(error, "Queue enqueue failed.", PERSISTED_ERROR_MESSAGE_LIMIT), outboxId)
+      .bind(safeTelemetryErrorMessage(error, "Queue enqueue failed."), outboxId)
       .run();
   }
 }

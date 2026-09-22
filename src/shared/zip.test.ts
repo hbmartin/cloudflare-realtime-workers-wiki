@@ -70,6 +70,24 @@ describe("ZIP utilities", () => {
     await expect(readZip(zip, { maxExpandedBytes: 5 })).rejects.toThrow(/expands beyond/);
   });
 
+  it("rejects corrupt stored sizes before applying or allocating against the archive budget", async () => {
+    const plain = new TextEncoder().encode("stored payload");
+    const name = new TextEncoder().encode("stored.txt");
+    const stored = createZip([{ path: "stored.txt", bytes: plain }]);
+    const centralOffset = 30 + name.byteLength + plain.byteLength;
+    const corrupt = stored.slice();
+    new DataView(corrupt.buffer).setUint32(centralOffset + 24, 5, true);
+
+    await expect(readZip(corrupt, { maxExpandedBytes: 5 })).rejects.toMatchObject({
+      name: "ZipValidationError",
+      kind: "invalid",
+    } satisfies Partial<ZipValidationError>);
+    await expect(readZip(stored, { maxExpandedBytes: plain.byteLength - 1 })).rejects.toMatchObject({
+      name: "ZipValidationError",
+      kind: "limit",
+    } satisfies Partial<ZipValidationError>);
+  });
+
   it("names validation failures", async () => {
     await expect(readZip(new Uint8Array())).rejects.toMatchObject({
       name: "ZipValidationError",

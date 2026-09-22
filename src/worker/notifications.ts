@@ -7,7 +7,6 @@ import type {
   WatchState,
 } from "../shared/types";
 import { tracing } from "cloudflare:workers";
-import { PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { sendPersonalSlackNotification, SlackRateLimitError, slackChannelFanoutStatements } from "./slack";
@@ -667,7 +666,7 @@ export async function deliverNotification(env: Env, notificationId: string, outb
         "email",
         emailClaim.token,
         "failed",
-        safeTelemetryErrorMessage(error, "Email delivery failed.", PERSISTED_ERROR_MESSAGE_LIMIT),
+        safeTelemetryErrorMessage(error, "Email delivery failed."),
       );
       throw error;
     }
@@ -694,7 +693,7 @@ export async function deliverNotification(env: Env, notificationId: string, outb
         "slack",
         slackClaim.token,
         "failed",
-        safeTelemetryErrorMessage(error, "Slack delivery failed.", PERSISTED_ERROR_MESSAGE_LIMIT),
+        safeTelemetryErrorMessage(error, "Slack delivery failed."),
       );
       throw error;
     }
@@ -948,7 +947,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
           "email",
           claim.token,
           "failed",
-          safeTelemetryErrorMessage(error, "Digest delivery failed.", PERSISTED_ERROR_MESSAGE_LIMIT),
+          safeTelemetryErrorMessage(error, "Digest delivery failed."),
         );
         logger.error(
           "notification.digest_email.failed",
@@ -1059,7 +1058,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           "slack",
           claim.token,
           "failed",
-          safeTelemetryErrorMessage(error, "Slack digest failed.", PERSISTED_ERROR_MESSAGE_LIMIT),
+          safeTelemetryErrorMessage(error, "Slack digest failed."),
         );
         if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
         // One unreachable recipient must not starve the digests queued behind it.
