@@ -138,25 +138,11 @@ export function createAuth(env: Env, allowRegistration = false) {
         if (source.action === "create-user" && !invite) {
           return { error: "registration_closed", errorDescription: "Open a valid invitation to create an account." };
         }
-        let workspaceId = invite?.workspaceId;
-        let teamId = invite?.teamId;
         const linkedUserId = typeof state?.link?.userId === "string" ? state.link.userId : null;
-        if (!workspaceId && linkedUserId) {
-          const installation = await env.DB.prepare(
-            `SELECT installation.workspace_id, installation.team_id
-               FROM workspace_members member
-               JOIN slack_installations installation ON installation.workspace_id = member.workspace_id
-              WHERE member.user_id = ? AND installation.disconnected_at IS NULL LIMIT 1`,
-          )
-            .bind(linkedUserId)
-            .first<{ workspace_id: string; team_id: string }>();
-          workspaceId = installation?.workspace_id;
-          teamId = installation?.team_id;
-        }
         try {
           const identity = await validateSlackIdentity(env, profile, {
-            ...(workspaceId ? { workspaceId } : {}),
-            ...(teamId ? { teamId } : {}),
+            ...(invite ? { workspaceId: invite.workspaceId, teamId: invite.teamId } : {}),
+            ...(linkedUserId ? { memberUserId: linkedUserId } : {}),
           });
           const existingLink = await env.DB.prepare(
             `SELECT user_id FROM slack_user_links

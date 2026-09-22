@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SecurityScreen } from "./SecurityScreen";
-import { api, authClient } from "./api";
+import { ApiClientError, api, authClient } from "./api";
 import type { SecurityStatus } from "../shared/security";
 
 vi.mock("./api", async (original) => ({
@@ -10,7 +10,7 @@ vi.mock("./api", async (original) => ({
   api: vi.fn(),
   authClient: {
     signOut: vi.fn(),
-    signIn: { passkey: vi.fn() },
+    signIn: { passkey: vi.fn(), social: vi.fn() },
     passkey: { addPasskey: vi.fn() },
     twoFactor: { verifyTotp: vi.fn() },
   },
@@ -29,6 +29,7 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("account protection screens", () => {
@@ -72,6 +73,58 @@ describe("account protection screens", () => {
     expect(api).toHaveBeenCalledWith("/api/security/setup-totp", { method: "POST", body: "{}" });
   });
 
+  it("restores the password field and offers Slack sign-in when primary proof expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const slackStatus: SecurityStatus = {
+      ...status,
+      slackPrimary: { available: true, expiresAt: Date.now() + 1_000 },
+    };
+    vi.mocked(api).mockImplementation(async (path) =>
+      path === "/api/security/status" ? status : { totpURI: "otpauth://totp/NoteFlare?secret=AFTEREXPIRY" },
+    );
+    vi.mocked(authClient.signIn.social).mockResolvedValue({ data: null, error: null } as never);
+    render(<SecurityScreen initialStatus={slackStatus} />);
+    await act(async () => {});
+    expect(screen.queryByLabelText("Account password")).not.toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_001);
+    });
+    const password = screen.getByLabelText("Account password");
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with Slack again" }));
+    await act(async () => {});
+    expect(authClient.signIn.social).toHaveBeenCalledWith({
+      provider: "slack",
+      callbackURL: "/",
+      errorCallbackURL: "/?slackAuth=callback",
+    });
+    fireEvent.change(password, { target: { value: "password123" } });
+    fireEvent.submit(password.closest("form")!);
+    await act(async () => {});
+    expect(api).toHaveBeenCalledWith("/api/security/setup-totp", {
+      method: "POST",
+      body: JSON.stringify({ password: "password123" }),
+    });
+  });
+
+  it("refreshes the primary factor options after the server rejects expired proof", async () => {
+    const slackStatus: SecurityStatus = {
+      ...status,
+      slackPrimary: { available: true, expiresAt: Date.now() + 60_000 },
+    };
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/security/setup-totp") {
+        throw new ApiClientError(403, "SECURITY_REQUIRED", "Enter your password or sign in with Slack again.");
+      }
+      return status;
+    });
+    render(<SecurityScreen initialStatus={slackStatus} />);
+    fireEvent.click(screen.getByRole("button", { name: "Set up authenticator app" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Enter your password");
+    expect(screen.getByLabelText("Account password")).toBeVisible();
+    expect(api).toHaveBeenCalledWith("/api/security/status");
+  });
+
   it("requires acknowledgment of the displayed recovery-code batch", async () => {
     vi.mocked(api).mockImplementation(async (path) =>
       path === "/api/security/recovery-codes"
@@ -88,6 +141,32 @@ describe("account protection screens", () => {
 });
 
 describe("protection recovery flows", () => {
+  it("requests a password after Slack proof expires on the recovery form", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const recovery: SecurityStatus = {
+      ...status,
+      state: "recovery_required",
+      recoveryCanResume: true,
+      slackPrimary: { available: true, expiresAt: Date.now() + 1_000 },
+    };
+    vi.mocked(api).mockImplementation(async (path) =>
+      path === "/api/security/status" ? { ...recovery, slackPrimary: undefined } : { success: true },
+    );
+    render(<SecurityScreen initialStatus={recovery} />);
+    await act(async () => {});
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_001);
+    });
+    const password = screen.getByLabelText("Password to resume recovery");
+    fireEvent.change(password, { target: { value: "password123" } });
+    fireEvent.submit(password.closest("form")!);
+    await act(async () => {});
+    expect(api).toHaveBeenCalledWith("/api/security/resume-recovery", {
+      method: "POST",
+      body: JSON.stringify({ password: "password123" }),
+    });
+  });
   it("allows re-verification while codes are displayed without replacing the batch", async () => {
     let acknowledged = false;
     let fresh = false;

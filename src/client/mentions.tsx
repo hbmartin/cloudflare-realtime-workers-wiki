@@ -104,3 +104,15 @@ export const notesSchema = BlockNoteSchema.create({
   inlineContentSpecs: { ...defaultInlineContentSpecs, mention: mentionInlineSpec, inlineMath: inlineMathSpec },
   styleSpecs: defaultStyleSpecs,
 });
+
+// Imported Slack replies use these blocks and the same verified mention chip as documents.
+// Keep the comment surface smaller than the document editor (no embeds or attachments).
+export const notesCommentSchema = BlockNoteSchema.create({
+  blockSpecs: {
+    paragraph: defaultBlockSpecs.paragraph,
+    quote: defaultBlockSpecs.quote,
+    codeBlock: defaultBlockSpecs.codeBlock,
+  },
+  inlineContentSpecs: { ...defaultInlineContentSpecs, mention: mentionInlineSpec },
+  styleSpecs: defaultStyleSpecs,
+});

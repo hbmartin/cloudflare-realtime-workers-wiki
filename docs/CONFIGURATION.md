@@ -230,6 +230,34 @@ Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:; img-sr
 | Connection reauthorization | Every 5 minutes                                                                                |
 | Application rate limiting  | `/v1` and browser telemetry use Worker Rate Limit bindings; authentication still relies on WAF |
 
+## Slack thread mirrors
+
+Channel mappings remain one-way until an owner with a verified Slack identity selects **Validate and enable mirror**
+in Slack Settings. The bot and the owner must be channel members. Mirroring requires `chat:write`, `channels:read`,
+`groups:read`, `channels:history`, `groups:history`, and `users:read`; public/private channels are supported, while DMs,
+MPIMs, Slack Connect, and archived channels are rejected. Existing search, unfurls, and notifications retain their
+original scope requirements.
+
+A page mirror takes precedence over its space mirror when a new thread link is reserved. Existing links keep their
+original mapping while it remains enabled and covers the page. Mirroring covers new comments and resolution changes
+independently of one-way notification filters/cadence; enabling it does not backfill history. Disabling or deleting a
+mapping retires its roots. Re-enabling permits a new root on the next eligible event. Muted/snoozed mappings suppress
+new roots and channel notifications, but replies on existing roots continue.
+
+Slack replies require a current OpenID-verified member, channel membership, and current page access. Resolve/Reopen
+uses NoteFlare's existing resolution permission. Bot messages, edits, deletes, and unsupported message subtypes are
+ignored. Conversion accepts at most 16 KiB of Slack text, 50 distinct mention tokens, 201 text blocks, and 300 inline
+nodes before the existing 32 KiB comment validation. Unknown mentions remain plain text. Delivery rechecks current
+authority; disconnect invalidates queued work and requires identity verification and mirror opt-in after reconnect.
+
+Outbound posts carry an opaque delivery marker. A lost response or abandoned send is reconciled against at most 20
+history pages of 100 messages. An inconclusive result blocks the delivery and its successors instead of posting a
+possible duplicate. Slack Settings displays the blocked count and logs emit `slack.thread.delivery_blocked` without
+content. Do not reset a `sending` or `blocked` record to `pending`: that can duplicate a message Slack already accepted.
+An operator can inspect the marker in Slack and the durable delivery record; this milestone deliberately provides no
+automatic resend for an uncertain result. Disabling the mirror stops subsequent work without deleting Slack history.
+Ephemeral denials are best effort and never fall back to public channel messages.
+
 ## Environments
 
 `wrangler.jsonc` keeps local-safe defaults at the top level and defines two named environments:

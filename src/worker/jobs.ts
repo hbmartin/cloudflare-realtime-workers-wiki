@@ -1,3 +1,4 @@
+import { deliverSlackThread, deliverSlackMutation, deliverSlackDenial } from "./slack-threads";
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import * as Y from "yjs";
@@ -1453,6 +1454,15 @@ export async function consumeDeliveryMessage(
     const notificationId = payload.notificationId;
     if (typeof notificationId !== "string") return await rejectPayload("Notification outbox payload is invalid.");
     await deliverNotification(env, notificationId, outboxId);
+  } else if (row.topic === "slack_thread_reply") {
+    if (typeof payload.deliveryId !== "string") return await rejectPayload("Slack thread delivery is invalid.");
+    await deliverSlackThread(env, payload.deliveryId);
+  } else if (row.topic === "slack_inbound_reply" || row.topic === "slack_thread_action") {
+    if (typeof payload.receiptId !== "string") return await rejectPayload("Slack receipt is invalid.");
+    await deliverSlackMutation(env, payload.receiptId, row.topic === "slack_thread_action");
+    await sweepOutbox(env);
+  } else if (row.topic === "slack_interaction_response") {
+    await deliverSlackDenial(env, payload);
   } else if (row.topic === "slack_channel") {
     const eventId = payload.eventId;
     if (typeof eventId !== "string") return await rejectPayload("Slack channel outbox payload is invalid.");

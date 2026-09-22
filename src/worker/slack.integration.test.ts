@@ -1,4 +1,4 @@
-import { enrollAccount } from "../../tests/helpers/security";
+import { enrollAccount, responseCookies } from "../../tests/helpers/security";
 import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
@@ -227,6 +227,41 @@ describe("Slack security and integration", () => {
     }
   });
 
+  it("matches settings identity linking to a Slack team the member belongs to", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO workspaces (id, name, created_at) VALUES ('second-workspace', 'Second', ?)`).bind(
+        timestamp,
+      ),
+      env.DB.prepare(`INSERT INTO slack_installations
+        (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
+         installed_by, created_at, updated_at)
+        VALUES ('second-installation', 'second-workspace', 'T999', 'Second Slack', 'B999', ?,
+          'commands,users:read', ?, ?, ?)`).bind(
+        await encryptSlackToken(slackEnv(), "xoxb-second"),
+        installed.member.user.id,
+        timestamp,
+        timestamp,
+      ),
+    ]);
+    const profile = { "https://slack.com/team_id": "T999", "https://slack.com/user_id": "UOTHER" };
+    const fetchMock = vi.fn(async () => Response.json({ ok: true, user: { id: "UOTHER", team_id: "T999" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(
+      validateSlackIdentity(slackEnv(), profile, { memberUserId: installed.member.user.id }),
+    ).rejects.toMatchObject({ code: "slack_team_mismatch" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await env.DB.prepare(`INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+      VALUES ('second-workspace', ?, 'editor', ?)`)
+      .bind(installed.member.user.id, timestamp)
+      .run();
+    await expect(
+      validateSlackIdentity(slackEnv(), profile, { memberUserId: installed.member.user.id }),
+    ).resolves.toMatchObject({ installationId: "second-installation", teamId: "T999" });
+  });
+
   it("starts Slack sign-up only from a live server-owned invite reservation", async () => {
     const installed = await bootstrap();
     await installSlack(installed.member);
@@ -241,22 +276,20 @@ describe("Slack security and integration", () => {
       }),
     );
     const token = (await invitation.json<{ invite: { token: string } }>()).invite.token;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request) => {
-        if (String(input).includes(".well-known/openid-configuration")) {
-          return Response.json({
-            issuer: "https://slack.com",
-            authorization_endpoint: "https://slack.com/openid/connect/authorize",
-            token_endpoint: "https://slack.com/api/openid.connect.token",
-            userinfo_endpoint: "https://slack.com/api/openid.connect.userInfo",
-            jwks_uri: "https://slack.com/openid/connect/keys",
-            id_token_signing_alg_values_supported: ["RS256"],
-          });
-        }
-        return Response.json({ ok: true });
-      }),
-    );
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).includes(".well-known/openid-configuration")) {
+        return Response.json({
+          issuer: "https://slack.com",
+          authorization_endpoint: "https://slack.com/openid/connect/authorize",
+          token_endpoint: "https://slack.com/api/openid.connect.token",
+          userinfo_endpoint: "https://slack.com/api/openid.connect.userInfo",
+          jwks_uri: "https://slack.com/openid/connect/keys",
+          id_token_signing_alg_values_supported: ["RS256"],
+        });
+      }
+      return Response.json({ ok: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
     const start = () =>
       worker.fetch(
         request(installed.cookie, "/api/slack/identity/invite/start", {
@@ -269,7 +302,17 @@ describe("Slack security and integration", () => {
       );
     const started = await start();
     expect(started.status).toBe(200);
-    expect(await started.json<{ url: string }>()).toMatchObject({ url: expect.stringContaining("slack.com") });
+    const authorization = await started.json<{ url: string }>();
+    expect(authorization).toMatchObject({ url: expect.stringContaining("slack.com") });
+    const cookie = responseCookies(started, installed.cookie);
+    expect(cookie).toMatch(/(?:^|; )better-auth\.state=/);
+    const state = new URL(authorization.url).searchParams.get("state");
+    await worker.fetch(
+      request(cookie, `/api/auth/callback/slack?state=${encodeURIComponent(state!)}&code=invalid-code`),
+      slackEnv(),
+      createExecutionContext(),
+    );
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("openid.connect.token"))).toBe(true);
     expect(await start()).toMatchObject({ status: 409 });
 
     const direct = await worker.fetch(
@@ -409,7 +452,7 @@ describe("Slack security and integration", () => {
     const configured = slackEnv();
     const authorization = new URL(await createSlackOAuthUrl(configured, memberContext(installed.member)));
     const state = authorization.searchParams.get("state")!;
-    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("oauth.v2.access")) {
         return Response.json({
@@ -422,6 +465,7 @@ describe("Slack security and integration", () => {
           team: { id: "T123", name: "Test Slack" },
         });
       }
+      if (url.endsWith("auth.revoke")) return Response.json({ ok: true, revoked: true });
       return Response.json({ ok: true });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -448,6 +492,7 @@ describe("Slack security and integration", () => {
       Response.json({
         ok: true,
         access_token: "xoxb-wrong-team",
+        refresh_token: "xoxe-wrong-team",
         scope: "commands",
         bot_user_id: "B999",
         team: { id: "T999", name: "Wrong Slack" },
@@ -456,10 +501,25 @@ describe("Slack security and integration", () => {
     await expect(
       finishSlackOAuth(configured, memberContext(installed.member), "oauth-code", mismatchState),
     ).rejects.toMatchObject({ code: "slack_team_mismatch" });
+    const revocations = fetchMock.mock.calls.filter(([input]) => String(input).endsWith("auth.revoke"));
+    expect(revocations.map(([, init]) => new Headers(init?.headers).get("authorization"))).toEqual([
+      "Bearer xoxb-wrong-team",
+      "Bearer xoxe-wrong-team",
+    ]);
     expect(await env.DB.prepare(`SELECT id, team_id FROM slack_installations`).first()).toEqual({
       id: installation!.id,
       team_id: "T123",
     });
+    const failedCleanupState = new URL(
+      await createSlackOAuthUrl(configured, memberContext(installed.member)),
+    ).searchParams.get("state")!;
+    fetchMock.mockResolvedValueOnce(
+      Response.json({ ok: true, access_token: "xoxb-cleanup-fails", bot_user_id: "B999", team: { id: "T999" } }),
+    );
+    fetchMock.mockResolvedValueOnce(Response.json({ ok: false }, { status: 500 }));
+    await expect(
+      finishSlackOAuth(configured, memberContext(installed.member), "oauth-code", failedCleanupState),
+    ).rejects.toMatchObject({ code: "slack_team_mismatch" });
     const reauthorizeState = new URL(
       await createSlackOAuthUrl(configured, memberContext(installed.member)),
     ).searchParams.get("state")!;
@@ -524,6 +584,67 @@ describe("Slack security and integration", () => {
       bot_refresh_token_ciphertext: null,
       token_expires_at: null,
       disconnected: 1,
+    });
+  });
+
+  it("keeps a verified Slack identity intact when a legacy link names another user", async () => {
+    const installed = await bootstrap();
+    const viewer = await inviteViewer(installed.cookie);
+    await installSlack(installed.member);
+    const timestamp = Date.now();
+    await env.DB.prepare(`INSERT INTO account (id, accountId, providerId, userId, createdAt, updatedAt)
+      VALUES ('verified-slack-account', 'T123:UOWNER', 'slack', ?, ?, ?)`)
+      .bind(installed.member.user.id, timestamp, timestamp)
+      .run();
+    const session = await env.DB.prepare(`SELECT id FROM session WHERE userId = ? LIMIT 1`)
+      .bind(installed.member.user.id)
+      .first<{ id: string }>();
+    await recordVerifiedSlackIdentity(slackEnv(), installed.member.user.id, session!.id, "verified-slack-account", {
+      installationId: "slack-installation",
+      installationGeneration: 0,
+      workspaceId: installed.member.workspace.id,
+      teamId: "T123",
+      slackUserId: "UOWNER",
+      accountSubject: "T123:UOWNER",
+    });
+    const linkToken = async (slackUserId: string) => {
+      const reply = await handleSlackCommand(
+        slackEnv(),
+        new URLSearchParams({ team_id: "T123", user_id: slackUserId, text: "link" }),
+      );
+      return new URL(reply.text.match(/https?:\S+/)![0]).searchParams.get("slackLink")!;
+    };
+    const otherToken = await linkToken("UOTHER");
+    await expect(consumeSlackLink(slackEnv(), memberContext(installed.member), otherToken)).rejects.toMatchObject({
+      code: "slack_identity_verified",
+    });
+    expect(
+      await env.DB.prepare(`SELECT used_at FROM slack_link_tokens WHERE slack_user_id = 'UOTHER'`).first(),
+    ).toEqual({ used_at: null });
+    const sameToken = await linkToken("UOWNER");
+    await consumeSlackLink(slackEnv(), memberContext(installed.member), sameToken);
+    expect(
+      await env.DB.prepare(`SELECT slack_user_id, migration_state, better_auth_account_id
+      FROM slack_user_links WHERE installation_id = 'slack-installation' AND user_id = ?`)
+        .bind(installed.member.user.id)
+        .first(),
+    ).toEqual({
+      slack_user_id: "UOWNER",
+      migration_state: "verified",
+      better_auth_account_id: "verified-slack-account",
+    });
+    await consumeSlackLink(slackEnv(), memberContext(viewer.member), await linkToken("UVIEWER"));
+    await consumeSlackLink(slackEnv(), memberContext(viewer.member), await linkToken("UTHIRD"));
+    expect(
+      await env.DB.prepare(`SELECT slack_user_id, migration_state, verified_at, better_auth_account_id
+      FROM slack_user_links WHERE installation_id = 'slack-installation' AND user_id = ?`)
+        .bind(viewer.member.user.id)
+        .first(),
+    ).toEqual({
+      slack_user_id: "UTHIRD",
+      migration_state: "legacy",
+      verified_at: null,
+      better_auth_account_id: null,
     });
   });
 
