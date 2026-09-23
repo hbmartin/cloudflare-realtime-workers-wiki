@@ -39,7 +39,6 @@ export function SecurityScreen({
   const [trust, setTrust] = useState(false);
   const [recover, setRecover] = useState(false);
   const [reset, setReset] = useState(false);
-  const [proofExpired, setProofExpired] = useState(false);
   const [hadSlackPrimary, setHadSlackPrimary] = useState(initialStatus?.slackPrimary?.available === true);
 
   const reload = useCallback(async () => {
@@ -70,16 +69,18 @@ export function SecurityScreen({
   }, [settings, initialStatus]);
   useEffect(() => {
     const expiresAt = status?.slackPrimary?.expiresAt;
-    if (!expiresAt) return undefined;
+    if (!expiresAt || !status?.serverNow) return undefined;
     const timer = window.setTimeout(
       () => {
-        setProofExpired(true);
+        setStatus((current) =>
+          current?.slackPrimary?.expiresAt === expiresAt ? { ...current, slackPrimary: undefined } : current,
+        );
         void reload().catch((cause) => setError(apiErrorMessage(cause, "Unable to refresh security settings.")));
       },
-      Math.max(0, expiresAt - Date.now() + 1),
+      Math.max(1000, expiresAt - status.serverNow + 1),
     );
     return () => window.clearTimeout(timer);
-  }, [status?.slackPrimary?.expiresAt, reload]);
+  }, [status?.slackPrimary?.expiresAt, status?.serverNow, reload]);
 
   async function run(action: () => Promise<void>) {
     setBusy(true);
@@ -90,7 +91,6 @@ export function SecurityScreen({
     } catch (cause) {
       if (hadSlackPrimary && cause instanceof ApiClientError && cause.code === "SECURITY_REQUIRED") {
         await reload().catch(() => undefined);
-        setProofExpired(true);
       }
       setError(cause instanceof Error ? cause.message : "Security request failed.");
     } finally {
@@ -144,7 +144,7 @@ export function SecurityScreen({
   const enrollment = status.state === "enrollment_required" && !status.totp && !status.passkeys;
   const recoveryEnrollment = status.state === "recovery_required";
   const canManage = status.fresh || enrollment || recoveryEnrollment;
-  const slackPrimary = status.slackPrimary?.available === true && !proofExpired;
+  const slackPrimary = status.slackPrimary?.available === true;
   const primaryFactorFormVisible =
     codes.length === 0 &&
     ((recoveryEnrollment && status.recoveryCanResume) ||

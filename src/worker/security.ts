@@ -16,7 +16,13 @@ const RECOVERY_MS = 10 * 60_000;
 const RECOVERY_RESUME_MS = 24 * 60 * 60_000;
 const PENDING_RECOVERY_MS = 30 * 60_000;
 const PASSWORD_ATTEMPT_RULE = { window: 15 * 60, max: 10 };
-type SecurityAccount = { generation: number; recovery_required: number; codes_saved: number; locked_until: number };
+type SecurityAccount = {
+  generation: number;
+  recovery_required: number;
+  recovery_started_at: number | null;
+  codes_saved: number;
+  locked_until: number;
+};
 type Grant = { method: "totp" | "passkey" | "trust" | "recovery"; verified_at: number; expires_at: number };
 type Identity = { userId: string; sessionId: string | null; challenge: string | null };
 
@@ -34,7 +40,7 @@ function field(ctx: GenericEndpointContext, key: string): string {
 
 async function securityAccount(env: Env, userId: string): Promise<SecurityAccount> {
   const account = await env.DB.prepare(
-    "SELECT generation,recovery_required,codes_saved,locked_until FROM account_security WHERE user_id=?",
+    "SELECT generation,recovery_required,recovery_started_at,codes_saved,locked_until FROM account_security WHERE user_id=?",
   )
     .bind(userId)
     .first<SecurityAccount>();
@@ -89,6 +95,7 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
   else if (!row.totp && !row.passkeys) state = "enrollment_required";
   else if (proof && proof.method !== "recovery") state = row.codes_saved ? "ready" : "enrollment_required";
   const status: SecurityStatus = {
+    serverNow: time,
     state,
     totp: !!row.totp,
     passkeys: row.passkeys,
@@ -98,7 +105,10 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
     ...(state === "recovery_required"
       ? {
           recoveryCanResume:
-            row.method === "recovery" && row.verified_at !== null && row.verified_at > time - RECOVERY_RESUME_MS,
+            row.recovery_started_at !== null &&
+            row.recovery_started_at > time - RECOVERY_RESUME_MS &&
+            ((row.method === "recovery" && row.verified_at !== null) ||
+              (row.slack_primary_expires_at !== null && row.slack_primary_expires_at > time)),
         }
       : {}),
     ...(row.slack_primary_expires_at
@@ -486,10 +496,9 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
             ...guardBinds,
           ),
           env.DB.prepare(`UPDATE user SET twoFactorEnabled=1 WHERE id=? AND ${guard}`).bind(id.userId, ...guardBinds),
-          env.DB.prepare(`UPDATE account_security SET recovery_required=0 WHERE user_id=? AND ${guard}`).bind(
-            id.userId,
-            ...guardBinds,
-          ),
+          env.DB.prepare(
+            `UPDATE account_security SET recovery_required=0,recovery_started_at=NULL WHERE user_id=? AND ${guard}`,
+          ).bind(id.userId, ...guardBinds),
           env.DB.prepare(`DELETE FROM trusted_browsers WHERE user_id=? AND ${guard}`).bind(id.userId, ...guardBinds),
           env.DB.prepare(`DELETE FROM session WHERE userId=? AND id!=? AND ${guard}`).bind(
             id.userId,
@@ -628,20 +637,28 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         if (!status.recoveryCanResume) throw deny("Use a recovery code or operator reset token first.");
         await attempt(env, id.userId);
         await primaryFactor(ctx, env, id);
-        // Keep verified_at unchanged: password re-entry cannot extend the absolute deadline.
-        const resumed = await env.DB.prepare(`UPDATE session_security SET expires_at=MIN(?,verified_at+?)
-          WHERE session_id=? AND user_id=? AND method='recovery' AND generation=? AND verified_at>?
-          AND EXISTS(SELECT 1 FROM account_security a WHERE a.user_id=session_security.user_id
-            AND a.generation=session_security.generation AND a.recovery_required=1)
-          AND EXISTS(SELECT 1 FROM session live WHERE live.id=session_security.session_id AND live.expiresAt>?) RETURNING session_id`)
+        // The account timestamp is the absolute deadline across replacement sessions.
+        const resumed = await env.DB.prepare(`INSERT INTO session_security
+          (session_id,user_id,generation,verified_at,expires_at,method,trust_id)
+          SELECT live.id,a.user_id,a.generation,a.recovery_started_at,MIN(?,a.recovery_started_at+?),'recovery',NULL
+            FROM account_security a JOIN session live ON live.userId=a.user_id AND live.id=? AND live.expiresAt>?
+           WHERE a.user_id=? AND a.generation=? AND a.recovery_required=1
+             AND a.recovery_started_at>? AND NOT EXISTS (SELECT 1 FROM security_resets reset WHERE reset.user_id=a.user_id)
+             AND (EXISTS (SELECT 1 FROM session_security old WHERE old.session_id=live.id AND old.user_id=a.user_id
+                    AND old.generation=a.generation AND old.method='recovery')
+               OR EXISTS (SELECT 1 FROM slack_primary_factor_proofs proof WHERE proof.session_id=live.id
+                    AND proof.user_id=a.user_id AND proof.expires_at>?))
+          ON CONFLICT(session_id) DO UPDATE SET generation=excluded.generation,verified_at=excluded.verified_at,
+            expires_at=excluded.expires_at,method='recovery',trust_id=NULL RETURNING session_id`)
           .bind(
             Date.now() + RECOVERY_MS,
             RECOVERY_RESUME_MS,
             id.sessionId,
+            new Date().toISOString(),
             id.userId,
             account.generation,
             Date.now() - RECOVERY_RESUME_MS,
-            new Date().toISOString(),
+            Date.now(),
           )
           .first();
         if (!resumed) throw deny("Recovery expired or was revoked. Use a recovery code or operator reset token.");
@@ -668,8 +685,9 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
           : "EXISTS(SELECT 1 FROM session WHERE id=? AND userId=? AND expiresAt>?)";
         const guard = "EXISTS(SELECT 1 FROM account_security WHERE user_id=? AND codes_batch=?)";
         const result = await env.DB.batch([
-          env.DB.prepare(`UPDATE account_security SET generation=generation+1,recovery_required=1,codes_saved=0,codes_batch=?
+          env.DB.prepare(`UPDATE account_security SET generation=generation+1,recovery_required=1,recovery_started_at=?,codes_saved=0,codes_batch=?
             WHERE user_id=? AND generation=? AND ${credential} AND ${authenticated} RETURNING generation`).bind(
+            time,
             receipt,
             id.userId,
             account.generation,
@@ -847,7 +865,9 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
                 ctx.path === "/two-factor/verify-totp" ? "totp" : "passkey",
                 capture.generation,
               );
-              await env.DB.prepare("UPDATE account_security SET recovery_required=0 WHERE user_id=? AND generation=?")
+              await env.DB.prepare(
+                "UPDATE account_security SET recovery_required=0,recovery_started_at=NULL WHERE user_id=? AND generation=?",
+              )
                 .bind(id.userId, capture.generation)
                 .run();
             }

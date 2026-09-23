@@ -20,7 +20,7 @@ export function slackThreadFanoutStatements(
       .prepare(`UPDATE slack_thread_links SET state = 'retired', updated_at = ? WHERE thread_id = ? AND state IN ('pending', 'active')
       AND NOT EXISTS (SELECT 1 FROM slack_channel_subscriptions s JOIN slack_installations i ON i.id = s.installation_id
         JOIN pages p ON p.id = slack_thread_links.page_id AND p.space_id = s.space_id AND p.workspace_id = i.workspace_id
-        WHERE s.id = slack_thread_links.subscription_id AND s.mirror_enabled = 1 AND s.channel_id = slack_thread_links.channel_id
+        WHERE s.id = slack_thread_links.subscription_id AND s.mirror_enabled = 1 AND s.validation_state = 'valid' AND s.channel_id = slack_thread_links.channel_id
           AND (s.page_id IS NULL OR s.page_id = p.id) AND i.disconnected_at IS NULL AND i.generation = slack_thread_links.installation_generation
           AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0)`)
       .bind(createdAt, threadId),
@@ -35,6 +35,7 @@ export function slackThreadFanoutStatements(
           AND (candidate.page_id = p.id OR candidate.page_id IS NULL) AND candidate.mirror_enabled = 1
         ORDER BY candidate.page_id IS NULL, candidate.id LIMIT 1)
       WHERE p.id = ? AND p.workspace_id = ? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
+        AND s.validation_state = 'valid'
         AND s.muted_at IS NULL AND (s.snoozed_until IS NULL OR s.snoozed_until <= ?)
         AND NOT EXISTS (SELECT 1 FROM comments WHERE id = ? AND slack_source_receipt_id IS NOT NULL)`)
       .bind(
@@ -51,7 +52,7 @@ export function slackThreadFanoutStatements(
       .prepare(`INSERT OR IGNORE INTO slack_thread_deliveries
       (id, link_id, operation, source_id, actor_id, comment_id, created_at, updated_at)
       SELECT l.id || ':root', l.id, 'root', l.thread_id, ?,
-        COALESCE(?, (SELECT id FROM comments WHERE thread_id = l.thread_id AND deleted_at IS NULL ORDER BY created_at, id LIMIT 1)), ?, ?
+        COALESCE(?, (SELECT id FROM comments WHERE thread_id = l.thread_id AND parent_id IS NULL AND deleted_at IS NULL ORDER BY created_at, id LIMIT 1)), ?, ?
       FROM slack_thread_links l WHERE l.thread_id = ? AND l.state = 'pending'`)
       .bind(actorId, event.commentId ?? null, createdAt, createdAt, threadId),
     db

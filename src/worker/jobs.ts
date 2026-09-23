@@ -40,6 +40,9 @@ const OUTBOX_POISON_WARNING_ATTEMPTS = 10;
 const OUTBOX_POISON_WARNING_INTERVAL = 24;
 const OUTBOX_RETRY_BASE_MS = 10_000;
 const OUTBOX_RETRY_MAX_MS = 60 * 60_000;
+const SLACK_REDRIVE_STALE_MS = 30 * 60_000;
+const SLACK_REDRIVE_BASE_MS = 15 * 60_000;
+const SLACK_REDRIVE_MAX_MS = 6 * 60 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
@@ -1406,6 +1409,63 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
       .bind(Date.now(), claimToken)
       .run();
   }
+}
+
+// Queue retries are bounded. Requeue only receipt-backed work that is still
+// pending; delivery handlers provide the idempotency and uncertain-send fence.
+export async function redriveStaleSlackOutbox(env: Env) {
+  const now = Date.now();
+  const rows = await env.DB.prepare(`SELECT id, topic, payload_json, enqueued_at, attempts FROM outbox
+    WHERE topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action')
+      AND enqueued_at IS NOT NULL AND enqueued_at <= ? AND available_at <= ?
+      AND (
+        (topic = 'slack_thread_reply' AND EXISTS (
+          SELECT 1 FROM slack_thread_deliveries d
+          WHERE d.id = json_extract(CASE WHEN json_valid(outbox.payload_json) THEN outbox.payload_json ELSE '{}' END, '$.deliveryId')
+            AND d.state IN ('pending','sending')
+        )) OR
+        (topic = 'slack_inbound_reply' AND EXISTS (
+          SELECT 1 FROM slack_inbound_receipts r
+          WHERE r.id = json_extract(CASE WHEN json_valid(outbox.payload_json) THEN outbox.payload_json ELSE '{}' END, '$.receiptId')
+            AND r.processed_at IS NULL
+        )) OR
+        (topic IN ('slack_thread_action','slack_workspace_action') AND EXISTS (
+          SELECT 1 FROM slack_interaction_receipts r
+          WHERE r.id = json_extract(CASE WHEN json_valid(outbox.payload_json) THEN outbox.payload_json ELSE '{}' END, '$.receiptId')
+            AND r.processed_at IS NULL
+        ))
+      )
+    ORDER BY enqueued_at LIMIT 50`)
+    .bind(now - SLACK_REDRIVE_STALE_MS, now)
+    .all<{ id: string; topic: string; payload_json: string; enqueued_at: number; attempts: number }>();
+  let redriven = 0;
+  for (const row of rows.results) {
+    const payload = jsonRecord(row.payload_json);
+    const key = row.topic === "slack_thread_reply" ? payload.deliveryId : payload.receiptId;
+    if (typeof key !== "string") continue;
+    const pending =
+      row.topic === "slack_thread_reply"
+        ? await env.DB.prepare(`SELECT 1 FROM slack_thread_deliveries WHERE id = ? AND state IN ('pending','sending')`)
+            .bind(key)
+            .first()
+        : await env.DB.prepare(`SELECT 1 FROM ${row.topic === "slack_inbound_reply" ? "slack_inbound_receipts" : "slack_interaction_receipts"}
+          WHERE id = ? AND processed_at IS NULL`)
+            .bind(key)
+            .first();
+    if (!pending) continue;
+    const backoff = Math.min(
+      SLACK_REDRIVE_MAX_MS,
+      SLACK_REDRIVE_BASE_MS * 2 ** Math.min(Math.max(row.attempts - 1, 0), 5),
+    );
+    const reset =
+      await env.DB.prepare(`UPDATE outbox SET enqueued_at = NULL, available_at = ?, last_error = 'Queue acknowledgement missing; scheduled redrive'
+      WHERE id = ? AND enqueued_at = ?`)
+        .bind(now + backoff, row.id, row.enqueued_at)
+        .run();
+    if (reset.meta.changes) redriven++;
+  }
+  if (redriven) logger.warn("slack.outbox.redrive", "slack", "Requeued stale Slack work.", { count: redriven });
+  return redriven;
 }
 
 export async function consumeDeliveryMessage(

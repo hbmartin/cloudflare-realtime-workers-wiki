@@ -141,6 +141,7 @@ import {
   jobJson,
   NotesJobWorkflow,
   recoverQueuedJobs,
+  redriveStaleSlackOutbox,
   startJobExecution,
   sweepOutbox,
   type DeliveryQueueMessage,
@@ -6426,6 +6427,7 @@ export default {
           await sweepOutbox(env);
           await purgeExpiredSlackSearchSessions(env);
         },
+        slack_redrive: () => redriveStaleSlackOutbox(env),
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
         slack_digests: () => sendDueSlackChannelDigests(env),

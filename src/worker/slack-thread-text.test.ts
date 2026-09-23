@@ -66,4 +66,24 @@ describe("Slack thread text", () => {
     expect(text.length).toBeLessThan(2800);
     expect(text.endsWith("…")).toBe(true);
   });
+  it("keeps delimiters inside words and preserves safe outbound link targets", async () => {
+    const imported = await slackReplyBody("file_name_here and *bold* <https://example.test/a|link>", async () => null);
+    const json = JSON.stringify(imported);
+    expect(json).toContain("file_name_here");
+    expect(json).toContain('"bold":true');
+    expect(json).toContain('"href":"https://example.test/a"');
+    const outbound = [
+      {
+        type: "paragraph",
+        content: [
+          { type: "text", text: "a|b " },
+          { type: "link", href: "https://example.test/a?x=1&y=2", content: [{ type: "text", text: "See|this" }] },
+          { type: "link", href: "javascript:alert(1)", content: [{ type: "text", text: " unsafe" }] },
+        ],
+      },
+    ] as unknown as Parameters<typeof slackCommentText>[0];
+    expect(await slackCommentText(outbound, async () => null)).toContain(
+      "a|b <https://example.test/a?x=1&y=2|See¦this> unsafe",
+    );
+  });
 });

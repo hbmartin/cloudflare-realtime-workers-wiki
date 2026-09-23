@@ -2,6 +2,7 @@ import type { CommentBody } from "../shared/types";
 import { addCommentReply, setThreadResolved, type CommentPage } from "./comments";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
+import { pageForIntegrationBot } from "./integrations";
 import { DeliveryInProgressError } from "./notifications";
 import { pageForMember } from "./page-access";
 import { logger } from "./observability";
@@ -23,6 +24,8 @@ const ID = /^[A-Za-z0-9_-]{1,100}$/;
 const TS = /^\d{1,16}\.\d{1,16}$/;
 const DENIED = "This NoteFlare thread is unavailable or you no longer have permission to use it.";
 const CONNECT = "Connect your Slack account from NoteFlare Settings before using this thread.";
+const CONTENT_ERROR =
+  "Your Slack reply could not be imported because it is too large or complex. Shorten it and try again.";
 
 type Link = {
   id: string;
@@ -46,6 +49,7 @@ export type Input = {
   slackUserId: string;
   identity: Identity | null;
   text?: string;
+  textTooLarge?: boolean;
   resolved?: boolean;
 };
 type Delivery = {
@@ -203,8 +207,10 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
   if (!link) throw new HttpError(403, "slack_identity_required", CONNECT);
   const { identity } = await verifiedMember(env, installation, link.slack_user_id);
   if (mapping.page_id) await pageForMember(env, current, mapping.page_id);
+  let channelValidated = false;
   try {
     const channel = await validateChannel(env, installation, mapping.channel_id);
+    channelValidated = true;
     await requireChannelMember(env, installation, mapping.channel_id, identity.slackUserId);
     const result =
       await env.DB.prepare(`UPDATE slack_channel_subscriptions SET mirror_enabled = 1, channel_name = ?, channel_type = ?, validation_state = 'valid', validation_error = NULL, validated_at = ?, bot_is_member = 1, updated_at = ?
@@ -233,11 +239,16 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
   } catch (error) {
     if (String(error).includes("UNIQUE constraint failed"))
       throw new HttpError(409, "slack_mirror_conflict", "Disable the existing mirror for this page or space first.");
-    if (error instanceof HttpError || error instanceof SlackApiError) {
+    if (
+      (!channelValidated && error instanceof HttpError && error.code === "slack_thread_unavailable") ||
+      (error instanceof SlackApiError &&
+        ["channel_not_found", "not_in_channel", "is_archived", "missing_scope", "no_permission"].includes(error.code))
+    ) {
       await env.DB.prepare(
-        `UPDATE slack_channel_subscriptions SET validation_state = 'invalid', validation_error = 'channel_unavailable' WHERE id = ?`,
+        `UPDATE slack_channel_subscriptions SET mirror_enabled = 0, validation_state = 'invalid',
+          validation_error = 'channel_unavailable', updated_at = ? WHERE id = ?`,
       )
-        .bind(subscriptionId)
+        .bind(Date.now(), subscriptionId)
         .run();
     }
     throw error;
@@ -356,6 +367,7 @@ export async function acceptSlackReply(env: Env, payload: SlackEventPayload) {
     .bind(installation.id, event.channel, event.thread_ts)
     .first<Link>();
   if (!link) return true;
+  const textTooLarge = new TextEncoder().encode(event.text).length > 16 * 1024;
   const input: Input = {
     installationId: installation.id,
     generation: installation.generation,
@@ -364,7 +376,7 @@ export async function acceptSlackReply(env: Env, payload: SlackEventPayload) {
     threadTs: event.thread_ts,
     slackUserId: event.user,
     identity: await identityFor(env, installation, event.user),
-    text: new TextEncoder().encode(event.text).length > 16 * 1024 ? "" : event.text,
+    ...(textTooLarge ? { textTooLarge: true } : { text: event.text }),
   };
   const id = crypto.randomUUID();
   await env.DB.batch([
@@ -469,9 +481,16 @@ async function mentionSlackId(env: Env, installation: SlackInstallation, userId:
 
 export async function deliverSlackMutation(env: Env, receiptId: string, action: boolean) {
   const table = action ? "slack_interaction_receipts" : "slack_inbound_receipts";
-  const receipt = await env.DB.prepare(`SELECT payload_json, processed_at, outcome FROM ${table} WHERE id = ?`)
+  const receipt = await env.DB.prepare(
+    `SELECT payload_json, processed_at, outcome, ${action ? "NULL" : "message_ts"} message_ts FROM ${table} WHERE id = ?`,
+  )
     .bind(receiptId)
-    .first<{ payload_json: string | null; processed_at: number | null; outcome: string | null }>();
+    .first<{
+      payload_json: string | null;
+      processed_at: number | null;
+      outcome: string | null;
+      message_ts: string | null;
+    }>();
   if (!receipt || receipt.processed_at !== null || !receipt.payload_json) return;
   const input = JSON.parse(receipt.payload_json) as Input;
   try {
@@ -483,11 +502,18 @@ export async function deliverSlackMutation(env: Env, receiptId: string, action: 
         guard: mutationGuard(env, receiptId, input, link.thread_id),
       });
     } else {
+      if (input.textTooLarge) throw new HttpError(413, "slack_comment_too_large", CONTENT_ERROR);
       const body = await slackReplyBody(input.text ?? "", (id) => mentionMember(env, installation, id, link.page_id));
+      const messageTs = receipt.message_ts;
+      if (!messageTs || !TS.test(messageTs)) throw new HttpError(422, "invalid_slack_timestamp", CONTENT_ERROR);
+      const [seconds, fraction] = messageTs.split(".");
+      const order = BigInt(seconds!) * 1_000_000n + BigInt(fraction!.padEnd(6, "0").slice(0, 6));
+      if (order > BigInt(Number.MAX_SAFE_INTEGER)) throw new HttpError(422, "invalid_slack_timestamp", CONTENT_ERROR);
       await addCommentReply(env, member, page, link.thread_id, body, undefined, {
         receiptId,
         commentId: receiptId,
         guard: mutationGuard(env, receiptId, input, link.thread_id),
+        slackOrderUs: Number(order),
       });
     }
     await broadcastWorkspaceEvent(env, link.workspace_id, { type: "comments-invalidated", pageId: link.page_id });
@@ -498,6 +524,18 @@ export async function deliverSlackMutation(env: Env, receiptId: string, action: 
       .bind(receiptId)
       .first<{ processed_at: number | null }>();
     if (done?.processed_at !== null && done?.processed_at !== undefined) return;
+    const contentError =
+      error instanceof HttpError &&
+      [
+        "slack_comment_too_large",
+        "slack_comment_too_complex",
+        "comment_too_large",
+        "comment_too_complex",
+        "empty_comment",
+        "invalid_comment",
+        "invalid_comment_block",
+        "invalid_slack_timestamp",
+      ].includes(error.code);
     const denied =
       (error instanceof HttpError && error.status < 500) ||
       (error instanceof SlackApiError &&
@@ -512,14 +550,18 @@ export async function deliverSlackMutation(env: Env, receiptId: string, action: 
         ].includes(error.code)) ||
       String(error).includes("CHECK constraint failed: authorized = 1");
     if (!denied) throw error;
-    const reason = error instanceof HttpError && error.code === "slack_identity_required" ? CONNECT : DENIED;
+    const reason = contentError
+      ? CONTENT_ERROR
+      : error instanceof HttpError && error.code === "slack_identity_required"
+        ? CONNECT
+        : DENIED;
     const installation = await env.DB.prepare(`SELECT workspace_id FROM slack_installations WHERE id = ?`)
       .bind(input.installationId)
       .first<{ workspace_id: string }>();
     await env.DB.batch([
       env.DB.prepare(
-        `UPDATE ${table} SET processed_at = ?, outcome = 'denied', payload_json = NULL WHERE id = ? AND processed_at IS NULL`,
-      ).bind(Date.now(), receiptId),
+        `UPDATE ${table} SET processed_at = ?, outcome = ?, payload_json = NULL WHERE id = ? AND processed_at IS NULL`,
+      ).bind(Date.now(), contentError ? "invalid_content" : "denied", receiptId),
       ...(installation
         ? [
             outboxStatement(
@@ -564,7 +606,7 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
     throw error;
   }
   const claimed = await env.DB.prepare(
-    `UPDATE ${table} SET denial_sent_at = ? WHERE id = ? AND outcome = 'denied' AND denial_sent_at IS NULL`,
+    `UPDATE ${table} SET denial_sent_at = ? WHERE id = ? AND outcome IN ('denied', 'invalid_content') AND denial_sent_at IS NULL`,
   )
     .bind(Date.now(), payload.receiptId)
     .run();
@@ -574,7 +616,7 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
       channel: payload.channelId,
       user: payload.slackUserId,
       thread_ts: payload.threadTs,
-      text: payload.text === CONNECT ? CONNECT : DENIED,
+      text: payload.text === CONNECT ? CONNECT : payload.text === CONTENT_ERROR ? CONTENT_ERROR : DENIED,
     });
   } catch (error) {
     if (error instanceof SlackRateLimitError) {
@@ -674,9 +716,32 @@ async function blockedDelivery(env: Env, delivery: Delivery) {
 async function outboundAuthority(env: Env, link: Link, actorId: string) {
   const current = await linkFor(env, link.id);
   const installation = await installationFor(env, current.installation_id, current.installation_generation);
+  const actor = await env.DB.prepare(`SELECT account_type FROM user WHERE id = ?`)
+    .bind(actorId)
+    .first<{ account_type: string }>();
+  if (actor?.account_type === "bot") {
+    const page = await pageForIntegrationBot(env, current.workspace_id, actorId, current.page_id);
+    if (!page) unavailable();
+    return { current, installation, member: null, page: { ...page, effective_role: "editor" as const } };
+  }
   const member = await memberFor(env, current.workspace_id, actorId);
   const page = await pageForMember(env, member, current.page_id);
   return { current, installation, member, page };
+}
+
+async function currentAuthorCanRead(env: Env, link: Link, authorId: string) {
+  const actor = await env.DB.prepare(`SELECT account_type FROM user WHERE id = ?`)
+    .bind(authorId)
+    .first<{ account_type: string }>();
+  if (actor?.account_type === "bot")
+    return Boolean(await pageForIntegrationBot(env, link.workspace_id, authorId, link.page_id));
+  try {
+    await pageForMember(env, await memberFor(env, link.workspace_id, authorId), link.page_id);
+    return true;
+  } catch (error) {
+    if (error instanceof HttpError && error.status < 500) return false;
+    throw error;
+  }
 }
 
 export async function deliverSlackThread(env: Env, deliveryId: string) {
@@ -726,12 +791,7 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       throw new DeliveryInProgressError();
     }
     if (delivery.state === "sending" && delivery.operation !== "refresh") {
-      let recovered: string | null = null;
-      try {
-        recovered = await reconcileDelivery(env, installation, link, delivery);
-      } catch (error) {
-        if (error instanceof SlackRateLimitError) throw error;
-      }
+      const recovered = await reconcileDelivery(env, installation, link, delivery);
       if (recovered) await finishDelivery(env, delivery, link, recovered);
       else await blockedDelivery(env, delivery);
       return;
@@ -752,9 +812,9 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
     if (!thread) unavailable();
     if (
       delivery.operation === "refresh" &&
-      member.role !== "owner" &&
+      member?.role !== "owner" &&
       page.effective_role === "viewer" &&
-      thread.created_by !== member.user.id
+      thread.created_by !== member?.user.id
     )
       unavailable();
     const rootDelivery =
@@ -773,47 +833,58 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
     if (!comment && delivery.operation !== "refresh") unavailable();
     let body = "Comment unavailable.";
     if (comment) {
-      const author = await memberFor(env, link.workspace_id, comment.user_id);
-      await pageForMember(env, author, link.page_id);
-      const authorName = escapeSlackText(comment.name)
-        .slice(0, 150)
-        .replace(/&[^;]*$/g, "");
-      const commentText = await slackCommentText(JSON.parse(comment.body_json) as CommentBody, (id) =>
-        mentionSlackId(env, installation, id, link.page_id),
-      );
-      body = `${authorName}: ${commentText}`;
+      const authorCanRead = await currentAuthorCanRead(env, link, comment.user_id);
+      if (!authorCanRead && delivery.operation !== "refresh") unavailable();
+      if (authorCanRead) {
+        const authorName = escapeSlackText(comment.name)
+          .slice(0, 150)
+          .replace(/&[^;]*$/g, "");
+        const commentText = await slackCommentText(JSON.parse(comment.body_json) as CommentBody, (id) =>
+          mentionSlackId(env, installation, id, link.page_id),
+        );
+        body = `${authorName}: ${commentText}`;
+      }
     }
     const url = `${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(link.page_id)}`;
     const heading = `${thread.resolved_at ? "Resolved" : "Open"} · ${escapeSlackText(page.title.slice(0, 200))}`;
-    const text = delivery.operation === "reply" ? body : `${heading}\n${body}\n<${url}|Open in NoteFlare>`;
+    let text = delivery.operation === "reply" ? body : `${heading}\n${body}\n<${url}|Open in NoteFlare>`;
     const controlState =
       delivery.operation === "reply"
         ? null
         : await env.DB.prepare(`SELECT muted_at, snoozed_until FROM slack_channel_subscriptions WHERE id = ?`)
             .bind(link.subscription_id)
             .first<{ muted_at: number | null; snoozed_until: number | null }>();
-    const blocks: unknown[] =
+    const shareActive =
+      delivery.operation === "reply"
+        ? null
+        : await env.DB.prepare(
+            `SELECT 1 FROM share_links WHERE root_page_id = ? AND workspace_id = ? AND revoked_at IS NULL`,
+          )
+            .bind(link.page_id, link.workspace_id)
+            .first();
+    const rootBlocks = (content: string) =>
+      threadRootBlocks({
+        heading,
+        body: content,
+        url,
+        linkId: link.id,
+        resolved: Boolean(thread.resolved_at),
+        muted: Boolean(controlState?.muted_at || (controlState?.snoozed_until ?? 0) > Date.now()),
+        shareActive: Boolean(shareActive),
+        shareEligible: page.kind !== "diagram",
+      });
+    let blocks: unknown[] =
       delivery.operation === "reply"
         ? [{ type: "section", text: { type: "mrkdwn", verbatim: true, text: body } }]
-        : threadRootBlocks({
-            heading,
-            body,
-            url,
-            linkId: link.id,
-            resolved: Boolean(thread.resolved_at),
-            muted: Boolean(controlState?.muted_at || (controlState?.snoozed_until ?? 0) > Date.now()),
-            shareActive: Boolean(
-              await env.DB.prepare(
-                `SELECT 1 FROM share_links WHERE root_page_id = ? AND workspace_id = ? AND revoked_at IS NULL`,
-              )
-                .bind(link.page_id, link.workspace_id)
-                .first(),
-            ),
-            shareEligible: page.kind !== "diagram",
-          });
+        : rootBlocks(body);
     // Revalidate local authority after Slack lookups, then fence the irreversible send.
     await outboundAuthority(env, link, delivery.actor_id);
-    if (comment) await pageForMember(env, await memberFor(env, link.workspace_id, comment.user_id), link.page_id);
+    if (comment && !(await currentAuthorCanRead(env, link, comment.user_id))) {
+      if (delivery.operation !== "refresh") unavailable();
+      body = "Comment unavailable.";
+      text = `${heading}\n${body}\n<${url}|Open in NoteFlare>`;
+      blocks = rootBlocks(body);
+    }
     const sending = await env.DB.prepare(
       `UPDATE slack_thread_deliveries SET state = 'sending', attempted_at = COALESCE(attempted_at, ?), updated_at = ? WHERE id = ? AND state IN ('pending', 'sending') AND EXISTS (SELECT 1 FROM slack_thread_links WHERE id = ? AND claim_token = ? AND state IN ('pending', 'active'))`,
     )
@@ -853,9 +924,8 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       throw error;
     }
   } catch (error) {
-    if (
-      (error instanceof HttpError && error.status < 500) ||
-      (error instanceof SlackApiError &&
+    if (error instanceof SlackApiError) {
+      if (
         [
           "channel_not_found",
           "not_in_channel",
@@ -864,8 +934,49 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
           "token_revoked",
           "account_inactive",
           "missing_scope",
-        ].includes(error.code))
-    ) {
+          "restricted_action",
+          "no_permission",
+        ].includes(error.code)
+      ) {
+        const subscription = await env.DB.prepare(`SELECT subscription_id FROM slack_thread_links WHERE id = ?`)
+          .bind(delivery.link_id)
+          .first<{ subscription_id: string | null }>();
+        if (subscription?.subscription_id) {
+          await env.DB.prepare(`UPDATE slack_channel_subscriptions SET mirror_enabled = 0, validation_state = 'invalid',
+            validation_error = 'channel_unavailable', updated_at = ? WHERE id = ?`)
+            .bind(Date.now(), subscription.subscription_id)
+            .run();
+          await env.DB.prepare(`UPDATE slack_thread_deliveries SET state = 'retired', updated_at = ?
+            WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id = ?) AND state IN ('pending','sending')`)
+            .bind(Date.now(), subscription.subscription_id)
+            .run();
+        } else {
+          await env.DB.prepare(`UPDATE slack_thread_links SET state = 'retired', updated_at = ? WHERE id = ?`)
+            .bind(Date.now(), delivery.link_id)
+            .run();
+          await env.DB.prepare(`UPDATE slack_thread_deliveries SET state = 'retired', updated_at = ?
+            WHERE link_id = ? AND state IN ('pending','sending')`)
+            .bind(Date.now(), delivery.link_id)
+            .run();
+        }
+        return;
+      }
+      if (error.code === "message_not_found" && delivery.operation === "refresh") {
+        await env.DB.prepare(`UPDATE slack_thread_links SET state = 'retired', updated_at = ? WHERE id = ?`)
+          .bind(Date.now(), delivery.link_id)
+          .run();
+        await env.DB.prepare(`UPDATE slack_thread_deliveries SET state = 'retired', updated_at = ?
+          WHERE link_id = ? AND state IN ('pending','sending')`)
+          .bind(Date.now(), delivery.link_id)
+          .run();
+        return;
+      }
+      if (["invalid_arguments", "invalid_blocks", "msg_too_long"].includes(error.code)) {
+        await blockedDelivery(env, delivery);
+        return;
+      }
+    }
+    if (error instanceof HttpError && error.status < 500) {
       await env.DB.prepare(
         `UPDATE slack_thread_deliveries SET state = CASE WHEN state = 'sending' THEN 'blocked' ELSE 'retired' END, updated_at = ? WHERE id = ? AND state IN ('pending', 'sending')`,
       )
