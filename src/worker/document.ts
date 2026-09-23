@@ -95,19 +95,14 @@ function documentTextNodes(document: Y.Doc) {
 // Read only mention identifiers. A full ProseMirror/diagram projection on every Yjs update
 // would make ordinary typing scale with document serialization cost.
 function liveMentionTargets(document: Y.Doc, kind: "document" | "diagram") {
-  const targets = new Map<string, Set<object>>();
-  const add = (targetId: string, source: object) => {
-    const sources = targets.get(targetId) ?? new Set<object>();
-    sources.add(source);
-    targets.set(targetId, sources);
-  };
+  const targets = new Set<string>();
   if (kind === "diagram") {
     for (const node of document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT).values()) {
       if (!(node instanceof Y.Map)) continue;
       const mentions = node.get("mentions");
       if (!(mentions instanceof Y.Map)) continue;
       for (const [id, label] of mentions.entries())
-        if (/^[\w-]{1,100}$/.test(id) && typeof label === "string") add(id, mentions);
+        if (/^[\w-]{1,100}$/.test(id) && typeof label === "string") targets.add(id);
     }
   } else {
     const visit = (parent: Y.XmlFragment | Y.XmlElement) => {
@@ -116,7 +111,7 @@ function liveMentionTargets(document: Y.Doc, kind: "document" | "diagram") {
         if (child.nodeName === "mention" && child.getAttribute("entityType") === "user") {
           const id = child.getAttribute("entityId");
           const label = child.getAttribute("label");
-          if (typeof id === "string" && id && typeof label === "string" && label) add(id, child);
+          if (typeof id === "string" && id && typeof label === "string" && label) targets.add(id);
         }
         visit(child);
       }
@@ -124,6 +119,41 @@ function liveMentionTargets(document: Y.Doc, kind: "document" | "diagram") {
     visit(document.getXmlFragment("document-store"));
   }
   return targets;
+}
+
+function mentionTargetsMayChange(document: Y.Doc, kind: "document" | "diagram", transaction: Y.Transaction) {
+  if (kind === "document") {
+    const root = document.getXmlFragment("document-store");
+    for (const [type, keys] of transaction.changed) {
+      if (Object.is(type, root)) return true;
+      if (type instanceof Y.XmlElement) {
+        if (keys.has(null)) return true;
+        if (type.nodeName === "mention" && ["entityType", "entityId", "label"].some((key) => keys.has(key)))
+          return true;
+      }
+    }
+    return false;
+  }
+  const nodes = document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT);
+  for (const [type, keys] of transaction.changed) {
+    if (Object.is(type, nodes)) return true;
+    if (!(type instanceof Y.Map)) continue;
+    if (type.parent === nodes && keys.has("mentions")) return true;
+    if (type.parent instanceof Y.Map && type.parent.parent === nodes && type.parent.get("mentions") === type)
+      return true;
+  }
+  return false;
+}
+
+function mentionGroups(targetIds: string[], actors: Map<string, string | null>) {
+  const grouped = new Map<string | null, string[]>();
+  for (const targetId of targetIds) {
+    const actorId = actors.get(targetId) ?? null;
+    const recipients = grouped.get(actorId) ?? [];
+    recipients.push(targetId);
+    grouped.set(actorId, recipients);
+  }
+  return [...grouped].map(([actorId, recipientIds]) => ({ actorId, recipientIds }));
 }
 
 function commentMarkThreadId(markName: string, value: unknown) {
@@ -422,7 +452,7 @@ export class Document extends YServer {
   private pendingUpdates: Uint8Array[] = [];
   private pendingAuthorId: string | null = null;
   private pendingMentionActors = new Map<string, string | null>();
-  private currentMentionTargets = new Map<string, Set<object>>();
+  private currentMentionTargets = new Set<string>();
   private pendingNotifyEdit = false;
   private purged = false;
   private transition: "archive" | "restore" | null = null;
@@ -542,8 +572,8 @@ export class Document extends YServer {
 
     await super.onStart();
     this.currentMentionTargets = liveMentionTargets(this.document, this.metadata.content_kind);
-    this.document.on("update", (update: Uint8Array, origin: unknown) => {
-      this.bufferUpdate(update, origin);
+    this.document.on("update", (update: Uint8Array, origin: unknown, _document: Y.Doc, transaction: Y.Transaction) => {
+      this.bufferUpdate(update, origin, transaction);
     });
     // A restored epoch starts with an R2 snapshot but no local update log. Seed
     // one idempotent Yjs update so the new room regenerates search projections,
@@ -1037,19 +1067,18 @@ export class Document extends YServer {
     return new Response("Not found", { status: 404 });
   }
 
-  private bufferUpdate(update: Uint8Array, origin: unknown) {
+  private bufferUpdate(update: Uint8Array, origin: unknown, transaction?: Y.Transaction) {
     if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) return;
-    const nextTargets = liveMentionTargets(this.document, this.metadata.content_kind);
     const connection = origin && typeof origin === "object" ? (origin as Connection<ConnectionAuth>) : null;
-    const actorId = connection?.state?.userId ?? (origin === "api-mutation" ? this.pendingAuthorId : null);
-    for (const [target, sources] of nextTargets) {
-      const previous = this.currentMentionTargets.get(target);
-      if (!previous || ![...sources].some((source) => previous.has(source)))
-        this.pendingMentionActors.set(target, actorId);
+    if (transaction && mentionTargetsMayChange(this.document, this.metadata.content_kind, transaction)) {
+      const nextTargets = liveMentionTargets(this.document, this.metadata.content_kind);
+      const actorId = connection?.state?.userId ?? (origin === "api-mutation" ? this.pendingAuthorId : null);
+      for (const target of nextTargets)
+        if (!this.currentMentionTargets.has(target)) this.pendingMentionActors.set(target, actorId);
+      for (const target of this.currentMentionTargets)
+        if (!nextTargets.has(target)) this.pendingMentionActors.delete(target);
+      this.currentMentionTargets = nextTargets;
     }
-    for (const target of this.currentMentionTargets.keys())
-      if (!nextTargets.has(target)) this.pendingMentionActors.delete(target);
-    this.currentMentionTargets = nextTargets;
     this.pendingUpdates.push(update);
     this.pendingAuthorId = connection?.state?.userId ?? this.pendingAuthorId;
     this.pendingNotifyEdit ||= Boolean(connection?.state?.userId);
@@ -1498,8 +1527,7 @@ export class Document extends YServer {
               })),
           ...(effectsSuppressed || !metadataAtStart.notify_edit
             ? []
-            : newMentionIds.flatMap((targetId) => {
-                const actorId = mentionActors.get(targetId) ?? null;
+            : mentionGroups(newMentionIds, mentionActors).flatMap(({ actorId, recipientIds }) => {
                 return notificationFanoutStatements(this.bindings.DB, {
                   workspaceId: page.workspace_id,
                   spaceId: page.space_id,
@@ -1507,8 +1535,8 @@ export class Document extends YServer {
                   threadId: null,
                   actorId,
                   eventType: "mention",
-                  sourceId: `${pageId}:${epoch}:${maximum}:${targetId}`,
-                  recipientIds: [targetId],
+                  sourceId: `${pageId}:${epoch}:${maximum}:${actorId ?? "collaborator"}`,
+                  recipientIds,
                   emitSlackChannel: actorId !== null,
                   data: { sequence: maximum },
                   createdAt: timestamp,
@@ -1954,8 +1982,7 @@ export class Document extends YServer {
             createdAt: timestamp,
           }),
           ...(metadataAtStart.notify_edit
-            ? newMentionIds.flatMap((targetId) => {
-                const actorId = mentionActors.get(targetId) ?? null;
+            ? mentionGroups(newMentionIds, mentionActors).flatMap(({ actorId, recipientIds }) => {
                 return notificationFanoutStatements(this.bindings.DB, {
                   workspaceId: page.workspace_id,
                   spaceId: page.space_id,
@@ -1963,8 +1990,8 @@ export class Document extends YServer {
                   threadId: null,
                   actorId,
                   eventType: "mention",
-                  sourceId: `${pageId}:${epoch}:${maximum}:${targetId}`,
-                  recipientIds: [targetId],
+                  sourceId: `${pageId}:${epoch}:${maximum}:${actorId ?? "collaborator"}`,
+                  recipientIds,
                   emitSlackChannel: actorId !== null,
                   data: { sequence: maximum },
                   createdAt: timestamp,

@@ -385,6 +385,10 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
             {subscriptions.map((subscription) => {
               const space = spaces.find((candidate) => candidate.id === subscription.spaceId);
               const page = subscription.pageId ? pages.find((candidate) => candidate.id === subscription.pageId) : null;
+              const paused =
+                (subscription.mutedAt !== null && subscription.mutedAt !== undefined) ||
+                (subscription.snoozedUntil ?? 0) > currentTime;
+              const pauseLabel = paused ? "Unmute" : "Mute";
               return (
                 <article key={subscription.id}>
                   <div>
@@ -420,20 +424,10 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                   </button>
                   <button
                     disabled={busy}
-                    onClick={() =>
-                      void pauseChannel(
-                        subscription,
-                        (subscription.mutedAt !== null && subscription.mutedAt !== undefined) ||
-                          (subscription.snoozedUntil ?? 0) > currentTime
-                          ? "unmute"
-                          : "mute",
-                      )
-                    }
+                    aria-label={`${pauseLabel} #${subscription.channelName || subscription.channelId}`}
+                    onClick={() => void pauseChannel(subscription, paused ? "unmute" : "mute")}
                   >
-                    {(subscription.mutedAt !== null && subscription.mutedAt !== undefined) ||
-                    (subscription.snoozedUntil ?? 0) > currentTime
-                      ? "Unmute"
-                      : "Mute"}
+                    {pauseLabel}
                   </button>
                   <select
                     aria-label={`Snooze updates for #${subscription.channelName || subscription.channelId}`}

@@ -2802,7 +2802,8 @@ app.post("/api/slack/interactions", async (c) => {
   } catch (error) {
     if (error instanceof HttpError && error.code === "slack_ack_timeout") throw error;
     if (payload.type === "block_suggestion") return c.json({ options: [] });
-    if (error instanceof HttpError && error.status < 500) return c.json({ ok: true });
+    if (error instanceof HttpError && error.status < 500)
+      return payload.type === "view_submission" ? c.body(null, 200) : c.json({ ok: true });
     throw error;
   }
   if (workspace.handled) {

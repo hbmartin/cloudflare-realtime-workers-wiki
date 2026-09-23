@@ -759,12 +759,24 @@ function homeGuard(env: Env, receiptId: string, input: ActionInput, sessionId: s
   );
 }
 
+async function supersedeHomeAction(env: Env, receiptId: string) {
+  await env.DB.prepare(
+    `UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'superseded', payload_json = NULL
+      WHERE id = ? AND processed_at IS NULL`,
+  )
+    .bind(Date.now(), receiptId)
+    .run();
+}
+
 async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput) {
   if (!input.sessionId) unavailable();
   const installation = await installationFor(env, input.installationId, input.generation);
   const session = await sessionFor(env, input.sessionId, "home", installation, input.slackUserId);
-  if (session.view_id !== input.viewId || session.view_hash !== input.viewHash) unavailable();
   const { member } = await verifiedMember(env, installation, input.slackUserId, input.identity);
+  if (session.view_id !== input.viewId || session.view_hash !== input.viewHash) {
+    await supersedeHomeAction(env, receiptId);
+    return;
+  }
   const state = parseSession(session) as HomeState;
   if (input.actionId === "noteflare_home_read") {
     await env.DB.batch([
@@ -787,11 +799,17 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
   const next: HomeState = { asOf: state.asOf, cursors: [...state.cursors], page: state.page };
   if (input.actionId === "noteflare_home_next") {
     const current = await mentionsInbox(env, member, state.asOf, state.cursors[state.page] ?? null, 10);
-    if (!current.nextCursor) unavailable();
+    if (!current.nextCursor) {
+      await supersedeHomeAction(env, receiptId);
+      return;
+    }
     next.cursors = [...state.cursors.slice(0, state.page + 1), current.nextCursor];
     next.page += 1;
   } else if (input.actionId === "noteflare_home_previous") {
-    if (!state.page) unavailable();
+    if (!state.page) {
+      await supersedeHomeAction(env, receiptId);
+      return;
+    }
     next.page -= 1;
     next.cursors = next.cursors.slice(0, next.page + 1);
   } else unavailable();
@@ -810,12 +828,22 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
   )
     .bind(JSON.stringify(next), session.revision + 1, pendingToken, session.id, session.revision, session.view_hash)
     .run();
-  if (!intent.meta.changes) unavailable();
-  const published = await slackApi(env, installation, "views.publish", {
-    user_id: input.slackUserId,
-    view,
-    ...(session.view_hash ? { hash: session.view_hash } : {}),
-  });
+  if (!intent.meta.changes) {
+    await supersedeHomeAction(env, receiptId);
+    return;
+  }
+  let published: { view: { id: string; hash?: string } };
+  try {
+    published = await slackApi(env, installation, "views.publish", {
+      user_id: input.slackUserId,
+      view,
+      ...(session.view_hash ? { hash: session.view_hash } : {}),
+    });
+  } catch (error) {
+    if (!(error instanceof SlackApiError && error.code === "hash_conflict")) throw error;
+    await supersedeHomeAction(env, receiptId);
+    return;
+  }
   await env.DB.batch([
     env.DB.prepare(`UPDATE slack_view_sessions SET state_json = ?, view_id = ?, view_hash = ?,
       pending_state_json = NULL, pending_revision = NULL, pending_token = NULL,
@@ -839,7 +867,16 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
   const committed = await env.DB.prepare(`SELECT processed_at FROM slack_interaction_receipts WHERE id = ?`)
     .bind(receiptId)
     .first<{ processed_at: number | null }>();
-  if (!committed?.processed_at) throw new Error("Slack Home navigation could not be finalized.");
+  if (!committed?.processed_at) {
+    const current = await env.DB.prepare(`SELECT revision, pending_token FROM slack_view_sessions WHERE id = ?`)
+      .bind(session.id)
+      .first<{ revision: number; pending_token: string | null }>();
+    if (current && (current.revision > session.revision || current.pending_token !== pendingToken)) {
+      await supersedeHomeAction(env, receiptId);
+      return;
+    }
+    throw new Error("Slack Home navigation could not be finalized.");
+  }
 }
 
 async function deliverRootAction(env: Env, receiptId: string, input: ActionInput) {

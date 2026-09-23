@@ -274,6 +274,7 @@ describe("notification feed and subscriptions", () => {
         );
       add(first.userId, installed.userId);
       add(installed.userId, second.userId);
+      add(second.userId, installed.userId);
     });
     await stub.fetch(
       new Request("https://document.internal/content", {
@@ -289,19 +290,25 @@ describe("notification feed and subscriptions", () => {
       [
         { target_user_id: first.userId, first_seen_actor_id: installed.userId },
         { target_user_id: installed.userId, first_seen_actor_id: second.userId },
+        { target_user_id: second.userId, first_seen_actor_id: installed.userId },
       ].sort((a, b) => (a.target_user_id < b.target_user_id ? -1 : 1)),
     );
     const notifications = await env.DB.prepare(
-      `SELECT user_id, actor_id FROM notifications WHERE page_id = ? AND event_type = 'mention' ORDER BY user_id`,
+      `SELECT user_id, actor_id, dedupe_key FROM notifications
+        WHERE page_id = ? AND event_type = 'mention' ORDER BY user_id`,
     )
       .bind(installed.page.id)
-      .all<{ user_id: string; actor_id: string | null }>();
-    expect(notifications.results).toEqual(
+      .all<{ user_id: string; actor_id: string | null; dedupe_key: string }>();
+    expect(notifications.results.map(({ user_id, actor_id }) => ({ user_id, actor_id }))).toEqual(
       [
         { user_id: first.userId, actor_id: installed.userId },
         { user_id: installed.userId, actor_id: second.userId },
+        { user_id: second.userId, actor_id: installed.userId },
       ].sort((a, b) => (a.user_id < b.user_id ? -1 : 1)),
     );
+    const firstKey = notifications.results.find((row) => row.user_id === first.userId)!.dedupe_key;
+    const secondKey = notifications.results.find((row) => row.user_id === second.userId)!.dedupe_key;
+    expect(firstKey.slice(0, -first.userId.length)).toBe(secondKey.slice(0, -second.userId.length));
   });
 
   it("credits a removed and reinserted mention to its new author", async () => {
@@ -314,13 +321,15 @@ describe("notification feed and subscriptions", () => {
         headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
       }),
     );
-    const add = async (actorId: string, replace = false) =>
+    const add = async (actorId: string, replace: "none" | "atomic" | "separate" = "none") =>
       runInDurableObject(stub, async (instance) => {
         const document = (instance as unknown as { document: Y.Doc }).document;
+        const root = document.getXmlFragment("document-store");
+        if (replace === "separate")
+          document.transact(() => root.delete(0, root.length), { state: { userId: actorId } });
         document.transact(
           () => {
-            const root = document.getXmlFragment("document-store");
-            if (replace) root.delete(0, root.length);
+            if (replace === "atomic") root.delete(0, root.length);
             const paragraph = new Y.XmlElement("paragraph");
             const mention = new Y.XmlElement("mention");
             mention.setAttribute("entityType", "user");
@@ -338,7 +347,20 @@ describe("notification feed and subscriptions", () => {
         headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
       }),
     );
-    await add(second.userId, true);
+    await add(second.userId, "atomic");
+    await stub.fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    expect(
+      await env.DB.prepare(
+        `SELECT first_seen_actor_id FROM member_mentions WHERE source_page_id = ? AND target_user_id = ?`,
+      )
+        .bind(installed.page.id, target.userId)
+        .first(),
+    ).toEqual({ first_seen_actor_id: installed.userId });
+    await add(second.userId, "separate");
     await stub.fetch(
       new Request("https://document.internal/content", {
         headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },

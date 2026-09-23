@@ -287,9 +287,9 @@ describe("Slack thread mirror controls", () => {
   it("shows mute state and lets an owner unmute without an active root", async () => {
     setupMirror();
     render(<SlackSettings owner spaces={[space]} pages={[page]} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Mute" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Mute #product" }));
     expect(await screen.findByText("Muted until you unmute this mapping.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Unmute" }));
+    fireEvent.click(screen.getByRole("button", { name: "Unmute #product" }));
     await waitFor(() => expect(screen.queryByText("Muted until you unmute this mapping.")).not.toBeInTheDocument());
     fireEvent.change(screen.getByLabelText("Snooze updates for #product"), { target: { value: "8" } });
     await waitFor(() =>

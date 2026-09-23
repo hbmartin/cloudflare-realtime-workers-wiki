@@ -804,6 +804,20 @@ describe("interactive Slack workspace", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("");
     await waitOnExecutionContext(context);
+    const staleContext = createExecutionContext();
+    const stale = await worker.fetch(
+      await signedSlackRequest(
+        "/api/slack/interactions",
+        new URLSearchParams({
+          payload: JSON.stringify({ ...payload, view: { ...payload.view, hash: "stale-hash" } }),
+        }).toString(),
+      ),
+      runtime(),
+      staleContext,
+    );
+    expect(stale.status).toBe(200);
+    expect(await stale.text()).toBe("");
+    await waitOnExecutionContext(staleContext);
   });
 
   it("navigates Home by Mentions cursors, records actor context, and marks the snapshot read", async () => {
@@ -909,6 +923,11 @@ describe("interactive Slack workspace", () => {
       `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_home_next'`,
     ).all<{ id: string }>();
     await Promise.allSettled(receipts.results.map((receipt) => deliverSlackWorkspaceAction(runtime(), receipt.id)));
+    await Promise.all(receipts.results.map((receipt) => deliverSlackWorkspaceAction(runtime(), receipt.id)));
+    const outcomes = await env.DB.prepare(
+      `SELECT outcome FROM slack_interaction_receipts WHERE callback_id = 'noteflare_home_next' ORDER BY outcome`,
+    ).all<{ outcome: string }>();
+    expect(outcomes.results.map((row) => row.outcome)).toEqual(["accepted", "superseded"]);
     expect(
       await env.DB.prepare(`SELECT json_extract(state_json, '$.page') page FROM slack_view_sessions WHERE id = ?`)
         .bind(session!.id)
