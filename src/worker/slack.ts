@@ -1,15 +1,9 @@
-import type {
-  NotificationEventType,
-  SearchResponse,
-  SlackCapability,
-  SlackCapabilityHealth,
-  SlackStatus,
-} from "../shared/types";
+import type { NotificationEventType, SlackCapability, SlackCapabilityHealth, SlackStatus } from "../shared/types";
 import { tracing } from "cloudflare:workers";
 import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256 } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
-import { parseSearchRequest, searchPages } from "./search";
+import { safeSlackText, unfurlBlocks } from "./slack-blocks";
 import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
 
 const OAUTH_STATE_TTL_MS = 10 * 60_000;
@@ -83,9 +77,20 @@ export type SlackInteractionPayload = {
   action_ts?: unknown;
   channel?: { id?: unknown };
   message?: { ts?: unknown };
-  actions?: Array<{ action_id?: unknown; action_ts?: unknown; value?: unknown }>;
+  actions?: Array<{ action_id?: unknown; action_ts?: unknown; value?: unknown; selected_option?: { value?: unknown } }>;
   team?: { id?: unknown };
   user?: { id?: unknown };
+  view?: {
+    id?: unknown;
+    hash?: unknown;
+    private_metadata?: unknown;
+    callback_id?: unknown;
+    state?: { values?: unknown };
+  };
+  container?: { channel_id?: unknown; message_ts?: unknown; app_unfurl_url?: unknown };
+  app_unfurl?: { app_unfurl_url?: unknown };
+  value?: unknown;
+  action_id?: unknown;
 };
 
 export class SlackRateLimitError extends Error {
@@ -189,6 +194,10 @@ export type SlackApiContracts = {
   };
   "views.open": {
     input: { trigger_id: string; view: Record<string, unknown> };
+    output: { view: { id: string; hash?: string } };
+  };
+  "views.update": {
+    input: { view_id: string; view: Record<string, unknown>; hash?: string };
     output: { view: { id: string; hash?: string } };
   };
   "views.publish": {
@@ -788,6 +797,7 @@ export async function slackApi<Method extends SlackApiMethod>(
   installation: SlackInstallation,
   method: Method,
   payload: SlackApiContracts[Method]["input"],
+  timeoutMs = SLACK_FETCH_TIMEOUT_MS,
 ): Promise<SlackApiContracts[Method]["output"]> {
   const response = await traced(tracing, "notes.integration.slack", { "notes.operation": method }, async () => {
     return fetch(`https://slack.com/api/${method}`, {
@@ -797,7 +807,7 @@ export async function slackApi<Method extends SlackApiMethod>(
         "content-type": "application/json; charset=utf-8",
       },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     }).catch((error: unknown) => {
       if (isTimeoutAbort(error)) throw new Error(`Slack ${method} timed out.`);
       throw error;
@@ -987,7 +997,17 @@ async function linkedMember(env: Env, teamId: string, slackUserId: string) {
   } satisfies MemberContext;
 }
 
-export async function handleSlackCommand(env: Env, form: URLSearchParams) {
+export async function handleSlackCommand(
+  env: Env,
+  form: URLSearchParams,
+  openSearch?: (
+    env: Env,
+    installation: SlackInstallation,
+    userId: string,
+    triggerId: string,
+    query: string,
+  ) => Promise<{ response_type: string; text: string }>,
+) {
   const teamId = form.get("team_id") ?? "";
   const slackUserId = form.get("user_id") ?? "";
   const query = (form.get("text") ?? "").trim();
@@ -1006,28 +1026,8 @@ export async function handleSlackCommand(env: Env, form: URLSearchParams) {
       text: `Link your NoteFlare account: ${env.BETTER_AUTH_URL}/?view=settings&slackLink=${encodeURIComponent(rawToken)}`,
     };
   }
-  const member = await linkedMember(env, teamId, slackUserId);
-  if (!member) return { response_type: "ephemeral", text: "Link your account first with `/notes link`." };
-  if (!query)
-    return {
-      response_type: "ephemeral",
-      text: "Use `/notes <query>` to search or `/notes link` to link your account.",
-    };
-  const url = new URL("https://notes.invalid/api/search");
-  url.searchParams.set("q", query);
-  url.searchParams.set("limit", "5");
-  const result: SearchResponse = await searchPages(env.DB, member, parseSearchRequest(url.href));
-  return {
-    response_type: "ephemeral",
-    text: result.results.length
-      ? result.results
-          .map(
-            (item) =>
-              `• <${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(item.page.id)}|${escapeSlackMrkdwn(item.page.title)}> — ${escapeSlackMrkdwn(item.space.name)}`,
-          )
-          .join("\n")
-      : `No NoteFlare pages matched “${query.slice(0, 100)}”.`,
-  };
+  if (!openSearch) return { response_type: "ephemeral", text: "Search is unavailable. Try `/notes <query>` again." };
+  return openSearch(env, installation, slackUserId, form.get("trigger_id") ?? "", query);
 }
 
 export async function consumeSlackLink(env: Env, member: MemberContext, rawToken: string) {
@@ -1344,12 +1344,13 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     await env.DB.prepare(
       `INSERT OR IGNORE INTO outbox
         (id, workspace_id, topic, payload_json, available_at, created_at, correlation_id)
-       VALUES (?, ?, 'slack_home_publish', json_object('installationId', ?, 'userId', ?), ?, ?, ?)`,
+       VALUES (?, ?, 'slack_home_publish', json_object('installationId', ?, 'generation', ?, 'userId', ?, 'reset', 1), ?, ?, ?)`,
     )
       .bind(
         outboxId,
         installation.workspace_id,
         installation.id,
+        installation.generation,
         payload.event.user,
         timestamp,
         timestamp,
@@ -1381,6 +1382,7 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
   const installation = await activeInstallation(env, payload.team_id);
   if (!member || !installation) return { ok: true };
   const unfurls: Record<string, unknown> = {};
+  const shareReferences: D1PreparedStatement[] = [];
   const notesOrigin = new URL(env.BETTER_AUTH_URL).origin;
   for (const link of payload.event.links ?? []) {
     if (typeof link.url !== "string") continue;
@@ -1394,40 +1396,98 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     }
     if (!pageId) continue;
     const page = await env.DB.prepare(
-      `SELECT p.id, p.title, p.plain_text, p.space_id, s.name space_name, s.visibility,
+      `SELECT p.id, p.title, p.kind, p.plain_text, p.space_id, s.name space_name, s.visibility,
               (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL) accessible,
               EXISTS (SELECT 1 FROM slack_channel_subscriptions subscription
                 WHERE subscription.installation_id = ? AND subscription.channel_id = ?
-                  AND subscription.space_id = p.space_id AND (subscription.page_id IS NULL OR subscription.page_id = p.id)) mapped
+                  AND subscription.space_id = p.space_id AND (subscription.page_id IS NULL OR subscription.page_id = p.id)) mapped,
+              EXISTS (SELECT 1 FROM slack_channel_subscriptions subscription
+                WHERE subscription.installation_id = ? AND subscription.channel_id = ?
+                  AND subscription.validation_state = 'valid' AND subscription.space_id = p.space_id
+                  AND (subscription.page_id IS NULL OR subscription.page_id = p.id)) actionable
          FROM pages p JOIN spaces s ON s.id = p.space_id
          LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
         WHERE p.id = ? AND p.workspace_id = ? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0`,
     )
-      .bind(member.role, installation.id, payload.event.channel, member.user.id, pageId, member.workspace.id)
+      .bind(
+        member.role,
+        installation.id,
+        payload.event.channel,
+        installation.id,
+        payload.event.channel,
+        member.user.id,
+        pageId,
+        member.workspace.id,
+      )
       .first<{
         id: string;
         title: string;
+        kind: string;
         plain_text: string;
         space_id: string;
         space_name: string;
         visibility: string;
         accessible: number;
         mapped: number;
+        actionable: number;
       }>();
     if (!page?.accessible || (page.visibility === "private" && !payload.event.channel.startsWith("D") && !page.mapped))
       continue;
-    unfurls[link.url] = {
-      blocks: [
-        {
-          type: "section",
-          text: {
-            type: "mrkdwn",
-            text: `*${escapeSlackMrkdwn(page.title)}*\n${escapeSlackMrkdwn(
-              page.plain_text.slice(0, 240) || `A page in ${page.space_name}`,
-            )}`,
+    if (!page.actionable || page.kind === "diagram" || !/^[CG][A-Z0-9]+$/.test(payload.event.channel)) {
+      unfurls[link.url] = {
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              verbatim: true,
+              text: `*${safeSlackText(page.title, 200)}*\n${safeSlackText(page.plain_text || `A page in ${page.space_name}`, 240)}`,
+            },
           },
-        },
-      ],
+        ],
+      };
+      continue;
+    }
+    const existingReference = await env.DB.prepare(
+      `SELECT id FROM slack_share_references WHERE installation_id = ? AND channel_id = ? AND message_ts = ? AND url = ?`,
+    )
+      .bind(installation.id, payload.event.channel, payload.event.message_ts, link.url)
+      .first<{ id: string }>();
+    const referenceId = existingReference?.id ?? crypto.randomUUID();
+    const activeShare = await env.DB.prepare(
+      `SELECT id FROM share_links WHERE root_page_id = ? AND workspace_id = ? AND revoked_at IS NULL`,
+    )
+      .bind(page.id, installation.workspace_id)
+      .first<{ id: string }>();
+    shareReferences.push(
+      env.DB.prepare(
+        `INSERT INTO slack_share_references
+        (id, installation_id, installation_generation, share_link_id, page_id, channel_id, message_ts, url, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(installation_id, channel_id, message_ts, url) DO UPDATE SET
+         installation_generation = excluded.installation_generation,
+         share_link_id = excluded.share_link_id, page_id = excluded.page_id,
+         state = 'observed', updated_at = excluded.updated_at`,
+      ).bind(
+        referenceId,
+        installation.id,
+        installation.generation,
+        activeShare?.id ?? null,
+        page.id,
+        payload.event.channel,
+        payload.event.message_ts,
+        link.url,
+        Date.now(),
+        Date.now(),
+      ),
+    );
+    unfurls[link.url] = {
+      blocks: unfurlBlocks({
+        title: page.title,
+        excerpt: page.plain_text || `A page in ${page.space_name}`,
+        referenceId,
+        shareActive: Boolean(activeShare),
+      }),
     };
   }
   if (Object.keys(unfurls).length) {
@@ -1435,13 +1495,15 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     const outboxId = `outbox:slack-unfurl:${id}`;
     const timestamp = Date.now();
     await env.DB.batch([
+      ...shareReferences,
       env.DB.prepare(
         `INSERT OR IGNORE INTO slack_unfurls
-          (id, installation_id, workspace_id, user_id, channel_id, message_ts, unfurls_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, installation_id, installation_generation, workspace_id, user_id, channel_id, message_ts, unfurls_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id,
         installation.id,
+        installation.generation,
         installation.workspace_id,
         member.user.id,
         payload.event.channel,
@@ -1499,37 +1561,30 @@ export async function handleSlackInteraction(env: Env, payload: SlackInteraction
     .bind(crypto.randomUUID(), installation.id, interactionId, payload.callback_id, Date.now())
     .run();
   if (!inserted.meta.changes) return;
-  await slackApi(env, installation, "views.open", {
-    trigger_id: payload.trigger_id,
-    view: {
-      type: "modal",
-      callback_id: "noteflare_milestone_zero_placeholder",
-      title: { type: "plain_text", text: "NoteFlare" },
-      close: { type: "plain_text", text: "Close" },
-      blocks: [
-        {
-          type: "section",
-          text: { type: "mrkdwn", text: "This Slack action is not available yet." },
-        },
-      ],
+  await slackApi(
+    env,
+    installation,
+    "views.open",
+    {
+      trigger_id: payload.trigger_id,
+      view: {
+        type: "modal",
+        callback_id: "noteflare_milestone_zero_placeholder",
+        title: { type: "plain_text", text: "NoteFlare" },
+        close: { type: "plain_text", text: "Close" },
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: "This Slack action is not available yet." },
+          },
+        ],
+      },
     },
-  });
+    1800,
+  );
   await env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at = ? WHERE interaction_id = ?`)
     .bind(Date.now(), interactionId)
     .run();
-}
-
-export async function deliverSlackHome(env: Env, installationId: string, userId: string) {
-  const installation = await env.DB.prepare(
-    `SELECT * FROM slack_installations WHERE id = ? AND disconnected_at IS NULL`,
-  )
-    .bind(installationId)
-    .first<SlackInstallation>();
-  if (!installation) return;
-  await slackApi(env, installation, "views.publish", {
-    user_id: userId,
-    view: { type: "home", blocks: [] },
-  });
 }
 
 async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_message_ts", outboxId: string) {
@@ -1551,6 +1606,7 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
             installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at
        FROM slack_unfurls unfurl
        JOIN slack_installations installation ON installation.id = unfurl.installation_id
+         AND installation.generation = unfurl.installation_generation
       WHERE unfurl.id = ? AND unfurl.delivered_at IS NULL AND unfurl.retired_at IS NULL
         AND installation.disconnected_at IS NULL`,
   )

@@ -16,6 +16,7 @@ import {
   type SlackInstallation,
 } from "./slack";
 import { escapeSlackText, slackCommentText, slackReplyBody } from "./slack-thread-text";
+import { threadRootBlocks } from "./slack-blocks";
 
 const SCOPES = ["chat:write", "channels:read", "groups:read", "channels:history", "groups:history", "users:read"];
 const ID = /^[A-Za-z0-9_-]{1,100}$/;
@@ -35,8 +36,8 @@ type Link = {
   root_message_ts: string | null;
   state: "pending" | "active" | "retired";
 };
-type Identity = { userId: string; accountId: string; verifiedAt: number; slackUserId: string };
-type Input = {
+export type Identity = { userId: string; accountId: string; verifiedAt: number; slackUserId: string };
+export type Input = {
   installationId: string;
   generation: number;
   linkId: string;
@@ -61,7 +62,7 @@ type Delivery = {
 function unavailable(): never {
   throw new HttpError(403, "slack_thread_unavailable", DENIED);
 }
-async function installationFor(env: Env, id: string, generation?: number) {
+export async function installationFor(env: Env, id: string, generation?: number) {
   const row = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id = ? AND disconnected_at IS NULL`)
     .bind(id)
     .first<SlackInstallation>();
@@ -91,7 +92,11 @@ async function memberFor(env: Env, workspaceId: string, userId: string): Promise
     session: { id: "slack-thread", expiresAt: new Date(Date.now() + 60_000) },
   };
 }
-async function identityFor(env: Env, installation: SlackInstallation, slackUserId: string): Promise<Identity | null> {
+export async function identityFor(
+  env: Env,
+  installation: SlackInstallation,
+  slackUserId: string,
+): Promise<Identity | null> {
   return env.DB.prepare(`SELECT l.user_id userId, l.better_auth_account_id accountId, l.verified_at verifiedAt, l.slack_user_id slackUserId
     FROM slack_user_links l JOIN account a ON a.id = l.better_auth_account_id AND a.userId = l.user_id
     JOIN workspace_members wm ON wm.user_id = l.user_id AND wm.workspace_id = ?
@@ -107,7 +112,7 @@ async function identityFor(env: Env, installation: SlackInstallation, slackUserI
     )
     .first<Identity>();
 }
-async function verifiedMember(
+export async function verifiedMember(
   env: Env,
   installation: SlackInstallation,
   slackUserId: string,
@@ -131,7 +136,7 @@ async function verifiedMember(
   );
   return { identity, member: await memberFor(env, installation.workspace_id, identity.userId) };
 }
-async function validateChannel(env: Env, installation: SlackInstallation, channelId: string) {
+export async function validateChannel(env: Env, installation: SlackInstallation, channelId: string) {
   const { channel } = await slackApi(env, installation, "conversations.info", { channel: channelId });
   if (
     !channel ||
@@ -149,7 +154,12 @@ async function validateChannel(env: Env, installation: SlackInstallation, channe
     unavailable();
   return channel;
 }
-async function requireChannelMember(env: Env, installation: SlackInstallation, channelId: string, userId: string) {
+export async function requireChannelMember(
+  env: Env,
+  installation: SlackInstallation,
+  channelId: string,
+  userId: string,
+) {
   let cursor: string | undefined;
   for (let page = 0; page < 100; page++) {
     const result = await slackApi(env, installation, "conversations.members", {
@@ -246,7 +256,7 @@ async function linkFor(env: Env, id: string) {
   if (!link) unavailable();
   return link;
 }
-async function currentInput(env: Env, input: Input) {
+export async function currentInput(env: Env, input: Input) {
   const installation = await installationFor(env, input.installationId, input.generation);
   const link = await linkFor(env, input.linkId);
   if (
@@ -776,26 +786,31 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
     const url = `${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(link.page_id)}`;
     const heading = `${thread.resolved_at ? "Resolved" : "Open"} · ${escapeSlackText(page.title.slice(0, 200))}`;
     const text = delivery.operation === "reply" ? body : `${heading}\n${body}\n<${url}|Open in NoteFlare>`;
+    const controlState =
+      delivery.operation === "reply"
+        ? null
+        : await env.DB.prepare(`SELECT muted_at, snoozed_until FROM slack_channel_subscriptions WHERE id = ?`)
+            .bind(link.subscription_id)
+            .first<{ muted_at: number | null; snoozed_until: number | null }>();
     const blocks: unknown[] =
       delivery.operation === "reply"
         ? [{ type: "section", text: { type: "mrkdwn", verbatim: true, text: body } }]
-        : [
-            { type: "section", text: { type: "mrkdwn", verbatim: true, text: heading } },
-            { type: "section", text: { type: "mrkdwn", verbatim: true, text: body } },
-            { type: "context", elements: [{ type: "mrkdwn", verbatim: true, text: `<${url}|Open in NoteFlare>` }] },
-          ];
-    if (delivery.operation !== "reply")
-      blocks.push({
-        type: "actions",
-        elements: [
-          {
-            type: "button",
-            action_id: thread.resolved_at ? "noteflare_thread_reopen" : "noteflare_thread_resolve",
-            text: { type: "plain_text", text: thread.resolved_at ? "Reopen" : "Resolve" },
-            value: link.id,
-          },
-        ],
-      });
+        : threadRootBlocks({
+            heading,
+            body,
+            url,
+            linkId: link.id,
+            resolved: Boolean(thread.resolved_at),
+            muted: Boolean(controlState?.muted_at || (controlState?.snoozed_until ?? 0) > Date.now()),
+            shareActive: Boolean(
+              await env.DB.prepare(
+                `SELECT 1 FROM share_links WHERE root_page_id = ? AND workspace_id = ? AND revoked_at IS NULL`,
+              )
+                .bind(link.page_id, link.workspace_id)
+                .first(),
+            ),
+            shareEligible: page.kind !== "diagram",
+          });
     // Revalidate local authority after Slack lookups, then fence the irreversible send.
     await outboundAuthority(env, link, delivery.actor_id);
     if (comment) await pageForMember(env, await memberFor(env, link.workspace_id, comment.user_id), link.page_id);

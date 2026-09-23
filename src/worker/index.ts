@@ -1,5 +1,7 @@
 import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror } from "./slack-threads";
+import { acceptSlackWorkspaceInteraction, openSlackSearch, purgeExpiredSlackSearchSessions } from "./slack-workspace";
 import { pageForMember, effectiveSpaceRole, type PageRow } from "./page-access";
+import { mentionsInbox, markMentionsRead } from "./mentions-inbox";
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
 import { routePartykitRequest } from "partyserver";
@@ -2717,7 +2719,9 @@ app.post("/api/slack/commands", async (c) => {
   const rawBody = await c.req.raw.text();
   const verified = await verifySlackRequest(c.env, c.req.raw, rawBody);
   if (verified.duplicate) return c.json({ response_type: "ephemeral", text: "Request already handled." });
-  return c.json(await handleSlackCommand(c.env, new URLSearchParams(rawBody)));
+  const response = await handleSlackCommand(c.env, new URLSearchParams(rawBody), openSlackSearch);
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return response.text ? c.json(response) : c.body(null, 200);
 });
 
 app.post("/api/slack/events", async (c) => {
@@ -2748,17 +2752,28 @@ app.post("/api/slack/interactions", async (c) => {
     c.executionCtx.waitUntil(sweepOutbox(c.env));
     return c.json({ ok: true });
   }
-  c.executionCtx.waitUntil(
-    handleSlackInteraction(c.env, payload).catch((error) =>
-      logger.error(
-        "slack.interaction.failed",
-        "slack",
-        "Slack interaction placeholder failed.",
-        { callbackId: typeof payload.callback_id === "string" ? payload.callback_id : undefined },
-        error,
-      ),
-    ),
-  );
+  let workspace: Awaited<ReturnType<typeof acceptSlackWorkspaceInteraction>>;
+  try {
+    workspace = await acceptSlackWorkspaceInteraction(c.env, payload);
+  } catch (error) {
+    if (error instanceof HttpError && error.status < 500) return c.json({ ok: true });
+    throw error;
+  }
+  if (workspace.handled) {
+    c.executionCtx.waitUntil(sweepOutbox(c.env));
+    return c.json(workspace.response ?? { ok: true });
+  }
+  try {
+    await handleSlackInteraction(c.env, payload);
+  } catch (error) {
+    logger.error(
+      "slack.interaction.failed",
+      "slack",
+      "Slack interaction failed.",
+      { callbackId: typeof payload.callback_id === "string" ? payload.callback_id : undefined },
+      error,
+    );
+  }
   return c.json({ ok: true });
 });
 
@@ -4357,46 +4372,17 @@ app.get("/api/mentions", async (c) => {
   ) {
     throw new HttpError(422, "invalid_mentions_cursor", "The mention page cursor is invalid.");
   }
-  const rows = await c.env.DB.prepare(
-    `SELECT source.*, mention.excerpt, mention.first_seen_at,
-            CASE WHEN mention.first_seen_at > COALESCE(reads.read_at, 0) THEN 1 ELSE 0 END unread
-       FROM member_mentions mention
-       JOIN pages source ON source.id = mention.source_page_id AND source.archived_at IS NULL
-       JOIN spaces s ON s.id = source.space_id
-       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
-       LEFT JOIN mention_reads reads
-         ON reads.workspace_id = mention.workspace_id AND reads.user_id = mention.target_user_id
-      WHERE mention.workspace_id = ? AND mention.target_user_id = ? AND mention.first_seen_at <= ?
-        AND source.import_job_id IS NULL AND source.is_template = 0
-        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
-        AND (? IS NULL OR mention.first_seen_at < ?
-          OR (mention.first_seen_at = ? AND source.id > ?))
-      ORDER BY mention.first_seen_at DESC, source.id LIMIT 101`,
-  )
-    .bind(
-      member.user.id,
-      member.workspace.id,
-      member.user.id,
-      asOf,
-      member.role,
-      beforeAt,
-      beforeAt,
-      beforeAt,
-      beforeId ?? null,
-    )
-    .all<PageRow & { excerpt: string; first_seen_at: number; unread: number }>();
-  const pageRows = rows.results.slice(0, 100);
-  const last = pageRows.at(-1);
-  return c.json({
+  const result = await mentionsInbox(
+    c.env,
+    member,
     asOf,
-    nextCursor:
-      rows.results.length > pageRows.length && last ? { firstSeenAt: last.first_seen_at, pageId: last.id } : null,
-    mentions: pageRows.map((row) => ({
-      page: pageJson(row),
-      excerpt: row.excerpt,
-      firstSeenAt: row.first_seen_at,
-      unread: Boolean(row.unread),
-    })),
+    beforeAt === null ? null : { firstSeenAt: beforeAt, pageId: beforeId! },
+    100,
+  );
+  return c.json({
+    asOf: result.asOf,
+    nextCursor: result.nextCursor,
+    mentions: result.mentions.map(({ page, excerpt, firstSeenAt, unread }) => ({ page, excerpt, firstSeenAt, unread })),
   });
 });
 
@@ -4407,12 +4393,7 @@ app.post("/api/mentions/read", async (c) => {
   if (!Number.isInteger(through) || through < 0 || through > now() + 1_000) {
     throw new HttpError(422, "invalid_read_cursor", "through must be a valid server timestamp.");
   }
-  await c.env.DB.prepare(
-    `INSERT INTO mention_reads (workspace_id, user_id, read_at) VALUES (?, ?, ?)
-      ON CONFLICT(workspace_id, user_id) DO UPDATE SET read_at = MAX(read_at, excluded.read_at)`,
-  )
-    .bind(member.workspace.id, member.user.id, through)
-    .run();
+  await markMentionsRead(c.env, member, through);
   const unread = await c.env.DB.prepare(
     `SELECT COUNT(DISTINCT mention.source_page_id) count
        FROM member_mentions mention
@@ -6441,7 +6422,10 @@ export default {
         upload_reaps: () => processDueUploadReaps(env),
         page_move_receipts: () => pruneExpiredPageMoveReceipts(env.DB),
         queued_jobs: () => recoverQueuedJobs(env),
-        outbox: () => sweepOutbox(env),
+        outbox: async () => {
+          await sweepOutbox(env);
+          await purgeExpiredSlackSearchSessions(env);
+        },
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
         slack_digests: () => sendDueSlackChannelDigests(env),

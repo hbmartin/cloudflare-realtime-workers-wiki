@@ -17,8 +17,17 @@ import {
   upsertSlackChannelSubscription,
   verifySlackRequest,
   type SlackEventPayload,
+  type SlackInstallation,
 } from "./slack";
 import { DeliveryInProgressError } from "./notifications";
+import {
+  acceptSlackWorkspaceInteraction,
+  deliverSlackWorkspaceAction,
+  deliverSlackSearchUpdate,
+  openSlackSearch,
+  purgeExpiredSlackSearchSessions,
+  publishSlackHome,
+} from "./slack-workspace";
 import { consumeDeliveryMessage, type DeliveryQueueMessage } from "./jobs";
 import worker from "./index";
 import { hmacSha256 } from "../shared/security";
@@ -108,6 +117,12 @@ async function mockSlack(input: RequestInfo | URL, init?: RequestInit) {
     return Response.json({ ok: true, messages: posts, response_metadata: {} });
   if (method === "chat.update") return Response.json({ ok: true, channel: payload.channel, ts: payload.ts });
   if (method === "chat.postEphemeral") return Response.json({ ok: true, message_ts: "1700000009.000001" });
+  if (method === "views.open") return Response.json({ ok: true, view: { id: "VSEARCH", hash: "hash-open" } });
+  if (method === "views.update")
+    return Response.json({ ok: true, view: { id: payload.view_id, hash: `hash-${calls.length}` } });
+  if (method === "views.publish")
+    return Response.json({ ok: true, view: { id: "VHOME", hash: `hash-${calls.length}` } });
+  if (method === "chat.unfurl") return Response.json({ ok: true });
   if (method === "auth.revoke") return Response.json({ ok: true, revoked: true });
   throw new Error(`Unexpected Slack method: ${method}`);
 }
@@ -227,6 +242,504 @@ beforeEach(async () => {
   ]);
   await mapping("space");
   vi.stubGlobal("fetch", vi.fn(mockSlack));
+});
+
+describe("interactive Slack workspace", () => {
+  async function workspaceAction(input: {
+    actionId: string;
+    value: string;
+    user?: string;
+    link?: { id: string; root_message_ts: string };
+    actionTs?: string;
+    selected?: boolean;
+  }) {
+    const response = await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: input.user ?? "UOWNER" },
+      channel: { id: "CSPACE" },
+      message: { ts: input.link?.root_message_ts ?? "1700000000.000001" },
+      actions: [
+        {
+          action_id: input.actionId,
+          action_ts: input.actionTs ?? "1700000800.000001",
+          ...(input.selected ? { selected_option: { value: input.value } } : { value: input.value }),
+        },
+      ],
+    });
+    expect(response.handled).toBe(true);
+    const receipt = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = ? ORDER BY rowid DESC LIMIT 1`,
+    )
+      .bind(input.actionId)
+      .first<{ id: string }>();
+    return receipt!.id;
+  }
+
+  it("deduplicates Watch and owner controls, then rechecks a revoked owner before execution", async () => {
+    const { link } = await activeThread();
+    const watch = await workspaceAction({ actionId: "noteflare_page_watch", value: link.id, link });
+    await workspaceAction({ actionId: "noteflare_page_watch", value: link.id, link });
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) count FROM slack_interaction_receipts WHERE callback_id = 'noteflare_page_watch'`,
+      ).first(),
+    ).toEqual({ count: 1 });
+    await deliverSlackWorkspaceAction(runtime(), watch);
+    await deliverSlackWorkspaceAction(runtime(), watch);
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) count FROM subscriptions WHERE user_id = 'owner' AND resource_type = 'page' AND resource_id = 'page' AND muted_at IS NULL`,
+      ).first(),
+    ).toEqual({ count: 1 });
+    const unwatch = await workspaceAction({
+      actionId: "noteflare_page_unwatch",
+      value: link.id,
+      link,
+      actionTs: "1700000801.000001",
+    });
+    await deliverSlackWorkspaceAction(runtime(), unwatch);
+    expect(
+      await env.DB.prepare(
+        `SELECT muted_at IS NOT NULL muted FROM subscriptions WHERE user_id = 'owner' AND resource_type = 'page' AND resource_id = 'page'`,
+      ).first(),
+    ).toEqual({ muted: 1 });
+    const snooze = await workspaceAction({
+      actionId: "noteflare_mapping_snooze",
+      value: `${link.id}:8`,
+      link,
+      selected: true,
+      actionTs: "1700000802.000001",
+    });
+    await deliverSlackWorkspaceAction(runtime(), snooze);
+    expect(
+      (await env.DB.prepare(`SELECT snoozed_until FROM slack_channel_subscriptions WHERE id = 'space'`).first<{
+        snoozed_until: number;
+      }>())!.snoozed_until,
+    ).toBeGreaterThan(Date.now() + 7 * 3_600_000);
+    const mute = await workspaceAction({
+      actionId: "noteflare_mapping_mute",
+      value: link.id,
+      link,
+      actionTs: "1700000803.000001",
+    });
+    await env.DB.prepare(`UPDATE workspace_members SET role = 'owner' WHERE user_id = 'viewer'`).run();
+    await env.DB.prepare(`UPDATE workspace_members SET role = 'editor' WHERE user_id = 'owner'`).run();
+    await deliverSlackWorkspaceAction(runtime(), mute);
+    expect(await env.DB.prepare(`SELECT muted_at FROM slack_channel_subscriptions WHERE id = 'space'`).first()).toEqual(
+      { muted_at: null },
+    );
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(mute).first(),
+    ).toEqual({ outcome: "denied" });
+  });
+
+  it("opens search synchronously, pages ten results, and rejects a stale view hash", async () => {
+    const pages = Array.from({ length: 12 }, (_, index) => `search-${String(index).padStart(2, "0")}`);
+    await env.DB.batch(
+      pages.flatMap((id) => [
+        env.DB.prepare(`INSERT INTO pages (id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+        VALUES (?, 'workspace', 'workspace-general', 'document', ?, ?, 'owner', 1, 1)`).bind(id, id, `Orchid ${id}`),
+        env.DB.prepare(`INSERT INTO page_search_v2
+        (page_id,workspace_id,space_id,title,tags,body,comments,attachments)
+        VALUES (?, 'workspace', 'workspace-general', ?, '', '', '', '')`).bind(id, `Orchid ${id}`),
+      ]),
+    );
+    const opened = await openSlackSearch(
+      runtime(),
+      (await env.DB.prepare(`SELECT * FROM slack_installations WHERE id = 'installation'`).first())!,
+      "UOWNER",
+      "trigger",
+      "Orchid",
+    );
+    expect(opened.text).toBe("");
+    const session = await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind = 'search'`).first<{
+      id: string;
+    }>();
+    await deliverSlackSearchUpdate(runtime(), session!.id, 0);
+    const first = calls.find((call) => call.method === "views.update")!;
+    expect(
+      (first.payload.view as { blocks: Array<{ type: string }> }).blocks.filter(
+        (block) => block.type === "section" && JSON.stringify(block).includes("Orchid search-"),
+      ),
+    ).toHaveLength(10);
+    const state = await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id = ?`)
+      .bind(session!.id)
+      .first<{ view_hash: string }>();
+    const next = await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash: state!.view_hash,
+        private_metadata: session!.id,
+        state: { values: { query: { value: { value: "Orchid" } } } },
+      },
+      actions: [{ action_id: "noteflare_search_next", action_ts: "1700000900.000001", value: session!.id }],
+    });
+    expect(next.handled).toBe(true);
+    const receipt = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_search_next'`,
+    ).first<{ id: string }>();
+    await deliverSlackWorkspaceAction(runtime(), receipt!.id);
+    expect(
+      await env.DB.prepare(`SELECT json_extract(state_json, '$.offset') offset FROM slack_view_sessions WHERE id = ?`)
+        .bind(session!.id)
+        .first(),
+    ).toEqual({ offset: 10 });
+    await deliverSlackWorkspaceAction(runtime(), receipt!.id);
+    expect(calls.filter((call) => call.method === "views.update")).toHaveLength(2);
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash: state!.view_hash,
+        private_metadata: session!.id,
+        state: { values: { query: { value: { value: "Orchid" } } } },
+      },
+      actions: [{ action_id: "noteflare_search_next", action_ts: "1700000900.000002", value: session!.id }],
+    });
+    const stale = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_search_next' ORDER BY rowid DESC LIMIT 1`,
+    ).first<{ id: string }>();
+    await deliverSlackWorkspaceAction(runtime(), stale!.id);
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(stale!.id).first(),
+    ).toEqual({ outcome: "denied" });
+    expect(calls.filter((call) => call.method === "views.update")).toHaveLength(2);
+  });
+
+  it("maps every Slack search input to SearchFilters and rechecks page visibility", async () => {
+    await env.DB.batch([
+      env.DB
+        .prepare(`INSERT INTO pages (id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,archived_at)
+        VALUES ('filtered', 'workspace', 'workspace-general', 'table', 'z', 'Orchid filtered', 'owner', 1, 1, 2)`),
+      env.DB.prepare(`INSERT INTO page_search_v2
+        (page_id,workspace_id,space_id,title,tags,body,comments,attachments)
+        VALUES ('filtered', 'workspace', 'workspace-general', 'Orchid filtered', 'launch', '', '', '')`),
+      env.DB.prepare(`INSERT INTO tags (id,workspace_id,name,created_by,created_at,updated_at)
+        VALUES ('launch', 'workspace', 'Launch', 'owner', 1, 1)`),
+      env.DB.prepare(
+        `INSERT INTO page_tags (page_id,tag_id,created_by,created_at) VALUES ('filtered', 'launch', 'owner', 1)`,
+      ),
+    ]);
+    const installed = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id = 'installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installed, "UOWNER", "trigger", "Orchid");
+    const session = await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind = 'search'`).first<{
+      id: string;
+    }>();
+    await deliverSlackSearchUpdate(runtime(), session!.id, 0);
+    const current = await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id = ?`)
+      .bind(session!.id)
+      .first<{ view_hash: string }>();
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash: current!.view_hash,
+        private_metadata: session!.id,
+        state: {
+          values: {
+            query: { value: { value: "Orchid" } },
+            space: { value: { selected_option: { value: "workspace-general" } } },
+            tags: { value: { selected_options: [{ value: "launch" }] } },
+            kind: { value: { selected_option: { value: "table" } } },
+            archive: { value: { selected_option: { value: "archived" } } },
+          },
+        },
+      },
+      actions: [{ action_id: "noteflare_search_run", action_ts: "1700000910.000001", value: session!.id }],
+    });
+    const receipt = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_search_run'`,
+    ).first<{ id: string }>();
+    await deliverSlackWorkspaceAction(runtime(), receipt!.id);
+    const update = calls.filter((call) => call.method === "views.update").at(-1)!;
+    expect(JSON.stringify(update.payload.view)).toContain("Orchid filtered");
+    const blocks = (update.payload.view as { blocks: Array<{ block_id?: string; element?: Record<string, unknown> }> })
+      .blocks;
+    expect(blocks.find((block) => block.block_id === "space")?.element?.initial_option).toMatchObject({
+      value: "workspace-general",
+    });
+    expect(blocks.find((block) => block.block_id === "tags")?.element?.initial_options).toMatchObject([
+      { value: "launch" },
+    ]);
+    expect(
+      await env.DB.prepare(`SELECT json_extract(state_json, '$.kind') kind,
+      json_extract(state_json, '$.archive') archive FROM slack_view_sessions WHERE id = ?`)
+        .bind(session!.id)
+        .first(),
+    ).toEqual({ kind: "table", archive: "archived" });
+    await env.DB.prepare(`DELETE FROM page_tags WHERE page_id = 'filtered'`).run();
+    const newer = await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id = ?`)
+      .bind(session!.id)
+      .first<{ view_hash: string }>();
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash: newer!.view_hash,
+        private_metadata: session!.id,
+        state: {
+          values: {
+            query: { value: { value: "Orchid" } },
+            space: { value: { selected_option: { value: "workspace-general" } } },
+            tags: { value: { selected_options: [{ value: "launch" }] } },
+            kind: { value: { selected_option: { value: "table" } } },
+            archive: { value: { selected_option: { value: "archived" } } },
+          },
+        },
+      },
+      actions: [{ action_id: "noteflare_search_run", action_ts: "1700000910.000002", value: session!.id }],
+    });
+    const next = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_search_run' ORDER BY rowid DESC LIMIT 1`,
+    ).first<{ id: string }>();
+    await deliverSlackWorkspaceAction(runtime(), next!.id);
+    expect(JSON.stringify(calls.filter((call) => call.method === "views.update").at(-1)!.payload.view)).toContain(
+      "No accessible pages matched",
+    );
+    const emptyBlocks = (
+      calls.filter((call) => call.method === "views.update").at(-1)!.payload.view as {
+        blocks: Array<{ block_id?: string }>;
+      }
+    ).blocks;
+    expect(emptyBlocks.some((block) => block.block_id === "search_navigation")).toBe(false);
+  });
+
+  it("opens a valid input modal and deduplicates Done submissions before expiring the session", async () => {
+    const installed = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id = 'installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installed, "UOWNER", "trigger", "Orchid");
+    expect(
+      (calls.find((call) => call.method === "views.open")!.payload.view as { submit: { text: string } }).submit.text,
+    ).toBe("Done");
+    const session = await env.DB.prepare(`SELECT id, view_hash FROM slack_view_sessions WHERE kind = 'search'`).first<{
+      id: string;
+      view_hash: string;
+    }>();
+    const submission = {
+      type: "view_submission",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: { callback_id: "noteflare_search", private_metadata: session!.id, id: "VSEARCH", hash: session!.view_hash },
+    };
+    expect((await acceptSlackWorkspaceInteraction(runtime(), submission)).response).toEqual({});
+    expect((await acceptSlackWorkspaceInteraction(runtime(), submission)).response).toEqual({});
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) count FROM slack_interaction_receipts WHERE callback_id = 'noteflare_search_done'`,
+      ).first(),
+    ).toEqual({ count: 1 });
+    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at = 1 WHERE id = ?`).bind(session!.id).run();
+    await purgeExpiredSlackSearchSessions(runtime());
+    expect(await env.DB.prepare(`SELECT 1 FROM slack_view_sessions WHERE id = ?`).bind(session!.id).first()).toBeNull();
+  });
+
+  it("navigates Home by Mentions cursors, records actor context, and marks the snapshot read", async () => {
+    const timestamp = Date.now() - 1000;
+    await env.DB.batch(
+      Array.from({ length: 12 }, (_, index) => {
+        const id = `mention-${String(index).padStart(2, "0")}`;
+        return [
+          env.DB.prepare(`INSERT INTO pages (id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+          VALUES (?, 'workspace', 'workspace-general', 'document', ?, ?, 'owner', 1, 1)`).bind(
+            id,
+            id,
+            `Mention ${index}`,
+          ),
+          env.DB.prepare(`INSERT INTO member_mentions
+          (workspace_id,source_page_id,target_user_id,excerpt,first_seen_at,first_seen_actor_id,projection_seq)
+          VALUES ('workspace', ?, 'viewer', 'A useful excerpt', ?, 'owner', 1)`).bind(id, timestamp - index),
+        ];
+      }).flat(),
+    );
+    await publishSlackHome(runtime(), "installation", "UVIEWER");
+    const first = calls.find((call) => call.method === "views.publish")!;
+    expect(JSON.stringify(first.payload.view)).toContain("Owner mentioned you");
+    expect(
+      (first.payload.view as { blocks: Array<{ type: string }> }).blocks.filter((block) => block.type === "section"),
+    ).toHaveLength(10);
+    const session = await env.DB.prepare(`SELECT id, view_hash FROM slack_view_sessions WHERE kind = 'home'`).first<{
+      id: string;
+      view_hash: string;
+    }>();
+    const next = await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UVIEWER" },
+      view: { id: "VHOME", hash: session!.view_hash, private_metadata: session!.id },
+      actions: [{ action_id: "noteflare_home_next", action_ts: "1700000901.000001", value: session!.id }],
+    });
+    expect(next.handled).toBe(true);
+    const nextReceipt = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_home_next'`,
+    ).first<{ id: string }>();
+    await deliverSlackWorkspaceAction(runtime(), nextReceipt!.id);
+    expect(
+      await env.DB.prepare(`SELECT json_extract(state_json, '$.page') page FROM slack_view_sessions WHERE id = ?`)
+        .bind(session!.id)
+        .first(),
+    ).toEqual({ page: 1 });
+    const current = await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id = ?`)
+      .bind(session!.id)
+      .first<{ view_hash: string }>();
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UVIEWER" },
+      view: { id: "VHOME", hash: current!.view_hash, private_metadata: session!.id },
+      actions: [{ action_id: "noteflare_home_read", action_ts: "1700000902.000001", value: session!.id }],
+    });
+    const readReceipt = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_home_read'`,
+    ).first<{ id: string }>();
+    await deliverSlackWorkspaceAction(runtime(), readReceipt!.id);
+    expect(await env.DB.prepare(`SELECT read_at FROM mention_reads WHERE user_id = 'viewer'`).first()).toEqual({
+      read_at: (await env.DB.prepare(
+        `SELECT json_extract(state_json, '$.asOf') asOf FROM slack_view_sessions WHERE id = ?`,
+      )
+        .bind(session!.id)
+        .first<{ asOf: number }>())!.asOf,
+    });
+  });
+
+  it("rechecks Home identity after receipt ingestion and publishes an unavailable state", async () => {
+    await env.DB.prepare(`INSERT INTO member_mentions
+      (workspace_id,source_page_id,target_user_id,excerpt,first_seen_at,first_seen_actor_id,projection_seq)
+      VALUES ('workspace', 'page', 'viewer', 'Private excerpt', ?, 'owner', 1)`)
+      .bind(Date.now() - 1000)
+      .run();
+    await publishSlackHome(runtime(), "installation", "UVIEWER");
+    const session = await env.DB.prepare(`SELECT id, view_hash FROM slack_view_sessions WHERE kind = 'home'`).first<{
+      id: string;
+      view_hash: string;
+    }>();
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UVIEWER" },
+      view: { id: "VHOME", hash: session!.view_hash, private_metadata: session!.id },
+      actions: [{ action_id: "noteflare_home_read", action_ts: "1700000904.000001", value: session!.id }],
+    });
+    const receipt = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_home_read'`,
+    ).first<{ id: string }>();
+    await env.DB.prepare(`DELETE FROM workspace_members WHERE user_id = 'viewer'`).run();
+    await deliverSlackWorkspaceAction(runtime(), receipt!.id);
+    expect(await env.DB.prepare(`SELECT 1 FROM mention_reads WHERE user_id = 'viewer'`).first()).toBeNull();
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(receipt!.id).first(),
+    ).toEqual({ outcome: "denied" });
+    await publishSlackHome(runtime(), "installation", "UVIEWER");
+    expect(JSON.stringify(calls.filter((call) => call.method === "views.publish").at(-1)!.payload.view)).toContain(
+      "inbox is unavailable",
+    );
+  });
+
+  it("acknowledges a signed slash command while a modal open call stalls", async () => {
+    beforeResponse = async (method) => {
+      if (method === "views.open") await new Promise((resolve) => setTimeout(resolve, 3500));
+    };
+    const formBody = new URLSearchParams({
+      team_id: "T123",
+      user_id: "UOWNER",
+      trigger_id: "trigger",
+      text: "Orchid",
+    }).toString();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = `v0=${Array.from(
+      await hmacSha256(secrets.SLACK_SIGNING_SECRET, `v0:${timestamp}:${formBody}`),
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("")}`;
+    const context = createExecutionContext();
+    const started = performance.now();
+    const response = await worker.fetch(
+      new Request("http://example.test/api/slack/commands", {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "x-slack-request-timestamp": String(timestamp),
+          "x-slack-signature": signature,
+        },
+        body: formBody,
+      }),
+      runtime(),
+      context,
+    );
+    expect(response.status).toBe(200);
+    expect(performance.now() - started).toBeLessThan(3000);
+    expect((await response.json<{ text: string }>()).text).toContain("Search could not open");
+    await waitOnExecutionContext(context);
+  });
+
+  it("creates one public share from a root and an unfurl without trusting stale button state", async () => {
+    const { link } = await activeThread();
+    const create = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
+    await deliverSlackWorkspaceAction(runtime(), create);
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) count FROM share_links WHERE root_page_id = 'page' AND revoked_at IS NULL`,
+      ).first(),
+    ).toEqual({ count: 1 });
+    const again = await workspaceAction({
+      actionId: "noteflare_share_create",
+      value: link.id,
+      link,
+      actionTs: "1700000804.000001",
+    });
+    await deliverSlackWorkspaceAction(runtime(), again);
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) count FROM share_links WHERE root_page_id = 'page' AND revoked_at IS NULL`,
+      ).first(),
+    ).toEqual({ count: 1 });
+    await handleSlackEvent(runtime(), {
+      type: "event_callback",
+      event_id: "Ev-share",
+      team_id: "T123",
+      event: {
+        type: "link_shared",
+        user: "UOWNER",
+        channel: "CSPACE",
+        message_ts: "1700000700.000001",
+        links: [{ url: "http://example.test/?page=page" }],
+      },
+    });
+    const reference = await env.DB.prepare(`SELECT id FROM slack_share_references WHERE page_id = 'page'`).first<{
+      id: string;
+    }>();
+    expect(reference).not.toBeNull();
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      container: {
+        channel_id: "CSPACE",
+        message_ts: "1700000700.000001",
+        app_unfurl_url: "http://example.test/?page=page",
+      },
+      app_unfurl: { app_unfurl_url: "http://example.test/?page=page" },
+      actions: [{ action_id: "noteflare_unfurl_share_view", action_ts: "1700000903.000001", value: reference!.id }],
+    });
+    const receipt = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_unfurl_share_view'`,
+    ).first<{ id: string }>();
+    await deliverSlackWorkspaceAction(runtime(), receipt!.id);
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(receipt!.id).first(),
+    ).toEqual({ outcome: "accepted" });
+  });
 });
 afterEach(() => {
   vi.unstubAllGlobals();
