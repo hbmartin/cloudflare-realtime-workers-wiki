@@ -24,6 +24,7 @@ export type NotificationFanout = {
   workspaceId: string;
   spaceId: string;
   pageId: string;
+  contentEpoch?: number;
   threadId: string | null;
   actorId: string | null;
   eventType: NotificationEventType;
@@ -101,6 +102,7 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
            JOIN spaces s ON s.id = p.space_id
            LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = recipient.value
           WHERE (? IS NULL OR recipient.value <> ?) AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
+            AND (? IS NULL OR p.content_epoch = ?)
             AND (wm.role = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
             AND NOT EXISTS (
               SELECT 1 FROM notifications recent
@@ -124,6 +126,8 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         fanout.pageId,
         fanout.actorId,
         fanout.actorId,
+        fanout.contentEpoch ?? null,
+        fanout.contentEpoch ?? null,
         coalesceAfter,
         fanout.pageId,
         fanout.eventType,

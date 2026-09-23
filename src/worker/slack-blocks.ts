@@ -106,6 +106,7 @@ export function searchModal(
   origin: string,
   result?: SearchResponse,
   error?: string,
+  revision = 0,
 ) {
   const filterBlocks: unknown[] = [
     {
@@ -202,7 +203,7 @@ export function searchModal(
   return {
     type: "modal",
     callback_id: "noteflare_search",
-    private_metadata: sessionId,
+    private_metadata: `${sessionId}:${revision}`,
     title: plain("Search NoteFlare"),
     close: plain("Close"),
     submit: plain("Done"),

@@ -776,6 +776,48 @@ export async function deleteSlackChannelSubscription(env: Env, member: MemberCon
   if (!deleted.meta.changes) throw new HttpError(404, "slack_channel_not_found", "Slack channel mapping not found.");
 }
 
+function rootControlRefreshStatements(
+  env: Env,
+  mappingId: string,
+  workspaceId: string,
+  actorId: string,
+  sourceId: string,
+  now: number,
+) {
+  return [
+    env.DB.prepare(`INSERT OR IGNORE INTO slack_thread_deliveries
+      (id, link_id, operation, source_id, actor_id, created_at, updated_at)
+      SELECT link.id || ':refresh:' || ?, link.id, 'refresh', ?, ?, ?, ?
+        FROM slack_thread_links link
+        JOIN slack_channel_subscriptions mapping ON mapping.id = link.subscription_id
+        JOIN slack_installations installation ON installation.id = mapping.installation_id
+       WHERE mapping.id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL
+         AND link.installation_generation = installation.generation AND mapping.mirror_enabled = 1
+         AND mapping.validation_state = 'valid' AND link.state = 'active' AND link.root_message_ts IS NOT NULL`).bind(
+      sourceId,
+      sourceId,
+      actorId,
+      now,
+      now,
+      mappingId,
+      workspaceId,
+    ),
+    env.DB.prepare(`INSERT OR IGNORE INTO outbox
+      (id, workspace_id, topic, payload_json, available_at, created_at)
+      SELECT 'outbox:' || delivery.id, ?, 'slack_thread_reply',
+        json_object('deliveryId', delivery.id), ?, ?
+        FROM slack_thread_deliveries delivery
+        JOIN slack_thread_links link ON link.id = delivery.link_id
+       WHERE delivery.source_id = ? AND link.subscription_id = ? AND delivery.state = 'pending'`).bind(
+      workspaceId,
+      now,
+      now,
+      sourceId,
+      mappingId,
+    ),
+  ];
+}
+
 export async function setSlackChannelPause(
   env: Env,
   member: MemberContext,
@@ -788,16 +830,17 @@ export async function setSlackChannelPause(
   if (mode === "snooze" && hours !== 1 && hours !== 8 && hours !== 24)
     throw new HttpError(422, "invalid_snooze", "Choose 1, 8, or 24 hours.");
   const mapping = await env.DB.prepare(
-    `SELECT mapping.id FROM slack_channel_subscriptions mapping
+    `SELECT mapping.id, installation.generation FROM slack_channel_subscriptions mapping
        JOIN slack_installations installation ON installation.id = mapping.installation_id
       WHERE mapping.id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL`,
   )
     .bind(id, member.workspace.id)
-    .first<{ id: string }>();
+    .first<{ id: string; generation: number }>();
   if (!mapping) throw new HttpError(404, "slack_channel_not_found", "Slack channel mapping not found.");
   const now = Date.now();
   const mutedAt = mode === "mute" ? now : null;
   const snoozedUntil = mode === "snooze" ? now + hours! * 3_600_000 : null;
+  const sourceId = `settings:${crypto.randomUUID()}`;
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE slack_channel_subscriptions SET muted_at = ?, snoozed_until = ?, updated_at = ?
@@ -812,7 +855,56 @@ export async function setSlackChannelPause(
         WHERE subscription_id = ? AND delivered_at IS NULL AND suppressed_at IS NULL`,
           ).bind(now, id),
         ]),
+    ...rootControlRefreshStatements(env, id, member.workspace.id, member.user.id, sourceId, now),
+    ...(snoozedUntil === null
+      ? []
+      : [
+          env.DB.prepare(`INSERT OR IGNORE INTO outbox
+            (id, workspace_id, topic, payload_json, available_at, created_at)
+            VALUES (?, ?, 'slack_controls_expire', ?, ?, ?)`).bind(
+            `outbox:slack-controls-expire:${sourceId}`,
+            member.workspace.id,
+            JSON.stringify({
+              mappingId: id,
+              installationGeneration: mapping.generation,
+              actorId: member.user.id,
+              snoozedUntil,
+            }),
+            snoozedUntil,
+            now,
+          ),
+        ]),
   ]);
+}
+
+export async function deliverSlackControlsExpiry(env: Env, payload: Record<string, unknown>) {
+  if (
+    typeof payload.mappingId !== "string" ||
+    typeof payload.installationGeneration !== "number" ||
+    typeof payload.actorId !== "string" ||
+    typeof payload.snoozedUntil !== "number"
+  )
+    return;
+  const mapping = await env.DB.prepare(`SELECT installation.workspace_id
+    FROM slack_channel_subscriptions mapping
+    JOIN slack_installations installation ON installation.id = mapping.installation_id
+    JOIN workspace_members owner ON owner.workspace_id = installation.workspace_id
+      AND owner.user_id = ? AND owner.role = 'owner'
+    WHERE mapping.id = ? AND installation.generation = ? AND installation.disconnected_at IS NULL
+      AND mapping.snoozed_until = ? AND mapping.snoozed_until <= ?`)
+    .bind(payload.actorId, payload.mappingId, payload.installationGeneration, payload.snoozedUntil, Date.now())
+    .first<{ workspace_id: string }>();
+  if (!mapping) return;
+  await env.DB.batch(
+    rootControlRefreshStatements(
+      env,
+      payload.mappingId,
+      mapping.workspace_id,
+      payload.actorId,
+      `expiry:${payload.mappingId}:${payload.snoozedUntil}`,
+      Date.now(),
+    ),
+  );
 }
 
 export async function verifySlackRequest(env: Env, request: Request, body: string) {
@@ -868,11 +960,10 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
       grant_type: "refresh_token",
       refresh_token: await decryptSlackToken(env, installation.bot_refresh_token_ciphertext),
     }),
-    signal: signal
-      ? AbortSignal.any([signal, AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS)])
-      : AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
+    // Once Slack accepts a refresh token, persist its replacement even if the
+    // caller's short acknowledgment deadline expires.
+    signal: AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
   });
-  signal?.throwIfAborted();
   const result = await response.json<{
     ok?: boolean;
     error?: string;
@@ -909,6 +1000,9 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
       .bind(installation.id)
       .first<SlackInstallation>();
     if (!current) throw new Error("The Slack installation was disconnected.");
+    installation.bot_token_ciphertext = current.bot_token_ciphertext;
+    installation.bot_refresh_token_ciphertext = current.bot_refresh_token_ciphertext;
+    installation.token_expires_at = current.token_expires_at;
     return decryptSlackToken(env, current.bot_token_ciphertext);
   }
   installation.bot_token_ciphertext = accessTokenCiphertext;
@@ -1254,6 +1348,7 @@ export function slackChannelFanoutStatements(
     workspaceId: string;
     spaceId: string;
     pageId: string;
+    contentEpoch?: number;
     threadId: string | null;
     actorId: string | null;
     eventType: NotificationEventType;
@@ -1277,6 +1372,8 @@ export function slackChannelFanoutStatements(
            JOIN slack_installations installation ON installation.id = subscription.installation_id
           WHERE installation.workspace_id = ? AND installation.disconnected_at IS NULL
             AND installation.auth_error IS NULL
+            AND EXISTS (SELECT 1 FROM pages p WHERE p.id = ? AND p.workspace_id = ?
+              AND (? IS NULL OR p.content_epoch = ?))
             AND subscription.space_id = ? AND (subscription.page_id IS NULL OR subscription.page_id = ?)
             AND subscription.notification_blocked_at IS NULL
             AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
@@ -1297,6 +1394,10 @@ export function slackChannelFanoutStatements(
         fanout.threadId,
         fanout.createdAt,
         fanout.workspaceId,
+        fanout.pageId,
+        fanout.workspaceId,
+        fanout.contentEpoch ?? null,
+        fanout.contentEpoch ?? null,
         fanout.spaceId,
         fanout.pageId,
         fanout.createdAt,
@@ -1344,6 +1445,7 @@ async function claimSlackRows(env: Env, table: "slack_channel_events" | "slack_u
   const claimed = await env.DB.prepare(
     `UPDATE ${table} SET claimed_at = ?, claim_token = ?
       WHERE id IN (SELECT value FROM json_each(?)) AND delivered_at IS NULL
+        ${table === "slack_channel_events" ? "AND suppressed_at IS NULL" : ""}
         AND (claimed_at IS NULL OR claimed_at <= ?)
       RETURNING id`,
   )
@@ -1450,10 +1552,14 @@ const channelActorAccessSql = `(
 )`;
 
 export async function deliverSlackChannelEvent(env: Env, eventId: string) {
-  const row = await channelEvent(env, eventId);
-  if (!row) return;
+  if (!(await channelEvent(env, eventId))) return;
   const claim = await claimSlackRows(env, "slack_channel_events", [eventId]);
   if (!claim.ids.length) return;
+  const row = await channelEvent(env, eventId);
+  if (!row) {
+    await releaseSlackClaims(env, "slack_channel_events", [eventId], claim.token);
+    return;
+  }
   const copy = escapeSlackMrkdwn(eventCopy(row.event_type, row.actor_name, row.page_title));
   try {
     await slackApi(env, row, "chat.postMessage", {

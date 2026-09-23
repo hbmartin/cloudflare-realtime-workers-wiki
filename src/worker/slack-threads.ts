@@ -678,7 +678,8 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
     throw error;
   }
   const claimed = await env.DB.prepare(
-    `UPDATE ${table} SET denial_sent_at = ? WHERE id = ? AND outcome IN ('denied', 'invalid_content') AND denial_sent_at IS NULL`,
+    `UPDATE ${table} SET denial_sent_at = ? WHERE id = ?
+      AND outcome IN ('denied', 'invalid_content', 'content_unavailable') AND denial_sent_at IS NULL`,
   )
     .bind(Date.now(), payload.receiptId)
     .run();
@@ -687,14 +688,17 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
     await slackApi(env, installation, "chat.postEphemeral", {
       channel: payload.channelId,
       user: payload.slackUserId,
+      ...(payload.action === true ? {} : { thread_ts: payload.threadTs }),
       text:
         payload.reason === "connect" ||
         payload.text === CONNECT ||
         payload.text === "Connect your Slack account from NoteFlare Settings before using this action."
           ? CONNECT
-          : payload.text === CONTENT_ERROR
-            ? CONTENT_ERROR
-            : DENIED,
+          : payload.text === BROADCAST_MISSING
+            ? BROADCAST_MISSING
+            : payload.text === CONTENT_ERROR
+              ? CONTENT_ERROR
+              : DENIED,
     });
   } catch (error) {
     if (error instanceof SlackRateLimitError) {

@@ -429,6 +429,183 @@ describe("notification feed and subscriptions", () => {
     );
   });
 
+  it.each(["document", "diagram"] as const)(
+    "does not re-date or re-notify a committed %s mention when its introduction log is replayed",
+    async (kind) => {
+      const installed = await bootstrap();
+      const first = await invite(installed.cookie, `replay-${kind}-first`);
+      const second = await invite(installed.cookie, `replay-${kind}-second`);
+      const pageId = kind === "document" ? installed.page.id : `replay-${kind}-page`;
+      if (kind === "diagram")
+        await env.DB.prepare(`INSERT INTO pages
+          (id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+          VALUES (?,?,?,?,?,'Replay diagram',?,1,1)`)
+          .bind(pageId, installed.workspaceId, installed.page.spaceId, kind, "z1", installed.userId)
+          .run();
+      const stub = env.DOCUMENT.getByName(`${pageId}~1`);
+      const content = () =>
+        stub.fetch(
+          new Request("https://document.internal/content", {
+            headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+          }),
+        );
+      await content();
+      const add = async (targetId: string, actorId: string, key: string) =>
+        runInDurableObject(stub, async (instance) => {
+          const document = (instance as unknown as { document: Y.Doc }).document;
+          document.transact(
+            () => {
+              if (kind === "diagram") {
+                const node = new Y.Map<unknown>();
+                const mentions = new Y.Map<string>();
+                mentions.set(targetId, "Mentioned collaborator");
+                node.set("mentions", mentions);
+                document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT).set(key, node);
+              } else {
+                const paragraph = new Y.XmlElement("paragraph");
+                const mention = new Y.XmlElement("mention");
+                mention.setAttribute("entityType", "user");
+                mention.setAttribute("entityId", targetId);
+                mention.setAttribute("label", "Mentioned collaborator");
+                paragraph.insert(0, [mention]);
+                document.getXmlFragment("document-store").insert(0, [paragraph]);
+              }
+            },
+            { state: { userId: actorId } },
+          );
+        });
+      await add(first.userId, installed.userId, "first");
+      await content();
+      const firstRow = (await env.DB.prepare(`SELECT introduction_seq, first_seen_actor_id
+        FROM member_mentions WHERE source_page_id=? AND target_user_id=?`)
+        .bind(pageId, first.userId)
+        .first<{ introduction_seq: number; first_seen_actor_id: string }>())!;
+      await env.DB.prepare(`UPDATE member_mentions SET first_seen_at=12345
+        WHERE source_page_id=? AND target_user_id=?`)
+        .bind(pageId, first.userId)
+        .run();
+      // Recreate the DO records left behind by a crash after the D1 batch.
+      await runInDurableObject(stub, async (instance, state) => {
+        state.storage.sql.exec(
+          `INSERT INTO update_events (seq,author_id,created_at) VALUES (?,?,?)`,
+          firstRow.introduction_seq,
+          installed.userId,
+          Date.now(),
+        );
+        state.storage.sql.exec(
+          `INSERT INTO mention_introductions (target_user_id,seq,actor_id) VALUES (?,?,?)`,
+          first.userId,
+          firstRow.introduction_seq,
+          installed.userId,
+        );
+        await (instance as unknown as { compact: () => Promise<void> }).compact();
+      });
+      expect(
+        await env.DB.prepare(`SELECT first_seen_at,first_seen_actor_id,introduction_seq
+        FROM member_mentions WHERE source_page_id=? AND target_user_id=?`)
+          .bind(pageId, first.userId)
+          .first(),
+      ).toEqual({
+        first_seen_at: 12345,
+        first_seen_actor_id: installed.userId,
+        introduction_seq: firstRow.introduction_seq,
+      });
+      await runInDurableObject(stub, async (_instance, state) => {
+        state.storage.sql.exec(
+          `INSERT INTO mention_introductions (target_user_id,seq,actor_id) VALUES (?,?,?)`,
+          first.userId,
+          firstRow.introduction_seq,
+          installed.userId,
+        );
+      });
+      await add(second.userId, first.userId, "second");
+      await content();
+      expect(
+        await env.DB.prepare(`SELECT first_seen_at,first_seen_actor_id,introduction_seq
+        FROM member_mentions WHERE source_page_id=? AND target_user_id=?`)
+          .bind(pageId, first.userId)
+          .first(),
+      ).toEqual({
+        first_seen_at: 12345,
+        first_seen_actor_id: installed.userId,
+        introduction_seq: firstRow.introduction_seq,
+      });
+      expect(
+        await env.DB.prepare(`SELECT first_seen_actor_id FROM member_mentions
+        WHERE source_page_id=? AND target_user_id=?`)
+          .bind(pageId, second.userId)
+          .first(),
+      ).toEqual({ first_seen_actor_id: first.userId });
+      expect(
+        await env.DB.prepare(`SELECT user_id,COUNT(*) count FROM notifications
+        WHERE page_id=? AND event_type='mention' GROUP BY user_id ORDER BY user_id`)
+          .bind(pageId)
+          .all(),
+      ).toMatchObject({
+        results: [
+          { user_id: first.userId, count: 1 },
+          { user_id: second.userId, count: 1 },
+        ].sort((a, b) => (a.user_id < b.user_id ? -1 : 1)),
+      });
+    },
+  );
+
+  it.each(["document", "diagram"] as const)(
+    "does not write %s mention provenance or fanout from a stale content epoch",
+    async (kind) => {
+      const installed = await bootstrap();
+      const target = await invite(installed.cookie, `stale-${kind}`);
+      const pageId = kind === "document" ? installed.page.id : "stale-diagram";
+      if (kind === "diagram")
+        await env.DB.prepare(`INSERT INTO pages
+          (id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+          VALUES (?,?,?,?,?,'Stale diagram',?,1,1)`)
+          .bind(pageId, installed.workspaceId, installed.page.spaceId, kind, "z2", installed.userId)
+          .run();
+      const stub = env.DOCUMENT.getByName(`${pageId}~1`);
+      const content = () =>
+        stub.fetch(
+          new Request("https://document.internal/content", {
+            headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+          }),
+        );
+      await content();
+      await runInDurableObject(stub, async (instance) => {
+        const document = (instance as unknown as { document: Y.Doc }).document;
+        document.transact(
+          () => {
+            if (kind === "diagram") {
+              const node = new Y.Map<unknown>();
+              const mentions = new Y.Map<string>();
+              mentions.set(target.userId, "Mentioned collaborator");
+              node.set("mentions", mentions);
+              document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT).set("stale-node", node);
+            } else {
+              const paragraph = new Y.XmlElement("paragraph");
+              const mention = new Y.XmlElement("mention");
+              mention.setAttribute("entityType", "user");
+              mention.setAttribute("entityId", target.userId);
+              mention.setAttribute("label", "Mentioned collaborator");
+              paragraph.insert(0, [mention]);
+              document.getXmlFragment("document-store").insert(0, [paragraph]);
+            }
+          },
+          { state: { userId: installed.userId } },
+        );
+      });
+      await env.DB.prepare(`UPDATE pages SET content_epoch=2 WHERE id=?`).bind(pageId).run();
+      await content();
+      expect(
+        await env.DB.prepare(`SELECT 1 FROM member_mentions WHERE source_page_id=?`).bind(pageId).first(),
+      ).toBeNull();
+      expect(
+        await env.DB.prepare(`SELECT 1 FROM notifications WHERE page_id=? AND event_type='mention'`)
+          .bind(pageId)
+          .first(),
+      ).toBeNull();
+    },
+  );
+
   it("validates preferences and reports unavailable external channels", async () => {
     const installed = await bootstrap();
     const response = await SELF.fetch(request(installed.cookie, "/api/notification-preferences"));

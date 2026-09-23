@@ -2904,6 +2904,7 @@ app.patch("/api/slack/channels/:id/pause", async (c) => {
   if (body.mode === "snooze" && hours === undefined)
     throw new HttpError(422, "invalid_slack_pause", "Choose 1, 8, or 24 hours.");
   await setSlackChannelPause(c.env, member, c.req.param("id"), body.mode, body.mode === "snooze" ? hours : undefined);
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json({
     subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
   });

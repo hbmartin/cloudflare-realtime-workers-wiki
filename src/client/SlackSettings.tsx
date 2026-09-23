@@ -60,6 +60,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(() => new URLSearchParams(window.location.search).has("slackLink"));
   const [currentTime, setCurrentTime] = useState(() => Date.now());
+  const [snoozeHours, setSnoozeHours] = useState<Record<string, "" | "1" | "8" | "24">>({});
   const [spaceId, setSpaceId] = useState(spaces[0]?.id ?? "");
   const resolvedSpaceId = spaces.some((space) => space.id === spaceId) ? spaceId : (spaces[0]?.id ?? "");
 
@@ -234,6 +235,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
             ? "Channel updates muted."
             : `Channel updates snoozed for ${hours} hours.`,
       );
+      if (mode === "snooze") setSnoozeHours((current) => ({ ...current, [subscription.id]: "" }));
       await load();
     } catch (cause) {
       setError(apiErrorMessage(cause, "Channel controls could not be changed."));
@@ -470,18 +472,30 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                   </button>
                   <select
                     aria-label={`Snooze updates for #${subscription.channelName || subscription.channelId}`}
-                    value=""
+                    value={snoozeHours[subscription.id] ?? ""}
                     disabled={busy}
-                    onChange={(event) => {
-                      const hours = Number(event.target.value);
-                      if (hours === 1 || hours === 8 || hours === 24) void pauseChannel(subscription, "snooze", hours);
-                    }}
+                    onChange={(event) =>
+                      setSnoozeHours((current) => ({
+                        ...current,
+                        [subscription.id]: event.target.value as "" | "1" | "8" | "24",
+                      }))
+                    }
                   >
                     <option value="">Snooze…</option>
                     <option value="1">1 hour</option>
                     <option value="8">8 hours</option>
                     <option value="24">24 hours</option>
                   </select>
+                  <button
+                    disabled={busy || !snoozeHours[subscription.id]}
+                    aria-label={`Apply snooze for #${subscription.channelName || subscription.channelId}`}
+                    onClick={() => {
+                      const hours = Number(snoozeHours[subscription.id]);
+                      if (hours === 1 || hours === 8 || hours === 24) void pauseChannel(subscription, "snooze", hours);
+                    }}
+                  >
+                    Apply snooze
+                  </button>
                   <button
                     className="text-danger"
                     disabled={busy}
