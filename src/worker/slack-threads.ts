@@ -210,8 +210,8 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
   let channelValidated = false;
   try {
     const channel = await validateChannel(env, installation, mapping.channel_id);
-    await requireChannelMember(env, installation, mapping.channel_id, identity.slackUserId);
     channelValidated = true;
+    await requireChannelMember(env, installation, mapping.channel_id, identity.slackUserId);
     const result =
       await env.DB.prepare(`UPDATE slack_channel_subscriptions SET mirror_enabled = 1, channel_name = ?, channel_type = ?, validation_state = 'valid', validation_error = NULL, validated_at = ?, bot_is_member = 1, updated_at = ?
       WHERE id = ? AND EXISTS (SELECT 1 FROM slack_installations i JOIN workspace_members wm ON wm.workspace_id = i.workspace_id
@@ -241,8 +241,7 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
       throw new HttpError(409, "slack_mirror_conflict", "Disable the existing mirror for this page or space first.");
     if (
       (!channelValidated && error instanceof HttpError && error.code === "slack_thread_unavailable") ||
-      (!channelValidated &&
-        error instanceof SlackApiError &&
+      (error instanceof SlackApiError &&
         ["channel_not_found", "not_in_channel", "is_archived", "missing_scope", "no_permission"].includes(error.code))
     ) {
       await env.DB.prepare(

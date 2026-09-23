@@ -843,8 +843,31 @@ describe("canonical Slack mirrors", () => {
       ).first(),
     ).toEqual({ mirror_enabled: 1, validation_state: "valid" });
     beforeResponse = undefined;
+    members = ["UVIEWER"];
+    await expect(setSlackMirror(runtime(), owner, "space", true)).rejects.toMatchObject({ status: 403 });
+    expect(
+      await env.DB.prepare(
+        `SELECT mirror_enabled, validation_state FROM slack_channel_subscriptions WHERE id = 'space'`,
+      ).first(),
+    ).toEqual({ mirror_enabled: 1, validation_state: "valid" });
+    members = ["UOWNER", "UVIEWER"];
     channelExtra = { is_member: false };
     await expect(setSlackMirror(runtime(), owner, "space", true)).rejects.toMatchObject({ status: 403 });
+    expect(
+      await env.DB.prepare(
+        `SELECT mirror_enabled, validation_state FROM slack_channel_subscriptions WHERE id = 'space'`,
+      ).first(),
+    ).toEqual({ mirror_enabled: 0, validation_state: "invalid" });
+    expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id = ?`).bind(link.id).first()).toEqual({
+      state: "retired",
+    });
+  });
+  it("retires an enabled mirror when Slack definitively loses channel access during membership lookup", async () => {
+    const { link } = await activeThread();
+    beforeResponse = async (method) => {
+      if (method === "conversations.members") throw new SlackApiError(method, "channel_not_found", 200);
+    };
+    await expect(setSlackMirror(runtime(), owner, "space", true)).rejects.toMatchObject({ code: "channel_not_found" });
     expect(
       await env.DB.prepare(
         `SELECT mirror_enabled, validation_state FROM slack_channel_subscriptions WHERE id = 'space'`,

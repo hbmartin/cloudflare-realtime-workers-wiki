@@ -6,7 +6,12 @@ UPDATE comments SET
   slack_order_us = CAST(substr(receipt.message_ts, 1, instr(receipt.message_ts, '.') - 1) AS INTEGER) * 1000000
     + CAST(substr(substr(receipt.message_ts, instr(receipt.message_ts, '.') + 1) || '000000', 1, 6) AS INTEGER)
 FROM slack_inbound_receipts receipt
-WHERE comments.slack_source_receipt_id = receipt.id AND receipt.message_ts GLOB '[0-9]*.[0-9]*';
+WHERE comments.slack_source_receipt_id = receipt.id
+  AND instr(receipt.message_ts, '.') BETWEEN 2 AND 11
+  AND length(receipt.message_ts) - instr(receipt.message_ts, '.') BETWEEN 1 AND 16
+  AND substr(receipt.message_ts, 1, instr(receipt.message_ts, '.') - 1) NOT GLOB '*[^0-9]*'
+  AND substr(receipt.message_ts, instr(receipt.message_ts, '.') + 1) NOT GLOB '*[^0-9]*'
+  AND CAST(substr(receipt.message_ts, 1, instr(receipt.message_ts, '.') - 1) AS INTEGER) <= 9007199254;
 
 -- A new Slack session may resume a redeemed recovery, but issuing an operator
 -- reset alone must not create a resumable recovery window.

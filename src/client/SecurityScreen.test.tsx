@@ -108,6 +108,23 @@ describe("account protection screens", () => {
     });
   });
 
+  it("restores the password fallback when proof refresh fails after expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const slackStatus: SecurityStatus = {
+      ...status,
+      slackPrimary: { available: true, expiresAt: Date.now() + 1_000 },
+      serverNow: Date.now(),
+    };
+    vi.mocked(api).mockRejectedValue(new Error("Refresh unavailable"));
+    render(<SecurityScreen initialStatus={slackStatus} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_001);
+    });
+    expect(screen.getByLabelText("Account password")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Sign in with Slack again" })).toBeVisible();
+  });
+
   it("refreshes the primary factor options after the server rejects expired proof", async () => {
     const slackStatus: SecurityStatus = {
       ...status,

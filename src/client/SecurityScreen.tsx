@@ -72,6 +72,9 @@ export function SecurityScreen({
     if (!expiresAt || !status?.serverNow) return undefined;
     const timer = window.setTimeout(
       () => {
+        setStatus((current) =>
+          current?.slackPrimary?.expiresAt === expiresAt ? { ...current, slackPrimary: undefined } : current,
+        );
         void reload().catch((cause) => setError(apiErrorMessage(cause, "Unable to refresh security settings.")));
       },
       Math.max(1000, expiresAt - status.serverNow + 1),
