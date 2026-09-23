@@ -6,6 +6,43 @@ import { createAuth } from "./auth";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("repairs only unedited imported Slack comments and indexes pending redrive", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0040"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+        VALUES ('owner','Owner','owner@example.test',1,1)`),
+      env.DB.prepare(`INSERT INTO workspaces(id,name,created_at) VALUES ('workspace','Notes',1)`),
+      env.DB.prepare(`INSERT INTO workspace_members(workspace_id,user_id,role,created_at)
+        VALUES ('workspace','owner','owner',1)`),
+      env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+        VALUES ('page','workspace','workspace-general','document','a0','Page','owner',1,1)`),
+      env.DB.prepare(`INSERT INTO comment_threads(id,workspace_id,space_id,page_id,created_by,created_at,updated_at)
+        VALUES ('thread','workspace','workspace-general','page','owner',1,1)`),
+      env.DB
+        .prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,
+        scopes,installed_by,created_at,updated_at) VALUES ('installation','workspace','T123','Slack','UBOT','cipher','', 'owner',1,1)`),
+      env.DB.prepare(`INSERT INTO slack_inbound_receipts(id,installation_id,event_id,channel_id,message_ts,event_type,
+        received_at,processed_at) VALUES ('receipt-1','installation','Ev1','C123','1700000000.000001','message',1,2000),
+        ('receipt-2','installation','Ev2','C123','1700000000.000002','message',1,3000)`),
+      env.DB.prepare(`INSERT INTO comments(id,thread_id,user_id,body_json,plain_text,created_at,updated_at,
+        slack_source_receipt_id) VALUES ('original','thread','owner','[]','one',1000,2000,'receipt-1'),
+        ('edited','thread','owner','[]','two',1001,4000,'receipt-2')`),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect((await env.DB.prepare(`SELECT id,created_at,updated_at FROM comments ORDER BY id`).all()).results).toEqual([
+      { id: "edited", created_at: 1001, updated_at: 4000 },
+      { id: "original", created_at: 1000, updated_at: 1000 },
+    ]);
+    const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN SELECT id FROM outbox
+      WHERE slack_redrive_due_at IS NOT NULL AND slack_redrive_due_at <= ?
+      ORDER BY slack_redrive_due_at,id LIMIT 50`)
+      .bind(Date.now())
+      .all<{ detail: string }>();
+    expect(plan.results.some((row) => row.detail.includes("idx_outbox_slack_redrive_due"))).toBe(true);
+  });
   it("backfills scheduler tokens without renewing grace for never-successful tasks", async () => {
     await applyD1Migrations(
       env.DB,

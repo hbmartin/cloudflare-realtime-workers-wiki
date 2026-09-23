@@ -83,7 +83,29 @@ describe("Slack thread text", () => {
       },
     ] as unknown as Parameters<typeof slackCommentText>[0];
     expect(await slackCommentText(outbound, async () => null)).toContain(
-      "a|b <https://example.test/a?x=1&y=2|See¦this> unsafe",
+      "a|b <https://example.test/a?x=1&amp;y=2|See¦this> unsafe",
     );
+  });
+  it("keeps ambiguous emphasis literal while parsing nested links and mentions", async () => {
+    const body = await slackReplyBody(
+      "file_<@UONE>_ task*<https://example.test/a?x=1&amp;y=2|open>* (*<@UONE>*)",
+      async () => ({ id: "member-1", name: "One" }),
+    );
+    const json = JSON.stringify(body);
+    expect(json).toContain("file_");
+    expect(json).toContain("task*");
+    expect(json).toContain('"entityId":"member-1"');
+    expect(json).toContain('"href":"https://example.test/a?x=1&y=2"');
+  });
+  it("truncates before complete Slack tokens and escaped entities", async () => {
+    const text = await slackCommentText(
+      [
+        { type: "text", text: "x".repeat(2698) },
+        { type: "mention", props: { entityType: "user", entityId: "member", label: "One" } },
+        { type: "text", text: " & more".repeat(30) },
+      ] as unknown as Parameters<typeof slackCommentText>[0],
+      async () => "UONE",
+    );
+    expect(text).toBe(`${"x".repeat(2698)}…`);
   });
 });

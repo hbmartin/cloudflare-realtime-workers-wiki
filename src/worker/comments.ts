@@ -399,7 +399,7 @@ export async function addCommentReply(
       body.json,
       body.plainText,
       source?.slackOrderUs === undefined ? timestamp : Math.floor(source.slackOrderUs / 1000),
-      timestamp,
+      source?.slackOrderUs === undefined ? timestamp : Math.floor(source.slackOrderUs / 1000),
       source?.receiptId ?? null,
       source?.slackOrderUs ?? null,
     ),

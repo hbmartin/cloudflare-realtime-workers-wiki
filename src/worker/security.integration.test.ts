@@ -605,6 +605,7 @@ describe("security lifecycle regressions", () => {
     const recovery = responseCookies(
       await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] }),
     );
+    await env.DB.prepare(`UPDATE account_security SET recovery_resume_key_hash=NULL`).run();
     await env.DB.prepare("UPDATE session_security SET expires_at=? WHERE method='recovery'")
       .bind(Date.now() - 1)
       .run();
@@ -639,9 +640,14 @@ describe("security lifecycle regressions", () => {
       await request(cookie, "/api/security/recovery-codes", {})
     ).json<{ codes: string[]; receipt: string }>();
     expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
-    expect((await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] })).status).toBe(
-      200,
-    );
+    const recoveryResponse = await request(cookie, "/api/security/recover", {
+      password: "password123",
+      code: codes[0],
+    });
+    expect(recoveryResponse.status).toBe(200);
+    expect(recoveryResponse.headers.get("cache-control")).toBe("no-store");
+    const { resumeKey } = await recoveryResponse.json<{ resumeKey: string }>();
+    expect(resumeKey).toMatch(/^[a-f0-9]{64}$/);
     // Model the replacement session created by Slack OAuth without a password 2FA challenge.
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM twoFactor WHERE userId = (SELECT id FROM user WHERE email = 'owner@example.test')`),
@@ -670,7 +676,11 @@ describe("security lifecycle regressions", () => {
       recoveryCanResume: true,
       slackPrimary: { available: true },
     });
-    expect((await request(replacement, "/api/security/resume-recovery", {})).status).toBe(200);
+    expect((await request(replacement, "/api/security/resume-recovery", {})).status).toBe(403);
+    expect((await request(replacement, "/api/security/resume-recovery", { resumeKey })).status).toBe(200);
+    expect(await env.DB.prepare(`SELECT recovery_resume_key_hash hash FROM account_security`).first()).toEqual({
+      hash: null,
+    });
     expect(
       await env.DB.prepare(`SELECT proof.verified_at = account.recovery_started_at matched
       FROM session_security proof JOIN account_security account ON account.user_id = proof.user_id
@@ -682,6 +692,98 @@ describe("security lifecycle regressions", () => {
       .bind(now - 25 * 60 * 60_000)
       .run();
     expect((await request(replacement, "/api/security/resume-recovery", {})).status).toBe(403);
+  });
+
+  it("requires both the saved key and a primary factor for password replacement sessions", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const { resumeKey } = await recovery.json<{ resumeKey: string }>();
+    expect(await env.DB.prepare(`SELECT recovery_resume_key_hash hash FROM account_security`).first()).toEqual({
+      hash: await sha256(resumeKey),
+    });
+    const signIn = async () =>
+      responseCookies(
+        await request("", "/api/auth/sign-in/email", {
+          email: "owner@example.test",
+          password: "password123",
+        }),
+      );
+    const challenge = await signIn();
+    expect((await request(challenge, "/api/security/resume-recovery", { resumeKey })).status).toBe(403);
+    expect(
+      (
+        await request(challenge, "/api/security/resume-recovery", {
+          password: "wrong",
+          resumeKey,
+        })
+      ).status,
+    ).toBe(403);
+    const resumed = await request(challenge, "/api/security/resume-recovery", {
+      password: "password123",
+      resumeKey,
+    });
+    expect(resumed.status).toBe(200);
+    const replacement = responseCookies(resumed);
+    expect((await request(replacement, "/api/security/status")).status).toBe(200);
+    expect(await env.DB.prepare(`SELECT recovery_resume_key_hash hash FROM account_security`).first()).toEqual({
+      hash: null,
+    });
+  });
+
+  it("allows only one concurrent replacement claim and revokes an unused key on operator reset", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const { resumeKey } = await recovery.json<{ resumeKey: string }>();
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM twoFactor WHERE userId=(SELECT id FROM user WHERE email='owner@example.test')`),
+      env.DB.prepare(`UPDATE user SET twoFactorEnabled=0 WHERE email='owner@example.test'`),
+    ]);
+    const signIn = () =>
+      request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      });
+    const [first, second] = await Promise.all([signIn(), signIn()]);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    const user = await env.DB.prepare(`SELECT id FROM user WHERE email='owner@example.test'`).first<{ id: string }>();
+    const sessions = await env.DB.prepare(`SELECT id FROM session WHERE userId=?`).bind(user!.id).all<{ id: string }>();
+    const now = Date.now();
+    await env.DB.prepare(`INSERT INTO account(id,accountId,providerId,userId,createdAt,updatedAt)
+      VALUES ('slack-proof-account','T123:UOWNER','slack',?,?,?)`)
+      .bind(user!.id, now, now)
+      .run();
+    for (const session of sessions.results)
+      await env.DB.prepare(`INSERT OR IGNORE INTO slack_primary_factor_proofs
+      (session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at)
+      VALUES (?,?,'slack-proof-account','T123','UOWNER',?,?)`)
+        .bind(session.id, user!.id, now, now + 600_000)
+        .run();
+    const results = await Promise.all([
+      request(responseCookies(first), "/api/security/resume-recovery", { resumeKey }),
+      request(responseCookies(second), "/api/security/resume-recovery", { resumeKey }),
+    ]);
+    expect(results.map((result) => result.status).sort((a, b) => a - b)).toEqual([200, 403]);
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_key_hash hash,
+      recovery_resume_claim_session_id IS NOT NULL claimed FROM account_security`).first(),
+    ).toEqual({ hash: null, claimed: 1 });
+    await env.DB.prepare(`INSERT INTO security_resets(token_hash,user_id,expires_at)
+      VALUES ('reset-token',?,?)`)
+      .bind(user!.id, Date.now() + 60_000)
+      .run();
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_key_hash hash,recovery_resume_claim_session_id claim
+      FROM account_security`).first(),
+    ).toEqual({ hash: null, claim: null });
   });
 
   it("does not burn recovery credentials when a challenge expires between authorization and consumption", async () => {

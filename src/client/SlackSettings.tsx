@@ -25,6 +25,9 @@ type ChannelSubscription = {
   botIsMember?: boolean | null;
   mirrorEnabled?: boolean;
   blockedDeliveries?: number;
+  failedDeliveries?: number;
+  notificationBlockedAt?: number | null;
+  notificationError?: string | null;
   mutedAt?: number | null;
   snoozedUntil?: number | null;
 };
@@ -198,6 +201,20 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
     }
   }
 
+  async function repairNotifications(subscription: ChannelSubscription) {
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/slack/channels/${encodeURIComponent(subscription.id)}/repair-notifications`, { method: "POST" });
+      setNotice("Channel access verified. New notifications will resume.");
+      await load();
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "Channel access could not be verified."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function pauseChannel(
     subscription: ChannelSubscription,
     mode: "mute" | "unmute" | "snooze",
@@ -300,6 +317,11 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
         <button className="primary-small" disabled={busy} onClick={() => void linkIdentity()}>
           {identityState === "legacy" ? "Verify Slack identity" : "Connect Slack identity"}
         </button>
+      )}
+      {connected && status?.installation?.authError && (
+        <output className="channel-status">
+          Slack bot authentication failed. Ask an owner to reauthorize the workspace app.
+        </output>
       )}
       {owner && connected && status.installation?.scopeHealth && (
         <div className="slack-scope-health">
@@ -408,10 +430,22 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                     {subscription.validationState === "invalid" && (
                       <p>Channel validation failed. Check bot membership and channel access.</p>
                     )}
+                    {subscription.notificationBlockedAt && (
+                      <output>
+                        One-way notifications are blocked because the bot cannot use this channel. Pending updates were
+                        discarded.
+                      </output>
+                    )}
                     {Boolean(subscription.blockedDeliveries) && (
                       <output>
                         {subscription.blockedDeliveries} thread deliveries need reconciliation. Sending is paused to
                         prevent duplicates.
+                      </output>
+                    )}
+                    {Boolean(subscription.failedDeliveries) && (
+                      <output>
+                        {subscription.failedDeliveries} thread deliveries failed. Later replies can continue after a
+                        rejected reply.
                       </output>
                     )}
                   </div>
@@ -422,6 +456,11 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                   >
                     {subscription.mirrorEnabled ? "Disable mirror" : "Validate and enable mirror"}
                   </button>
+                  {subscription.notificationBlockedAt && (
+                    <button disabled={busy} onClick={() => void repairNotifications(subscription)}>
+                      Verify and resume notifications
+                    </button>
+                  )}
                   <button
                     disabled={busy}
                     aria-label={`${pauseLabel} #${subscription.channelName || subscription.channelId}`}
