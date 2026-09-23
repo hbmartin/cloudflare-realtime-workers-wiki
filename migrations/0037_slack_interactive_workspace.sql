@@ -20,6 +20,7 @@ CREATE TABLE slack_view_sessions (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX idx_slack_view_sessions_user ON slack_view_sessions(installation_id, slack_user_id, kind);
+CREATE INDEX idx_slack_view_sessions_expiry ON slack_view_sessions(kind, updated_at);
 
 CREATE TABLE slack_action_commits (
   receipt_id TEXT PRIMARY KEY REFERENCES slack_interaction_receipts(id) ON DELETE CASCADE,

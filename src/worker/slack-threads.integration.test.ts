@@ -25,6 +25,7 @@ import {
   deliverSlackWorkspaceAction,
   deliverSlackSearchUpdate,
   openSlackSearch,
+  purgeExpiredSlackSearchSessions,
   publishSlackHome,
 } from "./slack-workspace";
 import { consumeDeliveryMessage, type DeliveryQueueMessage } from "./jobs";
@@ -513,6 +514,36 @@ describe("interactive Slack workspace", () => {
       }
     ).blocks;
     expect(emptyBlocks.some((block) => block.block_id === "search_navigation")).toBe(false);
+  });
+
+  it("opens a valid input modal and deduplicates Done submissions before expiring the session", async () => {
+    const installed = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id = 'installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installed, "UOWNER", "trigger", "Orchid");
+    expect(
+      (calls.find((call) => call.method === "views.open")!.payload.view as { submit: { text: string } }).submit.text,
+    ).toBe("Done");
+    const session = await env.DB.prepare(`SELECT id, view_hash FROM slack_view_sessions WHERE kind = 'search'`).first<{
+      id: string;
+      view_hash: string;
+    }>();
+    const submission = {
+      type: "view_submission",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: { callback_id: "noteflare_search", private_metadata: session!.id, id: "VSEARCH", hash: session!.view_hash },
+    };
+    expect((await acceptSlackWorkspaceInteraction(runtime(), submission)).response).toEqual({});
+    expect((await acceptSlackWorkspaceInteraction(runtime(), submission)).response).toEqual({});
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) count FROM slack_interaction_receipts WHERE callback_id = 'noteflare_search_done'`,
+      ).first(),
+    ).toEqual({ count: 1 });
+    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at = 1 WHERE id = ?`).bind(session!.id).run();
+    await purgeExpiredSlackSearchSessions(runtime());
+    expect(await env.DB.prepare(`SELECT 1 FROM slack_view_sessions WHERE id = ?`).bind(session!.id).first()).toBeNull();
   });
 
   it("navigates Home by Mentions cursors, records actor context, and marks the snapshot read", async () => {

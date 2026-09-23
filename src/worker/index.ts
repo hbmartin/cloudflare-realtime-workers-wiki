@@ -1,5 +1,5 @@
 import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror } from "./slack-threads";
-import { acceptSlackWorkspaceInteraction, openSlackSearch } from "./slack-workspace";
+import { acceptSlackWorkspaceInteraction, openSlackSearch, purgeExpiredSlackSearchSessions } from "./slack-workspace";
 import { pageForMember, effectiveSpaceRole, type PageRow } from "./page-access";
 import { mentionsInbox, markMentionsRead } from "./mentions-inbox";
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
@@ -2752,7 +2752,13 @@ app.post("/api/slack/interactions", async (c) => {
     c.executionCtx.waitUntil(sweepOutbox(c.env));
     return c.json({ ok: true });
   }
-  const workspace = await acceptSlackWorkspaceInteraction(c.env, payload);
+  let workspace: Awaited<ReturnType<typeof acceptSlackWorkspaceInteraction>>;
+  try {
+    workspace = await acceptSlackWorkspaceInteraction(c.env, payload);
+  } catch (error) {
+    if (error instanceof HttpError && error.status < 500) return c.json({ ok: true });
+    throw error;
+  }
   if (workspace.handled) {
     c.executionCtx.waitUntil(sweepOutbox(c.env));
     return c.json(workspace.response ?? { ok: true });
@@ -6416,7 +6422,10 @@ export default {
         upload_reaps: () => processDueUploadReaps(env),
         page_move_receipts: () => pruneExpiredPageMoveReceipts(env.DB),
         queued_jobs: () => recoverQueuedJobs(env),
-        outbox: () => sweepOutbox(env),
+        outbox: async () => {
+          await sweepOutbox(env);
+          await purgeExpiredSlackSearchSessions(env);
+        },
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
         slack_digests: () => sendDueSlackChannelDigests(env),

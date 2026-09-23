@@ -205,6 +205,7 @@ export function searchModal(
     private_metadata: sessionId,
     title: plain("Search NoteFlare"),
     close: plain("Close"),
+    submit: plain("Done"),
     blocks: [...filterBlocks, ...resultBlocks, ...nav],
   };
 }

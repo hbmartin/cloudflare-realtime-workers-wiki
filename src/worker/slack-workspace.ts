@@ -25,6 +25,7 @@ const DENIED = "This NoteFlare resource is unavailable or you no longer have per
 const CONNECT = "Connect your Slack account from NoteFlare Settings before using this action.";
 const ID = /^[A-Za-z0-9:_-]{1,200}$/;
 const TS = /^\d{1,16}\.\d{1,16}$/;
+const SEARCH_SESSION_TTL_MS = 24 * 3_600_000;
 const SEARCH_ACTIONS = new Set(["noteflare_search_run", "noteflare_search_next", "noteflare_search_previous"]);
 const HOME_ACTIONS = new Set(["noteflare_home_next", "noteflare_home_previous", "noteflare_home_read"]);
 const ROOT_ACTIONS = new Set([
@@ -90,9 +91,9 @@ async function sessionFor(
 ) {
   const row = await env.DB.prepare(
     `SELECT * FROM slack_view_sessions WHERE id = ? AND kind = ? AND installation_id = ?
-      AND installation_generation = ? AND slack_user_id = ?`,
+      AND installation_generation = ? AND slack_user_id = ? AND (? = 'home' OR updated_at >= ?)`,
   )
-    .bind(id, kind, installation.id, installation.generation, userId)
+    .bind(id, kind, installation.id, installation.generation, userId, kind, Date.now() - SEARCH_SESSION_TTL_MS)
     .first<Session>();
   if (!row) unavailable();
   return row;
@@ -318,6 +319,34 @@ export async function acceptSlackWorkspaceInteraction(env: Env, payload: SlackIn
       return { handled: true, response: { options: [] } };
     }
   }
+  if (payload.type === "view_submission" && payload.view?.callback_id === "noteflare_search") {
+    if (typeof payload.team?.id !== "string" || typeof payload.user?.id !== "string")
+      return { handled: true, response: { ok: true } };
+    const installation = await currentInstallation(env, payload.team.id);
+    if (!installation) return { handled: true, response: { ok: true } };
+    const sessionId = payload.view.private_metadata;
+    if (typeof sessionId !== "string" || !ID.test(sessionId) || typeof payload.view.id !== "string")
+      return { handled: true, response: { ok: true } };
+    const session = await sessionFor(env, sessionId, "search", installation, payload.user.id);
+    if (session.view_id !== payload.view.id || session.view_hash !== payload.view.hash) unavailable();
+    const identity = await identityFor(env, installation, payload.user.id);
+    if (!identity || !(await memberForCurrent(env, installation, identity.userId))) unavailable();
+    const interactionId = receiptKey({
+      teamId: payload.team.id,
+      userId: payload.user.id,
+      actionId: "noteflare_search_done",
+      actionTs: session.view_hash ?? "",
+      containerId: session.id,
+    });
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO slack_interaction_receipts
+        (id, installation_id, interaction_id, callback_id, received_at, processed_at, outcome)
+       VALUES (?, ?, ?, 'noteflare_search_done', ?, ?, 'accepted')`,
+    )
+      .bind(crypto.randomUUID(), installation.id, interactionId, Date.now(), Date.now())
+      .run();
+    return { handled: true, response: {} };
+  }
   if (
     payload.type !== "block_actions" ||
     payload.actions?.length !== 1 ||
@@ -425,8 +454,10 @@ export async function acceptSlackWorkspaceInteraction(env: Env, payload: SlackIn
 }
 
 async function deliverSearch(env: Env, input: ActionInput | null, sessionId: string, revision: number) {
-  const row = await env.DB.prepare(`SELECT * FROM slack_view_sessions WHERE id = ? AND kind = 'search'`)
-    .bind(sessionId)
+  const row = await env.DB.prepare(
+    `SELECT * FROM slack_view_sessions WHERE id = ? AND kind = 'search' AND updated_at >= ?`,
+  )
+    .bind(sessionId, Date.now() - SEARCH_SESSION_TTL_MS)
     .first<Session>();
   if (!row || !row.view_id || row.revision !== revision) return;
   const installation = await env.DB.prepare(
@@ -474,6 +505,12 @@ export async function deliverSlackSearchUpdate(env: Env, sessionId: string, revi
     if (error instanceof SlackApiError && ["hash_conflict", "view_not_found"].includes(error.code)) return;
     throw error;
   }
+}
+
+export async function purgeExpiredSlackSearchSessions(env: Env) {
+  await env.DB.prepare(`DELETE FROM slack_view_sessions WHERE kind = 'search' AND updated_at < ?`)
+    .bind(Date.now() - SEARCH_SESSION_TTL_MS)
+    .run();
 }
 
 export async function deliverSlackHome(
@@ -1042,12 +1079,6 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
     typeof payload.shareId !== "string"
   )
     return;
-  const receipt = await env.DB.prepare(
-    `UPDATE slack_interaction_receipts SET denial_sent_at = ? WHERE id = ? AND outcome = 'accepted' AND denial_sent_at IS NULL`,
-  )
-    .bind(Date.now(), payload.receiptId)
-    .run();
-  if (!receipt.meta.changes) return;
   try {
     const installation = await installationFor(env, payload.installationId, payload.generation);
     const { member } = await verifiedMember(env, installation, payload.userId);
@@ -1088,6 +1119,13 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
     } else return;
     const share = await getShare(env, member, payload.pageId, origin(env));
     if (!share || share.id !== payload.shareId) return;
+    // Claim only after all permission reads. An ambiguous Slack send is not safe to repost.
+    const receipt = await env.DB.prepare(
+      `UPDATE slack_interaction_receipts SET denial_sent_at = ? WHERE id = ? AND outcome = 'accepted' AND denial_sent_at IS NULL`,
+    )
+      .bind(Date.now(), payload.receiptId)
+      .run();
+    if (!receipt.meta.changes) return;
     await slackApi(env, installation, "chat.postEphemeral", {
       channel: payload.channelId,
       user: payload.userId,
