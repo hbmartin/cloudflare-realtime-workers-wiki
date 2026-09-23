@@ -85,6 +85,12 @@ async function activeShareForPage(env: Env, member: MemberContext, pageId: strin
 }
 
 export async function getShare(env: Env, member: MemberContext, pageId: string, origin: string) {
+  const owner = await env.DB.prepare(
+    `SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role = 'owner'`,
+  )
+    .bind(member.workspace.id, member.user.id)
+    .first();
+  if (!owner) throw new HttpError(404, "page_not_found", "Page not found.");
   const page = await env.DB.prepare(`SELECT id FROM pages WHERE id = ? AND workspace_id = ?`)
     .bind(pageId, member.workspace.id)
     .first();
@@ -99,7 +105,14 @@ export async function createShare(
   pageId: string,
   origin: string,
   options: Partial<{ includeSubpages: boolean; allowIndexing: boolean; showToc: boolean; showLastUpdated: boolean }>,
+  mutation?: { guard: D1PreparedStatement; afterCreate: (shareId: string) => D1PreparedStatement[] },
 ) {
+  const owner = await env.DB.prepare(
+    `SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role = 'owner'`,
+  )
+    .bind(member.workspace.id, member.user.id)
+    .first();
+  if (!owner) throw new HttpError(404, "page_not_found", "Page not found.");
   const page = await env.DB.prepare(
     `SELECT id, kind FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL AND import_job_id IS NULL`,
   )
@@ -115,27 +128,42 @@ export async function createShare(
   const id = crypto.randomUUID();
   const urlKey = randomUrlKey();
   try {
-    await env.DB.prepare(
+    const insert = env.DB.prepare(
       `INSERT INTO share_links
         (id, workspace_id, root_page_id, url_key, include_subpages, allow_indexing, show_toc,
          show_last_updated, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(
-        id,
-        member.workspace.id,
-        pageId,
-        urlKey,
-        options.includeSubpages ? 1 : 0,
-        options.allowIndexing ? 1 : 0,
-        options.showToc === false ? 0 : 1,
-        options.showLastUpdated === false ? 0 : 1,
-        member.user.id,
-        timestamp,
-        timestamp,
-      )
-      .run();
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role = 'owner')
+          AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL
+            AND import_job_id IS NULL AND kind <> 'diagram')`,
+    ).bind(
+      id,
+      member.workspace.id,
+      pageId,
+      urlKey,
+      options.includeSubpages ? 1 : 0,
+      options.allowIndexing ? 1 : 0,
+      options.showToc === false ? 0 : 1,
+      options.showLastUpdated === false ? 0 : 1,
+      member.user.id,
+      timestamp,
+      timestamp,
+      member.workspace.id,
+      member.user.id,
+      pageId,
+      member.workspace.id,
+    );
+    const inserted = mutation
+      ? (await env.DB.batch([mutation.guard, insert, ...mutation.afterCreate(id)]))[1]!
+      : await insert.run();
+    if (!inserted.meta.changes) throw new HttpError(404, "page_not_found", "Page not found.");
   } catch (error) {
+    if (
+      error instanceof HttpError ||
+      (mutation && String(error).includes("slack_action_commits")) ||
+      String(error).includes("CHECK constraint failed: authorized = 1")
+    )
+      throw error;
     const raced = await activeShareForPage(env, member, pageId);
     if (raced) return shareJson(raced, origin);
     throw error;

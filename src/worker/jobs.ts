@@ -1,4 +1,5 @@
 import { deliverSlackThread, deliverSlackMutation, deliverSlackDenial } from "./slack-threads";
+import { deliverSlackWorkspaceAction, deliverSlackSearchUpdate, deliverSlackShareResponse } from "./slack-workspace";
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import * as Y from "yjs";
@@ -17,7 +18,8 @@ import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { cleanupExport, runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
-import { deliverSlackChannelEvent, deliverSlackHome, deliverSlackUnfurl } from "./slack";
+import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
+import { deliverSlackHome } from "./slack-workspace";
 import { deliverWebhook, fanoutWebhookEvent } from "./webhooks";
 import {
   correlationHeaders,
@@ -1463,6 +1465,16 @@ export async function consumeDeliveryMessage(
     await sweepOutbox(env);
   } else if (row.topic === "slack_interaction_response") {
     await deliverSlackDenial(env, payload);
+  } else if (row.topic === "slack_workspace_action") {
+    if (typeof payload.receiptId !== "string") return await rejectPayload("Slack workspace receipt is invalid.");
+    await deliverSlackWorkspaceAction(env, payload.receiptId);
+    await sweepOutbox(env);
+  } else if (row.topic === "slack_search_update") {
+    if (typeof payload.sessionId !== "string" || typeof payload.revision !== "number")
+      return await rejectPayload("Slack search update is invalid.");
+    await deliverSlackSearchUpdate(env, payload.sessionId, payload.revision);
+  } else if (row.topic === "slack_share_response") {
+    await deliverSlackShareResponse(env, payload);
   } else if (row.topic === "slack_channel") {
     const eventId = payload.eventId;
     if (typeof eventId !== "string") return await rejectPayload("Slack channel outbox payload is invalid.");
@@ -1477,7 +1489,13 @@ export async function consumeDeliveryMessage(
     if (typeof installationId !== "string" || typeof userId !== "string") {
       return await rejectPayload("Slack Home outbox payload is invalid.");
     }
-    await deliverSlackHome(env, installationId, userId);
+    await deliverSlackHome(
+      env,
+      installationId,
+      userId,
+      typeof payload.generation === "number" ? payload.generation : undefined,
+      payload.reset === true,
+    );
   } else if (row.topic === "webhook_event") {
     const eventId = payload.eventId;
     if (typeof eventId !== "string") return await rejectPayload("Webhook event outbox payload is invalid.");

@@ -1287,8 +1287,8 @@ export class Document extends YServer {
           ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
             `INSERT INTO member_mentions
-              (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, projection_seq)
-              SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?, ?
+              (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, first_seen_actor_id, projection_seq)
+              SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?, ?, ?
                 FROM json_each(?) item
                 JOIN workspace_members member
                   ON member.workspace_id = ? AND member.user_id = json_extract(item.value, '$.targetId')
@@ -1299,6 +1299,7 @@ export class Document extends YServer {
             page.workspace_id,
             pageId,
             timestamp,
+            metadataAtStart.last_editor_id,
             maximum,
             JSON.stringify(projection.memberMentions),
             page.workspace_id,
@@ -1788,8 +1789,8 @@ export class Document extends YServer {
           ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
             `INSERT INTO member_mentions
-              (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, projection_seq)
-              SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?, ?
+              (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, first_seen_actor_id, projection_seq)
+              SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?, ?, ?
                 FROM json_each(?) item
                 JOIN workspace_members member
                   ON member.workspace_id = ? AND member.user_id = json_extract(item.value, '$.targetId')
@@ -1800,6 +1801,7 @@ export class Document extends YServer {
             page.workspace_id,
             pageId,
             timestamp,
+            metadataAtStart.last_editor_id,
             maximum,
             JSON.stringify(projection.memberMentions),
             page.workspace_id,

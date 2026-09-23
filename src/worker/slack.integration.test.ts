@@ -11,7 +11,6 @@ import {
   createSlackOAuthUrl,
   decryptSlackToken,
   deliverSlackChannelEvent,
-  deliverSlackHome,
   deliverSlackUnfurl,
   disconnectSlack,
   encryptSlackToken,
@@ -27,6 +26,7 @@ import {
   validateSlackIdentity,
   verifySlackRequest,
 } from "./slack";
+import { deliverSlackHome } from "./slack-workspace";
 
 const SLACK_SECRETS = {
   SLACK_CLIENT_ID: "123.456",
@@ -372,7 +372,7 @@ describe("Slack security and integration", () => {
     ).toEqual({ processed: 1 });
   });
 
-  it("publishes one durable empty App Home placeholder and ignores message events", async () => {
+  it("queues one Home publication and shows a safe linking state", async () => {
     const installed = await bootstrap();
     await installSlack(installed.member);
     const home = {
@@ -398,7 +398,7 @@ describe("Slack security and integration", () => {
     await deliverSlackHome(slackEnv(), "slack-installation", "UOWNER");
     expect(fetchMock).toHaveBeenCalledWith(
       "https://slack.com/api/views.publish",
-      expect.objectContaining({ body: expect.stringContaining('"blocks":[]') }),
+      expect.objectContaining({ body: expect.stringContaining("Your NoteFlare inbox is unavailable") }),
     );
   });
 
@@ -648,7 +648,7 @@ describe("Slack security and integration", () => {
     });
   });
 
-  it("links accounts once and keeps slash search scoped to the linked NoteFlare user", async () => {
+  it("links accounts once and requires a live trigger for slash search", async () => {
     const installed = await bootstrap();
     const viewer = await inviteViewer(installed.cookie);
     await installSlack(installed.member);
@@ -690,12 +690,12 @@ describe("Slack security and integration", () => {
       slackEnv(),
       new URLSearchParams("team_id=T123&user_id=UOWNER&text=Orchid"),
     );
-    expect(ownerResult.text).toContain("Orchid launch");
+    expect(ownerResult.text).toContain("Search is unavailable");
     const viewerResult = await handleSlackCommand(
       slackEnv(),
       new URLSearchParams("team_id=T123&user_id=UVIEWER&text=Orchid"),
     );
-    expect(viewerResult.text).toContain("No NoteFlare pages matched");
+    expect(viewerResult.text).toContain("Search is unavailable");
   });
 
   it("suppresses private unfurls unless the linked user has access and the channel is explicitly mapped", async () => {

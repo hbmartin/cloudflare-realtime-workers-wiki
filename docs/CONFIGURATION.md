@@ -258,6 +258,20 @@ An operator can inspect the marker in Slack and the durable delivery record; thi
 automatic resend for an uncertain result. Disabling the mirror stops subsequent work without deleting Slack history.
 Ephemeral denials are best effort and never fall back to public channel messages.
 
+## Interactive Slack workspace
+
+`/notes <query>` opens a search modal with space, tag, page-kind, and archive filters. Search and pagination
+show ten currently accessible results at a time. The Slack App Home Mentions tab shows ten mentions per page,
+with unread state and a **Mark inbox read** action. Opening Home starts a fresh inbox snapshot; Next and Previous
+continue within that snapshot. Older mentions without recorded actor provenance display “A collaborator.”
+
+Canonical thread roots offer Resolve/Reopen and page Watch/Unwatch. A page Unwatch also overrides a watched
+space. Workspace owners can Mute/Unmute or Snooze the mapping for 1, 8, or 24 hours. Unmute clears both mute
+and snooze; Snooze replaces an indefinite mute. Owners can create or view the current public share from a
+supported root or mapped page unfurl. The link is returned ephemerally to the acting user. These actions
+recheck current identity, membership, mapping, and page permissions when delayed work runs; old buttons and
+saved modal state do not grant access.
+
 ## Environments
 
 `wrangler.jsonc` keeps local-safe defaults at the top level and defines two named environments:
