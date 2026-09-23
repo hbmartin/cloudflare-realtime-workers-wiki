@@ -291,7 +291,14 @@ describe("Slack thread mirror controls", () => {
     expect(await screen.findByText("Muted until you unmute this mapping.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Unmute #product" }));
     await waitFor(() => expect(screen.queryByText("Muted until you unmute this mapping.")).not.toBeInTheDocument());
+    const pauseCalls = vi
+      .mocked(api)
+      .mock.calls.filter(([path]) => path === "/api/slack/channels/mapping/pause").length;
     fireEvent.change(screen.getByLabelText("Snooze updates for #product"), { target: { value: "8" } });
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path === "/api/slack/channels/mapping/pause")).toHaveLength(
+      pauseCalls,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply snooze for #product" }));
     await waitFor(() =>
       expect(api).toHaveBeenCalledWith(
         "/api/slack/channels/mapping/pause",

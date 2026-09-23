@@ -20,6 +20,7 @@ import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
 import { sweepOutbox } from "./jobs";
 import { notificationFanoutStatements } from "./notifications";
+import { MentionTargetTracker } from "./mention-targets";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { webhookEventStatements } from "./webhooks";
@@ -92,68 +93,55 @@ function documentTextNodes(document: Y.Doc) {
   return nodes;
 }
 
-// Read only mention identifiers. A full ProseMirror/diagram projection on every Yjs update
-// would make ordinary typing scale with document serialization cost.
-function liveMentionTargets(document: Y.Doc, kind: "document" | "diagram") {
-  const targets = new Set<string>();
-  if (kind === "diagram") {
-    for (const node of document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT).values()) {
-      if (!(node instanceof Y.Map)) continue;
-      const mentions = node.get("mentions");
-      if (!(mentions instanceof Y.Map)) continue;
-      for (const [id, label] of mentions.entries())
-        if (/^[\w-]{1,100}$/.test(id) && typeof label === "string") targets.add(id);
-    }
-  } else {
-    const visit = (parent: Y.XmlFragment | Y.XmlElement) => {
-      for (const child of parent.toArray()) {
-        if (!(child instanceof Y.XmlElement)) continue;
-        if (child.nodeName === "mention" && child.getAttribute("entityType") === "user") {
-          const id = child.getAttribute("entityId");
-          const label = child.getAttribute("label");
-          if (typeof id === "string" && id && typeof label === "string" && label) targets.add(id);
-        }
-        visit(child);
-      }
+type MentionIntroduction = { actorId: string | null; sequence: number };
+type ProjectedMention = { targetId: string; excerpt: string };
+type StoredMention = { id: string; introduction_epoch: number | null; introduction_seq: number | null };
+
+function mentionProjection(
+  mentions: ProjectedMention[],
+  oldRows: StoredMention[],
+  introductions: Map<string, MentionIntroduction>,
+  epoch: number,
+  maximum: number,
+) {
+  const old = new Map(oldRows.map((row) => [row.id, row]));
+  const introduced: Array<{ targetId: string; actorId: string | null; sequence: number }> = [];
+  const projected = mentions.map((mention) => {
+    const previous = old.get(mention.targetId);
+    const introduction = introductions.get(mention.targetId);
+    const fresh =
+      !previous ||
+      (introduction !== undefined &&
+        (previous.introduction_epoch !== epoch || introduction.sequence > (previous.introduction_seq ?? -1)));
+    if (fresh)
+      introduced.push({
+        targetId: mention.targetId,
+        actorId: introduction?.actorId ?? null,
+        sequence: introduction?.sequence ?? maximum,
+      });
+    return {
+      ...mention,
+      actorId: fresh ? (introduction?.actorId ?? null) : null,
+      introductionEpoch: fresh ? epoch : (previous?.introduction_epoch ?? epoch),
+      introductionSeq: fresh ? (introduction?.sequence ?? maximum) : (previous?.introduction_seq ?? maximum),
     };
-    visit(document.getXmlFragment("document-store"));
+  });
+  const groups = new Map<string | null, { recipientIds: string[]; latestSequence: number }>();
+  for (const { targetId, actorId, sequence } of introduced) {
+    const group = groups.get(actorId) ?? { recipientIds: [], latestSequence: sequence };
+    group.recipientIds.push(targetId);
+    group.latestSequence = Math.max(group.latestSequence, sequence);
+    groups.set(actorId, group);
   }
-  return targets;
-}
-
-function mentionTargetsMayChange(document: Y.Doc, kind: "document" | "diagram", transaction: Y.Transaction) {
-  if (kind === "document") {
-    const root = document.getXmlFragment("document-store");
-    for (const [type, keys] of transaction.changed) {
-      if (Object.is(type, root)) return true;
-      if (type instanceof Y.XmlElement) {
-        if (keys.has(null)) return true;
-        if (type.nodeName === "mention" && ["entityType", "entityId", "label"].some((key) => keys.has(key)))
-          return true;
-      }
-    }
-    return false;
-  }
-  const nodes = document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT);
-  for (const [type, keys] of transaction.changed) {
-    if (Object.is(type, nodes)) return true;
-    if (!(type instanceof Y.Map)) continue;
-    if (type.parent === nodes && keys.has("mentions")) return true;
-    if (type.parent instanceof Y.Map && type.parent.parent === nodes && type.parent.get("mentions") === type)
-      return true;
-  }
-  return false;
-}
-
-function mentionGroups(targetIds: string[], actors: Map<string, string | null>) {
-  const grouped = new Map<string | null, string[]>();
-  for (const targetId of targetIds) {
-    const actorId = actors.get(targetId) ?? null;
-    const recipients = grouped.get(actorId) ?? [];
-    recipients.push(targetId);
-    grouped.set(actorId, recipients);
-  }
-  return [...grouped].map(([actorId, recipientIds]) => ({ actorId, recipientIds }));
+  return {
+    projected,
+    introducedIds: introduced.map((entry) => entry.targetId),
+    groups: [...groups].map(([actorId, group]) => ({
+      actorId,
+      recipientIds: group.recipientIds,
+      sourceKey: group.latestSequence,
+    })),
+  };
 }
 
 function commentMarkThreadId(markName: string, value: unknown) {
@@ -452,6 +440,7 @@ export class Document extends YServer {
   private pendingUpdates: Uint8Array[] = [];
   private pendingAuthorId: string | null = null;
   private pendingMentionActors = new Map<string, string | null>();
+  private mentionTracker: MentionTargetTracker | null = null;
   private currentMentionTargets = new Set<string>();
   private pendingNotifyEdit = false;
   private purged = false;
@@ -571,7 +560,13 @@ export class Document extends YServer {
     }
 
     await super.onStart();
-    this.currentMentionTargets = liveMentionTargets(this.document, this.metadata.content_kind);
+    this.mentionTracker = new MentionTargetTracker(this.document, this.metadata.content_kind);
+    this.currentMentionTargets = this.mentionTracker.targets;
+    const mentionRoot =
+      this.metadata.content_kind === "diagram"
+        ? this.document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT)
+        : this.document.getXmlFragment("document-store");
+    mentionRoot.observeDeep((events, transaction) => this.captureMentionTargets(events, transaction));
     this.document.on("update", (update: Uint8Array, origin: unknown, _document: Y.Doc, transaction: Y.Transaction) => {
       this.bufferUpdate(update, origin, transaction);
     });
@@ -1067,18 +1062,26 @@ export class Document extends YServer {
     return new Response("Not found", { status: 404 });
   }
 
-  private bufferUpdate(update: Uint8Array, origin: unknown, transaction?: Y.Transaction) {
+  private captureMentionTargets(events: Y.YEvent<any>[], transaction: Y.Transaction) {
+    const nextTargets = this.mentionTracker?.update(transaction, events);
+    if (!nextTargets) return;
+    if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) {
+      this.currentMentionTargets = nextTargets;
+      return;
+    }
+    const origin = transaction.origin;
+    const connection = origin && typeof origin === "object" ? (origin as Connection<ConnectionAuth>) : null;
+    const actorId = connection?.state?.userId ?? (origin === "api-mutation" ? this.pendingAuthorId : null);
+    for (const target of nextTargets)
+      if (!this.currentMentionTargets.has(target)) this.pendingMentionActors.set(target, actorId);
+    for (const target of this.currentMentionTargets)
+      if (!nextTargets.has(target)) this.pendingMentionActors.delete(target);
+    this.currentMentionTargets = nextTargets;
+  }
+
+  private bufferUpdate(update: Uint8Array, origin: unknown, _transaction?: Y.Transaction) {
     if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) return;
     const connection = origin && typeof origin === "object" ? (origin as Connection<ConnectionAuth>) : null;
-    if (transaction && mentionTargetsMayChange(this.document, this.metadata.content_kind, transaction)) {
-      const nextTargets = liveMentionTargets(this.document, this.metadata.content_kind);
-      const actorId = connection?.state?.userId ?? (origin === "api-mutation" ? this.pendingAuthorId : null);
-      for (const target of nextTargets)
-        if (!this.currentMentionTargets.has(target)) this.pendingMentionActors.set(target, actorId);
-      for (const target of this.currentMentionTargets)
-        if (!nextTargets.has(target)) this.pendingMentionActors.delete(target);
-      this.currentMentionTargets = nextTargets;
-    }
     this.pendingUpdates.push(update);
     this.pendingAuthorId = connection?.state?.userId ?? this.pendingAuthorId;
     this.pendingNotifyEdit ||= Boolean(connection?.state?.userId);
@@ -1176,12 +1179,12 @@ export class Document extends YServer {
   private mentionActorsThrough(sequence: number) {
     return new Map(
       this.state.storage.sql
-        .exec<{ target_user_id: string; actor_id: string | null }>(
-          `SELECT target_user_id, actor_id FROM mention_introductions WHERE seq <= ?`,
+        .exec<{ target_user_id: string; actor_id: string | null; seq: number }>(
+          `SELECT target_user_id, actor_id, seq FROM mention_introductions WHERE seq <= ?`,
           sequence,
         )
         .toArray()
-        .map((row) => [row.target_user_id, row.actor_id]),
+        .map((row) => [row.target_user_id, { actorId: row.actor_id, sequence: row.seq }] as const),
     );
   }
 
@@ -1301,9 +1304,10 @@ export class Document extends YServer {
           this.bindings.DB.prepare(`SELECT target_page_id id FROM page_references WHERE source_page_id = ?`)
             .bind(pageId)
             .all<{ id: string }>(),
-          this.bindings.DB.prepare(`SELECT target_user_id id FROM member_mentions WHERE source_page_id = ?`)
+          this.bindings.DB.prepare(`SELECT target_user_id id, introduction_epoch, introduction_seq
+            FROM member_mentions WHERE source_page_id = ?`)
             .bind(pageId)
-            .all<{ id: string }>(),
+            .all<StoredMention>(),
           metadataAtStart.notify_edit && metadataAtStart.last_editor_id
             ? this.bindings.DB.prepare(
                 `SELECT user_id id FROM subscriptions
@@ -1323,10 +1327,14 @@ export class Document extends YServer {
             : Promise.resolve({ results: [] as Array<{ id: string }> }),
         ]);
         const timestamp = Date.now();
-        const oldMentionIds = new Set(oldUserTargets.results.map((row) => row.id));
-        const newMentionIds = projection.memberMentions
-          .map((mention) => mention.targetId)
-          .filter((id) => !oldMentionIds.has(id) || mentionActors.has(id));
+        const mentionState = mentionProjection(
+          projection.memberMentions,
+          oldUserTargets.results,
+          mentionActors,
+          epoch,
+          maximum,
+        );
+        const newMentionIds = mentionState.introducedIds;
         const watcherIds = watcherRows.results.map((row) => row.id).filter((id) => !newMentionIds.includes(id));
         const makeVersion = Boolean(
           forceVersion ||
@@ -1394,40 +1402,32 @@ export class Document extends YServer {
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
-            `UPDATE member_mentions SET first_seen_actor_id =
-                (SELECT json_extract(item.value, '$.actorId') FROM json_each(?) item
-                  WHERE json_extract(item.value, '$.targetId') = member_mentions.target_user_id),
-                first_seen_at = ?
-              WHERE source_page_id = ? AND target_user_id IN
-                (SELECT json_extract(item.value, '$.targetId') FROM json_each(?) item)`,
-          ).bind(
-            JSON.stringify([...mentionActors].map(([targetId, actorId]) => ({ targetId, actorId }))),
-            timestamp,
-            pageId,
-            JSON.stringify([...mentionActors].map(([targetId]) => ({ targetId }))),
-          ),
-          this.bindings.DB.prepare(
             `INSERT INTO member_mentions
-              (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, first_seen_actor_id, projection_seq)
+              (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, first_seen_actor_id,
+               introduction_epoch, introduction_seq, projection_seq)
               SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?,
-                json_extract(item.value, '$.actorId'), ?
+                json_extract(item.value, '$.actorId'), json_extract(item.value, '$.introductionEpoch'),
+                json_extract(item.value, '$.introductionSeq'), ?
                 FROM json_each(?) item
                 JOIN workspace_members member
                   ON member.workspace_id = ? AND member.user_id = json_extract(item.value, '$.targetId')
                WHERE EXISTS (SELECT 1 FROM pages source WHERE source.id = ? AND source.content_epoch = ?)
               ON CONFLICT(source_page_id, target_user_id) DO UPDATE SET
-                excerpt = excluded.excerpt, projection_seq = excluded.projection_seq`,
+                excerpt = excluded.excerpt, projection_seq = excluded.projection_seq,
+                first_seen_actor_id = CASE WHEN excluded.introduction_epoch <> member_mentions.introduction_epoch
+                  OR excluded.introduction_seq > member_mentions.introduction_seq
+                  THEN excluded.first_seen_actor_id ELSE member_mentions.first_seen_actor_id END,
+                first_seen_at = CASE WHEN excluded.introduction_epoch <> member_mentions.introduction_epoch
+                  OR excluded.introduction_seq > member_mentions.introduction_seq
+                  THEN excluded.first_seen_at ELSE member_mentions.first_seen_at END,
+                introduction_epoch = excluded.introduction_epoch,
+                introduction_seq = excluded.introduction_seq`,
           ).bind(
             page.workspace_id,
             pageId,
             timestamp,
             maximum,
-            JSON.stringify(
-              projection.memberMentions.map((mention) => ({
-                ...mention,
-                actorId: mentionActors.get(mention.targetId) ?? null,
-              })),
-            ),
+            JSON.stringify(mentionState.projected),
             page.workspace_id,
             pageId,
             epoch,
@@ -1527,15 +1527,16 @@ export class Document extends YServer {
               })),
           ...(effectsSuppressed || !metadataAtStart.notify_edit
             ? []
-            : mentionGroups(newMentionIds, mentionActors).flatMap(({ actorId, recipientIds }) => {
+            : mentionState.groups.flatMap(({ actorId, recipientIds, sourceKey }) => {
                 return notificationFanoutStatements(this.bindings.DB, {
                   workspaceId: page.workspace_id,
                   spaceId: page.space_id,
                   pageId,
+                  contentEpoch: epoch,
                   threadId: null,
                   actorId,
                   eventType: "mention",
-                  sourceId: `${pageId}:${epoch}:${maximum}:${actorId ?? "collaborator"}`,
+                  sourceId: `${pageId}:${epoch}:${sourceKey}:${actorId ?? "collaborator"}`,
                   recipientIds,
                   emitSlackChannel: actorId !== null,
                   data: { sequence: maximum },
@@ -1807,9 +1808,10 @@ export class Document extends YServer {
           this.bindings.DB.prepare(`SELECT target_page_id id FROM page_references WHERE source_page_id = ?`)
             .bind(pageId)
             .all<{ id: string }>(),
-          this.bindings.DB.prepare(`SELECT target_user_id id FROM member_mentions WHERE source_page_id = ?`)
+          this.bindings.DB.prepare(`SELECT target_user_id id, introduction_epoch, introduction_seq
+            FROM member_mentions WHERE source_page_id = ?`)
             .bind(pageId)
-            .all<{ id: string }>(),
+            .all<StoredMention>(),
           metadataAtStart.notify_edit && metadataAtStart.last_editor_id
             ? this.bindings.DB.prepare(
                 `SELECT user_id id FROM subscriptions
@@ -1829,10 +1831,14 @@ export class Document extends YServer {
             : Promise.resolve({ results: [] as Array<{ id: string }> }),
         ]);
         const timestamp = Date.now();
-        const oldMentionIds = new Set(oldUserTargets.results.map((row) => row.id));
-        const newMentionIds = projection.memberMentions
-          .map((mention) => mention.targetId)
-          .filter((id) => !oldMentionIds.has(id) || mentionActors.has(id));
+        const mentionState = mentionProjection(
+          projection.memberMentions,
+          oldUserTargets.results,
+          mentionActors,
+          epoch,
+          maximum,
+        );
+        const newMentionIds = mentionState.introducedIds;
         const watcherIds = watcherRows.results.map((row) => row.id).filter((id) => !newMentionIds.includes(id));
         const makeVersion = Boolean(
           forceVersion ||
@@ -1916,40 +1922,32 @@ export class Document extends YServer {
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
-            `UPDATE member_mentions SET first_seen_actor_id =
-                (SELECT json_extract(item.value, '$.actorId') FROM json_each(?) item
-                  WHERE json_extract(item.value, '$.targetId') = member_mentions.target_user_id),
-                first_seen_at = ?
-              WHERE source_page_id = ? AND target_user_id IN
-                (SELECT json_extract(item.value, '$.targetId') FROM json_each(?) item)`,
-          ).bind(
-            JSON.stringify([...mentionActors].map(([targetId, actorId]) => ({ targetId, actorId }))),
-            timestamp,
-            pageId,
-            JSON.stringify([...mentionActors].map(([targetId]) => ({ targetId }))),
-          ),
-          this.bindings.DB.prepare(
             `INSERT INTO member_mentions
-              (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, first_seen_actor_id, projection_seq)
+              (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, first_seen_actor_id,
+               introduction_epoch, introduction_seq, projection_seq)
               SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?,
-                json_extract(item.value, '$.actorId'), ?
+                json_extract(item.value, '$.actorId'), json_extract(item.value, '$.introductionEpoch'),
+                json_extract(item.value, '$.introductionSeq'), ?
                 FROM json_each(?) item
                 JOIN workspace_members member
                   ON member.workspace_id = ? AND member.user_id = json_extract(item.value, '$.targetId')
                WHERE EXISTS (SELECT 1 FROM pages source WHERE source.id = ? AND source.content_epoch = ?)
               ON CONFLICT(source_page_id, target_user_id) DO UPDATE SET
-                excerpt = excluded.excerpt, projection_seq = excluded.projection_seq`,
+                excerpt = excluded.excerpt, projection_seq = excluded.projection_seq,
+                first_seen_actor_id = CASE WHEN excluded.introduction_epoch <> member_mentions.introduction_epoch
+                  OR excluded.introduction_seq > member_mentions.introduction_seq
+                  THEN excluded.first_seen_actor_id ELSE member_mentions.first_seen_actor_id END,
+                first_seen_at = CASE WHEN excluded.introduction_epoch <> member_mentions.introduction_epoch
+                  OR excluded.introduction_seq > member_mentions.introduction_seq
+                  THEN excluded.first_seen_at ELSE member_mentions.first_seen_at END,
+                introduction_epoch = excluded.introduction_epoch,
+                introduction_seq = excluded.introduction_seq`,
           ).bind(
             page.workspace_id,
             pageId,
             timestamp,
             maximum,
-            JSON.stringify(
-              projection.memberMentions.map((mention) => ({
-                ...mention,
-                actorId: mentionActors.get(mention.targetId) ?? null,
-              })),
-            ),
+            JSON.stringify(mentionState.projected),
             page.workspace_id,
             pageId,
             epoch,
@@ -1982,15 +1980,16 @@ export class Document extends YServer {
             createdAt: timestamp,
           }),
           ...(metadataAtStart.notify_edit
-            ? mentionGroups(newMentionIds, mentionActors).flatMap(({ actorId, recipientIds }) => {
+            ? mentionState.groups.flatMap(({ actorId, recipientIds, sourceKey }) => {
                 return notificationFanoutStatements(this.bindings.DB, {
                   workspaceId: page.workspace_id,
                   spaceId: page.space_id,
                   pageId,
+                  contentEpoch: epoch,
                   threadId: null,
                   actorId,
                   eventType: "mention",
-                  sourceId: `${pageId}:${epoch}:${maximum}:${actorId ?? "collaborator"}`,
+                  sourceId: `${pageId}:${epoch}:${sourceKey}:${actorId ?? "collaborator"}`,
                   recipientIds,
                   emitSlackChannel: actorId !== null,
                   data: { sequence: maximum },

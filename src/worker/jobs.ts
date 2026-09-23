@@ -18,7 +18,7 @@ import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { cleanupExport, runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
-import { deliverSlackChannelEvent, deliverSlackUnfurl } from "./slack";
+import { deliverSlackChannelEvent, deliverSlackControlsExpiry, deliverSlackUnfurl } from "./slack";
 import { deliverSlackHome } from "./slack-workspace";
 import { deliverWebhook, fanoutWebhookEvent } from "./webhooks";
 import {
@@ -1590,6 +1590,23 @@ export async function consumeDeliveryMessage(
     message.ack();
     return "discarded";
   };
+  const deferSlackView = async (): Promise<DeliveryMessageOutcome> => {
+    const now = Date.now();
+    await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL, available_at=?, slack_redrive_due_at=NULL
+      WHERE id=?`)
+      .bind(now + 2_000, outboxId)
+      .run();
+    try {
+      await env.DELIVERY_QUEUE.send({ outboxId }, { delaySeconds: 2 });
+      await env.DB.prepare(`UPDATE outbox SET enqueued_at=?, slack_redrive_due_at=? WHERE id=?`)
+        .bind(now, now + SLACK_REDRIVE_STALE_MS, outboxId)
+        .run();
+    } catch {
+      // The outbox sweep recovers a failed delayed enqueue.
+    }
+    message.ack();
+    return "acknowledged";
+  };
   if (row.topic === "notification") {
     const notificationId = payload.notificationId;
     if (typeof notificationId !== "string") return await rejectPayload("Notification outbox payload is invalid.");
@@ -1614,18 +1631,23 @@ export async function consumeDeliveryMessage(
     await deliverSlackDenial(env, payload);
   } else if (row.topic === "slack_workspace_action") {
     if (typeof payload.receiptId !== "string") return await rejectPayload("Slack workspace receipt is invalid.");
-    await deliverSlackWorkspaceAction(env, payload.receiptId);
+    if ((await deliverSlackWorkspaceAction(env, payload.receiptId)) === "deferred") return await deferSlackView();
     await sweepOutbox(env);
   } else if (row.topic === "slack_search_update") {
     if (typeof payload.sessionId !== "string" || typeof payload.revision !== "number")
       return await rejectPayload("Slack search update is invalid.");
-    await deliverSlackSearchUpdate(env, payload.sessionId, payload.revision);
+    if ((await deliverSlackSearchUpdate(env, payload.sessionId, payload.revision)) === "deferred")
+      return await deferSlackView();
+    await sweepOutbox(env);
   } else if (row.topic === "slack_share_response") {
     await deliverSlackShareResponse(env, payload);
   } else if (row.topic === "slack_channel") {
     const eventId = payload.eventId;
     if (typeof eventId !== "string") return await rejectPayload("Slack channel outbox payload is invalid.");
     await deliverSlackChannelEvent(env, eventId);
+  } else if (row.topic === "slack_controls_expire") {
+    await deliverSlackControlsExpiry(env, payload);
+    await sweepOutbox(env);
   } else if (row.topic === "slack_unfurl") {
     const unfurlId = payload.unfurlId;
     if (typeof unfurlId !== "string") return await rejectPayload("Slack unfurl outbox payload is invalid.");

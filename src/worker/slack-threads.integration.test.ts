@@ -18,7 +18,9 @@ import {
 } from "./slack-threads";
 import {
   encryptSlackToken,
+  decryptSlackToken,
   deliverSlackChannelEvent,
+  deliverSlackControlsExpiry,
   disconnectSlack,
   handleSlackEvent,
   recordVerifiedSlackIdentity,
@@ -109,7 +111,7 @@ let members = ["UOWNER", "UVIEWER"];
 let postFailure: "none" | "rate" | "lost" | "unrecorded" | "malformed" | "permission" = "none";
 let ephemeralFailure: "none" | "rate" | "lost" = "none";
 let userFailure: "none" | "transient" = "none";
-let viewFailure: "none" | "not_found" = "none";
+let viewFailure: "none" | "not_found" | "transient" | "hash_conflict" = "none";
 let homePublishFailure: "none" | "lost" = "none";
 let homeHash: string | null = null;
 let beforeResponse: ((method: string) => Promise<void>) | undefined;
@@ -176,6 +178,14 @@ async function mockSlack(input: RequestInfo | URL, init?: RequestInit) {
   }
   if (method === "views.open") return Response.json({ ok: true, view: { id: "VSEARCH", hash: "hash-open" } });
   if (method === "views.update" && viewFailure === "not_found") return Response.json({ ok: false, error: "not_found" });
+  if (method === "views.update" && viewFailure === "transient") {
+    viewFailure = "none";
+    return Response.json({ ok: false, error: "service_unavailable" }, { status: 503 });
+  }
+  if (method === "views.update" && viewFailure === "hash_conflict") {
+    viewFailure = "none";
+    return Response.json({ ok: false, error: "hash_conflict" });
+  }
   if (method === "views.update")
     return Response.json({ ok: true, view: { id: payload.view_id, hash: `hash-${calls.length}` } });
   if (method === "views.publish") {
@@ -509,7 +519,7 @@ describe("interactive Slack workspace", () => {
     await deliverSlackWorkspaceAction(runtime(), stale!.id);
     expect(
       await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(stale!.id).first(),
-    ).toEqual({ outcome: "denied" });
+    ).toEqual({ outcome: "superseded" });
     expect(calls.filter((call) => call.method === "views.update")).toHaveLength(2);
   });
 
@@ -522,7 +532,7 @@ describe("interactive Slack workspace", () => {
       id: string;
       view_hash: string;
     }>();
-    const click = async (query: string, hash: string, actionTs: string) => {
+    const click = async (query: string, hash: string, revision: number, actionTs: string) => {
       await acceptSlackWorkspaceInteraction(runtime(), {
         type: "block_actions",
         team: { id: "T123" },
@@ -530,7 +540,7 @@ describe("interactive Slack workspace", () => {
         view: {
           id: "VSEARCH",
           hash,
-          private_metadata: session!.id,
+          private_metadata: `${session!.id}:${revision}`,
           state: { values: { query: { value: { value: query } } } },
         },
         actions: [{ action_id: "noteflare_search_run", action_ts: actionTs, value: session!.id }],
@@ -538,8 +548,11 @@ describe("interactive Slack workspace", () => {
       return (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
         WHERE callback_id = 'noteflare_search_run' ORDER BY rowid DESC LIMIT 1`).first<{ id: string }>())!.id;
     };
-    const loadingClick = await click("While loading", session!.view_hash, "1700000991.000001");
+    const loadingClick = await click("While loading", session!.view_hash, 0, "1700000991.000001");
     await deliverSlackSearchUpdate(runtime(), session!.id, 0);
+    const firstHash = (await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id = ?`)
+      .bind(session!.id)
+      .first<{ view_hash: string }>())!.view_hash;
     await deliverSlackWorkspaceAction(runtime(), loadingClick);
     expect(
       await env.DB.prepare(`SELECT json_extract(state_json, '$.query') query FROM slack_view_sessions WHERE id = ?`)
@@ -549,12 +562,18 @@ describe("interactive Slack workspace", () => {
     const actualHash = (await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id = ?`)
       .bind(session!.id)
       .first<{ view_hash: string }>())!.view_hash;
-    await env.DB.prepare(`UPDATE slack_view_sessions SET view_hash = 'lost-hash', pending_state_json = state_json,
-      pending_revision = revision + 1 WHERE id = ?`)
-      .bind(session!.id)
+    await env.DB.prepare(`UPDATE slack_view_sessions SET view_hash = ?, revision = 1,
+      pending_state_json = state_json, pending_revision = 2, pending_token = 'lost-intent' WHERE id = ?`)
+      .bind(firstHash, session!.id)
       .run();
-    const recoveryClick = await click("Recovered", actualHash, "1700000992.000001");
+    const staleClick = await click("Stale", session!.view_hash, 0, "1700000992.000001");
+    expect(await deliverSlackWorkspaceAction(runtime(), staleClick)).toBe("deferred");
+    const recoveryClick = await click("Recovered", actualHash, 2, "1700000992.000002");
     await deliverSlackWorkspaceAction(runtime(), recoveryClick);
+    expect(await deliverSlackWorkspaceAction(runtime(), staleClick)).toBe("completed");
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(staleClick).first(),
+    ).toEqual({ outcome: "superseded" });
     expect(
       await env.DB.prepare(`SELECT json_extract(state_json, '$.query') query, pending_state_json pending
       FROM slack_view_sessions WHERE id = ?`)
@@ -562,6 +581,298 @@ describe("interactive Slack workspace", () => {
         .first(),
     ).toEqual({ query: "Recovered", pending: null });
     expect(calls.filter((call) => call.method === "views.update").at(-1)?.payload.hash).toBe(actualHash);
+  });
+
+  it("defers a loading-view click until its first result update finishes", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "loading-race", "Original");
+    const session = (await env.DB.prepare(`SELECT id, view_hash FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+      view_hash: string;
+    }>())!;
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    beforeResponse = async (method) => {
+      if (method === "views.update" && calls.filter((call) => call.method === "views.update").length === 1) {
+        enter();
+        await held;
+      }
+    };
+    const initial = deliverSlackSearchUpdate(runtime(), session.id, 0);
+    await entered;
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash: session.view_hash,
+        private_metadata: session.id,
+        state: { values: { query: { value: { value: "Clicked while loading" } } } },
+      },
+      actions: [{ action_id: "noteflare_search_run", action_ts: "1700000993.000001", value: session.id }],
+    });
+    const receipt = (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+      WHERE callback_id='noteflare_search_run'`).first<{ id: string }>())!;
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("deferred");
+    expect(
+      await env.DB.prepare(`SELECT processed_at FROM slack_interaction_receipts WHERE id=?`).bind(receipt.id).first(),
+    ).toEqual({ processed_at: null });
+    release();
+    await initial;
+    beforeResponse = undefined;
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("completed");
+    expect(
+      await env.DB.prepare(`SELECT json_extract(state_json,'$.query') query FROM slack_view_sessions WHERE id=?`)
+        .bind(session.id)
+        .first(),
+    ).toEqual({ query: "Clicked while loading" });
+  });
+
+  it("retries the same Search intent after a transient Slack update failure", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "transient-search", "Original");
+    const session = (await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+    }>())!;
+    viewFailure = "transient";
+    await expect(deliverSlackSearchUpdate(runtime(), session.id, 0)).rejects.toThrow("Slack views.update failed.");
+    expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("deferred");
+    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`)
+      .bind(Date.now() - 16_000, session.id)
+      .run();
+    expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("applied");
+    expect(
+      await env.DB.prepare(`SELECT revision,pending_token FROM slack_view_sessions WHERE id=?`)
+        .bind(session.id)
+        .first(),
+    ).toEqual({ revision: 1, pending_token: null });
+  });
+
+  it("retries a receipt-backed Search intent after a transient Slack update failure", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "receipt-retry", "Original");
+    const session = (await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+    }>())!;
+    await deliverSlackSearchUpdate(runtime(), session.id, 0);
+    const hash = (await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id=?`)
+      .bind(session.id)
+      .first<{ view_hash: string }>())!.view_hash;
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash,
+        private_metadata: `${session.id}:1`,
+        state: { values: { query: { value: { value: "Retry this search" } } } },
+      },
+      actions: [{ action_id: "noteflare_search_run", action_ts: "1700000995.000001", value: session.id }],
+    });
+    const receipt = (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+      WHERE callback_id='noteflare_search_run'`).first<{ id: string }>())!;
+    viewFailure = "transient";
+    await expect(deliverSlackWorkspaceAction(runtime(), receipt.id)).rejects.toThrow("Slack views.update failed.");
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("deferred");
+    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`)
+      .bind(Date.now() - 16_000, session.id)
+      .run();
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("completed");
+    expect(
+      await env.DB.prepare(
+        `SELECT json_extract(state_json,'$.query') query,pending_token FROM slack_view_sessions WHERE id=?`,
+      )
+        .bind(session.id)
+        .first(),
+    ).toEqual({ query: "Retry this search", pending_token: null });
+  });
+
+  it("releases an expired Search owner so a current-view click can proceed", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "abandoned-search", "Original");
+    const session = (await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+    }>())!;
+    await deliverSlackSearchUpdate(runtime(), session.id, 0);
+    const hash = (await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id=?`)
+      .bind(session.id)
+      .first<{ view_hash: string }>())!.view_hash;
+    const click = async (query: string, actionTs: string) => {
+      await acceptSlackWorkspaceInteraction(runtime(), {
+        type: "block_actions",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        view: {
+          id: "VSEARCH",
+          hash,
+          private_metadata: `${session.id}:1`,
+          state: { values: { query: { value: { value: query } } } },
+        },
+        actions: [{ action_id: "noteflare_search_run", action_ts: actionTs, value: session.id }],
+      });
+      return (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+        WHERE callback_id='noteflare_search_run' ORDER BY rowid DESC LIMIT 1`).first<{ id: string }>())!.id;
+    };
+    const first = await click("Abandoned", "1700000996.000001");
+    viewFailure = "transient";
+    await expect(deliverSlackWorkspaceAction(runtime(), first)).rejects.toThrow("Slack views.update failed.");
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at=?,outcome='expired' WHERE id=?`).bind(
+        Date.now(),
+        first,
+      ),
+      env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`).bind(Date.now() - 16_000, session.id),
+    ]);
+    const second = await click("Current", "1700000996.000002");
+    expect(await deliverSlackWorkspaceAction(runtime(), second)).toBe("completed");
+    expect(
+      await env.DB.prepare(
+        `SELECT json_extract(state_json,'$.query') query,pending_token FROM slack_view_sessions WHERE id=?`,
+      )
+        .bind(session.id)
+        .first(),
+    ).toEqual({ query: "Current", pending_token: null });
+  });
+
+  it("releases an abandoned initial Search load after ten minutes", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "old-load", "Original");
+    const session = (await env.DB.prepare(`SELECT id,view_hash FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+      view_hash: string;
+    }>())!;
+    viewFailure = "transient";
+    await expect(deliverSlackSearchUpdate(runtime(), session.id, 0)).rejects.toThrow("Slack views.update failed.");
+    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`)
+      .bind(Date.now() - 11 * 60_000, session.id)
+      .run();
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash: session.view_hash,
+        private_metadata: `${session.id}:0`,
+        state: { values: { query: { value: { value: "New request" } } } },
+      },
+      actions: [{ action_id: "noteflare_search_run", action_ts: "1700000996.000003", value: session.id }],
+    });
+    const receipt = (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+      WHERE callback_id='noteflare_search_run'`).first<{ id: string }>())!;
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("completed");
+    expect(
+      await env.DB.prepare(`SELECT json_extract(state_json,'$.query') query FROM slack_view_sessions WHERE id=?`)
+        .bind(session.id)
+        .first(),
+    ).toEqual({ query: "New request" });
+  });
+
+  it("stops polling an uncertain Search update while retaining its recovery intent", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "uncertain-search", "Original");
+    const session = (await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+    }>())!;
+    viewFailure = "transient";
+    await expect(deliverSlackSearchUpdate(runtime(), session.id, 0)).rejects.toThrow("Slack views.update failed.");
+    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`)
+      .bind(Date.now() - 16_000, session.id)
+      .run();
+    viewFailure = "hash_conflict";
+    expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("uncertain");
+    const updates = calls.filter((call) => call.method === "views.update").length;
+    expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("deferred");
+    expect(calls.filter((call) => call.method === "views.update")).toHaveLength(updates);
+    expect(
+      (await env.DB.prepare(`SELECT pending_token FROM slack_view_sessions WHERE id=?`)
+        .bind(session.id)
+        .first<{ pending_token: string }>())!.pending_token,
+    ).toMatch(/^initial-uncertain:/);
+  });
+
+  it("keeps concurrent Search clicks from replacing one another's pending intent", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "concurrent-search", "Original");
+    const session = (await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+    }>())!;
+    await deliverSlackSearchUpdate(runtime(), session.id, 0);
+    const hash = (await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id=?`)
+      .bind(session.id)
+      .first<{ view_hash: string }>())!.view_hash;
+    const click = async (query: string, actionTs: string) => {
+      await acceptSlackWorkspaceInteraction(runtime(), {
+        type: "block_actions",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        view: {
+          id: "VSEARCH",
+          hash,
+          private_metadata: session.id,
+          state: { values: { query: { value: { value: query } } } },
+        },
+        actions: [{ action_id: "noteflare_search_run", action_ts: actionTs, value: session.id }],
+      });
+      return (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+        WHERE callback_id='noteflare_search_run' ORDER BY rowid DESC LIMIT 1`).first<{ id: string }>())!.id;
+    };
+    const first = await click("First", "1700000994.000001");
+    const second = await click("Second", "1700000994.000002");
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    beforeResponse = async (method) => {
+      if (method === "views.update") {
+        enter();
+        await held;
+      }
+    };
+    const firstWork = deliverSlackWorkspaceAction(runtime(), first);
+    await entered;
+    expect(await deliverSlackWorkspaceAction(runtime(), second)).toBe("deferred");
+    expect(
+      await env.DB.prepare(`SELECT pending_token FROM slack_view_sessions WHERE id=?`).bind(session.id).first(),
+    ).toEqual({ pending_token: first });
+    release();
+    await firstWork;
+    beforeResponse = undefined;
+    await deliverSlackWorkspaceAction(runtime(), second);
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id=?`).bind(second).first(),
+    ).toEqual({ outcome: "superseded" });
+    expect(
+      await env.DB.prepare(`SELECT json_extract(state_json,'$.query') query FROM slack_view_sessions WHERE id=?`)
+        .bind(session.id)
+        .first(),
+    ).toEqual({ query: "First" });
   });
 
   it("retires a closed Search modal without retrying its update", async () => {
@@ -1097,16 +1408,33 @@ describe("interactive Slack workspace", () => {
     const receipt = await env.DB.prepare(
       `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_home_read'`,
     ).first<{ id: string }>();
+    await env.DB.prepare(`UPDATE slack_view_sessions SET state_json=json_set(state_json,'$.page',1)
+      WHERE id=?`)
+      .bind(session!.id)
+      .run();
     await env.DB.prepare(`DELETE FROM workspace_members WHERE user_id = 'viewer'`).run();
     await deliverSlackWorkspaceAction(runtime(), receipt!.id);
     expect(await env.DB.prepare(`SELECT 1 FROM mention_reads WHERE user_id = 'viewer'`).first()).toBeNull();
     expect(
       await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(receipt!.id).first(),
     ).toEqual({ outcome: "denied" });
+    expect(
+      await env.DB.prepare(`SELECT json_extract(payload_json,'$.reset') reset FROM outbox
+      WHERE id=?`)
+        .bind(`outbox:slack-home:unavailable:${receipt!.id}`)
+        .first(),
+    ).toEqual({ reset: 0 });
+    homeHash = "newer-remote-hash";
     await publishSlackHome(runtime(), "installation", "UVIEWER");
+    expect(
+      await env.DB.prepare(`SELECT json_extract(state_json,'$.page') page FROM slack_view_sessions WHERE id=?`)
+        .bind(session!.id)
+        .first(),
+    ).toEqual({ page: 1 });
     expect(JSON.stringify(calls.filter((call) => call.method === "views.publish").at(-1)!.payload.view)).toContain(
       "inbox is unavailable",
     );
+    expect(calls.filter((call) => call.method === "views.publish").at(-1)!.payload.hash).toBeUndefined();
   });
 
   it("acknowledges a signed slash command while a modal open call stalls", async () => {
@@ -1181,6 +1509,13 @@ describe("interactive Slack workspace", () => {
     await new Promise((resolve) => setTimeout(resolve, 1_200));
     expect(calls.filter((call) => call.method === "views.open")).toHaveLength(0);
     await waitOnExecutionContext(context);
+    const rotated = await env.DB.prepare(`SELECT bot_token_ciphertext, bot_refresh_token_ciphertext
+      FROM slack_installations WHERE id='installation'`).first<{
+      bot_token_ciphertext: string;
+      bot_refresh_token_ciphertext: string;
+    }>();
+    expect(await decryptSlackToken(runtime(), rotated!.bot_token_ciphertext)).toBe("xoxb-new");
+    expect(await decryptSlackToken(runtime(), rotated!.bot_refresh_token_ciphertext)).toBe("xoxr-new");
   });
 
   it("creates one public share from a root and an unfurl without trusting stale button state", async () => {
@@ -1319,6 +1654,11 @@ describe("canonical Slack mirrors", () => {
       VALUES ('waiting','space','workspace','page_edit','owner','page','digest',?)`)
       .bind(cutoff - 1000)
       .run();
+    await env.DB.prepare(`INSERT INTO slack_channel_events
+      (id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+      VALUES ('waiting-immediate','space','workspace','page_edit','owner','page','immediate',?)`)
+      .bind(cutoff - 1000)
+      .run();
     await expect(setSlackChannelPause(runtime(), viewer, "space", "mute")).rejects.toMatchObject({ status: 403 });
     await setSlackChannelPause(runtime(), owner, "space", "mute");
     expect(
@@ -1338,12 +1678,45 @@ describe("canonical Slack mirrors", () => {
         `SELECT muted_at, snoozed_until FROM slack_channel_subscriptions WHERE id = 'space'`,
       ).first(),
     ).toEqual({ muted_at: null, snoozed_until: null });
+    await deliverSlackChannelEvent(runtime(), "waiting-immediate");
+    expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(0);
     await setSlackChannelPause(runtime(), owner, "space", "snooze", 8);
     expect(
       (await env.DB.prepare(`SELECT snoozed_until FROM slack_channel_subscriptions WHERE id = 'space'`).first<{
         snoozed_until: number;
       }>())!.snoozed_until,
     ).toBeGreaterThan(Date.now() + 7 * 3_600_000);
+  });
+
+  it("refreshes active root controls after Settings changes and snooze expiry", async () => {
+    const { link } = await activeThread();
+    const deliverRefresh = async () => {
+      const delivery = await env.DB.prepare(`SELECT id FROM slack_thread_deliveries
+        WHERE link_id = ? AND operation = 'refresh' AND state = 'pending' ORDER BY created_at, id LIMIT 1`)
+        .bind(link.id)
+        .first<{ id: string }>();
+      expect(delivery).not.toBeNull();
+      await deliverSlackThread(runtime(), delivery!.id);
+      return calls.filter((call) => call.method === "chat.update").at(-1)!;
+    };
+    await setSlackChannelPause(runtime(), owner, "space", "mute");
+    expect(JSON.stringify((await deliverRefresh()).payload.blocks)).toContain("noteflare_mapping_unmute");
+    await setSlackChannelPause(runtime(), owner, "space", "unmute");
+    expect(JSON.stringify((await deliverRefresh()).payload.blocks)).toContain("noteflare_mapping_mute");
+    await setSlackChannelPause(runtime(), owner, "space", "snooze", 1);
+    expect(JSON.stringify((await deliverRefresh()).payload.blocks)).toContain("noteflare_mapping_unmute");
+    const expiry = await env.DB.prepare(`SELECT payload_json FROM outbox WHERE topic='slack_controls_expire'`).first<{
+      payload_json: string;
+    }>();
+    const expired = Date.now() - 1;
+    await env.DB.prepare(`UPDATE slack_channel_subscriptions SET snoozed_until = ? WHERE id = 'space'`)
+      .bind(expired)
+      .run();
+    await deliverSlackControlsExpiry(runtime(), {
+      ...(JSON.parse(expiry!.payload_json) as Record<string, unknown>),
+      snoozedUntil: expired,
+    });
+    expect(JSON.stringify((await deliverRefresh()).payload.blocks)).toContain("noteflare_mapping_mute");
   });
 
   it("does not let fifty muted mappings starve an eligible digest", async () => {
@@ -1852,6 +2225,7 @@ describe("Slack inbound replies and actions", () => {
     expect(String(calls.find((call) => call.method === "chat.postEphemeral")?.payload.text)).toContain(
       "too large or complex",
     );
+    expect(calls.find((call) => call.method === "chat.postEphemeral")?.payload.thread_ts).toBe(link.root_message_ts);
     const mentions = Array.from({ length: 51 }, (_, index) => `<@U${String(index).padStart(3, "0")}>`).join(" ");
     await acceptSlackReply(
       runtime(),
@@ -1939,6 +2313,14 @@ describe("Slack inbound replies and actions", () => {
       outcome: "content_unavailable",
     });
     expect(await env.DB.prepare(`SELECT 1 FROM comments WHERE slack_source_receipt_id IS NOT NULL`).first()).toBeNull();
+    const denial = await env.DB.prepare(
+      `SELECT payload_json FROM outbox WHERE topic='slack_interaction_response'`,
+    ).first<{ payload_json: string }>();
+    await deliverSlackDenial(runtime(), JSON.parse(denial!.payload_json) as Record<string, unknown>);
+    expect(calls.find((call) => call.method === "chat.postEphemeral")?.payload).toMatchObject({
+      thread_ts: link.root_message_ts,
+      text: expect.stringContaining("could not be retrieved"),
+    });
   });
   it.each([
     "DELETE FROM workspace_members WHERE user_id = 'viewer'",
@@ -1999,6 +2381,7 @@ describe("Slack inbound replies and actions", () => {
     expect(denial).toHaveLength(1);
     expect(denial[0]!.payload.text).not.toContain("Private project title");
     expect(denial[0]!.payload.user).toBe("UVIEWER");
+    expect(denial[0]!.payload.thread_ts).toBe(link.root_message_ts);
   });
   it("resolves and reopens through durable actions, deduplicates retries, and refreshes the same root", async () => {
     const { created, link } = await activeThread();
