@@ -16,17 +16,21 @@ function addCounts(target: Counts, source: Counts, sign: 1 | -1) {
   }
 }
 
-function xmlCounts(node: Y.XmlElement): Counts {
+function addDelta(target: Counts, source: Counts, sign: 1 | -1) {
+  for (const [id, count] of source) {
+    const next = (target.get(id) ?? 0) + sign * count;
+    if (next) target.set(id, next);
+    else target.delete(id);
+  }
+}
+
+function ownXmlCounts(element: Y.XmlElement): Counts {
   const counts: Counts = new Map();
-  const visit = (element: Y.XmlElement) => {
-    if (element.nodeName === "mention" && element.getAttribute("entityType") === "user") {
-      const id = element.getAttribute("entityId");
-      const label = element.getAttribute("label");
-      if (typeof id === "string" && id && typeof label === "string" && label) counts.set(id, (counts.get(id) ?? 0) + 1);
-    }
-    for (const child of element.toArray()) if (child instanceof Y.XmlElement) visit(child);
-  };
-  visit(node);
+  if (element.nodeName === "mention" && element.getAttribute("entityType") === "user") {
+    const id = element.getAttribute("entityId");
+    const label = element.getAttribute("label");
+    if (typeof id === "string" && id && typeof label === "string" && label) counts.set(id, 1);
+  }
   return counts;
 }
 
@@ -45,6 +49,7 @@ function diagramCounts(node: Y.Map<unknown>): Counts {
 export class MentionTargetTracker {
   private readonly counts: Counts = new Map();
   private readonly xml = new WeakMap<Y.XmlElement, Counts>();
+  private readonly xmlOwn = new WeakMap<Y.XmlElement, Counts>();
   private readonly diagram = new WeakMap<Y.Map<unknown>, Counts>();
   private readonly diagramKeys = new WeakMap<Y.Map<unknown>, string>();
 
@@ -64,6 +69,16 @@ export class MentionTargetTracker {
     addCounts(this.counts, next, 1);
   }
 
+  private cacheXml(element: Y.XmlElement): Counts {
+    const own = ownXmlCounts(element);
+    const counts = new Map(own);
+    for (const child of element.toArray())
+      if (child instanceof Y.XmlElement) addCounts(counts, this.cacheXml(child), 1);
+    this.xmlOwn.set(element, own);
+    this.xml.set(element, counts);
+    return counts;
+  }
+
   private rebuild() {
     this.counts.clear();
     if (this.kind === "diagram") {
@@ -77,8 +92,7 @@ export class MentionTargetTracker {
     } else {
       for (const child of this.document.getXmlFragment("document-store").toArray()) {
         if (!(child instanceof Y.XmlElement)) continue;
-        const found = xmlCounts(child);
-        this.xml.set(child, found);
+        const found = this.cacheXml(child);
         addCounts(this.counts, found, 1);
       }
     }
@@ -104,35 +118,62 @@ export class MentionTargetTracker {
       this.rebuild();
       return this.targets;
     }
+    // Snapshot removed subtrees before rebuilding any moved or added element.
+    const removed = new Map<Y.XmlElement, Counts>();
     const replaced = new Set<Y.XmlElement>();
-    if (rootEvent) {
-      for (const item of rootEvent.changes.deleted)
+    for (const event of events) {
+      if (!(event.target instanceof Y.XmlElement) && !Object.is(event.target, root)) continue;
+      for (const item of event.changes.deleted)
         for (const child of item.content.getContent())
           if (child instanceof Y.XmlElement) {
-            addCounts(this.counts, this.xml.get(child) ?? new Map(), -1);
-            this.xml.delete(child);
+            removed.set(child, this.xml.get(child) ?? new Map());
             replaced.add(child);
           }
-      for (const item of rootEvent.changes.added)
+      for (const item of event.changes.added)
+        for (const child of item.content.getContent()) if (child instanceof Y.XmlElement) replaced.add(child);
+    }
+    for (const event of events) {
+      const target = event.target;
+      if (!(target instanceof Y.XmlElement) && !Object.is(target, root)) continue;
+      if (target instanceof Y.XmlElement) {
+        let ancestor: unknown = target;
+        let insideReplaced = false;
+        while (ancestor instanceof Y.XmlElement) {
+          if (replaced.has(ancestor)) insideReplaced = true;
+          ancestor = ancestor.parent;
+        }
+        if (insideReplaced) continue;
+      }
+      const delta: Counts = new Map();
+      for (const item of event.changes.deleted)
         for (const child of item.content.getContent())
-          if (child instanceof Y.XmlElement) {
-            const found = xmlCounts(child);
-            this.xml.set(child, found);
-            addCounts(this.counts, found, 1);
-            replaced.add(child);
-          }
-    }
-    const touched = new Set<Y.XmlElement>();
-    for (const [type] of transaction.changed) {
-      if (!(type instanceof Y.XmlElement)) continue;
-      let top = type;
-      while (top.parent instanceof Y.XmlElement && top.parent !== root) top = top.parent;
-      if (top.parent === root && !replaced.has(top)) touched.add(top);
-    }
-    for (const top of touched) {
-      const found = xmlCounts(top);
-      this.replace(this.xml.get(top) ?? new Map(), found);
-      this.xml.set(top, found);
+          if (child instanceof Y.XmlElement) addDelta(delta, removed.get(child) ?? new Map(), -1);
+      for (const item of event.changes.added)
+        for (const child of item.content.getContent())
+          if (child instanceof Y.XmlElement) addDelta(delta, this.cacheXml(child), 1);
+      if (target instanceof Y.XmlElement && target.nodeName === "mention") {
+        const own = ownXmlCounts(target);
+        addDelta(delta, this.xmlOwn.get(target) ?? new Map(), -1);
+        addDelta(delta, own, 1);
+        this.xmlOwn.set(target, own);
+      }
+      if (!delta.size) continue;
+      let ancestor = target instanceof Y.XmlElement ? target : null;
+      while (ancestor instanceof Y.XmlElement) {
+        const counts = this.xml.get(ancestor) ?? new Map();
+        for (const [id, count] of delta) {
+          const next = (counts.get(id) ?? 0) + count;
+          if (next > 0) counts.set(id, next);
+          else counts.delete(id);
+        }
+        this.xml.set(ancestor, counts);
+        ancestor = ancestor.parent instanceof Y.XmlElement ? ancestor.parent : null;
+      }
+      for (const [id, count] of delta) {
+        const next = (this.counts.get(id) ?? 0) + count;
+        if (next > 0) this.counts.set(id, next);
+        else this.counts.delete(id);
+      }
     }
     return this.targets;
   }

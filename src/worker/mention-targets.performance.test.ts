@@ -35,16 +35,20 @@ describe("mention target scan measurement", () => {
       let editable: Y.XmlText | Y.Map<unknown>;
       if (kind === "document") {
         const root = document.getXmlFragment("document-store");
+        const group = new Y.XmlElement("blockGroup");
         const blocks: Y.XmlElement[] = [];
         for (let index = 0; index < 10_000; index++) {
-          const block = new Y.XmlElement("paragraph");
+          const block = new Y.XmlElement("blockContainer");
+          const paragraph = new Y.XmlElement("paragraph");
           const text = new Y.XmlText();
           text.insert(0, "text");
-          block.insert(0, [text]);
+          paragraph.insert(0, [text]);
+          block.insert(0, [paragraph]);
           blocks.push(block);
           if (index === 0) editable = text;
         }
-        root.insert(0, blocks);
+        group.insert(0, blocks);
+        root.insert(0, [group]);
       } else {
         const nodes = document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT);
         document.transact(() => {
@@ -78,8 +82,9 @@ describe("mention target scan measurement", () => {
         typing.push(performance.now() - start);
         start = performance.now();
         if (kind === "document") {
-          const block = new Y.XmlElement("paragraph");
-          document.getXmlFragment("document-store").insert(10_000 + index, [block]);
+          const block = new Y.XmlElement("blockContainer");
+          block.insert(0, [new Y.XmlElement("paragraph")]);
+          (document.getXmlFragment("document-store").get(0) as Y.XmlElement).insert(10_000 + index, [block]);
         } else {
           document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT).set(`new-${index}`, new Y.Map());
         }

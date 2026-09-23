@@ -29,6 +29,7 @@ const ID = /^[A-Za-z0-9:_-]{1,200}$/;
 const TS = /^\d{1,16}\.\d{1,16}$/;
 const SEARCH_SESSION_TTL_MS = 24 * 3_600_000;
 const SEARCH_PENDING_RETRY_MS = 15_000;
+const SEARCH_PENDING_ABANDON_MS = 10 * 60_000;
 const SEARCH_ACTIONS = new Set(["noteflare_search_run", "noteflare_search_next", "noteflare_search_previous"]);
 const HOME_ACTIONS = new Set(["noteflare_home_next", "noteflare_home_previous", "noteflare_home_read"]);
 const ROOT_ACTIONS = new Set([
@@ -541,7 +542,7 @@ export async function acceptSlackWorkspaceInteraction(env: Env, payload: SlackIn
   return { handled: true, response: { ok: true } };
 }
 
-export type SearchDelivery = "applied" | "deferred" | "superseded";
+export type SearchDelivery = "applied" | "deferred" | "superseded" | "uncertain";
 
 async function deliverSearch(
   env: Env,
@@ -600,6 +601,26 @@ async function deliverSearch(
     ]);
     row = await env.DB.prepare(`SELECT * FROM slack_view_sessions WHERE id = ?`).bind(row.id).first<Session>();
     if (!row) unavailable();
+  }
+  if (row.pending_token && input?.viewHash === row.view_hash) {
+    const now = Date.now();
+    const released = await env.DB.prepare(`UPDATE slack_view_sessions
+      SET pending_state_json=NULL, pending_revision=NULL, pending_token=NULL
+      WHERE id=? AND pending_token=? AND revision=? AND view_hash IS ? AND updated_at<=?
+        AND ((pending_token LIKE 'initial:%' AND updated_at<=?)
+          OR EXISTS (SELECT 1 FROM slack_interaction_receipts receipt
+            WHERE receipt.id=slack_view_sessions.pending_token AND receipt.processed_at IS NOT NULL
+              AND receipt.outcome <> 'uncertain'))`)
+      .bind(
+        row.id,
+        row.pending_token,
+        row.revision,
+        row.view_hash,
+        now - SEARCH_PENDING_RETRY_MS,
+        now - SEARCH_PENDING_ABANDON_MS,
+      )
+      .run();
+    if (released.meta.changes) row = { ...row, pending_state_json: null, pending_revision: null, pending_token: null };
   }
   const retryPending =
     row.pending_token !== null &&
@@ -660,7 +681,23 @@ async function deliverSearch(
       ...(expectedHash ? { hash: expectedHash } : {}),
     });
   } catch (error) {
-    if (error instanceof SlackApiError && error.code === "hash_conflict" && retryPending) return "deferred";
+    if (error instanceof SlackApiError && error.code === "hash_conflict" && retryPending) {
+      // A prior attempt may already be visible in Slack. Preserve its intent
+      // for a signed interaction, but stop polling the stale base hash.
+      if (receiptId)
+        await env.DB.prepare(`UPDATE slack_interaction_receipts
+          SET processed_at=?, outcome='uncertain', payload_json=NULL
+          WHERE id=? AND processed_at IS NULL`)
+          .bind(Date.now(), receiptId)
+          .run();
+      else
+        await env.DB.prepare(`UPDATE slack_view_sessions
+          SET pending_token='initial-uncertain:' || substr(pending_token, 9)
+          WHERE id=? AND pending_token=?`)
+          .bind(row.id, pendingToken)
+          .run();
+      return "uncertain";
+    }
     if (error instanceof SlackApiError && (error.code === "hash_conflict" || error.code === "not_found")) {
       await env.DB.prepare(
         `UPDATE slack_view_sessions SET pending_state_json = NULL, pending_revision = NULL, pending_token = NULL
@@ -757,6 +794,7 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
       .run();
   }
   let view: Record<string, unknown>;
+  let unavailableView = false;
   try {
     const { member } = await verifiedMember(env, installation, userId);
     const result = await mentionsInbox(env, member, state.asOf, state.cursors[state.page] ?? null, 10);
@@ -769,6 +807,7 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
     });
   } catch (error) {
     if (!deniedError(error)) throw error;
+    unavailableView = true;
     view = homeView({
       sessionId: id,
       mentions: [],
@@ -790,7 +829,7 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
     const published = await slackApi(env, installation, "views.publish", {
       user_id: userId,
       view,
-      ...(!reset && old?.view_hash ? { hash: old.view_hash } : {}),
+      ...(!reset && !unavailableView && old?.view_hash ? { hash: old.view_hash } : {}),
     });
     await env.DB.prepare(
       `UPDATE slack_view_sessions SET installation_generation = ?, state_json = ?, view_id = ?, view_hash = ?,

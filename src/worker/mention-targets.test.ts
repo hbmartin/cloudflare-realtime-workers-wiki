@@ -30,6 +30,47 @@ describe("incremental mention targets", () => {
     expect(changes).toEqual([["target"], ["target"], ["target"], [], ["target"]]);
   });
 
+  it("tracks structural edits beneath a BlockNote blockGroup", () => {
+    const document = new Y.Doc();
+    const root = document.getXmlFragment("document-store");
+    const group = new Y.XmlElement("blockGroup");
+    root.insert(0, [group]);
+    const tracker = new MentionTargetTracker(document, "document");
+    const changes: string[][] = [];
+    root.observeDeep((events, transaction) => {
+      const targets = tracker.update(transaction, events);
+      if (targets) changes.push([...targets].sort());
+    });
+    const container = (id: string) => {
+      const block = new Y.XmlElement("blockContainer");
+      const paragraph = new Y.XmlElement("paragraph");
+      const mention = new Y.XmlElement("mention");
+      mention.setAttribute("entityType", "user");
+      mention.setAttribute("entityId", id);
+      mention.setAttribute("label", id);
+      paragraph.insert(0, [mention]);
+      block.insert(0, [paragraph]);
+      return { block, paragraph, mention };
+    };
+    const first = container("first");
+    const second = container("second");
+    group.insert(0, [first.block]);
+    group.insert(1, [second.block]);
+    first.mention.setAttribute("entityId", "third");
+    group.delete(1, 1);
+    const nested = new Y.XmlElement("blockGroup");
+    first.block.insert(1, [nested]);
+    nested.insert(0, [container("fourth").block]);
+    expect(changes).toEqual([
+      ["first"],
+      ["first", "second"],
+      ["second", "third"],
+      ["third"],
+      ["third"],
+      ["fourth", "third"],
+    ]);
+  });
+
   it("tracks a changed diagram node without scanning its siblings", () => {
     const document = new Y.Doc();
     const nodes = document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT);

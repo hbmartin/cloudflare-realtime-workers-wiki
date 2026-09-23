@@ -1063,9 +1063,12 @@ export class Document extends YServer {
   }
 
   private captureMentionTargets(events: Y.YEvent<any>[], transaction: Y.Transaction) {
-    if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) return;
     const nextTargets = this.mentionTracker?.update(transaction, events);
     if (!nextTargets) return;
+    if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) {
+      this.currentMentionTargets = nextTargets;
+      return;
+    }
     const origin = transaction.origin;
     const connection = origin && typeof origin === "object" ? (origin as Connection<ConnectionAuth>) : null;
     const actorId = connection?.state?.userId ?? (origin === "api-mutation" ? this.pendingAuthorId : null);
