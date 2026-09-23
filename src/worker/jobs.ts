@@ -1415,6 +1415,11 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
 // pending; delivery handlers provide the idempotency and uncertain-send fence.
 export async function redriveStaleSlackOutbox(env: Env) {
   const now = Date.now();
+  await env.DB.prepare(`UPDATE slack_interaction_receipts
+    SET response_delivery_state = 'blocked', response_delivery_error = 'send_unconfirmed'
+    WHERE response_delivery_state = 'sending' AND response_delivery_attempted_at <= ?`)
+    .bind(now - SLACK_REDRIVE_STALE_MS)
+    .run();
   const rows = await env.DB.prepare(`SELECT id, topic, payload_json, enqueued_at, attempts FROM outbox
     WHERE topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action')
       AND enqueued_at IS NOT NULL AND enqueued_at <= ? AND available_at <= ?
@@ -1554,7 +1559,7 @@ export async function consumeDeliveryMessage(
       installationId,
       userId,
       typeof payload.generation === "number" ? payload.generation : undefined,
-      payload.reset === true,
+      payload.reset === true || payload.reset === 1,
     );
   } else if (row.topic === "webhook_event") {
     const eventId = payload.eventId;

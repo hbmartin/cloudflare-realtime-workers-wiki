@@ -703,6 +703,45 @@ export async function deleteSlackChannelSubscription(env: Env, member: MemberCon
   if (!deleted.meta.changes) throw new HttpError(404, "slack_channel_not_found", "Slack channel mapping not found.");
 }
 
+export async function setSlackChannelPause(
+  env: Env,
+  member: MemberContext,
+  id: string,
+  mode: "mute" | "unmute" | "snooze",
+  hours?: 1 | 8 | 24,
+) {
+  if (member.role !== "owner")
+    throw new HttpError(403, "owner_required", "Only an owner can change Slack channel controls.");
+  if (mode === "snooze" && hours !== 1 && hours !== 8 && hours !== 24)
+    throw new HttpError(422, "invalid_snooze", "Choose 1, 8, or 24 hours.");
+  const mapping = await env.DB.prepare(
+    `SELECT mapping.id FROM slack_channel_subscriptions mapping
+       JOIN slack_installations installation ON installation.id = mapping.installation_id
+      WHERE mapping.id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL`,
+  )
+    .bind(id, member.workspace.id)
+    .first<{ id: string }>();
+  if (!mapping) throw new HttpError(404, "slack_channel_not_found", "Slack channel mapping not found.");
+  const now = Date.now();
+  const mutedAt = mode === "mute" ? now : null;
+  const snoozedUntil = mode === "snooze" ? now + hours! * 3_600_000 : null;
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE slack_channel_subscriptions SET muted_at = ?, snoozed_until = ?, updated_at = ?
+        WHERE id = ? AND installation_id IN
+          (SELECT id FROM slack_installations WHERE workspace_id = ? AND disconnected_at IS NULL)`,
+    ).bind(mutedAt, snoozedUntil, now, id, member.workspace.id),
+    ...(mode === "unmute"
+      ? []
+      : [
+          env.DB.prepare(
+            `UPDATE slack_channel_events SET suppressed_at = ?
+        WHERE subscription_id = ? AND delivered_at IS NULL AND suppressed_at IS NULL`,
+          ).bind(now, id),
+        ]),
+  ]);
+}
+
 export async function verifySlackRequest(env: Env, request: Request, body: string) {
   requireSlackConfiguration(env);
   const timestamp = request.headers.get("x-slack-request-timestamp") ?? "";
@@ -739,7 +778,8 @@ async function activeInstallation(env: Env, teamId: string) {
     .first<SlackInstallation>();
 }
 
-async function usableBotToken(env: Env, installation: SlackInstallation) {
+export async function usableBotToken(env: Env, installation: SlackInstallation, signal?: AbortSignal) {
+  signal?.throwIfAborted();
   if (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000) {
     return decryptSlackToken(env, installation.bot_token_ciphertext);
   }
@@ -755,8 +795,11 @@ async function usableBotToken(env: Env, installation: SlackInstallation) {
       grant_type: "refresh_token",
       refresh_token: await decryptSlackToken(env, installation.bot_refresh_token_ciphertext),
     }),
-    signal: AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS)])
+      : AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
   });
+  signal?.throwIfAborted();
   const result = await response.json<{
     ok?: boolean;
     error?: string;
@@ -805,6 +848,7 @@ export async function slackApi<Method extends SlackApiMethod>(
   method: Method,
   payload: SlackApiContracts[Method]["input"],
   timeoutMs = SLACK_FETCH_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<SlackApiContracts[Method]["output"]> {
   const response = await traced(tracing, "notes.integration.slack", { "notes.operation": method }, async () => {
     const read = SLACK_READ_METHODS.has(method);
@@ -812,14 +856,19 @@ export async function slackApi<Method extends SlackApiMethod>(
     if (read)
       for (const [key, value] of Object.entries(payload))
         if (value !== undefined) url.searchParams.set(key, String(value));
+    const token =
+      method === "auth.revoke"
+        ? await decryptSlackToken(env, installation.bot_token_ciphertext)
+        : await usableBotToken(env, installation, signal);
+    signal?.throwIfAborted();
     return fetch(url.toString(), {
       method: read ? "GET" : "POST",
       headers: {
-        authorization: `Bearer ${method === "auth.revoke" ? await decryptSlackToken(env, installation.bot_token_ciphertext) : await usableBotToken(env, installation)}`,
+        authorization: `Bearer ${token}`,
         ...(read ? {} : { "content-type": "application/json; charset=utf-8" }),
       },
       ...(read ? {} : { body: JSON.stringify(payload) }),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     }).catch((error: unknown) => {
       if (isTimeoutAbort(error)) throw new Error(`Slack ${method} timed out.`);
       throw error;
@@ -1027,7 +1076,11 @@ export async function handleSlackCommand(
     userId: string,
     triggerId: string,
     query: string,
+    deadlineAt?: number,
+    defer?: (work: Promise<void>) => void,
   ) => Promise<{ response_type: string; text: string }>,
+  deadlineAt?: number,
+  defer?: (work: Promise<void>) => void,
 ) {
   const teamId = form.get("team_id") ?? "";
   const slackUserId = form.get("user_id") ?? "";
@@ -1048,7 +1101,7 @@ export async function handleSlackCommand(
     };
   }
   if (!openSearch) return { response_type: "ephemeral", text: "Search is unavailable. Try `/notes <query>` again." };
-  return openSearch(env, installation, slackUserId, form.get("trigger_id") ?? "", query);
+  return openSearch(env, installation, slackUserId, form.get("trigger_id") ?? "", query, deadlineAt, defer);
 }
 
 export async function consumeSlackLink(env: Env, member: MemberContext, rawToken: string) {
@@ -1127,7 +1180,7 @@ export function slackChannelFanoutStatements(
     spaceId: string;
     pageId: string;
     threadId: string | null;
-    actorId: string;
+    actorId: string | null;
     eventType: NotificationEventType;
     sourceId: string;
     createdAt: number;
@@ -1382,7 +1435,7 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     await env.DB.prepare(
       `INSERT OR IGNORE INTO outbox
         (id, workspace_id, topic, payload_json, available_at, created_at, correlation_id)
-       VALUES (?, ?, 'slack_home_publish', json_object('installationId', ?, 'generation', ?, 'userId', ?, 'reset', 1), ?, ?, ?)`,
+       VALUES (?, ?, 'slack_home_publish', json_object('installationId', ?, 'generation', ?, 'userId', ?, 'reset', json('true')), ?, ?, ?)`,
     )
       .bind(
         outboxId,
@@ -1577,7 +1630,12 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
 
 const SLACK_SHORTCUT_CALLBACKS = new Set(["noteflare_save_to_notes", "noteflare_new_page_from_thread"]);
 
-export async function handleSlackInteraction(env: Env, payload: SlackInteractionPayload) {
+export async function handleSlackInteraction(
+  env: Env,
+  payload: SlackInteractionPayload,
+  deadlineAt = Date.now() + 2_400,
+  defer?: (work: Promise<void>) => void,
+) {
   if (
     payload.type !== "message_action" ||
     typeof payload.callback_id !== "string" ||
@@ -1599,30 +1657,49 @@ export async function handleSlackInteraction(env: Env, payload: SlackInteraction
     .bind(crypto.randomUUID(), installation.id, interactionId, payload.callback_id, Date.now())
     .run();
   if (!inserted.meta.changes) return;
-  await slackApi(
-    env,
-    installation,
-    "views.open",
-    {
-      trigger_id: payload.trigger_id,
-      view: {
-        type: "modal",
-        callback_id: "noteflare_milestone_zero_placeholder",
-        title: { type: "plain_text", text: "NoteFlare" },
-        close: { type: "plain_text", text: "Close" },
-        blocks: [
-          {
-            type: "section",
-            text: { type: "mrkdwn", text: "This Slack action is not available yet." },
+  const remaining = deadlineAt - Date.now() - 150;
+  if (remaining <= 0) throw new HttpError(503, "slack_ack_timeout", "Slack modal trigger expired.");
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      slackApi(
+        env,
+        installation,
+        "views.open",
+        {
+          trigger_id: payload.trigger_id,
+          view: {
+            type: "modal",
+            callback_id: "noteflare_milestone_zero_placeholder",
+            title: { type: "plain_text", text: "NoteFlare" },
+            close: { type: "plain_text", text: "Close" },
+            blocks: [
+              {
+                type: "section",
+                text: { type: "mrkdwn", text: "This Slack action is not available yet." },
+              },
+            ],
           },
-        ],
-      },
-    },
-    1800,
-  );
-  await env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at = ? WHERE interaction_id = ?`)
+        },
+        Math.min(1_800, remaining),
+        controller.signal,
+      ),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort(new Error("Slack modal trigger expired."));
+          reject(new HttpError(503, "slack_ack_timeout", "Slack modal trigger expired."));
+        }, remaining);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  const finish = env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at = ? WHERE interaction_id = ?`)
     .bind(Date.now(), interactionId)
     .run();
+  if (defer) defer(finish.then(() => undefined));
+  else await finish;
 }
 
 async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_message_ts", outboxId: string) {
@@ -1724,11 +1801,21 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
     `SELECT event.subscription_id, subscription.installation_id
        FROM slack_channel_events event
        JOIN slack_channel_subscriptions subscription ON subscription.id = event.subscription_id
-      WHERE event.cadence = 'digest' AND event.delivered_at IS NULL AND event.created_at < ?
+       JOIN slack_installations installation ON installation.id = subscription.installation_id
+       JOIN pages page ON page.id = event.page_id
+      WHERE event.cadence = 'digest' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
+        AND event.created_at < ? AND installation.disconnected_at IS NULL
+        AND subscription.validation_state <> 'invalid'
+        AND subscription.muted_at IS NULL
+        AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
+        AND page.archived_at IS NULL AND page.import_job_id IS NULL AND page.is_template = 0
+        AND page.space_id = subscription.space_id
+        AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
+        AND ${channelActorAccessSql}
       GROUP BY event.subscription_id, subscription.installation_id
       ORDER BY MIN(event.created_at), event.subscription_id LIMIT 50`,
   )
-    .bind(cutoff)
+    .bind(cutoff, timestamp)
     .all<{ subscription_id: string; installation_id: string }>();
   const rateLimitedInstallations = new Set<string>();
   for (const { subscription_id: subscriptionId, installation_id: installationId } of subscriptions.results) {
@@ -1748,7 +1835,8 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
            AND page.import_job_id IS NULL AND page.is_template = 0
          LEFT JOIN user actor ON actor.id = event.actor_id
         WHERE event.subscription_id = ? AND event.cadence = 'digest'
-          AND event.delivered_at IS NULL AND event.created_at < ? AND installation.disconnected_at IS NULL
+          AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
+          AND event.created_at < ? AND installation.disconnected_at IS NULL
           AND page.space_id = subscription.space_id AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
           AND subscription.validation_state <> 'invalid' AND ${channelActorAccessSql}
           AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= unixepoch('subsec') * 1000)

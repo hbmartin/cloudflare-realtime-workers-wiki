@@ -56,13 +56,20 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
   const [error, setError] = useState(initialSlackOAuthError);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(() => new URLSearchParams(window.location.search).has("slackLink"));
+  const [currentTime, setCurrentTime] = useState(() => Date.now());
   const [spaceId, setSpaceId] = useState(spaces[0]?.id ?? "");
   const resolvedSpaceId = spaces.some((space) => space.id === spaceId) ? spaceId : (spaces[0]?.id ?? "");
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setCurrentTime(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const load = useCallback(async () => {
     try {
       const nextStatus = await api<SlackStatus>("/api/slack/status");
       setStatus(nextStatus);
+      setCurrentTime(Date.now());
       if (owner && nextStatus.installation?.connected) {
         const result = await api<{ subscriptions: ChannelSubscription[] }>("/api/slack/channels");
         setSubscriptions(result.subscriptions);
@@ -186,6 +193,33 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
       await load();
     } catch (cause) {
       setError(apiErrorMessage(cause, "Thread mirroring could not be changed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pauseChannel(
+    subscription: ChannelSubscription,
+    mode: "mute" | "unmute" | "snooze",
+    hours?: 1 | 8 | 24,
+  ) {
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/slack/channels/${encodeURIComponent(subscription.id)}/pause`, {
+        method: "PATCH",
+        body: json({ mode, ...(hours ? { hours } : {}) }),
+      });
+      setNotice(
+        mode === "unmute"
+          ? "Channel updates resumed."
+          : mode === "mute"
+            ? "Channel updates muted."
+            : `Channel updates snoozed for ${hours} hours.`,
+      );
+      await load();
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "Channel controls could not be changed."));
     } finally {
       setBusy(false);
     }
@@ -351,6 +385,10 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
             {subscriptions.map((subscription) => {
               const space = spaces.find((candidate) => candidate.id === subscription.spaceId);
               const page = subscription.pageId ? pages.find((candidate) => candidate.id === subscription.pageId) : null;
+              const paused =
+                (subscription.mutedAt !== null && subscription.mutedAt !== undefined) ||
+                (subscription.snoozedUntil ?? 0) > currentTime;
+              const pauseLabel = paused ? "Unmute" : "Mute";
               return (
                 <article key={subscription.id}>
                   <div>
@@ -360,6 +398,13 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       {page ? ` / ${page.title}` : " / all pages"} · {subscription.cadence}
                     </p>
                     <p>{subscription.mirrorEnabled ? "Thread mirror enabled" : "One-way notifications"}</p>
+                    {subscription.mutedAt !== null && subscription.mutedAt !== undefined ? (
+                      <p>Muted until you unmute this mapping.</p>
+                    ) : subscription.snoozedUntil !== null &&
+                      subscription.snoozedUntil !== undefined &&
+                      subscription.snoozedUntil > currentTime ? (
+                      <p>Snoozed until {new Date(subscription.snoozedUntil).toLocaleString()}.</p>
+                    ) : null}
                     {subscription.validationState === "invalid" && (
                       <p>Channel validation failed. Check bot membership and channel access.</p>
                     )}
@@ -377,6 +422,27 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                   >
                     {subscription.mirrorEnabled ? "Disable mirror" : "Validate and enable mirror"}
                   </button>
+                  <button
+                    disabled={busy}
+                    aria-label={`${pauseLabel} #${subscription.channelName || subscription.channelId}`}
+                    onClick={() => void pauseChannel(subscription, paused ? "unmute" : "mute")}
+                  >
+                    {pauseLabel}
+                  </button>
+                  <select
+                    aria-label={`Snooze updates for #${subscription.channelName || subscription.channelId}`}
+                    value=""
+                    disabled={busy}
+                    onChange={(event) => {
+                      const hours = Number(event.target.value);
+                      if (hours === 1 || hours === 8 || hours === 24) void pauseChannel(subscription, "snooze", hours);
+                    }}
+                  >
+                    <option value="">Snooze…</option>
+                    <option value="1">1 hour</option>
+                    <option value="8">8 hours</option>
+                    <option value="24">24 hours</option>
+                  </select>
                   <button
                     className="text-danger"
                     disabled={busy}

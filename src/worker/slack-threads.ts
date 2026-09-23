@@ -615,8 +615,14 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
     await slackApi(env, installation, "chat.postEphemeral", {
       channel: payload.channelId,
       user: payload.slackUserId,
-      thread_ts: payload.threadTs,
-      text: payload.text === CONNECT ? CONNECT : payload.text === CONTENT_ERROR ? CONTENT_ERROR : DENIED,
+      text:
+        payload.reason === "connect" ||
+        payload.text === CONNECT ||
+        payload.text === "Connect your Slack account from NoteFlare Settings before using this action."
+          ? CONNECT
+          : payload.text === CONTENT_ERROR
+            ? CONTENT_ERROR
+            : DENIED,
     });
   } catch (error) {
     if (error instanceof SlackRateLimitError) {

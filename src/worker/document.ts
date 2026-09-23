@@ -6,6 +6,7 @@ import * as Y from "yjs";
 import { collectTransclusions, projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import {
   diagramFromYDoc,
+  DIAGRAM_NODES_ROOT,
   DIAGRAM_THUMBNAIL_HEIGHT,
   DIAGRAM_THUMBNAIL_WIDTH,
   projectDiagram,
@@ -89,6 +90,70 @@ function documentTextNodes(document: Y.Doc) {
   };
   visit(document.getXmlFragment("document-store"));
   return nodes;
+}
+
+// Read only mention identifiers. A full ProseMirror/diagram projection on every Yjs update
+// would make ordinary typing scale with document serialization cost.
+function liveMentionTargets(document: Y.Doc, kind: "document" | "diagram") {
+  const targets = new Set<string>();
+  if (kind === "diagram") {
+    for (const node of document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT).values()) {
+      if (!(node instanceof Y.Map)) continue;
+      const mentions = node.get("mentions");
+      if (!(mentions instanceof Y.Map)) continue;
+      for (const [id, label] of mentions.entries())
+        if (/^[\w-]{1,100}$/.test(id) && typeof label === "string") targets.add(id);
+    }
+  } else {
+    const visit = (parent: Y.XmlFragment | Y.XmlElement) => {
+      for (const child of parent.toArray()) {
+        if (!(child instanceof Y.XmlElement)) continue;
+        if (child.nodeName === "mention" && child.getAttribute("entityType") === "user") {
+          const id = child.getAttribute("entityId");
+          const label = child.getAttribute("label");
+          if (typeof id === "string" && id && typeof label === "string" && label) targets.add(id);
+        }
+        visit(child);
+      }
+    };
+    visit(document.getXmlFragment("document-store"));
+  }
+  return targets;
+}
+
+function mentionTargetsMayChange(document: Y.Doc, kind: "document" | "diagram", transaction: Y.Transaction) {
+  if (kind === "document") {
+    const root = document.getXmlFragment("document-store");
+    for (const [type, keys] of transaction.changed) {
+      if (Object.is(type, root)) return true;
+      if (type instanceof Y.XmlElement) {
+        if (keys.has(null)) return true;
+        if (type.nodeName === "mention" && ["entityType", "entityId", "label"].some((key) => keys.has(key)))
+          return true;
+      }
+    }
+    return false;
+  }
+  const nodes = document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT);
+  for (const [type, keys] of transaction.changed) {
+    if (Object.is(type, nodes)) return true;
+    if (!(type instanceof Y.Map)) continue;
+    if (type.parent === nodes && keys.has("mentions")) return true;
+    if (type.parent instanceof Y.Map && type.parent.parent === nodes && type.parent.get("mentions") === type)
+      return true;
+  }
+  return false;
+}
+
+function mentionGroups(targetIds: string[], actors: Map<string, string | null>) {
+  const grouped = new Map<string | null, string[]>();
+  for (const targetId of targetIds) {
+    const actorId = actors.get(targetId) ?? null;
+    const recipients = grouped.get(actorId) ?? [];
+    recipients.push(targetId);
+    grouped.set(actorId, recipients);
+  }
+  return [...grouped].map(([actorId, recipientIds]) => ({ actorId, recipientIds }));
 }
 
 function commentMarkThreadId(markName: string, value: unknown) {
@@ -386,6 +451,8 @@ export class Document extends YServer {
   private metadata!: MetaRow;
   private pendingUpdates: Uint8Array[] = [];
   private pendingAuthorId: string | null = null;
+  private pendingMentionActors = new Map<string, string | null>();
+  private currentMentionTargets = new Set<string>();
   private pendingNotifyEdit = false;
   private purged = false;
   private transition: "archive" | "restore" | null = null;
@@ -466,6 +533,11 @@ export class Document extends YServer {
       data BLOB NOT NULL,
       PRIMARY KEY (seq, chunk_index)
     )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS mention_introductions (
+      target_user_id TEXT PRIMARY KEY,
+      seq INTEGER NOT NULL,
+      actor_id TEXT
+    )`);
     sql.exec(`CREATE TABLE IF NOT EXISTS restore_recovery (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       old_epoch INTEGER NOT NULL,
@@ -499,8 +571,9 @@ export class Document extends YServer {
     }
 
     await super.onStart();
-    this.document.on("update", (update: Uint8Array, origin: unknown) => {
-      this.bufferUpdate(update, origin as Connection<ConnectionAuth> | null);
+    this.currentMentionTargets = liveMentionTargets(this.document, this.metadata.content_kind);
+    this.document.on("update", (update: Uint8Array, origin: unknown, _document: Y.Doc, transaction: Y.Transaction) => {
+      this.bufferUpdate(update, origin, transaction);
     });
     // A restored epoch starts with an R2 snapshot but no local update log. Seed
     // one idempotent Yjs update so the new room regenerates search projections,
@@ -982,6 +1055,7 @@ export class Document extends YServer {
       this.metadata.retired = 1;
       this.pendingUpdates = [];
       this.pendingAuthorId = null;
+      this.pendingMentionActors.clear();
       this.pendingNotifyEdit = false;
       for (const connection of this.getConnections()) {
         connection.close(4411, "This page was permanently deleted.");
@@ -993,11 +1067,21 @@ export class Document extends YServer {
     return new Response("Not found", { status: 404 });
   }
 
-  private bufferUpdate(update: Uint8Array, origin: Connection<ConnectionAuth> | null) {
+  private bufferUpdate(update: Uint8Array, origin: unknown, transaction?: Y.Transaction) {
     if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) return;
+    const connection = origin && typeof origin === "object" ? (origin as Connection<ConnectionAuth>) : null;
+    if (transaction && mentionTargetsMayChange(this.document, this.metadata.content_kind, transaction)) {
+      const nextTargets = liveMentionTargets(this.document, this.metadata.content_kind);
+      const actorId = connection?.state?.userId ?? (origin === "api-mutation" ? this.pendingAuthorId : null);
+      for (const target of nextTargets)
+        if (!this.currentMentionTargets.has(target)) this.pendingMentionActors.set(target, actorId);
+      for (const target of this.currentMentionTargets)
+        if (!nextTargets.has(target)) this.pendingMentionActors.delete(target);
+      this.currentMentionTargets = nextTargets;
+    }
     this.pendingUpdates.push(update);
-    this.pendingAuthorId = origin?.state?.userId ?? this.pendingAuthorId;
-    this.pendingNotifyEdit ||= Boolean(origin?.state?.userId);
+    this.pendingAuthorId = connection?.state?.userId ?? this.pendingAuthorId;
+    this.pendingNotifyEdit ||= Boolean(connection?.state?.userId);
   }
 
   private flushPendingUpdates() {
@@ -1005,6 +1089,7 @@ export class Document extends YServer {
     const updates = this.pendingUpdates;
     const authorId = this.pendingAuthorId;
     const notifyEdit = this.pendingNotifyEdit;
+    const mentions = [...this.pendingMentionActors];
     const merged = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
     this.state.storage.transactionSync(() => {
       const row = this.state.storage.sql
@@ -1022,6 +1107,15 @@ export class Document extends YServer {
           bytes.buffer,
         );
       }
+      for (const [targetId, actorId] of mentions) {
+        this.state.storage.sql.exec(
+          `INSERT INTO mention_introductions (target_user_id, seq, actor_id) VALUES (?, ?, ?)
+            ON CONFLICT(target_user_id) DO UPDATE SET seq = excluded.seq, actor_id = excluded.actor_id`,
+          targetId,
+          row.seq,
+          actorId,
+        );
+      }
       this.state.storage.sql.exec(
         `UPDATE document_meta SET dirty = 1, last_editor_id = COALESCE(?, last_editor_id),
           notify_edit = CASE WHEN ? THEN 1 ELSE notify_edit END WHERE id = 1`,
@@ -1031,6 +1125,7 @@ export class Document extends YServer {
     });
     this.pendingUpdates = [];
     this.pendingAuthorId = null;
+    this.pendingMentionActors.clear();
     this.pendingNotifyEdit = false;
     this.metadata.dirty = 1;
     if (authorId) this.metadata.last_editor_id = authorId;
@@ -1078,6 +1173,18 @@ export class Document extends YServer {
     return tracked;
   }
 
+  private mentionActorsThrough(sequence: number) {
+    return new Map(
+      this.state.storage.sql
+        .exec<{ target_user_id: string; actor_id: string | null }>(
+          `SELECT target_user_id, actor_id FROM mention_introductions WHERE seq <= ?`,
+          sequence,
+        )
+        .toArray()
+        .map((row) => [row.target_user_id, row.actor_id]),
+    );
+  }
+
   private async compactOnce(forceVersion = false, suppressExternalEffects = false) {
     if (this.metadata.content_kind === "document") migrateLegacyColumns(this.document);
     this.flushPendingUpdates();
@@ -1097,6 +1204,7 @@ export class Document extends YServer {
     }
 
     const metadataAtStart = { ...this.metadata };
+    const mentionActors = this.mentionActorsThrough(maximum);
     const snapshot = Y.encodeStateAsUpdate(this.document);
     const json = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
     const projection = projectDocument(json);
@@ -1218,7 +1326,7 @@ export class Document extends YServer {
         const oldMentionIds = new Set(oldUserTargets.results.map((row) => row.id));
         const newMentionIds = projection.memberMentions
           .map((mention) => mention.targetId)
-          .filter((id) => !oldMentionIds.has(id));
+          .filter((id) => !oldMentionIds.has(id) || mentionActors.has(id));
         const watcherIds = watcherRows.results.map((row) => row.id).filter((id) => !newMentionIds.includes(id));
         const makeVersion = Boolean(
           forceVersion ||
@@ -1286,9 +1394,23 @@ export class Document extends YServer {
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
+            `UPDATE member_mentions SET first_seen_actor_id =
+                (SELECT json_extract(item.value, '$.actorId') FROM json_each(?) item
+                  WHERE json_extract(item.value, '$.targetId') = member_mentions.target_user_id),
+                first_seen_at = ?
+              WHERE source_page_id = ? AND target_user_id IN
+                (SELECT json_extract(item.value, '$.targetId') FROM json_each(?) item)`,
+          ).bind(
+            JSON.stringify([...mentionActors].map(([targetId, actorId]) => ({ targetId, actorId }))),
+            timestamp,
+            pageId,
+            JSON.stringify([...mentionActors].map(([targetId]) => ({ targetId }))),
+          ),
+          this.bindings.DB.prepare(
             `INSERT INTO member_mentions
               (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, first_seen_actor_id, projection_seq)
-              SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?, ?, ?
+              SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?,
+                json_extract(item.value, '$.actorId'), ?
                 FROM json_each(?) item
                 JOIN workspace_members member
                   ON member.workspace_id = ? AND member.user_id = json_extract(item.value, '$.targetId')
@@ -1299,9 +1421,13 @@ export class Document extends YServer {
             page.workspace_id,
             pageId,
             timestamp,
-            metadataAtStart.last_editor_id,
             maximum,
-            JSON.stringify(projection.memberMentions),
+            JSON.stringify(
+              projection.memberMentions.map((mention) => ({
+                ...mention,
+                actorId: mentionActors.get(mention.targetId) ?? null,
+              })),
+            ),
             page.workspace_id,
             pageId,
             epoch,
@@ -1399,22 +1525,22 @@ export class Document extends YServer {
                 data: { sequence: maximum },
                 createdAt: timestamp,
               })),
-          ...(effectsSuppressed
+          ...(effectsSuppressed || !metadataAtStart.notify_edit
             ? []
-            : notificationFanoutStatements(this.bindings.DB, {
-                workspaceId: page.workspace_id,
-                spaceId: page.space_id,
-                pageId,
-                threadId: null,
-                actorId: metadataAtStart.last_editor_id ?? "",
-                eventType: "mention",
-                sourceId: `${pageId}:${epoch}:${maximum}`,
-                recipientIds: metadataAtStart.notify_edit && metadataAtStart.last_editor_id ? newMentionIds : [],
-                emitSlackChannel: Boolean(
-                  metadataAtStart.notify_edit && metadataAtStart.last_editor_id && newMentionIds.length,
-                ),
-                data: { sequence: maximum },
-                createdAt: timestamp,
+            : mentionGroups(newMentionIds, mentionActors).flatMap(({ actorId, recipientIds }) => {
+                return notificationFanoutStatements(this.bindings.DB, {
+                  workspaceId: page.workspace_id,
+                  spaceId: page.space_id,
+                  pageId,
+                  threadId: null,
+                  actorId,
+                  eventType: "mention",
+                  sourceId: `${pageId}:${epoch}:${maximum}:${actorId ?? "collaborator"}`,
+                  recipientIds,
+                  emitSlackChannel: actorId !== null,
+                  data: { sequence: maximum },
+                  createdAt: timestamp,
+                });
               })),
           ...(effectsSuppressed
             ? []
@@ -1562,6 +1688,7 @@ export class Document extends YServer {
       this.state.storage.transactionSync(() => {
         this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
         this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
+        this.state.storage.sql.exec(`DELETE FROM mention_introductions WHERE seq <= ?`, maximum);
         this.state.storage.sql.exec(
           `UPDATE document_meta SET snapshot_seq = ?, last_version_at = ? WHERE id = 1`,
           maximum,
@@ -1609,6 +1736,7 @@ export class Document extends YServer {
   private async compactDiagram(maximum: number, forceVersion: boolean) {
     const { pageId, epoch } = this.ids;
     const metadataAtStart = { ...this.metadata };
+    const mentionActors = this.mentionActorsThrough(maximum);
     const snapshot = Y.encodeStateAsUpdate(this.document);
     const envelope = diagramFromYDoc(this.document, { pageId, contentEpoch: epoch, sequence: maximum });
     const projection = projectDiagram(envelope);
@@ -1704,7 +1832,7 @@ export class Document extends YServer {
         const oldMentionIds = new Set(oldUserTargets.results.map((row) => row.id));
         const newMentionIds = projection.memberMentions
           .map((mention) => mention.targetId)
-          .filter((id) => !oldMentionIds.has(id));
+          .filter((id) => !oldMentionIds.has(id) || mentionActors.has(id));
         const watcherIds = watcherRows.results.map((row) => row.id).filter((id) => !newMentionIds.includes(id));
         const makeVersion = Boolean(
           forceVersion ||
@@ -1788,9 +1916,23 @@ export class Document extends YServer {
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
           ).bind(pageId, pageId, epoch),
           this.bindings.DB.prepare(
+            `UPDATE member_mentions SET first_seen_actor_id =
+                (SELECT json_extract(item.value, '$.actorId') FROM json_each(?) item
+                  WHERE json_extract(item.value, '$.targetId') = member_mentions.target_user_id),
+                first_seen_at = ?
+              WHERE source_page_id = ? AND target_user_id IN
+                (SELECT json_extract(item.value, '$.targetId') FROM json_each(?) item)`,
+          ).bind(
+            JSON.stringify([...mentionActors].map(([targetId, actorId]) => ({ targetId, actorId }))),
+            timestamp,
+            pageId,
+            JSON.stringify([...mentionActors].map(([targetId]) => ({ targetId }))),
+          ),
+          this.bindings.DB.prepare(
             `INSERT INTO member_mentions
               (workspace_id, source_page_id, target_user_id, excerpt, first_seen_at, first_seen_actor_id, projection_seq)
-              SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?, ?, ?
+              SELECT ?, ?, member.user_id, json_extract(item.value, '$.excerpt'), ?,
+                json_extract(item.value, '$.actorId'), ?
                 FROM json_each(?) item
                 JOIN workspace_members member
                   ON member.workspace_id = ? AND member.user_id = json_extract(item.value, '$.targetId')
@@ -1801,9 +1943,13 @@ export class Document extends YServer {
             page.workspace_id,
             pageId,
             timestamp,
-            metadataAtStart.last_editor_id,
             maximum,
-            JSON.stringify(projection.memberMentions),
+            JSON.stringify(
+              projection.memberMentions.map((mention) => ({
+                ...mention,
+                actorId: mentionActors.get(mention.targetId) ?? null,
+              })),
+            ),
             page.workspace_id,
             pageId,
             epoch,
@@ -1835,21 +1981,23 @@ export class Document extends YServer {
             data: { sequence: maximum },
             createdAt: timestamp,
           }),
-          ...notificationFanoutStatements(this.bindings.DB, {
-            workspaceId: page.workspace_id,
-            spaceId: page.space_id,
-            pageId,
-            threadId: null,
-            actorId: metadataAtStart.last_editor_id ?? "",
-            eventType: "mention",
-            sourceId: `${pageId}:${epoch}:${maximum}`,
-            recipientIds: metadataAtStart.notify_edit && metadataAtStart.last_editor_id ? newMentionIds : [],
-            emitSlackChannel: Boolean(
-              metadataAtStart.notify_edit && metadataAtStart.last_editor_id && newMentionIds.length,
-            ),
-            data: { sequence: maximum },
-            createdAt: timestamp,
-          }),
+          ...(metadataAtStart.notify_edit
+            ? mentionGroups(newMentionIds, mentionActors).flatMap(({ actorId, recipientIds }) => {
+                return notificationFanoutStatements(this.bindings.DB, {
+                  workspaceId: page.workspace_id,
+                  spaceId: page.space_id,
+                  pageId,
+                  threadId: null,
+                  actorId,
+                  eventType: "mention",
+                  sourceId: `${pageId}:${epoch}:${maximum}:${actorId ?? "collaborator"}`,
+                  recipientIds,
+                  emitSlackChannel: actorId !== null,
+                  data: { sequence: maximum },
+                  createdAt: timestamp,
+                });
+              })
+            : []),
           ...notificationFanoutStatements(this.bindings.DB, {
             workspaceId: page.workspace_id,
             spaceId: page.space_id,
@@ -1994,6 +2142,7 @@ export class Document extends YServer {
       this.state.storage.transactionSync(() => {
         this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
         this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
+        this.state.storage.sql.exec(`DELETE FROM mention_introductions WHERE seq <= ?`, maximum);
         this.state.storage.sql.exec(
           `UPDATE document_meta SET snapshot_seq = ?, last_version_at = ? WHERE id = 1`,
           maximum,
