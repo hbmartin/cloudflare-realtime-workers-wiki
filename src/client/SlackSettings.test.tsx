@@ -204,6 +204,8 @@ describe("SlackSettings", () => {
 describe("Slack thread mirror controls", () => {
   function setupMirror(identity = "verified", mirrorEnabled = false, blockedDeliveries = 0) {
     let enabled = mirrorEnabled;
+    let mutedAt: number | null = null;
+    let snoozedUntil: number | null = null;
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/slack/status")
         return {
@@ -225,6 +227,12 @@ describe("Slack thread mirror controls", () => {
         enabled = (JSON.parse(String(init.body)) as { mirrorEnabled: boolean }).mirrorEnabled;
         return {};
       }
+      if (path === "/api/slack/channels/mapping/pause" && init?.method === "PATCH") {
+        const input = JSON.parse(String(init.body)) as { mode: string; hours?: number };
+        mutedAt = input.mode === "mute" ? Date.now() : null;
+        snoozedUntil = input.mode === "snooze" ? Date.now() + (input.hours ?? 0) * 3_600_000 : null;
+        return {};
+      }
       if (path === "/api/slack/channels")
         return {
           subscriptions: [
@@ -238,6 +246,8 @@ describe("Slack thread mirror controls", () => {
               cadence: "immediate",
               mirrorEnabled: enabled,
               blockedDeliveries,
+              mutedAt,
+              snoozedUntil,
               validationState: "valid",
             },
           ],
@@ -273,6 +283,21 @@ describe("Slack thread mirror controls", () => {
     render(<SlackSettings owner spaces={[space]} pages={[page]} />);
     expect(await screen.findByText(/2 thread deliveries need reconciliation/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Disable thread mirror for #product" })).toBeEnabled();
+  });
+  it("shows mute state and lets an owner unmute without an active root", async () => {
+    setupMirror();
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Mute" }));
+    expect(await screen.findByText("Muted until you unmute this mapping.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Unmute" }));
+    await waitFor(() => expect(screen.queryByText("Muted until you unmute this mapping.")).not.toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("Snooze updates for #product"), { target: { value: "8" } });
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        "/api/slack/channels/mapping/pause",
+        expect.objectContaining({ method: "PATCH", body: JSON.stringify({ mode: "snooze", hours: 8 }) }),
+      ),
+    );
   });
   it("does not expose mapping controls to non-owners", async () => {
     setupMirror();

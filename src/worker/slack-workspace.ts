@@ -17,12 +17,12 @@ import {
   slackApi,
   SlackApiError,
   SlackRateLimitError,
+  usableBotToken,
   type SlackInstallation,
   type SlackInteractionPayload,
 } from "./slack";
 
 const DENIED = "This NoteFlare resource is unavailable or you no longer have permission to use it.";
-const CONNECT = "Connect your Slack account from NoteFlare Settings before using this action.";
 const ID = /^[A-Za-z0-9:_-]{1,200}$/;
 const TS = /^\d{1,16}\.\d{1,16}$/;
 const SEARCH_SESSION_TTL_MS = 24 * 3_600_000;
@@ -49,6 +49,9 @@ type Session = {
   view_hash: string | null;
   state_json: string;
   revision: number;
+  pending_state_json: string | null;
+  pending_revision: number | null;
+  pending_token: string | null;
 };
 type HomeState = { asOf: number; cursors: Array<MentionCursor | null>; page: number };
 type SearchState = SearchModalFilters;
@@ -66,6 +69,7 @@ type ActionInput = {
   sessionId?: string;
   viewId?: string;
   viewHash?: string;
+  initialLoading?: boolean;
   search?: SearchState;
 };
 
@@ -140,7 +144,8 @@ function searchFromValues(value: unknown, fallback: SearchState): SearchState {
     const state = block && typeof block === "object" ? (block as Record<string, unknown>).value : null;
     return state && typeof state === "object" ? (state as Record<string, unknown>) : {};
   };
-  const query = typeof field("query").value === "string" ? String(field("query").value) : fallback.query;
+  const queryValue = field("query").value;
+  const query = typeof queryValue === "string" ? queryValue : queryValue === null ? "" : fallback.query;
   const option = (name: string) => {
     const selected = field(name).selected_option;
     return selected && typeof selected === "object" && typeof (selected as Record<string, unknown>).value === "string"
@@ -182,6 +187,8 @@ export async function openSlackSearch(
   userId: string,
   triggerId: string,
   query: string,
+  deadlineAt = Date.now() + 2_400,
+  defer?: (work: Promise<void>) => void,
 ) {
   if (!triggerId || !ID.test(userId))
     return { response_type: "ephemeral", text: "Search is unavailable. Try `/notes <query>` again." };
@@ -194,7 +201,12 @@ export async function openSlackSearch(
   )
     .bind(id, installation.id, installation.generation, userId, JSON.stringify(state), Date.now(), Date.now())
     .run();
+  const controller = new AbortController();
+  // Reserve time for the slash-command HTTP acknowledgment after a failed open.
+  const remaining = Math.max(0, deadlineAt - Date.now() - 150);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
+    if (remaining <= 0) throw new Error("Slack modal trigger expired.");
     const result = await Promise.race([
       slackApi(
         env,
@@ -204,28 +216,55 @@ export async function openSlackSearch(
           trigger_id: triggerId,
           view: searchModal(id, state, origin(env)),
         },
-        1800,
+        Math.min(1_800, remaining),
+        controller.signal,
       ),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Slack modal trigger expired.")), 2000)),
-    ]);
-    if (!result.view?.id) throw new Error("Slack did not return a modal ID.");
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE slack_view_sessions SET view_id = ?, view_hash = ?, updated_at = ? WHERE id = ?`).bind(
-        result.view.id,
-        result.view.hash ?? null,
-        Date.now(),
-        id,
-      ),
-      queue(env, `outbox:slack-search:${id}:open`, installation.workspace_id, "slack_search_update", {
-        sessionId: id,
-        revision: 0,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort(new Error("Slack modal trigger expired."));
+          reject(new Error("Slack modal trigger expired."));
+        }, remaining);
       }),
     ]);
+    if (!result.view?.id) throw new Error("Slack did not return a modal ID.");
+    const finishOpen = () =>
+      env.DB.batch([
+        env.DB.prepare(
+          `UPDATE slack_view_sessions SET view_id = ?, view_hash = ?, updated_at = ? WHERE id = ? AND view_id IS NULL`,
+        ).bind(result.view.id, result.view.hash ?? null, Date.now(), id),
+        queue(env, `outbox:slack-search:${id}:open`, installation.workspace_id, "slack_search_update", {
+          sessionId: id,
+          revision: 0,
+        }),
+      ]);
+    if (defer) defer(finishOpen().then(() => undefined));
+    else await finishOpen();
     return { response_type: "ephemeral", text: "" };
   } catch {
     await env.DB.prepare(`DELETE FROM slack_view_sessions WHERE id = ?`).bind(id).run();
     return { response_type: "ephemeral", text: "Search could not open. Try `/notes <query>` again." };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
+}
+
+async function reconcileOpenedSearchView(
+  env: Env,
+  session: Session,
+  view: NonNullable<SlackInteractionPayload["view"]>,
+) {
+  if (session.view_id || typeof view.id !== "string" || typeof view.hash !== "string") return session;
+  const updated = await env.DB.prepare(
+    `UPDATE slack_view_sessions SET view_id = ?, view_hash = ?, updated_at = ?
+      WHERE id = ? AND view_id IS NULL AND revision = 0`,
+  )
+    .bind(view.id, view.hash, Date.now(), session.id)
+    .run();
+  if (updated.meta.changes) return { ...session, view_id: view.id, view_hash: view.hash };
+  const current = await env.DB.prepare(`SELECT * FROM slack_view_sessions WHERE id = ?`)
+    .bind(session.id)
+    .first<Session>();
+  return current ?? session;
 }
 
 async function currentInstallation(env: Env, teamId: string) {
@@ -327,7 +366,11 @@ export async function acceptSlackWorkspaceInteraction(env: Env, payload: SlackIn
     const sessionId = payload.view.private_metadata;
     if (typeof sessionId !== "string" || !ID.test(sessionId) || typeof payload.view.id !== "string")
       return { handled: true, response: { ok: true } };
-    const session = await sessionFor(env, sessionId, "search", installation, payload.user.id);
+    const session = await reconcileOpenedSearchView(
+      env,
+      await sessionFor(env, sessionId, "search", installation, payload.user.id),
+      payload.view,
+    );
     if (session.view_id !== payload.view.id || session.view_hash !== payload.view.hash) unavailable();
     const identity = await identityFor(env, installation, payload.user.id);
     if (!identity || !(await memberForCurrent(env, installation, identity.userId))) unavailable();
@@ -380,7 +423,11 @@ export async function acceptSlackWorkspaceInteraction(env: Env, payload: SlackIn
     const sessionId = typeof action.value === "string" ? action.value : payload.view?.private_metadata;
     if (typeof sessionId !== "string" || !ID.test(sessionId) || typeof payload.view?.id !== "string")
       return { handled: true, response: { ok: true } };
-    const session = await sessionFor(env, sessionId, "search", installation, payload.user.id);
+    const session = await reconcileOpenedSearchView(
+      env,
+      await sessionFor(env, sessionId, "search", installation, payload.user.id),
+      payload.view,
+    );
     const current = parseSession(session) as SearchState;
     const chosen = searchFromValues(payload.view?.state?.values, current);
     const sameFilters = JSON.stringify({ ...current, offset: 0 }) === JSON.stringify(chosen);
@@ -391,6 +438,8 @@ export async function acceptSlackWorkspaceInteraction(env: Env, payload: SlackIn
           ? Math.max(0, current.offset - 10)
           : 0;
     input.sessionId = sessionId;
+    input.initialLoading =
+      actionId === "noteflare_search_run" && session.revision === 0 && session.view_hash === payload.view.hash;
     input.viewId = payload.view.id;
     if (typeof payload.view.hash === "string") input.viewHash = payload.view.hash;
     input.search = { ...chosen, offset };
@@ -469,40 +518,67 @@ async function deliverSearch(env: Env, input: ActionInput | null, sessionId: str
   if (
     input &&
     (input.viewId !== row.view_id ||
-      input.viewHash !== row.view_hash ||
+      !input.viewHash ||
+      (input.viewHash !== row.view_hash &&
+        row.pending_state_json === null &&
+        !(input.initialLoading && row.revision === 1)) ||
       input.slackUserId !== row.slack_user_id ||
       input.generation !== row.installation_generation)
   )
     unavailable();
   const state = input?.search ?? (parseSession(row) as SearchState);
+  const expectedHash = input?.initialLoading && row.revision === 1 ? row.view_hash : (input?.viewHash ?? row.view_hash);
   let view: Record<string, unknown>;
   try {
     const { member } = await verifiedMember(env, installation, row.slack_user_id, input?.identity);
     const result = await searchPages(env.DB, member, searchRequest(state));
     view = searchModal(row.id, state, origin(env), result);
   } catch (error) {
-    if (!(error instanceof HttpError) && !(error instanceof SlackApiError)) throw error;
-    view = searchModal(row.id, state, origin(env), undefined, DENIED);
+    if (error instanceof HttpError && error.code === "slack_identity_required") {
+      view = searchModal(
+        row.id,
+        state,
+        origin(env),
+        undefined,
+        "Verify your Slack identity in NoteFlare Settings to search.",
+      );
+    } else if (deniedError(error)) {
+      view = searchModal(row.id, state, origin(env), undefined, DENIED);
+    } else throw error;
   }
+  const pendingToken = crypto.randomUUID();
+  const intent = await env.DB.prepare(
+    `UPDATE slack_view_sessions SET pending_state_json = ?, pending_revision = ?, pending_token = ?
+      WHERE id = ? AND revision = ?`,
+  )
+    .bind(JSON.stringify(state), row.revision + 1, pendingToken, row.id, row.revision)
+    .run();
+  if (!intent.meta.changes) throw new Error("Slack search state changed during publication.");
   const updated = await slackApi(env, installation, "views.update", {
     view_id: row.view_id,
     view,
-    ...(row.view_hash ? { hash: row.view_hash } : {}),
+    ...(expectedHash ? { hash: expectedHash } : {}),
   });
   if (!updated.view?.hash) throw new Error("Slack did not return the updated modal hash.");
-  await env.DB.prepare(
-    `UPDATE slack_view_sessions SET state_json = ?, view_hash = ?, revision = revision + 1, updated_at = ?
-      WHERE id = ? AND revision = ? AND view_hash IS ?`,
+  const finalized = await env.DB.prepare(
+    `UPDATE slack_view_sessions SET state_json = ?, view_hash = ?, revision = revision + 1,
+      pending_state_json = NULL, pending_revision = NULL, pending_token = NULL, updated_at = ?
+      WHERE id = ? AND revision = ? AND view_hash IS ? AND pending_token = ?`,
   )
-    .bind(JSON.stringify(state), updated.view.hash, Date.now(), row.id, row.revision, row.view_hash)
+    .bind(JSON.stringify(state), updated.view.hash, Date.now(), row.id, row.revision, row.view_hash, pendingToken)
     .run();
+  if (!finalized.meta.changes) throw new Error("Slack search update could not be finalized.");
 }
 
 export async function deliverSlackSearchUpdate(env: Env, sessionId: string, revision: number) {
   try {
     await deliverSearch(env, null, sessionId, revision);
   } catch (error) {
-    if (error instanceof SlackApiError && ["hash_conflict", "view_not_found"].includes(error.code)) return;
+    if (error instanceof SlackApiError && error.code === "not_found") {
+      await env.DB.prepare(`DELETE FROM slack_view_sessions WHERE id = ? AND kind = 'search'`).bind(sessionId).run();
+      return;
+    }
+    if (error instanceof SlackApiError && error.code === "hash_conflict") return;
     throw error;
   }
 }
@@ -565,7 +641,7 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
       origin: origin(env),
     });
   } catch (error) {
-    if (!(error instanceof HttpError) && !(error instanceof SlackApiError)) throw error;
+    if (!deniedError(error)) throw error;
     view = homeView({
       sessionId: id,
       mentions: [],
@@ -576,6 +652,14 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
     });
   }
   try {
+    const pendingToken = crypto.randomUUID();
+    const intent = await env.DB.prepare(
+      `UPDATE slack_view_sessions SET pending_state_json = ?, pending_revision = revision + 1,
+        pending_token = ? WHERE id = ? AND revision = ? AND view_hash IS ?`,
+    )
+      .bind(JSON.stringify(state), pendingToken, id, old?.revision ?? 0, old?.view_hash ?? null)
+      .run();
+    if (!intent.meta.changes) return;
     const published = await slackApi(env, installation, "views.publish", {
       user_id: userId,
       view,
@@ -583,7 +667,9 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
     });
     await env.DB.prepare(
       `UPDATE slack_view_sessions SET installation_generation = ?, state_json = ?, view_id = ?, view_hash = ?,
-        revision = revision + 1, updated_at = ? WHERE id = ?`,
+        pending_state_json = NULL, pending_revision = NULL, pending_token = NULL,
+        revision = revision + 1, updated_at = ?
+        WHERE id = ? AND revision = ? AND pending_token = ?`,
     )
       .bind(
         installation.generation,
@@ -592,6 +678,8 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
         published.view.hash ?? null,
         Date.now(),
         id,
+        old?.revision ?? 0,
+        pendingToken,
       )
       .run();
   } catch (error) {
@@ -715,14 +803,24 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
     nextCursor: result.nextCursor,
     origin: origin(env),
   });
+  const pendingToken = crypto.randomUUID();
+  const intent = await env.DB.prepare(
+    `UPDATE slack_view_sessions SET pending_state_json = ?, pending_revision = ?, pending_token = ?
+      WHERE id = ? AND revision = ? AND view_hash IS ?`,
+  )
+    .bind(JSON.stringify(next), session.revision + 1, pendingToken, session.id, session.revision, session.view_hash)
+    .run();
+  if (!intent.meta.changes) unavailable();
   const published = await slackApi(env, installation, "views.publish", {
     user_id: input.slackUserId,
     view,
     ...(session.view_hash ? { hash: session.view_hash } : {}),
   });
   await env.DB.batch([
-    env.DB.prepare(`UPDATE slack_view_sessions SET state_json = ?, view_id = ?, view_hash = ?, revision = revision + 1, updated_at = ?
-      WHERE id = ? AND revision = ? AND view_hash IS ?`).bind(
+    env.DB.prepare(`UPDATE slack_view_sessions SET state_json = ?, view_id = ?, view_hash = ?,
+      pending_state_json = NULL, pending_revision = NULL, pending_token = NULL,
+      revision = revision + 1, updated_at = ?
+      WHERE id = ? AND revision = ? AND view_hash IS ? AND pending_token = ?`).bind(
       JSON.stringify(next),
       published.view.id,
       published.view.hash ?? null,
@@ -730,11 +828,18 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
       session.id,
       session.revision,
       session.view_hash,
+      pendingToken,
     ),
     env.DB.prepare(
-      `UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'accepted', payload_json = NULL WHERE id = ? AND processed_at IS NULL`,
-    ).bind(Date.now(), receiptId),
+      `UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'accepted', payload_json = NULL
+        WHERE id = ? AND processed_at IS NULL AND EXISTS
+        (SELECT 1 FROM slack_view_sessions WHERE id = ? AND revision = ? AND view_hash IS ? AND pending_token IS NULL)`,
+    ).bind(Date.now(), receiptId, session.id, session.revision + 1, published.view.hash ?? null),
   ]);
+  const committed = await env.DB.prepare(`SELECT processed_at FROM slack_interaction_receipts WHERE id = ?`)
+    .bind(receiptId)
+    .first<{ processed_at: number | null }>();
+  if (!committed?.processed_at) throw new Error("Slack Home navigation could not be finalized.");
 }
 
 async function deliverRootAction(env: Env, receiptId: string, input: ActionInput) {
@@ -792,6 +897,14 @@ async function deliverRootAction(env: Env, receiptId: string, input: ActionInput
       env.DB.prepare(
         `UPDATE slack_channel_subscriptions SET muted_at = ?, snoozed_until = ?, updated_at = ? WHERE id = ?`,
       ).bind(mutedAt, snoozedUntil, Date.now(), link.subscription_id),
+      ...(input.actionId === "noteflare_mapping_unmute"
+        ? []
+        : [
+            env.DB.prepare(
+              `UPDATE slack_channel_events SET suppressed_at = ?
+          WHERE subscription_id = ? AND delivered_at IS NULL AND suppressed_at IS NULL`,
+            ).bind(Date.now(), link.subscription_id),
+          ]),
       env.DB.prepare(`INSERT OR IGNORE INTO slack_thread_deliveries
         (id, link_id, operation, source_id, actor_id, created_at, updated_at)
         VALUES (?, ?, 'refresh', ?, ?, ?, ?)`).bind(
@@ -921,7 +1034,8 @@ async function deliverShareAction(
     : unfurlGuard(env, receiptId, input, context.referenceId!);
   const afterCreate = (shareId: string): D1PreparedStatement[] => {
     const statements: D1PreparedStatement[] = [
-      env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'accepted', payload_json = NULL
+      env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'accepted', payload_json = NULL,
+        response_delivery_state = 'pending', response_delivery_error = NULL
         WHERE id = ? AND processed_at IS NULL`).bind(Date.now(), receiptId),
       queue(
         env,
@@ -995,7 +1109,7 @@ function deniedError(error: unknown) {
         "invalid_auth",
         "missing_scope",
         "hash_conflict",
-        "view_not_found",
+        "not_found",
       ].includes(error.code)) ||
     String(error).includes("CHECK constraint failed: authorized = 1") ||
     String(error).includes("UNIQUE constraint failed: slack_action_commits.receipt_id")
@@ -1015,7 +1129,17 @@ export async function deliverSlackWorkspaceAction(env: Env, receiptId: string) {
         .bind(input.sessionId)
         .first<{ revision: number }>();
       if (!session) unavailable();
-      await deliverSearch(env, input, input.sessionId, session.revision);
+      try {
+        await deliverSearch(env, input, input.sessionId, session.revision);
+      } catch (error) {
+        if (!(input.initialLoading && error instanceof SlackApiError && error.code === "hash_conflict")) throw error;
+        const current = await env.DB.prepare(`SELECT revision FROM slack_view_sessions WHERE id = ?`)
+          .bind(input.sessionId)
+          .first<{ revision: number }>();
+        if (!current || current.revision !== 1)
+          throw new Error("Initial Slack search update is still in progress.", { cause: error });
+        await deliverSearch(env, input, input.sessionId, current.revision);
+      }
       await env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'accepted', payload_json = NULL
         WHERE id = ? AND processed_at IS NULL`)
         .bind(Date.now(), receiptId)
@@ -1033,7 +1157,7 @@ export async function deliverSlackWorkspaceAction(env: Env, receiptId: string) {
       .first<{ processed_at: number | null }>();
     if (done?.processed_at !== null && done?.processed_at !== undefined) return;
     if (!deniedError(error)) throw error;
-    const text = error instanceof HttpError && error.code === "slack_identity_required" ? CONNECT : DENIED;
+    const connect = error instanceof HttpError && error.code === "slack_identity_required";
     const installed = await env.DB.prepare(`SELECT workspace_id FROM slack_installations WHERE id = ?`)
       .bind(input.installationId)
       .first<{ workspace_id: string }>();
@@ -1050,7 +1174,7 @@ export async function deliverSlackWorkspaceAction(env: Env, receiptId: string) {
               channelId: input.channelId,
               slackUserId: input.slackUserId,
               threadTs: input.messageTs,
-              text,
+              reason: connect ? "connect" : "unavailable",
             }),
           ]
         : []),
@@ -1060,6 +1184,7 @@ export async function deliverSlackWorkspaceAction(env: Env, receiptId: string) {
               installationId: input.installationId,
               generation: input.generation,
               userId: input.slackUserId,
+              reset: true,
             }),
           ]
         : []),
@@ -1079,10 +1204,11 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
     typeof payload.shareId !== "string"
   )
     return;
+  let claimed = false;
   try {
     const installation = await installationFor(env, payload.installationId, payload.generation);
     const { member } = await verifiedMember(env, installation, payload.userId);
-    if (member.role !== "owner") return;
+    if (member.role !== "owner") unavailable();
     await validateChannel(env, installation, payload.channelId);
     await requireChannelMember(env, installation, payload.channelId, payload.userId);
     const page = await pageForMember(env, member, payload.pageId);
@@ -1092,7 +1218,7 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
     )
       .bind(installation.id, payload.channelId, page.space_id, page.id)
       .first();
-    if (!mapping) return;
+    if (!mapping) unavailable();
     if (typeof payload.linkId === "string") {
       const link = await env.DB.prepare(
         `SELECT 1 FROM slack_thread_links WHERE id = ? AND installation_id = ? AND installation_generation = ?
@@ -1100,7 +1226,7 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
       )
         .bind(payload.linkId, installation.id, installation.generation, page.id, payload.channelId, payload.messageTs)
         .first();
-      if (!link) return;
+      if (!link) unavailable();
     } else if (typeof payload.referenceId === "string") {
       const reference = await env.DB.prepare(
         `SELECT 1 FROM slack_share_references WHERE id = ? AND installation_id = ? AND installation_generation = ?
@@ -1115,30 +1241,58 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
           payload.messageTs,
         )
         .first();
-      if (!reference) return;
-    } else return;
+      if (!reference) unavailable();
+    } else unavailable();
     const share = await getShare(env, member, payload.pageId, origin(env));
-    if (!share || share.id !== payload.shareId) return;
-    // Claim only after all permission reads. An ambiguous Slack send is not safe to repost.
+    if (!share || share.id !== payload.shareId) unavailable();
+    // Token refresh happens before the attempt claim, so its failures remain safe to retry.
+    await usableBotToken(env, installation);
+    // A second consumer cannot repost an uncertain ephemeral send.
     const receipt = await env.DB.prepare(
-      `UPDATE slack_interaction_receipts SET denial_sent_at = ? WHERE id = ? AND outcome = 'accepted' AND denial_sent_at IS NULL`,
+      `UPDATE slack_interaction_receipts SET response_delivery_state = 'sending',
+         response_delivery_attempted_at = ?, response_delivery_error = NULL WHERE id = ? AND outcome = 'accepted'
+         AND denial_sent_at IS NULL AND (response_delivery_state IS NULL OR response_delivery_state = 'pending')`,
     )
       .bind(Date.now(), payload.receiptId)
       .run();
     if (!receipt.meta.changes) return;
+    claimed = true;
     await slackApi(env, installation, "chat.postEphemeral", {
       channel: payload.channelId,
       user: payload.userId,
-      thread_ts: payload.messageTs,
       text: `Public share: ${share.url}`,
     });
+    await env.DB.prepare(
+      `UPDATE slack_interaction_receipts SET response_delivery_state = 'sent', denial_sent_at = ?
+        WHERE id = ? AND response_delivery_state = 'sending'`,
+    )
+      .bind(Date.now(), payload.receiptId)
+      .run();
   } catch (error) {
     if (error instanceof SlackRateLimitError) {
-      await env.DB.prepare(`UPDATE slack_interaction_receipts SET denial_sent_at = NULL WHERE id = ?`)
+      await env.DB.prepare(
+        `UPDATE slack_interaction_receipts SET response_delivery_state = 'pending' WHERE id = ? AND response_delivery_state = 'sending'`,
+      )
         .bind(payload.receiptId)
         .run();
       throw error;
     }
-    if (!deniedError(error)) throw error;
+    if (claimed || deniedError(error)) {
+      await env.DB.prepare(
+        `UPDATE slack_interaction_receipts SET response_delivery_state = 'blocked', response_delivery_error = ?
+          WHERE id = ? AND (response_delivery_state = 'sending' OR response_delivery_state = 'pending')`,
+      )
+        .bind(
+          error instanceof SlackApiError
+            ? error.code
+            : deniedError(error)
+              ? "permission_unavailable"
+              : "send_unconfirmed",
+          payload.receiptId,
+        )
+        .run();
+      return;
+    }
+    throw error;
   }
 }

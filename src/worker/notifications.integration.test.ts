@@ -2,6 +2,7 @@ import { enrollAccount } from "../../tests/helpers/security";
 import { abortAllDurableObjects, applyD1Migrations, env, reset, runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
+import { DIAGRAM_NODES_ROOT } from "../shared/diagram";
 import { PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import type { CommentThread, Notification, NotificationPreference, Page } from "../shared/types";
 import type { Env } from "./env";
@@ -243,6 +244,167 @@ describe("notification feed and subscriptions", () => {
     );
     const events = (await notificationFeed(viewer.cookie)).notifications.map((item) => item.eventType);
     expect(events).toEqual(["mention", "page_edit"]);
+  });
+
+  it("credits each new document mention to its update author across one compaction", async () => {
+    const installed = await bootstrap();
+    const first = await invite(installed.cookie, "first-mention");
+    const second = await invite(installed.cookie, "second-mention");
+    await env.DB.prepare(`UPDATE workspace_members SET role = 'editor' WHERE user_id = ?`).bind(second.userId).run();
+    const stub = env.DOCUMENT.getByName(`${installed.page.id}~${installed.page.contentEpoch}`);
+    await stub.fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    await runInDurableObject(stub, async (instance) => {
+      const document = (instance as unknown as { document: Y.Doc }).document;
+      const add = (targetId: string, actorId: string) =>
+        document.transact(
+          () => {
+            const paragraph = new Y.XmlElement("paragraph");
+            const mention = new Y.XmlElement("mention");
+            mention.setAttribute("entityType", "user");
+            mention.setAttribute("entityId", targetId);
+            mention.setAttribute("label", "Mentioned collaborator");
+            paragraph.insert(0, [mention]);
+            document.getXmlFragment("document-store").insert(0, [paragraph]);
+          },
+          { state: { userId: actorId } },
+        );
+      add(first.userId, installed.userId);
+      add(installed.userId, second.userId);
+    });
+    await stub.fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    const rows = await env.DB.prepare(
+      `SELECT target_user_id, first_seen_actor_id FROM member_mentions WHERE source_page_id = ? ORDER BY target_user_id`,
+    )
+      .bind(installed.page.id)
+      .all<{ target_user_id: string; first_seen_actor_id: string | null }>();
+    expect(rows.results).toEqual(
+      [
+        { target_user_id: first.userId, first_seen_actor_id: installed.userId },
+        { target_user_id: installed.userId, first_seen_actor_id: second.userId },
+      ].sort((a, b) => (a.target_user_id < b.target_user_id ? -1 : 1)),
+    );
+    const notifications = await env.DB.prepare(
+      `SELECT user_id, actor_id FROM notifications WHERE page_id = ? AND event_type = 'mention' ORDER BY user_id`,
+    )
+      .bind(installed.page.id)
+      .all<{ user_id: string; actor_id: string | null }>();
+    expect(notifications.results).toEqual(
+      [
+        { user_id: first.userId, actor_id: installed.userId },
+        { user_id: installed.userId, actor_id: second.userId },
+      ].sort((a, b) => (a.user_id < b.user_id ? -1 : 1)),
+    );
+  });
+
+  it("credits a removed and reinserted mention to its new author", async () => {
+    const installed = await bootstrap();
+    const target = await invite(installed.cookie, "reinsert-target");
+    const second = await invite(installed.cookie, "reinsert-editor");
+    const stub = env.DOCUMENT.getByName(`${installed.page.id}~${installed.page.contentEpoch}`);
+    await stub.fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    const add = async (actorId: string, replace = false) =>
+      runInDurableObject(stub, async (instance) => {
+        const document = (instance as unknown as { document: Y.Doc }).document;
+        document.transact(
+          () => {
+            const root = document.getXmlFragment("document-store");
+            if (replace) root.delete(0, root.length);
+            const paragraph = new Y.XmlElement("paragraph");
+            const mention = new Y.XmlElement("mention");
+            mention.setAttribute("entityType", "user");
+            mention.setAttribute("entityId", target.userId);
+            mention.setAttribute("label", "Mentioned collaborator");
+            paragraph.insert(0, [mention]);
+            root.insert(0, [paragraph]);
+          },
+          { state: { userId: actorId } },
+        );
+      });
+    await add(installed.userId);
+    await stub.fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    await add(second.userId, true);
+    await stub.fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    expect(
+      await env.DB.prepare(
+        `SELECT first_seen_actor_id FROM member_mentions WHERE source_page_id = ? AND target_user_id = ?`,
+      )
+        .bind(installed.page.id, target.userId)
+        .first(),
+    ).toEqual({ first_seen_actor_id: second.userId });
+    const notifications = await env.DB.prepare(
+      `SELECT actor_id FROM notifications WHERE page_id = ? AND user_id = ? AND event_type = 'mention' ORDER BY created_at`,
+    )
+      .bind(installed.page.id, target.userId)
+      .all<{ actor_id: string | null }>();
+    expect(notifications.results.map((row) => row.actor_id)).toEqual([installed.userId, second.userId]);
+  });
+
+  it("credits diagram mentions to separate editors before they are compacted", async () => {
+    const installed = await bootstrap();
+    const first = await invite(installed.cookie, "diagram-first");
+    const second = await invite(installed.cookie, "diagram-second");
+    await env.DB.prepare(`INSERT INTO pages
+      (id, workspace_id, space_id, kind, position, title, created_by, created_at, updated_at)
+      VALUES ('diagram-actors', ?, ?, 'diagram', 'z0', 'Diagram actors', ?, 1, 1)`)
+      .bind(installed.workspaceId, installed.page.spaceId, installed.userId)
+      .run();
+    const stub = env.DOCUMENT.getByName("diagram-actors~1");
+    await stub.fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    await runInDurableObject(stub, async (instance) => {
+      const document = (instance as unknown as { document: Y.Doc }).document;
+      const add = (nodeId: string, targetId: string, actorId: string) =>
+        document.transact(
+          () => {
+            const node = new Y.Map<unknown>();
+            const mentions = new Y.Map<string>();
+            mentions.set(targetId, "Mentioned collaborator");
+            node.set("mentions", mentions);
+            document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT).set(nodeId, node);
+          },
+          { state: { userId: actorId } },
+        );
+      add("node-one", first.userId, installed.userId);
+      add("node-two", installed.userId, second.userId);
+    });
+    await stub.fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    const rows = await env.DB.prepare(
+      `SELECT target_user_id, first_seen_actor_id FROM member_mentions
+        WHERE source_page_id = 'diagram-actors' ORDER BY target_user_id`,
+    ).all<{ target_user_id: string; first_seen_actor_id: string | null }>();
+    expect(rows.results).toEqual(
+      [
+        { target_user_id: first.userId, first_seen_actor_id: installed.userId },
+        { target_user_id: installed.userId, first_seen_actor_id: second.userId },
+      ].sort((a, b) => (a.target_user_id < b.target_user_id ? -1 : 1)),
+    );
   });
 
   it("validates preferences and reports unavailable external channels", async () => {

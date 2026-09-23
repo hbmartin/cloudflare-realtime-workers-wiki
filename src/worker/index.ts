@@ -188,6 +188,7 @@ import {
   listSlackChannelSubscriptions,
   pruneSlackSecurityRecords,
   sendDueSlackChannelDigests,
+  setSlackChannelPause,
   SlackRateLimitError,
   slackConfigurationStatus,
   slackIdentityAvailability,
@@ -2717,10 +2718,33 @@ app.post("/api/slack/link", async (c) => {
 });
 
 app.post("/api/slack/commands", async (c) => {
-  const rawBody = await c.req.raw.text();
-  const verified = await verifySlackRequest(c.env, c.req.raw, rawBody);
+  const deadlineAt = Date.now() + 2_500;
+  const beforeAck = async <T>(work: Promise<T>): Promise<T> => {
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 0) throw new HttpError(503, "slack_ack_timeout", "Slack acknowledgment timed out.");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new HttpError(503, "slack_ack_timeout", "Slack acknowledgment timed out.")),
+            remaining,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const rawBody = await beforeAck(c.req.raw.text());
+  const verified = await beforeAck(verifySlackRequest(c.env, c.req.raw, rawBody));
   if (verified.duplicate) return c.json({ response_type: "ephemeral", text: "Request already handled." });
-  const response = await handleSlackCommand(c.env, new URLSearchParams(rawBody), openSlackSearch);
+  const response = await beforeAck(
+    handleSlackCommand(c.env, new URLSearchParams(rawBody), openSlackSearch, deadlineAt, (work) => {
+      c.executionCtx.waitUntil(work.then(() => sweepOutbox(c.env)));
+    }),
+  );
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   return response.text ? c.json(response) : c.body(null, 200);
 });
@@ -2740,8 +2764,27 @@ app.post("/api/slack/events", async (c) => {
 });
 
 app.post("/api/slack/interactions", async (c) => {
-  const rawBody = await c.req.raw.text();
-  await verifySlackRequest(c.env, c.req.raw, rawBody);
+  const deadlineAt = Date.now() + 2_700;
+  const beforeAck = async <T>(work: () => Promise<T>): Promise<T> => {
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 0) throw new HttpError(503, "slack_ack_timeout", "Slack acknowledgment timed out.");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new HttpError(503, "slack_ack_timeout", "Slack acknowledgment timed out.")),
+            remaining,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const rawBody = await beforeAck(() => c.req.raw.text());
+  await beforeAck(() => verifySlackRequest(c.env, c.req.raw, rawBody));
   const form = new URLSearchParams(rawBody);
   let payload: SlackInteractionPayload;
   try {
@@ -2749,24 +2792,28 @@ app.post("/api/slack/interactions", async (c) => {
   } catch {
     throw new HttpError(422, "invalid_slack_interaction", "Slack interaction payload is invalid.");
   }
-  if (await acceptSlackThreadAction(c.env, payload)) {
+  if (await beforeAck(() => acceptSlackThreadAction(c.env, payload))) {
     c.executionCtx.waitUntil(sweepOutbox(c.env));
     return c.json({ ok: true });
   }
   let workspace: Awaited<ReturnType<typeof acceptSlackWorkspaceInteraction>>;
   try {
-    workspace = await acceptSlackWorkspaceInteraction(c.env, payload);
+    workspace = await beforeAck(() => acceptSlackWorkspaceInteraction(c.env, payload));
   } catch (error) {
+    if (error instanceof HttpError && error.code === "slack_ack_timeout") throw error;
+    if (payload.type === "block_suggestion") return c.json({ options: [] });
     if (error instanceof HttpError && error.status < 500) return c.json({ ok: true });
     throw error;
   }
   if (workspace.handled) {
     c.executionCtx.waitUntil(sweepOutbox(c.env));
+    if (payload.type === "view_submission") return c.body(null, 200);
     return c.json(workspace.response ?? { ok: true });
   }
   try {
-    await handleSlackInteraction(c.env, payload);
+    await beforeAck(() => handleSlackInteraction(c.env, payload, deadlineAt, (work) => c.executionCtx.waitUntil(work)));
   } catch (error) {
+    if (error instanceof HttpError && error.code === "slack_ack_timeout") throw error;
     logger.error(
       "slack.interaction.failed",
       "slack",
@@ -2774,6 +2821,7 @@ app.post("/api/slack/interactions", async (c) => {
       { callbackId: typeof payload.callback_id === "string" ? payload.callback_id : undefined },
       error,
     );
+    throw error;
   }
   return c.json({ ok: true });
 });
@@ -2838,6 +2886,22 @@ app.patch("/api/slack/channels/:id/mirror", async (c) => {
   if (typeof body.mirrorEnabled !== "boolean")
     throw new HttpError(422, "invalid_slack_mirror", "Choose whether to enable mirroring.");
   await setSlackMirror(c.env, member, c.req.param("id"), body.mirrorEnabled);
+  return c.json({
+    subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
+  });
+});
+
+app.patch("/api/slack/channels/:id/pause", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const body = await jsonBody(c.req.raw);
+  if (body.mode !== "mute" && body.mode !== "unmute" && body.mode !== "snooze")
+    throw new HttpError(422, "invalid_slack_pause", "Choose mute, unmute, or snooze.");
+  const hours: 1 | 8 | 24 | undefined =
+    body.hours === 1 ? 1 : body.hours === 8 ? 8 : body.hours === 24 ? 24 : undefined;
+  if (body.mode === "snooze" && hours === undefined)
+    throw new HttpError(422, "invalid_slack_pause", "Choose 1, 8, or 24 hours.");
+  await setSlackChannelPause(c.env, member, c.req.param("id"), body.mode, body.mode === "snooze" ? hours : undefined);
   return c.json({
     subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
   });

@@ -263,12 +263,17 @@ Ephemeral denials are best effort and never fall back to public channel messages
 `/notes <query>` opens a search modal with space, tag, page-kind, and archive filters. Search and pagination
 show ten currently accessible results at a time. The Slack App Home Mentions tab shows ten mentions per page,
 with unread state and a **Mark inbox read** action. Opening Home starts a fresh inbox snapshot; Next and Previous
-continue within that snapshot. Older mentions without recorded actor provenance display “A collaborator.”
+continue within that snapshot. Configure the manifest's interactivity **Options Load URL** alongside its Request URL
+to load Space and Tags options. Legacy `/notes link` users must verify their Slack identity from NoteFlare Settings
+before searching. New mentions use the actor of the update that introduced them; historical or automated mentions
+without proven provenance display “A collaborator.”
 
 Canonical thread roots offer Resolve/Reopen and page Watch/Unwatch. A page Unwatch also overrides a watched
 space. Workspace owners can Mute/Unmute or Snooze the mapping for 1, 8, or 24 hours. Unmute clears both mute
-and snooze; Snooze replaces an indefinite mute. Owners can create or view the current public share from a
-supported root or mapped page unfurl. The link is returned ephemerally to the acting user. These actions
+and snooze; Snooze replaces an indefinite mute. These controls also appear in Slack Settings without requiring an
+active root. Pending digests are discarded on mute or snooze, and unmute resumes with new events. Owners can create
+or view the current public share from a supported root or mapped page unfurl. The link is returned as a channel-level
+ephemeral to the acting user while they are active in Slack; an uncertain send is never blindly reposted. These actions
 recheck current identity, membership, mapping, and page permissions when delayed work runs; old buttons and
 saved modal state do not grant access.
 
