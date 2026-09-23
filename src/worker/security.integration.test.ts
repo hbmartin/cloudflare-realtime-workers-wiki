@@ -872,20 +872,26 @@ describe("security lifecycle regressions", () => {
 
   it("restores the strict three-per-ten-second two-factor limit for one source", async () => {
     await enrollAccount(await bootstrap());
-    const pending = responseCookies(
-      await requestFromIp("192.0.2.10", "/api/auth/sign-in/email", {
-        email: "owner@example.test",
-        password: "password123",
-      }),
-    );
-    for (let i = 0; i < 3; i++) {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const pending = responseCookies(
+        await requestFromIp("192.0.2.10", "/api/auth/sign-in/email", {
+          email: "owner@example.test",
+          password: "password123",
+        }),
+      );
+      for (let i = 0; i < 3; i++) {
+        expect(
+          (await requestFromIp("192.0.2.10", "/api/auth/two-factor/verify-totp", { code: "invalid" }, pending)).status,
+        ).not.toBe(429);
+      }
       expect(
         (await requestFromIp("192.0.2.10", "/api/auth/two-factor/verify-totp", { code: "invalid" }, pending)).status,
-      ).not.toBe(429);
+      ).toBe(429);
+    } finally {
+      clock.mockRestore();
     }
-    expect(
-      (await requestFromIp("192.0.2.10", "/api/auth/two-factor/verify-totp", { code: "invalid" }, pending)).status,
-    ).toBe(429);
   });
 
   it("limits normalized password attempts within one source without locking another source", async () => {
