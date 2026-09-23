@@ -34,6 +34,8 @@ export function SecurityScreen({
   const [setup, setSetup] = useState(false);
   const [uri, setUri] = useState("");
   const [codes, setCodes] = useState<string[]>([]);
+  const [resumeKey, setResumeKey] = useState("");
+  const [resumeKeySaved, setResumeKeySaved] = useState(false);
   const [receipt, setReceipt] = useState("");
   const [saved, setSaved] = useState(false);
   const [trust, setTrust] = useState(false);
@@ -147,6 +149,7 @@ export function SecurityScreen({
   const slackPrimary = status.slackPrimary?.available === true;
   const primaryFactorFormVisible =
     codes.length === 0 &&
+    resumeKey.length === 0 &&
     ((recoveryEnrollment && status.recoveryCanResume) ||
       ((enrollment || setup || recoveryEnrollment) && !uri) ||
       (!settings && !enrollment && recover));
@@ -181,7 +184,42 @@ export function SecurityScreen({
             </button>
           </div>
         )}
-        {codes.length > 0 ? (
+        {resumeKey ? (
+          <>
+            <h3>Save your recovery resume key</h3>
+            <p>
+              Store this key privately. It appears only now and is needed with your password or a fresh Slack sign-in if
+              this recovery session is lost. It expires 24 hours after recovery started.
+            </p>
+            <pre className="recovery-codes">{resumeKey}</pre>
+            <button
+              type="button"
+              onClick={() =>
+                void navigator.clipboard.writeText(resumeKey).then(() => setNotice("Recovery resume key copied."))
+              }
+            >
+              Copy resume key
+            </button>
+            <label>
+              <input
+                type="checkbox"
+                checked={resumeKeySaved}
+                onChange={(event) => setResumeKeySaved(event.target.checked)}
+              />{" "}
+              I saved my recovery resume key
+            </label>
+            <button
+              type="button"
+              disabled={!resumeKeySaved}
+              onClick={() => {
+                setResumeKey("");
+                setResumeKeySaved(false);
+              }}
+            >
+              Continue
+            </button>
+          </>
+        ) : codes.length > 0 ? (
           <>
             <h3>Save your recovery codes</h3>
             <p>
@@ -230,7 +268,10 @@ export function SecurityScreen({
                 className="auth-form"
                 onSubmit={(event) =>
                   submit(event, async (values) => {
-                    await securityAction("resume-recovery", slackPrimary ? {} : { password: values.get("password") });
+                    await securityAction("resume-recovery", {
+                      ...(slackPrimary ? {} : { password: values.get("password") }),
+                      ...(status.recoveryResumeRequiresKey ? { resumeKey: values.get("resumeKey") } : {}),
+                    });
                     setUri("");
                     await reload();
                     setNotice("Recovery resumed. Finish restoring an authenticator or passkey.");
@@ -244,6 +285,12 @@ export function SecurityScreen({
                   <label>
                     Password to resume recovery
                     <input name="password" type="password" autoComplete="current-password" required />
+                  </label>
+                )}
+                {status.recoveryResumeRequiresKey && (
+                  <label>
+                    Recovery resume key
+                    <input name="resumeKey" autoComplete="off" required />
                   </label>
                 )}
                 <button>Resume recovery</button>
@@ -414,11 +461,13 @@ export function SecurityScreen({
                     className="auth-form"
                     onSubmit={(event) =>
                       submit(event, async (values) => {
-                        await securityAction("recover", {
+                        const result = await securityAction<{ success: boolean; resumeKey: string }>("recover", {
                           ...(slackPrimary ? {} : { password: values.get("password") }),
                           code: values.get("code"),
                           reset,
                         });
+                        setResumeKey(result.resumeKey);
+                        setResumeKeySaved(false);
                         setRecover(false);
                         await reload();
                       })

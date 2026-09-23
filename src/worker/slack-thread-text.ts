@@ -40,7 +40,13 @@ export async function slackReplyBody(
       if (["*", "_", "~"].includes(token[0]!)) {
         const before = value[match.index! - 1] ?? "";
         const after = value[match.index! + token.length] ?? "";
-        if ((before && !/[\s([{]/.test(before)) || (after && !/[\s.,!?;:)\]}]/.test(after))) continue;
+        if ((before && !/[\s([{]/.test(before)) || (after && !/[\s.,!?;:)\]}]/.test(after))) {
+          literal(value.slice(offset, match.index! + 1));
+          result.push(...inline(token.slice(1, -1), depth + 1));
+          literal(token.at(-1)!);
+          offset = match.index! + token.length;
+          continue;
+        }
       }
       literal(value.slice(offset, match.index));
       const mention = /^<@([UW][A-Z0-9]+)>$/.exec(token);
@@ -82,9 +88,20 @@ export async function slackReplyBody(
       offset = match.index + token.length;
     }
     literal(value.slice(offset));
-    nodes += result.length;
+    const merged: CommentNode[] = [];
+    for (const node of result) {
+      const previous = merged.at(-1);
+      if (
+        previous?.type === "text" &&
+        node.type === "text" &&
+        JSON.stringify(previous.styles ?? {}) === JSON.stringify(node.styles ?? {})
+      )
+        previous.text = (previous.text ?? "") + (node.text ?? "");
+      else merged.push(node);
+    }
+    nodes += merged.length;
     if (nodes > 300) throw new HttpError(422, "slack_comment_too_complex", "Reply is too complex.");
-    return result;
+    return merged;
   }
   const blocks: CommentNode[] = [];
   const segments = text.split(/(```[\s\S]*?```)/g);
@@ -139,7 +156,8 @@ export async function slackCommentText(body: CommentBody, resolve: (id: string) 
       const label = (await render(n.content)).replaceAll("|", "¦");
       try {
         const url = new URL(href);
-        if (["http:", "https:"].includes(url.protocol)) return `<${url.toString().replaceAll("|", "%7C")}|${label}>`;
+        if (["http:", "https:"].includes(url.protocol))
+          return `<${escapeSlackText(url.toString().replaceAll("|", "%7C"))}|${label}>`;
       } catch {
         // A malformed stored link remains safe, readable text.
       }
@@ -153,5 +171,14 @@ export async function slackCommentText(body: CommentBody, resolve: (id: string) 
   // Escape before truncating; don't cut a live Slack mention or entity in half.
   const rendered = (await render(body)).trim();
   if (rendered.length <= 2800) return rendered;
-  return rendered.slice(0, 2700).replace(/<[^>]*$|&[^;]*$/g, "") + "…";
+  let end = 2700;
+  // A cut inside a Slack token or HTML entity changes how the remaining text is read.
+  for (const token of rendered.matchAll(/<[^>]*>|&(?:amp|lt|gt);/g)) {
+    const start = token.index!;
+    if (start < end && start + token[0].length > end) {
+      end = start;
+      break;
+    }
+  }
+  return rendered.slice(0, end) + "…";
 }

@@ -244,9 +244,15 @@ independently of one-way notification filters/cadence; enabling it does not back
 mapping retires its roots. Re-enabling permits a new root on the next eligible event. Muted/snoozed mappings suppress
 new roots and channel notifications, but replies on existing roots continue.
 
+One-way notifications have separate channel health from mirror validation. Shared channels may receive one-way
+notifications even though they cannot host mirrors. A definitive channel failure blocks that mapping's notifications
+and discards waiting events; an owner can verify bot access in Settings to resume with new events. An installation token
+failure is shown separately and requires reauthorization; it does not disable mirrors or mislabel a channel as lost.
+
 Slack replies require a current OpenID-verified member, channel membership, and current page access. Resolve/Reopen
 uses NoteFlare's existing resolution permission. Bot messages, edits, deletes, and unsupported message subtypes are
-ignored. Conversion accepts at most 16 KiB of Slack text, 50 distinct mention tokens, 201 text blocks, and 300 inline
+ignored. A `thread_broadcast` pointer is resolved against the actual threaded reply before import and deduplicated
+against an ordinary message event by its reply timestamp. Conversion accepts at most 16 KiB of Slack text, 50 distinct mention tokens, 201 text blocks, and 300 inline
 nodes before the existing 32 KiB comment validation. Unknown mentions remain plain text. Delivery rechecks current
 authority; disconnect invalidates queued work and requires identity verification and mirror opt-in after reconnect.
 
@@ -257,6 +263,9 @@ content. Do not reset a `sending` or `blocked` record to `pending`: that can dup
 An operator can inspect the marker in Slack and the durable delivery record; this milestone deliberately provides no
 automatic resend for an uncertain result. Disabling the mirror stops subsequent work without deleting Slack history.
 Ephemeral denials are best effort and never fall back to public channel messages.
+Definitively rejected replies are recorded as failed and skipped so later replies continue; a rejected root retires
+its link. Pending receipts and deliveries are redriven after 30 minutes with bounded backoff, at most eight redrives
+or 24 hours. Unresolved sends remain blocked for marker reconciliation. Unapplied buttons expire after ten minutes.
 
 ## Interactive Slack workspace
 

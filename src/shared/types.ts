@@ -228,6 +228,8 @@ export type SlackStatus = {
     connected: boolean;
     createdAt: number;
     updatedAt: number;
+    authError?: string | null;
+    authErrorAt?: number | null;
     scopeHealth?: {
       required: string[];
       granted: string[];

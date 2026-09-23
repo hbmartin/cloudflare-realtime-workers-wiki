@@ -187,6 +187,7 @@ import {
   handleSlackInteraction,
   listSlackChannelSubscriptions,
   pruneSlackSecurityRecords,
+  repairSlackChannelNotifications,
   sendDueSlackChannelDigests,
   setSlackChannelPause,
   SlackRateLimitError,
@@ -2903,6 +2904,15 @@ app.patch("/api/slack/channels/:id/pause", async (c) => {
   if (body.mode === "snooze" && hours === undefined)
     throw new HttpError(422, "invalid_slack_pause", "Choose 1, 8, or 24 hours.");
   await setSlackChannelPause(c.env, member, c.req.param("id"), body.mode, body.mode === "snooze" ? hours : undefined);
+  return c.json({
+    subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
+  });
+});
+
+app.post("/api/slack/channels/:id/repair-notifications", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await repairSlackChannelNotifications(c.env, member, c.req.param("id"));
   return c.json({
     subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
   });

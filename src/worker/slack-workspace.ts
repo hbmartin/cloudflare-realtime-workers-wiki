@@ -15,6 +15,8 @@ import {
 } from "./slack-threads";
 import {
   slackApi,
+  recordSlackInstallationError,
+  slackInstallationError,
   SlackApiError,
   SlackRateLimitError,
   usableBotToken,
@@ -702,7 +704,8 @@ function rootGuard(env: Env, receiptId: string, input: ActionInput, linkId: stri
       JOIN account account ON account.id = link.better_auth_account_id AND account.userId = link.user_id
       JOIN workspace_members wm ON wm.workspace_id = i.workspace_id AND wm.user_id = link.user_id
       LEFT JOIN space_members sm ON sm.space_id = space.id AND sm.user_id = wm.user_id
-      WHERE receipt.id = ? AND receipt.processed_at IS NULL AND i.id = ? AND i.generation = ?
+      WHERE receipt.id = ? AND receipt.processed_at IS NULL
+        AND receipt.received_at > unixepoch('subsec') * 1000 - 600000 AND i.id = ? AND i.generation = ?
         AND l.id = ? AND l.state = 'active' AND l.channel_id = ? AND l.root_message_ts = ?
         AND (mapping.page_id IS NULL OR mapping.page_id = p.id)
         AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
@@ -738,7 +741,8 @@ function homeGuard(env: Env, receiptId: string, input: ActionInput, sessionId: s
       JOIN slack_user_links link ON link.installation_id = i.id AND link.installation_generation = i.generation
       JOIN account account ON account.id = link.better_auth_account_id AND account.userId = link.user_id
       JOIN workspace_members wm ON wm.workspace_id = i.workspace_id AND wm.user_id = link.user_id
-      WHERE receipt.id = ? AND receipt.processed_at IS NULL AND i.id = ? AND i.generation = ?
+      WHERE receipt.id = ? AND receipt.processed_at IS NULL
+        AND receipt.received_at > unixepoch('subsec') * 1000 - 600000 AND i.id = ? AND i.generation = ?
         AND session.id = ? AND session.kind = 'home' AND session.slack_user_id = ?
         AND link.slack_user_id = ? AND link.migration_state = 'verified'
         AND link.verification_method = 'slack_openid' AND link.verified_at = ?
@@ -1001,7 +1005,8 @@ function unfurlGuard(env: Env, receiptId: string, input: ActionInput, referenceI
       JOIN slack_user_links link ON link.installation_id = i.id AND link.installation_generation = i.generation
       JOIN account account ON account.id = link.better_auth_account_id AND account.userId = link.user_id
       JOIN workspace_members wm ON wm.workspace_id = i.workspace_id AND wm.user_id = link.user_id AND wm.role = 'owner'
-      WHERE receipt.id = ? AND receipt.processed_at IS NULL AND i.id = ? AND i.generation = ?
+      WHERE receipt.id = ? AND receipt.processed_at IS NULL
+        AND receipt.received_at > unixepoch('subsec') * 1000 - 600000 AND i.id = ? AND i.generation = ?
         AND ref.id = ? AND ref.channel_id = ? AND ref.message_ts = ? AND ref.state <> 'retired'
         AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
         AND link.slack_user_id = ? AND link.migration_state = 'verified'
@@ -1164,6 +1169,7 @@ function deniedError(error: unknown) {
         "token_revoked",
         "invalid_auth",
         "missing_scope",
+        "no_permission",
         "hash_conflict",
         "not_found",
       ].includes(error.code)) ||
@@ -1173,12 +1179,16 @@ function deniedError(error: unknown) {
 }
 
 export async function deliverSlackWorkspaceAction(env: Env, receiptId: string) {
-  const receipt = await env.DB.prepare(`SELECT payload_json, processed_at FROM slack_interaction_receipts WHERE id = ?`)
+  const receipt = await env.DB.prepare(
+    `SELECT payload_json, processed_at, received_at FROM slack_interaction_receipts WHERE id = ?`,
+  )
     .bind(receiptId)
-    .first<{ payload_json: string | null; processed_at: number | null }>();
+    .first<{ payload_json: string | null; processed_at: number | null; received_at: number }>();
   if (!receipt || receipt.processed_at !== null || !receipt.payload_json) return;
   const input = JSON.parse(receipt.payload_json) as ActionInput;
   try {
+    if (receipt.received_at <= Date.now() - 10 * 60_000)
+      throw new HttpError(403, "slack_action_expired", "This Slack action expired.");
     if (SEARCH_ACTIONS.has(input.actionId)) {
       if (!input.sessionId) unavailable();
       const session = await env.DB.prepare(`SELECT revision FROM slack_view_sessions WHERE id = ?`)
@@ -1212,14 +1222,20 @@ export async function deliverSlackWorkspaceAction(env: Env, receiptId: string) {
       .bind(receiptId)
       .first<{ processed_at: number | null }>();
     if (done?.processed_at !== null && done?.processed_at !== undefined) return;
+    if (error instanceof SlackApiError && slackInstallationError(error))
+      await recordSlackInstallationError(env, input.installationId, error);
     if (!deniedError(error)) throw error;
     const connect = error instanceof HttpError && error.code === "slack_identity_required";
     const installed = await env.DB.prepare(`SELECT workspace_id FROM slack_installations WHERE id = ?`)
       .bind(input.installationId)
       .first<{ workspace_id: string }>();
     await env.DB.batch([
-      env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'denied', payload_json = NULL
-        WHERE id = ? AND processed_at IS NULL`).bind(Date.now(), receiptId),
+      env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at = ?, outcome = ?, payload_json = NULL
+        WHERE id = ? AND processed_at IS NULL`).bind(
+        Date.now(),
+        error instanceof HttpError && error.code === "slack_action_expired" ? "expired" : "denied",
+        receiptId,
+      ),
       ...(installed && input.channelId && input.messageTs
         ? [
             queue(env, `outbox:slack-denial:${receiptId}`, installed.workspace_id, "slack_interaction_response", {
@@ -1325,6 +1341,10 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
       .bind(Date.now(), payload.receiptId)
       .run();
   } catch (error) {
+    if (!claimed && error instanceof SlackApiError && slackInstallationError(error)) {
+      await recordSlackInstallationError(env, payload.installationId, error);
+      throw error;
+    }
     if (error instanceof SlackRateLimitError) {
       await env.DB.prepare(
         `UPDATE slack_interaction_receipts SET response_delivery_state = 'pending' WHERE id = ? AND response_delivery_state = 'sending'`,
