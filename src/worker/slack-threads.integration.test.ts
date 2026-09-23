@@ -108,6 +108,8 @@ let postFailure: "none" | "rate" | "lost" | "unrecorded" | "malformed" = "none";
 let ephemeralFailure: "none" | "rate" | "lost" = "none";
 let userFailure: "none" | "transient" = "none";
 let viewFailure: "none" | "not_found" = "none";
+let homePublishFailure: "none" | "lost" = "none";
+let homeHash: string | null = null;
 let beforeResponse: ((method: string) => Promise<void>) | undefined;
 
 async function mockSlack(input: RequestInfo | URL, init?: RequestInit) {
@@ -169,8 +171,15 @@ async function mockSlack(input: RequestInfo | URL, init?: RequestInit) {
   if (method === "views.update" && viewFailure === "not_found") return Response.json({ ok: false, error: "not_found" });
   if (method === "views.update")
     return Response.json({ ok: true, view: { id: payload.view_id, hash: `hash-${calls.length}` } });
-  if (method === "views.publish")
-    return Response.json({ ok: true, view: { id: "VHOME", hash: `hash-${calls.length}` } });
+  if (method === "views.publish") {
+    if (payload.hash && payload.hash !== homeHash) return Response.json({ ok: false, error: "hash_conflict" });
+    homeHash = `hash-${calls.length}`;
+    if (homePublishFailure === "lost") {
+      homePublishFailure = "none";
+      throw new Error("Home publish response lost");
+    }
+    return Response.json({ ok: true, view: { id: "VHOME", hash: homeHash } });
+  }
   if (method === "chat.unfurl") return Response.json({ ok: true });
   if (method === "auth.revoke") return Response.json({ ok: true, revoked: true });
   throw new Error(`Unexpected Slack method: ${method}`);
@@ -270,6 +279,8 @@ beforeEach(async () => {
   ephemeralFailure = "none";
   userFailure = "none";
   viewFailure = "none";
+  homePublishFailure = "none";
+  homeHash = null;
   beforeResponse = undefined;
   await env.DB.batch([
     env.DB.prepare(
@@ -933,6 +944,50 @@ describe("interactive Slack workspace", () => {
         .bind(session!.id)
         .first(),
     ).toEqual({ page: 1 });
+  });
+
+  it("reconciles a Home publish whose Slack response was lost", async () => {
+    const timestamp = Date.now() - 1_000;
+    await env.DB.batch(
+      Array.from({ length: 11 }, (_, index) => {
+        const id = `lost-home-mention-${index}`;
+        return [
+          env.DB.prepare(`INSERT INTO pages (id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+            VALUES (?, 'workspace', 'workspace-general', 'document', ?, ?, 'owner', 1, 1)`).bind(id, id, id),
+          env.DB.prepare(`INSERT INTO member_mentions
+            (workspace_id,source_page_id,target_user_id,excerpt,first_seen_at,projection_seq)
+            VALUES ('workspace', ?, 'viewer', 'Excerpt', ?, 1)`).bind(id, timestamp - index),
+        ];
+      }).flat(),
+    );
+    await publishSlackHome(runtime(), "installation", "UVIEWER");
+    const session = await env.DB.prepare(`SELECT id, view_hash FROM slack_view_sessions WHERE kind = 'home'`).first<{
+      id: string;
+      view_hash: string;
+    }>();
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UVIEWER" },
+      view: { id: "VHOME", hash: session!.view_hash, private_metadata: session!.id },
+      actions: [{ action_id: "noteflare_home_next", action_ts: "1700000909.000001", value: session!.id }],
+    });
+    const receipt = await env.DB.prepare(
+      `SELECT id FROM slack_interaction_receipts WHERE callback_id = 'noteflare_home_next'`,
+    ).first<{ id: string }>();
+    homePublishFailure = "lost";
+    await expect(deliverSlackWorkspaceAction(runtime(), receipt!.id)).rejects.toThrow("Home publish response lost");
+    await deliverSlackWorkspaceAction(runtime(), receipt!.id);
+    const current = await env.DB.prepare(
+      `SELECT json_extract(state_json, '$.page') page, view_hash, pending_token FROM slack_view_sessions WHERE id = ?`,
+    )
+      .bind(session!.id)
+      .first<{ page: number; view_hash: string; pending_token: string | null }>();
+    expect(current).toMatchObject({ page: 1, view_hash: homeHash, pending_token: null });
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(receipt!.id).first(),
+    ).toEqual({ outcome: "accepted" });
+    expect(calls.filter((call) => call.method === "views.publish").at(-1)?.payload.hash).toBeUndefined();
   });
 
   it("refreshes Home through queued open events, including older numeric reset payloads", async () => {

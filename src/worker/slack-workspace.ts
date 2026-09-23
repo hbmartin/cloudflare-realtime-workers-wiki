@@ -821,12 +821,21 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
     nextCursor: result.nextCursor,
     origin: origin(env),
   });
-  const pendingToken = crypto.randomUUID();
+  const pendingToken = receiptId;
   const intent = await env.DB.prepare(
     `UPDATE slack_view_sessions SET pending_state_json = ?, pending_revision = ?, pending_token = ?
-      WHERE id = ? AND revision = ? AND view_hash IS ?`,
+      WHERE id = ? AND revision = ? AND view_hash IS ?
+        AND (pending_token IS NULL OR pending_token = ?)`,
   )
-    .bind(JSON.stringify(next), session.revision + 1, pendingToken, session.id, session.revision, session.view_hash)
+    .bind(
+      JSON.stringify(next),
+      session.revision + 1,
+      pendingToken,
+      session.id,
+      session.revision,
+      session.view_hash,
+      pendingToken,
+    )
     .run();
   if (!intent.meta.changes) {
     await supersedeHomeAction(env, receiptId);
@@ -841,9 +850,19 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
     });
   } catch (error) {
     if (!(error instanceof SlackApiError && error.code === "hash_conflict")) throw error;
-    await supersedeHomeAction(env, receiptId);
-    return;
+    const current = await env.DB.prepare(`SELECT pending_token FROM slack_view_sessions WHERE id = ?`)
+      .bind(session.id)
+      .first<{ pending_token: string | null }>();
+    if (current?.pending_token !== pendingToken) {
+      await supersedeHomeAction(env, receiptId);
+      return;
+    }
+    published = await slackApi(env, installation, "views.publish", {
+      user_id: input.slackUserId,
+      view,
+    });
   }
+  if (!published.view.hash) throw new Error("Slack did not return the published Home hash.");
   await env.DB.batch([
     env.DB.prepare(`UPDATE slack_view_sessions SET state_json = ?, view_id = ?, view_hash = ?,
       pending_state_json = NULL, pending_revision = NULL, pending_token = NULL,
