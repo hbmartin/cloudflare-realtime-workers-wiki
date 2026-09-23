@@ -656,9 +656,9 @@ async function clearWorkerDatabase() {
     env.DB.prepare(`DELETE FROM user`),
     env.DB.prepare(`DELETE FROM observability_task_runs`),
     env.DB.prepare(
-      `INSERT INTO observability_task_runs (task_name, last_started_at, last_succeeded_at)
-        VALUES ${SCHEDULED_TASK_NAMES.map(() => "(?, ?, ?)").join(", ")}`,
-    ).bind(...SCHEDULED_TASK_NAMES.flatMap((name) => [name, baselineAt, baselineAt])),
+      `INSERT INTO observability_task_runs (task_name, last_started_at, last_succeeded_at, first_observed_at)
+        VALUES ${SCHEDULED_TASK_NAMES.map(() => "(?, ?, ?, ?)").join(", ")}`,
+    ).bind(...SCHEDULED_TASK_NAMES.flatMap((name) => [name, baselineAt, baselineAt, baselineAt])),
   ]);
 }
 
@@ -714,6 +714,15 @@ describe("Worker integration", () => {
   });
 
   it("does not write cron rows during routine readiness probes", async () => {
+    const baselineAt = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO observability_task_runs (task_name, last_started_at, last_succeeded_at, first_observed_at)
+        VALUES ${SCHEDULED_TASK_NAMES.map(() => "(?, ?, ?, ?)").join(", ")}
+        ON CONFLICT(task_name) DO UPDATE SET first_observed_at = excluded.first_observed_at,
+          last_succeeded_at = excluded.last_succeeded_at`,
+    )
+      .bind(...SCHEDULED_TASK_NAMES.flatMap((name) => [name, baselineAt, baselineAt, baselineAt]))
+      .run();
     let cronWrites = 0;
     const database = new Proxy(env.DB, {
       get(target, property, receiver) {

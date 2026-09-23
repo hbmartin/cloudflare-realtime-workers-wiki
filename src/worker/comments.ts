@@ -201,7 +201,7 @@ async function commentsForThreads(env: Env, threadIds: string[]) {
     `SELECT c.*, u.name user_name, u.email user_email
        FROM comments c JOIN user u ON u.id = c.user_id
       WHERE c.thread_id IN (SELECT value FROM json_each(?))
-      ORDER BY c.created_at, c.id`,
+      ORDER BY c.parent_id IS NOT NULL, COALESCE(c.slack_order_us, c.created_at * 1000), c.id`,
   )
     .bind(JSON.stringify(threadIds))
     .all<CommentRow>();
@@ -360,7 +360,7 @@ export async function addCommentReply(
   threadId: string,
   bodyValue: unknown,
   requestedParentId?: unknown,
-  source?: { receiptId: string; commentId: string; guard: D1PreparedStatement },
+  source?: { receiptId: string; commentId: string; guard: D1PreparedStatement; slackOrderUs?: number },
 ) {
   const thread = await threadRow(env, page, threadId);
   const body = validatedCommentBody(bodyValue);
@@ -374,7 +374,9 @@ export async function addCommentReply(
   } else {
     parentId =
       (
-        await env.DB.prepare(`SELECT id FROM comments WHERE thread_id = ? ORDER BY created_at, id LIMIT 1`)
+        await env.DB.prepare(
+          `SELECT id FROM comments WHERE thread_id = ? AND parent_id IS NULL ORDER BY created_at, id LIMIT 1`,
+        )
           .bind(threadId)
           .first<{ id: string }>()
       )?.id ?? null;
@@ -387,8 +389,8 @@ export async function addCommentReply(
     ...(source ? [source.guard] : []),
     env.DB.prepare(
       `INSERT INTO comments
-        (id, thread_id, parent_id, user_id, body_json, plain_text, created_at, updated_at, slack_source_receipt_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, thread_id, parent_id, user_id, body_json, plain_text, created_at, updated_at, slack_source_receipt_id, slack_order_us)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       commentId,
       threadId,
@@ -396,9 +398,10 @@ export async function addCommentReply(
       member.user.id,
       body.json,
       body.plainText,
-      timestamp,
+      source?.slackOrderUs === undefined ? timestamp : Math.floor(source.slackOrderUs / 1000),
       timestamp,
       source?.receiptId ?? null,
+      source?.slackOrderUs ?? null,
     ),
     env.DB.prepare(`UPDATE comment_threads SET updated_at = ? WHERE id = ?`).bind(timestamp, thread.id),
     watchPageStatement(env.DB, page, member.user.id, timestamp),

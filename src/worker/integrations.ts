@@ -351,6 +351,36 @@ export async function pageForIntegration(
     .first<IntegrationPage>();
 }
 
+export async function pageForIntegrationBot(env: Env, workspaceId: string, botUserId: string, pageId: string) {
+  const row = await env.DB.prepare(
+    `SELECT integration.*, workspace.name workspace_name, bot.name bot_name
+       FROM integrations integration JOIN workspaces workspace ON workspace.id = integration.workspace_id
+       JOIN user bot ON bot.id = integration.bot_user_id
+      WHERE integration.workspace_id = ? AND integration.bot_user_id = ?
+        AND integration.revoked_at IS NULL AND integration.read_comments = 1 AND integration.insert_comments = 1`,
+  )
+    .bind(workspaceId, botUserId)
+    .first<IntegrationRow & { workspace_name: string; bot_name: string }>();
+  if (!row) return null;
+  return pageForIntegration(
+    env,
+    {
+      integrationId: row.id,
+      workspaceId,
+      workspaceName: row.workspace_name,
+      botUserId,
+      botName: row.bot_name,
+      readContent: Boolean(row.read_content),
+      insertContent: Boolean(row.insert_content),
+      updateContent: Boolean(row.update_content),
+      readComments: true,
+      insertComments: Boolean(row.insert_comments),
+      userInformation: row.user_information,
+    },
+    pageId,
+  );
+}
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export async function publicPageIds(env: Env, pageIds: string[]) {

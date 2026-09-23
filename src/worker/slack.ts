@@ -215,6 +215,13 @@ export type SlackHistoryMessage = {
 };
 
 export type SlackApiMethod = keyof SlackApiContracts;
+const SLACK_READ_METHODS = new Set<SlackApiMethod>([
+  "conversations.info",
+  "conversations.members",
+  "conversations.history",
+  "conversations.replies",
+  "users.info",
+]);
 
 function normalizeScopes(scopes: string | readonly string[]) {
   return [
@@ -800,13 +807,18 @@ export async function slackApi<Method extends SlackApiMethod>(
   timeoutMs = SLACK_FETCH_TIMEOUT_MS,
 ): Promise<SlackApiContracts[Method]["output"]> {
   const response = await traced(tracing, "notes.integration.slack", { "notes.operation": method }, async () => {
-    return fetch(`https://slack.com/api/${method}`, {
-      method: "POST",
+    const read = SLACK_READ_METHODS.has(method);
+    const url = new URL(`https://slack.com/api/${method}`);
+    if (read)
+      for (const [key, value] of Object.entries(payload))
+        if (value !== undefined) url.searchParams.set(key, String(value));
+    return fetch(url.toString(), {
+      method: read ? "GET" : "POST",
       headers: {
         authorization: `Bearer ${method === "auth.revoke" ? await decryptSlackToken(env, installation.bot_token_ciphertext) : await usableBotToken(env, installation)}`,
-        "content-type": "application/json; charset=utf-8",
+        ...(read ? {} : { "content-type": "application/json; charset=utf-8" }),
       },
-      body: JSON.stringify(payload),
+      ...(read ? {} : { body: JSON.stringify(payload) }),
       signal: AbortSignal.timeout(timeoutMs),
     }).catch((error: unknown) => {
       if (isTimeoutAbort(error)) throw new Error(`Slack ${method} timed out.`);
@@ -927,7 +939,13 @@ export async function recordVerifiedSlackIdentity(
        ON CONFLICT(installation_id, user_id) DO UPDATE SET
          slack_user_id = excluded.slack_user_id,
          better_auth_account_id = excluded.better_auth_account_id,
-         verification_method = 'slack_openid', verified_at = excluded.verified_at,
+         verification_method = 'slack_openid',
+         verified_at = CASE WHEN slack_user_links.slack_user_id = excluded.slack_user_id
+           AND slack_user_links.better_auth_account_id = excluded.better_auth_account_id
+           AND slack_user_links.installation_generation = excluded.installation_generation
+           AND slack_user_links.verification_method = 'slack_openid'
+           AND slack_user_links.migration_state = 'verified'
+           THEN slack_user_links.verified_at ELSE excluded.verified_at END,
          migration_state = 'verified', linked_at = excluded.linked_at, installation_generation = excluded.installation_generation`,
     ).bind(
       identity.installationId,
@@ -945,7 +963,9 @@ export async function recordVerifiedSlackIdentity(
        SELECT ?, ?, ?, ?, ?, ?, ?
         WHERE EXISTS(SELECT 1 FROM session WHERE id = ? AND userId = ? AND expiresAt > ?)
           AND EXISTS (SELECT 1 FROM slack_user_links l JOIN slack_installations i ON i.id = l.installation_id
-            WHERE l.installation_id = ? AND l.user_id = ? AND l.verified_at = ? AND l.installation_generation = i.generation AND i.disconnected_at IS NULL)
+            WHERE l.installation_id = ? AND l.user_id = ? AND l.slack_user_id = ? AND l.better_auth_account_id = ?
+              AND l.verification_method = 'slack_openid' AND l.migration_state = 'verified'
+              AND l.installation_generation = i.generation AND i.disconnected_at IS NULL)
        ON CONFLICT(session_id) DO UPDATE SET account_id = excluded.account_id,
          team_id = excluded.team_id, slack_user_id = excluded.slack_user_id,
          verified_at = excluded.verified_at, expires_at = excluded.expires_at`,
@@ -962,7 +982,8 @@ export async function recordVerifiedSlackIdentity(
       new Date(timestamp).toISOString(),
       identity.installationId,
       userId,
-      timestamp,
+      identity.slackUserId,
+      accountId,
     ),
   ]);
   return { expiresAt: proofExpiresAt };
@@ -1128,6 +1149,7 @@ export function slackChannelFanoutStatements(
            JOIN slack_installations installation ON installation.id = subscription.installation_id
           WHERE installation.workspace_id = ? AND installation.disconnected_at IS NULL
             AND subscription.space_id = ? AND (subscription.page_id IS NULL OR subscription.page_id = ?)
+            AND subscription.validation_state <> 'invalid'
             AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
             AND NOT EXISTS (SELECT 1 FROM slack_thread_links mirror WHERE mirror.installation_id = installation.id
               AND mirror.thread_id = ? AND mirror.channel_id = subscription.channel_id AND mirror.state IN ('pending', 'active'))
@@ -1230,9 +1252,7 @@ async function channelEvent(env: Env, eventId: string) {
        LEFT JOIN user actor ON actor.id = event.actor_id
       WHERE event.id = ? AND event.delivered_at IS NULL AND installation.disconnected_at IS NULL
         AND page.space_id = subscription.space_id AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
-        AND EXISTS (SELECT 1 FROM workspace_members wm JOIN spaces sp ON sp.workspace_id = wm.workspace_id AND sp.id = page.space_id
-          LEFT JOIN space_members sm ON sm.space_id = sp.id AND sm.user_id = wm.user_id
-          WHERE wm.workspace_id = page.workspace_id AND wm.user_id = event.actor_id AND (wm.role = 'owner' OR sp.visibility = 'workspace' OR sm.user_id IS NOT NULL))
+        AND subscription.validation_state <> 'invalid' AND ${channelActorAccessSql}
         AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= unixepoch('subsec') * 1000)`,
   )
     .bind(eventId)
@@ -1260,6 +1280,24 @@ function eventCopy(eventType: NotificationEventType, actorName: string | null, p
 function escapeSlackMrkdwn(value: string) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll("|", "¦");
 }
+
+const channelActorAccessSql = `(
+  EXISTS (SELECT 1 FROM workspace_members wm JOIN spaces sp ON sp.workspace_id = wm.workspace_id AND sp.id = page.space_id
+    LEFT JOIN space_members sm ON sm.space_id = sp.id AND sm.user_id = wm.user_id
+    WHERE wm.workspace_id = page.workspace_id AND wm.user_id = event.actor_id
+      AND (wm.role = 'owner' OR sp.visibility = 'workspace' OR sm.user_id IS NOT NULL))
+  OR EXISTS (
+    WITH RECURSIVE ancestors(id, parent_id) AS (
+      SELECT id, parent_id FROM pages WHERE id = page.id AND workspace_id = page.workspace_id
+      UNION ALL SELECT parent.id, parent.parent_id FROM pages parent
+        JOIN ancestors child ON parent.id = child.parent_id WHERE parent.workspace_id = page.workspace_id
+    )
+    SELECT 1 FROM integrations bot JOIN integration_grants grant_row ON grant_row.integration_id = bot.id
+      JOIN ancestors ON ancestors.id = grant_row.root_page_id
+      JOIN pages grant_page ON grant_page.id = grant_row.root_page_id AND grant_page.archived_at IS NULL
+    WHERE bot.workspace_id = page.workspace_id AND bot.bot_user_id = event.actor_id
+      AND bot.revoked_at IS NULL AND bot.read_comments = 1 AND bot.insert_comments = 1)
+)`;
 
 export async function deliverSlackChannelEvent(env: Env, eventId: string) {
   const row = await channelEvent(env, eventId);
@@ -1712,9 +1750,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
         WHERE event.subscription_id = ? AND event.cadence = 'digest'
           AND event.delivered_at IS NULL AND event.created_at < ? AND installation.disconnected_at IS NULL
           AND page.space_id = subscription.space_id AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
-          AND EXISTS (SELECT 1 FROM workspace_members wm JOIN spaces sp ON sp.workspace_id = wm.workspace_id AND sp.id = page.space_id
-            LEFT JOIN space_members sm ON sm.space_id = sp.id AND sm.user_id = wm.user_id
-            WHERE wm.workspace_id = page.workspace_id AND wm.user_id = event.actor_id AND (wm.role = 'owner' OR sp.visibility = 'workspace' OR sm.user_id IS NOT NULL))
+          AND subscription.validation_state <> 'invalid' AND ${channelActorAccessSql}
           AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= unixepoch('subsec') * 1000)
         ORDER BY event.created_at LIMIT 40`,
       )

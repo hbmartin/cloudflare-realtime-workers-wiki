@@ -13,7 +13,7 @@ type Mention = { id: string; name: string };
 const decode = (value: string) =>
   value.replace(/&(?:amp|lt|gt);/g, (entity) => ({ "&amp;": "&", "&lt;": "<", "&gt;": ">" })[entity]!);
 export const escapeSlackText = (value: string) =>
-  value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll("|", "¦");
+  value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
 // Only recognized Slack tokens become structured nodes. HTML and broadcasts stay text.
 export async function slackReplyBody(
@@ -36,8 +36,13 @@ export async function slackReplyBody(
       if (v) result.push({ type: "text", text: decode(v), styles: {} });
     };
     for (const match of value.matchAll(tokens)) {
-      literal(value.slice(offset, match.index));
       const token = match[0];
+      if (["*", "_", "~"].includes(token[0]!)) {
+        const before = value[match.index! - 1] ?? "";
+        const after = value[match.index! + token.length] ?? "";
+        if ((before && !/[\s([{]/.test(before)) || (after && !/[\s.,!?;:)\]}]/.test(after))) continue;
+      }
+      literal(value.slice(offset, match.index));
       const mention = /^<@([UW][A-Z0-9]+)>$/.exec(token);
       if (mention) {
         const member = mentions.get(mention[1]!);
@@ -128,6 +133,17 @@ export async function slackCommentText(body: CommentBody, resolve: (id: string) 
         if (slackId && /^[UW][A-Z0-9]+$/.test(slackId)) return `<@${slackId}>`;
       }
       return escapeSlackText(`@${typeof attrs.label === "string" ? attrs.label : "Member"}`);
+    }
+    if (n.type === "link") {
+      const href = typeof n.href === "string" ? n.href : "";
+      const label = (await render(n.content)).replaceAll("|", "¦");
+      try {
+        const url = new URL(href);
+        if (["http:", "https:"].includes(url.protocol)) return `<${url.toString().replaceAll("|", "%7C")}|${label}>`;
+      } catch {
+        // A malformed stored link remains safe, readable text.
+      }
+      return label;
     }
     if (typeof n.text === "string") return escapeSlackText(n.text);
     const content = await render(n.content);
