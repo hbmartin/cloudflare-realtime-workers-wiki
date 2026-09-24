@@ -231,7 +231,9 @@ describe("protection recovery flows", () => {
       serverNow: Date.now(),
     };
     vi.mocked(api).mockImplementation(async (path) =>
-      path === "/api/security/status" ? { ...recovery, slackPrimary: undefined } : { success: true },
+      path === "/api/security/status"
+        ? { ...recovery, slackPrimary: undefined }
+        : { success: true, resumeKey: "rotated-key" },
     );
     render(<SecurityScreen initialStatus={recovery} />);
     await act(async () => {});
@@ -289,7 +291,11 @@ describe("protection recovery flows", () => {
   it("offers password-protected resumption only when the server allows it", async () => {
     const recovery = { ...status, state: "recovery_required" as const, recoveryCanResume: true };
     vi.mocked(api).mockImplementation(async (path) =>
-      path === "/api/security/setup-totp" ? { totpURI: "otpauth://totp/NoteFlare?secret=EXPIRED" } : recovery,
+      path === "/api/security/setup-totp"
+        ? { totpURI: "otpauth://totp/NoteFlare?secret=EXPIRED" }
+        : path === "/api/security/resume-recovery"
+          ? { success: true, resumeKey: "rotated-key" }
+          : recovery,
     );
     render(<SecurityScreen initialStatus={recovery} />);
     const setup = screen.getByLabelText("Account password");
@@ -299,7 +305,11 @@ describe("protection recovery flows", () => {
     const input = screen.getByLabelText("Password to resume recovery");
     fireEvent.change(input, { target: { value: "password123" } });
     fireEvent.submit(input.closest("form")!);
-    await screen.findByText("Recovery resumed. Finish restoring an authenticator or passkey.");
+    await screen.findByText("Recovery resumed. Save your new one-time resume key before continuing.");
+    expect(screen.getByText("rotated-key")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("I saved my recovery resume key"));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(screen.queryByLabelText("Setup key")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Set up authenticator app" })).toBeVisible();
     expect(api).toHaveBeenCalledWith("/api/security/resume-recovery", {

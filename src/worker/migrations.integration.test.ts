@@ -6,6 +6,44 @@ import { createAuth } from "./auth";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("repairs mention introduction epochs from matching projections after a restore", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0042"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+        VALUES ('owner','Owner','owner@example.test',1,1),('target','Target','target@example.test',1,1)`),
+      env.DB.prepare(`INSERT INTO workspaces(id,name,created_at) VALUES ('workspace','Notes',1)`),
+      env.DB
+        .prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,content_epoch)
+        VALUES ('document','workspace','workspace-general','document','a0','Document','owner',1,1,2),
+          ('diagram','workspace','workspace-general','diagram','a1','Diagram','owner',1,1,2),
+          ('unknown','workspace','workspace-general','document','a2','Unknown','owner',1,1,2)`),
+      env.DB.prepare(`INSERT INTO document_projections
+        (page_id,content_epoch,sequence,schema_version,r2_key,content_hash,byte_size,updated_at)
+        VALUES ('document',1,7,1,'r2-document','hash',1,1)`),
+      env.DB.prepare(`INSERT INTO diagram_projections
+        (page_id,content_epoch,sequence,schema_version,r2_key,content_hash,byte_size,
+         thumbnail_r2_key,thumbnail_hash,thumbnail_byte_size,updated_at)
+        VALUES ('diagram',1,9,1,'r2-diagram','hash',1,'thumbnail','hash',1,1)`),
+      env.DB.prepare(`INSERT INTO member_mentions
+        (workspace_id,source_page_id,target_user_id,first_seen_at,projection_seq,introduction_epoch,introduction_seq)
+        VALUES ('workspace','document','target',1,7,2,7),('workspace','diagram','target',1,9,2,9),
+          ('workspace','unknown','target',1,11,2,11)`),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      (
+        await env.DB.prepare(`SELECT source_page_id,introduction_epoch,introduction_seq
+      FROM member_mentions ORDER BY source_page_id`).all()
+      ).results,
+    ).toEqual([
+      { source_page_id: "diagram", introduction_epoch: 1, introduction_seq: 9 },
+      { source_page_id: "document", introduction_epoch: 1, introduction_seq: 7 },
+      { source_page_id: "unknown", introduction_epoch: null, introduction_seq: null },
+    ]);
+  });
   it("repairs only unedited imported Slack comments and indexes pending redrive", async () => {
     await applyD1Migrations(
       env.DB,

@@ -392,6 +392,7 @@ export function webhookEventStatements(
     entityType: "page" | "block" | "comment";
     entityId: string;
     pageId: string | null;
+    contentEpoch?: number;
     actorId: string | null;
     sourceKey: string;
     data?: Record<string, unknown>;
@@ -405,7 +406,9 @@ export function webhookEventStatements(
       .prepare(
         `INSERT OR IGNORE INTO webhook_events
         (id, workspace_id, event_type, entity_type, entity_id, page_id, actor_id, data_json, source_key, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE (? IS NULL OR EXISTS (SELECT 1 FROM pages page
+         WHERE page.id=? AND page.content_epoch=?))`,
       )
       .bind(
         eventId,
@@ -418,11 +421,15 @@ export function webhookEventStatements(
         JSON.stringify(input.data ?? {}),
         input.sourceKey,
         input.createdAt,
+        input.contentEpoch ?? null,
+        input.pageId,
+        input.contentEpoch ?? null,
       ),
     database
       .prepare(
         `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at, correlation_id)
-       SELECT ?, ?, 'webhook_event', ?, ?, ?, ? WHERE changes() > 0`,
+       SELECT ?, ?, 'webhook_event', ?, ?, ?, ?
+         WHERE EXISTS (SELECT 1 FROM webhook_events WHERE id=?)`,
       )
       .bind(
         outboxId,
@@ -431,6 +438,7 @@ export function webhookEventStatements(
         input.createdAt,
         input.createdAt,
         currentObservabilityContext()?.correlationId ?? null,
+        eventId,
       ),
   ];
 }

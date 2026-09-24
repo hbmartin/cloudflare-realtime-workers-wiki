@@ -271,13 +271,15 @@ export function SecurityScreen({
                 className="auth-form"
                 onSubmit={(event) =>
                   submit(event, async (values) => {
-                    await securityAction("resume-recovery", {
+                    const result = await securityAction<{ success: boolean; resumeKey: string }>("resume-recovery", {
                       ...(slackPrimary ? {} : { password: values.get("password") }),
                       ...(status.recoveryResumeRequiresKey ? { resumeKey: values.get("resumeKey") } : {}),
                     });
                     setUri("");
+                    setResumeKey(result.resumeKey);
+                    setResumeKeySaved(false);
                     await reload();
-                    setNotice("Recovery resumed. Finish restoring an authenticator or passkey.");
+                    setNotice("Recovery resumed. Save your new one-time resume key before continuing.");
                   })
                 }
               >

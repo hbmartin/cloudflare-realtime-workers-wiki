@@ -30,6 +30,7 @@ const CONNECT = "Connect your Slack account from NoteFlare Settings before using
 const CONTENT_ERROR =
   "Your Slack reply could not be imported because it is too large or complex. Shorten it and try again.";
 const BROADCAST_MISSING = "Your broadcast reply could not be retrieved from the Slack thread.";
+const EXPIRED_ACTION = "This action expired. Open the current NoteFlare message and try again.";
 
 type Link = {
   id: string;
@@ -617,7 +618,9 @@ export async function deliverSlackMutation(env: Env, receiptId: string, action: 
         : CONTENT_ERROR
       : error instanceof HttpError && error.code === "slack_identity_required"
         ? CONNECT
-        : DENIED;
+        : error instanceof HttpError && error.code === "slack_action_expired"
+          ? EXPIRED_ACTION
+          : DENIED;
     const installation = await env.DB.prepare(`SELECT workspace_id FROM slack_installations WHERE id = ?`)
       .bind(input.installationId)
       .first<{ workspace_id: string }>();
@@ -680,7 +683,7 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
   }
   const claimed = await env.DB.prepare(
     `UPDATE ${table} SET denial_sent_at = ? WHERE id = ?
-      AND outcome IN ('denied', 'invalid_content', 'content_unavailable') AND denial_sent_at IS NULL`,
+      AND outcome IN ('denied', 'invalid_content', 'content_unavailable', 'expired') AND denial_sent_at IS NULL`,
   )
     .bind(Date.now(), payload.receiptId)
     .run();
@@ -695,11 +698,13 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
         payload.text === CONNECT ||
         payload.text === "Connect your Slack account from NoteFlare Settings before using this action."
           ? CONNECT
-          : payload.text === BROADCAST_MISSING
-            ? BROADCAST_MISSING
-            : payload.text === CONTENT_ERROR
-              ? CONTENT_ERROR
-              : DENIED,
+          : payload.reason === "expired" || payload.text === EXPIRED_ACTION
+            ? EXPIRED_ACTION
+            : payload.text === BROADCAST_MISSING
+              ? BROADCAST_MISSING
+              : payload.text === CONTENT_ERROR
+                ? CONTENT_ERROR
+                : DENIED,
     });
   } catch (error) {
     if (error instanceof SlackRateLimitError) {
@@ -843,6 +848,9 @@ async function reconcileDelivery(env: Env, installation: SlackInstallation, link
   return null;
 }
 
+const transientSlackLookup = (error: SlackApiError) =>
+  error.status >= 500 || ["ratelimited", "internal_error", "service_unavailable", "fatal_error"].includes(error.code);
+
 function definitelyNotPosted(error: unknown) {
   return (
     error instanceof SlackRateLimitError ||
@@ -943,8 +951,27 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
     if (!currentDelivery || ["sent", "retired", "blocked"].includes(currentDelivery.state)) return;
     Object.assign(delivery, currentDelivery);
     const link = await linkFor(env, delivery.link_id);
+    const installed = await installationFor(env, link.installation_id, link.installation_generation);
+    await validateChannel(env, installed, link.channel_id);
+    // A lost post response must be reconciled before a later author revocation
+    // can retire this root and permit a duplicate root for the thread.
+    if (delivery.state === "sending" && delivery.operation !== "refresh") {
+      let recovered: string | null;
+      try {
+        recovered = await reconcileDelivery(env, installed, link, delivery);
+      } catch (error) {
+        if (error instanceof SlackApiError && !transientSlackLookup(error)) {
+          if (slackInstallationError(error)) await recordSlackInstallationError(env, installed.id, error);
+          await blockSlackDelivery(env, delivery, `reconciliation_${error.code}`);
+          return;
+        }
+        throw error;
+      }
+      if (recovered) await finishDelivery(env, delivery, link, recovered);
+      else await blockSlackDelivery(env, delivery);
+      return;
+    }
     const { installation, member, page } = await outboundAuthority(env, link, delivery.actor_id);
-    await validateChannel(env, installation, link.channel_id);
     if (delivery.operation !== "root" && !link.root_message_ts) {
       const root = await env.DB.prepare(
         `SELECT state FROM slack_thread_deliveries WHERE link_id = ? AND operation = 'root'`,
@@ -972,22 +999,6 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       .bind(link.id, delivery.id, delivery.created_at, delivery.created_at, delivery.id)
       .first();
     if (earlier && delivery.operation !== "root") throw new DeliveryInProgressError();
-    if (delivery.state === "sending" && delivery.operation !== "refresh") {
-      let recovered: string | null;
-      try {
-        recovered = await reconcileDelivery(env, installation, link, delivery);
-      } catch (error) {
-        if (error instanceof SlackApiError && error.status < 500 && error.code !== "ratelimited") {
-          if (slackInstallationError(error)) await recordSlackInstallationError(env, installation.id, error);
-          await blockSlackDelivery(env, delivery, `reconciliation_${error.code}`);
-          return;
-        }
-        throw error;
-      }
-      if (recovered) await finishDelivery(env, delivery, link, recovered);
-      else await blockSlackDelivery(env, delivery);
-      return;
-    }
     if (delivery.operation === "root") {
       const mapping = await env.DB.prepare(
         `SELECT muted_at, snoozed_until FROM slack_channel_subscriptions WHERE id = ?`,
@@ -1151,6 +1162,13 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       }
     }
     if (error instanceof HttpError && error.status < 500) {
+      const current = await env.DB.prepare(`SELECT state FROM slack_thread_deliveries WHERE id=?`)
+        .bind(delivery.id)
+        .first<{ state: string }>();
+      if (current?.state === "sending") {
+        await blockSlackDelivery(env, delivery, `reconciliation_${error.code}`);
+        return;
+      }
       await retireRejectedDelivery(env, delivery, error.code);
       return;
     }

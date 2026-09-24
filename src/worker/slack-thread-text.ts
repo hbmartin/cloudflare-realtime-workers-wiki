@@ -26,7 +26,6 @@ export async function slackReplyBody(
   const ids = [...new Set([...text.matchAll(/<@([UW][A-Z0-9]+)>/g)].map((match) => match[1]!))];
   if (ids.length > 50) throw new HttpError(422, "slack_comment_too_complex", "Reply has too many mentions.");
   for (const id of ids) mentions.set(id, await resolve(id));
-  let nodes = 0;
   function inline(value: string, depth = 0): CommentNode[] {
     if (depth > 8) return [{ type: "text", text: decode(value), styles: {} }];
     const result: CommentNode[] = [];
@@ -99,8 +98,6 @@ export async function slackReplyBody(
         previous.text = (previous.text ?? "") + (node.text ?? "");
       else merged.push(node);
     }
-    nodes += merged.length;
-    if (nodes > 300) throw new HttpError(422, "slack_comment_too_complex", "Reply is too complex.");
     return merged;
   }
   const blocks: CommentNode[] = [];
@@ -126,6 +123,15 @@ export async function slackReplyBody(
       }
     }
   }
+  let nodes = 0;
+  const count = (items: CommentNode[]) => {
+    for (const item of items) {
+      if (++nodes > 300) throw new HttpError(422, "slack_comment_too_complex", "Reply is too complex.");
+      if (item.content) count(item.content);
+      if (item.children) count(item.children);
+    }
+  };
+  count(blocks);
   return blocks;
 }
 
