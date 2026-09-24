@@ -104,6 +104,11 @@ export class MentionTargetTracker {
 
   private updateXml(transaction: Y.Transaction, events: Y.YEvent<any>[]): Set<string> | null {
     const root = this.document.getXmlFragment("document-store");
+    const reachable = (element: Y.XmlElement) => {
+      let node: unknown = element;
+      while (node instanceof Y.XmlElement) node = node.parent;
+      return Object.is(node, root);
+    };
     const relevant = [...transaction.changed].some(
       ([type, keys]) =>
         Object.is(type, root) ||
@@ -135,6 +140,7 @@ export class MentionTargetTracker {
     for (const event of events) {
       const target = event.target;
       if (!(target instanceof Y.XmlElement) && !Object.is(target, root)) continue;
+      if (target instanceof Y.XmlElement && !reachable(target)) continue;
       if (target instanceof Y.XmlElement) {
         let ancestor: unknown = target;
         let insideReplaced = false;

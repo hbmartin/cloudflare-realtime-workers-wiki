@@ -704,9 +704,13 @@ describe("security lifecycle regressions", () => {
       slackPrimary: { available: true },
     });
     expect((await request(replacement, "/api/security/resume-recovery", {})).status).toBe(403);
-    expect((await request(replacement, "/api/security/resume-recovery", { resumeKey })).status).toBe(200);
+    const resumed = await request(replacement, "/api/security/resume-recovery", { resumeKey });
+    expect(resumed.status).toBe(200);
+    expect(resumed.headers.get("cache-control")).toBe("no-store");
+    const rotated = (await resumed.json<{ resumeKey: string }>()).resumeKey;
+    expect(rotated).not.toBe(resumeKey);
     expect(await env.DB.prepare(`SELECT recovery_resume_key_hash hash FROM account_security`).first()).toEqual({
-      hash: null,
+      hash: await sha256(rotated),
     });
     expect(
       await env.DB.prepare(`SELECT proof.verified_at = account.recovery_started_at matched
@@ -715,6 +719,30 @@ describe("security lifecycle regressions", () => {
         .bind(session!.id)
         .first(),
     ).toEqual({ matched: 1 });
+    const nextSignIn = responseCookies(
+      await request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    const nextSession = await env.DB.prepare(
+      `SELECT id FROM session WHERE userId=? ORDER BY createdAt DESC,rowid DESC LIMIT 1`,
+    )
+      .bind(user!.id)
+      .first<{ id: string }>();
+    await env.DB.prepare(`INSERT INTO slack_primary_factor_proofs
+      (session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at)
+      VALUES (?,?,'slack-proof-account','T123','UOWNER',?,?)`)
+      .bind(nextSession!.id, user!.id, Date.now(), Date.now() + 600_000)
+      .run();
+    expect((await request(nextSignIn, "/api/security/resume-recovery", { resumeKey })).status).toBe(403);
+    const secondResume = await request(nextSignIn, "/api/security/resume-recovery", { resumeKey: rotated });
+    expect(secondResume.status).toBe(200);
+    const thirdKey = (await secondResume.json<{ resumeKey: string }>()).resumeKey;
+    expect(thirdKey).not.toBe(rotated);
+    expect(await env.DB.prepare(`SELECT recovery_resume_key_hash hash FROM account_security`).first()).toEqual({
+      hash: await sha256(thirdKey),
+    });
     await env.DB.prepare(`UPDATE account_security SET recovery_started_at = ?`)
       .bind(now - 25 * 60 * 60_000)
       .run();
@@ -762,10 +790,11 @@ describe("security lifecycle regressions", () => {
       resumeKey,
     });
     expect(resumed.status).toBe(200);
+    const rotated = (await resumed.clone().json<{ resumeKey: string }>()).resumeKey;
     const replacement = responseCookies(resumed);
     expect((await request(replacement, "/api/security/status")).status).toBe(200);
     expect(await env.DB.prepare(`SELECT recovery_resume_key_hash hash FROM account_security`).first()).toEqual({
-      hash: null,
+      hash: await sha256(rotated),
     });
   });
 
@@ -992,10 +1021,11 @@ describe("security lifecycle regressions", () => {
       request(responseCookies(second), "/api/security/resume-recovery", { resumeKey }),
     ]);
     expect(results.map((result) => result.status).sort((a, b) => a - b)).toEqual([200, 403]);
+    const rotated = (await results.find((result) => result.status === 200)!.json<{ resumeKey: string }>()).resumeKey;
     expect(
       await env.DB.prepare(`SELECT recovery_resume_key_hash hash,
       recovery_resume_claim_session_id IS NOT NULL claimed FROM account_security`).first(),
-    ).toEqual({ hash: null, claimed: 1 });
+    ).toEqual({ hash: await sha256(rotated), claimed: 0 });
     await env.DB.prepare(`INSERT INTO security_resets(token_hash,user_id,expires_at)
       VALUES ('reset-token',?,?)`)
       .bind(user!.id, Date.now() + 60_000)

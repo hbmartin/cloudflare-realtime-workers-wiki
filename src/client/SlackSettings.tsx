@@ -28,6 +28,7 @@ type ChannelSubscription = {
   failedDeliveries?: number;
   notificationBlockedAt?: number | null;
   notificationError?: string | null;
+  controlsError?: string | null;
   mutedAt?: number | null;
   snoozedUntil?: number | null;
 };
@@ -439,6 +440,11 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       <output>
                         One-way notifications are blocked because the bot cannot use this channel. Pending updates were
                         discarded.
+                      </output>
+                    )}
+                    {subscription.controlsError === "no_authorized_owner" && (
+                      <output>
+                        Snooze ended, but no current workspace owner can refresh the Slack thread controls.
                       </output>
                     )}
                     {Boolean(subscription.blockedDeliveries) && (
