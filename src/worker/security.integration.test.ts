@@ -8,6 +8,7 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as authCookies from "better-auth/cookies";
 import { createAuth } from "./auth";
 import {
   cleanupFailedPasskeyRegistration,
@@ -344,6 +345,32 @@ function beforeBatch(change: () => Promise<unknown>) {
       },
     }),
   });
+}
+function missingUserAfterGrant() {
+  let granted = false;
+  const auth = createAuth({
+    ...env,
+    DB: new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            const result = await target.batch(statements);
+            granted = true;
+            return result;
+          };
+        if (key === "prepare")
+          return (sql: string) =>
+            target.prepare(
+              granted && /^\s*select\b/i.test(sql) && /\bfrom\s+["`]?user["`]?\b/i.test(sql)
+                ? `SELECT * FROM (${sql}) WHERE 1=0`
+                : sql,
+            );
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  });
+  return { auth, wasGranted: () => granted };
 }
 function authRequest(cookie: string, path: string, body: object) {
   return new Request(`http://example.test/api/auth/security/${path}`, {
@@ -722,6 +749,14 @@ describe("security lifecycle regressions", () => {
         })
       ).status,
     ).toBe(403);
+    expect(
+      (
+        await request(challenge, "/api/security/resume-recovery", {
+          password: "password123",
+          resumeKey: "incorrect",
+        })
+      ).status,
+    ).toBe(403);
     const resumed = await request(challenge, "/api/security/resume-recovery", {
       password: "password123",
       resumeKey,
@@ -734,7 +769,192 @@ describe("security lifecycle regressions", () => {
     });
   });
 
-  it("allows only one concurrent replacement claim and revokes an unused key on operator reset", async () => {
+  it("deletes a replacement session when the recovery grant fails and keeps the key usable", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const { resumeKey } = await recovery.json<{ resumeKey: string }>();
+    const user = await env.DB.prepare(`SELECT id FROM user WHERE email='owner@example.test'`).first<{ id: string }>();
+    const pending = responseCookies(
+      await request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    const count = async () =>
+      (await env.DB.prepare(`SELECT COUNT(*) count FROM session WHERE userId=?`)
+        .bind(user!.id)
+        .first<{ count: number }>())!.count;
+    const before = await count();
+    let injected = false;
+    const auth = beforeBatch(async () => {
+      if (!injected && (await count()) > before) {
+        injected = true;
+        throw new Error("grant unavailable");
+      }
+    });
+    const failed = await auth.handler(
+      authRequest(pending, "resume-recovery", {
+        password: "password123",
+        resumeKey,
+      }),
+    );
+    expect(failed.status).toBeGreaterThanOrEqual(500);
+    expect(injected).toBe(true);
+    expect(await count()).toBe(before);
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_key_hash hash,recovery_resume_claim_session_id claim
+      FROM account_security`).first(),
+    ).toEqual({ hash: await sha256(resumeKey), claim: null });
+    const next = responseCookies(
+      await request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    expect(
+      (
+        await request(next, "/api/security/resume-recovery", {
+          password: "password123",
+          resumeKey,
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("restores a claimed key when the replacement session cookie cannot be set", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const { resumeKey } = await recovery.json<{ resumeKey: string }>();
+    const user = await env.DB.prepare(`SELECT id FROM user WHERE email='owner@example.test'`).first<{ id: string }>();
+    const before = await env.DB.prepare(`SELECT COUNT(*) count FROM session WHERE userId=?`)
+      .bind(user!.id)
+      .first<{ count: number }>();
+    const pending = responseCookies(
+      await request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    const cookieWrite = vi
+      .spyOn(authCookies, "setSessionCookie")
+      .mockRejectedValueOnce(new Error("cookie unavailable"));
+    try {
+      const failed = await request(pending, "/api/security/resume-recovery", { password: "password123", resumeKey });
+      expect(failed.status).toBeGreaterThanOrEqual(500);
+      expect(cookieWrite).toHaveBeenCalled();
+    } finally {
+      cookieWrite.mockRestore();
+    }
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM session WHERE userId=?`).bind(user!.id).first()).toEqual(
+      before,
+    );
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_key_hash hash,recovery_resume_claim_session_id claim
+      FROM account_security`).first(),
+    ).toEqual({ hash: await sha256(resumeKey), claim: null });
+    const next = responseCookies(
+      await request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    expect(
+      (
+        await request(next, "/api/security/resume-recovery", {
+          password: "password123",
+          resumeKey,
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("removes a replacement session when the post-grant user lookup finds no user", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const { resumeKey } = await recovery.json<{ resumeKey: string }>();
+    const user = await env.DB.prepare(`SELECT id FROM user WHERE email='owner@example.test'`).first<{ id: string }>();
+    const before = await env.DB.prepare(`SELECT COUNT(*) count FROM session WHERE userId=?`)
+      .bind(user!.id)
+      .first<{ count: number }>();
+    const pending = responseCookies(
+      await request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    const { auth, wasGranted } = missingUserAfterGrant();
+    expect(
+      (
+        await auth.handler(
+          authRequest(pending, "resume-recovery", {
+            password: "password123",
+            resumeKey,
+          }),
+        )
+      ).status,
+    ).toBe(403);
+    expect(wasGranted()).toBe(true);
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM session WHERE userId=?`).bind(user!.id).first()).toEqual(
+      before,
+    );
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_key_hash hash,recovery_resume_claim_session_id claim
+      FROM account_security`).first(),
+    ).toEqual({ hash: await sha256(resumeKey), claim: null });
+  });
+
+  it("does not restore a failed replacement claim after an operator reset", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const { resumeKey } = await recovery.json<{ resumeKey: string }>();
+    const user = await env.DB.prepare(`SELECT id FROM user WHERE email='owner@example.test'`).first<{ id: string }>();
+    const pending = responseCookies(
+      await request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    const cookieWrite = vi.spyOn(authCookies, "setSessionCookie").mockImplementationOnce(async () => {
+      await env.DB.prepare(`INSERT INTO security_resets(token_hash,user_id,expires_at) VALUES ('raced-reset',?,?)`)
+        .bind(user!.id, Date.now() + 60_000)
+        .run();
+      throw new Error("cookie unavailable");
+    });
+    try {
+      expect(
+        (
+          await request(pending, "/api/security/resume-recovery", {
+            password: "password123",
+            resumeKey,
+          })
+        ).status,
+      ).toBeGreaterThanOrEqual(500);
+    } finally {
+      cookieWrite.mockRestore();
+    }
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_key_hash hash,recovery_resume_claim_session_id claim
+      FROM account_security`).first(),
+    ).toEqual({ hash: null, claim: null });
+  });
+
+  it("allows only one concurrent replacement claim and clears its claim on operator reset", async () => {
     const cookie = await enrollAccount(await bootstrap());
     const { codes, receipt } = await (
       await request(cookie, "/api/security/recovery-codes", {})
@@ -784,6 +1004,42 @@ describe("security lifecycle regressions", () => {
       await env.DB.prepare(`SELECT recovery_resume_key_hash hash,recovery_resume_claim_session_id claim
       FROM account_security`).first(),
     ).toEqual({ hash: null, claim: null });
+  });
+
+  it("revokes an unused recovery resume key on operator reset", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const { resumeKey } = await recovery.json<{ resumeKey: string }>();
+    const user = await env.DB.prepare(`SELECT id FROM user WHERE email='owner@example.test'`).first<{ id: string }>();
+    expect(await env.DB.prepare(`SELECT recovery_resume_key_hash hash FROM account_security`).first()).toEqual({
+      hash: await sha256(resumeKey),
+    });
+    await env.DB.prepare(`INSERT INTO security_resets(token_hash,user_id,expires_at)
+      VALUES ('unused-key-reset',?,?)`)
+      .bind(user!.id, Date.now() + 60_000)
+      .run();
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_key_hash hash,recovery_resume_claim_session_id claim
+      FROM account_security`).first(),
+    ).toEqual({ hash: null, claim: null });
+    const replacement = responseCookies(
+      await request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    expect(
+      (
+        await request(replacement, "/api/security/resume-recovery", {
+          password: "password123",
+          resumeKey,
+        })
+      ).status,
+    ).toBe(403);
   });
 
   it("does not burn recovery credentials when a challenge expires between authorization and consumption", async () => {

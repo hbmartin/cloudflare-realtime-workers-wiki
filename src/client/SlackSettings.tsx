@@ -322,7 +322,10 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
       )}
       {connected && status?.installation?.authError && (
         <output className="channel-status">
-          Slack bot authentication failed. Ask an owner to reauthorize the workspace app.
+          Slack bot authentication failed.{" "}
+          {owner
+            ? "Reauthorize the workspace app to resume delivery."
+            : "Ask an owner to reauthorize the workspace app."}
         </output>
       )}
       {owner && connected && status.installation?.scopeHealth && (

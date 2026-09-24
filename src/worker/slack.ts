@@ -607,7 +607,7 @@ export async function slackWorkspaceStatus(env: Env, member: MemberContext) {
       verifiedAt: link?.verified_at ?? null,
     },
     reauthorization: {
-      required: Boolean(connected && scopeHealth?.reauthorizationRequired),
+      required: Boolean(connected && (scopeHealth?.reauthorizationRequired || installation?.auth_error)),
       available: configured(env),
     },
   } satisfies SlackStatus;

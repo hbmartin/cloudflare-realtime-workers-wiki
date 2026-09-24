@@ -192,6 +192,34 @@ describe("account protection screens", () => {
 });
 
 describe("protection recovery flows", () => {
+  it("reports resume-key clipboard failure and confirms a later successful copy", async () => {
+    const recovery: SecurityStatus = { ...status, state: "recovery_required", recoveryCanResume: true };
+    vi.mocked(api).mockImplementation(async (path) =>
+      path === "/api/security/recover" ? { success: true, resumeKey: "save-this-key" } : recovery,
+    );
+    const writeText = vi.fn().mockRejectedValueOnce(new Error("Clipboard unavailable")).mockResolvedValue(undefined);
+    const descriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    try {
+      render(<SecurityScreen initialStatus={recovery} />);
+      fireEvent.click(screen.getByRole("button", { name: "Use a recovery code or operator reset" }));
+      const code = screen.getByLabelText("Recovery code");
+      const form = code.closest("form")!;
+      fireEvent.change(form.querySelector('input[name="password"]')!, { target: { value: "password123" } });
+      fireEvent.change(code, { target: { value: "valid-code" } });
+      fireEvent.submit(form);
+      const copy = await screen.findByRole("button", { name: "Copy resume key" });
+      fireEvent.click(copy);
+      expect(await screen.findByRole("alert")).toHaveTextContent("Clipboard unavailable");
+      expect(screen.queryByText("Recovery resume key copied.")).not.toBeInTheDocument();
+      fireEvent.click(copy);
+      expect(await screen.findByText("Recovery resume key copied.")).toBeVisible();
+      expect(writeText).toHaveBeenCalledWith("save-this-key");
+    } finally {
+      if (descriptor) Object.defineProperty(navigator, "clipboard", descriptor);
+      else Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
   it("requests a password after Slack proof expires on the recovery form", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));

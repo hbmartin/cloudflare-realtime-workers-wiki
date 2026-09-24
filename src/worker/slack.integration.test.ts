@@ -133,6 +133,21 @@ afterEach(() => {
 });
 
 describe("Slack security and integration", () => {
+  it("requires reauthorization when the connected bot token fails with complete scopes", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    await env.DB.prepare(`UPDATE slack_installations SET scopes = ?,auth_error='invalid_auth',auth_error_at=?
+      WHERE id='slack-installation'`)
+      .bind(
+        "commands,chat:write,links:read,links:write,channels:read,groups:read,channels:history,groups:history,users:read,reactions:read,files:write",
+        Date.now(),
+      )
+      .run();
+    const status = await slackWorkspaceStatus(slackEnv(), memberContext(installed.member));
+    expect(status.installation?.scopeHealth.reauthorizationRequired).toBe(false);
+    expect(status.reauthorization.required).toBe(true);
+    expect(status.installation?.authError).toBe("invalid_auth");
+  });
   it("reports capability-specific scope health without disabling legacy features", () => {
     const legacy = slackScopeHealth("links:write,commands,chat:write,links:read,commands");
     expect(legacy.granted).toEqual(["chat:write", "commands", "links:read", "links:write"]);

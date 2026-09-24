@@ -15,6 +15,7 @@ import {
   deliverSlackMutation,
   deliverSlackThread,
   setSlackMirror,
+  wakeNextSlackDelivery,
 } from "./slack-threads";
 import {
   encryptSlackToken,
@@ -1960,6 +1961,132 @@ describe("canonical Slack mirrors", () => {
     await deliverSlackThread(runtime(), second.id);
     expect(posts.at(-1)?.text).toContain("Second");
   });
+  it("blocks successors behind any blocked predecessor and releases them in order", async () => {
+    const { created, link } = await activeThread();
+    for (let index = 0; index < 4; index++)
+      await addCommentReply(runtime(), owner, commentPage, created.id, body(`Reply ${index}`));
+    const replies = (await deliveries(created.id)).filter((delivery) => delivery.operation === "reply");
+    const [earlierPending, blocked, next, last] = replies;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',failure_reason='reconciliation_inconclusive'
+      WHERE id=?`)
+      .bind(blocked!.id)
+      .run();
+    await deliverSlackThread(runtime(), next!.id);
+    expect(
+      await env.DB.prepare(`SELECT id,state,failure_reason FROM slack_thread_deliveries
+      WHERE id IN (?,?) ORDER BY id`)
+        .bind(next!.id, last!.id)
+        .all(),
+    ).toMatchObject({
+      results: expect.arrayContaining([
+        { id: next!.id, state: "blocked", failure_reason: "predecessor_blocked" },
+        { id: last!.id, state: "blocked", failure_reason: "predecessor_blocked" },
+      ]),
+    });
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === earlierPending!.id)?.state).toBe(
+      "pending",
+    );
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sent',failure_reason=NULL WHERE id=?`)
+      .bind(blocked!.id)
+      .run();
+    await wakeNextSlackDelivery(runtime(), link.id);
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === next!.id)?.state).toBe("pending");
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === last!.id)?.state).toBe("blocked");
+    await deliverSlackThread(runtime(), earlierPending!.id);
+    await deliverSlackThread(runtime(), next!.id);
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === last!.id)?.state).toBe("pending");
+    await deliverSlackThread(runtime(), last!.id);
+    expect(
+      (await deliveries(created.id))
+        .filter((delivery) => delivery.operation === "reply")
+        .every((delivery) => delivery.state === "sent"),
+    ).toBe(true);
+  });
+  it("releases a derived block after its reply predecessor is definitively retired", async () => {
+    const { created, link } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Rejected predecessor"));
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Waiting successor"));
+    const [first, second] = (await deliveries(created.id)).filter((delivery) => delivery.operation === "reply");
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',failure_reason='reconciliation_inconclusive'
+      WHERE id=?`)
+      .bind(first!.id)
+      .run();
+    await deliverSlackThread(runtime(), second!.id);
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === second!.id)?.state).toBe("blocked");
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',failure_reason='invalid_blocks'
+      WHERE id=?`)
+      .bind(first!.id)
+      .run();
+    await wakeNextSlackDelivery(runtime(), link.id);
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === second!.id)?.state).toBe("pending");
+    await deliverSlackThread(runtime(), second!.id);
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === second!.id)?.state).toBe("sent");
+  });
+  it("blocks later pending replies when an uncertain predecessor exhausts redrive", async () => {
+    const { created } = await activeThread();
+    for (let index = 0; index < 2; index++)
+      await addCommentReply(runtime(), owner, commentPage, created.id, body(`Waiting ${index}`));
+    const [first, second] = (await deliveries(created.id)).filter((delivery) => delivery.operation === "reply");
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',attempted_at=? WHERE id=?`).bind(
+        Date.now(),
+        first!.id,
+      ),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?,slack_redrive_count=8 WHERE id=?`).bind(
+        Date.now() - 31 * 60_000,
+        Date.now() - 1,
+        `outbox:${first!.id}`,
+      ),
+    ]);
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(first!.id)
+        .first(),
+    ).toEqual({ state: "blocked", failure_reason: "redrive_exhausted_uncertain" });
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(second!.id)
+        .first(),
+    ).toEqual({ state: "blocked", failure_reason: "predecessor_blocked" });
+  });
+  it("redrive detects a blocked predecessor even behind an earlier pending reply", async () => {
+    const { created } = await activeThread();
+    for (let index = 0; index < 3; index++)
+      await addCommentReply(runtime(), owner, commentPage, created.id, body(`Queued ${index}`));
+    const [earlier, blocked, last] = (await deliveries(created.id)).filter(
+      (delivery) => delivery.operation === "reply",
+    );
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',failure_reason='reconciliation_inconclusive'
+      WHERE id=?`)
+      .bind(blocked!.id)
+      .run();
+    await env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=? WHERE id=?`)
+      .bind(Date.now() - 31 * 60_000, Date.now() - 1, `outbox:${last!.id}`)
+      .run();
+    await redriveStaleSlackOutbox(runtime());
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === earlier!.id)?.state).toBe("pending");
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(last!.id)
+        .first(),
+    ).toEqual({ state: "blocked", failure_reason: "predecessor_blocked" });
+  });
+  it("blocks replies already pending when an uncertain root cannot be reconciled", async () => {
+    await setSlackMirror(runtime(), owner, "space", true);
+    const created = await thread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Waiting for root"));
+    const [root, waiting] = await deliveries(created.id);
+    postFailure = "unrecorded";
+    await expect(deliverSlackThread(runtime(), root!.id)).rejects.toThrow("connection lost");
+    postFailure = "none";
+    await deliverSlackThread(runtime(), root!.id);
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(waiting!.id)
+        .first(),
+    ).toEqual({ state: "blocked", failure_reason: "predecessor_blocked" });
+  });
   it("retires a rejected root and its waiting replies when redrive is exhausted", async () => {
     await setSlackMirror(runtime(), owner, "space", true);
     const created = await thread();
@@ -2570,7 +2697,7 @@ describe("Slack inbound replies and actions", () => {
     beforeResponse = async (method) => {
       if (method === "chat.postMessage") throw new SlackApiError(method, "invalid_auth", 200);
     };
-    await deliverSlackThread(runtime(), root.id);
+    await expect(deliverSlackThread(runtime(), root.id)).rejects.toMatchObject({ code: "invalid_auth" });
     expect(
       await env.DB.prepare(
         `SELECT mirror_enabled,validation_state FROM slack_channel_subscriptions WHERE id='space'`,
@@ -2579,6 +2706,11 @@ describe("Slack inbound replies and actions", () => {
     expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
       auth_error: "invalid_auth",
     });
+    expect((await deliveries(created.id))[0]?.state).toBe("pending");
+    beforeResponse = undefined;
+    await env.DB.prepare(`UPDATE slack_installations SET auth_error=NULL WHERE id='installation'`).run();
+    await deliverSlackThread(runtime(), root.id);
+    expect((await deliveries(created.id))[0]?.state).toBe("sent");
   });
   it("refreshes a resolved root with a placeholder after its original author leaves", async () => {
     const { created, link } = await activeThread(viewer);
