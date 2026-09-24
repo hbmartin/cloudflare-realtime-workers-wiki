@@ -488,7 +488,7 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
       .run();
     await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
       WHERE workspace_id=? AND
-        ((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action')
+        ((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl')
           AND (slack_redrive_due_at IS NOT NULL OR id IN
             (SELECT 'outbox:' || d.id FROM slack_thread_deliveries d WHERE d.state='sending')))
         OR (topic='slack_channel' AND EXISTS (SELECT 1 FROM slack_channel_events event
@@ -1255,6 +1255,7 @@ export async function slackApi<Method extends SlackApiMethod>(
   payload: SlackApiContracts[Method]["input"],
   timeoutMs = SLACK_FETCH_TIMEOUT_MS,
   signal?: AbortSignal,
+  preparedToken?: string,
 ): Promise<SlackApiContracts[Method]["output"]> {
   const response = await traced(tracing, "notes.integration.slack", { "notes.operation": method }, async () => {
     const read = SLACK_READ_METHODS.has(method);
@@ -1265,7 +1266,7 @@ export async function slackApi<Method extends SlackApiMethod>(
     const token =
       method === "auth.revoke"
         ? await decryptSlackToken(env, installation.bot_token_ciphertext)
-        : await usableBotToken(env, installation, signal);
+        : (preparedToken ?? (await usableBotToken(env, installation, signal)));
     signal?.throwIfAborted();
     return fetch(url.toString(), {
       method: read ? "GET" : "POST",
@@ -2070,8 +2071,10 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     try {
       const correlationId = currentObservabilityContext()?.correlationId;
       await env.DELIVERY_QUEUE.send({ outboxId, ...(correlationId ? { correlationId } : {}) });
-      await env.DB.prepare(`UPDATE outbox SET enqueued_at = ? WHERE id = ? AND enqueued_at IS NULL`)
-        .bind(Date.now(), outboxId)
+      const queuedAt = Date.now();
+      await env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?
+        WHERE id=? AND enqueued_at IS NULL`)
+        .bind(queuedAt, queuedAt + 30 * 60_000, outboxId)
         .run();
     } catch {
       // The scheduled outbox sweep recovers this enqueue after a D1/Queue split failure.
@@ -2177,7 +2180,8 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
     `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.message_ts, unfurl.unfurls_json,
             installation.id, installation.workspace_id, installation.team_id, installation.team_name,
             installation.bot_user_id, installation.bot_token_ciphertext,
-            installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at
+            installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at,
+            installation.credential_revision
        FROM slack_unfurls unfurl
        JOIN slack_installations installation ON installation.id = unfurl.installation_id
          AND installation.generation = unfurl.installation_generation
@@ -2237,6 +2241,8 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
       await slackApi(env, row, "chat.unfurl", { channel: row.channel_id, ts: row.message_ts, unfurls });
     } catch (error) {
       await releaseSlackClaims(env, "slack_unfurls", [unfurlId], claim.token);
+      if (error instanceof SlackApiError && slackInstallationError(error))
+        await recordSlackInstallationError(env, row.id, error);
       throw error;
     }
     await env.DB.prepare(
@@ -2286,7 +2292,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
               installation.id installation_id, installation.workspace_id, installation.team_id,
               installation.team_name, installation.bot_user_id, installation.bot_token_ciphertext,
               installation.bot_refresh_token_ciphertext, installation.token_expires_at,
-              installation.disconnected_at
+              installation.disconnected_at, installation.credential_revision
          FROM slack_channel_events event
          JOIN slack_channel_subscriptions subscription ON subscription.id = event.subscription_id
          JOIN slack_installations installation ON installation.id = subscription.installation_id

@@ -80,6 +80,10 @@ describe("mandatory account protection", () => {
     expect(recovery.headers.get("cache-control")).toBe("no-store");
     const { resumeKey } = await recovery.clone().json<{ resumeKey: string }>();
     const session = responseCookies(recovery, cookie);
+    expect(await (await rawRequest(session, "/api/security/status")).json()).toMatchObject({
+      recoveryEnrollmentAllowed: false,
+      recoveryKeyAcknowledgmentRequired: true,
+    });
     expect(
       await env.DB.prepare(`SELECT recovery_resume_key_hash active,
       recovery_pending_key_hash pending FROM account_security`).first(),
@@ -92,6 +96,10 @@ describe("mandatory account protection", () => {
       403,
     );
     expect((await rawRequest(session, "/api/security/acknowledge-resume-key", { resumeKey })).status).toBe(200);
+    expect(await (await rawRequest(session, "/api/security/status")).json()).toMatchObject({
+      recoveryEnrollmentAllowed: true,
+      recoveryKeyAcknowledgmentRequired: false,
+    });
     expect((await rawRequest(session, "/api/security/acknowledge-resume-key", { resumeKey })).status).toBe(200);
     expect(
       await env.DB.prepare(`SELECT recovery_resume_key_hash active,
@@ -1099,6 +1107,72 @@ describe("security lifecycle regressions", () => {
       await env.DB.prepare(`SELECT recovery_resume_key_hash hash,recovery_resume_claim_session_id claim
       FROM account_security`).first(),
     ).toEqual({ hash: await sha256(resumeKey), claim: null });
+  });
+  it("rejects a lost final recovery handoff without setting a replacement cookie", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    expect((await request(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const { resumeKey } = await recovery.json<{ resumeKey: string }>();
+    const pending = responseCookies(
+      await request("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    const user = (await env.DB.prepare(`SELECT id FROM user WHERE email='owner@example.test'`).first<{
+      id: string;
+    }>())!;
+    const sessionsBefore = await env.DB.prepare(`SELECT COUNT(*) count FROM session WHERE userId=?`)
+      .bind(user.id)
+      .first();
+    let superseded = false;
+    const auth = createAuth({
+      ...env,
+      DB: new Proxy(env.DB, {
+        get(target, key) {
+          if (key === "batch")
+            return async (statements: D1PreparedStatement[]) => {
+              const result = await target.batch(statements);
+              if (
+                !superseded &&
+                (await target
+                  .prepare(`SELECT 1 FROM account_security
+            WHERE recovery_pending_repair_at IS NOT NULL`)
+                  .first())
+              ) {
+                superseded = true;
+                await target
+                  .prepare(`UPDATE account_security SET recovery_pending_key_hash='newer-handoff'
+              WHERE user_id=?`)
+                  .bind(user.id)
+                  .run();
+              }
+              return result;
+            };
+          const value = Reflect.get(target, key);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }),
+    });
+    const result = await auth.handler(
+      authRequest(pending, "resume-recovery", {
+        password: "password123",
+        resumeKey,
+      }),
+    );
+    expect(superseded).toBe(true);
+    expect(result.status).toBe(403);
+    expect(result.headers.get("set-cookie") ?? "").not.toContain("session_token");
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM session WHERE userId=?`).bind(user.id).first()).toEqual(
+      sessionsBefore,
+    );
+    expect(await env.DB.prepare(`SELECT COUNT(*) count FROM recovery_session_repairs`).first()).toEqual({ count: 0 });
+    expect(await env.DB.prepare(`SELECT recovery_pending_key_hash hash FROM account_security`).first()).toEqual({
+      hash: "newer-handoff",
+    });
   });
 
   it("does not restore a failed replacement claim after an operator reset", async () => {

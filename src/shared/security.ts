@@ -43,6 +43,7 @@ export interface SecurityStatus {
   recoveryCanResume?: boolean;
   recoveryResumeRequiresKey?: boolean;
   recoveryKeyAcknowledgmentRequired?: boolean;
+  recoveryEnrollmentAllowed?: boolean;
   pendingInvite?: boolean;
   slackPrimary?: { available: boolean; expiresAt: number };
   serverNow?: number;

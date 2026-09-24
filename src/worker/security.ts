@@ -127,6 +127,11 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
           ),
           recoveryKeyAcknowledgmentRequired:
             row.recovery_pending_session_id === sessionId && row.recovery_pending_key_hash !== null,
+          recoveryEnrollmentAllowed:
+            row.recovery_resume_key_hash !== null &&
+            row.recovery_pending_session_id !== sessionId &&
+            row.recovery_pending_repair_at === null &&
+            proof?.method === "recovery",
         }
       : {}),
     ...(row.slack_primary_expires_at
@@ -173,14 +178,10 @@ async function requireEnrollment(ctx: GenericEndpointContext, env: Env) {
   const security = await readSecurity(env, id.userId, id.sessionId);
   const { status, account, proof } = security;
   if (account.recovery_required) {
-    if (
-      !account.recovery_resume_key_hash ||
-      account.recovery_pending_session_id === id.sessionId ||
-      account.recovery_pending_repair_at !== null
-    )
-      throw deny("Save your recovery resume key before finishing account protection.");
-    if (!proof || proof.method !== "recovery")
-      throw deny("Resume recovery with your password, or use a recovery code or operator reset token.");
+    if (!status.recoveryEnrollmentAllowed)
+      throw deny(
+        "Resume recovery with fresh proof and save your recovery resume key before restoring account protection.",
+      );
   } else if ((status.totp || status.passkeys) && !status.fresh) throw deny();
   const session = await getSessionFromCtx(ctx);
   if (!proof && (!session || session.session.createdAt.getTime() < Date.now() - RECOVERY_MS))
@@ -907,14 +908,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
             throw deny("Recovery expired or was revoked. Use a recovery code or operator reset token.");
           }
           if (!result[original ? 1 : 2]!.meta.changes) throw deny("Recovery key expired, used, or revoked.");
-          if (replacementSession) {
-            const user = await ctx.context.internalAdapter.findUserById(id.userId);
-            if (!user) throw deny("Sign in again.");
-            await setSessionCookie(ctx, { user, session: replacementSession });
-            cookieSet = true;
-            expireCookie(ctx, ctx.context.createAuthCookie("two_factor"));
-          }
-          await env.DB.batch([
+          const handoff = await env.DB.batch([
             env.DB.prepare(`UPDATE account_security SET recovery_pending_repair_at=NULL
               WHERE user_id=? AND generation=? AND recovery_pending_key_hash=? AND recovery_pending_session_id=?`).bind(
               id.userId,
@@ -933,6 +927,15 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
                 ]
               : []),
           ]);
+          if (!handoff[0]!.meta.changes || (replacementSession && !handoff[1]!.meta.changes))
+            throw deny("Recovery key was replaced or expired. Resume recovery again.");
+          if (replacementSession) {
+            const user = await ctx.context.internalAdapter.findUserById(id.userId);
+            if (!user) throw deny("Sign in again.");
+            await setSessionCookie(ctx, { user, session: replacementSession });
+            cookieSet = true;
+            expireCookie(ctx, ctx.context.createAuthCookie("two_factor"));
+          }
         } catch (error) {
           if (replacementSession && !cookieSet) {
             // Restore only this failed claim. A reset, a new recovery, or an expired
