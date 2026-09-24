@@ -854,7 +854,8 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
           SELECT live.id,a.user_id,a.generation,a.recovery_started_at,MIN(?,a.recovery_started_at+?),'recovery',NULL
             FROM account_security a JOIN session live ON live.userId=a.user_id AND live.id=? AND live.expiresAt>?
            WHERE a.user_id=? AND a.generation=? AND a.recovery_required=1
-             AND a.recovery_started_at>? AND NOT EXISTS (SELECT 1 FROM security_resets reset WHERE reset.user_id=a.user_id)
+             AND a.recovery_started_at>? AND a.recovery_pending_key_hash IS NULL
+             AND NOT EXISTS (SELECT 1 FROM security_resets reset WHERE reset.user_id=a.user_id)
              AND (EXISTS (SELECT 1 FROM session_security old WHERE old.session_id=live.id AND old.user_id=a.user_id
                     AND old.generation=a.generation AND old.method='recovery')
                OR a.recovery_resume_claim_session_id=live.id)
@@ -873,6 +874,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
               recovery_pending_repair_at=?, recovery_resume_claim_session_id=NULL
             WHERE user_id=? AND generation=? AND recovery_required=1 AND recovery_started_at=?
               AND recovery_started_at>? AND recovery_resume_key_hash IS ?
+              AND recovery_pending_key_hash IS NULL
               AND ${original ? "1=1" : "recovery_resume_claim_session_id=?"}
               AND NOT EXISTS (SELECT 1 FROM security_resets reset WHERE reset.user_id=account_security.user_id)
               AND EXISTS (SELECT 1 FROM session_security proof WHERE proof.session_id=? AND proof.user_id=?
@@ -891,7 +893,12 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
             id.userId,
             account.generation,
           );
-          const result = await env.DB.batch(original ? [grant, rotate] : [claim, grant, rotate]);
+          const clearAttempts = env.DB.prepare(`UPDATE account_security SET failed_attempts=0,locked_until=0
+            WHERE user_id=? AND generation=? AND recovery_pending_key_hash=?
+              AND recovery_pending_session_id=?`).bind(id.userId, account.generation, nextKeyHash, grantSessionId);
+          const result = await env.DB.batch(
+            original ? [grant, rotate, clearAttempts] : [claim, grant, rotate, clearAttempts],
+          );
           if (!original && !result[0]!.results.length) {
             throw deny("Recovery key expired, used, or revoked.");
           }
@@ -900,7 +907,6 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
             throw deny("Recovery expired or was revoked. Use a recovery code or operator reset token.");
           }
           if (!result[original ? 1 : 2]!.meta.changes) throw deny("Recovery key expired, used, or revoked.");
-          await resetAttempts(env, id.userId, account.generation);
           if (replacementSession) {
             const user = await ctx.context.internalAdapter.findUserById(id.userId);
             if (!user) throw deny("Sign in again.");

@@ -112,7 +112,7 @@ export async function slackReplyBody(
       });
     } else {
       for (const line of segment.split("\n")) {
-        if (blocks.length > 200) throw new HttpError(422, "slack_comment_too_complex", "Reply has too many lines.");
+        if (blocks.length >= 200) throw new HttpError(422, "slack_comment_too_complex", "Reply has too many lines.");
         const quote = /^(?:>|&gt;)\s?/.test(line);
         blocks.push({
           type: quote ? "quote" : "paragraph",
@@ -124,14 +124,11 @@ export async function slackReplyBody(
     }
   }
   let nodes = 0;
-  const count = (items: CommentNode[]) => {
-    for (const item of items) {
-      if (++nodes > 300) throw new HttpError(422, "slack_comment_too_complex", "Reply is too complex.");
-      if (item.content) count(item.content);
-      if (item.children) count(item.children);
-    }
+  const countInline = (node: CommentNode) => {
+    if (++nodes > 300) throw new HttpError(422, "slack_comment_too_complex", "Reply is too complex.");
+    for (const child of node.content ?? []) countInline(child);
   };
-  count(blocks);
+  for (const block of blocks) for (const node of block.content ?? []) countInline(node);
   return blocks;
 }
 

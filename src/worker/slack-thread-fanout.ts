@@ -77,7 +77,9 @@ export function slackThreadFanoutStatements(
     db
       .prepare(`INSERT OR IGNORE INTO slack_thread_deliveries
       (id, link_id, operation, source_id, actor_id, comment_id, created_at, updated_at)
-      SELECT l.id || ':' || ? || ':' || ?, l.id, ?, ?, ?, ?, ?, ? FROM slack_thread_links l
+      SELECT l.id || ':' || ? || ':' || ?, l.id, ?, ?, ?, ?,
+        MAX(?, COALESCE((SELECT MAX(prior.created_at)+1 FROM slack_thread_deliveries prior
+          WHERE prior.link_id=l.id AND prior.operation=?), ?)), ? FROM slack_thread_links l
       WHERE l.thread_id = ? AND l.state IN ('pending', 'active')
         AND (? = 1 OR NOT EXISTS (SELECT 1 FROM slack_thread_deliveries root WHERE root.link_id = l.id AND root.operation = 'root' AND root.comment_id = ?))
         AND NOT EXISTS (SELECT 1 FROM comments WHERE id = ? AND slack_source_receipt_id IS NOT NULL)`)
@@ -88,6 +90,8 @@ export function slackThreadFanoutStatements(
         sourceId,
         actorId,
         event.commentId ?? null,
+        createdAt,
+        event.refresh ? "refresh" : "reply",
         createdAt,
         createdAt,
         threadId,

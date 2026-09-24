@@ -1174,10 +1174,19 @@ describe("security lifecycle regressions", () => {
         .bind(session.id, user!.id, now, now + 600_000)
         .run();
     const signInCookies = [responseCookies(first), responseCookies(second)];
+    const grantsBefore = (await env.DB.prepare(
+      `SELECT COUNT(*) count FROM session_security WHERE method='recovery'`,
+    ).first<{ count: number }>())!.count;
     const results = await Promise.all(
       signInCookies.map((sessionCookie) => rawRequest(sessionCookie, "/api/security/resume-recovery", { resumeKey })),
     );
-    expect(results.some((result) => result.status === 200)).toBe(true);
+    expect(results.filter((result) => result.status === 200)).toHaveLength(1);
+    expect(results.filter((result) => result.status === 403)).toHaveLength(1);
+    expect(
+      (await env.DB.prepare(`SELECT COUNT(*) count FROM session_security WHERE method='recovery'`).first<{
+        count: number;
+      }>())!.count,
+    ).toBe(grantsBefore + 1);
     const pending = await env.DB.prepare(`SELECT recovery_pending_key_hash hash FROM account_security`).first<{
       hash: string;
     }>();

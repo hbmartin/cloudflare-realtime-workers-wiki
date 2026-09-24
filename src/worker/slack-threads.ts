@@ -837,6 +837,10 @@ async function finishDelivery(env: Env, delivery: Delivery, link: Link, messageT
       ? [
           env.DB.prepare(`UPDATE slack_thread_links SET root_message_ts = ?, state = 'active', updated_at = ? WHERE id = ? AND state = 'pending' AND subscription_id IS NOT NULL
       AND EXISTS (SELECT 1 FROM slack_installations i JOIN slack_channel_subscriptions s ON s.installation_id = i.id WHERE i.id = slack_thread_links.installation_id AND i.generation = slack_thread_links.installation_generation AND i.disconnected_at IS NULL AND s.id = slack_thread_links.subscription_id AND s.mirror_enabled = 1)
+      AND EXISTS (SELECT 1 FROM pages p JOIN comment_threads t ON t.page_id=p.id
+        WHERE p.id=slack_thread_links.page_id AND p.workspace_id=slack_thread_links.workspace_id
+          AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0
+          AND t.id=slack_thread_links.thread_id)
       AND EXISTS (SELECT 1 FROM slack_thread_deliveries d WHERE d.id=? AND d.state='sent' AND d.message_ts=?)`).bind(
             messageTs,
             Date.now(),
@@ -848,6 +852,30 @@ async function finishDelivery(env: Env, delivery: Delivery, link: Link, messageT
       : []),
   ]);
   await wakeNextSlackDelivery(env, link.id);
+}
+
+async function retireInvalidReconciledLink(env: Env, link: Link, delivery: Delivery) {
+  try {
+    await outboundAuthority(env, link, delivery.actor_id);
+    if (delivery.comment_id) {
+      const comment = await env.DB.prepare(
+        `SELECT user_id FROM comments WHERE id=? AND thread_id=? AND deleted_at IS NULL`,
+      )
+        .bind(delivery.comment_id, link.thread_id)
+        .first<{ user_id: string }>();
+      if (!comment || !(await currentAuthorCanRead(env, link, comment.user_id))) unavailable();
+    }
+    return;
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.status >= 500) throw error;
+  }
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE slack_thread_links SET state='retired',updated_at=?
+      WHERE id=? AND state IN ('pending','active')`).bind(now, link.id),
+    env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',failure_reason='link_unavailable',updated_at=?
+      WHERE link_id=? AND state='pending'`).bind(now, link.id),
+  ]);
 }
 
 export async function wakeNextSlackDelivery(env: Env, linkId: string) {
@@ -1066,7 +1094,8 @@ export async function retireUncertainSlackDelivery(
   const reason = "reconciliation_expired";
   const result = await env.DB.batch([
     env.DB.prepare(`UPDATE slack_thread_deliveries
-      SET state='retired',failure_reason=?,updated_at=? WHERE id=? AND state='sending'
+      SET state='retired',failure_reason=?,updated_at=? WHERE id=?
+        AND (state='sending' OR (state='blocked' AND failure_reason LIKE 'reconciliation_%'))
         AND NOT EXISTS (SELECT 1 FROM slack_thread_links link WHERE link.id=slack_thread_deliveries.link_id
           AND link.claim_token IS NOT NULL AND link.claimed_at>?)`).bind(reason, now, delivery.id, now - 60_000),
     env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
@@ -1149,9 +1178,11 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       .first<Delivery>();
     if (!currentDelivery || ["sent", "retired", "blocked"].includes(currentDelivery.state)) return;
     Object.assign(delivery, currentDelivery);
-    const link = await linkFor(env, delivery.link_id);
+    const link = await env.DB.prepare(`SELECT * FROM slack_thread_links WHERE id=?`)
+      .bind(delivery.link_id)
+      .first<Link>();
+    if (!link) unavailable();
     const installed = await installationFor(env, link.installation_id, link.installation_generation);
-    await validateChannel(env, installed, link.channel_id);
     // A lost post response must be reconciled before a later author revocation
     // can retire this root and permit a duplicate root for the thread.
     if (delivery.state === "sending" && delivery.operation !== "refresh") {
@@ -1171,14 +1202,14 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
         throw error;
       }
       await resumeHistoryClock(env, delivery, installed.id);
-      if (recovered) await finishDelivery(env, delivery, link, recovered);
-      else
-        await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=?
-        WHERE id=? AND slack_redrive_due_at IS NOT NULL`)
-          .bind(Date.now() + 60_000, `outbox:${delivery.id}`)
-          .run();
+      if (recovered) {
+        await finishDelivery(env, delivery, link, recovered);
+        await retireInvalidReconciledLink(env, link, delivery);
+      }
       return;
     }
+    await linkFor(env, delivery.link_id);
+    await validateChannel(env, installed, link.channel_id);
     const { installation, member, page } = await outboundAuthority(env, link, delivery.actor_id);
     if (delivery.operation !== "root" && !link.root_message_ts) {
       throw new DeliveryInProgressError();
@@ -1357,6 +1388,10 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
     }
   } catch (error) {
     if (error instanceof HttpError && error.code === "slack_channel_invalid") {
+      if (delivery.operation === "refresh") {
+        await retireRejectedDelivery(env, delivery, error.code);
+        return;
+      }
       if (delivery.state === "sending") {
         await pauseHistoryClock(env, delivery);
         await blockSlackDelivery(env, delivery, "reconciliation_channel_unavailable");
@@ -1376,6 +1411,10 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
         throw error;
       }
       if (slackChannelError(error)) {
+        if (delivery.operation === "refresh") {
+          await retireRejectedDelivery(env, delivery, error.code);
+          return;
+        }
         if (delivery.state === "sending") {
           await pauseHistoryClock(env, delivery);
           await blockSlackDelivery(env, delivery, `reconciliation_${error.code}`);
@@ -1401,6 +1440,10 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       }
     }
     if (error instanceof HttpError && error.status < 500) {
+      if (delivery.operation === "refresh") {
+        await retireRejectedDelivery(env, delivery, error.code);
+        return;
+      }
       const current = await env.DB.prepare(`SELECT state FROM slack_thread_deliveries WHERE id=?`)
         .bind(delivery.id)
         .first<{ state: string }>();

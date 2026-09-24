@@ -21,6 +21,7 @@ import {
   SlackRateLimitError,
   usableBotToken,
   slackPauseStatements,
+  rootControlRefreshStatements,
   type SlackInstallation,
   type SlackInteractionPayload,
 } from "./slack";
@@ -122,7 +123,7 @@ async function sessionFor(
 ) {
   const row = await env.DB.prepare(
     `SELECT * FROM slack_view_sessions WHERE id = ? AND kind = ? AND installation_id = ?
-      AND installation_generation = ? AND slack_user_id = ? AND (? = 'home' OR updated_at >= ?)`,
+      AND installation_generation = ? AND slack_user_id = ? AND (? = 'home' OR created_at >= ?)`,
   )
     .bind(id, kind, installation.id, installation.generation, userId, kind, Date.now() - SEARCH_SESSION_TTL_MS)
     .first<Session>();
@@ -609,6 +610,19 @@ async function deliverSearch(
     row = await env.DB.prepare(`SELECT * FROM slack_view_sessions WHERE id = ?`).bind(row.id).first<Session>();
     if (!row) unavailable();
   }
+  if (
+    row.pending_token &&
+    row.pending_attempts === 0 &&
+    (row.pending_started_at ?? row.updated_at) <= Date.now() - SEARCH_PENDING_ABANDON_MS
+  ) {
+    await env.DB.prepare(`UPDATE slack_view_sessions SET pending_state_json=NULL,pending_revision=NULL,
+      pending_token=NULL,pending_started_at=NULL,pending_lease_until=NULL
+      WHERE id=? AND pending_token=? AND pending_attempts=0`)
+      .bind(row.id, row.pending_token)
+      .run();
+    row = await env.DB.prepare(`SELECT * FROM slack_view_sessions WHERE id=?`).bind(row.id).first<Session>();
+    if (!row) unavailable();
+  }
   const retryPending =
     row.pending_token !== null &&
     row.pending_state_json !== null &&
@@ -637,7 +651,15 @@ async function deliverSearch(
     input?.initialLoading === true &&
     row.revision <= 1 &&
     (input.viewHash === row.opening_view_hash || (row.opening_view_hash === null && input.viewRevision === 0));
-  if (input && input.viewHash !== row.view_hash && !loadingClick) return "superseded";
+  if (input && input.viewHash !== row.view_hash && !loadingClick) {
+    if (row.pending_token || input.viewRevision !== row.revision || !input.viewHash) return "superseded";
+    const rebased = await env.DB.prepare(`UPDATE slack_view_sessions SET view_hash=?
+      WHERE id=? AND revision=? AND pending_token IS NULL AND view_hash IS ?`)
+      .bind(input.viewHash, row.id, row.revision, row.view_hash)
+      .run();
+    if (!rebased.meta.changes) return "deferred";
+    row.view_hash = input.viewHash;
+  }
   const state = retryPending
     ? (JSON.parse(row.pending_state_json!) as SearchState)
     : (input?.search ?? (parseSession(row) as SearchState));
@@ -725,6 +747,14 @@ async function deliverSearch(
     });
   } catch (error) {
     if (error instanceof SlackApiError && error.code === "hash_conflict") {
+      if (row.pending_attempts === 0) {
+        await env.DB.prepare(`UPDATE slack_view_sessions SET pending_state_json=NULL,pending_revision=NULL,
+          pending_token=NULL,pending_started_at=NULL,pending_lease_until=NULL,pending_attempts=0
+          WHERE id=? AND pending_token=? AND pending_lease_until=? AND pending_attempts=1`)
+          .bind(row.id, pendingToken, leaseUntil)
+          .run();
+        return "superseded";
+      }
       // A prior attempt may already be visible in Slack. Preserve its intent
       // for a signed interaction, but stop polling the stale base hash.
       if (receiptId)
@@ -748,6 +778,15 @@ async function deliverSearch(
         .run();
       await env.DB.prepare(`DELETE FROM slack_view_sessions WHERE id = ?`).bind(row.id).run();
       return "superseded";
+    }
+    if (
+      error instanceof SlackRateLimitError ||
+      (error instanceof SlackApiError && error.method === "oauth.v2.access")
+    ) {
+      await env.DB.prepare(`UPDATE slack_view_sessions SET pending_attempts=MAX(0,pending_attempts-1),
+        pending_lease_until=NULL WHERE id=? AND pending_token=? AND pending_lease_until=?`)
+        .bind(row.id, pendingToken, leaseUntil)
+        .run();
     }
     // A failed transport may have reached Slack. Keep the intent and base hash
     // for reconciliation from the next signed view interaction.
@@ -1173,7 +1212,14 @@ async function deliverRootAction(env: Env, receiptId: string, input: ActionInput
     await env.DB.batch([
       rootGuard(env, receiptId, input, linkId, true),
       ...(unchanged
-        ? []
+        ? rootControlRefreshStatements(
+            env,
+            link.subscription_id!,
+            installation.workspace_id,
+            member.user.id,
+            receiptId,
+            now,
+          )
         : slackPauseStatements(
             env,
             link.subscription_id!,
@@ -1338,11 +1384,15 @@ async function deliverShareAction(
       statements.push(
         env.DB.prepare(`INSERT OR IGNORE INTO slack_thread_deliveries
         (id, link_id, operation, source_id, actor_id, created_at, updated_at)
-        VALUES (?, ?, 'refresh', ?, ?, ?, ?)`).bind(
+        VALUES (?, ?, 'refresh', ?, ?,
+          MAX(?, COALESCE((SELECT MAX(prior.created_at)+1 FROM slack_thread_deliveries prior
+            WHERE prior.link_id=? AND prior.operation='refresh'), ?)), ?)`).bind(
           refreshId,
           context.linkId,
           receiptId,
           context.member.user.id,
+          Date.now(),
+          context.linkId,
           Date.now(),
           Date.now(),
         ),
