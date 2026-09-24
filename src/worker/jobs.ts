@@ -1,5 +1,5 @@
 import {
-  blockSlackDelivery,
+  retireUncertainSlackDelivery,
   deliverSlackThread,
   deliverSlackMutation,
   deliverSlackDenial,
@@ -24,7 +24,13 @@ import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { cleanupExport, runExport } from "./exporter";
 import { cleanupImport, runImport } from "./importer";
-import { deliverSlackChannelEvent, deliverSlackControlsExpiry, deliverSlackUnfurl } from "./slack";
+import {
+  deliverSlackChannelEvent,
+  deliverSlackControlsExpiry,
+  deliverSlackUnfurl,
+  SlackApiError,
+  slackInstallationError,
+} from "./slack";
 import { deliverSlackHome } from "./slack-workspace";
 import { deliverWebhook, fanoutWebhookEvent } from "./webhooks";
 import {
@@ -1431,7 +1437,7 @@ export async function redriveStaleSlackOutbox(env: Env) {
     .bind(now - SLACK_REDRIVE_STALE_MS)
     .run();
   const rows = await env.DB.prepare(`SELECT id, workspace_id, topic, payload_json, enqueued_at, created_at,
-      slack_redrive_due_at, slack_redrive_count FROM outbox
+      slack_redrive_due_at, slack_redrive_count, slack_auth_pause_baseline_ms FROM outbox
     WHERE slack_redrive_due_at IS NOT NULL AND slack_redrive_due_at <= ?
     ORDER BY slack_redrive_due_at, id LIMIT 50`)
     .bind(now)
@@ -1444,6 +1450,7 @@ export async function redriveStaleSlackOutbox(env: Env) {
       created_at: number;
       slack_redrive_due_at: number;
       slack_redrive_count: number;
+      slack_auth_pause_baseline_ms: number | null;
     }>();
   let redriven = 0;
   for (const row of rows.results) {
@@ -1459,7 +1466,9 @@ export async function redriveStaleSlackOutbox(env: Env) {
     }
     const pending =
       row.topic === "slack_thread_reply"
-        ? await env.DB.prepare(`SELECT id, link_id, operation, state, created_at FROM slack_thread_deliveries
+        ? await env.DB.prepare(`SELECT id, link_id, operation, state, created_at,attempted_at,
+            auth_pause_baseline_ms,history_paused_at,history_pause_auth_ms,history_pause_total_ms
+            FROM slack_thread_deliveries
             WHERE id = ? AND state IN ('pending','sending')`)
             .bind(key)
             .first<{
@@ -1468,6 +1477,11 @@ export async function redriveStaleSlackOutbox(env: Env) {
               operation: "root" | "reply" | "refresh";
               state: string;
               created_at: number;
+              attempted_at: number | null;
+              auth_pause_baseline_ms: number | null;
+              history_paused_at: number | null;
+              history_pause_auth_ms: number | null;
+              history_pause_total_ms: number;
             }>()
         : await env.DB.prepare(`SELECT 1 FROM ${row.topic === "slack_inbound_reply" ? "slack_inbound_receipts" : "slack_interaction_receipts"}
           WHERE id = ? AND processed_at IS NULL`)
@@ -1485,29 +1499,54 @@ export async function redriveStaleSlackOutbox(env: Env) {
             operation: "root" | "reply" | "refresh";
             state: string;
             created_at: number;
+            attempted_at: number | null;
+            auth_pause_baseline_ms: number | null;
+            history_paused_at: number | null;
+            history_pause_auth_ms: number | null;
+            history_pause_total_ms: number;
           })
         : null;
-    if (delivery) {
-      const blockedEarlier = await env.DB.prepare(`SELECT 1 FROM slack_thread_deliveries prior
-        WHERE prior.link_id=? AND prior.id<>? AND prior.state='blocked'
-          AND (?<>'root' AND (prior.operation='root' OR
-            (prior.operation<>'root' AND (prior.created_at < ? OR (prior.created_at=? AND prior.id < ?))))) LIMIT 1`)
-        .bind(delivery.link_id, delivery.id, delivery.operation, delivery.created_at, delivery.created_at, delivery.id)
-        .first();
-      if (blockedEarlier) {
-        await blockSlackDelivery(
-          env,
-          delivery,
-          delivery.state === "sending" ? "reconciliation_predecessor_blocked" : "predecessor_blocked",
-        );
-        await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=NULL WHERE id=?`).bind(row.id).run();
-        continue;
-      }
+    const installation = await env.DB.prepare(`SELECT auth_error_at,auth_paused_ms FROM slack_installations
+      WHERE workspace_id=? AND disconnected_at IS NULL`)
+      .bind(row.workspace_id)
+      .first<{ auth_error_at: number | null; auth_paused_ms: number }>();
+    const authClock =
+      (installation?.auth_paused_ms ?? 0) +
+      (installation?.auth_error_at === null || installation?.auth_error_at === undefined
+        ? 0
+        : Math.max(0, now - installation.auth_error_at));
+    if (
+      installation?.auth_error_at !== null &&
+      installation?.auth_error_at !== undefined &&
+      row.topic !== "slack_thread_action" &&
+      row.topic !== "slack_workspace_action"
+    ) {
+      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=? AND slack_redrive_due_at=?`)
+        .bind(now + 60_000, row.id, row.slack_redrive_due_at)
+        .run();
+      continue;
+    }
+    if (delivery?.state === "pending") {
       const earlier = await env.DB.prepare(`SELECT 1 FROM slack_thread_deliveries prior
         WHERE prior.link_id=? AND prior.id<>? AND prior.state IN ('pending','sending','blocked')
           AND (?<>'root' AND (prior.operation='root' OR
-            (prior.operation<>'root' AND (prior.created_at < ? OR (prior.created_at=? AND prior.id < ?))))) LIMIT 1`)
-        .bind(delivery.link_id, delivery.id, delivery.operation, delivery.created_at, delivery.created_at, delivery.id)
+            (?='reply' AND prior.operation='reply' AND
+              (prior.created_at < ? OR (prior.created_at=? AND prior.id < ?))) OR
+            (?='refresh' AND prior.operation='refresh' AND
+              (prior.created_at < ? OR (prior.created_at=? AND prior.id < ?))))) LIMIT 1`)
+        .bind(
+          delivery.link_id,
+          delivery.id,
+          delivery.operation,
+          delivery.operation,
+          delivery.created_at,
+          delivery.created_at,
+          delivery.id,
+          delivery.operation,
+          delivery.created_at,
+          delivery.created_at,
+          delivery.id,
+        )
         .first();
       if (earlier) {
         // Completion normally wakes the successor. Keep a cheap due check in
@@ -1519,16 +1558,57 @@ export async function redriveStaleSlackOutbox(env: Env) {
       }
     }
     const expiredAction = row.topic === "slack_thread_action" || row.topic === "slack_workspace_action";
-    const exhausted = row.slack_redrive_count >= 8 || row.created_at <= now - 24 * 60 * 60_000;
+    const eligibleAge = Math.max(
+      0,
+      now - row.created_at - Math.max(0, authClock - (row.slack_auth_pause_baseline_ms ?? 0)),
+    );
+    const historyPause =
+      delivery?.history_paused_at === null || delivery?.history_paused_at === undefined
+        ? 0
+        : Math.max(
+            0,
+            now - delivery.history_paused_at - Math.max(0, authClock - (delivery.history_pause_auth_ms ?? authClock)),
+          );
+    const uncertainAge =
+      delivery?.attempted_at === null || delivery?.attempted_at === undefined
+        ? 0
+        : Math.max(
+            0,
+            now -
+              delivery.attempted_at -
+              Math.max(0, authClock - (delivery.auth_pause_baseline_ms ?? 0)) -
+              delivery.history_pause_total_ms -
+              historyPause,
+          );
+    const exhausted =
+      delivery?.state === "sending"
+        ? uncertainAge >= 24 * 60 * 60_000
+        : row.slack_redrive_count >= 8 || eligibleAge >= 24 * 60 * 60_000;
     if (expiredAction || exhausted) {
       if (delivery) {
         if (delivery.state === "sending") {
-          await blockSlackDelivery(env, delivery, "redrive_exhausted_uncertain");
+          if (!(await retireUncertainSlackDelivery(env, delivery))) {
+            await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=?
+              WHERE id=? AND slack_redrive_due_at=?`)
+              .bind(now + 60_000, row.id, row.slack_redrive_due_at)
+              .run();
+            continue;
+          }
         } else {
           if (delivery.operation === "root") {
             await env.DB.batch([
               env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired', failure_reason='redrive_exhausted', updated_at=?
                 WHERE id=? AND state='pending'`).bind(now, key),
+              env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
+                (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
+                SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,''),
+                  COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'redrive_exhausted',?
+                FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
+                LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
+                WHERE delivery.id=? AND delivery.state='retired' AND delivery.failure_reason='redrive_exhausted'`).bind(
+                now,
+                key,
+              ),
               env.DB.prepare(`UPDATE slack_thread_links SET state='retired', updated_at=?
                 WHERE id=? AND EXISTS
                   (SELECT 1 FROM slack_thread_deliveries WHERE id=? AND state='retired' AND failure_reason='redrive_exhausted')`).bind(
@@ -1543,10 +1623,20 @@ export async function redriveStaleSlackOutbox(env: Env) {
                     AND failure_reason='redrive_exhausted')`).bind(now, delivery.link_id, delivery.link_id, key),
             ]);
           } else {
-            await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired', failure_reason='redrive_exhausted', updated_at=?
-              WHERE id=? AND state='pending'`)
-              .bind(now, key)
-              .run();
+            await env.DB.batch([
+              env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',failure_reason='redrive_exhausted',updated_at=?
+                WHERE id=? AND state='pending'`).bind(now, key),
+              env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
+                (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
+                SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,''),
+                  COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'redrive_exhausted',?
+                FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
+                LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
+                WHERE delivery.id=? AND delivery.state='retired' AND delivery.failure_reason='redrive_exhausted'`).bind(
+                now,
+                key,
+              ),
+            ]);
             await wakeNextSlackDelivery(env, delivery.link_id);
           }
         }
@@ -1682,7 +1772,18 @@ export async function consumeDeliveryMessage(
     try {
       await deliverSlackThread(env, payload.deliveryId);
     } catch (error) {
-      if (!(error instanceof DeliveryInProgressError)) throw error;
+      if (
+        !(error instanceof DeliveryInProgressError) &&
+        !(
+          error instanceof SlackApiError &&
+          (slackInstallationError(error) ||
+            error.status >= 500 ||
+            ["internal_error", "service_unavailable", "fatal_error", "invalid_response", "http_error"].includes(
+              error.code,
+            ))
+        )
+      )
+        throw error;
       // The predecessor or another consumer owns the link. The indexed due marker
       // and predecessor completion will wake this row without spending queue retries.
       await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=? AND slack_redrive_due_at IS NOT NULL`)
@@ -1694,7 +1795,16 @@ export async function consumeDeliveryMessage(
     await sweepOutbox(env);
   } else if (row.topic === "slack_inbound_reply" || row.topic === "slack_thread_action") {
     if (typeof payload.receiptId !== "string") return await rejectPayload("Slack receipt is invalid.");
-    await deliverSlackMutation(env, payload.receiptId, row.topic === "slack_thread_action");
+    try {
+      await deliverSlackMutation(env, payload.receiptId, row.topic === "slack_thread_action");
+    } catch (error) {
+      if (!(error instanceof SlackApiError && slackInstallationError(error))) throw error;
+      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=? AND slack_redrive_due_at IS NOT NULL`)
+        .bind(Date.now() + 60_000, outboxId)
+        .run();
+      message.ack();
+      return "acknowledged";
+    }
     await sweepOutbox(env);
   } else if (row.topic === "slack_interaction_response") {
     await deliverSlackDenial(env, payload);
@@ -1713,7 +1823,16 @@ export async function consumeDeliveryMessage(
   } else if (row.topic === "slack_channel") {
     const eventId = payload.eventId;
     if (typeof eventId !== "string") return await rejectPayload("Slack channel outbox payload is invalid.");
-    await deliverSlackChannelEvent(env, eventId);
+    try {
+      await deliverSlackChannelEvent(env, eventId);
+    } catch (error) {
+      if (!(error instanceof SlackApiError && slackInstallationError(error))) throw error;
+      await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=? WHERE id=?`)
+        .bind(Date.now() + 60_000, outboxId)
+        .run();
+      message.ack();
+      return "acknowledged";
+    }
   } else if (row.topic === "slack_controls_expire") {
     await deliverSlackControlsExpiry(env, payload);
     await sweepOutbox(env);

@@ -145,7 +145,7 @@ export function SecurityScreen({
   if (!status) return <output>Loading account protection…</output>;
   const enrollment = status.state === "enrollment_required" && !status.totp && !status.passkeys;
   const recoveryEnrollment = status.state === "recovery_required";
-  const canManage = status.fresh || enrollment || recoveryEnrollment;
+  const canManage = (status.fresh || enrollment || recoveryEnrollment) && !status.recoveryKeyAcknowledgmentRequired;
   const slackPrimary = status.slackPrimary?.available === true;
   const primaryFactorFormVisible =
     codes.length === 0 &&
@@ -214,10 +214,15 @@ export function SecurityScreen({
             <button
               type="button"
               disabled={!resumeKeySaved}
-              onClick={() => {
-                setResumeKey("");
-                setResumeKeySaved(false);
-              }}
+              onClick={() =>
+                void run(async () => {
+                  await securityAction("acknowledge-resume-key", { resumeKey });
+                  setResumeKey("");
+                  setResumeKeySaved(false);
+                  await reload();
+                  setNotice("Recovery resume key saved.");
+                })
+              }
             >
               Continue
             </button>
@@ -301,7 +306,12 @@ export function SecurityScreen({
                 <button>Resume recovery</button>
               </form>
             )}
-            {(enrollment || setup || recoveryEnrollment) && (
+            {status.recoveryKeyAcknowledgmentRequired && (
+              <p>
+                The key shown for this session was not saved. Resume recovery with fresh proof to issue another key.
+              </p>
+            )}
+            {(enrollment || setup || recoveryEnrollment) && !status.recoveryKeyAcknowledgmentRequired && (
               <>
                 <h3>{recoveryEnrollment ? "Restore account protection" : "Choose an authenticator app or passkey"}</h3>
                 <button type="button" onClick={() => void run(addPasskey)}>

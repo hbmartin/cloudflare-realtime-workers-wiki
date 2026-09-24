@@ -311,7 +311,11 @@ describe("protection recovery flows", () => {
     fireEvent.click(screen.getByLabelText("I saved my recovery resume key"));
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(screen.queryByLabelText("Setup key")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Set up authenticator app" })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "Set up authenticator app" })).toBeVisible();
+    expect(api).toHaveBeenCalledWith("/api/security/acknowledge-resume-key", {
+      method: "POST",
+      body: JSON.stringify({ resumeKey: "rotated-key" }),
+    });
     expect(api).toHaveBeenCalledWith("/api/security/resume-recovery", {
       method: "POST",
       body: JSON.stringify({ password: "password123" }),

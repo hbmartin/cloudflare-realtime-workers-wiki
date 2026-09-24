@@ -18,9 +18,11 @@ import {
   handleSlackCommand,
   handleSlackEvent,
   recordVerifiedSlackIdentity,
+  recordSlackInstallationError,
   sendPersonalSlackNotification,
   sendDueSlackChannelDigests,
   SlackRateLimitError,
+  SlackApiError,
   slackScopeHealth,
   slackWorkspaceStatus,
   validateSlackIdentity,
@@ -549,7 +551,24 @@ describe("Slack security and integration", () => {
         team: { id: "T123", name: "Test Slack" },
       }),
     );
+    const oldRevision = (await env.DB.prepare(`SELECT credential_revision revision FROM slack_installations
+      WHERE team_id='T123'`).first<{ revision: number }>())!.revision;
+    await env.DB.prepare(`INSERT INTO outbox
+      (id,workspace_id,topic,payload_json,available_at,enqueued_at,created_at,slack_redrive_due_at)
+      SELECT 'reauth-pending',workspace_id,'slack_inbound_reply','{"receiptId":"pending"}',1,1,1,1
+      FROM slack_installations WHERE team_id='T123'`).run();
     await finishSlackOAuth(configured, memberContext(installed.member), "oauth-code", reauthorizeState);
+    expect(
+      await env.DB.prepare(`SELECT enqueued_at,slack_redrive_due_at FROM outbox WHERE id='reauth-pending'`).first(),
+    ).toEqual({ enqueued_at: null, slack_redrive_due_at: null });
+    await recordSlackInstallationError(
+      configured,
+      installation!.id,
+      new SlackApiError("chat.postMessage", "invalid_auth", 200, oldRevision),
+    );
+    expect(
+      await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id=?`).bind(installation!.id).first(),
+    ).toEqual({ auth_error: null });
     expect(await env.DB.prepare(`SELECT id FROM slack_installations WHERE team_id = 'T123'`).first()).toEqual({
       id: installation!.id,
     });

@@ -257,15 +257,20 @@ nodes before the existing 32 KiB comment validation. Unknown mentions remain pla
 authority; disconnect invalidates queued work and requires identity verification and mirror opt-in after reconnect.
 
 Outbound posts carry an opaque delivery marker. A lost response or abandoned send is reconciled against at most 20
-history pages of 100 messages. An inconclusive result blocks the delivery and its successors instead of posting a
-possible duplicate. Slack Settings displays the blocked count and logs emit `slack.thread.delivery_blocked` without
-content. Do not reset a `sending` or `blocked` record to `pending`: that can duplicate a message Slack already accepted.
-An operator can inspect the marker in Slack and the durable delivery record; this milestone deliberately provides no
-automatic resend for an uncertain result. Disabling the mirror stops subsequent work without deleting Slack history.
+history pages of 100 messages. Replies waiting for an earlier delivery stay pending; Settings shows waiting and
+unresolved reconciliation separately. An uncertain send is never blindly reposted. Do not reset a `sending` record
+to `pending`: Slack may already have accepted it. Installation authentication outages and failed history lookups pause
+the reconciliation clock. After 24 eligible hours without confirmation, an uncertain reply is skipped and later
+replies can continue. An uncertain root retires its link, so a later eligible event can establish a new root.
+History permission loss holds the send for owner verification or reauthorization. Disabling the mirror retires its
+unsent work without deleting Slack history.
 Ephemeral denials are best effort and never fall back to public channel messages.
 Definitively rejected replies are recorded as failed and skipped so later replies continue; a rejected root retires
-its link. Pending receipts and deliveries are redriven after 30 minutes with bounded backoff, at most eight redrives
-or 24 hours. Unresolved sends remain blocked for marker reconciliation. Unapplied buttons expire after ten minutes.
+its link. Pending receipts and deliveries are redriven with bounded backoff, at most eight eligible redrives or 24
+eligible hours. Authentication outages pause those limits; ordering waits consume no redrive budget. Slack Settings
+retains terminal delivery failures, including after mapping deletion, until an owner acknowledges their visibility.
+Acknowledgment does not retry or remove a delivery. Owners can Verify and resume after repairing channel access.
+Unapplied buttons expire after ten minutes.
 
 ## Interactive Slack workspace
 
