@@ -2349,13 +2349,57 @@ describe("canonical Slack mirrors", () => {
     const { created } = await activeThread();
     await addCommentReply(runtime(), owner, commentPage, created.id, body("Uncertain"));
     const failedReply = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
-    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending' WHERE id=?`).bind(failedReply.id).run();
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+      failure_reason='reconciliation_inconclusive' WHERE id=?`)
+      .bind(failedReply.id)
+      .run();
     await deleteSlackChannelSubscription(runtime(), owner, "space");
     expect(await listSlackDeliveryFailureGroups(runtime(), owner)).toMatchObject([
       { id: "space", failedDeliveries: 1 },
     ]);
     expect((await deliveries(created.id)).find((d) => d.id === failedReply.id)?.state).toBe("retired");
+    expect(
+      await env.DB.prepare(`SELECT reason FROM slack_delivery_failures WHERE delivery_id=?`)
+        .bind(failedReply.id)
+        .first(),
+    ).toEqual({ reason: "mapping_removed_unconfirmed" });
     await acknowledgeSlackDeliveryFailures(runtime(), owner, "space");
+    expect(await listSlackDeliveryFailureGroups(runtime(), owner)).toEqual([]);
+  });
+  it("retires blocked uncertainty on mirror disable", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Uncertain"));
+    const failedReply = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+      failure_reason='reconciliation_inconclusive' WHERE id=?`)
+      .bind(failedReply.id)
+      .run();
+    await setSlackMirror(runtime(), owner, "space", false);
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(failedReply.id)
+        .first(),
+    ).toEqual({ state: "retired", failure_reason: "mirror_disabled_unconfirmed" });
+    expect(
+      await env.DB.prepare(`SELECT reason FROM slack_delivery_failures WHERE delivery_id=?`)
+        .bind(failedReply.id)
+        .first(),
+    ).toEqual({ reason: "mirror_disabled_unconfirmed" });
+  });
+  it("groups a disconnected orphaned link by a usable health identifier", async () => {
+    const { created, link } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Uncertain"));
+    const failedReply = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+      failure_reason='reconciliation_inconclusive' WHERE id=?`)
+      .bind(failedReply.id)
+      .run();
+    await env.DB.prepare(`UPDATE slack_thread_links SET subscription_id=NULL WHERE id=?`).bind(link.id).run();
+    await disconnectSlack(runtime(), owner);
+    expect(await listSlackDeliveryFailureGroups(runtime(), owner)).toEqual(
+      expect.arrayContaining([{ id: `orphan:${link.id}`, channelName: "CSPACE", failedDeliveries: 1 }]),
+    );
+    await acknowledgeSlackDeliveryFailures(runtime(), owner, `orphan:${link.id}`);
     expect(await listSlackDeliveryFailureGroups(runtime(), owner)).toEqual([]);
   });
   it("does not resume blocked deliveries after the verifying owner loses access", async () => {

@@ -27,17 +27,21 @@ export function slackThreadFanoutStatements(
     db
       .prepare(`INSERT OR IGNORE INTO slack_delivery_failures
       (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
-      SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,''),
+      SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
         COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'mapping_retired_unconfirmed',?
       FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
       LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
-      WHERE link.thread_id=? AND link.state='retired' AND link.updated_at=? AND delivery.state='sending'`)
+      WHERE link.thread_id=? AND link.state='retired' AND link.updated_at=?
+        AND (delivery.state='sending' OR
+          (delivery.state='blocked' AND delivery.failure_reason LIKE 'reconciliation_%'))`)
       .bind(createdAt, threadId, createdAt),
     db
       .prepare(`UPDATE slack_thread_deliveries SET state='retired',updated_at=?,
-      failure_reason=CASE WHEN state='sending' THEN 'mapping_retired_unconfirmed' ELSE 'mapping_retired' END
+      failure_reason=CASE WHEN state IN ('sending','blocked') THEN 'mapping_retired_unconfirmed' ELSE 'mapping_retired' END
       WHERE link_id IN (SELECT id FROM slack_thread_links
-        WHERE thread_id=? AND state='retired' AND updated_at=?) AND state IN ('pending','sending')`)
+        WHERE thread_id=? AND state='retired' AND updated_at=?)
+        AND (state IN ('pending','sending') OR
+          (state='blocked' AND failure_reason LIKE 'reconciliation_%'))`)
       .bind(createdAt, threadId, createdAt),
     db
       .prepare(`INSERT OR IGNORE INTO slack_thread_links

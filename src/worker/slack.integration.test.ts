@@ -1003,6 +1003,19 @@ describe("Slack security and integration", () => {
       await env.DB.prepare(`SELECT delivered_at FROM slack_channel_events WHERE id = ?`).bind(event!.id).first(),
     ).toEqual({ delivered_at: null });
 
+    await env.DB.prepare(`UPDATE slack_installations SET credential_revision=7 WHERE id='slack-installation'`).run();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ ok: false, error: "invalid_auth" })),
+    );
+    await expect(deliverSlackChannelEvent(slackEnv(), event!.id)).rejects.toMatchObject({ code: "invalid_auth" });
+    expect(
+      await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='slack-installation'`).first(),
+    ).toEqual({ auth_error: "invalid_auth" });
+    await env.DB.prepare(
+      `UPDATE slack_installations SET auth_error=NULL,auth_error_at=NULL WHERE id='slack-installation'`,
+    ).run();
+
     const deliveredFetch = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
       Response.json({ ok: true }),
     );

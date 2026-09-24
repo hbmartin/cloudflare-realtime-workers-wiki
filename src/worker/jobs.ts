@@ -1601,7 +1601,7 @@ export async function redriveStaleSlackOutbox(env: Env) {
                 WHERE id=? AND state='pending'`).bind(now, key),
               env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
                 (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
-                SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,''),
+                SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
                   COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'redrive_exhausted',?
                 FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
                 LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
@@ -1628,7 +1628,7 @@ export async function redriveStaleSlackOutbox(env: Env) {
                 WHERE id=? AND state='pending'`).bind(now, key),
               env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
                 (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
-                SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,''),
+                SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
                   COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'redrive_exhausted',?
                 FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
                 LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id

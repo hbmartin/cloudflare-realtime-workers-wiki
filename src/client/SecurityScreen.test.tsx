@@ -322,6 +322,25 @@ describe("protection recovery flows", () => {
     });
   });
 
+  it("returns to recovery when a displayed handoff key has expired or been superseded", async () => {
+    const recovery = { ...status, state: "recovery_required" as const, recoveryCanResume: true };
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/security/resume-recovery") return { success: true, resumeKey: "stale-key" };
+      if (path === "/api/security/acknowledge-resume-key")
+        throw new ApiClientError(403, "recovery_key_expired", "Recovery key expired.");
+      return recovery;
+    });
+    render(<SecurityScreen initialStatus={recovery} />);
+    fireEvent.change(screen.getByLabelText("Password to resume recovery"), { target: { value: "password123" } });
+    fireEvent.submit(screen.getByLabelText("Password to resume recovery").closest("form")!);
+    await screen.findByText("stale-key");
+    fireEvent.click(screen.getByLabelText("I saved my recovery resume key"));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Recovery key expired.");
+    expect(screen.queryByText("stale-key")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Password to resume recovery")).toBeVisible();
+  });
+
   it("uses the shared API fallback for non-JSON failures", async () => {
     const original = await vi.importActual<typeof import("./api")>("./api");
     vi.mocked(api).mockImplementation(original.api);

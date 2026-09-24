@@ -216,7 +216,16 @@ export function SecurityScreen({
               disabled={!resumeKeySaved}
               onClick={() =>
                 void run(async () => {
-                  await securityAction("acknowledge-resume-key", { resumeKey });
+                  try {
+                    await securityAction("acknowledge-resume-key", { resumeKey });
+                  } catch (cause) {
+                    if (cause instanceof ApiClientError && cause.status === 403) {
+                      setResumeKey("");
+                      setResumeKeySaved(false);
+                      await reload().catch(() => undefined);
+                    }
+                    throw cause;
+                  }
                   setResumeKey("");
                   setResumeKeySaved(false);
                   await reload();

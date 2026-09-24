@@ -537,15 +537,20 @@ export async function disconnectSlack(env: Env, member: MemberContext) {
   await env.DB.batch([
     env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
       (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
-      SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,''),
+      SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
         COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'disconnect_unconfirmed',?
       FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
       LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
-      WHERE link.workspace_id=? AND delivery.state='sending'`).bind(Date.now(), member.workspace.id),
+      WHERE link.workspace_id=? AND (delivery.state='sending' OR
+        (delivery.state='blocked' AND delivery.failure_reason LIKE 'reconciliation_%'))`).bind(
+      Date.now(),
+      member.workspace.id,
+    ),
     env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',updated_at=?,
-      failure_reason=CASE WHEN state='sending' THEN 'disconnect_unconfirmed' ELSE 'disconnected' END
+      failure_reason=CASE WHEN state IN ('sending','blocked') THEN 'disconnect_unconfirmed' ELSE 'disconnected' END
       WHERE link_id IN (SELECT id FROM slack_thread_links WHERE workspace_id=?)
-        AND state IN ('pending','sending')`).bind(Date.now(), member.workspace.id),
+        AND (state IN ('pending','sending') OR
+          (state='blocked' AND failure_reason LIKE 'reconciliation_%'))`).bind(Date.now(), member.workspace.id),
     env.DB.prepare(
       `UPDATE slack_installations SET generation = generation + 1, disconnected_at = ?, updated_at = ? WHERE workspace_id = ? AND disconnected_at IS NULL`,
     ).bind(Date.now(), Date.now(), member.workspace.id),
@@ -867,7 +872,8 @@ export async function deleteSlackChannelSubscription(env: Env, member: MemberCon
         'mapping_removed_unconfirmed',?
       FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
       JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
-      WHERE mapping.id=? AND link.workspace_id=? AND delivery.state='sending'
+      WHERE mapping.id=? AND link.workspace_id=? AND (delivery.state='sending' OR
+        (delivery.state='blocked' AND delivery.failure_reason LIKE 'reconciliation_%'))
         AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`).bind(
       id,
       now,
@@ -877,10 +883,11 @@ export async function deleteSlackChannelSubscription(env: Env, member: MemberCon
       member.user.id,
     ),
     env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',updated_at=?,
-      failure_reason=CASE WHEN state='sending' THEN 'mapping_removed_unconfirmed' ELSE 'mapping_removed' END
+      failure_reason=CASE WHEN state IN ('sending','blocked') THEN 'mapping_removed_unconfirmed' ELSE 'mapping_removed' END
       WHERE link_id IN (SELECT link.id FROM slack_thread_links link
         WHERE link.subscription_id=? AND link.workspace_id=?)
-        AND state IN ('pending','sending')
+        AND (state IN ('pending','sending') OR
+          (state='blocked' AND failure_reason LIKE 'reconciliation_%'))
         AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`).bind(
       now,
       id,
@@ -1690,7 +1697,8 @@ async function channelEvent(env: Env, eventId: string) {
             actor.name actor_name, subscription.channel_id, subscription.id subscription_id,
             installation.id, installation.workspace_id, installation.team_id, installation.team_name,
             installation.bot_user_id, installation.bot_token_ciphertext,
-            installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at
+            installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at,
+            installation.generation, installation.credential_revision, installation.scopes
        FROM slack_channel_events event
        JOIN slack_channel_subscriptions subscription ON subscription.id = event.subscription_id
        JOIN slack_installations installation ON installation.id = subscription.installation_id

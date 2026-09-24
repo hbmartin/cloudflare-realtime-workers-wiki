@@ -50,6 +50,23 @@ afterEach(() => {
 });
 
 describe("SlackSettings", () => {
+  it("acknowledges a failure for an orphaned link using its encoded identifier", async () => {
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/slack/status") return { available: true, missing: [], installation: null, linked: false };
+      if (path === "/api/slack/delivery-health")
+        return { orphanedFailures: [{ id: "orphan:link-1", channelName: "notes", failedDeliveries: 1 }] };
+      if (path === "/api/slack/delivery-health/orphan%3Alink-1/acknowledge") return { ok: true };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Clear failures" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith("/api/slack/delivery-health/orphan%3Alink-1/acknowledge", {
+        method: "POST",
+      }),
+    );
+  });
+
   it("clearly reports unavailable operator configuration", async () => {
     vi.mocked(api).mockResolvedValue({
       available: false,

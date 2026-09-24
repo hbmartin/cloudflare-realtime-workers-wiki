@@ -204,7 +204,8 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
         SELECT d.id,?,mapping.id,mapping.channel_name,'mirror_disabled_unconfirmed',?
         FROM slack_thread_deliveries d JOIN slack_thread_links link ON link.id=d.link_id
           JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
-        WHERE mapping.id=? AND d.state='sending' AND EXISTS
+        WHERE mapping.id=? AND (d.state='sending' OR
+          (d.state='blocked' AND d.failure_reason LIKE 'reconciliation_%')) AND EXISTS
           (SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`).bind(
         member.workspace.id,
         now,
@@ -213,9 +214,10 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
         member.user.id,
       ),
       env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',
-        failure_reason=CASE WHEN state='sending' THEN 'mirror_disabled_unconfirmed' ELSE 'mirror_disabled' END,
+        failure_reason=CASE WHEN state IN ('sending','blocked') THEN 'mirror_disabled_unconfirmed' ELSE 'mirror_disabled' END,
         updated_at=? WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id=?)
-          AND state IN ('pending','sending') AND EXISTS
+          AND (state IN ('pending','sending') OR
+            (state='blocked' AND failure_reason LIKE 'reconciliation_%')) AND EXISTS
           (SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`).bind(
         now,
         subscriptionId,
@@ -282,10 +284,16 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
         env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
           (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
           SELECT delivery.id,link.workspace_id,?,COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),
-            'channel_unavailable',?
+            CASE WHEN delivery.state='pending' THEN 'channel_unavailable'
+              ELSE 'channel_unavailable_unconfirmed' END,?
           FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
           JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
-          WHERE mapping.id=? AND delivery.state IN ('pending','sending')`).bind(subscriptionId, now, subscriptionId),
+          WHERE mapping.id=? AND (delivery.state IN ('pending','sending') OR
+            (delivery.state='blocked' AND delivery.failure_reason LIKE 'reconciliation_%'))`).bind(
+          subscriptionId,
+          now,
+          subscriptionId,
+        ),
         env.DB.prepare(`UPDATE slack_channel_subscriptions SET mirror_enabled = 0, validation_state = 'invalid',
           validation_error = 'channel_unavailable', updated_at = ? WHERE id = ?`).bind(now, subscriptionId),
         env.DB.prepare(`UPDATE slack_thread_links SET state='retired', updated_at=?
@@ -297,7 +305,8 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
           subscriptionId,
         ),
         env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired', failure_reason='channel_unavailable_unconfirmed', updated_at=?
-          WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id=?) AND state='sending'`).bind(
+          WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id=?)
+            AND (state='sending' OR (state='blocked' AND failure_reason LIKE 'reconciliation_%'))`).bind(
           now,
           subscriptionId,
         ),
@@ -871,7 +880,7 @@ async function retireRejectedDelivery(env: Env, delivery: Delivery, reason: stri
       WHERE id=? AND state IN ('pending','sending') RETURNING id`).bind(reason, now, delivery.id),
     env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
       (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
-      SELECT ?,link.workspace_id,COALESCE(link.subscription_id,''),
+      SELECT ?,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
         COALESCE(mapping.channel_name,link.channel_id),?,?
       FROM slack_thread_links link LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
       WHERE link.id=? AND EXISTS (SELECT 1 FROM slack_thread_deliveries d
@@ -907,10 +916,12 @@ async function retireMirrorChannel(env: Env, delivery: Delivery, reason: string)
     await env.DB.batch([
       env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
         (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
-        SELECT d.id,thread_link.workspace_id,?,COALESCE(NULLIF(mapping.channel_name,''),thread_link.channel_id),?,?
+        SELECT d.id,thread_link.workspace_id,?,COALESCE(NULLIF(mapping.channel_name,''),thread_link.channel_id),
+          CASE WHEN d.state='pending' THEN ? ELSE 'channel_unavailable_unconfirmed' END,?
         FROM slack_thread_deliveries d JOIN slack_thread_links thread_link ON thread_link.id=d.link_id
         JOIN slack_channel_subscriptions mapping ON mapping.id=thread_link.subscription_id
-        WHERE mapping.id=? AND d.state IN ('pending','sending')`).bind(
+        WHERE mapping.id=? AND (d.state IN ('pending','sending') OR
+          (d.state='blocked' AND d.failure_reason LIKE 'reconciliation_%'))`).bind(
         link.subscription_id,
         reason,
         now,
@@ -928,7 +939,8 @@ async function retireMirrorChannel(env: Env, delivery: Delivery, reason: string)
         link.subscription_id,
       ),
       env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired', failure_reason=?, updated_at=?
-        WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id=?) AND state='sending'`).bind(
+        WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id=?)
+          AND (state='sending' OR (state='blocked' AND failure_reason LIKE 'reconciliation_%'))`).bind(
         `channel_unavailable_unconfirmed`,
         now,
         link.subscription_id,
@@ -1059,7 +1071,7 @@ export async function retireUncertainSlackDelivery(
           AND link.claim_token IS NOT NULL AND link.claimed_at>?)`).bind(reason, now, delivery.id, now - 60_000),
     env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
       (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
-      SELECT ?,link.workspace_id,COALESCE(link.subscription_id,''),
+      SELECT ?,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
         COALESCE(mapping.channel_name,link.channel_id),?,?
       FROM slack_thread_links link LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
       WHERE link.id=? AND EXISTS (SELECT 1 FROM slack_thread_deliveries d

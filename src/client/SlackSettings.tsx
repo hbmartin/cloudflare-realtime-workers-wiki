@@ -498,7 +498,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       disabled={busy}
                       onClick={() =>
                         void deliveryHealthAction(
-                          `/api/slack/channels/${subscription.id}/verify-recovery`,
+                          `/api/slack/channels/${encodeURIComponent(subscription.id)}/verify-recovery`,
                           "Slack channel access verified.",
                         )
                       }
@@ -511,7 +511,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       disabled={busy}
                       onClick={() =>
                         void deliveryHealthAction(
-                          `/api/slack/delivery-health/${subscription.id}/acknowledge`,
+                          `/api/slack/delivery-health/${encodeURIComponent(subscription.id)}/acknowledge`,
                           "Delivery failures acknowledged.",
                         )
                       }
@@ -589,7 +589,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
               disabled={busy}
               onClick={() =>
                 void deliveryHealthAction(
-                  `/api/slack/delivery-health/${group.id}/acknowledge`,
+                  `/api/slack/delivery-health/${encodeURIComponent(group.id)}/acknowledge`,
                   "Delivery failures acknowledged.",
                 )
               }
