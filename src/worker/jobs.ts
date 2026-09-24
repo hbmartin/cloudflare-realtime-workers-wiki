@@ -1,4 +1,10 @@
-import { deliverSlackThread, deliverSlackMutation, deliverSlackDenial } from "./slack-threads";
+import {
+  blockSlackDelivery,
+  deliverSlackThread,
+  deliverSlackMutation,
+  deliverSlackDenial,
+  wakeNextSlackDelivery,
+} from "./slack-threads";
 import { deliverSlackWorkspaceAction, deliverSlackSearchUpdate, deliverSlackShareResponse } from "./slack-workspace";
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
@@ -1455,7 +1461,13 @@ export async function redriveStaleSlackOutbox(env: Env) {
         ? await env.DB.prepare(`SELECT id, link_id, operation, state, created_at FROM slack_thread_deliveries
             WHERE id = ? AND state IN ('pending','sending')`)
             .bind(key)
-            .first<{ id: string; link_id: string; operation: string; state: string; created_at: number }>()
+            .first<{
+              id: string;
+              link_id: string;
+              operation: "root" | "reply" | "refresh";
+              state: string;
+              created_at: number;
+            }>()
         : await env.DB.prepare(`SELECT 1 FROM ${row.topic === "slack_inbound_reply" ? "slack_inbound_receipts" : "slack_interaction_receipts"}
           WHERE id = ? AND processed_at IS NULL`)
             .bind(key)
@@ -1466,9 +1478,29 @@ export async function redriveStaleSlackOutbox(env: Env) {
     }
     const delivery =
       row.topic === "slack_thread_reply"
-        ? (pending as { id: string; link_id: string; operation: string; state: string; created_at: number })
+        ? (pending as {
+            id: string;
+            link_id: string;
+            operation: "root" | "reply" | "refresh";
+            state: string;
+            created_at: number;
+          })
         : null;
     if (delivery) {
+      const blockedEarlier = await env.DB.prepare(`SELECT 1 FROM slack_thread_deliveries prior
+        WHERE prior.link_id=? AND prior.id<>? AND prior.state='blocked'
+          AND (prior.operation='root' OR (prior.created_at < ? OR (prior.created_at=? AND prior.id < ?))) LIMIT 1`)
+        .bind(delivery.link_id, delivery.id, delivery.created_at, delivery.created_at, delivery.id)
+        .first();
+      if (blockedEarlier) {
+        await blockSlackDelivery(
+          env,
+          delivery,
+          delivery.state === "sending" ? "reconciliation_predecessor_blocked" : "predecessor_blocked",
+        );
+        await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=NULL WHERE id=?`).bind(row.id).run();
+        continue;
+      }
       const earlier = await env.DB.prepare(`SELECT 1 FROM slack_thread_deliveries prior
         WHERE prior.link_id=? AND prior.id<>? AND prior.state IN ('pending','sending','blocked')
           AND (prior.operation='root' OR (prior.created_at < ? OR (prior.created_at=? AND prior.id < ?))) LIMIT 1`)
@@ -1484,10 +1516,7 @@ export async function redriveStaleSlackOutbox(env: Env) {
     if (expiredAction || exhausted) {
       if (delivery) {
         if (delivery.state === "sending") {
-          await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked', failure_reason='redrive_exhausted_uncertain', updated_at=?
-            WHERE id=? AND state='sending'`)
-            .bind(now, key)
-            .run();
+          await blockSlackDelivery(env, delivery, "redrive_exhausted_uncertain");
         } else {
           await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired', failure_reason='redrive_exhausted', updated_at=?
             WHERE id=? AND state='pending'`)
@@ -1500,20 +1529,12 @@ export async function redriveStaleSlackOutbox(env: Env) {
                 delivery.link_id,
               ),
               env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired', failure_reason='root_rejected', updated_at=?
-                WHERE link_id=? AND state='pending'`).bind(now, delivery.link_id),
+                WHERE link_id=? AND (state='pending' OR (state='blocked' AND failure_reason='predecessor_blocked'))`).bind(
+                now,
+                delivery.link_id,
+              ),
             ]);
-          else {
-            const next =
-              await env.DB.prepare(`SELECT id FROM slack_thread_deliveries WHERE link_id=? AND state='pending'
-              ORDER BY created_at,id LIMIT 1`)
-                .bind(delivery.link_id)
-                .first<{ id: string }>();
-            if (next)
-              await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
-              WHERE id=?`)
-                .bind(now, `outbox:${next.id}`)
-                .run();
-          }
+          else await wakeNextSlackDelivery(env, delivery.link_id);
         }
       } else if (row.topic === "slack_inbound_reply") {
         await env.DB.prepare(`UPDATE slack_inbound_receipts SET processed_at=?,outcome='redrive_exhausted',payload_json=NULL

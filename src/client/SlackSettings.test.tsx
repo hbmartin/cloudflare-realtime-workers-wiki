@@ -169,6 +169,46 @@ describe("SlackSettings", () => {
     expect(screen.getByText("Missing: chat:write")).toBeInTheDocument();
   });
 
+  it("offers owners reauthorization for bot authentication failure with complete scopes", async () => {
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/slack/status")
+        return {
+          available: true,
+          missing: [],
+          installation: {
+            teamId: "T123",
+            teamName: "Product Slack",
+            botUserId: "B123",
+            scopes: ["chat:write"],
+            connected: true,
+            createdAt: 1,
+            updatedAt: 1,
+            authError: "invalid_auth",
+            scopeHealth: {
+              required: ["chat:write"],
+              granted: ["chat:write"],
+              missing: [],
+              reauthorizationRequired: false,
+            },
+            capabilities: {
+              identity: { available: true, requiredScopes: ["users:read"], missingScopes: [] },
+            },
+          },
+          linked: false,
+          reauthorization: { required: true, available: true },
+        };
+      if (path === "/api/slack/channels") return { subscriptions: [] };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    expect(await screen.findByRole("button", { name: "Reauthorize Slack" })).toBeVisible();
+    expect(screen.getByText(/Reauthorize the workspace app to resume delivery/)).toBeVisible();
+    cleanup();
+    render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
+    expect(await screen.findByText(/Ask an owner to reauthorize the workspace app/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Reauthorize Slack" })).not.toBeInTheDocument();
+  });
+
   it("confirms a verified Slack identity without offering migration", async () => {
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/slack/status") {

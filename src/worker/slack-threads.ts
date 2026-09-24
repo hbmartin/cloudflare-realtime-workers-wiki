@@ -255,7 +255,8 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
         env.DB.prepare(`UPDATE slack_thread_links SET state='retired', updated_at=?
           WHERE subscription_id=? AND state IN ('pending','active')`).bind(now, subscriptionId),
         env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired', failure_reason='channel_unavailable', updated_at=?
-          WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id=?) AND state='pending'`).bind(
+          WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id=?)
+            AND (state='pending' OR (state='blocked' AND failure_reason='predecessor_blocked'))`).bind(
           now,
           subscriptionId,
         ),
@@ -728,10 +729,31 @@ async function finishDelivery(env: Env, delivery: Delivery, link: Link, messageT
         ]
       : []),
   ]);
-  await wakeNextDelivery(env, link.id);
+  await wakeNextSlackDelivery(env, link.id);
 }
 
-async function wakeNextDelivery(env: Env, linkId: string) {
+export async function wakeNextSlackDelivery(env: Env, linkId: string) {
+  // A successor blocked only by ordering can resume once no blocked or
+  // uncertain predecessor remains. Release one at a time to preserve order.
+  const releasable = await env.DB.prepare(`SELECT d.id FROM slack_thread_deliveries d
+    WHERE d.link_id=? AND d.state='blocked' AND d.failure_reason='predecessor_blocked'
+      AND NOT EXISTS (SELECT 1 FROM slack_thread_deliveries prior
+        WHERE prior.link_id=d.link_id AND prior.id<>d.id AND prior.state IN ('blocked','sending')
+          AND (prior.operation='root' OR
+            (prior.created_at<d.created_at OR (prior.created_at=d.created_at AND prior.id<d.id))))
+    ORDER BY d.created_at,d.id LIMIT 1`)
+    .bind(linkId)
+    .first<{ id: string }>();
+  if (releasable)
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='pending',failure_reason=NULL,updated_at=?
+      WHERE id=? AND state='blocked' AND failure_reason='predecessor_blocked'
+        AND NOT EXISTS (SELECT 1 FROM slack_thread_deliveries prior
+          WHERE prior.link_id=slack_thread_deliveries.link_id AND prior.id<>slack_thread_deliveries.id
+            AND prior.state IN ('blocked','sending')
+            AND (prior.operation='root' OR prior.created_at<slack_thread_deliveries.created_at OR
+              (prior.created_at=slack_thread_deliveries.created_at AND prior.id<slack_thread_deliveries.id)))`)
+      .bind(Date.now(), releasable.id)
+      .run();
   const next = await env.DB.prepare(`SELECT id FROM slack_thread_deliveries
     WHERE link_id=? AND state='pending' ORDER BY
       CASE operation WHEN 'root' THEN 0 ELSE 1 END, created_at, id LIMIT 1`)
@@ -757,9 +779,10 @@ async function retireRejectedDelivery(env: Env, delivery: Delivery, reason: stri
         delivery.link_id,
       ),
       env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired', failure_reason='root_rejected', updated_at=?
-        WHERE link_id=? AND state IN ('pending','sending')`).bind(now, delivery.link_id),
+        WHERE link_id=? AND (state IN ('pending','sending') OR
+          (state='blocked' AND failure_reason='predecessor_blocked'))`).bind(now, delivery.link_id),
     ]);
-  } else await wakeNextDelivery(env, delivery.link_id);
+  } else await wakeNextSlackDelivery(env, delivery.link_id);
 }
 
 async function retireMirrorChannel(env: Env, delivery: Delivery, reason: string) {
@@ -774,7 +797,8 @@ async function retireMirrorChannel(env: Env, delivery: Delivery, reason: string)
       env.DB.prepare(`UPDATE slack_thread_links SET state='retired', updated_at=?
         WHERE subscription_id=? AND state IN ('pending','active')`).bind(now, link.subscription_id),
       env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired', failure_reason=?, updated_at=?
-        WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id=?) AND state='pending'`).bind(
+        WHERE link_id IN (SELECT id FROM slack_thread_links WHERE subscription_id=?)
+          AND (state='pending' OR (state='blocked' AND failure_reason='predecessor_blocked'))`).bind(
         reason,
         now,
         link.subscription_id,
@@ -841,18 +865,32 @@ function definitelyNotPosted(error: unknown) {
       ].includes(error.code))
   );
 }
-async function blockedDelivery(env: Env, delivery: Delivery, reason = "reconciliation_inconclusive") {
-  await env.DB.prepare(
-    `UPDATE slack_thread_deliveries SET state = 'blocked', failure_reason=?, updated_at = ? WHERE id = ? AND state IN ('sending', 'pending')`,
-  )
-    .bind(reason, Date.now(), delivery.id)
-    .run();
-  logger.warn(
-    "slack.thread.delivery_blocked",
-    "slack",
-    "Slack delivery needs reconciliation; no duplicate will be posted.",
-    { deliveryId: delivery.id },
-  );
+export async function blockSlackDelivery(
+  env: Env,
+  delivery: { id: string; link_id: string; operation: "root" | "reply" | "refresh"; created_at: number },
+  reason = "reconciliation_inconclusive",
+) {
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',failure_reason=?,updated_at=?
+      WHERE id=? AND state IN ('sending','pending')`).bind(reason, now, delivery.id),
+    env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',failure_reason='predecessor_blocked',updated_at=?
+      WHERE link_id=? AND id<>? AND state='pending' AND operation<>'root'
+        AND (?='root' OR created_at>? OR (created_at=? AND id>?))
+        AND EXISTS (SELECT 1 FROM slack_thread_deliveries blocked WHERE blocked.id=? AND blocked.state='blocked')`).bind(
+      now,
+      delivery.link_id,
+      delivery.id,
+      delivery.operation,
+      delivery.created_at,
+      delivery.created_at,
+      delivery.id,
+      delivery.id,
+    ),
+  ]);
+  logger.warn("slack.thread.delivery_blocked", "slack", "Slack delivery is blocked; no duplicate will be posted.", {
+    deliveryId: delivery.id,
+  });
 }
 async function outboundAuthority(env: Env, link: Link, actorId: string) {
   const current = await linkFor(env, link.id);
@@ -914,23 +952,26 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
         .bind(link.id)
         .first<{ state: string }>();
       if (root?.state === "blocked") {
-        await blockedDelivery(env, delivery);
+        await blockSlackDelivery(env, delivery, "predecessor_blocked");
         return;
       }
       throw new DeliveryInProgressError();
     }
-    const earlier =
-      await env.DB.prepare(`SELECT state FROM slack_thread_deliveries WHERE link_id = ? AND id <> ? AND state IN ('pending', 'sending', 'blocked')
-      AND (operation = 'root' OR (created_at < ? OR (created_at = ? AND id < ?))) ORDER BY created_at, id LIMIT 1`)
+    const blockedEarlier =
+      await env.DB.prepare(`SELECT 1 FROM slack_thread_deliveries WHERE link_id = ? AND id <> ? AND state='blocked'
+      AND (operation = 'root' OR (created_at < ? OR (created_at = ? AND id < ?))) LIMIT 1`)
         .bind(link.id, delivery.id, delivery.created_at, delivery.created_at, delivery.id)
-        .first<{ state: string }>();
-    if (earlier && delivery.operation !== "root") {
-      if (earlier.state === "blocked") {
-        await blockedDelivery(env, delivery);
-        return;
-      }
-      throw new DeliveryInProgressError();
+        .first();
+    if (blockedEarlier && delivery.operation !== "root") {
+      await blockSlackDelivery(env, delivery, "predecessor_blocked");
+      return;
     }
+    const earlier = await env.DB.prepare(`SELECT 1 FROM slack_thread_deliveries WHERE link_id = ? AND id <> ?
+      AND state IN ('pending','sending')
+      AND (operation = 'root' OR (created_at < ? OR (created_at = ? AND id < ?))) LIMIT 1`)
+      .bind(link.id, delivery.id, delivery.created_at, delivery.created_at, delivery.id)
+      .first();
+    if (earlier && delivery.operation !== "root") throw new DeliveryInProgressError();
     if (delivery.state === "sending" && delivery.operation !== "refresh") {
       let recovered: string | null;
       try {
@@ -938,13 +979,13 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       } catch (error) {
         if (error instanceof SlackApiError && error.status < 500 && error.code !== "ratelimited") {
           if (slackInstallationError(error)) await recordSlackInstallationError(env, installation.id, error);
-          await blockedDelivery(env, delivery, `reconciliation_${error.code}`);
+          await blockSlackDelivery(env, delivery, `reconciliation_${error.code}`);
           return;
         }
         throw error;
       }
       if (recovered) await finishDelivery(env, delivery, link, recovered);
-      else await blockedDelivery(env, delivery);
+      else await blockSlackDelivery(env, delivery);
       return;
     }
     if (delivery.operation === "root") {
@@ -1087,8 +1128,7 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
             .first<{ installation_id: string }>()
         )?.installation_id;
         if (installationId) await recordSlackInstallationError(env, installationId, error);
-        await blockedDelivery(env, delivery, `installation_${error.code}`);
-        return;
+        throw error;
       }
       if (slackChannelError(error)) {
         await retireMirrorChannel(env, delivery, error.code);
@@ -1099,7 +1139,8 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
           .bind(Date.now(), delivery.link_id)
           .run();
         await env.DB.prepare(`UPDATE slack_thread_deliveries SET state = 'retired', updated_at = ?
-          WHERE link_id = ? AND state IN ('pending','sending')`)
+          WHERE link_id = ? AND (state IN ('pending','sending') OR
+            (state='blocked' AND failure_reason='predecessor_blocked'))`)
           .bind(Date.now(), delivery.link_id)
           .run();
         return;

@@ -195,7 +195,10 @@ export function SecurityScreen({
             <button
               type="button"
               onClick={() =>
-                void navigator.clipboard.writeText(resumeKey).then(() => setNotice("Recovery resume key copied."))
+                void run(async () => {
+                  await navigator.clipboard.writeText(resumeKey);
+                  setNotice("Recovery resume key copied.");
+                })
               }
             >
               Copy resume key
