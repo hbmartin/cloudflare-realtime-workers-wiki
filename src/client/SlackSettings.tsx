@@ -25,6 +25,7 @@ type ChannelSubscription = {
   botIsMember?: boolean | null;
   mirrorEnabled?: boolean;
   blockedDeliveries?: number;
+  waitingDeliveries?: number;
   failedDeliveries?: number;
   notificationBlockedAt?: number | null;
   notificationError?: string | null;
@@ -57,6 +58,13 @@ function initialSlackOAuthError() {
 export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces: Space[]; pages: Page[] }) {
   const [status, setStatus] = useState<SlackStatus | null>(null);
   const [subscriptions, setSubscriptions] = useState<ChannelSubscription[]>([]);
+  const [orphanedFailures, setOrphanedFailures] = useState<
+    Array<{
+      id: string;
+      channelName: string;
+      failedDeliveries: number;
+    }>
+  >([]);
   const [error, setError] = useState(initialSlackOAuthError);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(() => new URLSearchParams(window.location.search).has("slackLink"));
@@ -80,6 +88,17 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
         setSubscriptions(result.subscriptions);
       } else {
         setSubscriptions([]);
+        if (!owner) setOrphanedFailures([]);
+      }
+      if (owner) {
+        const health = await api<{
+          orphanedFailures: Array<{
+            id: string;
+            channelName: string;
+            failedDeliveries: number;
+          }>;
+        }>("/api/slack/delivery-health");
+        setOrphanedFailures(health.orphanedFailures ?? []);
       }
     } catch (cause) {
       setError(apiErrorMessage(cause, "Slack settings could not be loaded."));
@@ -134,6 +153,20 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
       await load();
     } catch (cause) {
       setError(apiErrorMessage(cause, "Slack could not be disconnected."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deliveryHealthAction(path: string, successMessage: string) {
+    setBusy(true);
+    setError("");
+    try {
+      await api(path, { method: "POST" });
+      setNotice(successMessage);
+      await load();
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "Slack delivery health could not be updated."));
     } finally {
       setBusy(false);
     }
@@ -449,17 +482,43 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                     )}
                     {Boolean(subscription.blockedDeliveries) && (
                       <output>
-                        {subscription.blockedDeliveries} thread deliveries need reconciliation. Sending is paused to
-                        prevent duplicates.
+                        {subscription.blockedDeliveries} thread deliveries need reconciliation. Later replies are
+                        waiting to prevent duplicates.
                       </output>
+                    )}
+                    {Boolean(subscription.waitingDeliveries) && (
+                      <p>{subscription.waitingDeliveries} thread replies are waiting their turn.</p>
                     )}
                     {Boolean(subscription.failedDeliveries) && (
-                      <output>
-                        {subscription.failedDeliveries} thread deliveries failed. Later replies can continue after a
-                        rejected reply.
-                      </output>
+                      <output>{subscription.failedDeliveries} thread deliveries failed.</output>
                     )}
                   </div>
+                  {Boolean(subscription.blockedDeliveries) && (
+                    <button
+                      disabled={busy}
+                      onClick={() =>
+                        void deliveryHealthAction(
+                          `/api/slack/channels/${encodeURIComponent(subscription.id)}/verify-recovery`,
+                          "Slack channel access verified.",
+                        )
+                      }
+                    >
+                      Verify and resume delivery
+                    </button>
+                  )}
+                  {Boolean(subscription.failedDeliveries) && (
+                    <button
+                      disabled={busy}
+                      onClick={() =>
+                        void deliveryHealthAction(
+                          `/api/slack/delivery-health/${encodeURIComponent(subscription.id)}/acknowledge`,
+                          "Delivery failures acknowledged.",
+                        )
+                      }
+                    >
+                      Clear failures
+                    </button>
+                  )}
                   <button
                     disabled={busy || (!subscription.mirrorEnabled && status?.identity?.state !== "verified")}
                     aria-label={`${subscription.mirrorEnabled ? "Disable" : "Enable"} thread mirror for #${subscription.channelName || subscription.channelId}`}
@@ -520,6 +579,25 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
           </div>
         </>
       )}
+      {owner &&
+        orphanedFailures.map((group) => (
+          <article key={group.id}>
+            <output>
+              {group.failedDeliveries} delivery failures for removed mapping #{group.channelName}.
+            </output>
+            <button
+              disabled={busy}
+              onClick={() =>
+                void deliveryHealthAction(
+                  `/api/slack/delivery-health/${encodeURIComponent(group.id)}/acknowledge`,
+                  "Delivery failures acknowledged.",
+                )
+              }
+            >
+              Clear failures
+            </button>
+          </article>
+        ))}
     </section>
   );
 }

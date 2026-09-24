@@ -1,4 +1,4 @@
-import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror } from "./slack-threads";
+import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror, verifySlackMirrorRecovery } from "./slack-threads";
 import { acceptSlackWorkspaceInteraction, openSlackSearch, purgeExpiredSlackSearchSessions } from "./slack-workspace";
 import { pageForMember, effectiveSpaceRole, type PageRow } from "./page-access";
 import { mentionsInbox, markMentionsRead } from "./mentions-inbox";
@@ -186,6 +186,8 @@ import {
   handleSlackEvent,
   handleSlackInteraction,
   listSlackChannelSubscriptions,
+  listSlackDeliveryFailureGroups,
+  acknowledgeSlackDeliveryFailures,
   pruneSlackSecurityRecords,
   repairSlackChannelNotifications,
   sendDueSlackChannelDigests,
@@ -2701,6 +2703,7 @@ app.get("/api/slack/oauth/callback", async (c) => {
   const code = text(c.req.query("code"), "code", 500);
   const state = text(c.req.query("state"), "state", 500);
   await finishSlackOAuth(c.env, member, code, state);
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.redirect("/?view=settings&slack=connected", 303);
 });
 
@@ -2832,6 +2835,27 @@ app.get("/api/slack/channels", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   return c.json({ subscriptions: await listSlackChannelSubscriptions(c.env, member) });
+});
+
+app.get("/api/slack/delivery-health", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json({ orphanedFailures: await listSlackDeliveryFailureGroups(c.env, member) });
+});
+
+app.post("/api/slack/delivery-health/:id/acknowledge", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await acknowledgeSlackDeliveryFailures(c.env, member, c.req.param("id"));
+  return c.json({ ok: true });
+});
+
+app.post("/api/slack/channels/:id/verify-recovery", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await verifySlackMirrorRecovery(c.env, member, c.req.param("id"));
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json({ ok: true });
 });
 
 app.post("/api/slack/channels", async (c) => {

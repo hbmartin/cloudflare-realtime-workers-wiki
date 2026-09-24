@@ -311,11 +311,34 @@ describe("protection recovery flows", () => {
     fireEvent.click(screen.getByLabelText("I saved my recovery resume key"));
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(screen.queryByLabelText("Setup key")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Set up authenticator app" })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "Set up authenticator app" })).toBeVisible();
+    expect(api).toHaveBeenCalledWith("/api/security/acknowledge-resume-key", {
+      method: "POST",
+      body: JSON.stringify({ resumeKey: "rotated-key" }),
+    });
     expect(api).toHaveBeenCalledWith("/api/security/resume-recovery", {
       method: "POST",
       body: JSON.stringify({ password: "password123" }),
     });
+  });
+
+  it("returns to recovery when a displayed handoff key has expired or been superseded", async () => {
+    const recovery = { ...status, state: "recovery_required" as const, recoveryCanResume: true };
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/security/resume-recovery") return { success: true, resumeKey: "stale-key" };
+      if (path === "/api/security/acknowledge-resume-key")
+        throw new ApiClientError(403, "recovery_key_expired", "Recovery key expired.");
+      return recovery;
+    });
+    render(<SecurityScreen initialStatus={recovery} />);
+    fireEvent.change(screen.getByLabelText("Password to resume recovery"), { target: { value: "password123" } });
+    fireEvent.submit(screen.getByLabelText("Password to resume recovery").closest("form")!);
+    await screen.findByText("stale-key");
+    fireEvent.click(screen.getByLabelText("I saved my recovery resume key"));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Recovery key expired.");
+    expect(screen.queryByText("stale-key")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Password to resume recovery")).toBeVisible();
   });
 
   it("uses the shared API fallback for non-JSON failures", async () => {
