@@ -1219,6 +1219,7 @@ async function deliverRootAction(env: Env, receiptId: string, input: ActionInput
             member.user.id,
             receiptId,
             now,
+            link.id,
           )
         : slackPauseStatements(
             env,

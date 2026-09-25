@@ -5,6 +5,7 @@ import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { safeSlackText, unfurlBlocks } from "./slack-blocks";
 import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
+import { SLACK_REDRIVE_STALE_MS } from "./slack-redrive";
 
 const OAUTH_STATE_TTL_MS = 10 * 60_000;
 const LINK_TOKEN_TTL_MS = 10 * 60_000;
@@ -914,6 +915,7 @@ export function rootControlRefreshStatements(
   actorId: string,
   sourceId: string,
   now: number,
+  linkId?: string,
 ) {
   return [
     env.DB.prepare(`INSERT OR IGNORE INTO slack_thread_deliveries
@@ -927,7 +929,8 @@ export function rootControlRefreshStatements(
         JOIN pages page ON page.id = link.page_id AND page.archived_at IS NULL
        WHERE mapping.id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL
          AND link.installation_generation = installation.generation AND mapping.mirror_enabled = 1
-         AND mapping.validation_state = 'valid' AND link.state = 'active' AND link.root_message_ts IS NOT NULL`).bind(
+         AND mapping.validation_state = 'valid' AND link.state = 'active' AND link.root_message_ts IS NOT NULL
+         AND (? IS NULL OR link.id = ?)`).bind(
       sourceId,
       sourceId,
       actorId,
@@ -936,6 +939,8 @@ export function rootControlRefreshStatements(
       now,
       mappingId,
       workspaceId,
+      linkId ?? null,
+      linkId ?? null,
     ),
     env.DB.prepare(`INSERT OR IGNORE INTO outbox
       (id, workspace_id, topic, payload_json, available_at, created_at)
@@ -1104,6 +1109,8 @@ async function activeInstallation(env: Env, teamId: string) {
 
 export async function usableBotToken(env: Env, installation: SlackInstallation, signal?: AbortSignal) {
   signal?.throwIfAborted();
+  if (!Number.isSafeInteger(installation.generation))
+    throw new Error("Slack installation generation is unavailable for token refresh.");
   if (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000) {
     return decryptSlackToken(env, installation.bot_token_ciphertext);
   }
@@ -1117,9 +1124,9 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
     signal?.throwIfAborted();
     const now = Date.now();
     const lease = await env.DB.prepare(`UPDATE slack_installations SET refresh_lease_token=?,refresh_lease_until=?
-      WHERE id=? AND disconnected_at IS NULL AND bot_token_ciphertext=?
+      WHERE id=? AND generation=? AND disconnected_at IS NULL AND bot_token_ciphertext=?
         AND (refresh_lease_token IS NULL OR refresh_lease_until<=?)`)
-      .bind(leaseToken, now + 30_000, installation.id, oldCiphertext, now)
+      .bind(leaseToken, now + 30_000, installation.id, installation.generation, oldCiphertext, now)
       .run();
     if (lease.meta.changes) {
       claimed = true;
@@ -1128,7 +1135,8 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
     const current = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL`)
       .bind(installation.id)
       .first<SlackInstallation>();
-    if (!current) throw new Error("The Slack installation was disconnected.");
+    if (!current || current.generation !== installation.generation)
+      throw new Error("The Slack installation changed during token refresh.");
     if (current.bot_token_ciphertext !== oldCiphertext) {
       Object.assign(installation, current);
       return decryptSlackToken(env, current.bot_token_ciphertext);
@@ -1177,7 +1185,7 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
           )
             .bind(installation.id)
             .first<SlackInstallation>();
-          if (current?.bot_token_ciphertext !== oldCiphertext && current) {
+          if (current?.generation === installation.generation && current.bot_token_ciphertext !== oldCiphertext) {
             Object.assign(installation, current);
             return decryptSlackToken(env, current.bot_token_ciphertext);
           }
@@ -1228,7 +1236,9 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
       const current = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id = ? AND disconnected_at IS NULL`)
         .bind(installation.id)
         .first<SlackInstallation>();
-      if (!current) throw new Error("The Slack installation was disconnected.");
+      if (!current || current.generation !== installation.generation)
+        throw new Error("The Slack installation changed during token refresh.");
+      if (current.bot_token_ciphertext === oldCiphertext) throw new Error("Slack token refresh was not persisted.");
       installation.bot_token_ciphertext = current.bot_token_ciphertext;
       installation.bot_refresh_token_ciphertext = current.bot_refresh_token_ciphertext;
       installation.token_expires_at = current.token_expires_at;
@@ -2074,7 +2084,7 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
       const queuedAt = Date.now();
       await env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?
         WHERE id=? AND enqueued_at IS NULL`)
-        .bind(queuedAt, queuedAt + 30 * 60_000, outboxId)
+        .bind(queuedAt, queuedAt + SLACK_REDRIVE_STALE_MS, outboxId)
         .run();
     } catch {
       // The scheduled outbox sweep recovers this enqueue after a D1/Queue split failure.
@@ -2178,7 +2188,7 @@ async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_me
 export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: string) {
   const row = await env.DB.prepare(
     `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.message_ts, unfurl.unfurls_json,
-            installation.id, installation.workspace_id, installation.team_id, installation.team_name,
+            installation.id, installation.generation, installation.workspace_id, installation.team_id, installation.team_name,
             installation.bot_user_id, installation.bot_token_ciphertext,
             installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at,
             installation.credential_revision
@@ -2289,7 +2299,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
       const events = await env.DB.prepare(
         `SELECT event.id, event.event_type, event.page_id, page.title page_title, actor.name actor_name,
               subscription.channel_id,
-              installation.id installation_id, installation.workspace_id, installation.team_id,
+              installation.id installation_id, installation.generation, installation.workspace_id, installation.team_id,
               installation.team_name, installation.bot_user_id, installation.bot_token_ciphertext,
               installation.bot_refresh_token_ciphertext, installation.token_expires_at,
               installation.disconnected_at, installation.credential_revision

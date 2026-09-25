@@ -319,12 +319,16 @@ export function SecurityScreen({
             )}
             {status.recoveryKeyAcknowledgmentRequired && (
               <p>
-                The key shown for this session was not saved. Resume recovery with fresh proof to issue another key.
+                {status.recoveryCanResume
+                  ? "The key shown for this session was not saved. Resume recovery with fresh proof to issue another key."
+                  : "The unsaved recovery key expired. Use a recovery code or operator reset token to recover again."}
               </p>
             )}
             {recoveryEnrollment && !status.recoveryEnrollmentAllowed && !status.recoveryKeyAcknowledgmentRequired && (
               <p>
-                Resume recovery with fresh proof and save your recovery resume key before restoring account protection.
+                {status.recoveryCanResume
+                  ? "Resume recovery with fresh proof and save your recovery resume key before restoring account protection."
+                  : "Use a recovery code or operator reset token to recover account protection."}
               </p>
             )}
             {(recoveryEnrollment ? status.recoveryEnrollmentAllowed : enrollment || setup) &&
