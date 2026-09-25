@@ -145,7 +145,9 @@ export function SecurityScreen({
   if (!status) return <output>Loading account protection…</output>;
   const enrollment = status.state === "enrollment_required" && !status.totp && !status.passkeys;
   const recoveryEnrollment = status.state === "recovery_required";
-  const canManage = (status.fresh || enrollment || recoveryEnrollment) && !status.recoveryKeyAcknowledgmentRequired;
+  const canManage =
+    (recoveryEnrollment ? status.recoveryEnrollmentAllowed === true : status.fresh || enrollment) &&
+    !status.recoveryKeyAcknowledgmentRequired;
   const slackPrimary = status.slackPrimary?.available === true;
   const primaryFactorFormVisible =
     codes.length === 0 &&
@@ -219,10 +221,10 @@ export function SecurityScreen({
                   try {
                     await securityAction("acknowledge-resume-key", { resumeKey });
                   } catch (cause) {
-                    if (cause instanceof ApiClientError && cause.status === 403) {
+                    if (cause instanceof ApiClientError && (cause.status === 401 || cause.status === 403)) {
                       setResumeKey("");
                       setResumeKeySaved(false);
-                      await reload().catch(() => undefined);
+                      if (cause.status === 403) await reload().catch(() => undefined);
                     }
                     throw cause;
                   }
@@ -320,80 +322,88 @@ export function SecurityScreen({
                 The key shown for this session was not saved. Resume recovery with fresh proof to issue another key.
               </p>
             )}
-            {(enrollment || setup || recoveryEnrollment) && !status.recoveryKeyAcknowledgmentRequired && (
-              <>
-                <h3>{recoveryEnrollment ? "Restore account protection" : "Choose an authenticator app or passkey"}</h3>
-                <button type="button" onClick={() => void run(addPasskey)}>
-                  Create a passkey
-                </button>
-                {!uri ? (
-                  <form
-                    className="auth-form"
-                    onSubmit={(event) =>
-                      submit(event, async (values) => {
-                        const result = await securityAction<{ totpURI: string }>(
-                          "setup-totp",
-                          slackPrimary ? {} : { password: values.get("password") },
-                        );
-                        setUri(result.totpURI);
-                      })
-                    }
-                  >
-                    {slackPrimary ? (
-                      <p>Your recent Slack sign-in confirms the primary factor for authenticator setup.</p>
-                    ) : (
-                      <label>
-                        Account password
-                        <input name="password" type="password" autoComplete="current-password" required />
-                      </label>
-                    )}
-                    <button>Set up authenticator app</button>
-                  </form>
-                ) : (
-                  <form
-                    className="auth-form"
-                    onSubmit={(event) =>
-                      submit(event, async (values) => {
-                        await securityAction("confirm-totp", { code: values.get("code") });
-                        await verified();
-                      })
-                    }
-                  >
-                    <p>Scan this QR code in your authenticator app, or enter the setup key manually.</p>
-                    <div className="security-qr">
-                      <QRCode value={uri} size={192} />
-                    </div>
-                    <label>
-                      Setup key
-                      <input value={new URL(uri).searchParams.get("secret") ?? ""} readOnly />
-                    </label>
-                    <label>
-                      Authenticator code
-                      <input
-                        name="code"
-                        inputMode="numeric"
-                        autoComplete="one-time-code"
-                        pattern="[0-9]{6}"
-                        maxLength={6}
-                        required
-                      />
-                    </label>
-                    <button>Verify authenticator</button>
-                  </form>
-                )}
-                {settings && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSetup(false);
-                      setUri("");
-                    }}
-                  >
-                    Cancel setup
-                  </button>
-                )}
-              </>
+            {recoveryEnrollment && !status.recoveryEnrollmentAllowed && !status.recoveryKeyAcknowledgmentRequired && (
+              <p>
+                Resume recovery with fresh proof and save your recovery resume key before restoring account protection.
+              </p>
             )}
+            {(recoveryEnrollment ? status.recoveryEnrollmentAllowed : enrollment || setup) &&
+              !status.recoveryKeyAcknowledgmentRequired && (
+                <>
+                  <h3>
+                    {recoveryEnrollment ? "Restore account protection" : "Choose an authenticator app or passkey"}
+                  </h3>
+                  <button type="button" onClick={() => void run(addPasskey)}>
+                    Create a passkey
+                  </button>
+                  {!uri ? (
+                    <form
+                      className="auth-form"
+                      onSubmit={(event) =>
+                        submit(event, async (values) => {
+                          const result = await securityAction<{ totpURI: string }>(
+                            "setup-totp",
+                            slackPrimary ? {} : { password: values.get("password") },
+                          );
+                          setUri(result.totpURI);
+                        })
+                      }
+                    >
+                      {slackPrimary ? (
+                        <p>Your recent Slack sign-in confirms the primary factor for authenticator setup.</p>
+                      ) : (
+                        <label>
+                          Account password
+                          <input name="password" type="password" autoComplete="current-password" required />
+                        </label>
+                      )}
+                      <button>Set up authenticator app</button>
+                    </form>
+                  ) : (
+                    <form
+                      className="auth-form"
+                      onSubmit={(event) =>
+                        submit(event, async (values) => {
+                          await securityAction("confirm-totp", { code: values.get("code") });
+                          await verified();
+                        })
+                      }
+                    >
+                      <p>Scan this QR code in your authenticator app, or enter the setup key manually.</p>
+                      <div className="security-qr">
+                        <QRCode value={uri} size={192} />
+                      </div>
+                      <label>
+                        Setup key
+                        <input value={new URL(uri).searchParams.get("secret") ?? ""} readOnly />
+                      </label>
+                      <label>
+                        Authenticator code
+                        <input
+                          name="code"
+                          inputMode="numeric"
+                          autoComplete="one-time-code"
+                          pattern="[0-9]{6}"
+                          maxLength={6}
+                          required
+                        />
+                      </label>
+                      <button>Verify authenticator</button>
+                    </form>
+                  )}
+                  {settings && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSetup(false);
+                        setUri("");
+                      }}
+                    >
+                      Cancel setup
+                    </button>
+                  )}
+                </>
+              )}
             {!settings && (
               <label>
                 <input type="checkbox" checked={trust} onChange={(event) => setTrust(event.target.checked)} /> Trust

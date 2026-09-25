@@ -12,6 +12,7 @@ import {
   recordSlackInstallationError,
   slackChannelError,
   slackInstallationError,
+  usableBotToken,
   SlackApiError,
   SlackRateLimitError,
   validateSlackIdentity,
@@ -78,7 +79,8 @@ export async function installationFor(env: Env, id: string, generation?: number)
     .first<SlackInstallation>();
   if (!row || (generation !== undefined && row.generation !== generation)) unavailable();
   const scopes = new Set(row.scopes.split(",").map((scope) => scope.trim()));
-  if (SCOPES.some((scope) => !scopes.has(scope))) unavailable();
+  if (SCOPES.some((scope) => !scopes.has(scope)))
+    throw new SlackApiError("installation", "missing_scope", 403, row.credential_revision);
   return row;
 }
 async function memberFor(env: Env, workspaceId: string, userId: string): Promise<MemberContext> {
@@ -692,8 +694,25 @@ export async function deliverSlackMutation(env: Env, receiptId: string, action: 
       .bind(receiptId)
       .first<{ processed_at: number | null }>();
     if (done?.processed_at !== null && done?.processed_at !== undefined) return;
-    if (error instanceof SlackApiError && slackInstallationError(error))
+    if (error instanceof SlackApiError && slackInstallationError(error)) {
       await recordSlackInstallationError(env, input.installationId, error);
+      throw error;
+    }
+    if (String(error).includes("CHECK constraint failed: authorized = 1")) {
+      const current = await env.DB.prepare(`SELECT scopes,auth_error,credential_revision
+        FROM slack_installations WHERE id=? AND disconnected_at IS NULL`)
+        .bind(input.installationId)
+        .first<{ scopes: string; auth_error: string | null; credential_revision: number }>();
+      if (current) {
+        const scopes = new Set(current.scopes.split(",").map((scope) => scope.trim()));
+        const code = SCOPES.some((scope) => !scopes.has(scope)) ? "missing_scope" : current.auth_error;
+        if (code && ["missing_scope", "invalid_auth", "token_revoked", "account_inactive"].includes(code)) {
+          const authError = new SlackApiError("installation", code, 403, current.credential_revision);
+          await recordSlackInstallationError(env, input.installationId, authError);
+          throw authError;
+        }
+      }
+    }
     const contentError =
       error instanceof HttpError &&
       [
@@ -788,7 +807,7 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
     installation = await installationFor(env, payload.installationId, payload.generation);
     await validateChannel(env, installation, payload.channelId);
   } catch (error) {
-    if (error instanceof HttpError || error instanceof SlackApiError) return;
+    if (error instanceof HttpError || (error instanceof SlackApiError && error.status < 500)) return;
     throw error;
   }
   const claimed = await env.DB.prepare(
@@ -837,6 +856,10 @@ async function finishDelivery(env: Env, delivery: Delivery, link: Link, messageT
       ? [
           env.DB.prepare(`UPDATE slack_thread_links SET root_message_ts = ?, state = 'active', updated_at = ? WHERE id = ? AND state = 'pending' AND subscription_id IS NOT NULL
       AND EXISTS (SELECT 1 FROM slack_installations i JOIN slack_channel_subscriptions s ON s.installation_id = i.id WHERE i.id = slack_thread_links.installation_id AND i.generation = slack_thread_links.installation_generation AND i.disconnected_at IS NULL AND s.id = slack_thread_links.subscription_id AND s.mirror_enabled = 1)
+      AND EXISTS (SELECT 1 FROM pages p JOIN comment_threads t ON t.page_id=p.id
+        WHERE p.id=slack_thread_links.page_id AND p.workspace_id=slack_thread_links.workspace_id
+          AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0
+          AND t.id=slack_thread_links.thread_id)
       AND EXISTS (SELECT 1 FROM slack_thread_deliveries d WHERE d.id=? AND d.state='sent' AND d.message_ts=?)`).bind(
             messageTs,
             Date.now(),
@@ -850,11 +873,41 @@ async function finishDelivery(env: Env, delivery: Delivery, link: Link, messageT
   await wakeNextSlackDelivery(env, link.id);
 }
 
+async function retireInvalidReconciledLink(env: Env, link: Link, delivery: Delivery) {
+  try {
+    await outboundAuthority(env, link, delivery.actor_id);
+    if (delivery.comment_id) {
+      const comment = await env.DB.prepare(
+        `SELECT user_id FROM comments WHERE id=? AND thread_id=? AND deleted_at IS NULL`,
+      )
+        .bind(delivery.comment_id, link.thread_id)
+        .first<{ user_id: string }>();
+      if (!comment || !(await currentAuthorCanRead(env, link, comment.user_id))) unavailable();
+    }
+    return;
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.status >= 500) throw error;
+  }
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE slack_thread_links SET state='retired',updated_at=?
+      WHERE id=? AND state IN ('pending','active')`).bind(now, link.id),
+    env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',failure_reason='link_unavailable',updated_at=?
+      WHERE link_id=? AND state='pending'`).bind(now, link.id),
+  ]);
+}
+
 export async function wakeNextSlackDelivery(env: Env, linkId: string) {
-  // Waiting is derived from the delivery order. One conditional update also
-  // recovers a lost completion wake without changing delivery state.
-  await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL, available_at=?, slack_redrive_due_at=NULL
-    WHERE id=(SELECT 'outbox:' || d.id FROM slack_thread_deliveries d
+  const now = Date.now();
+  // Reply and refresh have separate orderings. Start the retry clock only when
+  // each delivery can actually run, and wake both queues after a completion.
+  await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL, available_at=?, slack_redrive_due_at=NULL,
+      slack_eligible_started_at=COALESCE(slack_eligible_started_at,?),
+      slack_auth_pause_baseline_ms=CASE WHEN slack_eligible_started_at IS NULL THEN
+        (SELECT i.auth_paused_ms+CASE WHEN i.auth_error_at IS NULL THEN 0 ELSE MAX(0,?-i.auth_error_at) END
+         FROM slack_installations i WHERE i.workspace_id=outbox.workspace_id AND i.disconnected_at IS NULL)
+        ELSE slack_auth_pause_baseline_ms END
+    WHERE id IN (SELECT 'outbox:' || d.id FROM slack_thread_deliveries d
       JOIN slack_thread_links link ON link.id=d.link_id
       WHERE d.link_id=? AND d.state='pending' AND
         (d.operation='root' OR link.root_message_ts IS NOT NULL)
@@ -866,10 +919,8 @@ export async function wakeNextSlackDelivery(env: Env, linkId: string) {
                   (prior.created_at<d.created_at OR (prior.created_at=d.created_at AND prior.id<d.id))) OR
                 (d.operation='refresh' AND prior.operation='refresh' AND
                   (prior.created_at<d.created_at OR (prior.created_at=d.created_at AND prior.id<d.id))))))
-      ORDER BY CASE d.operation WHEN 'root' THEN 0 WHEN 'refresh' THEN 1 ELSE 2 END,
-        d.created_at,d.id LIMIT 1)
-      AND enqueued_at IS NOT NULL`)
-    .bind(Date.now(), linkId)
+    ) AND (enqueued_at IS NOT NULL OR slack_eligible_started_at IS NULL)`)
+    .bind(now, now, now, linkId)
     .run();
 }
 
@@ -1038,6 +1089,10 @@ function definitelyNotPosted(error: unknown) {
         "msg_too_long",
         "restricted_action",
         "no_permission",
+        "invalid_auth",
+        "token_revoked",
+        "account_inactive",
+        "missing_scope",
       ].includes(error.code))
   );
 }
@@ -1066,7 +1121,8 @@ export async function retireUncertainSlackDelivery(
   const reason = "reconciliation_expired";
   const result = await env.DB.batch([
     env.DB.prepare(`UPDATE slack_thread_deliveries
-      SET state='retired',failure_reason=?,updated_at=? WHERE id=? AND state='sending'
+      SET state='retired',failure_reason=?,updated_at=? WHERE id=?
+        AND (state='sending' OR (state='blocked' AND failure_reason LIKE 'reconciliation_%'))
         AND NOT EXISTS (SELECT 1 FROM slack_thread_links link WHERE link.id=slack_thread_deliveries.link_id
           AND link.claim_token IS NOT NULL AND link.claimed_at>?)`).bind(reason, now, delivery.id, now - 60_000),
     env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
@@ -1149,9 +1205,11 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       .first<Delivery>();
     if (!currentDelivery || ["sent", "retired", "blocked"].includes(currentDelivery.state)) return;
     Object.assign(delivery, currentDelivery);
-    const link = await linkFor(env, delivery.link_id);
+    const link = await env.DB.prepare(`SELECT * FROM slack_thread_links WHERE id=?`)
+      .bind(delivery.link_id)
+      .first<Link>();
+    if (!link) unavailable();
     const installed = await installationFor(env, link.installation_id, link.installation_generation);
-    await validateChannel(env, installed, link.channel_id);
     // A lost post response must be reconciled before a later author revocation
     // can retire this root and permit a duplicate root for the thread.
     if (delivery.state === "sending" && delivery.operation !== "refresh") {
@@ -1171,14 +1229,14 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
         throw error;
       }
       await resumeHistoryClock(env, delivery, installed.id);
-      if (recovered) await finishDelivery(env, delivery, link, recovered);
-      else
-        await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=?
-        WHERE id=? AND slack_redrive_due_at IS NOT NULL`)
-          .bind(Date.now() + 60_000, `outbox:${delivery.id}`)
-          .run();
+      if (recovered) {
+        await finishDelivery(env, delivery, link, recovered);
+        await retireInvalidReconciledLink(env, link, delivery);
+      }
       return;
     }
+    await linkFor(env, delivery.link_id);
+    await validateChannel(env, installed, link.channel_id);
     const { installation, member, page } = await outboundAuthority(env, link, delivery.actor_id);
     if (delivery.operation !== "root" && !link.root_message_ts) {
       throw new DeliveryInProgressError();
@@ -1211,7 +1269,7 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
         .first();
       if (newer) {
         await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',failure_reason='superseded',updated_at=?
-          WHERE id=? AND state='pending'`)
+          WHERE id=? AND state IN ('pending','sending')`)
           .bind(Date.now(), delivery.id)
           .run();
         await wakeNextSlackDelivery(env, link.id);
@@ -1307,6 +1365,7 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       text = `${heading}\n${body}\n<${url}|Open in NoteFlare>`;
       blocks = rootBlocks(body);
     }
+    const sendToken = await usableBotToken(env, installation);
     const sending = await env.DB.prepare(
       `UPDATE slack_thread_deliveries SET state = 'sending', attempted_at = COALESCE(attempted_at, ?),
         auth_pause_baseline_ms=COALESCE(auth_pause_baseline_ms,
@@ -1322,22 +1381,38 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
     try {
       const result =
         delivery.operation === "refresh"
-          ? await slackApi(env, installation, "chat.update", {
-              channel: link.channel_id,
-              ts: link.root_message_ts!,
-              text,
-              blocks,
-            })
-          : await slackApi(env, installation, "chat.postMessage", {
-              channel: link.channel_id,
-              text,
-              blocks,
-              ...(delivery.operation === "reply" ? { thread_ts: link.root_message_ts! } : {}),
-              metadata: { event_type: "noteflare_thread_delivery", event_payload: { delivery_id: delivery.id } },
-              parse: "none",
-              unfurl_links: false,
-              unfurl_media: false,
-            });
+          ? await slackApi(
+              env,
+              installation,
+              "chat.update",
+              {
+                channel: link.channel_id,
+                ts: link.root_message_ts!,
+                text,
+                blocks,
+              },
+              undefined,
+              undefined,
+              sendToken,
+            )
+          : await slackApi(
+              env,
+              installation,
+              "chat.postMessage",
+              {
+                channel: link.channel_id,
+                text,
+                blocks,
+                ...(delivery.operation === "reply" ? { thread_ts: link.root_message_ts! } : {}),
+                metadata: { event_type: "noteflare_thread_delivery", event_payload: { delivery_id: delivery.id } },
+                parse: "none",
+                unfurl_links: false,
+                unfurl_media: false,
+              },
+              undefined,
+              undefined,
+              sendToken,
+            );
       if (result.channel !== link.channel_id || !TS.test(result.ts))
         throw new Error("Slack message result is incomplete.");
       await finishDelivery(env, delivery, link, result.ts);
@@ -1357,6 +1432,10 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
     }
   } catch (error) {
     if (error instanceof HttpError && error.code === "slack_channel_invalid") {
+      if (delivery.operation === "refresh") {
+        await retireRejectedDelivery(env, delivery, error.code);
+        return;
+      }
       if (delivery.state === "sending") {
         await pauseHistoryClock(env, delivery);
         await blockSlackDelivery(env, delivery, "reconciliation_channel_unavailable");
@@ -1376,6 +1455,10 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
         throw error;
       }
       if (slackChannelError(error)) {
+        if (delivery.operation === "refresh") {
+          await retireRejectedDelivery(env, delivery, error.code);
+          return;
+        }
         if (delivery.state === "sending") {
           await pauseHistoryClock(env, delivery);
           await blockSlackDelivery(env, delivery, `reconciliation_${error.code}`);
@@ -1385,14 +1468,26 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
         return;
       }
       if (error.code === "message_not_found" && delivery.operation === "refresh") {
-        await env.DB.prepare(`UPDATE slack_thread_links SET state = 'retired', updated_at = ? WHERE id = ?`)
-          .bind(Date.now(), delivery.link_id)
-          .run();
-        await env.DB.prepare(`UPDATE slack_thread_deliveries SET state = 'retired', updated_at = ?
-          WHERE link_id = ? AND (state IN ('pending','sending') OR
-            (state='blocked' AND failure_reason='predecessor_blocked'))`)
-          .bind(Date.now(), delivery.link_id)
-          .run();
+        const now = Date.now();
+        await env.DB.batch([
+          env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
+            (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
+            SELECT d.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
+              COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'root_message_not_found_unconfirmed',?
+            FROM slack_thread_deliveries d JOIN slack_thread_links link ON link.id=d.link_id
+            LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
+            WHERE d.link_id=? AND (d.state='sending' OR
+              (d.state='blocked' AND d.failure_reason LIKE 'reconciliation_%'))`).bind(now, delivery.link_id),
+          env.DB.prepare(`UPDATE slack_thread_links SET state='retired',updated_at=? WHERE id=?`).bind(
+            now,
+            delivery.link_id,
+          ),
+          env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',
+            failure_reason=CASE WHEN state='sending' OR (state='blocked' AND failure_reason LIKE 'reconciliation_%')
+              THEN 'root_message_not_found_unconfirmed' ELSE 'root_message_not_found' END, updated_at=?
+            WHERE link_id=? AND (state IN ('pending','sending') OR
+              (state='blocked' AND failure_reason LIKE 'reconciliation_%'))`).bind(now, delivery.link_id),
+        ]);
         return;
       }
       if (["invalid_arguments", "invalid_blocks", "msg_too_long"].includes(error.code)) {
@@ -1401,6 +1496,10 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       }
     }
     if (error instanceof HttpError && error.status < 500) {
+      if (delivery.operation === "refresh") {
+        await retireRejectedDelivery(env, delivery, error.code);
+        return;
+      }
       const current = await env.DB.prepare(`SELECT state FROM slack_thread_deliveries WHERE id=?`)
         .bind(delivery.id)
         .first<{ state: string }>();

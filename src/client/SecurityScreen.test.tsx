@@ -289,7 +289,12 @@ describe("protection recovery flows", () => {
   });
 
   it("offers password-protected resumption only when the server allows it", async () => {
-    const recovery = { ...status, state: "recovery_required" as const, recoveryCanResume: true };
+    const recovery = {
+      ...status,
+      state: "recovery_required" as const,
+      recoveryCanResume: true,
+      recoveryEnrollmentAllowed: true,
+    };
     vi.mocked(api).mockImplementation(async (path) =>
       path === "/api/security/setup-totp"
         ? { totpURI: "otpauth://totp/NoteFlare?secret=EXPIRED" }
@@ -339,6 +344,34 @@ describe("protection recovery flows", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Recovery key expired.");
     expect(screen.queryByText("stale-key")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Password to resume recovery")).toBeVisible();
+  });
+  it("hides enrollment until recovery proof is eligible", () => {
+    const recovery: SecurityStatus = {
+      ...status,
+      state: "recovery_required",
+      recoveryCanResume: true,
+      recoveryEnrollmentAllowed: false,
+    };
+    render(<SecurityScreen initialStatus={recovery} />);
+    expect(screen.queryByRole("button", { name: "Create a passkey" })).not.toBeInTheDocument();
+    expect(screen.getByText(/Resume recovery with fresh proof and save your recovery resume key/)).toBeVisible();
+  });
+  it("clears a dead resume key when its replacement session is revoked", async () => {
+    const recovery = { ...status, state: "recovery_required" as const, recoveryCanResume: true };
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/security/resume-recovery") return { success: true, resumeKey: "dead-key" };
+      if (path === "/api/security/acknowledge-resume-key")
+        throw new ApiClientError(401, "UNAUTHORIZED", "Sign in again.");
+      return recovery;
+    });
+    render(<SecurityScreen initialStatus={recovery} />);
+    fireEvent.change(screen.getByLabelText("Password to resume recovery"), { target: { value: "password123" } });
+    fireEvent.submit(screen.getByLabelText("Password to resume recovery").closest("form")!);
+    await screen.findByText("dead-key");
+    fireEvent.click(screen.getByLabelText("I saved my recovery resume key"));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sign in again.");
+    expect(screen.queryByText("dead-key")).not.toBeInTheDocument();
   });
 
   it("uses the shared API fallback for non-JSON failures", async () => {
