@@ -386,7 +386,40 @@ describe("protection recovery flows", () => {
     );
     expect(screen.queryByRole("button", { name: "Resume recovery" })).not.toBeInTheDocument();
     expect(screen.getByText(/Another recovery key is awaiting acknowledgment/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Refresh status" })).toBeVisible();
     expect(screen.queryByText(/Use a recovery code or operator reset token/)).not.toBeInTheDocument();
+  });
+  it("refreshes a pending recovery key after another session acknowledges it", async () => {
+    const waiting: SecurityStatus = {
+      ...status,
+      state: "recovery_required",
+      recoveryCanResume: false,
+      recoveryEnrollmentAllowed: false,
+      recoveryKeyPendingElsewhere: true,
+    };
+    vi.mocked(api).mockResolvedValue({
+      ...waiting,
+      recoveryKeyPendingElsewhere: false,
+      recoveryEnrollmentAllowed: true,
+    });
+    render(<SecurityScreen initialStatus={waiting} />);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    expect(await screen.findByRole("button", { name: "Create a passkey" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Refresh status" })).not.toBeInTheDocument();
+    expect(api).toHaveBeenCalledWith("/api/security/status");
+  });
+  it("keeps the recovery refresh available after a status error", async () => {
+    const waiting: SecurityStatus = {
+      ...status,
+      state: "recovery_required",
+      recoveryKeyPendingElsewhere: true,
+      recoveryEnrollmentAllowed: false,
+    };
+    vi.mocked(api).mockRejectedValue(new Error("Status unavailable"));
+    render(<SecurityScreen initialStatus={waiting} />);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Status unavailable");
+    expect(screen.getByRole("button", { name: "Refresh status" })).toBeEnabled();
   });
   it("clears a dead resume key when its replacement session is revoked", async () => {
     const recovery = { ...status, state: "recovery_required" as const, recoveryCanResume: true };

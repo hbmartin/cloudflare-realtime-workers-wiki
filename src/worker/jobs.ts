@@ -56,6 +56,7 @@ const OUTBOX_RETRY_BASE_MS = 10_000;
 const OUTBOX_RETRY_MAX_MS = 60 * 60_000;
 const SLACK_REDRIVE_BASE_MS = 15 * 60_000;
 const SLACK_REDRIVE_MAX_MS = 6 * 60 * 60_000;
+const SLACK_BLOCKED_RECHECK_MS = 5 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
@@ -1707,7 +1708,7 @@ export async function redriveStaleSlackOutbox(env: Env) {
     }
     if (delivery?.state === "blocked") {
       await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=? AND slack_redrive_due_at=?`)
-        .bind(now + SLACK_REDRIVE_STALE_MS, row.id, row.slack_redrive_due_at)
+        .bind(now + SLACK_BLOCKED_RECHECK_MS, row.id, row.slack_redrive_due_at)
         .run();
       continue;
     }
@@ -1795,7 +1796,7 @@ export async function consumeDeliveryMessage(
     if (!delivery || !["pending", "sending", "blocked"].includes(delivery.state)) return false;
     if (delivery.state === "blocked" && !delivery.failure_reason?.startsWith("reconciliation_")) return false;
     await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=? AND slack_scope_paused_at IS NULL`)
-      .bind(Date.now() + (delivery.state === "blocked" ? 5 * 60_000 : 60_000), outboxId)
+      .bind(Date.now() + (delivery.state === "blocked" ? SLACK_BLOCKED_RECHECK_MS : 60_000), outboxId)
       .run();
     return true;
   };

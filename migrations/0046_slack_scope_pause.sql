@@ -12,7 +12,7 @@ WHERE recovery_resume_claim_session_id IS NOT NULL
       AND proof.user_id=account_security.user_id AND proof.generation=account_security.generation
       AND proof.method='recovery');
 
--- Legacy method-specific scope errors were stored as installation-wide outages.
+-- Fold remaining missing-scope outages into auth_paused_ms once; future pauses live on outbox rows.
 UPDATE slack_installations SET
   auth_paused_ms=auth_paused_ms+CASE WHEN auth_error_at IS NULL THEN 0
     ELSE MAX(0,CAST(unixepoch('subsec')*1000 AS INTEGER)-auth_error_at) END,

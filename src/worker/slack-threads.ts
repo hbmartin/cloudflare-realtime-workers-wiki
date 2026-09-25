@@ -615,6 +615,12 @@ async function mentionMember(env: Env, installation: SlackInstallation, slackUse
     return { id: member.user.id, name: member.user.name };
   } catch (error) {
     if (error instanceof HttpError && error.status < 500) return null;
+    if (
+      error instanceof SlackApiError &&
+      error.method === "users.info" &&
+      ["no_permission", "restricted_action"].includes(error.code)
+    )
+      return null;
     throw error;
   }
 }

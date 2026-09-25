@@ -2755,6 +2755,32 @@ describe("canonical Slack mirrors", () => {
       .run();
     expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
   });
+  it("rechecks blocked reconciliation after five minutes without requeueing", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Unconfirmed"));
+    const replyDelivery = (await deliveries(created.id)).find((delivery) => delivery.operation === "reply")!;
+    const outboxId = `outbox:${replyDelivery.id}`;
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+        failure_reason='reconciliation_no_permission',attempted_at=? WHERE id=?`).bind(Date.now(), replyDelivery.id),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`).bind(outboxId),
+    ]);
+    const before = Date.now();
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
+    const after = Date.now();
+    const row = await env.DB.prepare(`SELECT enqueued_at,slack_redrive_count,slack_redrive_due_at
+      FROM outbox WHERE id=?`)
+      .bind(outboxId)
+      .first<{
+        enqueued_at: number | null;
+        slack_redrive_count: number;
+        slack_redrive_due_at: number;
+      }>();
+    expect(row?.enqueued_at).toBe(1);
+    expect(row?.slack_redrive_count).toBe(0);
+    expect(row?.slack_redrive_due_at).toBeGreaterThanOrEqual(before + 5 * 60_000);
+    expect(row?.slack_redrive_due_at).toBeLessThanOrEqual(after + 5 * 60_000);
+  });
   it("retains a redrive marker when an acknowledged uncertain send finds no Slack post", async () => {
     const { created } = await activeThread();
     await addCommentReply(runtime(), owner, commentPage, created.id, body("Unconfirmed"));
@@ -4325,6 +4351,30 @@ describe("Slack delayed-work boundaries", () => {
     expect(posts.at(-1)!.text).toContain("@Viewer");
     expect(posts.at(-1)!.text).not.toContain("<@UVIEWER>");
   });
+  it.each(["no_permission", "restricted_action"])(
+    "keeps a mirror active when outbound mention lookup returns %s",
+    async (code) => {
+      const { created, link } = await activeThread();
+      await addCommentReply(runtime(), owner, commentPage, created.id, [
+        { type: "mention", props: { entityType: "user", entityId: "viewer", label: "Viewer" } },
+      ]);
+      beforeResponse = async (method) => {
+        if (method === "users.info" && calls.at(-1)?.payload.user === "UVIEWER")
+          throw new SlackApiError(method, code, 403);
+      };
+      const delivery = (await deliveries(created.id)).find((row) => row.operation === "reply")!;
+      await deliverSlackThread(runtime(), delivery.id);
+      expect(posts.at(-1)!.text).toContain("@Viewer");
+      expect(posts.at(-1)!.text).not.toContain("<@UVIEWER>");
+      expect((await deliveries(created.id)).find((row) => row.id === delivery.id)?.state).toBe("sent");
+      expect(
+        await env.DB.prepare(`SELECT mirror_enabled FROM slack_channel_subscriptions WHERE id='space'`).first(),
+      ).toEqual({ mirror_enabled: 1 });
+      expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(link.id).first()).toEqual({
+        state: "active",
+      });
+    },
+  );
   it("retires a moved page's old root and selects its new space mapping", async () => {
     const { created, link } = await activeThread();
     await env.DB.prepare(
