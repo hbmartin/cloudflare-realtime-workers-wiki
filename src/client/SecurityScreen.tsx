@@ -326,9 +326,11 @@ export function SecurityScreen({
             )}
             {recoveryEnrollment && !status.recoveryEnrollmentAllowed && !status.recoveryKeyAcknowledgmentRequired && (
               <p>
-                {status.recoveryCanResume
-                  ? "Resume recovery with fresh proof and save your recovery resume key before restoring account protection."
-                  : "Use a recovery code or operator reset token to recover account protection."}
+                {status.recoveryKeyPendingElsewhere
+                  ? "Another recovery key is awaiting acknowledgment. Try again after it expires."
+                  : status.recoveryCanResume
+                    ? "Resume recovery with fresh proof and save your recovery resume key before restoring account protection."
+                    : "Use a recovery code or operator reset token to recover account protection."}
               </p>
             )}
             {(recoveryEnrollment ? status.recoveryEnrollmentAllowed : enrollment || setup) &&

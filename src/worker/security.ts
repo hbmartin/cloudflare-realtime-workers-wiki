@@ -114,6 +114,7 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
           recoveryCanResume:
             row.recovery_started_at !== null &&
             row.recovery_started_at > time - RECOVERY_RESUME_MS &&
+            (row.recovery_pending_key_hash === null || row.recovery_pending_session_id === sessionId) &&
             ((sessionId !== null &&
               ((row.recovery_origin_session_id === sessionId &&
                 row.method === "recovery" &&
@@ -127,6 +128,8 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
           ),
           recoveryKeyAcknowledgmentRequired:
             row.recovery_pending_session_id === sessionId && row.recovery_pending_key_hash !== null,
+          recoveryKeyPendingElsewhere:
+            row.recovery_pending_key_hash !== null && row.recovery_pending_session_id !== sessionId,
           recoveryEnrollmentAllowed:
             row.recovery_resume_key_hash !== null &&
             row.recovery_pending_key_hash === null &&
@@ -794,6 +797,8 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
       resumeRecovery: post("/security/resume-recovery", async (ctx) => {
         const id = await requireIdentity(ctx);
         const { account, status } = await readSecurity(env, id.userId, id.sessionId);
+        if (account.recovery_pending_key_hash !== null && account.recovery_pending_session_id !== id.sessionId)
+          throw deny("Another recovery key is awaiting acknowledgment. Try again after it expires.");
         if (!status.recoveryCanResume) throw deny("Use a recovery code or operator reset token first.");
         const time = Date.now();
         const original =
@@ -811,8 +816,6 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
                 )
                 .first()
             : null;
-        if (account.recovery_pending_key_hash !== null && !original)
-          throw deny("Another recovery key is awaiting acknowledgment. Try again after it expires.");
         await attempt(env, id.userId);
         await primaryFactor(ctx, env, id);
         const suppliedKey = ctx.body?.resumeKey;

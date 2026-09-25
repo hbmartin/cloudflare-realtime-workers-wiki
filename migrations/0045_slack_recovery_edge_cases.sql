@@ -51,7 +51,7 @@ WHERE topic='slack_thread_reply' AND enqueued_at IS NOT NULL
 
 -- A claim with no recovery proof was stranded by the old pending-key race.
 UPDATE account_security SET recovery_resume_claim_session_id=NULL
-WHERE recovery_resume_claim_session_id IS NOT NULL AND recovery_pending_key_hash IS NOT NULL
+WHERE recovery_resume_claim_session_id IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM session_security proof
     WHERE proof.session_id=account_security.recovery_resume_claim_session_id
       AND proof.user_id=account_security.user_id AND proof.generation=account_security.generation

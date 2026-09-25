@@ -30,6 +30,7 @@ import {
   deleteSlackChannelSubscription,
   handleSlackEvent,
   recordVerifiedSlackIdentity,
+  slackWorkspaceStatus,
   listSlackDeliveryFailureGroups,
   repairSlackChannelNotifications,
   sendDueSlackChannelDigests,
@@ -1785,6 +1786,16 @@ describe("interactive Slack workspace", () => {
     ).toEqual({ auth_error: "invalid_refresh_token", refresh_lease_token: null });
   });
 
+  it("uses a valid bot token without a generation and requires one for refresh", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    const incomplete = { ...installation, generation: undefined } as unknown as SlackInstallation;
+    expect(await usableBotToken(runtime(), incomplete)).toBe("xoxb-test");
+    incomplete.token_expires_at = 1;
+    await expect(usableBotToken(runtime(), incomplete)).rejects.toThrow("generation is unavailable");
+  });
+
   it("persists token rotations for unfurls and digests", async () => {
     const refreshTokens = ["xoxr-unfurl", "xoxr-digest"];
     const refreshed: string[] = [];
@@ -2034,6 +2045,47 @@ describe("interactive Slack workspace", () => {
     ).toEqual({ delivered: 1 });
   });
 
+  it("pauses an unfurl on missing_scope without pausing the installation", async () => {
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO slack_unfurls
+        (id,installation_id,installation_generation,workspace_id,user_id,channel_id,message_ts,unfurls_json,created_at)
+        VALUES ('unfurl-scope','installation',0,'workspace','owner','CSPACE','1700000700.000001',?,?)`).bind(
+        JSON.stringify({ "http://example.test/?page=page": { blocks: [] } }),
+        Date.now(),
+      ),
+      env.DB.prepare(`INSERT INTO outbox
+        (id,workspace_id,topic,payload_json,available_at,enqueued_at,created_at,slack_redrive_due_at)
+        VALUES ('outbox:slack-unfurl:unfurl-scope','workspace','slack_unfurl',?,1,1,?,1)`).bind(
+        JSON.stringify({ unfurlId: "unfurl-scope" }),
+        Date.now(),
+      ),
+    ]);
+    beforeResponse = async (method) => {
+      if (method === "chat.unfurl") throw new SlackApiError(method, "missing_scope", 403);
+    };
+    const outboxId = "outbox:slack-unfurl:unfurl-scope";
+    const ack = vi.fn();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId },
+      ack,
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: null,
+    });
+    expect(
+      await env.DB.prepare(`SELECT slack_scope_paused_at IS NOT NULL paused,slack_redrive_due_at
+      FROM outbox WHERE id=?`)
+        .bind(outboxId)
+        .first(),
+    ).toEqual({ paused: 1, slack_redrive_due_at: null });
+    expect(
+      await env.DB.prepare(`SELECT delivered_at,retired_at FROM slack_unfurls WHERE id='unfurl-scope'`).first(),
+    ).toEqual({ delivered_at: null, retired_at: null });
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
+  });
+
   it("sends share links outside the thread and distinguishes rate limits from uncertain sends", async () => {
     const { link } = await activeThread();
     const create = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
@@ -2141,6 +2193,97 @@ afterEach(() => {
 });
 
 describe("canonical Slack mirrors", () => {
+  it("keeps a scope-paused root beyond a day and posts it once after reauthorization", async () => {
+    await setSlackMirror(runtime(), owner, "space", true);
+    const created = await thread();
+    const root = (await deliveries(created.id))[0]!;
+    const outboxId = `outbox:${root.id}`;
+    await env.DB.prepare(`UPDATE slack_installations SET scopes=? WHERE id='installation'`)
+      .bind(`${scopes},reactions:read,files:write`)
+      .run();
+    beforeResponse = async (method) => {
+      if (method === "chat.postMessage") throw new SlackApiError(method, "missing_scope", 403);
+    };
+    const ack = vi.fn();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId },
+      ack,
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare(`SELECT slack_scope_paused_at IS NOT NULL paused,slack_redrive_due_at,
+        slack_redrive_count FROM outbox WHERE id=?`)
+        .bind(outboxId)
+        .first(),
+    ).toEqual({ paused: 1, slack_redrive_due_at: null, slack_redrive_count: 0 });
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: null,
+    });
+    expect((await slackWorkspaceStatus(runtime(), owner)).reauthorization.required).toBe(true);
+    await publishSlackHome(runtime(), "installation", "UOWNER");
+    expect(calls.some((call) => call.method === "views.publish")).toBe(true);
+    await env.DB.prepare(`UPDATE outbox SET slack_scope_paused_at=?,slack_eligible_started_at=? WHERE id=?`)
+      .bind(Date.now() - 25 * 60 * 60_000, Date.now() - 25 * 60 * 60_000, outboxId)
+      .run();
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
+    expect((await deliveries(created.id))[0]?.state).toBe("pending");
+    const oauthUrl = new URL(await createSlackOAuthUrl(runtime(), owner));
+    const state = oauthUrl.searchParams.get("state")!;
+    beforeResponse = undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith("/oauth.v2.access")
+          ? Response.json({
+              ok: true,
+              access_token: "xoxb-reauthorized",
+              bot_user_id: "UBOT",
+              team: { id: "T123", name: "Slack" },
+              scope: `${scopes},reactions:read,files:write`,
+            })
+          : mockSlack(input, init),
+      ),
+    );
+    await finishSlackOAuth(runtime(), owner, "new-code", state);
+    expect(
+      await env.DB.prepare(`SELECT slack_scope_paused_at,slack_scope_paused_ms,slack_redrive_count
+        FROM outbox WHERE id=?`)
+        .bind(outboxId)
+        .first(),
+    ).toEqual({ slack_scope_paused_at: null, slack_scope_paused_ms: expect.any(Number), slack_redrive_count: 0 });
+    await env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`).bind(outboxId).run();
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(1);
+    expect((await deliveries(created.id))[0]?.state).toBe("pending");
+    await env.DB.prepare(`UPDATE outbox SET available_at=1 WHERE id=?`).bind(outboxId).run();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId },
+      ack: vi.fn(),
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect((await deliveries(created.id))[0]?.state).toBe("sent");
+    expect(posts).toHaveLength(1);
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId },
+      ack: vi.fn(),
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(posts).toHaveLength(1);
+  });
+  it.each(["no_permission", "restricted_action"])("preserves mirrors on users.info %s", async (code) => {
+    const { created, link } = await activeThread();
+    beforeResponse = async (method) => {
+      if (method === "users.info") throw new SlackApiError(method, code, 403);
+    };
+    await expect(setSlackMirror(runtime(), owner, "space", true)).rejects.toMatchObject({ code });
+    expect(
+      await env.DB.prepare(`SELECT mirror_enabled FROM slack_channel_subscriptions WHERE id='space'`).first(),
+    ).toEqual({ mirror_enabled: 1 });
+    expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(link.id).first()).toEqual({
+      state: "active",
+    });
+    expect((await deliveries(created.id))[0]?.state).toBe("sent");
+  });
   it("lets an owner restore a mapping without a root and suppresses waiting digests on pause", async () => {
     const cutoff = Date.UTC(2026, 8, 24, 9);
     await env.DB.prepare(`INSERT INTO slack_channel_events
@@ -2667,7 +2810,7 @@ describe("canonical Slack mirrors", () => {
       FROM outbox WHERE id=?`)
         .bind(Date.now(), `outbox:${refreshId}`)
         .first(),
-    ).toEqual({ slack_redrive_count: 0, due: 1 });
+    ).toEqual({ slack_redrive_count: 0, due: 0 });
     expect(
       await env.DB.prepare(`SELECT slack_redrive_count FROM outbox WHERE id=?`).bind(`outbox:${root.id}`).first(),
     ).toEqual({ slack_redrive_count: 1 });
@@ -2699,8 +2842,8 @@ describe("canonical Slack mirrors", () => {
     await env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=2 WHERE id=?`)
       .bind(`outbox:${runnable.id}`)
       .run();
-    expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
     expect(await redriveStaleSlackOutbox(runtime())).toBe(1);
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
     expect(
       await env.DB.prepare(`SELECT enqueued_at FROM outbox WHERE id=?`).bind(`outbox:${runnable.id}`).first(),
     ).toEqual({ enqueued_at: null });
@@ -3709,10 +3852,23 @@ describe("Slack inbound replies and actions", () => {
       await env.DB.prepare(`SELECT processed_at FROM slack_inbound_receipts WHERE id=?`).bind(receiptId).first(),
     ).toEqual({ processed_at: null });
     expect(
-      await env.DB.prepare(`SELECT slack_redrive_due_at>? deferred FROM outbox WHERE id=?`)
-        .bind(Date.now(), outboxId)
+      await env.DB.prepare(`SELECT slack_redrive_due_at IS NOT NULL due,slack_scope_paused_at IS NOT NULL paused
+        FROM outbox WHERE id=?`)
+        .bind(outboxId)
         .first(),
-    ).toEqual({ deferred: 1 });
+    ).toEqual(authError === "missing_scope" ? { due: 0, paused: 1 } : { due: 1, paused: 0 });
+  });
+  it("denies a time-limited thread action when its mirror scopes are missing", async () => {
+    const { link } = await activeThread();
+    const receiptId = await action(link);
+    await env.DB.prepare(`UPDATE slack_installations SET scopes='chat:write' WHERE id='installation'`).run();
+    await deliverSlackMutation(runtime(), receiptId, true);
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id=?`).bind(receiptId).first(),
+    ).toEqual({ outcome: "denied" });
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: null,
+    });
   });
   it("resolves and reopens through durable actions, deduplicates retries, and refreshes the same root", async () => {
     const { created, link } = await activeThread();
@@ -3893,6 +4049,23 @@ describe("Slack inbound replies and actions", () => {
     await deliverSlackChannelEvent(runtime(), second!.id);
     expect(posts).toHaveLength(1);
   });
+  it("blocks only a notification mapping on missing_scope", async () => {
+    await env.DB.prepare(`INSERT INTO slack_channel_events
+      (id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+      VALUES ('scope-event','space','workspace','page_edit','owner','page','immediate',?)`)
+      .bind(Date.now())
+      .run();
+    beforeResponse = async (method) => {
+      if (method === "chat.postMessage") throw new SlackApiError(method, "missing_scope", 403);
+    };
+    await deliverSlackChannelEvent(runtime(), "scope-event");
+    expect(
+      await env.DB.prepare(`SELECT notification_error FROM slack_channel_subscriptions WHERE id='space'`).first(),
+    ).toEqual({ notification_error: "missing_scope" });
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: null,
+    });
+  });
   it("keeps shared-channel one-way delivery separate from mirror validation and repairs blocked notifications", async () => {
     await mapping("shared", "CSHARED");
     await env.DB.prepare(`UPDATE slack_channel_subscriptions SET validation_state='invalid',
@@ -4016,8 +4189,8 @@ describe("Slack inbound replies and actions", () => {
         .first(),
     ).toEqual({ reason: "root_message_not_found_unconfirmed" });
     expect(
-      await env.DB.prepare(`SELECT 1 FROM slack_delivery_failures WHERE delivery_id=?`).bind(refresh.id).first(),
-    ).toBeNull();
+      await env.DB.prepare(`SELECT reason FROM slack_delivery_failures WHERE delivery_id=?`).bind(refresh.id).first(),
+    ).toEqual({ reason: "root_message_not_found" });
     expect(
       await env.DB.prepare(`SELECT failure_reason FROM slack_thread_deliveries WHERE id=?`).bind(refresh.id).first(),
     ).toEqual({ failure_reason: "root_message_not_found" });

@@ -6,6 +6,24 @@ import { createAuth } from "./auth";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("repairs a stale recovery claim after its pending key was pruned", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0046"),
+    );
+    await env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+      VALUES ('owner','Owner','owner@example.test',1,1)`).run();
+    await env.DB.prepare(`UPDATE account_security SET recovery_resume_key_hash='saved',
+      recovery_resume_claim_session_id='stranded' WHERE user_id='owner'`).run();
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_key_hash saved,recovery_resume_claim_session_id claim
+        FROM account_security WHERE user_id='owner'`).first(),
+    ).toEqual({ saved: "saved", claim: null });
+    expect(
+      await env.DB.prepare(`SELECT slack_scope_paused_at,slack_scope_paused_ms FROM outbox LIMIT 1`).all(),
+    ).toMatchObject({ success: true });
+  });
   it("repairs legacy Slack scope pauses, stranded claims, and blocked redrive markers", async () => {
     await applyD1Migrations(
       env.DB,

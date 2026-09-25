@@ -12,6 +12,9 @@ import {
   recordSlackInstallationError,
   slackChannelError,
   slackInstallationError,
+  slackMissingScope,
+  slackHasScopes,
+  SLACK_MIRROR_SCOPES,
   usableBotToken,
   SlackApiError,
   SlackRateLimitError,
@@ -23,7 +26,6 @@ import {
 import { escapeSlackText, slackCommentText, slackReplyBody } from "./slack-thread-text";
 import { threadRootBlocks } from "./slack-blocks";
 
-const SCOPES = ["chat:write", "channels:read", "groups:read", "channels:history", "groups:history", "users:read"];
 const ID = /^[A-Za-z0-9_-]{1,100}$/;
 const TS = /^\d{1,16}\.\d{1,16}$/;
 const DENIED = "This NoteFlare thread is unavailable or you no longer have permission to use it.";
@@ -81,13 +83,12 @@ export async function installationFor(env: Env, id: string, generation?: number)
   return row;
 }
 function requireMirrorScopes(installation: SlackInstallation) {
-  const scopes = new Set(installation.scopes.split(",").map((scope) => scope.trim()));
-  if (SCOPES.some((scope) => !scopes.has(scope)))
+  if (!slackHasScopes(installation.scopes, SLACK_MIRROR_SCOPES))
     throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
   return installation;
 }
 function mirrorRouteError(error: unknown): never {
-  if (error instanceof SlackApiError && error.code === "missing_scope")
+  if (slackMissingScope(error))
     throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
   throw error;
 }
@@ -283,12 +284,14 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
         .run();
     if (!result.meta.changes) unavailable();
   } catch (error) {
-    if (error instanceof SlackApiError && error.code === "missing_scope") mirrorRouteError(error);
+    if (slackMissingScope(error)) mirrorRouteError(error);
     if (String(error).includes("UNIQUE constraint failed"))
       throw new HttpError(409, "slack_mirror_conflict", "Disable the existing mirror for this page or space first.");
     if (
       (!channelValidated && error instanceof HttpError && error.code === "slack_channel_invalid") ||
-      slackChannelError(error)
+      (error instanceof SlackApiError &&
+        ["conversations.info", "conversations.members"].includes(error.method) &&
+        slackChannelError(error))
     ) {
       const now = Date.now();
       await env.DB.batch([
@@ -464,7 +467,7 @@ function mutationGuard(env: Env, receiptId: string, input: Input, threadId: stri
     input.slackUserId,
     input.identity?.verifiedAt ?? -1,
     input.identity?.accountId ?? "",
-    JSON.stringify(SCOPES),
+    JSON.stringify(SLACK_MIRROR_SCOPES),
     receiptId,
     input.resolved === undefined ? 0 : 1,
   );
@@ -707,7 +710,8 @@ export async function deliverSlackMutation(env: Env, receiptId: string, action: 
       .bind(receiptId)
       .first<{ processed_at: number | null }>();
     if (done?.processed_at !== null && done?.processed_at !== undefined) return;
-    if (error instanceof HttpError && error.code === "slack_mirror_missing_scope") throw error;
+    if (error instanceof HttpError && error.code === "slack_mirror_missing_scope" && !action) throw error;
+    if (slackMissingScope(error) && !action) mirrorRouteError(error);
     if (error instanceof SlackApiError && slackInstallationError(error)) {
       await recordSlackInstallationError(env, input.installationId, error);
       throw error;
@@ -718,8 +722,7 @@ export async function deliverSlackMutation(env: Env, receiptId: string, action: 
         .bind(input.installationId)
         .first<{ scopes: string }>();
       if (current) {
-        const scopes = new Set(current.scopes.split(",").map((scope) => scope.trim()));
-        if (SCOPES.some((scope) => !scopes.has(scope)))
+        if (!action && !slackHasScopes(current.scopes, SLACK_MIRROR_SCOPES))
           throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
       }
     }
@@ -884,15 +887,16 @@ async function finishDelivery(env: Env, delivery: Delivery, link: Link, messageT
 }
 
 async function retireInvalidReconciledLink(env: Env, link: Link, delivery: Delivery) {
+  let current: Link;
   try {
-    await linkFor(env, link.id);
+    current = await linkFor(env, link.id);
   } catch (error) {
     if (!(error instanceof HttpError) || error.status >= 500) throw error;
     await retireReconciledLink(env, link);
     return;
   }
   try {
-    await outboundAuthority(env, link, delivery.actor_id);
+    await outboundAuthority(env, link, delivery.actor_id, current);
     if (delivery.comment_id) {
       const comment = await env.DB.prepare(
         `SELECT user_id FROM comments WHERE id=? AND thread_id=? AND deleted_at IS NULL`,
@@ -1175,8 +1179,8 @@ export async function retireUncertainSlackDelivery(
   if (delivery.operation !== "root") await wakeNextSlackDelivery(env, delivery.link_id);
   return true;
 }
-async function outboundAuthority(env: Env, link: Link, actorId: string) {
-  const current = await linkFor(env, link.id);
+async function outboundAuthority(env: Env, link: Link, actorId: string, validatedLink?: Link) {
+  const current = validatedLink ?? (await linkFor(env, link.id));
   const installation = requireMirrorScopes(
     await installationFor(env, current.installation_id, current.installation_generation),
   );
@@ -1240,6 +1244,7 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
         recovered = await reconcileDelivery(env, installed, link, delivery);
       } catch (error) {
         await pauseHistoryClock(env, delivery, installed.id);
+        if (slackMissingScope(error)) mirrorRouteError(error);
         if (error instanceof SlackApiError && !transientSlackLookup(error)) {
           if (slackInstallationError(error)) {
             await recordSlackInstallationError(env, installed.id, error);
@@ -1439,7 +1444,14 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       throw error;
     }
   } catch (error) {
-    if (error instanceof HttpError && error.code === "slack_mirror_missing_scope") throw error;
+    if (error instanceof HttpError && error.code === "slack_mirror_missing_scope") {
+      if (delivery.state === "sending") await pauseHistoryClock(env, delivery);
+      throw error;
+    }
+    if (slackMissingScope(error)) {
+      if (delivery.state === "sending") await pauseHistoryClock(env, delivery);
+      mirrorRouteError(error);
+    }
     if (error instanceof HttpError && error.code === "slack_channel_invalid") {
       if (delivery.operation === "refresh") {
         await retireRejectedDelivery(env, delivery, error.code);
@@ -1479,6 +1491,13 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       if (error.code === "message_not_found" && delivery.operation === "refresh") {
         const now = Date.now();
         await env.DB.batch([
+          env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
+            (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
+            SELECT d.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
+              COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'root_message_not_found',?
+            FROM slack_thread_deliveries d JOIN slack_thread_links link ON link.id=d.link_id
+            LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
+            WHERE d.id=? AND d.state IN ('pending','sending')`).bind(now, delivery.id),
           env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
             (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
             SELECT d.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),

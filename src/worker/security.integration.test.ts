@@ -209,9 +209,16 @@ describe("mandatory account protection", () => {
     expect(resumed.status).toBe(200);
     const replacementKey = (await resumed.json<{ resumeKey: string }>()).resumeKey;
     expect(await (await rawRequest(originSession, "/api/security/status")).json()).toMatchObject({
+      recoveryCanResume: false,
+      recoveryKeyPendingElsewhere: true,
       recoveryEnrollmentAllowed: false,
       recoveryKeyAcknowledgmentRequired: false,
     });
+    const attempts = await env.DB.prepare(`SELECT failed_attempts FROM account_security`).first();
+    const denied = await rawRequest(originSession, "/api/security/resume-recovery", { password: "password123" });
+    expect(denied.status).toBe(403);
+    expect(await denied.text()).toContain("Another recovery key is awaiting acknowledgment");
+    expect(await env.DB.prepare(`SELECT failed_attempts FROM account_security`).first()).toEqual(attempts);
     expect((await rawRequest(originSession, "/api/security/setup-totp", { password: "password123" })).status).toBe(403);
     expect(
       (
@@ -221,6 +228,7 @@ describe("mandatory account protection", () => {
       ).status,
     ).toBe(200);
     expect(await (await rawRequest(originSession, "/api/security/status")).json()).toMatchObject({
+      recoveryKeyPendingElsewhere: false,
       recoveryEnrollmentAllowed: true,
     });
   });
