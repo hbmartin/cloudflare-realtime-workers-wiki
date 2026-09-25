@@ -360,6 +360,53 @@ export function passkeyRegistrationRevokedResponse() {
   });
 }
 
+async function clearExpiredRecoveryHandoff(env: Env, userId: string, time: number) {
+  const handoff = await env.DB.prepare(`SELECT generation,recovery_resume_key_hash,recovery_pending_key_hash,
+    recovery_pending_session_id,recovery_origin_session_id FROM account_security
+    WHERE user_id=? AND recovery_pending_key_hash IS NOT NULL AND
+      (recovery_pending_until<=? OR recovery_pending_repair_at<=?)`)
+    .bind(userId, time, time - 2 * 60_000)
+    .first<{
+      generation: number;
+      recovery_resume_key_hash: string | null;
+      recovery_pending_key_hash: string;
+      recovery_pending_session_id: string | null;
+      recovery_origin_session_id: string | null;
+    }>();
+  if (!handoff) return;
+  const cleared = await env.DB.prepare(`UPDATE account_security SET recovery_pending_key_hash=NULL,
+    recovery_pending_session_id=NULL,recovery_pending_until=NULL,recovery_pending_repair_at=NULL
+    WHERE user_id=? AND generation=? AND recovery_pending_key_hash=?
+      AND recovery_pending_session_id IS ? AND
+      (recovery_pending_until<=? OR recovery_pending_repair_at<=?) RETURNING user_id`)
+    .bind(
+      userId,
+      handoff.generation,
+      handoff.recovery_pending_key_hash,
+      handoff.recovery_pending_session_id,
+      time,
+      time - 2 * 60_000,
+    )
+    .first();
+  if (
+    cleared &&
+    handoff.recovery_pending_session_id &&
+    handoff.recovery_pending_session_id !== handoff.recovery_origin_session_id
+  )
+    await env.DB.prepare(`DELETE FROM session WHERE id=? AND userId=? AND EXISTS
+      (SELECT 1 FROM account_security WHERE user_id=? AND generation=?
+        AND recovery_pending_session_id IS NOT ? AND recovery_resume_key_hash IS ?)`)
+      .bind(
+        handoff.recovery_pending_session_id,
+        userId,
+        userId,
+        handoff.generation,
+        handoff.recovery_pending_session_id,
+        handoff.recovery_resume_key_hash,
+      )
+      .run();
+}
+
 export async function pruneSecurityState(env: Env) {
   const time = Date.now();
   await env.DB.batch([
@@ -424,34 +471,12 @@ export async function pruneSecurityState(env: Env) {
       await env.DB.prepare("DELETE FROM recovery_session_repairs WHERE session_id=?").bind(repair.session_id).run();
     }
   }
-  const handoffs = await env.DB.prepare(`SELECT user_id,generation,recovery_pending_session_id,
-    recovery_origin_session_id FROM account_security
+  const handoffs = await env.DB.prepare(`SELECT user_id FROM account_security
     WHERE recovery_pending_key_hash IS NOT NULL AND
       (recovery_pending_until<=? OR recovery_pending_repair_at<=?) LIMIT 100`)
     .bind(time, time - 2 * 60_000)
-    .all<{
-      user_id: string;
-      generation: number;
-      recovery_pending_session_id: string | null;
-      recovery_origin_session_id: string | null;
-    }>();
-  for (const handoff of handoffs.results) {
-    const cleared = await env.DB.prepare(`UPDATE account_security SET recovery_pending_key_hash=NULL,
-      recovery_pending_session_id=NULL,recovery_pending_until=NULL,recovery_pending_repair_at=NULL
-      WHERE user_id=? AND generation=? AND recovery_pending_key_hash IS NOT NULL
-        AND recovery_pending_session_id IS ? AND
-        (recovery_pending_until<=? OR recovery_pending_repair_at<=?) RETURNING user_id`)
-      .bind(handoff.user_id, handoff.generation, handoff.recovery_pending_session_id, time, time - 2 * 60_000)
-      .first();
-    if (
-      cleared &&
-      handoff.recovery_pending_session_id &&
-      handoff.recovery_pending_session_id !== handoff.recovery_origin_session_id
-    )
-      await env.DB.prepare("DELETE FROM session WHERE id=? AND userId=?")
-        .bind(handoff.recovery_pending_session_id, handoff.user_id)
-        .run();
-  }
+    .all<{ user_id: string }>();
+  for (const handoff of handoffs.results) await clearExpiredRecoveryHandoff(env, handoff.user_id, time);
 }
 
 function passwordSource(headers: Headers | undefined) {
@@ -482,6 +507,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
     endpoints: {
       securityStatus: createAuthEndpoint("/security/status", { method: "GET" }, async (ctx) => {
         const id = await identity(ctx);
+        if (id) await clearExpiredRecoveryHandoff(env, id.userId, Date.now());
         return ctx.json(
           id
             ? (await readSecurity(env, id.userId, id.sessionId, true)).status

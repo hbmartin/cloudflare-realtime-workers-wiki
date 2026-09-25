@@ -57,7 +57,7 @@ WHERE recovery_resume_claim_session_id IS NOT NULL
       AND proof.user_id=account_security.user_id AND proof.generation=account_security.generation
       AND proof.method='recovery');
 
--- Local mirror-scope validation used to pause the entire installation.
+-- Fold open local missing-scope outages into auth_paused_ms before clearing their timestamps.
 UPDATE slack_installations SET
   auth_paused_ms=auth_paused_ms+CASE WHEN auth_error_at IS NULL THEN 0
     ELSE MAX(0,CAST(unixepoch('subsec')*1000 AS INTEGER)-auth_error_at) END,

@@ -325,13 +325,28 @@ export function SecurityScreen({
               </p>
             )}
             {recoveryEnrollment && !status.recoveryEnrollmentAllowed && !status.recoveryKeyAcknowledgmentRequired && (
-              <p>
-                {status.recoveryKeyPendingElsewhere
-                  ? "Another recovery key is awaiting acknowledgment. Try again after it expires."
-                  : status.recoveryCanResume
-                    ? "Resume recovery with fresh proof and save your recovery resume key before restoring account protection."
-                    : "Use a recovery code or operator reset token to recover account protection."}
-              </p>
+              <>
+                <p>
+                  {status.recoveryKeyPendingElsewhere
+                    ? "Another recovery key is awaiting acknowledgment. Refresh status after it is saved or expires."
+                    : status.recoveryCanResume
+                      ? "Resume recovery with fresh proof and save your recovery resume key before restoring account protection."
+                      : "Use a recovery code or operator reset token to recover account protection."}
+                </p>
+                {status.recoveryKeyPendingElsewhere && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      void run(async () => {
+                        await reload();
+                      })
+                    }
+                  >
+                    Refresh status
+                  </button>
+                )}
+              </>
             )}
             {(recoveryEnrollment ? status.recoveryEnrollmentAllowed : enrollment || setup) &&
               !status.recoveryKeyAcknowledgmentRequired && (
