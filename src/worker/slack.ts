@@ -6,6 +6,16 @@ import { HttpError } from "./http";
 import { safeSlackText, unfurlBlocks } from "./slack-blocks";
 import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
 
+export const SLACK_REDRIVE_STALE_MS = 30 * 60_000;
+export const SLACK_MIRROR_SCOPES = [
+  "chat:write",
+  "channels:read",
+  "groups:read",
+  "channels:history",
+  "groups:history",
+  "users:read",
+] as const;
+
 const OAUTH_STATE_TTL_MS = 10 * 60_000;
 const LINK_TOKEN_TTL_MS = 10 * 60_000;
 const REQUEST_WINDOW_SECONDS = 5 * 60;
@@ -116,13 +126,7 @@ export class SlackApiError extends Error {
   }
 }
 
-const INSTALLATION_ERRORS = new Set([
-  "invalid_auth",
-  "token_revoked",
-  "account_inactive",
-  "missing_scope",
-  "invalid_refresh_token",
-]);
+const INSTALLATION_ERRORS = new Set(["invalid_auth", "token_revoked", "account_inactive", "invalid_refresh_token"]);
 const CHANNEL_ERRORS = new Set([
   "channel_not_found",
   "not_in_channel",
@@ -132,6 +136,12 @@ const CHANNEL_ERRORS = new Set([
 ]);
 export const slackInstallationError = (error: unknown): boolean =>
   error instanceof SlackApiError && INSTALLATION_ERRORS.has(error.code);
+export const slackMissingScope = (error: unknown): error is SlackApiError =>
+  error instanceof SlackApiError && error.code === "missing_scope";
+export const slackHasScopes = (scopes: string, required: readonly string[]): boolean => {
+  const granted = new Set(scopes.split(",").map((scope) => scope.trim()));
+  return required.every((scope) => granted.has(scope));
+};
 export const slackChannelError = (error: unknown): boolean =>
   error instanceof SlackApiError && CHANNEL_ERRORS.has(error.code);
 
@@ -486,6 +496,13 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
             AND link.state IN ('pending','active') AND mapping.mirror_enabled=1)`)
       .bind(timestamp, member.workspace.id)
       .run();
+    await env.DB.prepare(`UPDATE outbox SET
+      slack_scope_paused_ms=slack_scope_paused_ms+MAX(0,?-slack_scope_paused_at),
+      slack_scope_paused_at=NULL,slack_redrive_count=0,
+      enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
+      WHERE workspace_id=? AND slack_scope_paused_at IS NOT NULL`)
+      .bind(timestamp, timestamp, member.workspace.id)
+      .run();
     await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
       WHERE workspace_id=? AND
         ((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl')
@@ -595,7 +612,9 @@ export async function disconnectSlack(env: Env, member: MemberContext) {
 
 export async function slackWorkspaceStatus(env: Env, member: MemberContext) {
   const installation = await env.DB.prepare(
-    `SELECT id, team_id, team_name, bot_user_id, scopes, disconnected_at, created_at, updated_at, auth_error, auth_error_at
+    `SELECT id, team_id, team_name, bot_user_id, scopes, disconnected_at, created_at, updated_at, auth_error, auth_error_at,
+      EXISTS(SELECT 1 FROM outbox work WHERE work.workspace_id=slack_installations.workspace_id
+        AND work.slack_scope_paused_at IS NOT NULL) scope_work_paused
        FROM slack_installations WHERE workspace_id = ?`,
   )
     .bind(member.workspace.id)
@@ -610,6 +629,7 @@ export async function slackWorkspaceStatus(env: Env, member: MemberContext) {
       updated_at: number;
       auth_error: string | null;
       auth_error_at: number | null;
+      scope_work_paused: number;
     }>();
   const link = installation
     ? await env.DB.prepare(
@@ -656,7 +676,10 @@ export async function slackWorkspaceStatus(env: Env, member: MemberContext) {
       verifiedAt: link?.verified_at ?? null,
     },
     reauthorization: {
-      required: Boolean(connected && (scopeHealth?.reauthorizationRequired || installation?.auth_error)),
+      required: Boolean(
+        connected &&
+        (scopeHealth?.reauthorizationRequired || installation?.auth_error || installation?.scope_work_paused),
+      ),
       available: configured(env),
     },
   } satisfies SlackStatus;
@@ -914,6 +937,7 @@ export function rootControlRefreshStatements(
   actorId: string,
   sourceId: string,
   now: number,
+  linkId?: string,
 ) {
   return [
     env.DB.prepare(`INSERT OR IGNORE INTO slack_thread_deliveries
@@ -927,7 +951,8 @@ export function rootControlRefreshStatements(
         JOIN pages page ON page.id = link.page_id AND page.archived_at IS NULL
        WHERE mapping.id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL
          AND link.installation_generation = installation.generation AND mapping.mirror_enabled = 1
-         AND mapping.validation_state = 'valid' AND link.state = 'active' AND link.root_message_ts IS NOT NULL`).bind(
+         AND mapping.validation_state = 'valid' AND link.state = 'active' AND link.root_message_ts IS NOT NULL
+         AND (? IS NULL OR link.id = ?)`).bind(
       sourceId,
       sourceId,
       actorId,
@@ -936,6 +961,8 @@ export function rootControlRefreshStatements(
       now,
       mappingId,
       workspaceId,
+      linkId ?? null,
+      linkId ?? null,
     ),
     env.DB.prepare(`INSERT OR IGNORE INTO outbox
       (id, workspace_id, topic, payload_json, available_at, created_at)
@@ -1107,6 +1134,8 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
   if (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000) {
     return decryptSlackToken(env, installation.bot_token_ciphertext);
   }
+  if (!Number.isSafeInteger(installation.generation))
+    throw new Error("Slack installation generation is unavailable for token refresh.");
   if (!installation.bot_refresh_token_ciphertext) {
     throw new SlackApiError("oauth.v2.access", "invalid_auth", 401, installation.credential_revision);
   }
@@ -1117,9 +1146,9 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
     signal?.throwIfAborted();
     const now = Date.now();
     const lease = await env.DB.prepare(`UPDATE slack_installations SET refresh_lease_token=?,refresh_lease_until=?
-      WHERE id=? AND disconnected_at IS NULL AND bot_token_ciphertext=?
+      WHERE id=? AND generation=? AND disconnected_at IS NULL AND bot_token_ciphertext=?
         AND (refresh_lease_token IS NULL OR refresh_lease_until<=?)`)
-      .bind(leaseToken, now + 30_000, installation.id, oldCiphertext, now)
+      .bind(leaseToken, now + 30_000, installation.id, installation.generation, oldCiphertext, now)
       .run();
     if (lease.meta.changes) {
       claimed = true;
@@ -1128,7 +1157,8 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
     const current = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL`)
       .bind(installation.id)
       .first<SlackInstallation>();
-    if (!current) throw new Error("The Slack installation was disconnected.");
+    if (!current || current.generation !== installation.generation)
+      throw new Error("The Slack installation changed during token refresh.");
     if (current.bot_token_ciphertext !== oldCiphertext) {
       Object.assign(installation, current);
       return decryptSlackToken(env, current.bot_token_ciphertext);
@@ -1177,7 +1207,7 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
           )
             .bind(installation.id)
             .first<SlackInstallation>();
-          if (current?.bot_token_ciphertext !== oldCiphertext && current) {
+          if (current?.generation === installation.generation && current.bot_token_ciphertext !== oldCiphertext) {
             Object.assign(installation, current);
             return decryptSlackToken(env, current.bot_token_ciphertext);
           }
@@ -1228,7 +1258,9 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
       const current = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id = ? AND disconnected_at IS NULL`)
         .bind(installation.id)
         .first<SlackInstallation>();
-      if (!current) throw new Error("The Slack installation was disconnected.");
+      if (!current || current.generation !== installation.generation)
+        throw new Error("The Slack installation changed during token refresh.");
+      if (current.bot_token_ciphertext === oldCiphertext) throw new Error("Slack token refresh was not persisted.");
       installation.bot_token_ciphertext = current.bot_token_ciphertext;
       installation.bot_refresh_token_ciphertext = current.bot_refresh_token_ciphertext;
       installation.token_expires_at = current.token_expires_at;
@@ -1823,6 +1855,10 @@ export async function deliverSlackChannelEvent(env: Env, eventId: string) {
       await blockSlackNotifications(env, row.subscription_id, error.code);
       return;
     }
+    if (slackMissingScope(error)) {
+      await blockSlackNotifications(env, row.subscription_id, error.code);
+      return;
+    }
     if (error instanceof SlackApiError && slackInstallationError(error)) {
       await blockSlackInstallationNotifications(env, row.id, error);
       throw error;
@@ -2074,7 +2110,7 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
       const queuedAt = Date.now();
       await env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?
         WHERE id=? AND enqueued_at IS NULL`)
-        .bind(queuedAt, queuedAt + 30 * 60_000, outboxId)
+        .bind(queuedAt, queuedAt + SLACK_REDRIVE_STALE_MS, outboxId)
         .run();
     } catch {
       // The scheduled outbox sweep recovers this enqueue after a D1/Queue split failure.
@@ -2178,7 +2214,7 @@ async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_me
 export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: string) {
   const row = await env.DB.prepare(
     `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.message_ts, unfurl.unfurls_json,
-            installation.id, installation.workspace_id, installation.team_id, installation.team_name,
+            installation.id, installation.generation, installation.workspace_id, installation.team_id, installation.team_name,
             installation.bot_user_id, installation.bot_token_ciphertext,
             installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at,
             installation.credential_revision
@@ -2289,7 +2325,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
       const events = await env.DB.prepare(
         `SELECT event.id, event.event_type, event.page_id, page.title page_title, actor.name actor_name,
               subscription.channel_id,
-              installation.id installation_id, installation.workspace_id, installation.team_id,
+              installation.id installation_id, installation.generation, installation.workspace_id, installation.team_id,
               installation.team_name, installation.bot_user_id, installation.bot_token_ciphertext,
               installation.bot_refresh_token_ciphertext, installation.token_expires_at,
               installation.disconnected_at, installation.credential_revision
@@ -2348,6 +2384,10 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
           claim.token,
         );
         if (error instanceof SlackApiError && slackChannelError(error)) {
+          await blockSlackNotifications(env, subscriptionId, error.code);
+          continue;
+        }
+        if (slackMissingScope(error)) {
           await blockSlackNotifications(env, subscriptionId, error.code);
           continue;
         }

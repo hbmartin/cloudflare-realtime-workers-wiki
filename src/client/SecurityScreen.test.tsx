@@ -356,6 +356,38 @@ describe("protection recovery flows", () => {
     expect(screen.queryByRole("button", { name: "Create a passkey" })).not.toBeInTheDocument();
     expect(screen.getByText(/Resume recovery with fresh proof and save your recovery resume key/)).toBeVisible();
   });
+  it("shows the recovery-code path when the resume window is closed", () => {
+    render(
+      <SecurityScreen
+        initialStatus={{
+          ...status,
+          state: "recovery_required",
+          recoveryCanResume: false,
+          recoveryEnrollmentAllowed: false,
+          recoveryKeyAcknowledgmentRequired: false,
+        }}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Resume recovery" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Resume recovery with fresh proof/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Use a recovery code or operator reset token/)).toBeVisible();
+  });
+  it("asks another session to wait for a pending recovery key", () => {
+    render(
+      <SecurityScreen
+        initialStatus={{
+          ...status,
+          state: "recovery_required",
+          recoveryCanResume: false,
+          recoveryEnrollmentAllowed: false,
+          recoveryKeyPendingElsewhere: true,
+        }}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Resume recovery" })).not.toBeInTheDocument();
+    expect(screen.getByText(/Another recovery key is awaiting acknowledgment/)).toBeVisible();
+    expect(screen.queryByText(/Use a recovery code or operator reset token/)).not.toBeInTheDocument();
+  });
   it("clears a dead resume key when its replacement session is revoked", async () => {
     const recovery = { ...status, state: "recovery_required" as const, recoveryCanResume: true };
     vi.mocked(api).mockImplementation(async (path) => {

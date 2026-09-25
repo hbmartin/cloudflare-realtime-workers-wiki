@@ -12,6 +12,9 @@ import {
   recordSlackInstallationError,
   slackChannelError,
   slackInstallationError,
+  slackMissingScope,
+  slackHasScopes,
+  SLACK_MIRROR_SCOPES,
   usableBotToken,
   SlackApiError,
   SlackRateLimitError,
@@ -23,7 +26,6 @@ import {
 import { escapeSlackText, slackCommentText, slackReplyBody } from "./slack-thread-text";
 import { threadRootBlocks } from "./slack-blocks";
 
-const SCOPES = ["chat:write", "channels:read", "groups:read", "channels:history", "groups:history", "users:read"];
 const ID = /^[A-Za-z0-9_-]{1,100}$/;
 const TS = /^\d{1,16}\.\d{1,16}$/;
 const DENIED = "This NoteFlare thread is unavailable or you no longer have permission to use it.";
@@ -78,10 +80,17 @@ export async function installationFor(env: Env, id: string, generation?: number)
     .bind(id)
     .first<SlackInstallation>();
   if (!row || (generation !== undefined && row.generation !== generation)) unavailable();
-  const scopes = new Set(row.scopes.split(",").map((scope) => scope.trim()));
-  if (SCOPES.some((scope) => !scopes.has(scope)))
-    throw new SlackApiError("installation", "missing_scope", 403, row.credential_revision);
   return row;
+}
+function requireMirrorScopes(installation: SlackInstallation) {
+  if (!slackHasScopes(installation.scopes, SLACK_MIRROR_SCOPES))
+    throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
+  return installation;
+}
+function mirrorRouteError(error: unknown): never {
+  if (slackMissingScope(error))
+    throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
+  throw error;
 }
 async function memberFor(env: Env, workspaceId: string, userId: string): Promise<MemberContext> {
   const row = await env.DB.prepare(`SELECT u.id, u.name, u.email, wm.role, w.name workspace_name, w.location_hint
@@ -236,17 +245,17 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
     ]);
     return;
   }
-  const installation = await installationFor(env, mapping.installation_id);
-  const link = await env.DB.prepare(
-    `SELECT slack_user_id FROM slack_user_links WHERE installation_id = ? AND user_id = ?`,
-  )
-    .bind(installation.id, member.user.id)
-    .first<{ slack_user_id: string }>();
-  if (!link) throw new HttpError(403, "slack_identity_required", CONNECT);
-  const { identity } = await verifiedMember(env, installation, link.slack_user_id);
-  if (mapping.page_id) await pageForMember(env, current, mapping.page_id);
+  const installation = requireMirrorScopes(await installationFor(env, mapping.installation_id));
   let channelValidated = false;
   try {
+    const link = await env.DB.prepare(
+      `SELECT slack_user_id FROM slack_user_links WHERE installation_id = ? AND user_id = ?`,
+    )
+      .bind(installation.id, member.user.id)
+      .first<{ slack_user_id: string }>();
+    if (!link) throw new HttpError(403, "slack_identity_required", CONNECT);
+    const { identity } = await verifiedMember(env, installation, link.slack_user_id);
+    if (mapping.page_id) await pageForMember(env, current, mapping.page_id);
     const channel = await validateChannel(env, installation, mapping.channel_id);
     channelValidated = true;
     await requireChannelMember(env, installation, mapping.channel_id, identity.slackUserId);
@@ -275,11 +284,14 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
         .run();
     if (!result.meta.changes) unavailable();
   } catch (error) {
+    if (slackMissingScope(error)) mirrorRouteError(error);
     if (String(error).includes("UNIQUE constraint failed"))
       throw new HttpError(409, "slack_mirror_conflict", "Disable the existing mirror for this page or space first.");
     if (
       (!channelValidated && error instanceof HttpError && error.code === "slack_channel_invalid") ||
-      slackChannelError(error)
+      (error instanceof SlackApiError &&
+        ["conversations.info", "conversations.members"].includes(error.method) &&
+        slackChannelError(error))
     ) {
       const now = Date.now();
       await env.DB.batch([
@@ -329,8 +341,12 @@ export async function verifySlackMirrorRecovery(env: Env, member: MemberContext,
     .bind(subscriptionId, member.workspace.id)
     .first<{ channel_id: string; installation_id: string }>();
   if (!mapping) unavailable();
-  const installation = await installationFor(env, mapping.installation_id);
-  await validateChannel(env, installation, mapping.channel_id);
+  const installation = requireMirrorScopes(await installationFor(env, mapping.installation_id));
+  try {
+    await validateChannel(env, installation, mapping.channel_id);
+  } catch (error) {
+    mirrorRouteError(error);
+  }
   const now = Date.now();
   const ownerGuard = `EXISTS (SELECT 1 FROM workspace_members owner
     WHERE owner.workspace_id=? AND owner.user_id=? AND owner.role='owner')`;
@@ -397,7 +413,7 @@ async function linkFor(env: Env, id: string) {
   return link;
 }
 export async function currentInput(env: Env, input: Input) {
-  const installation = await installationFor(env, input.installationId, input.generation);
+  const installation = requireMirrorScopes(await installationFor(env, input.installationId, input.generation));
   const link = await linkFor(env, input.linkId);
   if (
     link.installation_id !== installation.id ||
@@ -451,7 +467,7 @@ function mutationGuard(env: Env, receiptId: string, input: Input, threadId: stri
     input.slackUserId,
     input.identity?.verifiedAt ?? -1,
     input.identity?.accountId ?? "",
-    JSON.stringify(SCOPES),
+    JSON.stringify(SLACK_MIRROR_SCOPES),
     receiptId,
     input.resolved === undefined ? 0 : 1,
   );
@@ -694,23 +710,20 @@ export async function deliverSlackMutation(env: Env, receiptId: string, action: 
       .bind(receiptId)
       .first<{ processed_at: number | null }>();
     if (done?.processed_at !== null && done?.processed_at !== undefined) return;
+    if (error instanceof HttpError && error.code === "slack_mirror_missing_scope" && !action) throw error;
+    if (slackMissingScope(error) && !action) mirrorRouteError(error);
     if (error instanceof SlackApiError && slackInstallationError(error)) {
       await recordSlackInstallationError(env, input.installationId, error);
       throw error;
     }
     if (String(error).includes("CHECK constraint failed: authorized = 1")) {
-      const current = await env.DB.prepare(`SELECT scopes,auth_error,credential_revision
+      const current = await env.DB.prepare(`SELECT scopes
         FROM slack_installations WHERE id=? AND disconnected_at IS NULL`)
         .bind(input.installationId)
-        .first<{ scopes: string; auth_error: string | null; credential_revision: number }>();
+        .first<{ scopes: string }>();
       if (current) {
-        const scopes = new Set(current.scopes.split(",").map((scope) => scope.trim()));
-        const code = SCOPES.some((scope) => !scopes.has(scope)) ? "missing_scope" : current.auth_error;
-        if (code && ["missing_scope", "invalid_auth", "token_revoked", "account_inactive"].includes(code)) {
-          const authError = new SlackApiError("installation", code, 403, current.credential_revision);
-          await recordSlackInstallationError(env, input.installationId, authError);
-          throw authError;
-        }
+        if (!action && !slackHasScopes(current.scopes, SLACK_MIRROR_SCOPES))
+          throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
       }
     }
     const contentError =
@@ -874,8 +887,16 @@ async function finishDelivery(env: Env, delivery: Delivery, link: Link, messageT
 }
 
 async function retireInvalidReconciledLink(env: Env, link: Link, delivery: Delivery) {
+  let current: Link;
   try {
-    await outboundAuthority(env, link, delivery.actor_id);
+    current = await linkFor(env, link.id);
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.status >= 500) throw error;
+    await retireReconciledLink(env, link);
+    return;
+  }
+  try {
+    await outboundAuthority(env, link, delivery.actor_id, current);
     if (delivery.comment_id) {
       const comment = await env.DB.prepare(
         `SELECT user_id FROM comments WHERE id=? AND thread_id=? AND deleted_at IS NULL`,
@@ -887,7 +908,19 @@ async function retireInvalidReconciledLink(env: Env, link: Link, delivery: Deliv
     return;
   } catch (error) {
     if (!(error instanceof HttpError) || error.status >= 500) throw error;
+    if (error.code === "slack_mirror_missing_scope") return;
   }
+  if (delivery.operation !== "root") {
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',failure_reason='reply_unavailable',updated_at=?
+      WHERE id=? AND state='sent'`)
+      .bind(Date.now(), delivery.id)
+      .run();
+    return;
+  }
+  await retireReconciledLink(env, link);
+}
+
+async function retireReconciledLink(env: Env, link: Link) {
   const now = Date.now();
   await env.DB.batch([
     env.DB.prepare(`UPDATE slack_thread_links SET state='retired',updated_at=?
@@ -908,17 +941,8 @@ export async function wakeNextSlackDelivery(env: Env, linkId: string) {
          FROM slack_installations i WHERE i.workspace_id=outbox.workspace_id AND i.disconnected_at IS NULL)
         ELSE slack_auth_pause_baseline_ms END
     WHERE id IN (SELECT 'outbox:' || d.id FROM slack_thread_deliveries d
-      JOIN slack_thread_links link ON link.id=d.link_id
-      WHERE d.link_id=? AND d.state='pending' AND
-        (d.operation='root' OR link.root_message_ts IS NOT NULL)
-        AND NOT EXISTS (SELECT 1 FROM slack_thread_deliveries prior
-          WHERE prior.link_id=d.link_id AND prior.id<>d.id AND prior.state IN ('pending','sending','blocked')
-            AND (d.operation<>'root' AND
-              (prior.operation='root' OR
-                (d.operation<>'refresh' AND prior.operation<>'refresh' AND
-                  (prior.created_at<d.created_at OR (prior.created_at=d.created_at AND prior.id<d.id))) OR
-                (d.operation='refresh' AND prior.operation='refresh' AND
-                  (prior.created_at<d.created_at OR (prior.created_at=d.created_at AND prior.id<d.id))))))
+      JOIN slack_thread_delivery_runnable runnable ON runnable.id=d.id
+      WHERE d.link_id=? AND d.state='pending'
     ) AND (enqueued_at IS NOT NULL OR slack_eligible_started_at IS NULL)`)
     .bind(now, now, now, linkId)
     .run();
@@ -1155,9 +1179,11 @@ export async function retireUncertainSlackDelivery(
   if (delivery.operation !== "root") await wakeNextSlackDelivery(env, delivery.link_id);
   return true;
 }
-async function outboundAuthority(env: Env, link: Link, actorId: string) {
-  const current = await linkFor(env, link.id);
-  const installation = await installationFor(env, current.installation_id, current.installation_generation);
+async function outboundAuthority(env: Env, link: Link, actorId: string, validatedLink?: Link) {
+  const current = validatedLink ?? (await linkFor(env, link.id));
+  const installation = requireMirrorScopes(
+    await installationFor(env, current.installation_id, current.installation_generation),
+  );
   const actor = await env.DB.prepare(`SELECT account_type FROM user WHERE id = ?`)
     .bind(actorId)
     .first<{ account_type: string }>();
@@ -1205,11 +1231,11 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       .first<Delivery>();
     if (!currentDelivery || ["sent", "retired", "blocked"].includes(currentDelivery.state)) return;
     Object.assign(delivery, currentDelivery);
-    const link = await env.DB.prepare(`SELECT * FROM slack_thread_links WHERE id=?`)
-      .bind(delivery.link_id)
-      .first<Link>();
+    let link = await env.DB.prepare(`SELECT * FROM slack_thread_links WHERE id=?`).bind(delivery.link_id).first<Link>();
     if (!link) unavailable();
-    const installed = await installationFor(env, link.installation_id, link.installation_generation);
+    const installed = requireMirrorScopes(
+      await installationFor(env, link.installation_id, link.installation_generation),
+    );
     // A lost post response must be reconciled before a later author revocation
     // can retire this root and permit a duplicate root for the thread.
     if (delivery.state === "sending" && delivery.operation !== "refresh") {
@@ -1218,6 +1244,7 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
         recovered = await reconcileDelivery(env, installed, link, delivery);
       } catch (error) {
         await pauseHistoryClock(env, delivery, installed.id);
+        if (slackMissingScope(error)) mirrorRouteError(error);
         if (error instanceof SlackApiError && !transientSlackLookup(error)) {
           if (slackInstallationError(error)) {
             await recordSlackInstallationError(env, installed.id, error);
@@ -1235,32 +1262,18 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       }
       return;
     }
-    await linkFor(env, delivery.link_id);
+    link = await linkFor(env, delivery.link_id);
     await validateChannel(env, installed, link.channel_id);
     const { installation, member, page } = await outboundAuthority(env, link, delivery.actor_id);
     if (delivery.operation !== "root" && !link.root_message_ts) {
       throw new DeliveryInProgressError();
     }
-    const earlier = await env.DB.prepare(`SELECT 1 FROM slack_thread_deliveries WHERE link_id = ? AND id <> ?
-      AND state IN ('pending','sending','blocked')
-      AND (operation = 'root' OR
-        (operation = ? AND ? = 'refresh' AND (created_at < ? OR (created_at = ? AND id < ?))) OR
-        (? = 'reply' AND operation = 'reply' AND (created_at < ? OR (created_at = ? AND id < ?)))) LIMIT 1`)
-      .bind(
-        link.id,
-        delivery.id,
-        delivery.operation,
-        delivery.operation,
-        delivery.created_at,
-        delivery.created_at,
-        delivery.id,
-        delivery.operation,
-        delivery.created_at,
-        delivery.created_at,
-        delivery.id,
-      )
-      .first();
-    if (earlier && delivery.operation !== "root") throw new DeliveryInProgressError();
+    if (delivery.operation !== "root") {
+      const runnable = await env.DB.prepare(`SELECT 1 FROM slack_thread_delivery_runnable WHERE id=?`)
+        .bind(delivery.id)
+        .first();
+      if (!runnable) throw new DeliveryInProgressError();
+    }
     if (delivery.operation === "refresh") {
       const newer = await env.DB.prepare(`SELECT 1 FROM slack_thread_deliveries
         WHERE link_id=? AND operation='refresh' AND state='pending' AND id<>?
@@ -1431,6 +1444,14 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
       throw error;
     }
   } catch (error) {
+    if (error instanceof HttpError && error.code === "slack_mirror_missing_scope") {
+      if (delivery.state === "sending") await pauseHistoryClock(env, delivery);
+      throw error;
+    }
+    if (slackMissingScope(error)) {
+      if (delivery.state === "sending") await pauseHistoryClock(env, delivery);
+      mirrorRouteError(error);
+    }
     if (error instanceof HttpError && error.code === "slack_channel_invalid") {
       if (delivery.operation === "refresh") {
         await retireRejectedDelivery(env, delivery, error.code);
@@ -1473,20 +1494,31 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
           env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
             (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
             SELECT d.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
+              COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'root_message_not_found',?
+            FROM slack_thread_deliveries d JOIN slack_thread_links link ON link.id=d.link_id
+            LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
+            WHERE d.id=? AND d.state IN ('pending','sending')`).bind(now, delivery.id),
+          env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
+            (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
+            SELECT d.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
               COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'root_message_not_found_unconfirmed',?
             FROM slack_thread_deliveries d JOIN slack_thread_links link ON link.id=d.link_id
             LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
-            WHERE d.link_id=? AND (d.state='sending' OR
-              (d.state='blocked' AND d.failure_reason LIKE 'reconciliation_%'))`).bind(now, delivery.link_id),
+            WHERE d.link_id=? AND d.id<>? AND (d.state='sending' OR
+              (d.state='blocked' AND d.failure_reason LIKE 'reconciliation_%'))`).bind(
+            now,
+            delivery.link_id,
+            delivery.id,
+          ),
           env.DB.prepare(`UPDATE slack_thread_links SET state='retired',updated_at=? WHERE id=?`).bind(
             now,
             delivery.link_id,
           ),
           env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',
-            failure_reason=CASE WHEN state='sending' OR (state='blocked' AND failure_reason LIKE 'reconciliation_%')
+            failure_reason=CASE WHEN id<>? AND (state='sending' OR (state='blocked' AND failure_reason LIKE 'reconciliation_%'))
               THEN 'root_message_not_found_unconfirmed' ELSE 'root_message_not_found' END, updated_at=?
             WHERE link_id=? AND (state IN ('pending','sending') OR
-              (state='blocked' AND failure_reason LIKE 'reconciliation_%'))`).bind(now, delivery.link_id),
+              (state='blocked' AND failure_reason LIKE 'reconciliation_%'))`).bind(delivery.id, now, delivery.link_id),
         ]);
         return;
       }

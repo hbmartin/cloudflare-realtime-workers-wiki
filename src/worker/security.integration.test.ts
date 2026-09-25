@@ -111,6 +111,128 @@ describe("mandatory account protection", () => {
     expect((await rawRequest(session, "/api/security/setup-totp", { password: "password123" })).status).toBe(200);
   });
 
+  it("reissues an unsaved key after reloading the same proven recovery session", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await rawRequest(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    await rawRequest(cookie, "/api/security/acknowledge-codes", { receipt });
+    const recovery = await rawRequest(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const session = responseCookies(recovery, cookie);
+    const firstKey = (await recovery.json<{ resumeKey: string }>()).resumeKey;
+    expect(await (await rawRequest(session, "/api/security/status")).json()).toMatchObject({
+      recoveryCanResume: true,
+      recoveryResumeRequiresKey: false,
+      recoveryKeyAcknowledgmentRequired: true,
+    });
+    const resumed = await rawRequest(session, "/api/security/resume-recovery", { password: "password123" });
+    expect(resumed.status).toBe(200);
+    const nextKey = (await resumed.json<{ resumeKey: string }>()).resumeKey;
+    expect(nextKey).not.toBe(firstKey);
+    expect((await rawRequest(session, "/api/security/acknowledge-resume-key", { resumeKey: firstKey })).status).toBe(
+      403,
+    );
+    expect((await rawRequest(session, "/api/security/acknowledge-resume-key", { resumeKey: nextKey })).status).toBe(
+      200,
+    );
+  });
+
+  it("does not claim or count a saved key while another session has a pending replacement", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    await request(cookie, "/api/security/acknowledge-codes", { receipt });
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const savedKey = (await recovery.json<{ resumeKey: string }>()).resumeKey;
+    const signIn = async () =>
+      responseCookies(
+        await rawRequest("", "/api/auth/sign-in/email", {
+          email: "owner@example.test",
+          password: "password123",
+        }),
+      );
+    const firstSession = await signIn();
+    const secondSession = await signIn();
+    const pending = await rawRequest(firstSession, "/api/security/resume-recovery", {
+      password: "password123",
+      resumeKey: savedKey,
+    });
+    expect(pending.status).toBe(200);
+    expect(await (await rawRequest(secondSession, "/api/security/status")).json()).toMatchObject({
+      recoveryCanResume: false,
+    });
+    const before = await env.DB.prepare(`SELECT failed_attempts FROM account_security`).first();
+    expect(
+      (
+        await rawRequest(secondSession, "/api/security/resume-recovery", {
+          password: "password123",
+          resumeKey: savedKey,
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      await env.DB.prepare(`SELECT failed_attempts,recovery_resume_claim_session_id claim
+      FROM account_security`).first(),
+    ).toEqual({ ...before, claim: null });
+    await env.DB.prepare(`UPDATE account_security SET recovery_pending_until=1`).run();
+    await pruneSecurityState(env);
+    expect(
+      (
+        await rawRequest(secondSession, "/api/security/resume-recovery", {
+          password: "password123",
+          resumeKey: savedKey,
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("blocks enrollment in the origin session until another session saves its replacement key", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    await request(cookie, "/api/security/acknowledge-codes", { receipt });
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const originSession = responseCookies(recovery, cookie);
+    const savedKey = (await recovery.json<{ resumeKey: string }>()).resumeKey;
+    const otherSession = responseCookies(
+      await rawRequest("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    const resumed = await rawRequest(otherSession, "/api/security/resume-recovery", {
+      password: "password123",
+      resumeKey: savedKey,
+    });
+    expect(resumed.status).toBe(200);
+    const replacementKey = (await resumed.json<{ resumeKey: string }>()).resumeKey;
+    expect(await (await rawRequest(originSession, "/api/security/status")).json()).toMatchObject({
+      recoveryCanResume: false,
+      recoveryKeyPendingElsewhere: true,
+      recoveryEnrollmentAllowed: false,
+      recoveryKeyAcknowledgmentRequired: false,
+    });
+    const attempts = await env.DB.prepare(`SELECT failed_attempts FROM account_security`).first();
+    const denied = await rawRequest(originSession, "/api/security/resume-recovery", { password: "password123" });
+    expect(denied.status).toBe(403);
+    expect(await denied.text()).toContain("Another recovery key is awaiting acknowledgment");
+    expect(await env.DB.prepare(`SELECT failed_attempts FROM account_security`).first()).toEqual(attempts);
+    expect((await rawRequest(originSession, "/api/security/setup-totp", { password: "password123" })).status).toBe(403);
+    expect(
+      (
+        await rawRequest(responseCookies(resumed, otherSession), "/api/security/acknowledge-resume-key", {
+          resumeKey: replacementKey,
+        })
+      ).status,
+    ).toBe(200);
+    expect(await (await rawRequest(originSession, "/api/security/status")).json()).toMatchObject({
+      recoveryKeyPendingElsewhere: false,
+      recoveryEnrollmentAllowed: true,
+    });
+  });
+
   it("expires an unsaved initial handoff but lets its original session prove identity again", async () => {
     const cookie = await enrollAccount(await bootstrap());
     const { codes, receipt } = await (

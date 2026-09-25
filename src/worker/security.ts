@@ -114,22 +114,25 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
           recoveryCanResume:
             row.recovery_started_at !== null &&
             row.recovery_started_at > time - RECOVERY_RESUME_MS &&
+            (row.recovery_pending_key_hash === null || row.recovery_pending_session_id === sessionId) &&
             ((sessionId !== null &&
-              row.recovery_origin_session_id === sessionId &&
-              row.method === "recovery" &&
-              row.verified_at !== null) ||
-              row.recovery_resume_key_hash !== null),
+              ((row.recovery_origin_session_id === sessionId &&
+                row.method === "recovery" &&
+                row.verified_at !== null) ||
+                (row.recovery_pending_session_id === sessionId && proof?.method === "recovery"))) ||
+              (row.recovery_resume_key_hash !== null && row.recovery_pending_key_hash === null)),
           recoveryResumeRequiresKey: !(
             sessionId !== null &&
-            row.recovery_origin_session_id === sessionId &&
-            row.method === "recovery" &&
-            row.verified_at !== null
+            ((row.recovery_origin_session_id === sessionId && row.method === "recovery" && row.verified_at !== null) ||
+              (row.recovery_pending_session_id === sessionId && proof?.method === "recovery"))
           ),
           recoveryKeyAcknowledgmentRequired:
             row.recovery_pending_session_id === sessionId && row.recovery_pending_key_hash !== null,
+          recoveryKeyPendingElsewhere:
+            row.recovery_pending_key_hash !== null && row.recovery_pending_session_id !== sessionId,
           recoveryEnrollmentAllowed:
             row.recovery_resume_key_hash !== null &&
-            row.recovery_pending_session_id !== sessionId &&
+            row.recovery_pending_key_hash === null &&
             row.recovery_pending_repair_at === null &&
             proof?.method === "recovery",
         }
@@ -794,17 +797,27 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
       resumeRecovery: post("/security/resume-recovery", async (ctx) => {
         const id = await requireIdentity(ctx);
         const { account, status } = await readSecurity(env, id.userId, id.sessionId);
+        if (account.recovery_pending_key_hash !== null && account.recovery_pending_session_id !== id.sessionId)
+          throw deny("Another recovery key is awaiting acknowledgment. Try again after it expires.");
         if (!status.recoveryCanResume) throw deny("Use a recovery code or operator reset token first.");
-        await attempt(env, id.userId);
-        await primaryFactor(ctx, env, id);
         const time = Date.now();
         const original =
-          id.sessionId && account.recovery_origin_session_id === id.sessionId
+          id.sessionId &&
+          (account.recovery_origin_session_id === id.sessionId || account.recovery_pending_session_id === id.sessionId)
             ? await env.DB.prepare(`SELECT 1 FROM session_security proof
-              WHERE proof.session_id=? AND proof.user_id=? AND proof.generation=? AND proof.method='recovery'`)
-                .bind(id.sessionId, id.userId, account.generation)
+              WHERE proof.session_id=? AND proof.user_id=? AND proof.generation=?
+                AND proof.method='recovery' AND (?=1 OR proof.expires_at>?)`)
+                .bind(
+                  id.sessionId,
+                  id.userId,
+                  account.generation,
+                  account.recovery_origin_session_id === id.sessionId ? 1 : 0,
+                  time,
+                )
                 .first()
             : null;
+        await attempt(env, id.userId);
+        await primaryFactor(ctx, env, id);
         const suppliedKey = ctx.body?.resumeKey;
         const keyHash =
           typeof suppliedKey === "string" && suppliedKey.length <= 1000 ? await sha256(suppliedKey) : null;
@@ -821,6 +834,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         // Create an unassured session, then claim the key and grant it together.
         let replacementSession: Awaited<ReturnType<typeof ctx.context.internalAdapter.createSession>> | null = null;
         let cookieSet = false;
+        let grantSessionId: string | null = null;
         try {
           if (!id.sessionId) {
             if (!id.challenge) throw deny("Sign in again.");
@@ -833,12 +847,13 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
               .bind(replacementSession.id, id.userId, account.generation, time + 2 * 60_000, time)
               .run();
           }
-          const grantSessionId = id.sessionId ?? replacementSession!.id;
+          grantSessionId = id.sessionId ?? replacementSession!.id;
           // The account timestamp is the absolute deadline across replacement sessions.
           const authenticated = `EXISTS (SELECT 1 FROM session live WHERE live.id=? AND live.userId=? AND live.expiresAt>?)`;
           const claim = env.DB.prepare(`UPDATE account_security SET recovery_resume_claim_session_id=?
           WHERE user_id=? AND generation=? AND recovery_required=1 AND recovery_started_at>?
             AND recovery_resume_key_hash=? AND recovery_resume_claim_session_id IS NULL
+            AND recovery_pending_key_hash IS NULL
             AND NOT EXISTS (SELECT 1 FROM security_resets reset WHERE reset.user_id=account_security.user_id)
             AND ${authenticated} RETURNING user_id`).bind(
             grantSessionId,
@@ -897,17 +912,43 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
           const clearAttempts = env.DB.prepare(`UPDATE account_security SET failed_attempts=0,locked_until=0
             WHERE user_id=? AND generation=? AND recovery_pending_key_hash=?
               AND recovery_pending_session_id=?`).bind(id.userId, account.generation, nextKeyHash, grantSessionId);
-          const result = await env.DB.batch(
-            original ? [grant, rotate, clearAttempts] : [claim, grant, rotate, clearAttempts],
-          );
-          if (!original && !result[0]!.results.length) {
+          const clearOwnPending =
+            original && account.recovery_pending_key_hash !== null
+              ? [
+                  env.DB.prepare(`UPDATE account_security SET recovery_pending_key_hash=NULL,
+                    recovery_pending_session_id=NULL,recovery_pending_until=NULL,recovery_pending_repair_at=NULL
+                    WHERE user_id=? AND generation=? AND recovery_pending_key_hash=?
+                      AND recovery_pending_session_id=? AND EXISTS
+                      (SELECT 1 FROM session_security proof WHERE proof.session_id=? AND proof.user_id=?
+                        AND proof.generation=? AND proof.method='recovery' AND (?=1 OR proof.expires_at>?))`).bind(
+                    id.userId,
+                    account.generation,
+                    account.recovery_pending_key_hash,
+                    grantSessionId,
+                    grantSessionId,
+                    id.userId,
+                    account.generation,
+                    account.recovery_origin_session_id === grantSessionId ? 1 : 0,
+                    time,
+                  ),
+                ]
+              : [];
+          const offset = clearOwnPending.length;
+          const result = await env.DB.batch([
+            ...clearOwnPending,
+            ...(original ? [] : [claim]),
+            grant,
+            rotate,
+            clearAttempts,
+          ]);
+          if (!original && !result[offset]!.results.length) {
             throw deny("Recovery key expired, used, or revoked.");
           }
-          const resumed = result[original ? 0 : 1]!.results[0];
+          const resumed = result[offset + (original ? 0 : 1)]!.results[0];
           if (!resumed) {
             throw deny("Recovery expired or was revoked. Use a recovery code or operator reset token.");
           }
-          if (!result[original ? 1 : 2]!.meta.changes) throw deny("Recovery key expired, used, or revoked.");
+          if (!result[offset + (original ? 1 : 2)]!.meta.changes) throw deny("Recovery key expired, used, or revoked.");
           const handoff = await env.DB.batch([
             env.DB.prepare(`UPDATE account_security SET recovery_pending_repair_at=NULL
               WHERE user_id=? AND generation=? AND recovery_pending_key_hash=? AND recovery_pending_session_id=?`).bind(
@@ -937,6 +978,12 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
             expireCookie(ctx, ctx.context.createAuthCookie("two_factor"));
           }
         } catch (error) {
+          if (!original && grantSessionId)
+            await env.DB.prepare(`UPDATE account_security SET recovery_resume_claim_session_id=NULL
+              WHERE user_id=? AND generation=? AND recovery_resume_key_hash=?
+                AND recovery_resume_claim_session_id=? AND recovery_pending_key_hash IS NULL`)
+              .bind(id.userId, account.generation, keyHash, grantSessionId)
+              .run();
           if (replacementSession && !cookieSet) {
             // Restore only this failed claim. A reset, a new recovery, or an expired
             // window must never regain the old key.
