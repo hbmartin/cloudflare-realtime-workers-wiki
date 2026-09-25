@@ -748,12 +748,17 @@ async function deliverSearch(
   } catch (error) {
     if (error instanceof SlackApiError && error.code === "hash_conflict") {
       if (row.pending_attempts === 0) {
-        await env.DB.prepare(`UPDATE slack_view_sessions SET pending_state_json=NULL,pending_revision=NULL,
+        const cleared =
+          await env.DB.prepare(`UPDATE slack_view_sessions SET pending_state_json=NULL,pending_revision=NULL,
           pending_token=NULL,pending_started_at=NULL,pending_lease_until=NULL,pending_attempts=0
           WHERE id=? AND pending_token=? AND pending_lease_until=? AND pending_attempts=1`)
-          .bind(row.id, pendingToken, leaseUntil)
-          .run();
-        return "superseded";
+            .bind(row.id, pendingToken, leaseUntil)
+            .run();
+        if (cleared.meta.changes) return "superseded";
+        const current = await env.DB.prepare(`SELECT pending_token FROM slack_view_sessions WHERE id=?`)
+          .bind(row.id)
+          .first<{ pending_token: string | null }>();
+        return current?.pending_token === pendingToken ? "deferred" : "superseded";
       }
       // A prior attempt may already be visible in Slack. Preserve its intent
       // for a signed interaction, but stop polling the stale base hash.

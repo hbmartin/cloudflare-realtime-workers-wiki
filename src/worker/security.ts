@@ -129,7 +129,7 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
             row.recovery_pending_session_id === sessionId && row.recovery_pending_key_hash !== null,
           recoveryEnrollmentAllowed:
             row.recovery_resume_key_hash !== null &&
-            row.recovery_pending_session_id !== sessionId &&
+            row.recovery_pending_key_hash === null &&
             row.recovery_pending_repair_at === null &&
             proof?.method === "recovery",
         }

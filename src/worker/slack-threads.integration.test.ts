@@ -926,6 +926,52 @@ describe("interactive Slack workspace", () => {
     ).toEqual({ revision: 1, query: "Rebased" });
   });
 
+  it("keeps a Search receipt pending when hash-conflict cleanup loses its lease", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "lease-conflict-search", "Original");
+    const session = (await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+    }>())!;
+    await deliverSlackSearchUpdate(runtime(), session.id, 0);
+    const hash = (await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id=?`)
+      .bind(session.id)
+      .first<{ view_hash: string }>())!.view_hash;
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash,
+        private_metadata: `${session.id}:1`,
+        state: { values: { query: { value: { value: "Keep this search" } } } },
+      },
+      actions: [{ action_id: "noteflare_search_run", action_ts: "1700000997.000002", value: session.id }],
+    });
+    const receipt = (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+      WHERE callback_id='noteflare_search_run'`).first<{ id: string }>())!;
+    viewFailure = "hash_conflict";
+    beforeResponse = async (method) => {
+      if (method === "views.update")
+        await env.DB.prepare(`UPDATE slack_view_sessions SET pending_lease_until=? WHERE id=?`)
+          .bind(Date.now() + 60_000, session.id)
+          .run();
+    };
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("deferred");
+    beforeResponse = undefined;
+    expect(
+      await env.DB.prepare(`SELECT processed_at FROM slack_interaction_receipts WHERE id=?`).bind(receipt.id).first(),
+    ).toEqual({ processed_at: null });
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("deferred");
+    await env.DB.prepare(`UPDATE slack_view_sessions SET pending_lease_until=1 WHERE id=?`).bind(session.id).run();
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("completed");
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id=?`).bind(receipt.id).first(),
+    ).toEqual({ outcome: "accepted" });
+  });
+
   it("bounds Search updates to five API attempts and retains the unresolved intent", async () => {
     const installation = (await env.DB.prepare(
       `SELECT * FROM slack_installations WHERE id='installation'`,
@@ -1774,6 +1820,15 @@ describe("interactive Slack workspace", () => {
       await env.DB.prepare(`SELECT delivered_at IS NOT NULL delivered FROM slack_unfurls
       WHERE id='rotate-unfurl'`).first(),
     ).toEqual({ delivered: 1 });
+    const unfurlTokens = await env.DB.prepare(`SELECT bot_token_ciphertext,bot_refresh_token_ciphertext,
+      credential_revision FROM slack_installations WHERE id='installation'`).first<{
+      bot_token_ciphertext: string;
+      bot_refresh_token_ciphertext: string;
+      credential_revision: number;
+    }>();
+    expect(await decryptSlackToken(runtime(), unfurlTokens!.bot_token_ciphertext)).toBe("xoxb-0");
+    expect(await decryptSlackToken(runtime(), unfurlTokens!.bot_refresh_token_ciphertext)).toBe("xoxr-unfurl");
+    expect(unfurlTokens!.credential_revision).toBe(1);
     const cutoff = Date.UTC(2026, 8, 24, 9);
     await env.DB.batch([
       env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1 WHERE id='installation'`),

@@ -187,6 +187,44 @@ describe("mandatory account protection", () => {
     ).toBe(200);
   });
 
+  it("blocks enrollment in the origin session until another session saves its replacement key", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { codes, receipt } = await (
+      await request(cookie, "/api/security/recovery-codes", {})
+    ).json<{ codes: string[]; receipt: string }>();
+    await request(cookie, "/api/security/acknowledge-codes", { receipt });
+    const recovery = await request(cookie, "/api/security/recover", { password: "password123", code: codes[0] });
+    const originSession = responseCookies(recovery, cookie);
+    const savedKey = (await recovery.json<{ resumeKey: string }>()).resumeKey;
+    const otherSession = responseCookies(
+      await rawRequest("", "/api/auth/sign-in/email", {
+        email: "owner@example.test",
+        password: "password123",
+      }),
+    );
+    const resumed = await rawRequest(otherSession, "/api/security/resume-recovery", {
+      password: "password123",
+      resumeKey: savedKey,
+    });
+    expect(resumed.status).toBe(200);
+    const replacementKey = (await resumed.json<{ resumeKey: string }>()).resumeKey;
+    expect(await (await rawRequest(originSession, "/api/security/status")).json()).toMatchObject({
+      recoveryEnrollmentAllowed: false,
+      recoveryKeyAcknowledgmentRequired: false,
+    });
+    expect((await rawRequest(originSession, "/api/security/setup-totp", { password: "password123" })).status).toBe(403);
+    expect(
+      (
+        await rawRequest(responseCookies(resumed, otherSession), "/api/security/acknowledge-resume-key", {
+          resumeKey: replacementKey,
+        })
+      ).status,
+    ).toBe(200);
+    expect(await (await rawRequest(originSession, "/api/security/status")).json()).toMatchObject({
+      recoveryEnrollmentAllowed: true,
+    });
+  });
+
   it("expires an unsaved initial handoff but lets its original session prove identity again", async () => {
     const cookie = await enrollAccount(await bootstrap());
     const { codes, receipt } = await (
