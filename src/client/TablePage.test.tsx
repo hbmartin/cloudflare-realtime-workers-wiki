@@ -200,6 +200,41 @@ describe("TablePage", () => {
     });
   });
 
+  it.each([
+    [new ApiClientError(422, "invalid_icon", "Choose one emoji."), "Choose one emoji."],
+    [new Error("offline"), "The page icon could not be saved."],
+  ])("reports page-icon PATCH failures while the table remains mounted", async (failure, message) => {
+    vi.spyOn(window, "prompt").mockReturnValue("🔥");
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${page.id}` && init?.method === "PATCH") throw failure;
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      return { table };
+    });
+    await renderActiveEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Page details" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+  });
+
+  it("does not update icon error state after unmount", async () => {
+    const patch = deferred<{ page: Page }>();
+    vi.spyOn(window, "prompt").mockReturnValue("🔥");
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (path === `/api/pages/${page.id}` && init?.method === "PATCH") return patch.promise;
+      if (path.endsWith("/lease") && init?.method === "POST") return Promise.resolve(leaseResult());
+      return Promise.resolve({ table });
+    });
+    await renderActiveEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Page details" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+    expect(api).toHaveBeenCalledWith(`/api/pages/${page.id}`, expect.objectContaining({ method: "PATCH" }));
+    cleanup();
+
+    await act(async () => patch.reject(new Error("offline")));
+  });
+
   it("keeps the read-only row-actions column aligned when only some rows have detail pages", async () => {
     const onSelectPage = vi.fn();
     vi.mocked(api).mockResolvedValue({

@@ -1457,6 +1457,54 @@ describe("interactive Slack workspace", () => {
     });
   });
 
+  it("marks accessible notifications through the Home read action time", async () => {
+    await publishSlackHome(runtime(), "installation", "UVIEWER");
+    const session = await env.DB.prepare(
+      `SELECT id,view_hash,json_extract(state_json,'$.asOf') as_of FROM slack_view_sessions WHERE kind='home'`,
+    ).first<{ id: string; view_hash: string; as_of: number }>();
+    const readAt = session!.as_of + 1_000;
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO notifications
+          (id,workspace_id,user_id,event_type,actor_id,space_id,page_id,data_json,dedupe_key,created_at)
+         VALUES ('before-read','workspace','viewer','page_edit','owner','workspace-general','page','{}','before-read',?)`,
+      ).bind(readAt - 1),
+      env.DB.prepare(
+        `INSERT INTO notifications
+          (id,workspace_id,user_id,event_type,actor_id,space_id,page_id,data_json,dedupe_key,created_at)
+         VALUES ('after-read','workspace','viewer','page_edit','owner','workspace-general','page','{}','after-read',?)`,
+      ).bind(readAt + 1),
+    ]);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(readAt);
+    try {
+      await acceptSlackWorkspaceInteraction(runtime(), {
+        type: "block_actions",
+        team: { id: "T123" },
+        user: { id: "UVIEWER" },
+        view: { id: "VHOME", hash: session!.view_hash, private_metadata: session!.id },
+        actions: [{ action_id: "noteflare_home_read", action_ts: "1700000910.000001", value: session!.id }],
+      });
+      const receipt = await env.DB.prepare(
+        `SELECT id FROM slack_interaction_receipts WHERE callback_id='noteflare_home_read'`,
+      ).first<{ id: string }>();
+      await deliverSlackWorkspaceAction(runtime(), receipt!.id);
+    } finally {
+      clock.mockRestore();
+    }
+
+    await expect(
+      env.DB.prepare(`SELECT id,read_at FROM notifications ORDER BY id`).all<{ id: string; read_at: number | null }>(),
+    ).resolves.toMatchObject({
+      results: [
+        { id: "after-read", read_at: null },
+        { id: "before-read", read_at: readAt },
+      ],
+    });
+    await expect(
+      env.DB.prepare(`SELECT read_at FROM mention_reads WHERE user_id='viewer'`).first<{ read_at: number }>(),
+    ).resolves.toEqual({ read_at: session!.as_of });
+  });
+
   it("keeps concurrent Home Next clicks on one page", async () => {
     const timestamp = Date.now() - 1_000;
     await env.DB.batch(
@@ -4473,10 +4521,10 @@ describe("Slack documents and tasks", () => {
       state: {
         values: {
           kind: { value: { selected_option: { value: kind } } },
-          destination: { value: { selected_option: { value: dest } } },
+          destination: { noteflare_destination: { selected_option: { value: dest } } },
           title: { value: { value: title } },
           status: { value: { selected_option: { value: "todo" } } },
-          assignee: { value: { selected_option: { value: "owner" } } },
+          assignee: { noteflare_assignee: { selected_option: { value: "owner" } } },
           due: { value: { selected_date: "2026-10-01" } },
         },
       },
@@ -4515,6 +4563,155 @@ describe("Slack documents and tasks", () => {
     expect((await acceptSlackProductInteraction(runtime(), other, Date.now() + 2500)).response).toMatchObject({
       response_action: "errors",
     });
+  });
+  it("uses the shared 200-character title limit in Slack product forms", async () => {
+    const acceptedId = await open("new");
+    const opened = calls.findLast((call) => call.method === "views.open")!.payload.view as {
+      blocks: Array<{ block_id?: string; element?: { max_length?: number } }>;
+    };
+    expect(opened.blocks.find((block) => block.block_id === "title")?.element?.max_length).toBe(200);
+    expect(
+      (
+        await acceptSlackProductInteraction(
+          runtime(),
+          submission(acceptedId, "document", "space:workspace-general", "a".repeat(200)),
+          Date.now() + 2500,
+        )
+      ).response,
+    ).toMatchObject({ response_action: "update" });
+
+    const rejectedId = await open("new");
+    expect(
+      (
+        await acceptSlackProductInteraction(
+          runtime(),
+          submission(rejectedId, "document", "space:workspace-general", "a".repeat(201)),
+          Date.now() + 2500,
+        )
+      ).response,
+    ).toMatchObject({ response_action: "errors", errors: { title: "Enter a title of up to 200 characters." } });
+  });
+  it("acknowledges product interactions when the optional fallback installation lookup fails", async () => {
+    const database = new Proxy(runtime().DB, {
+      get(target, property, receiver) {
+        if (property === "prepare")
+          return () => {
+            throw new Error("Installation lookup unavailable.");
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const broken = { ...runtime(), DB: database } as Env;
+
+    await expect(
+      acceptSlackProductInteraction(
+        broken,
+        {
+          type: "block_actions",
+          trigger_id: "fallback-trigger",
+          team: { id: "T123" },
+          user: { id: "UOWNER" },
+          actions: [{ action_id: "noteflare_compose_page", value: "compose" }],
+        },
+        Date.now() + 2500,
+      ),
+    ).resolves.toEqual({ handled: true, response: {} });
+  });
+  it("acknowledges permanent product-copy errors and keeps transient failures retryable", async () => {
+    const bodySubmission = (id: string, title: string) => {
+      const payload = submission(id, "document", "space:workspace-general", title);
+      (payload.view.state.values as Record<string, unknown>).body = { value: { value: "Captured body" } };
+      return payload;
+    };
+    const permanentId = await open("new");
+    await acceptSlackProductInteraction(runtime(), bodySubmission(permanentId, "Permanent copy"), Date.now() + 2500);
+    await env.DB.prepare(`UPDATE slack_user_links SET migration_state='legacy' WHERE user_id='owner'`).run();
+    const permanentAck = vi.fn();
+    const permanentRetry = vi.fn();
+    await expect(
+      consumeDeliveryMessage(runtime(), {
+        id: "permanent-copy",
+        timestamp: new Date(),
+        body: { outboxId: `slack-copy:${permanentId}` },
+        attempts: 1,
+        ack: permanentAck,
+        retry: permanentRetry,
+      } as unknown as Message<DeliveryQueueMessage>),
+    ).resolves.toBe("discarded");
+    expect(permanentAck).toHaveBeenCalledOnce();
+    expect(permanentRetry).not.toHaveBeenCalled();
+    await expect(
+      env.DB.prepare(`SELECT last_error FROM outbox WHERE id=?`).bind(`slack-copy:${permanentId}`).first(),
+    ).resolves.toEqual({ last_error: "slack_identity_required" });
+
+    await env.DB.prepare(`UPDATE slack_user_links SET migration_state='verified' WHERE user_id='owner'`).run();
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "message_action",
+        callback_id: "noteflare_save_to_notes",
+        trigger_id: "transient-copy-trigger",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        channel: { id: "CSPACE" },
+        message: { ts: "1700000100.000001", text: "Capture me", user: "UOWNER" },
+      },
+      Date.now() + 2500,
+    );
+    const transientId = (
+      calls.findLast((call) => call.method === "views.open")!.payload.view as {
+        private_metadata: string;
+      }
+    ).private_metadata;
+    await acceptSlackProductInteraction(
+      runtime(),
+      submission(transientId, "document", "space:workspace-general", "Transient copy"),
+      Date.now() + 2500,
+    );
+    const transientMessage = () => {
+      const ack = vi.fn();
+      return {
+        ack,
+        message: {
+          id: crypto.randomUUID(),
+          timestamp: new Date(),
+          body: { outboxId: `slack-copy:${transientId}` },
+          attempts: 1,
+          ack,
+          retry: vi.fn(),
+        } as unknown as Message<DeliveryQueueMessage>,
+      };
+    };
+
+    beforeResponse = async (method) => {
+      if (method === "chat.getPermalink") throw new SlackRateLimitError(30, method);
+    };
+    let attempt = transientMessage();
+    await expect(consumeDeliveryMessage(runtime(), attempt.message)).rejects.toBeInstanceOf(SlackRateLimitError);
+    expect(attempt.ack).not.toHaveBeenCalled();
+
+    beforeResponse = async (method) => {
+      if (method === "chat.getPermalink") throw new SlackApiError(method, "internal_error", 503);
+    };
+    attempt = transientMessage();
+    await expect(consumeDeliveryMessage(runtime(), attempt.message)).rejects.toBeInstanceOf(SlackApiError);
+    expect(attempt.ack).not.toHaveBeenCalled();
+
+    beforeResponse = undefined;
+    const documentFailure = new Error("Document copy unavailable.");
+    const brokenDocuments = {
+      getByName() {
+        return {
+          fetch: async () => {
+            throw documentFailure;
+          },
+        };
+      },
+    } as unknown as Env["DOCUMENT"];
+    const broken = { ...runtime(), DOCUMENT: brokenDocuments } as Env;
+    attempt = transientMessage();
+    await expect(consumeDeliveryMessage(broken, attempt.message)).rejects.toBe(documentFailure);
+    expect(attempt.ack).not.toHaveBeenCalled();
   });
   it("does not queue locked task changes and permits explicit retry after release", async () => {
     await list();

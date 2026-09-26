@@ -139,7 +139,7 @@ function getRootCreation() {
   const trigger = screen.getByRole("button", { name: /^New page in / });
   const details = trigger.closest("details")!;
   if (!details.open) fireEvent.click(trigger);
-  return within(details).getByRole("button", { name: "Document" });
+  return screen.getAllByRole("button", { name: "Document" }).find((button) => button.closest(".action-menu-portal"))!;
 }
 async function findRootCreation() {
   await screen.findByRole("button", { name: /^New page in / });
@@ -1204,6 +1204,89 @@ describe("App error handling", () => {
     );
   });
 
+  it("persists recent pages after committed navigation under Strict Mode", async () => {
+    mockShellApi();
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+
+    await findArchive("Archive Roadmap");
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("notes:ui:workspace:user:recent") ?? "[]")).toEqual([page.id]),
+    );
+  });
+
+  it("shows pending archive cleanup as a dismissible status", async () => {
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockWorkspaceApi();
+    const original = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE")
+        return {
+          ok: true,
+          pageIds: [page.id],
+          cleanupPending: true,
+          pendingPageCount: 2,
+          pendingPageIds: [page.id],
+          pendingPageIdsTruncated: true,
+        };
+      return original(path, init);
+    });
+    render(<App />);
+
+    fireEvent.click(await findArchive("Archive Roadmap"));
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Page archived. Realtime cleanup is continuing in the background for 2 pages.",
+    );
+    expect(screen.getByRole("status")).not.toHaveClass("notice-danger");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss archive cleanup notice" }));
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("replaces a cleanup notice with a newer archive and restarts its ten-second timer", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    const other = { ...page, id: "second-page", title: "Second", position: "b0" };
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree?archived=true") return { pages: [] };
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: treeLoads === 1 ? [page, other] : treeLoads === 2 ? [other] : [] };
+      }
+      if (init?.method === "DELETE" && path === `/api/pages/${page.id}`)
+        return { ok: true, pageIds: [page.id], cleanupPending: true, pendingPageCount: 2 };
+      if (init?.method === "DELETE" && path === `/api/pages/${other.id}`)
+        return { ok: true, pageIds: [other.id], cleanupPending: true, pendingPageCount: 5 };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+
+    fireEvent.click(await findArchive("Archive Roadmap"));
+    expect(await screen.findByRole("status")).toHaveTextContent("for 2 pages");
+    fireEvent.click(await findArchive("Archive Second"));
+    expect(await screen.findByRole("status")).toHaveTextContent("for 5 pages");
+
+    await act(() => vi.advanceTimersByTimeAsync(9_000));
+    expect(screen.getByRole("status")).toHaveTextContent("for 5 pages");
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
   it("reports an archive error when operation id generation fails", async () => {
     const randomUUID = vi.spyOn(crypto, "randomUUID").mockImplementation(() => {
       throw new Error("Random UUID unavailable.");
@@ -1548,7 +1631,7 @@ describe("App error handling", () => {
     fireEvent.click(createButton);
     expect(await screen.findByText("First creation failed.")).toBeInTheDocument();
 
-    fireEvent.click(createButton);
+    fireEvent.click(await findRootCreation());
 
     expect((await screen.findAllByText("Created")).length).toBeGreaterThan(0);
     await waitFor(() => expect(screen.queryByText("First creation failed.")).not.toBeInTheDocument());

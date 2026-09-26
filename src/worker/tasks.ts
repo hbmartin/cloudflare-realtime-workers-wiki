@@ -3,7 +3,7 @@ import type { Env, MemberContext } from "./env";
 import { HttpError, sha256 } from "./http";
 import { effectiveSpaceRole, pageForMember } from "./page-access";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
-import { ID_PATTERN } from "../shared/validation";
+import { ID_PATTERN, PAGE_TITLE_MAX } from "../shared/validation";
 import {
   TASK_STATUSES,
   TASK_STATUS_LABELS,
@@ -15,7 +15,8 @@ import {
 } from "../shared/tasks";
 import { TABLE_MAX_ROWS } from "../shared/table-limits";
 import { notificationFanoutStatements } from "./notifications";
-import { refreshPageSearchV2Statements } from "./search-index";
+import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
+import { normalizeSearchValue } from "../shared/search-normalization";
 
 export function taskListStatements(db: D1Database, pageId: string) {
   const columns = taskColumns(pageId);
@@ -34,8 +35,14 @@ export function taskListStatements(db: D1Database, pageId: string) {
     ),
     ...TASK_STATUSES.map((status, position) =>
       db
-        .prepare("INSERT INTO table_select_options (id,column_id,label,position) VALUES (?,?,?,?)")
-        .bind(`${pageId}-${status}`, columns.status, TASK_STATUS_LABELS[status], position),
+        .prepare("INSERT INTO table_select_options (id,column_id,label,label_search_value,position) VALUES (?,?,?,?,?)")
+        .bind(
+          `${pageId}-${status}`,
+          columns.status,
+          TASK_STATUS_LABELS[status],
+          normalizeSearchValue(TASK_STATUS_LABELS[status]),
+          position,
+        ),
     ),
   ];
 }
@@ -52,6 +59,32 @@ const TASK_FROM = `FROM table_rows r JOIN pages list ON list.id=r.page_id AND li
  LEFT JOIN table_cells due ON due.row_id=r.id AND due.column_id=list.id||'-due'
  WHERE list.workspace_id=? AND list.archived_at IS NULL AND list.import_job_id IS NULL
  AND (?='owner' OR s.visibility='workspace' OR sm.user_id IS NOT NULL)`;
+
+type TaskCursor =
+  | { list: true; position: number; id: string }
+  | { list: false; bucket: number; due: string; recent: number; id: string };
+
+function encodeTaskCursor(cursor: TaskCursor) {
+  return btoa(JSON.stringify(cursor)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function decodeTaskCursor(value: string, list: boolean): TaskCursor {
+  try {
+    const encoded = value.replaceAll("-", "+").replaceAll("_", "/");
+    const cursor = JSON.parse(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "="))) as TaskCursor;
+    if (
+      cursor.list !== list ||
+      typeof cursor.id !== "string" ||
+      (cursor.list
+        ? !Number.isFinite(cursor.position)
+        : !Number.isFinite(cursor.bucket) || typeof cursor.due !== "string" || !Number.isFinite(cursor.recent))
+    )
+      throw new Error("invalid cursor");
+    return cursor;
+  } catch {
+    throw new HttpError(422, "invalid_task_cursor", "Refresh the task list and try again.");
+  }
+}
 
 export async function listTasks(
   env: Env,
@@ -87,7 +120,7 @@ export async function listTasks(
   if (query.status) {
     if (!TASK_STATUSES.includes(query.status as TaskStatus))
       throw new HttpError(422, "invalid_task_status", "Choose a valid status.");
-    filter += " AND status.select_value=list.id||'-'||?";
+    filter += " AND coalesce(status.select_value,list.id||'-todo')=list.id||'-'||?";
     binds.push(query.status);
   }
   if (query.q) {
@@ -95,37 +128,54 @@ export async function listTasks(
     binds.push(query.q.slice(0, 200));
   }
   if (query.due === "overdue") {
-    filter += " AND due.date_value < ? AND status.select_value<>list.id||'-done'";
+    filter += " AND due.date_value < ? AND coalesce(status.select_value,'')<>list.id||'-done'";
     binds.push(new Date().toISOString().slice(0, 10));
   } else if (query.due === "undated") filter += " AND due.date_value IS NULL";
   else if (query.due === "today") {
     filter += " AND due.date_value=?";
     binds.push(new Date().toISOString().slice(0, 10));
   } else if (query.due) throw new HttpError(422, "invalid_due_filter", "Choose today, overdue, or undated.");
+  const doneSql = "coalesce(status.select_value,list.id||'-todo')=list.id||'-done'";
+  const bucketSql = `CASE WHEN ${doneSql} THEN 2 WHEN due.date_value IS NOT NULL THEN 0 ELSE 1 END`;
+  const dueSortSql = `CASE WHEN NOT (${doneSql}) AND due.date_value IS NOT NULL THEN due.date_value ELSE '' END`;
   if (query.cursor) {
-    filter += " AND r.id>?";
-    binds.push(query.cursor);
+    const cursor = decodeTaskCursor(query.cursor, Boolean(query.listId));
+    if (cursor.list) {
+      filter += " AND (r.position>? OR (r.position=? AND r.id>?))";
+      binds.push(cursor.position, cursor.position, cursor.id);
+    } else {
+      filter += ` AND (${bucketSql},${dueSortSql},-r.updated_at,r.id)>(?,?,?,?)`;
+      binds.push(cursor.bucket, cursor.due, cursor.recent, cursor.id);
+    }
   }
-  const rows = await env.DB.prepare(`SELECT r.id,list.id list_id,list.title list_title,list.space_id,
-    title.text_value title,assignee.text_value assignee_id,u.name assignee_name,status.select_value status,
-    due.date_value due_date,detail.id detail_page_id,state.revision,s.visibility,sm.role space_role
-    ${TASK_FROM}${filter} ORDER BY r.id LIMIT ?`)
-    .bind(...binds, limit + 1)
-    .all<{
-      id: string;
-      list_id: string;
-      list_title: string;
-      space_id: string;
-      title: string;
-      assignee_id: string | null;
-      assignee_name: string | null;
-      status: string;
-      due_date: string | null;
-      detail_page_id: string;
-      revision: number;
-      visibility: "workspace" | "private";
-      space_role: "editor" | "viewer" | null;
-    }>();
+  const order = query.listId ? "r.position,r.id" : `${bucketSql},${dueSortSql},r.updated_at DESC,r.id`;
+  const rows =
+    await env.DB.prepare(`SELECT r.id,r.position,r.updated_at,list.id list_id,list.title list_title,list.space_id,
+    title.text_value title,assignee.text_value assignee_id,u.name assignee_name,
+    coalesce(status.select_value,list.id||'-todo') status,
+    due.date_value due_date,detail.id detail_page_id,state.revision,s.visibility,sm.role space_role,
+    ${bucketSql} sort_bucket,${dueSortSql} sort_due
+    ${TASK_FROM}${filter} ORDER BY ${order} LIMIT ?`)
+      .bind(...binds, limit + 1)
+      .all<{
+        id: string;
+        position: number;
+        updated_at: number;
+        list_id: string;
+        list_title: string;
+        space_id: string;
+        title: string;
+        assignee_id: string | null;
+        assignee_name: string | null;
+        status: string;
+        due_date: string | null;
+        detail_page_id: string;
+        revision: number;
+        visibility: "workspace" | "private";
+        space_role: "editor" | "viewer" | null;
+        sort_bucket: number;
+        sort_due: string;
+      }>();
   const tasks: Task[] = rows.results.slice(0, limit).map((r) => ({
     id: r.id,
     listId: r.list_id,
@@ -140,10 +190,17 @@ export async function listTasks(
     revision: r.revision,
     editable: effectiveSpaceRole(member.role, r.visibility, r.space_role) !== "viewer",
   }));
+  const last = rows.results.length > limit ? rows.results[limit - 1] : undefined;
   return {
     tasks,
     hasMore: rows.results.length > limit,
-    nextCursor: rows.results.length > limit ? tasks.at(-1)!.id : null,
+    nextCursor: last
+      ? encodeTaskCursor(
+          query.listId
+            ? { list: true, position: last.position, id: last.id }
+            : { list: false, bucket: last.sort_bucket, due: last.sort_due, recent: -last.updated_at, id: last.id },
+        )
+      : null,
   };
 }
 
@@ -163,8 +220,12 @@ function fields(value: Record<string, unknown>, previous?: Task): TaskFields {
   const assigneeId = value.assigneeId === undefined ? (previous?.assigneeId ?? null) : value.assigneeId;
   const status = value.status === undefined ? (previous?.status ?? "todo") : value.status;
   const dueDate = value.dueDate === undefined ? (previous?.dueDate ?? null) : value.dueDate;
-  if (typeof title !== "string" || !title.trim() || title.length > 500)
-    throw new HttpError(422, "invalid_task_title", "Enter a task title of up to 500 characters.");
+  if (
+    typeof title !== "string" ||
+    !title.trim() ||
+    ((value.title !== undefined || !previous) && title.length > PAGE_TITLE_MAX)
+  )
+    throw new HttpError(422, "invalid_task_title", `Enter a task title of up to ${PAGE_TITLE_MAX} characters.`);
   if (assigneeId !== null && (typeof assigneeId !== "string" || !ID_PATTERN.test(assigneeId)))
     throw new HttpError(422, "invalid_assignee", "Choose an assignee.");
   if (!TASK_STATUSES.includes(status as TaskStatus))
@@ -222,7 +283,12 @@ export async function mutateTask(
     : undefined;
   if (rowId && !previous) throw new HttpError(404, "task_not_found", "The task no longer exists.");
   const next = fields(body, previous);
-  if (next.assigneeId && !(await taskAssignees(env, member, listId)).some((u) => u.id === next.assigneeId))
+  if (
+    body.assigneeId !== undefined &&
+    next.assigneeId &&
+    next.assigneeId !== previous?.assigneeId &&
+    !(await taskAssignees(env, member, listId)).some((u) => u.id === next.assigneeId)
+  )
     throw new HttpError(422, "invalid_assignee", "The assignee must have access to this task list.");
   const expectedRevision = Number(body.expectedRevision);
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
@@ -317,19 +383,35 @@ export async function mutateTask(
           ...guards,
         ),
       );
+      statements.push(
+        env.DB.prepare(`INSERT INTO subscriptions
+          (id,workspace_id,user_id,resource_type,resource_id,created_by,created_at)
+          SELECT ?,?,?,'page',?,?,? WHERE ${guard}
+          ON CONFLICT(user_id,resource_type,resource_id) DO UPDATE SET muted_at=NULL`).bind(
+          `page:${detailId}:${member.user.id}`,
+          member.workspace.id,
+          member.user.id,
+          detailId,
+          member.user.id,
+          now,
+          ...guards,
+        ),
+      );
     }
-    for (const [column, text, date, select] of [
+    const cellValues: Array<[string, string | null, string | null, string | null]> = [
       [c.title, next.title, null, null],
       [c.assignee, next.assigneeId, null, null],
       [c.status, null, null, `${listId}-${next.status}`],
       [c.due, null, next.dueDate, null],
-    ]) {
+    ];
+    for (const [column, text, date, select] of cellValues) {
       statements.push(
-        env.DB.prepare(`INSERT INTO table_cells(row_id,column_id,text_value,date_value,select_value,updated_at)
-        SELECT ?,?,?,?,?,? WHERE ${guard} ON CONFLICT(row_id,column_id) DO UPDATE SET text_value=excluded.text_value,date_value=excluded.date_value,select_value=excluded.select_value,updated_at=excluded.updated_at`).bind(
+        env.DB.prepare(`INSERT INTO table_cells(row_id,column_id,text_value,text_search_value,date_value,select_value,updated_at)
+        SELECT ?,?,?,?,?,?,? WHERE ${guard} ON CONFLICT(row_id,column_id) DO UPDATE SET text_value=excluded.text_value,text_search_value=excluded.text_search_value,date_value=excluded.date_value,select_value=excluded.select_value,updated_at=excluded.updated_at`).bind(
           id,
           column,
           text,
+          text === null ? null : normalizeSearchValue(text),
           date,
           select,
           now,
@@ -392,13 +474,31 @@ export async function mutateTask(
             ...guards,
           ),
         );
+        statements.push(
+          env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (${subtree}) AND ${guard}`).bind(
+            detailId,
+            ...guards,
+          ),
+        );
+        statements.push(
+          env.DB.prepare(
+            `INSERT INTO page_search(page_id,workspace_id,title,body)
+             SELECT id,workspace_id,title,coalesce(plain_text,'') FROM pages
+              WHERE id IN (${subtree}) AND archived_at IS NULL AND import_job_id IS NULL AND ${guard}`,
+          ).bind(detailId, ...guards),
+        );
+      } else {
+        statements.push(
+          env.DB.prepare(`DELETE FROM page_search WHERE page_id=? AND ${guard}`).bind(detailId, ...guards),
+        );
+        statements.push(
+          env.DB.prepare(
+            `INSERT INTO page_search(page_id,workspace_id,title,body)
+             SELECT id,workspace_id,title,coalesce(plain_text,'') FROM pages
+              WHERE id=? AND archived_at IS NULL AND import_job_id IS NULL AND ${guard}`,
+          ).bind(detailId, ...guards),
+        );
       }
-      statements.push(env.DB.prepare(`DELETE FROM page_search WHERE page_id=? AND ${guard}`).bind(detailId, ...guards));
-      statements.push(
-        env.DB.prepare(
-          `INSERT INTO page_search(page_id,workspace_id,title,body) SELECT id,workspace_id,title,coalesce(plain_text,'') FROM pages WHERE id=? AND ${guard}`,
-        ).bind(detailId, ...guards),
-      );
     }
     statements.push(
       env.DB.prepare(`INSERT INTO task_mutation_receipts(workspace_id,actor_id,operation_id,request_hash,row_id,detail_page_id,revision,created_at)
@@ -449,7 +549,11 @@ export async function mutateTask(
       );
     if (receipt.request_hash !== hash)
       throw new HttpError(409, "idempotency_key_reused", "That operation ID describes another change.");
-    await env.DB.batch(refreshPageSearchV2Statements(env.DB, detailId));
+    await env.DB.batch(
+      typeof body.archived === "boolean"
+        ? refreshPageSearchV2SubtreeStatements(env.DB, detailId)
+        : refreshPageSearchV2Statements(env.DB, detailId),
+    );
     return { rowId: id, detailPageId: detailId, revision: receipt.revision, replayed: false };
   } finally {
     if (shortLease)

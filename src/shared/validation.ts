@@ -113,18 +113,28 @@ export function parseWorkspaceEvent(value: unknown): WorkspaceEvent | null {
     Array.isArray(event.pages) &&
     event.pages.every(isPage) &&
     (event.restored === undefined || typeof event.restored === "boolean") &&
+    (event.sidebarHiddenPageIds === undefined ||
+      (stringList(event.sidebarHiddenPageIds) && event.sidebarHiddenPageIds.every((id) => ID_PATTERN.test(id)))) &&
     (event.restoredRootId === undefined ||
       (event.restored === true && typeof event.restoredRootId === "string" && ID_PATTERN.test(event.restoredRootId)))
   ) {
     const pages = event.pages.map(pageWithoutUnknownFields);
+    const sidebarHiddenPageIds =
+      event.sidebarHiddenPageIds === undefined ? {} : { sidebarHiddenPageIds: [...event.sidebarHiddenPageIds] };
     return event.restored === true
       ? {
           type: "pages-upserted",
           pages,
           restored: true,
+          ...sidebarHiddenPageIds,
           ...(event.restoredRootId === undefined ? {} : { restoredRootId: event.restoredRootId }),
         }
-      : { type: "pages-upserted", pages, ...(event.restored === false ? { restored: false } : {}) };
+      : {
+          type: "pages-upserted",
+          pages,
+          ...sidebarHiddenPageIds,
+          ...(event.restored === false ? { restored: false } : {}),
+        };
   }
   if (event.type === "pages-removed" && stringList(event.pageIds) && typeof event.permanently === "boolean") {
     const operationId =
@@ -151,6 +161,9 @@ export function parseWorkspaceEvent(value: unknown): WorkspaceEvent | null {
   }
   if (event.type === "comments-invalidated" && typeof event.pageId === "string" && ID_PATTERN.test(event.pageId)) {
     return { type: "comments-invalidated", pageId: event.pageId };
+  }
+  if (event.type === "task-list-invalidated" && typeof event.pageId === "string" && ID_PATTERN.test(event.pageId)) {
+    return { type: "task-list-invalidated", pageId: event.pageId };
   }
   if (
     event.type === "workspace-invalidated" ||

@@ -6,7 +6,7 @@ import { mentionsInbox, type MentionCursor } from "./mentions-inbox";
 import { pageForMember } from "./page-access";
 import { parseSearchRequest, searchPages } from "./search";
 import { createShare, getShare } from "./shares";
-import { homeView, searchModal, type SearchModalFilters } from "./slack-blocks";
+import { homeView, searchModal, slackLabel, type SearchModalFilters } from "./slack-blocks";
 import {
   identityFor,
   installationFor,
@@ -339,7 +339,7 @@ async function suggestions(env: Env, payload: SlackInteractionPayload) {
         .all<{ id: string; name: string }>();
       return {
         options: rows.results.map((row) => ({
-          text: { type: "plain_text", text: row.name.slice(0, 75) },
+          text: { type: "plain_text", text: slackLabel(row.name) },
           value: row.id,
         })),
       };
@@ -358,7 +358,7 @@ async function suggestions(env: Env, payload: SlackInteractionPayload) {
         .all<{ id: string; name: string }>();
       return {
         options: rows.results.map((row) => ({
-          text: { type: "plain_text", text: row.name.slice(0, 75) },
+          text: { type: "plain_text", text: slackLabel(row.name) },
           value: row.id,
         })),
       };
@@ -837,9 +837,7 @@ export async function deliverSlackSearchUpdate(env: Env, sessionId: string, revi
 }
 
 export async function purgeExpiredSlackSearchSessions(env: Env) {
-  await env.DB.prepare(
-    "DELETE FROM slack_product_sessions WHERE created_at<? AND (result_page_id IS NULL OR json_extract(state_json,'$.copied')=1 OR (json_extract(state_json,'$.source') IS NULL AND coalesce(json_extract(state_json,'$.body'),'')=''))",
-  )
+  await env.DB.prepare("DELETE FROM slack_product_sessions WHERE created_at<?")
     .bind(Date.now() - 7 * 86_400_000)
     .run();
   await env.DB.prepare(`DELETE FROM slack_view_sessions WHERE kind = 'search' AND created_at < ?`)
@@ -1043,6 +1041,7 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
   }
   const state = parseSession(session) as HomeState;
   if (input.actionId === "noteflare_home_read") {
+    const readAt = Date.now();
     await env.DB.batch([
       homeGuard(env, receiptId, input, session.id),
       env.DB.prepare(
@@ -1052,10 +1051,10 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
       env.DB.prepare(`UPDATE notifications SET read_at=coalesce(read_at,?) WHERE workspace_id=? AND user_id=? AND created_at<=?
         AND EXISTS(SELECT 1 FROM pages p JOIN spaces s ON s.id=p.space_id LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=?
           WHERE p.id=notifications.page_id AND p.archived_at IS NULL AND p.import_job_id IS NULL AND (?='owner' OR s.visibility='workspace' OR sm.user_id IS NOT NULL))`).bind(
-        Date.now(),
+        readAt,
         member.workspace.id,
         member.user.id,
-        state.asOf,
+        readAt,
         member.user.id,
         member.role,
       ),

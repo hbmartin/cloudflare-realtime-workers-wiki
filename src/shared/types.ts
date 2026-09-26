@@ -387,9 +387,22 @@ export type MentionInboxItem = {
 };
 
 export type WorkspaceEvent =
-  | { type: "pages-upserted"; pages: Page[]; restored: true; restoredRootId?: string }
-  | { type: "pages-upserted"; pages: Page[]; restored?: false; restoredRootId?: never }
+  | {
+      type: "pages-upserted";
+      pages: Page[];
+      restored: true;
+      restoredRootId?: string;
+      sidebarHiddenPageIds?: string[];
+    }
+  | {
+      type: "pages-upserted";
+      pages: Page[];
+      restored?: false;
+      restoredRootId?: never;
+      sidebarHiddenPageIds?: string[];
+    }
   | { type: "pages-removed"; pageIds: string[]; permanently: boolean; operationId?: string }
+  | { type: "task-list-invalidated"; pageId: string }
   | { type: "workspace-invalidated" }
   | { type: "organization-invalidated" }
   | { type: "notifications-invalidated" }

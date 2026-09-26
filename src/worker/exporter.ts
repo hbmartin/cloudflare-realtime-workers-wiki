@@ -31,6 +31,7 @@ type ExportPage = {
   content_epoch: number;
   kind: "document" | "table" | "diagram";
   title: string;
+  is_task_list: number;
 };
 type ExportColumn = { id: string; name: string };
 type ExportTableRow = { id: string; cells: string };
@@ -274,18 +275,25 @@ async function tableExport(env: Env, page: ExportPage): Promise<SerializedExport
     const rows = await env.DB.prepare(
       `SELECT row.id,
               COALESCE(json_group_object(column.id,
-                COALESCE(cell.text_value, cell.number_value,
+                CASE WHEN column.id = ? AND cell.text_value IS NOT NULL
+                  THEN coalesce(assignee.name, 'Former member')
+                  ELSE COALESCE(cell.text_value, cell.number_value,
                   CASE WHEN cell.boolean_value IS NULL THEN NULL WHEN cell.boolean_value = 1 THEN 'true' ELSE 'false' END,
-                  cell.date_value, option.label, '')), '{}') cells
+                  cell.date_value, option.label, '') END), '{}') cells
          FROM table_rows row
          CROSS JOIN table_columns column
          LEFT JOIN table_cells cell ON cell.row_id = row.id AND cell.column_id = column.id
          LEFT JOIN table_select_options option ON option.id = cell.select_value
+         LEFT JOIN user assignee ON assignee.id = cell.text_value
         WHERE row.page_id = ? AND column.page_id = ?
+          AND (? = 0 OR NOT EXISTS(
+            SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id = link.page_id
+             WHERE link.row_id = row.id AND detail.archived_at IS NOT NULL
+          ))
         GROUP BY row.id, row.position
         ORDER BY row.position, row.id LIMIT ? OFFSET ?`,
     )
-      .bind(page.id, page.id, TABLE_EXPORT_BATCH, offset)
+      .bind(`${page.id}-assignee`, page.id, page.id, page.is_task_list, TABLE_EXPORT_BATCH, offset)
       .all<ExportTableRow>();
     for (const row of rows.results) {
       const cells = jsonRecord(row.cells);
@@ -467,7 +475,7 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
     await assertExportActive(env, job);
     await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${job.attempt}/output/`);
     const page = await env.DB.prepare(
-      `SELECT id, workspace_id, content_epoch, kind, title FROM pages
+      `SELECT id, workspace_id, content_epoch, kind, title, is_task_list FROM pages
         WHERE id = ? AND workspace_id = ? AND space_id = ? AND import_job_id IS NULL AND is_template = 0`,
     )
       .bind(options.pageId, job.workspace_id, job.space_id)

@@ -40,7 +40,14 @@ export async function eventForCurrentWorkspaceState(
     // A later mutation can commit before an older queued event is delivered.
     // Broadcast the current rows instead of forcing every client to reconnect;
     // clients still receive authoritative state even if the later event is lost.
-    return { ...event, pages: currentPages };
+    const currentIds = new Set(currentPages.map((page) => page.id));
+    return {
+      ...event,
+      pages: currentPages,
+      ...(event.sidebarHiddenPageIds
+        ? { sidebarHiddenPageIds: event.sidebarHiddenPageIds.filter((pageId) => currentIds.has(pageId)) }
+        : {}),
+    };
   }
   if (event.type === "pages-removed") {
     const statePredicate = event.permanently ? "1 = 1" : "archived_at IS NOT NULL";
@@ -263,9 +270,15 @@ export class WorkspaceEvents extends YServer {
           if (!visiblePages.length) return null;
           const includesRestoredRoot =
             event.restoredRootId === undefined || visiblePages.some((page) => page.id === event.restoredRootId);
+          const visibleIds = new Set(visiblePages.map((page) => page.id));
+          const sidebarHiddenPageIds = event.sidebarHiddenPageIds?.filter((pageId) => visibleIds.has(pageId));
           return includesRestoredRoot
-            ? { ...event, pages: visiblePages }
-            : { type: "pages-upserted", pages: visiblePages };
+            ? { ...event, pages: visiblePages, ...(sidebarHiddenPageIds ? { sidebarHiddenPageIds } : {}) }
+            : {
+                type: "pages-upserted",
+                pages: visiblePages,
+                ...(sidebarHiddenPageIds ? { sidebarHiddenPageIds } : {}),
+              };
         }
         if (event.type === "pages-removed") {
           const visibleIds = event.pageIds.filter(canRead);

@@ -44,6 +44,7 @@ export function Icon({ name }: { name: keyof typeof paths }) {
   );
 }
 
+/* oxlint-disable jsx-a11y/prefer-tag-over-role -- summary has native button semantics; the explicit role supports test and assistive-tech implementations. */
 export function ActionMenu({
   label,
   children,
@@ -56,56 +57,89 @@ export function ActionMenu({
   className?: string;
 }) {
   const ref = useRef<HTMLDetailsElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
   useEffect(() => {
     const details = ref.current;
-    if (!details) return undefined;
+    const menu = menuRef.current;
+    if (!details || !menu || !open) return undefined;
+    const position = () => {
+      const anchor = details.querySelector("summary")!.getBoundingClientRect();
+      menu.style.left = `${Math.max(8, Math.min(anchor.left, window.innerWidth - menu.offsetWidth - 8))}px`;
+      menu.style.top = `${Math.max(8, Math.min(anchor.bottom + 4, window.innerHeight - menu.offsetHeight - 8))}px`;
+    };
+    position();
     const close = (event: PointerEvent) => {
-      if (details.open && !details.contains(event.target as Node)) details.open = false;
+      const target = event.target as Node;
+      if (!details.contains(target) && !menu.contains(target)) {
+        details.open = false;
+        setOpen(false);
+      }
     };
     const key = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && details.open) {
+      if (event.key === "Escape") {
         event.stopPropagation();
         details.open = false;
+        setOpen(false);
         details.querySelector("summary")?.focus();
       }
     };
     const click = (event: MouseEvent) => {
       if ((event.target as HTMLElement).closest("button[data-close-menu]")) {
         details.open = false;
+        setOpen(false);
         details.querySelector("summary")?.focus();
       }
     };
-    const position = () => {
-      if (!details.open) return;
-      const anchor = details.querySelector("summary")!.getBoundingClientRect();
-      const menu = details.querySelector<HTMLElement>(".action-menu-content")!;
-      menu.style.position = "fixed";
-      menu.style.left = `${Math.max(8, Math.min(anchor.left, window.innerWidth - menu.offsetWidth - 8))}px`;
-      menu.style.top = `${Math.max(8, Math.min(anchor.bottom + 4, window.innerHeight - menu.offsetHeight - 8))}px`;
-    };
     document.addEventListener("pointerdown", close);
-    details.addEventListener("keydown", key);
-    details.addEventListener("click", click);
-    details.addEventListener("toggle", position);
+    document.addEventListener("keydown", key);
+    menu.addEventListener("click", click);
+    window.addEventListener("resize", position);
+    window.addEventListener("scroll", position, true);
     return () => {
       document.removeEventListener("pointerdown", close);
-      details.removeEventListener("keydown", key);
-      details.removeEventListener("click", click);
-      details.removeEventListener("toggle", position);
+      document.removeEventListener("keydown", key);
+      menu.removeEventListener("click", click);
+      window.removeEventListener("resize", position);
+      window.removeEventListener("scroll", position, true);
     };
-  }, []);
+  }, [open]);
   return (
-    <details ref={ref} className={`action-menu ${className}`}>
-      {/* Summary is a native keyboard disclosure; the explicit role also supports accessibility test environments. */}
-      {/* eslint-disable-next-line jsx-a11y/prefer-tag-over-role */}
-      <summary role="button" aria-label={label} title={label}>
-        <Icon name={icon} />
-        <span className="menu-label">{label}</span>
-      </summary>
-      <div className="action-menu-content">{children}</div>
-    </details>
+    <>
+      <details ref={ref} className={`action-menu ${className}`}>
+        {/* Summary is a native keyboard disclosure. */}
+        <summary
+          role="button"
+          aria-label={label}
+          title={label}
+          onClick={(event) => {
+            event.preventDefault();
+            const details = ref.current;
+            if (!details) return;
+            details.open = !details.open;
+            setOpen(details.open);
+          }}
+        >
+          <Icon name={icon} />
+          <span className="menu-label">{label}</span>
+        </summary>
+        {!open && (
+          <div className="action-menu-content" aria-hidden={className.includes("creation-menu") || undefined}>
+            {children}
+          </div>
+        )}
+      </details>
+      {open &&
+        createPortal(
+          <div ref={menuRef} className="action-menu-content action-menu-portal">
+            {children}
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }
+/* oxlint-enable jsx-a11y/prefer-tag-over-role */
 
 /** Page editors own their controls; the shell supplies their shared toolbar location. */
 export function PageTools({ children }: { children: ReactNode }) {
@@ -218,6 +252,7 @@ export function QuickSwitcher({
     ? pages.filter((p) => !p.archivedAt && p.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()))
     : recentIds.flatMap((id) => pages.find((p) => p.id === id) ?? []);
   const results = [...local, ...remote.filter((r) => !local.some((p) => p.id === r.id))].slice(0, 20);
+  const selectedIndex = Math.max(0, Math.min(index, results.length - 1));
   return (
     <dialog
       ref={ref}
@@ -237,7 +272,7 @@ export function QuickSwitcher({
           role="combobox"
           aria-expanded={true}
           aria-controls="quick-switcher-options"
-          aria-activedescendant={results[index] ? `quick-result-${index}` : undefined}
+          aria-activedescendant={results[selectedIndex] ? `quick-result-${selectedIndex}` : undefined}
           autoComplete="off"
           value={query}
           onChange={(event) => {
@@ -251,8 +286,8 @@ export function QuickSwitcher({
               event.preventDefault();
               setIndex((i) => Math.max(0, Math.min(results.length - 1, i + (event.key === "ArrowDown" ? 1 : -1))));
             }
-            if (event.key === "Enter" && results[index]) {
-              onSelect(results[index].id);
+            if (event.key === "Enter" && results[selectedIndex]) {
+              onSelect(results[selectedIndex].id);
               onClose();
             }
           }}
@@ -270,9 +305,9 @@ export function QuickSwitcher({
             id={`quick-result-${i}`}
             // eslint-disable-next-line jsx-a11y/prefer-tag-over-role
             role="option"
-            aria-selected={i === index}
+            aria-selected={i === selectedIndex}
             key={page.id}
-            className={i === index ? "active" : ""}
+            className={i === selectedIndex ? "active" : ""}
             onMouseEnter={() => setIndex(i)}
             onClick={() => {
               onSelect(page.id);

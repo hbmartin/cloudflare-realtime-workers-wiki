@@ -13,11 +13,17 @@ export function safeSlackText(value: string, max = 3000) {
     .replaceAll("|", "¦");
 }
 
+export function slackLabel(value: string) {
+  const characters = Array.from(value);
+  return characters.length <= 75 ? value : `${characters.slice(0, 74).join("")}…`;
+}
+
 const plain = (text: string) => ({ type: "plain_text", text: text.slice(0, 150) });
-const button = (actionId: string, label: string, value: string) => ({
+const optionLabel = (text: string) => plain(slackLabel(text));
+const button = (actionId: string, text: string, value: string) => ({
   type: "button",
   action_id: actionId,
-  text: plain(label),
+  text: plain(slackLabel(text)),
   value,
 });
 
@@ -49,7 +55,7 @@ export function threadRootBlocks(input: {
       action_id: "noteflare_mapping_snooze",
       placeholder: plain("Snooze"),
       options: [1, 8, 24].map((hours) => ({
-        text: plain(`${hours} hour${hours === 1 ? "" : "s"}`),
+        text: optionLabel(`${hours} hour${hours === 1 ? "" : "s"}`),
         value: `${input.linkId}:${hours}`,
       })),
     },
@@ -129,7 +135,7 @@ export function searchModal(
         action_id: "value",
         min_query_length: 0,
         placeholder: plain("Any accessible space"),
-        ...(filters.spaceId ? { initial_option: { text: plain(filters.spaceId), value: filters.spaceId } } : {}),
+        ...(filters.spaceId ? { initial_option: { text: optionLabel(filters.spaceId), value: filters.spaceId } } : {}),
       },
     },
     {
@@ -144,7 +150,7 @@ export function searchModal(
         max_selected_items: 20,
         placeholder: plain("Any tag"),
         ...(filters.tagIds?.length
-          ? { initial_options: filters.tagIds.map((id) => ({ text: plain(id), value: id })) }
+          ? { initial_options: filters.tagIds.map((id) => ({ text: optionLabel(id), value: id })) }
           : {}),
       },
     },
@@ -157,8 +163,8 @@ export function searchModal(
         type: "static_select",
         action_id: "value",
         placeholder: plain("Any kind"),
-        options: ["document", "table", "diagram"].map((kind) => ({ text: plain(kind), value: kind })),
-        ...(filters.kind ? { initial_option: { text: plain(filters.kind), value: filters.kind } } : {}),
+        options: ["document", "table", "diagram"].map((kind) => ({ text: optionLabel(kind), value: kind })),
+        ...(filters.kind ? { initial_option: { text: optionLabel(filters.kind), value: filters.kind } } : {}),
       },
     },
     {
@@ -170,8 +176,8 @@ export function searchModal(
         type: "static_select",
         action_id: "value",
         placeholder: plain("Active"),
-        options: ["active", "archived", "all"].map((archive) => ({ text: plain(archive), value: archive })),
-        ...(filters.archive ? { initial_option: { text: plain(filters.archive), value: filters.archive } } : {}),
+        options: ["active", "archived", "all"].map((archive) => ({ text: optionLabel(archive), value: archive })),
+        ...(filters.archive ? { initial_option: { text: optionLabel(filters.archive), value: filters.archive } } : {}),
       },
     },
     { type: "actions", block_id: "search_action", elements: [button("noteflare_search_run", "Search", sessionId)] },

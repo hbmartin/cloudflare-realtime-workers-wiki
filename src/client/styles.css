@@ -243,6 +243,13 @@ select:focus-visible {
   gap: 12px;
 }
 
+.workspace-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .workspace-error-dismiss {
   border: 0;
   padding: 0;
@@ -3530,6 +3537,11 @@ button.mention-chip:focus-visible {
   border: 1px solid var(--line);
   border-radius: 8px;
   box-shadow: var(--shadow-dialog);
+}
+.action-menu-portal {
+  position: fixed;
+  right: auto;
+  z-index: 100;
 }
 .action-menu-content > button,
 .action-menu-content > .watch-control {
