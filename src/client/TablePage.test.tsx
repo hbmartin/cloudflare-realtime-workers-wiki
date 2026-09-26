@@ -5770,7 +5770,7 @@ describe("TablePage", () => {
     });
     renderViewer();
 
-    expect(await screen.findByText("1 / 4000 rows")).toBeInTheDocument();
+    expect(await screen.findByText("1 loaded · 4000 total rows")).toBeInTheDocument();
   });
 
   it("hides the load-more control once the last page has arrived", async () => {

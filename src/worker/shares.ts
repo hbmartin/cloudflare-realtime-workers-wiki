@@ -39,6 +39,7 @@ export type SharedPageRow = ShareRow & {
   page_title: string;
   page_icon: string | null;
   page_kind: PageKind;
+  full_width?: number;
   content_epoch: number;
   page_updated_at: number;
 };
@@ -250,7 +251,7 @@ async function resolveSharedTarget(
         WHERE parent.archived_at IS NULL AND parent.import_job_id IS NULL AND child.depth < 50
      )
      SELECT share.*, page.id page_id, page.parent_id, page.title page_title, page.icon page_icon,
-            page.kind page_kind, page.content_epoch, page.updated_at page_updated_at
+            page.kind page_kind, page.full_width, page.content_epoch, page.updated_at page_updated_at
        FROM share_links share JOIN pages page ON page.id = ?
       WHERE share.id = ? AND share.revoked_at IS NULL
         AND page.workspace_id = share.workspace_id AND page.archived_at IS NULL AND page.import_job_id IS NULL
@@ -465,14 +466,19 @@ async function publicTransclusions(
 
 async function publicTableHtml(env: Env, pageId: string) {
   const [columns, cells] = await Promise.all([
-    env.DB.prepare(`SELECT id, name FROM table_columns WHERE page_id = ? ORDER BY position, id`)
+    env.DB.prepare(
+      `SELECT column.id, column.name,
+              CASE WHEN page.is_task_list=1 AND column.id=page.id||'-assignee' THEN 1 ELSE 0 END private_assignee
+         FROM table_columns column JOIN pages page ON page.id=column.page_id
+        WHERE column.page_id = ? ORDER BY column.position, column.id`,
+    )
       .bind(pageId)
-      .all<{ id: string; name: string }>(),
+      .all<{ id: string; name: string; private_assignee: number }>(),
     env.DB.prepare(
       `SELECT row.id row_id, cell.column_id, cell.text_value, cell.number_value, cell.boolean_value,
               cell.date_value, option.label select_label
          FROM (
-           SELECT id, position FROM table_rows WHERE page_id = ? ORDER BY position, id LIMIT 501
+           SELECT id, position FROM table_rows WHERE page_id = ? AND NOT EXISTS (SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id JOIN pages list ON list.id=table_rows.page_id WHERE link.row_id=table_rows.id AND list.is_task_list=1 AND detail.archived_at IS NOT NULL) ORDER BY position, id LIMIT 501
          ) row LEFT JOIN table_cells cell ON cell.row_id = row.id
          LEFT JOIN table_select_options option ON option.id = cell.select_value
         ORDER BY row.position, row.id, cell.column_id`,
@@ -500,7 +506,12 @@ async function publicTableHtml(env: Env, pageId: string) {
     .map((rowId) => rows.get(rowId)!)
     .map(
       (row) =>
-        `<tr>${columns.results.map((column) => `<td>${escapeHtml(row.get(column.id) ?? "")}</td>`).join("")}</tr>`,
+        `<tr>${columns.results
+          .map((column) => {
+            const value = row.get(column.id) ?? "";
+            return `<td>${escapeHtml(column.private_assignee ? (value ? "Assigned" : "") : value)}</td>`;
+          })
+          .join("")}</tr>`,
     )
     .join("")}</tbody></table>`;
   return { html, truncated };
@@ -555,7 +566,7 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
   );
   if (tableTruncated) content += "<p><small>This public view is limited to the first 500 rows.</small></p>";
   const updatedAt = new Date(share.page_updated_at).toISOString();
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="robots" content="${robots}"><link rel="canonical" href="${canonical}"><title>${escapeHtml(share.page_title)}</title><style>:root{color-scheme:light dark;--page:#fff;--ink:#25231f;--muted:#625f57;--line:#dfddd5;--card:#f7f5ef;--accent:#5b5bd6}html[data-theme=dark]{--page:#191a19;--ink:#f0f1ed;--muted:#a7aaa4;--line:#3a3c39;--card:#242624;--accent:#9a98ff}*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:16px/1.6 system-ui,sans-serif}.public-shell{display:grid;grid-template-columns:${nav ? "240px" : "0"} minmax(0,860px) ${share.show_toc && toc ? "210px" : "0"};justify-content:center;gap:30px;padding:32px 24px}.public-tree,.public-toc{position:sticky;top:24px;align-self:start;display:grid;gap:5px;max-height:calc(100vh - 48px);overflow:auto}.public-tree a,.public-toc a{padding:5px 8px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:13px}.public-tree a:hover,.public-tree a.active{background:var(--card);color:var(--ink)}main{min-width:0}header{margin-bottom:34px}.public-breadcrumb{color:var(--muted);font-size:12px}.public-breadcrumb span{padding:0 5px}h1{font:700 clamp(34px,6vw,54px)/1.1 Georgia,serif;margin:16px 0 8px}header small{color:var(--muted)}a{color:var(--accent)}img,video,iframe{max-width:100%}pre{white-space:pre-wrap;background:var(--card);padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-left:4px solid var(--accent);background:var(--card)}.columns{display:flex;gap:16px}.column{flex:1}table{width:100%;border-collapse:collapse}td,th{border:1px solid var(--line);padding:7px;text-align:left}.theme-switch{position:fixed;right:14px;top:14px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);padding:7px 10px;cursor:pointer}@media(max-width:900px){.public-shell{display:block}.public-tree,.public-toc{position:static;margin-bottom:24px}.columns{display:block}}</style><script>try{const media=matchMedia('(prefers-color-scheme:dark)');const values=['auto','light','dark'];const apply=()=>{const preference=localStorage.getItem('notes:public-theme')||'auto';document.documentElement.dataset.theme=preference==='dark'||(preference==='auto'&&media.matches)?'dark':'light';document.documentElement.dataset.themePreference=preference};apply();media.addEventListener('change',()=>{if((localStorage.getItem('notes:public-theme')||'auto')==='auto')apply()});window.cyclePublicTheme=()=>{const current=localStorage.getItem('notes:public-theme')||'auto';const next=values[(values.indexOf(current)+1)%values.length];localStorage.setItem('notes:public-theme',next);apply()}}catch{}</script></head><body><button class="theme-switch" aria-label="Change theme: system, light, or dark" title="Theme: system → light → dark" onclick="cyclePublicTheme()">◐</button><div class="public-shell">${nav}<main><header><nav class="public-breadcrumb">${breadcrumbHtml}</nav><h1>${escapeHtml(share.page_icon ? `${share.page_icon} ${share.page_title}` : share.page_title)}</h1>${share.show_last_updated ? `<small>Updated <time datetime="${updatedAt}">${updatedAt}</time></small>` : ""}</header>${content}</main>${share.show_toc ? toc : ""}</div></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="robots" content="${robots}"><link rel="canonical" href="${canonical}"><title>${escapeHtml(share.page_title)}</title><style>:root{color-scheme:light dark;--page:#fbfaf7;--ink:#25231f;--muted:#625f57;--line:#dfddd5;--card:#f7f5ef;--accent:#5b5bd6}html[data-theme=dark]{--page:#191a19;--ink:#f0f1ed;--muted:#a7aaa4;--line:#3a3c39;--card:#242624;--accent:#9a98ff}*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:16px/1.6 system-ui,sans-serif}.public-shell{display:grid;grid-template-columns:${nav ? "240px" : "0"} minmax(0,${share.full_width || share.page_kind === "table" ? "1200px" : "720px"}) ${share.show_toc && toc ? "210px" : "0"};justify-content:center;gap:30px;padding:32px 24px}.public-tree,.public-toc{position:sticky;top:24px;align-self:start;display:grid;gap:5px;max-height:calc(100vh - 48px);overflow:auto}.public-tree a,.public-toc a{padding:5px 8px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:13px}.public-tree a:hover,.public-tree a.active{background:var(--card);color:var(--ink)}main{min-width:0}header{margin-bottom:34px}.public-breadcrumb{color:var(--muted);font-size:12px}.public-breadcrumb span{padding:0 5px}h1{font:400 clamp(32px,5vw,40px)/1.15 Georgia,serif;margin:16px 0 8px}header small{color:var(--muted)}a{color:var(--accent)}img,video,iframe{max-width:100%}pre{white-space:pre-wrap;background:var(--card);padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-radius:5px;background:var(--card)}.columns{display:flex;gap:16px}.column{flex:1}table{width:100%;border-collapse:collapse}td,th{border:1px solid var(--line);padding:7px;text-align:left}.theme-switch{position:fixed;right:14px;top:14px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);padding:7px 10px;cursor:pointer}@media(max-width:900px){.public-shell{display:block}.public-tree,.public-toc{position:static;margin-bottom:24px}.columns{display:block}}</style><script>try{const media=matchMedia('(prefers-color-scheme:dark)');const values=['auto','light','dark'];const apply=()=>{const preference=localStorage.getItem('notes:public-theme')||'auto';document.documentElement.dataset.theme=preference==='dark'||(preference==='auto'&&media.matches)?'dark':'light';document.documentElement.dataset.themePreference=preference};apply();media.addEventListener('change',()=>{if((localStorage.getItem('notes:public-theme')||'auto')==='auto')apply()});window.cyclePublicTheme=()=>{const current=localStorage.getItem('notes:public-theme')||'auto';const next=values[(values.indexOf(current)+1)%values.length];localStorage.setItem('notes:public-theme',next);apply()}}catch{}</script></head><body><button class="theme-switch" aria-label="Change theme: system, light, or dark" title="Theme: system → light → dark" onclick="cyclePublicTheme()">◐</button><div class="public-shell">${nav}<main><header><nav class="public-breadcrumb">${breadcrumbHtml}</nav><h1>${escapeHtml(share.page_icon ? `${share.page_icon} ${share.page_title}` : share.page_title)}</h1>${share.show_last_updated ? `<small>Updated <time datetime="${updatedAt}">${updatedAt}</time></small>` : ""}</header>${content}</main>${share.show_toc ? toc : ""}</div></body></html>`;
 }
 
 export async function publicAttachment(env: Env, share: SharedPageRow, attachmentId: string) {

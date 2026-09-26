@@ -724,7 +724,7 @@ describe("notification feed and subscriptions", () => {
       configured: boolean;
       channels: { email: { available: boolean }; slack: { available: boolean } };
     }>();
-    expect(initial.preferences).toHaveLength(5);
+    expect(initial.preferences).toHaveLength(6);
     expect(initial.configured).toBe(false);
     expect(initial.channels).toEqual({
       email: { available: false },

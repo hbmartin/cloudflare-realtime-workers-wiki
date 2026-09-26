@@ -1,3 +1,4 @@
+import { deliverSlackProductCopy } from "./slack-product";
 import {
   retireUncertainSlackDelivery,
   deliverSlackThread,
@@ -1857,6 +1858,9 @@ export async function consumeDeliveryMessage(
     await sweepOutbox(env);
   } else if (row.topic === "slack_interaction_response") {
     await deliverSlackDenial(env, payload);
+  } else if (row.topic === "slack_product_copy") {
+    if (typeof payload.sessionId !== "string") return await rejectPayload("Slack capture session is invalid.");
+    await deliverSlackProductCopy(env, payload.sessionId);
   } else if (row.topic === "slack_workspace_action") {
     if (typeof payload.receiptId !== "string") return await rejectPayload("Slack workspace receipt is invalid.");
     if ((await deliverSlackWorkspaceAction(env, payload.receiptId)) === "deferred") return await deferSlackView();

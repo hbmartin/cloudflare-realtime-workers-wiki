@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { startTransition, StrictMode, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext, Job, Page, Space, Tag, WorkspaceEvent } from "../shared/types";
@@ -9,6 +9,9 @@ import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, Un
 import { App, fallbackPageId, useCommittedRef } from "./App";
 import { PAGE_NAVIGATE_EVENT } from "./mentions";
 import { PageLoadEventBuffer } from "./page-state";
+
+// Rendering the full workspace under coverage can exceed the default one-second wait on CI.
+configure({ asyncUtilTimeout: 3000 });
 
 const mocks = vi.hoisted(() => ({
   createWorkspaceEvents: vi.fn((_workspaceId: string, _onEvent: unknown, _onReconnect: () => void) => ({
@@ -55,7 +58,12 @@ vi.mock("./retry", async (importOriginal) => ({
 vi.mock("./EditorPage", () => ({
   EditorPage: (props: EditorPageProps) => {
     mocks.editorRender(props);
-    return <button onClick={() => mocks.editorAction(props)}>Simulate document access denial</button>;
+    return (
+      <>
+        {props.metadata}
+        <button onClick={() => mocks.editorAction(props)}>Simulate document access denial</button>
+      </>
+    );
   },
 }));
 
@@ -127,6 +135,35 @@ function mockShellApi(options: { member?: ClientMemberContext; pages?: Page[]; j
   });
 }
 
+function getRootCreation() {
+  const trigger = screen.getByRole("button", { name: /^New page in / });
+  const details = trigger.closest("details")!;
+  if (!details.open) fireEvent.click(trigger);
+  return within(details).getByRole("button", { name: "Document" });
+}
+async function findRootCreation() {
+  await screen.findByRole("button", { name: /^New page in / });
+  return getRootCreation();
+}
+function openPageActions(name: string) {
+  const title = name.replace(/^Archive /, "");
+  const trigger = screen.getByRole("button", { name: `Actions for ${title}` });
+  const details = trigger.closest("details")!;
+  if (!details.open) fireEvent.click(trigger);
+}
+async function findArchive(name: string) {
+  await screen.findByRole("button", { name: `Actions for ${name.replace(/^Archive /, "")}` });
+  openPageActions(name);
+  return screen.getByRole("button", { name });
+}
+function getArchive(name: string) {
+  openPageActions(name);
+  return screen.getByRole("button", { name });
+}
+function queryArchive(name: string) {
+  return screen.queryByRole("button", { name: `Actions for ${name.replace(/^Archive /, "")}` });
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -189,6 +226,7 @@ describe("App error handling", () => {
       setItem: (key: string, value: string) => stored.set(key, value),
     } satisfies Storage);
     history.replaceState(null, "", "/");
+    localStorage.setItem("notes:last-page:workspace:user", page.id);
     sessionStorage.clear();
     vi.mocked(api).mockReset();
     mocks.createWorkspaceEvents.mockClear();
@@ -717,10 +755,10 @@ describe("App error handling", () => {
       },
     });
     render(<App />);
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     vi.useFakeTimers();
 
-    fireEvent.click(screen.getByRole("button", { name: /Activities/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Imports & exports/ }));
     await act(async () => Promise.resolve());
     expect(jobLoads).toBe(1);
 
@@ -774,7 +812,7 @@ describe("App error handling", () => {
       return shellApi(path, init);
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /Activities/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Imports & exports/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Confirm import" }));
     expect(await screen.findByText("Review the latest preview before confirming.")).toBeInTheDocument();
     expect(screen.getByText("Pages").parentElement).toHaveTextContent("2");
@@ -792,7 +830,7 @@ describe("App error handling", () => {
     const save = vi.spyOn(localStorage, "setItem");
     mockShellApi();
     render(<App />);
-    await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
+    await screen.findByText("Roadmap", { selector: ".breadcrumbs button" });
     const saves = () => save.mock.calls.filter(([key]) => key === "notes:last-page:workspace:user");
     const before = saves().length;
     act(() =>
@@ -801,7 +839,7 @@ describe("App error handling", () => {
         pages: [{ ...page, title: "Renamed", revision: page.revision + 1 }],
       }),
     );
-    await screen.findByText("Renamed", { selector: ".breadcrumbs span" });
+    await screen.findByText("Renamed", { selector: ".breadcrumbs button" });
     expect(saves()).toHaveLength(before);
     save.mockRestore();
   });
@@ -828,11 +866,11 @@ describe("App error handling", () => {
       return shellImplementation(path, init);
     });
     render(<App />);
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     fireEvent.click(screen.getByRole("button", { name: "Share" }));
     expect(await screen.findByDisplayValue("https://public.example.test/roadmap")).toBeInTheDocument();
 
-    const secondLink = screen.getByText("Second").closest("button");
+    const secondLink = screen.getByText("Second").closest<HTMLElement>('[role="treeitem"]');
     if (!secondLink) throw new Error("The second page link was not rendered.");
     fireEvent.click(secondLink);
     expect(screen.queryByRole("dialog", { name: "Share this page" })).not.toBeInTheDocument();
@@ -859,10 +897,10 @@ describe("App error handling", () => {
 
     expect(await screen.findByText("Tree unavailable.")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Workspace unavailable" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Create a root page" })).toBeDisabled();
+    expect(getRootCreation()).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     expect(treeLoads).toBe(2);
     expect(screen.queryByText("Tree unavailable.")).not.toBeInTheDocument();
   });
@@ -886,11 +924,11 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
 
-    expect(await screen.findByText("Untitled", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByText("Untitled", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     expect(directLoads).toBe(0);
   });
 
@@ -923,7 +961,7 @@ describe("App error handling", () => {
       </StrictMode>,
     );
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     expect(treeLoads).toBe(2);
     expect(firstRequestSignal?.aborted).toBe(true);
     expect(screen.queryByText(/page tree could not be loaded/i)).not.toBeInTheDocument();
@@ -1069,13 +1107,13 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Simulate document access denial" }));
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
 
     reconnectWorkspace();
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
   });
 
   it("starts a fresh unavailable-page reconciliation after an older load settles", async () => {
@@ -1098,11 +1136,11 @@ describe("App error handling", () => {
     mocks.editorAction.mockImplementation((props: EditorPageProps) => props.onPageUnavailable?.(page.id));
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     reconnectWorkspace();
     await waitFor(() => expect(treeLoads).toBe(2));
     fireEvent.click(screen.getByRole("button", { name: "Simulate document access denial" }));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
 
     await act(async () => {
       staleTree.resolve({ pages: [page] });
@@ -1110,7 +1148,7 @@ describe("App error handling", () => {
     });
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
   });
 
   it("retains an unavailable-page tombstone across a failed load and one stale retry", async () => {
@@ -1134,15 +1172,15 @@ describe("App error handling", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Simulate document access denial" }));
     expect(await screen.findByText("Tree unavailable.")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
 
     reconnectWorkspace();
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
 
     reconnectWorkspace();
     await waitFor(() => expect(treeLoads).toBe(4));
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
   });
 
   it("sends the archive operation id to the server", async () => {
@@ -1156,7 +1194,7 @@ describe("App error handling", () => {
     mockWorkspaceApi();
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     await waitFor(() =>
       expect(api).toHaveBeenCalledWith(`/api/pages/${page.id}`, {
@@ -1178,7 +1216,7 @@ describe("App error handling", () => {
     mockWorkspaceApi();
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(await screen.findByText("The page could not be archived.")).toBeInTheDocument();
     expect(api).not.toHaveBeenCalledWith(`/api/pages/${page.id}`, expect.objectContaining({ method: "DELETE" }));
@@ -1195,7 +1233,7 @@ describe("App error handling", () => {
     mockWorkspaceApi(new ApiClientError(503, "tree_unavailable", "Tree refresh unavailable."));
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(
       await screen.findByText(
@@ -1220,7 +1258,7 @@ describe("App error handling", () => {
     );
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(
       await screen.findByText(
@@ -1265,7 +1303,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const archive = await screen.findByRole("button", { name: "Archive Roadmap" });
+    const archive = await findArchive("Archive Roadmap");
     reconnectWorkspace();
     await waitFor(() => expect(treeLoads).toBe(2));
     fireEvent.click(archive);
@@ -1278,8 +1316,8 @@ describe("App error handling", () => {
     });
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Child" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
+    expect(queryArchive("Archive Child")).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(child.id);
     expect(api).not.toHaveBeenCalledWith("/api/pages/tree?archived=true");
@@ -1310,10 +1348,10 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(await screen.findByRole("button", { name: "Archive Child" })).toBeInTheDocument();
+    expect(await findArchive("Archive Child")).toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
     expect(mocks.invalidatePagePreview).not.toHaveBeenCalledWith(child.id);
   });
@@ -1343,7 +1381,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const archive = await screen.findByRole("button", { name: "Archive Roadmap" });
+    const archive = await findArchive("Archive Roadmap");
     reconnectWorkspace();
     await waitFor(() => expect(treeLoads).toBe(2));
     fireEvent.click(archive);
@@ -1357,8 +1395,8 @@ describe("App error handling", () => {
     });
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Child" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
+    expect(queryArchive("Archive Child")).not.toBeInTheDocument();
     expect(
       screen.queryByText("The server returned an invalid archive response. Refreshing the page tree."),
     ).not.toBeInTheDocument();
@@ -1388,13 +1426,13 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     await waitFor(() => expect(treeLoads).toBe(2));
     expect(
       screen.getByText("The server returned an invalid archive response. Refreshing the page tree."),
     ).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
 
     reconnectWorkspace();
 
@@ -1427,17 +1465,17 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Child" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
+    expect(queryArchive("Archive Child")).not.toBeInTheDocument();
 
     reconnectWorkspace();
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Archive Child" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
+    expect(getArchive("Archive Child")).toBeInTheDocument();
     expect(
       screen.getByText("The server returned an invalid archive response. Refreshing the page tree."),
     ).toBeVisible();
@@ -1459,7 +1497,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     const openSidebar = screen.getByRole("button", { name: "Open navigation" });
     fireEvent.click(openSidebar);
@@ -1505,7 +1543,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
     expect(await screen.findByText("First creation failed.")).toBeInTheDocument();
@@ -1533,7 +1571,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const secondLink = (await screen.findByText("Second")).closest("button");
+    const secondLink = (await screen.findByText("Second")).closest<HTMLElement>('[role="treeitem"]');
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     const openSidebar = screen.getByRole("button", { name: "Open navigation" });
     fireEvent.click(openSidebar);
@@ -1569,12 +1607,12 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
     expect(await screen.findByText("The page could not be created.")).toBeInTheDocument();
 
-    const secondLink = screen.getByText("Second").closest("button");
+    const secondLink = screen.getByText("Second").closest<HTMLElement>('[role="treeitem"]');
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
 
@@ -1586,7 +1624,7 @@ describe("App error handling", () => {
           headers: { "x-notes-operation-id": moveOperationId },
         }),
       );
-      expect(screen.getAllByTitle("Alt+arrow keys move this page")[0]).toHaveTextContent("Second");
+      expect(screen.getAllByRole("treeitem")[0]).toHaveTextContent("Second");
     });
     expect(api).not.toHaveBeenCalledWith("/api/pages", expect.objectContaining({ method: "POST" }));
     expect(screen.queryByText("The page could not be moved.")).not.toBeInTheDocument();
@@ -1614,7 +1652,7 @@ describe("App error handling", () => {
 
     const openSidebar = await screen.findByRole("button", { name: "Open navigation" });
     fireEvent.click(openSidebar);
-    fireEvent.click(screen.getByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(getArchive("Archive Roadmap"));
 
     expect(await screen.findByText("Archive was rejected.")).toBeInTheDocument();
     expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
@@ -1692,7 +1730,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
 
@@ -1744,7 +1782,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
 
@@ -1778,7 +1816,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
 
@@ -1824,7 +1862,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
 
@@ -1862,7 +1900,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const secondLink = (await screen.findByText("Second")).closest("button");
+    const secondLink = (await screen.findByText("Second")).closest<HTMLElement>('[role="treeitem"]');
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
 
@@ -1905,7 +1943,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     const treeRoot = document.querySelector(".tree-root");
     if (!treeRoot) throw new Error("The page tree root was not rendered.");
     fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
@@ -1944,7 +1982,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     const treeRoot = document.querySelector(".tree-root");
     if (!treeRoot) throw new Error("The page tree root was not rendered.");
     fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
@@ -1989,7 +2027,7 @@ describe("App error handling", () => {
     render(<App />);
 
     const navigation = await screen.findByRole("complementary", { name: "Workspace navigation" });
-    const pageLink = (await within(navigation).findByText("Roadmap")).closest("button");
+    const pageLink = (await within(navigation).findByText("Roadmap")).closest<HTMLElement>('[role="treeitem"]');
     if (!pageLink) throw new Error("The page navigation button was not rendered.");
     fireEvent.keyDown(pageLink, { altKey: true, key: "ArrowDown" });
 
@@ -2037,7 +2075,7 @@ describe("App error handling", () => {
     render(<App />);
 
     const navigation = await screen.findByRole("complementary", { name: "Workspace navigation" });
-    const pageLink = (await within(navigation).findByText("Roadmap")).closest("button");
+    const pageLink = (await within(navigation).findByText("Roadmap")).closest<HTMLElement>('[role="treeitem"]');
     if (!pageLink) throw new Error("The page navigation button was not rendered.");
     fireEvent.keyDown(pageLink, { altKey: true, key: "ArrowDown" });
 
@@ -2084,7 +2122,7 @@ describe("App error handling", () => {
     render(<App />);
 
     const navigation = await screen.findByRole("complementary", { name: "Workspace navigation" });
-    const pageLink = (await within(navigation).findByText("Roadmap")).closest("button");
+    const pageLink = (await within(navigation).findByText("Roadmap")).closest<HTMLElement>('[role="treeitem"]');
     if (!pageLink) throw new Error("The page navigation button was not rendered.");
     fireEvent.keyDown(pageLink, { altKey: true, key: "ArrowDown" });
 
@@ -2128,7 +2166,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     vi.useFakeTimers();
     const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
       const controller = new AbortController();
@@ -2190,7 +2228,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     const treeRoot = document.querySelector(".tree-root");
     if (!treeRoot) throw new Error("The page tree root was not rendered.");
     fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
@@ -2233,7 +2271,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     const treeRoot = document.querySelector(".tree-root");
     if (!treeRoot) throw new Error("The page tree root was not rendered.");
     fireEvent.drop(treeRoot, { dataTransfer: { getData: () => page.id } });
@@ -2264,10 +2302,10 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
-    const secondLink = screen.getByText("Second").closest("button");
+    const secondLink = screen.getByText("Second").closest<HTMLElement>('[role="treeitem"]');
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
 
@@ -2314,14 +2352,14 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
     expect(
       await screen.findByText("The page-creation result could not be verified. Checking the page tree."),
     ).toBeInTheDocument();
 
-    const secondLink = screen.getByText("Second").closest("button");
+    const secondLink = screen.getByText("Second").closest<HTMLElement>('[role="treeitem"]');
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
     expect(
@@ -2365,7 +2403,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const secondLink = (await screen.findByText("Second")).closest("button");
+    const secondLink = (await screen.findByText("Second")).closest<HTMLElement>('[role="treeitem"]');
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
@@ -2401,7 +2439,7 @@ describe("App error handling", () => {
     });
     const app = render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
     await waitFor(() => expect(api).toHaveBeenCalledWith("/api/pages", expect.objectContaining({ method: "POST" })));
@@ -2439,7 +2477,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const createButton = await screen.findByRole("button", { name: "Create a root page" });
+    const createButton = await findRootCreation();
     await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
     expect(document.querySelector(".workspace-sidebar")).toHaveClass("open");
@@ -2454,7 +2492,7 @@ describe("App error handling", () => {
     });
 
     expect(recordUpserts).not.toHaveBeenCalledWith([createdPage]);
-    expect(screen.queryByRole("button", { name: "Archive Created" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Created")).not.toBeInTheDocument();
     await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
     expect(await screen.findByText("The page was created, but it is no longer available.")).toBeInTheDocument();
     expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
@@ -2480,7 +2518,7 @@ describe("App error handling", () => {
     });
     const app = render(<App />);
 
-    const secondLink = (await screen.findByText("Second")).closest("button");
+    const secondLink = (await screen.findByText("Second")).closest<HTMLElement>('[role="treeitem"]');
     if (!secondLink) throw new Error("The second page navigation button was not rendered.");
     fireEvent.keyDown(secondLink, { altKey: true, key: "ArrowUp" });
     await waitFor(() =>
@@ -2520,7 +2558,7 @@ describe("App error handling", () => {
     });
     const app = render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     await waitFor(() =>
       expect(api).toHaveBeenCalledWith(`/api/pages/${page.id}`, expect.objectContaining({ method: "DELETE" })),
     );
@@ -2658,7 +2696,7 @@ describe("App error handling", () => {
     });
     const app = render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     await waitFor(() => expect(treeLoads).toBe(2));
     reported.mockClear();
 
@@ -2702,7 +2740,7 @@ describe("App error handling", () => {
     });
     const app = render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     await waitFor(() => expect(treeLoads).toBe(2));
     reported.mockClear();
 
@@ -2756,12 +2794,12 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(
       await screen.findByText("The server returned an invalid archive response. Refreshing the page tree."),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
     await act(async () => {
       reconciliation.resolve({ pages: [] });
@@ -2807,12 +2845,12 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(
       await screen.findByText("The server returned an invalid archive response. Refreshing the page tree."),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
     expect(reported).toHaveBeenCalledWith(
       "Successful mutation response could not be validated",
@@ -2868,9 +2906,9 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     expect(await screen.findByText(/invalid archive response/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Archive Second" }));
+    fireEvent.click(getArchive("Archive Second"));
     expect(await screen.findByText(/archive result could not be verified/i)).toBeInTheDocument();
     expect(screen.queryByText(/Second archive failure/)).not.toBeInTheDocument();
 
@@ -2926,11 +2964,11 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     await waitFor(() => expect(treeLoads).toBe(2));
     expect(screen.getByText("The archive result could not be verified. Refreshing the page tree.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(getArchive("Archive Roadmap")).toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
     expect(reported).toHaveBeenCalledWith(
       "Archive result could not be verified",
@@ -2974,11 +3012,11 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     await waitFor(() => expect(treeLoads).toBe(2));
     expect(screen.queryByText(/archive result could not be verified/i)).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
   });
 
   it("refreshes Trash when an uncertain archive is later confirmed", async () => {
@@ -3016,7 +3054,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const archive = await screen.findByRole("button", { name: "Archive Roadmap" });
+    const archive = await findArchive("Archive Roadmap");
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
     await waitFor(() => expect(trashLoads).toBe(1));
     fireEvent.click(archive);
@@ -3049,7 +3087,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(await screen.findByText("Archive rejected.")).toBeInTheDocument();
     expect(treeLoads).toBe(1);
@@ -3079,10 +3117,10 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
   });
@@ -3117,21 +3155,21 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    const archive = await screen.findByRole("button", { name: "Archive Roadmap" });
+    const archive = await findArchive("Archive Roadmap");
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
     await waitFor(() => expect(trashLoads).toBe(1));
     fireEvent.click(archive);
 
     await waitFor(() => expect(treeLoads).toBe(2));
     await waitFor(() => expect(trashLoads).toBe(2));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
     expect(mocks.invalidatePagePreview).toHaveBeenCalledWith(page.id);
     await act(async () => {
       reconciliation.resolve({ pages: [page] });
       await reconciliation.promise;
     });
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
   });
 
@@ -3162,15 +3200,15 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
     expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
 
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [{ ...page, title: "Late rename" }] }));
 
-    expect(screen.queryByRole("button", { name: "Archive Late rename" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Late rename")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Restore" })).toBeInTheDocument();
     await act(async () => {
       reconciliation.resolve({ pages: [] });
@@ -3204,7 +3242,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     await waitFor(() => expect(treeLoads).toBe(2));
     reconnectWorkspace();
     await waitFor(() => expect(treeLoads).toBe(3));
@@ -3214,8 +3252,8 @@ describe("App error handling", () => {
       await confirmingLoad.promise;
     });
 
-    expect(screen.queryByRole("button", { name: "Archive Late rename" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Late rename")).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
   });
 
   it("keeps a page_not_found removal through a failed reconciliation and one stale retry", async () => {
@@ -3244,24 +3282,24 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     await waitFor(() => expect(treeLoads).toBe(2));
     await act(async () => {
       failedReconciliation.reject(new ApiClientError(503, "tree_unavailable", "Tree unavailable."));
       await failedReconciliation.promise.catch(() => undefined);
     });
 
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     reconnectWorkspace();
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
 
     reconnectWorkspace();
 
     await waitFor(() => expect(treeLoads).toBe(4));
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
   });
 
   it("lets the user dismiss a scoped archive error", async () => {
@@ -3272,7 +3310,7 @@ describe("App error handling", () => {
     mockWorkspaceApi(undefined, new ApiClientError(422, "archive_rejected", "Archive rejected."));
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     expect(await screen.findByText("Archive rejected.")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Dismiss workspace errors" }));
@@ -3310,7 +3348,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     await waitFor(() =>
       expect(api).toHaveBeenCalledWith(`/api/pages/${page.id}`, expect.objectContaining({ method: "DELETE" })),
     );
@@ -3372,13 +3410,13 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     reconnectWorkspace();
 
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
   });
 
   it("reconciles an invalidated workspace through archive tombstones", async () => {
@@ -3398,13 +3436,13 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
   });
 
@@ -3429,7 +3467,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     await waitFor(() => expect(unreadLoads).toBe(1));
     await waitFor(() => expect(mocks.editorRender).toHaveBeenCalled());
     mocks.editorRender.mockClear();
@@ -3494,10 +3532,10 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
 
-    expect(await screen.findByRole("button", { name: "Archive Refreshed" })).toBeInTheDocument();
+    expect(await findArchive("Archive Refreshed")).toBeInTheDocument();
     await waitFor(() => expect(treeLoads).toBe(4));
     expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
     expect(mocks.waitForWorkspaceInvalidationRetry).toHaveBeenCalledOnce();
@@ -3521,12 +3559,12 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: true }));
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [{ ...page, title: "Late rename" }] }));
 
-    expect(screen.queryByRole("button", { name: "Archive Late rename" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Late rename")).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(treeLoads).toBe(1);
     expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
   });
@@ -3549,13 +3587,13 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
 
     await waitFor(() => expect(treeLoads).toBe(3));
     expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
   });
 
   it("restores a remote page when the first confirming tree still omits it", async () => {
@@ -3580,7 +3618,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
 
@@ -3597,7 +3635,7 @@ describe("App error handling", () => {
     });
     expect(treeLoads).toBe(3);
     expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce();
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
   });
 
   it("confirms every restored page from the full page tree", async () => {
@@ -3618,11 +3656,11 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Simulate document access denial" })).toBeInTheDocument();
     expect(treeLoads).toBe(2);
     expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
@@ -3647,13 +3685,13 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Child" })).toBeInTheDocument();
+    expect(await findArchive("Archive Child")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id, child.id], permanently: false }));
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page, child], restored: true }));
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Child" })).not.toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
+    expect(queryArchive("Archive Child")).not.toBeInTheDocument();
   });
 
   it("does not let a remote restore release an unrelated descendant tombstone", async () => {
@@ -3675,15 +3713,15 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Child" })).toBeInTheDocument();
+    expect(await findArchive("Archive Child")).toBeInTheDocument();
     act(() => {
       dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [child.id], permanently: false });
       dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false });
       dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true });
     });
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Child" })).not.toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
+    expect(queryArchive("Archive Child")).not.toBeInTheDocument();
     expect(treeLoads).toBe(2);
     expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
   });
@@ -3942,7 +3980,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
     reconnectWorkspace();
     await waitFor(() => expect(treeLoads).toBe(2));
@@ -3984,9 +4022,9 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
-    fireEvent.click(screen.getByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(getArchive("Archive Roadmap"));
     await waitFor(() => expect(treeLoads).toBe(2));
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
 
@@ -4042,7 +4080,7 @@ describe("App error handling", () => {
     });
     const app = render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true }));
     await waitFor(() => expect(mocks.waitForReconciliationRetry).toHaveBeenCalledOnce());
@@ -4241,7 +4279,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     reconnectWorkspace();
     await waitFor(() => expect(treeLoads).toBe(2));
     act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false }));
@@ -4254,7 +4292,7 @@ describe("App error handling", () => {
     });
 
     expect(treeLoads).toBe(2);
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
   });
 
   it("selects the restored root when the confirming tree lists a child first", async () => {
@@ -4277,7 +4315,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Child" })).toBeInTheDocument();
+    expect(await findArchive("Archive Child")).toBeInTheDocument();
     act(() => {
       dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id, child.id], permanently: false });
       dispatchWorkspaceEvent({ type: "pages-upserted", pages: [child, root], restored: true });
@@ -4335,7 +4373,7 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
   });
 
@@ -4363,8 +4401,26 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
 
-    expect(await screen.findByRole("button", { name: "Archive Other" })).toBeInTheDocument();
+    expect(await findArchive("Archive Other")).toBeInTheDocument();
     await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(otherPage.id));
+  });
+
+  it.each([false, true])("identifies task details independently of ordinary child documents: %s", async (hidden) => {
+    const taskList: Page = { ...page, id: "task-list", title: "Project tasks", kind: "table", taskList: true };
+    const child: Page = { ...page, parentId: taskList.id };
+    mockShellApi({ pages: hidden ? [taskList] : [taskList, child] });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${child.id}`) return { page: child, sidebarHidden: hidden };
+      return shellApi(path, init);
+    });
+    render(<App />);
+
+    await waitFor(() => {
+      const props = mocks.editorRender.mock.calls.at(-1)?.[0] as EditorPageProps | undefined;
+      expect(props?.page.id).toBe(child.id);
+      expect(props?.taskList).toEqual(hidden ? taskList : undefined);
+    });
   });
 
   it("loads a hidden navigation target directly without adding it to the sidebar", async () => {
@@ -4390,12 +4446,12 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
 
-    expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     expect(
       [...document.querySelectorAll(".page-link")].some((link) => link.textContent?.includes("Hidden detail")),
     ).toBe(false);
@@ -4403,13 +4459,13 @@ describe("App error handling", () => {
 
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(2));
-    expect(screen.getByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(screen.getByText("Hidden detail", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     expect(pageLoads).toBe(1);
 
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: page.id }));
     });
-    expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(3));
     await act(async () => {
@@ -4419,7 +4475,7 @@ describe("App error handling", () => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
 
-    expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     expect(pageLoads).toBe(2);
   });
 
@@ -4438,23 +4494,23 @@ describe("App error handling", () => {
       return shellApi(path, init);
     });
     render(<App />);
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
-    await screen.findByText("Visible detail", { selector: ".breadcrumbs span" });
-    expect(screen.queryByRole("button", { name: "Archive Visible detail" })).not.toBeInTheDocument();
+    await screen.findByText("Visible detail", { selector: ".breadcrumbs button" });
+    expect(queryArchive("Archive Visible detail")).not.toBeInTheDocument();
 
     visible = true;
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
-    expect(await screen.findByRole("button", { name: "Archive Visible detail" })).toBeInTheDocument();
+    expect(await findArchive("Archive Visible detail")).toBeInTheDocument();
     expect(treeLoads).toBe(2);
 
     visible = false;
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
-    expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     expect(treeLoads).toBe(3);
-    expect(screen.queryByRole("button", { name: "Archive Visible detail" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Visible detail")).not.toBeInTheDocument();
   });
 
   it.each([
@@ -4479,13 +4535,13 @@ describe("App error handling", () => {
       await screen.findByRole("heading", { name: "Workspace unavailable" });
       fireEvent.click(screen.getByRole("button", { name: "Refresh the page tree" }));
     }
-    expect(await screen.findByText("Initial hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByText("Initial hidden detail", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     expect(api).toHaveBeenCalledWith(
       `/api/pages/${hiddenPage.id}`,
       expect.objectContaining({ signal: expect.anything() }),
     );
     await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id));
-    expect(screen.queryByRole("button", { name: "Archive Initial hidden detail" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Initial hidden detail")).not.toBeInTheDocument();
   });
 
   it.each([403, 404, 410])("discards a remembered page returning %s and permits creation", async (status) => {
@@ -4497,7 +4553,7 @@ describe("App error handling", () => {
       return shellApi(path, init);
     });
     render(<App />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "Create a root page" })).toBeEnabled());
+    await waitFor(() => expect(getRootCreation()).toBeEnabled());
     await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBeNull());
     expect(screen.queryByRole("heading", { name: "Page unavailable" })).not.toBeInTheDocument();
   });
@@ -4508,7 +4564,7 @@ describe("App error handling", () => {
       localStorage.setItem(key, "foreign-page");
       mockShellApi();
       render(<App />);
-      await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
+      await screen.findByText("Roadmap", { selector: ".breadcrumbs button" });
       expect(api).not.toHaveBeenCalledWith("/api/pages/foreign-page", expect.anything());
       await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
     },
@@ -4528,17 +4584,17 @@ describe("App error handling", () => {
       return shellApi(path, init);
     });
     render(<App />);
-    await screen.findByText(linked.title, { selector: ".breadcrumbs span" });
+    await screen.findByText(linked.title, { selector: ".breadcrumbs button" });
     await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
     expect(new URLSearchParams(location.search).get("page")).toBe(linked.id);
-    expect(screen.queryByRole("button", { name: `Archive ${linked.title}` })).not.toBeInTheDocument();
+    expect(queryArchive(`Archive ${linked.title}`)).not.toBeInTheDocument();
     for (let refresh = 0; refresh < 2; refresh += 1) {
       await act(async () => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
-      expect(screen.getByText(linked.title, { selector: ".breadcrumbs span" })).toBeInTheDocument();
+      expect(screen.getByText(linked.title, { selector: ".breadcrumbs button" })).toBeInTheDocument();
       expect(new URLSearchParams(location.search).get("page")).toBe(linked.id);
     }
     await act(async () => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [linked.id], permanently: true }));
-    expect(screen.queryByText(linked.title, { selector: ".breadcrumbs span" })).not.toBeInTheDocument();
+    expect(screen.queryByText(linked.title, { selector: ".breadcrumbs button" })).not.toBeInTheDocument();
     expect(new URLSearchParams(location.search).get("page")).toBe(page.id);
   });
 
@@ -4560,7 +4616,7 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Search/ }));
     fireEvent.change(screen.getByRole("textbox", { name: "Search workspace" }), { target: { value: "Archived" } });
     fireEvent.click(await screen.findByRole("button", { name: /Archived result/ }));
-    await screen.findByText(archived.title, { selector: ".breadcrumbs span" });
+    await screen.findByText(archived.title, { selector: ".breadcrumbs button" });
     expect(new URLSearchParams(location.search).get("page")).toBe(archived.id);
   });
 
@@ -4585,7 +4641,7 @@ describe("App error handling", () => {
         return shellApi(path, init);
       });
       render(<App />);
-      await screen.findByText(page.title, { selector: ".breadcrumbs span" });
+      await screen.findByText(page.title, { selector: ".breadcrumbs button" });
       act(() => {
         dispatchWorkspaceEvent({ type: "workspace-invalidated" });
       });
@@ -4599,7 +4655,7 @@ describe("App error handling", () => {
         await direct.promise;
         tree.resolve({ pages: [page] });
       });
-      expect(await screen.findByText(target.title, { selector: ".breadcrumbs span" })).toBeInTheDocument();
+      expect(await screen.findByText(target.title, { selector: ".breadcrumbs button" })).toBeInTheDocument();
       expect(new URLSearchParams(location.search).get("page")).toBe(target.id);
     },
   );
@@ -4638,7 +4694,7 @@ describe("App error handling", () => {
       });
       const result =
         outcome === "archived" || outcome === "template"
-          ? await screen.findByText(target.title, { selector: ".breadcrumbs span" })
+          ? await screen.findByText(target.title, { selector: ".breadcrumbs button" })
           : (
               await screen.findAllByText(outcome === "network" ? "The page could not be loaded." : "Navigation failed")
             )[0];
@@ -4679,19 +4735,22 @@ describe("App error handling", () => {
     await waitFor(() => expect(pageLoads).toBe(2));
     await screen.findByRole("heading", { name: "Page unavailable" });
     fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
-    await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
+    await screen.findByText("Roadmap", { selector: ".breadcrumbs button" });
     expect(new URLSearchParams(location.search).get("page")).toBe(page.id);
   });
 
-  it("treats an empty page query as normal startup and permits creation and restored-root selection", async () => {
+  it("treats an empty page query as Home startup and permits creation and selecting a restored root", async () => {
+    localStorage.removeItem("notes:last-page:workspace:user");
     history.replaceState(null, "", "/?page=");
     mockShellApi({ pages: [] });
     render(<App />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "Create a root page" })).toBeEnabled());
+    await waitFor(() => expect(getRootCreation()).toBeEnabled());
     act(() =>
       dispatchWorkspaceEvent({ type: "pages-upserted", pages: [page], restored: true, restoredRootId: page.id }),
     );
-    expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Home" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("treeitem", { name: "Roadmap" }));
+    expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs button" })).toBeInTheDocument();
   });
 
   it.each([
@@ -4707,9 +4766,9 @@ describe("App error handling", () => {
       return shellApi(path, init);
     });
     render(<App />);
-    expect(await screen.findByText("Roadmap", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Home" })).toBeInTheDocument();
     expect(mocks.editorRender.mock.calls.some(([props]) => props.page.id === unavailable.id)).toBe(false);
-    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(page.id));
+    await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBeNull());
   });
 
   it("preserves hidden visibility through an older tree, then accepts newer visible state", async () => {
@@ -4729,20 +4788,20 @@ describe("App error handling", () => {
       return shellApi(path, init);
     });
     render(<App />);
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(2));
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
-    await screen.findByText("Newly hidden", { selector: ".breadcrumbs span" });
+    await screen.findByText("Newly hidden", { selector: ".breadcrumbs button" });
     await act(async () => staleTree.resolve({ pages: [page, hiddenPage] }));
-    expect(screen.queryByRole("button", { name: "Archive Newly hidden" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Newly hidden")).not.toBeInTheDocument();
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(3));
     await act(async () => freshTree.resolve({ pages: [page, hiddenPage] }));
-    expect(await screen.findByRole("button", { name: "Archive Newly hidden" })).toBeInTheDocument();
-    expect(screen.getByText("Newly hidden", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await findArchive("Archive Newly hidden")).toBeInTheDocument();
+    expect(screen.getByText("Newly hidden", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(hiddenPage.id));
   });
 
@@ -4761,7 +4820,7 @@ describe("App error handling", () => {
         return shellApi(path, init);
       });
       render(<App />);
-      await screen.findByRole("button", { name: "Archive Roadmap" });
+      await findArchive("Archive Roadmap");
       act(() => {
         window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
       });
@@ -4778,8 +4837,8 @@ describe("App error handling", () => {
         await act(async () => direct.resolve({ page: hiddenPage, sidebarHidden: true }));
         if (!treeFirst) await act(async () => tree.resolve({ pages: [page, hiddenPage] }));
       }
-      expect(await screen.findByRole("button", { name: "Archive Overlapping page" })).toBeInTheDocument();
-      expect(screen.getByText(hiddenPage.title, { selector: ".breadcrumbs span" })).toBeInTheDocument();
+      expect(await findArchive("Archive Overlapping page")).toBeInTheDocument();
+      expect(screen.getByText(hiddenPage.title, { selector: ".breadcrumbs button" })).toBeInTheDocument();
     },
   );
 
@@ -4809,15 +4868,15 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
-    await screen.findByText("Visibility detail", { selector: ".breadcrumbs span" });
+    await screen.findByText("Visibility detail", { selector: ".breadcrumbs button" });
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: page.id }));
     });
-    await screen.findByText("Roadmap", { selector: ".breadcrumbs span" });
+    await screen.findByText("Roadmap", { selector: ".breadcrumbs button" });
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(2));
     await act(async () => new Promise((resolve) => window.setTimeout(resolve)));
@@ -4828,31 +4887,26 @@ describe("App error handling", () => {
     act(() => dispatchWorkspaceEvent({ type: "workspace-invalidated" }));
     await waitFor(() => expect(treeLoads).toBe(3));
 
-    expect(screen.getByText(selectedTitle, { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(screen.getByText(selectedTitle, { selector: ".breadcrumbs button" })).toBeInTheDocument();
   });
 
   it("reports a failed direct page load and retries the same endpoint", async () => {
     const hiddenPage = { ...page, id: "hidden-page", position: "c0", title: "Hidden detail" };
     let pageLoads = 0;
-    vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/security/status")
-        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
-      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") return { pages: [page] };
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === `/api/pages/${hiddenPage.id}`) {
         pageLoads += 1;
         if (pageLoads === 1) throw new ApiClientError(503, "page_unavailable", "Page lookup failed.");
         return { page: hiddenPage, sidebarHidden: true };
       }
-      throw new Error(`Unexpected API request: ${path}`);
+      return shellApi(path, init);
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
-    act(() => {
+    await findArchive("Archive Roadmap");
+    await act(async () => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
 
@@ -4860,7 +4914,7 @@ describe("App error handling", () => {
     expect(screen.getAllByText("Page lookup failed.").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: "Try loading page again" }));
 
-    expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByText("Hidden detail", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     expect(pageLoads).toBe(2);
   });
 
@@ -4881,7 +4935,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
     });
@@ -4889,7 +4943,7 @@ describe("App error handling", () => {
 
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [missingPage] }));
 
-    expect(await screen.findByText("Event page", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByText("Event page", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     expect(screen.queryAllByText("Page lookup failed.")).toHaveLength(0);
   });
 
@@ -4913,7 +4967,7 @@ describe("App error handling", () => {
       throw new Error(`Unexpected API request: ${path}`);
     });
     render(<App />);
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     vi.useFakeTimers();
     const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
       const controller = new AbortController();
@@ -4993,7 +5047,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
     });
@@ -5001,7 +5055,7 @@ describe("App error handling", () => {
     fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
 
     expect(pageSignal?.aborted).toBe(true);
-    expect(screen.getByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(getArchive("Archive Roadmap")).toBeInTheDocument();
   });
 
   it("ignores a stale direct page response after navigation changes target", async () => {
@@ -5022,18 +5076,18 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: firstPage.id }));
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: secondPage.id }));
     });
-    expect(await screen.findByText("Second", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(await screen.findByText("Second", { selector: ".breadcrumbs button" })).toBeInTheDocument();
 
     await act(async () => {
       firstLoad.resolve({ page: firstPage, sidebarHidden: true });
       await firstLoad.promise;
     });
-    expect(screen.getByText("Second", { selector: ".breadcrumbs span" })).toBeInTheDocument();
+    expect(screen.getByText("Second", { selector: ".breadcrumbs button" })).toBeInTheDocument();
     await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(secondPage.id));
   });
 
@@ -5059,7 +5113,7 @@ describe("App error handling", () => {
     });
     const app = render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
     await waitFor(() => expect(trashRequestSignal).toBeInstanceOf(AbortSignal));
     const signal = trashRequestSignal;
@@ -5086,13 +5140,13 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
     });
     fireEvent.click(screen.getByRole("button", { name: "Return to current page" }));
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Opening page…" })).not.toBeInTheDocument();
   });
 
@@ -5110,14 +5164,14 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    await screen.findByRole("button", { name: "Archive Roadmap" });
+    await findArchive("Archive Roadmap");
     act(() => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: missingPage.id }));
     });
     fireEvent.click(screen.getByRole("button", { name: /Search/ }));
 
     expect(screen.getByRole("heading", { name: "Find anything" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "+ Page" })).toBeEnabled();
+    expect(getRootCreation()).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Return to current page" })).not.toBeInTheDocument();
   });
 
@@ -5153,7 +5207,7 @@ describe("App error handling", () => {
     });
 
     await waitFor(() => expect(localStorage.getItem("notes:last-page:workspace:user")).toBe(newerRoot.id));
-    expect(screen.getByRole("button", { name: "Archive Newer root" })).toBeInTheDocument();
+    expect(getArchive("Archive Newer root")).toBeInTheDocument();
   });
 
   it("does not let a confirmed restore response overwrite a newer removal", async () => {
@@ -5192,7 +5246,7 @@ describe("App error handling", () => {
 
     await waitFor(() => expect(treeLoads).toBe(2));
     expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
   });
 
   it("does not merge a raw restore snapshot after a removal arrives during the load", async () => {
@@ -5225,7 +5279,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     expect(await screen.findByText("Tree unavailable.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
@@ -5239,7 +5293,7 @@ describe("App error handling", () => {
 
     expect(treeLoads).toBe(3);
     expect(mocks.waitForReconciliationRetry).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "Archive Roadmap" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
   });
 
   it("keeps known restore tombstones pinned until an uncertain result is confirmed", async () => {
@@ -5274,21 +5328,21 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     expect(await screen.findByText("Tree unavailable.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
     await waitFor(() => expect(treeLoads).toBe(3));
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [{ ...page, title: "Late rename" }] }));
 
-    expect(screen.queryByRole("button", { name: "Archive Late rename" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Late rename")).not.toBeInTheDocument();
     await act(async () => {
       restoreReconciliation.resolve({ pages: [] });
       await restoreReconciliation.promise;
     });
     act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [{ ...page, title: "Confirmed rename" }] }));
 
-    expect(await screen.findByRole("button", { name: "Archive Confirmed rename" })).toBeInTheDocument();
+    expect(await findArchive("Archive Confirmed rename")).toBeInTheDocument();
   });
 
   it("does not reconcile the page tree after a definitive restore rejection", async () => {
@@ -5424,7 +5478,7 @@ describe("App error handling", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
     expect(screen.queryByText("The page could not be restored.")).not.toBeInTheDocument();
     expect(
@@ -5465,13 +5519,13 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     expect(await screen.findByText("Tree unavailable.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
 
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Archive Child" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
+    expect(getArchive("Archive Child")).toBeInTheDocument();
     expect(treeLoads).toBe(3);
   });
 
@@ -5505,14 +5559,14 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
     expect(await screen.findByText("Tree unavailable.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
 
     await waitFor(() => expect(treeLoads).toBe(4));
     expect(treeLoads).toBe(4);
-    expect(screen.getByRole("button", { name: "Archive Child" })).toBeInTheDocument();
+    expect(getArchive("Archive Child")).toBeInTheDocument();
   });
 
   it("starts a fresh page load after a legacy restore response and an older load", async () => {
@@ -5557,7 +5611,7 @@ describe("App error handling", () => {
     });
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(await screen.findByRole("button", { name: "Archive Roadmap" })).toBeInTheDocument();
+    expect(await findArchive("Archive Roadmap")).toBeInTheDocument();
     expect(trashLoads).toBe(2);
     expect(
       screen.queryByText("The server returned an invalid restore response. Refreshing pages."),
@@ -6049,13 +6103,13 @@ describe("App error handling", () => {
       newerCount.resolve({ unreadCount: 2 });
       await newerCount.promise;
     });
-    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.getByLabelText("Unread updates")).toBeInTheDocument();
 
     await act(async () => {
       olderCount.resolve({ unreadCount: 9 });
       await olderCount.promise;
     });
-    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.getByLabelText("Unread updates")).toBeInTheDocument();
     expect(screen.queryByText("9")).not.toBeInTheDocument();
   });
 
@@ -6087,7 +6141,7 @@ describe("App error handling", () => {
     render(<App />);
 
     expect(await screen.findByText("Mention count unavailable.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(getArchive("Archive Roadmap"));
 
     await waitFor(() => expect(treeLoads).toBe(2));
     expect(screen.getByText("Mention count unavailable.")).toBeInTheDocument();
@@ -6104,7 +6158,7 @@ describe("App error handling", () => {
     mockWorkspaceApi(new ApiClientError(503, "tree_unavailable", "Tree refresh unavailable."), archiveFailure);
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(
       await screen.findByText(
@@ -6163,7 +6217,7 @@ describe("App error handling", () => {
     });
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Roadmap" }));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(
       await screen.findByText(
@@ -6308,8 +6362,9 @@ describe("App error handling", () => {
     fireEvent.click(screen.getByRole("button", { name: "Favorite" }));
     const favoritesSection = await screen.findByLabelText("Favorites");
     expect(await within(favoritesSection).findByText("Roadmap")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Pin" }));
-    const pinnedSection = await screen.findByLabelText("Pinned");
+    fireEvent.click(screen.getByRole("button", { name: "Page actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pin in this space" }));
+    const pinnedSection = await screen.findByLabelText("Pinned in this space");
     expect(await within(pinnedSection).findByText("Roadmap")).toBeInTheDocument();
     const scrollRegion = document.querySelector(".sidebar-scroll-region");
     if (!(scrollRegion instanceof HTMLElement)) throw new Error("The sidebar scroll region was not rendered.");
@@ -6334,12 +6389,10 @@ describe("App error handling", () => {
     expect((await screen.findAllByText("Secrets")).length).toBeGreaterThan(0);
     // Without selecting the page the toolbar is absent because nothing is selected, so
     // the restriction assertions below would pass even with the viewer checks removed.
-    const secretsNode = screen
-      .getAllByRole("button", { name: /Secrets/ })
-      .find((button) => button.classList.contains("page-link"))!;
+    const secretsNode = screen.getByRole("treeitem", { name: "Secrets" });
     fireEvent.click(secretsNode);
     expect(await screen.findByRole("button", { name: "Favorite" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Pin" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Archive Secrets" })).not.toBeInTheDocument();
+    expect(queryArchive("Archive Secrets")).not.toBeInTheDocument();
   });
 });

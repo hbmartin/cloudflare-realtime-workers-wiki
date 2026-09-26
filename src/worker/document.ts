@@ -815,7 +815,7 @@ export class Document extends YServer {
       if (this.metadata.content_kind !== "document") {
         return Response.json({ error: "Block mutations are only available for document pages." }, { status: 422 });
       }
-      let body: { actorId?: unknown; operations?: unknown; suppressExternalEffects?: unknown };
+      let body: { actorId?: unknown; operations?: unknown; suppressExternalEffects?: unknown; operationId?: unknown };
       try {
         body = await request.json();
       } catch {
@@ -833,11 +833,29 @@ export class Document extends YServer {
         return Response.json({ error: "This document version has been retired." }, { status: 410 });
       }
       if (this.metadata.read_only) return Response.json({ error: "This document is read-only." }, { status: 409 });
+      const operationId =
+        typeof body.operationId === "string" && /^[A-Za-z0-9:_-]{1,200}$/.test(body.operationId)
+          ? body.operationId
+          : null;
+      const requestHash = operationId
+        ? await sha256Hex(canonicalJson({ actorId: body.actorId, operations: body.operations }))
+        : null;
+      const receipts = operationId ? this.document.getMap<string>("api-operation-receipts") : null;
+      if (operationId && receipts?.has(operationId)) {
+        if (receipts.get(operationId) !== requestHash)
+          return Response.json({ error: "idempotency_key_reused" }, { status: 409 });
+        if (this.metadata.dirty) await this.compact(true, body.suppressExternalEffects === true);
+        return Response.json({
+          document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")),
+          sequence: this.metadata.snapshot_seq,
+        });
+      }
       const clone = new Y.Doc();
       Y.applyUpdate(clone, Y.encodeStateAsUpdate(this.document));
       try {
         clone.transact(() => {
           for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(clone, operation);
+          if (operationId && requestHash) clone.getMap<string>("api-operation-receipts").set(operationId, requestHash);
         }, "api-validation");
       } catch (error) {
         const code = error instanceof Error ? error.message : "invalid_mutation";
@@ -860,6 +878,7 @@ export class Document extends YServer {
       this.pendingNotifyEdit = false;
       this.document.transact(() => {
         for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(this.document, operation);
+        if (operationId && requestHash) receipts!.set(operationId, requestHash);
       }, "api-mutation");
       this.flushPendingUpdates();
       if (this.metadata.dirty) await this.compact(true, body.suppressExternalEffects === true);

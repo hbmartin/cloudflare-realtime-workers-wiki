@@ -18,7 +18,7 @@ function settledRequestFailure(
 }
 
 async function openSidebar(page: Page) {
-  // Below the 760px breakpoint the sidebar is an off-canvas drawer. Decide from
+  // Below the 1000px breakpoint the sidebar is an off-canvas drawer. Decide from
   // the toggle and the scrim rather than the drawer's own visibility: the toggle only
   // renders below the breakpoint and the scrim only exists while the drawer is
   // open, so both track React state exactly, while the drawer stays visible for
@@ -37,14 +37,20 @@ async function openSidebar(page: Page) {
 }
 
 // A row's "Add child to <title>" and "Archive <title>" labels also carry the
-// title, and below the 760px breakpoint they are laid out rather than hidden,
+// title, and below the 1000px breakpoint they are laid out rather than hidden,
 // so matching on the title alone is ambiguous there. Match the link itself.
 function treeLink(page: Page, title: string) {
-  return page.locator("button.page-link").filter({ hasText: title });
+  return page.getByRole("treeitem", { name: title, exact: true });
+}
+
+async function createPage(page: Page, kind: "Document" | "Table" | "Diagram" | "Task List") {
+  await openSidebar(page);
+  await page.getByRole("button", { name: /^New page in / }).click();
+  await page.getByRole("button", { name: kind, exact: true }).click();
 }
 
 async function createDocument(page: Page, title: string) {
-  await page.getByRole("button", { name: "+ Page", exact: true }).click();
+  await createPage(page, "Document");
   const titleInput = page.getByLabel("Page title");
   await expect(titleInput).toHaveValue("Untitled");
   await titleInput.fill(title);
@@ -69,6 +75,9 @@ async function acceptInvite(context: BrowserContext, inviteURL: string, role: "e
   await page.getByLabel("Password").fill("password123");
   await page.getByRole("button", { name: "Accept invite" }).click();
   await completeEnrollment(page);
+  await expect(page.getByRole("button", { name: "Home", exact: true })).toBeAttached();
+  await openSidebar(page);
+  await page.getByRole("treeitem").first().click();
   await expect(page.getByLabel("Page title")).toBeVisible();
   return page;
 }
@@ -89,7 +98,7 @@ test("bootstraps or signs in and passes critical accessibility checks", async ({
 
 test("creates and edits a realtime diagram", async ({ page }) => {
   await signIn(page);
-  await page.getByRole("button", { name: "+ Diagram", exact: true }).click();
+  await createPage(page, "Diagram");
   const title = `Architecture ${Date.now()}`;
   const titleInput = page.getByLabel("Page title");
   await expect(titleInput).toHaveValue("Untitled");
@@ -110,9 +119,9 @@ test("creates and edits a realtime diagram", async ({ page }) => {
 
 test("opens the Activities tray with keyboard-safe focus and an accessible recent state", async ({ page }) => {
   await signIn(page);
-  const trigger = page.getByRole("button", { name: "Activities" });
+  const trigger = page.getByRole("button", { name: "Imports & exports" });
   await trigger.click();
-  const tray = page.getByRole("dialog", { name: "Activities" });
+  const tray = page.getByRole("dialog", { name: "Imports & exports" });
   await expect(tray).toBeVisible();
   await expect(tray.locator(".activity-empty, .activity-list")).toBeVisible();
   await expect(tray.getByRole("button", { name: "Close activities" })).toBeFocused();
@@ -136,15 +145,17 @@ test("organizes pages with spaces, favorites, pins, and tags", async ({ page }, 
   await expect(switcher).toHaveValue(/.+/);
 
   await page.getByRole("button", { name: "Favorite" }).click();
-  await page.getByRole("button", { name: "Pin" }).click();
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
+  await page.getByRole("button", { name: "Pin in this space", exact: true }).click();
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
   await openSidebar(page);
   await expect(page.getByLabel("Favorites").getByText(title)).toBeVisible();
-  await expect(page.getByLabel("Pinned").getByText(title)).toBeVisible();
+  await expect(page.getByLabel("Pinned in this space").getByText(title)).toBeVisible();
   const closeNavigation = page.getByRole("button", { name: "Close navigation" });
   if (await closeNavigation.isVisible()) await closeNavigation.click();
 
-  const tagName = `Getting started ${testInfo.project.name}`;
-  await page.getByRole("button", { name: "+ New tag" }).click();
+  const tagName = `Getting started ${testInfo.project.name} ${Date.now()}`;
+  await page.getByRole("button", { name: "+ Add tag" }).click();
   await page.getByLabel("Tag name").fill(tagName);
   await page.getByLabel("Tag color").selectOption("purple");
   await page.locator(".tag-create-form").getByRole("button", { name: "Create", exact: true }).click();
@@ -189,8 +200,9 @@ test("inserts the custom editor block pack from the slash menu", async ({ page }
 
 test("creates and instantiates a space-scoped template through the background workflow", async ({ page }) => {
   await signIn(page);
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
   await page.getByRole("button", { name: "Save as template" }).click();
-  const tray = page.getByRole("dialog", { name: "Activities" });
+  const tray = page.getByRole("dialog", { name: "Imports & exports" });
   await expect(tray).toBeVisible();
   const creation = tray.locator(".activity-list > li").first();
   await expect(creation).toContainText("Template copy");
@@ -244,10 +256,13 @@ test("renders server comments, watch state, notifications, and Slack configurati
   // server-backed thread and the automatic watcher enrollment in this client.
   await page.reload();
   await expect(page.getByLabel("Page title")).toBeVisible();
-  await page.getByRole("button", { name: "Comments" }).click();
+  await page.getByRole("button", { name: "Page details" }).click();
+  await page.getByRole("button", { name: "Comments", exact: true }).click();
   const comments = page.locator(".comments-panel");
   await expect(comments).toContainText(commentText);
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
   await expect(page.getByRole("button", { name: "Mute this page" })).toBeVisible();
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
   const commentsAccessibility = await new AxeBuilder({ page }).include(".comments-panel").analyze();
   expect(
     commentsAccessibility.violations.filter(
@@ -255,8 +270,10 @@ test("renders server comments, watch state, notifications, and Slack configurati
     ),
   ).toEqual([]);
 
-  await page.getByRole("button", { name: /^Notifications/ }).click();
-  const notifications = page.getByRole("dialog", { name: "Notifications" });
+  await page.getByRole("button", { name: "Close page panel", exact: true }).click();
+  await openSidebar(page);
+  await page.getByRole("button", { name: "Inbox", exact: true }).click();
+  const notifications = page.getByRole("dialog", { name: "Inbox" });
   await expect(notifications).toBeVisible();
   await notifications.getByRole("button", { name: "Notification settings" }).click();
   await expect(notifications.getByText(/Email is unavailable until a sending domain is configured/)).toBeVisible();
@@ -312,12 +329,13 @@ test("searches with URL-persisted scope filters", async ({ page }) => {
 
 test("exports and imports Markdown through resumable jobs", async ({ page }) => {
   await signIn(page);
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
   await page.getByRole("button", { name: "Export", exact: true }).click();
   const exportDialog = page.getByRole("dialog", { name: /Export “Welcome”/ });
   await expect(exportDialog).toBeVisible();
   await exportDialog.getByRole("button", { name: "Start export" }).click();
 
-  const activities = page.getByRole("dialog", { name: "Activities" });
+  const activities = page.getByRole("dialog", { name: "Imports & exports" });
   await expect(activities).toBeVisible();
   const exportJob = activities.locator(".activity-list > li").first();
   await expect(exportJob).toContainText("Export");
@@ -325,7 +343,7 @@ test("exports and imports Markdown through resumable jobs", async ({ page }) => 
   await expect(exportJob.getByRole("link", { name: "Download" })).toBeVisible();
   await page.keyboard.press("Escape");
 
-  await page.getByRole("button", { name: /Import/ }).click();
+  await page.getByRole("button", { name: "Import notes", exact: true }).click();
   const importDialog = page.getByRole("dialog", { name: "Import notes" });
   await importDialog.locator('input[type="file"]').setInputFiles({
     name: "browser-import.md",
@@ -351,7 +369,7 @@ test("refreshes an old import preview and imports only after a second confirmati
   const importTitle = `refresh-preview-${Date.now()}`;
   test.skip(Boolean(process.env.NOTES_E2E_BASE_URL), "Requires the isolated local D1 test database.");
   await signIn(page);
-  await page.getByRole("button", { name: /Import/ }).click();
+  await page.getByRole("button", { name: "Import notes", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Import notes" });
   await dialog.locator('input[type="file"]').setInputFiles({
     name: `${importTitle}.md`,
@@ -364,7 +382,7 @@ test("refreshes an old import preview and imports only after a second confirmati
   await dialog.getByRole("button", { name: "Upload and inspect" }).click();
   const { job } = await (await uploaded).json();
   expect(job.id).toMatch(/^[a-f0-9-]+$/);
-  const activities = page.getByRole("dialog", { name: "Activities" });
+  const activities = page.getByRole("dialog", { name: "Imports & exports" });
   const item = activities.locator(".activity-list > li").first();
   await expect(item.getByRole("button", { name: "Confirm import" })).toBeVisible({ timeout: 30_000 });
   const original = (await (await page.request.get(`/api/jobs/${job.id}`)).json()).job.result.preview.previewId;
@@ -404,7 +422,7 @@ test("refreshes an old import preview and imports only after a second confirmati
 test("creates, renames, archives, and restores a page through the UI @mobile-sidebar", async ({ page }, testInfo) => {
   await signIn(page);
   const title = `Lifecycle ${testInfo.project.name} ${Date.now()}`;
-  await page.getByRole("button", { name: "+ Page", exact: true }).click();
+  await createPage(page, "Document");
   const titleInput = page.getByLabel("Page title");
   await expect(titleInput).toHaveValue("Untitled");
   await titleInput.fill(title);
@@ -419,6 +437,7 @@ test("creates, renames, archives, and restores a page through the UI @mobile-sid
 
   await pageLink.locator("..").hover();
   page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: `Actions for ${title}`, exact: true }).click();
   await page.getByRole("button", { name: `Archive ${title}` }).click();
   await expect(pageLink).toHaveCount(0, { timeout: 10_000 });
   await openSidebar(page);
@@ -441,7 +460,7 @@ test("propagates page metadata to an invited editor in realtime", async ({ brows
   const editorContext = await browser.newContext();
   try {
     const editorPage = await acceptInvite(editorContext, inviteURL, "editor", suffix);
-    await page.getByRole("button", { name: "+ Page", exact: true }).click();
+    await createPage(page, "Document");
     const title = `Realtime ${suffix}`;
     await expect(page.getByLabel("Page title")).toHaveValue("Untitled");
     await page.getByLabel("Page title").fill(title);
@@ -467,7 +486,7 @@ test("enforces viewer UI permissions and table edit leases", async ({ browser, p
     await viewerContext.close();
   }
 
-  // "+ Table" is hidden below the 760px breakpoint, so the lease half of this
+  // "+ Table" is hidden below the 1000px breakpoint, so the lease half of this
   // scenario has no mobile entry point. The viewer assertions above still run
   // everywhere; skipping here keeps viewerContext.close() above it.
   test.skip(testInfo.project.name === "mobile-chromium", "+ Table is hidden at mobile widths");
@@ -476,8 +495,8 @@ test("enforces viewer UI permissions and table edit leases", async ({ browser, p
   const editorContext = await browser.newContext();
   try {
     const editorPage = await acceptInvite(editorContext, editorURL, "editor", `${suffix}-lease`);
-    await page.getByRole("button", { name: "+ Table", exact: true }).click();
-    await expect(page.getByText("Editing lease active")).toBeVisible();
+    await createPage(page, "Table");
+    await expect(page.getByRole("button", { name: "+ New row", exact: true })).toBeEnabled();
     const tableTitle = `Lease ${suffix}`;
     await expect(page.locator("input.page-title")).toHaveValue("Untitled");
     await page.locator("input.page-title").fill(tableTitle);
@@ -538,7 +557,7 @@ test("scrolls overflowing sidebar page collections while keeping its chrome fixe
     expect(initialChrome[1]).not.toBeNull();
 
     const favorites = page.getByLabel("Favorites");
-    const pins = page.getByLabel("Pinned");
+    const pins = page.getByLabel("Pinned in this space");
     const tree = sidebar.locator(".tree-root");
     const trash = sidebar.getByRole("button", { name: /Trash/ });
     const currentSpace = page.getByLabel("Current space");

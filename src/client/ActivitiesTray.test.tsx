@@ -57,7 +57,7 @@ describe("ActivitiesTray", () => {
       />,
     );
 
-    expect(screen.getByRole("dialog", { name: "Activities" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Imports & exports" })).toBeInTheDocument();
     expect(screen.getByRole("progressbar", { name: "Search reindex progress" })).toHaveValue(50);
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(cancel).toHaveBeenCalledWith(runningJob);

@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+import { ActionMenu, PageTools } from "./WorkspaceUI";
 import {
   Background,
   Controls,
@@ -50,6 +52,7 @@ import { uploadAttachment } from "./uploads";
 
 export type DiagramPageProps = {
   page: Page;
+  metadata?: ReactNode;
   member: ClientMemberContext;
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
@@ -1054,6 +1057,7 @@ function DiagramCanvas({
 
 export function DiagramPage({
   page,
+  metadata,
   member,
   onPageChanged,
   onPageUnavailable,
@@ -1135,21 +1139,23 @@ export function DiagramPage({
 
   return (
     <main className="page-canvas diagram-page">
-      <div className="page-tools">
-        <span className={`sync-state sync-${connected ? "connected" : status}`}>
-          <i />
-          {connected ? "connected" : status === "connected" ? "syncing" : status}
-        </span>
-        {(["comments", "history", "backlinks"] as const).map((value) => (
-          <button
-            key={value}
-            className="quiet-button"
-            onClick={() => setPanel((current) => (current === value ? null : value))}
-          >
-            {value[0]!.toUpperCase() + value.slice(1)}
-          </button>
-        ))}
-      </div>
+      <PageTools>
+        <ActionMenu label="Page details" icon="comment">
+          <span className={`sync-state sync-${connected ? "connected" : status}`}>
+            <i />
+            {connected ? "connected" : status === "connected" ? "syncing" : status}
+          </span>
+          {(["comments", "history", "backlinks"] as const).map((value) => (
+            <button
+              key={value}
+              className="quiet-button"
+              onClick={() => setPanel((current) => (current === value ? null : value))}
+            >
+              {value[0]!.toUpperCase() + value.slice(1)}
+            </button>
+          ))}
+        </ActionMenu>
+      </PageTools>
       {!connected ? (
         <div className="notice">This diagram is read-only until the server reconnects and finishes syncing.</div>
       ) : null}
@@ -1174,6 +1180,7 @@ export function DiagramPage({
               if (event.key === "Enter") event.currentTarget.blur();
             }}
           />
+          {metadata}
           {error ? <p className="form-error">{error}</p> : null}
           {bundle && ready ? (
             <ReactFlowProvider>

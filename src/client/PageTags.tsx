@@ -74,7 +74,7 @@ export function PageTags({
             </select>
           )}
           <button className="tag-create-trigger" disabled={busy} onClick={() => setCreating(true)}>
-            + New tag
+            + Add tag
           </button>
         </div>
       )}

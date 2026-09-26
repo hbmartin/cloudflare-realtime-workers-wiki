@@ -36,7 +36,12 @@ export async function signInOwner(page: Page) {
     await completeEnrollment(page, true);
   } else {
     const heading = page.getByRole("heading", { name: "Sign in", exact: true });
-    await expect(heading.or(page.getByLabel("Page title")).first()).toBeVisible({
+    await expect(
+      heading
+        .or(page.getByLabel("Page title"))
+        .or(page.getByRole("heading", { name: "Home", exact: true }))
+        .first(),
+    ).toBeVisible({
       timeout: WORKSPACE_READY_TIMEOUT_MS,
     });
     if (await heading.isVisible()) {
@@ -44,6 +49,14 @@ export async function signInOwner(page: Page) {
       await page.getByLabel("Password", { exact: true }).fill("password123");
       await page.getByRole("button", { name: "Continue", exact: true }).click();
     }
+  }
+  await expect(page.getByRole("button", { name: "Home", exact: true, includeHidden: true })).toBeAttached({
+    timeout: WORKSPACE_READY_TIMEOUT_MS,
+  });
+  if (await page.getByRole("heading", { name: "Home", exact: true }).isVisible()) {
+    const navigation = page.getByRole("button", { name: "Open navigation" });
+    if (await navigation.isVisible()) await navigation.click();
+    await page.getByRole("treeitem").first().click();
   }
   await expect(page.getByLabel("Page title")).toBeVisible({ timeout: WORKSPACE_READY_TIMEOUT_MS });
   writeFileSync(ownerCookies, JSON.stringify(await page.context().cookies()), { mode: 0o600 });

@@ -53,7 +53,7 @@ describe("PageTags", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "+ New tag" }));
+    fireEvent.click(screen.getByRole("button", { name: "+ Add tag" }));
     fireEvent.change(screen.getByLabelText("Tag name"), { target: { value: "Design" } });
     fireEvent.change(screen.getByLabelText("Tag color"), { target: { value: "purple" } });
     fireEvent.click(screen.getByRole("button", { name: "Create" }));

@@ -1,3 +1,5 @@
+import { acceptSlackProductInteraction, openSlackProduct } from "./slack-product";
+import { taskListStatements, listTasks, mutateTask, taskAssignees } from "./tasks";
 import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror, verifySlackMirrorRecovery } from "./slack-threads";
 import { acceptSlackWorkspaceInteraction, openSlackSearch, purgeExpiredSlackSearchSessions } from "./slack-workspace";
 import { pageForMember, effectiveSpaceRole, type PageRow } from "./page-access";
@@ -184,7 +186,6 @@ import {
   finishSlackOAuth,
   handleSlackCommand,
   handleSlackEvent,
-  handleSlackInteraction,
   listSlackChannelSubscriptions,
   listSlackDeliveryFailureGroups,
   acknowledgeSlackDeliveryFailures,
@@ -269,6 +270,8 @@ const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
   position: "position",
   title: "title",
   icon: "icon",
+  fullWidth: "full_width",
+  taskList: "is_task_list",
   revision: "revision",
   contentEpoch: "content_epoch",
   isTemplate: "is_template",
@@ -344,6 +347,8 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
     revision: page.revision,
     contentEpoch: page.contentEpoch,
     isTemplate: page.isTemplate === true || page.isTemplate === 1,
+    fullWidth: page.fullWidth === true || page.fullWidth === 1,
+    taskList: page.taskList === true || page.taskList === 1,
     archivedAt: page.archivedAt,
     createdAt: page.createdAt,
     updatedAt: page.updatedAt,
@@ -519,7 +524,7 @@ async function readPageCreateReplay(
   const existing = await database
     .prepare(
       `SELECT p.id, p.workspace_id, p.space_id, p.parent_id, p.kind, p.position, p.title, p.icon,
-              p.revision, p.content_epoch, p.is_template, p.archived_at, p.created_at, p.updated_at,
+              p.revision, p.content_epoch, p.is_template, p.archived_at, p.created_at, p.updated_at, p.full_width, p.is_task_list,
               r.request_hash receipt_request_hash
          FROM pages p
          LEFT JOIN page_create_receipts r ON r.page_id = p.id AND r.workspace_id = ?
@@ -1041,6 +1046,8 @@ function buildTableRowQuery(
   columns: { id: string; type: string }[],
   query: Record<string, string | undefined>,
 ): TableRowQuery {
+  const filter = (query.q ?? "").trim().slice(0, 200);
+  const filterSql = `AND NOT EXISTS(SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id JOIN pages list ON list.id=r.page_id WHERE link.row_id=r.id AND list.is_task_list=1 AND detail.archived_at IS NOT NULL) AND (? = '' OR EXISTS(SELECT 1 FROM table_cells fc LEFT JOIN table_select_options fo ON fo.id=fc.select_value WHERE fc.row_id=r.id AND instr(lower(coalesce(fc.text_value,CAST(fc.number_value AS TEXT),CASE WHEN fc.boolean_value IS NOT NULL THEN CASE WHEN fc.boolean_value=1 THEN 'true' ELSE 'false' END END,fc.date_value,fo.label,'')),lower(?))>0))`;
   const limit = query.limit === undefined ? TABLE_PAGE_DEFAULT : Number(query.limit);
   if (!Number.isInteger(limit) || limit < 1 || limit > TABLE_PAGE_MAX) {
     throw new HttpError(422, "invalid_table_cursor", `limit must be an integer between 1 and ${TABLE_PAGE_MAX}.`);
@@ -1087,10 +1094,10 @@ function buildTableRowQuery(
   if (!sortColumn) {
     return {
       sql: `SELECT r.id, r.position, 0 sort_null, NULL sort_value FROM table_rows r
-             WHERE r.page_id = ?
+             WHERE r.page_id = ? ${filterSql}
                AND (? IS NULL OR r.position > ? OR (r.position = ? AND r.id > ?))
              ORDER BY r.position, r.id LIMIT ? OFFSET ?`,
-      binds: [pageId, afterPosition, afterPosition, afterPosition, afterId ?? null],
+      binds: [pageId, filter, filter, afterPosition, afterPosition, afterPosition, afterId ?? null],
       orderSql: "page_rows.position, page_rows.id",
       limit,
       offset: 0,
@@ -1107,11 +1114,11 @@ function buildTableRowQuery(
     sql: `SELECT r.id, r.position, CASE WHEN ${value} IS NULL THEN 1 ELSE 0 END sort_null,
                  ${value} sort_value FROM table_rows r
            LEFT JOIN table_cells sort_cell ON sort_cell.row_id = r.id AND sort_cell.column_id = ?
-           WHERE r.page_id = ?
+           WHERE r.page_id = ? ${filterSql}
            ORDER BY (CASE WHEN ${value} IS NULL THEN 1 ELSE 0 END), ${value} ${dir === "desc" ? "DESC" : "ASC"},
                     r.position, r.id
            LIMIT ? OFFSET ?`,
-    binds: [sortColumn.id, pageId],
+    binds: [sortColumn.id, pageId, filter, filter],
     orderSql: `page_rows.sort_null, page_rows.sort_value ${dir === "desc" ? "DESC" : "ASC"}, page_rows.position, page_rows.id`,
     limit,
     offset,
@@ -2000,6 +2007,18 @@ app.post("/api/templates", async (c) => {
   const source = await pageForMember(c.env, member, text(body.pageId, "pageId", 100));
   requirePageEditor(source);
   if (source.is_template) throw new HttpError(409, "already_template", "This page is already a template.");
+  if (
+    await c.env.DB.prepare(
+      "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT 1 FROM pages WHERE id IN subtree AND is_task_list=1",
+    )
+      .bind(source.id)
+      .first()
+  )
+    throw new HttpError(
+      422,
+      "task_template_unsupported",
+      "Templates can contain documents, tables, and diagrams. Create task lists directly in their project.",
+    );
   if (!source.space_id) throw new HttpError(409, "space_required", "The source page is not assigned to a space.");
   const title = body.title === undefined ? source.title : text(body.title, "title", PAGE_TITLE_MAX);
   const targetPageId = crypto.randomUUID();
@@ -2745,9 +2764,17 @@ app.post("/api/slack/commands", async (c) => {
   const verified = await beforeAck(verifySlackRequest(c.env, c.req.raw, rawBody));
   if (verified.duplicate) return c.json({ response_type: "ephemeral", text: "Request already handled." });
   const response = await beforeAck(
-    handleSlackCommand(c.env, new URLSearchParams(rawBody), openSlackSearch, deadlineAt, (work) => {
-      c.executionCtx.waitUntil(work.then(() => sweepOutbox(c.env)));
-    }),
+    handleSlackCommand(
+      c.env,
+      new URLSearchParams(rawBody),
+      async (...args) =>
+        (await openSlackProduct(...(args.slice(0, 6) as Parameters<typeof openSlackProduct>))) ??
+        openSlackSearch(...args),
+      deadlineAt,
+      (work) => {
+        c.executionCtx.waitUntil(work.then(() => sweepOutbox(c.env)));
+      },
+    ),
   );
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   return response.text ? c.json(response) : c.body(null, 200);
@@ -2796,6 +2823,11 @@ app.post("/api/slack/interactions", async (c) => {
   } catch {
     throw new HttpError(422, "invalid_slack_interaction", "Slack interaction payload is invalid.");
   }
+  const product = await beforeAck(() => acceptSlackProductInteraction(c.env, payload, deadlineAt));
+  if (product.handled) {
+    c.executionCtx.waitUntil(sweepOutbox(c.env));
+    return c.json(product.response ?? {});
+  }
   if (await beforeAck(() => acceptSlackThreadAction(c.env, payload))) {
     c.executionCtx.waitUntil(sweepOutbox(c.env));
     return c.json({ ok: true });
@@ -2814,19 +2846,6 @@ app.post("/api/slack/interactions", async (c) => {
     c.executionCtx.waitUntil(sweepOutbox(c.env));
     if (payload.type === "view_submission") return c.body(null, 200);
     return c.json(workspace.response ?? { ok: true });
-  }
-  try {
-    await beforeAck(() => handleSlackInteraction(c.env, payload, deadlineAt, (work) => c.executionCtx.waitUntil(work)));
-  } catch (error) {
-    if (error instanceof HttpError && error.code === "slack_ack_timeout") throw error;
-    logger.error(
-      "slack.interaction.failed",
-      "slack",
-      "Slack interaction failed.",
-      { callbackId: typeof payload.callback_id === "string" ? payload.callback_id : undefined },
-      error,
-    );
-    throw error;
   }
   return c.json({ ok: true });
 });
@@ -2997,6 +3016,7 @@ app.get("/api/pages/tree", async (c) => {
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE p.workspace_id = ? AND p.archived_at IS ${archived ? "NOT " : ""}NULL
        AND p.is_template = 0 AND p.import_job_id IS NULL
+       ${archived ? "" : "AND NOT EXISTS (SELECT 1 FROM table_row_pages row_page WHERE row_page.page_id=p.id)"}
        AND NOT EXISTS (
          SELECT 1 FROM page_import_sources source
           WHERE source.page_id = p.id AND source.source_role = 'table_row_detail'
@@ -3027,8 +3047,17 @@ app.post("/api/pages", async (c) => {
   const id = clientProvidedId ? text(body.id, "id", 100) : crypto.randomUUID();
   if (!ID_PATTERN.test(id)) throw new HttpError(422, "invalid_input", "id is not a valid resource id.");
   const kind = pageKind(body.kind ?? "document");
-  const title = typeof body.title === "string" ? text(body.title, "title", PAGE_TITLE_MAX) : "Untitled";
-  const requestHash = await pageCreateRequestHash({ spaceId, parentId, kind, title });
+  const taskList = body.taskList === true;
+  if (taskList && kind !== "table") throw new HttpError(422, "table_required", "Task lists must be tables.");
+  const title =
+    typeof body.title === "string"
+      ? text(body.title, "title", PAGE_TITLE_MAX)
+      : taskList
+        ? "Untitled tasks"
+        : "Untitled";
+  const requestHash = await pageCreateRequestHash(
+    taskList ? { spaceId, parentId, kind, title, taskList: true } : { spaceId, parentId, kind, title },
+  );
   const requested = [{ id, spaceId, parentId, kind, title }];
   const conflictMessage = "That page id already describes a different page.";
   const initialReplay = clientProvidedId
@@ -3049,8 +3078,8 @@ app.post("/api/pages", async (c) => {
     const results = await c.env.DB.batch<PageRow>([
       c.env.DB.prepare(
         `INSERT INTO pages
-          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at, is_task_list)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       ).bind(
         id,
         member.workspace.id,
@@ -3063,6 +3092,7 @@ app.post("/api/pages", async (c) => {
         member.user.id,
         timestamp,
         timestamp,
+        Number(taskList),
       ),
       c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
         id,
@@ -3081,6 +3111,7 @@ app.post("/api/pages", async (c) => {
          ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
       ).bind(`page:${id}:${member.user.id}`, member.workspace.id, member.user.id, id, member.user.id, timestamp),
       ...(kind === "table" ? [c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(id)] : []),
+      ...(taskList ? taskListStatements(c.env.DB, id) : []),
       c.env.DB.prepare(
         `INSERT INTO page_create_receipts
          (workspace_id, page_id, request_hash) VALUES (?, ?, ?)`,
@@ -3260,11 +3291,7 @@ app.post("/api/pages/batch", async (c) => {
 app.get("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
-  const hidden = await c.env.DB.prepare(
-    `SELECT 1 hidden FROM page_import_sources WHERE page_id = ? AND source_role = 'table_row_detail'`,
-  )
-    .bind(page.id)
-    .first();
+  const hidden = await c.env.DB.prepare(`SELECT 1 hidden FROM table_row_pages WHERE page_id = ?`).bind(page.id).first();
   return c.json({ page: pageJson(page), sidebarHidden: Boolean(hidden) });
 });
 
@@ -3692,6 +3719,11 @@ app.get("/api/pages/:id/diagram-thumbnail.svg", async (c) => {
   );
 });
 
+async function requireStandalonePage(env: Env, pageId: string) {
+  if (await env.DB.prepare("SELECT 1 FROM table_row_pages WHERE page_id=?").bind(pageId).first())
+    throw new HttpError(422, "row_document_move", "Move the containing table to keep task and row details together.");
+}
+
 app.patch("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
@@ -3699,13 +3731,30 @@ app.patch("/api/pages/:id", async (c) => {
   requirePageEditor(page);
   const body = await jsonBody(c.req.raw);
   const revision = Number(body.revision);
+  if (
+    body.title !== undefined &&
+    body.title !== page.title &&
+    (await c.env.DB.prepare(
+      "SELECT 1 FROM table_row_pages link JOIN table_rows r ON r.id=link.row_id JOIN pages p ON p.id=r.page_id WHERE link.page_id=? AND p.is_task_list=1",
+    )
+      .bind(page.id)
+      .first())
+  )
+    throw new HttpError(
+      422,
+      "task_title_required",
+      "Rename this task from its task list so its title stays consistent.",
+    );
   const titleValue = body.title === undefined ? page.title : text(body.title, "title", PAGE_TITLE_MAX);
   const iconValue = body.icon === undefined ? page.icon : body.icon === null ? null : text(body.icon, "icon", 20);
+  if (body.fullWidth !== undefined && typeof body.fullWidth !== "boolean")
+    throw new HttpError(422, "invalid_input", "fullWidth must be a boolean.");
+  const fullWidth = body.fullWidth === undefined ? (page.full_width ?? 0) : Number(body.fullWidth);
   const result = await c.env.DB.prepare(
-    `UPDATE pages SET title = ?, icon = ?, revision = revision + 1, updated_by = ?, updated_at = ?
+    `UPDATE pages SET title = ?, icon = ?, full_width = ?, revision = revision + 1, updated_by = ?, updated_at = ?
       WHERE id = ? AND workspace_id = ? AND revision = ?`,
   )
-    .bind(titleValue, iconValue, member.user.id, now(), page.id, member.workspace.id, revision)
+    .bind(titleValue, iconValue, fullWidth, member.user.id, now(), page.id, member.workspace.id, revision)
     .run();
   if (!result.meta.changes)
     throw new HttpError(409, "stale_revision", "The page metadata changed. Reload and try again.");
@@ -3744,6 +3793,7 @@ app.post("/api/pages/:id/move", async (c) => {
   const requestHash = await sha256Hex(canonicalJson({ pageId, parentId, beforeId, afterId }));
   const authorizedPage = await pageForMember(c.env, member, pageId, true);
   requirePageEditor(authorizedPage);
+  await requireStandalonePage(c.env, authorizedPage.id);
   const receiptContext = {
     workspaceId: member.workspace.id,
     pageId,
@@ -3955,6 +4005,7 @@ app.post("/api/pages/:id/move-space", async (c) => {
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"));
   requirePageEditor(page);
+  await requireStandalonePage(c.env, page.id);
   const body = await jsonBody(c.req.raw);
   const spaceId = text(body.spaceId, "spaceId", 120);
   const parentId = nullableId(body.parentId, "parentId");
@@ -4008,11 +4059,36 @@ app.post("/api/pages/:id/move-space", async (c) => {
   return c.json({ pages: moved });
 });
 
+async function taskDetail(env: Env, pageId: string) {
+  return env.DB.prepare(
+    `SELECT r.id row_id,r.page_id list_id,state.revision FROM table_row_pages link JOIN table_rows r ON r.id=link.row_id JOIN pages list ON list.id=r.page_id JOIN table_state state ON state.page_id=list.id WHERE link.page_id=? AND list.is_task_list=1`,
+  )
+    .bind(pageId)
+    .first<{ row_id: string; list_id: string; revision: number }>();
+}
+
 app.delete("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
+  const task = await taskDetail(c.env, page.id);
+  if (task && page.archived_at === null) {
+    await mutateTask(c.env, member, task.list_id, task.row_id, {
+      operationId: c.req.header("x-notes-operation-id") ?? crypto.randomUUID(),
+      expectedRevision: task.revision,
+      archived: true,
+    });
+    const archived = await c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree`,
+    )
+      .bind(page.id)
+      .all<{ id: string }>();
+    const pageIds = archived.results.map((p) => p.id);
+    sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
+    await processArchiveDisconnectTargets(c.env, [{ page_id: page.id, content_epoch: page.content_epoch }]);
+    return c.json({ ok: true, pageIds });
+  }
   const requestedOperationId = c.req.header("x-notes-operation-id");
   const operationId = requestedOperationId && ID_PATTERN.test(requestedOperationId) ? requestedOperationId : undefined;
   const timestamp = now();
@@ -4150,6 +4226,27 @@ app.post("/api/pages/:id/restore", async (c) => {
       .bind(page.id, member.workspace.id)
       .all<PageRow>();
     return c.json({ pages: active.results.map(pageJson) });
+  }
+  const task = await taskDetail(c.env, page.id);
+  if (task) {
+    await mutateTask(c.env, member, task.list_id, task.row_id, {
+      operationId: crypto.randomUUID(),
+      expectedRevision: task.revision,
+      archived: false,
+    });
+    const restored = await c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT * FROM pages WHERE id IN subtree AND archived_at IS NULL`,
+    )
+      .bind(page.id)
+      .all<PageRow>();
+    const restoredPages = restored.results.map(pageJson);
+    sendWorkspaceEvent(c, member.workspace.id, {
+      type: "pages-upserted",
+      pages: restoredPages,
+      restored: true,
+      restoredRootId: page.id,
+    });
+    return c.json({ pages: restoredPages });
   }
   const archiveTimestamp = page.archived_at;
   const archiveOperationId = page.archive_operation_id ?? null;
@@ -5264,6 +5361,44 @@ function collectRowCells(results: Record<string, unknown>[]) {
   return [...rows.values()];
 }
 
+app.get("/api/tasks", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json(
+    await listTasks(c.env, member, {
+      listId: c.req.query("listId"),
+      mine: c.req.query("mine") === "true",
+      status: c.req.query("status"),
+      due: c.req.query("due"),
+      q: c.req.query("q"),
+      cursor: c.req.query("cursor"),
+    }),
+  );
+});
+app.get("/api/task-lists/:pageId/assignees", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json({ members: await taskAssignees(c.env, member, c.req.param("pageId")) });
+});
+app.post("/api/task-lists/:pageId/tasks", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const result = await mutateTask(c.env, member, c.req.param("pageId"), null, await jsonBody(c.req.raw));
+  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json(result, 201);
+});
+app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const result = await mutateTask(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    c.req.param("rowId"),
+    await jsonBody(c.req.raw),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json(result);
+});
+
 app.get("/api/tables/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const wantsCount = c.req.query("count") === "true";
@@ -5319,6 +5454,7 @@ app.get("/api/tables/:pageId", async (c) => {
   return c.json({
     table: {
       pageId: page.id,
+      filter: (c.req.query("q") ?? "").trim().slice(0, 200),
       revision,
       columns: columns.results.map((column) => ({
         ...column,
@@ -6172,6 +6308,8 @@ async function guardedBatch(
   prepareMutation: (guardedAt: number) => D1PreparedStatement | D1PreparedStatement[],
   options: { requireChanges?: boolean } = {},
 ) {
+  if (await env.DB.prepare("SELECT 1 FROM pages WHERE id=? AND is_task_list=1").bind(pageId).first())
+    throw new HttpError(422, "task_action_required", "Use task actions to edit a task list.");
   const requireChanges = options.requireChanges ?? true;
   const guardedAt = now();
   const prepared = prepareMutation(guardedAt);

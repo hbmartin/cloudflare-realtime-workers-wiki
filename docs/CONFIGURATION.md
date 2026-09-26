@@ -291,6 +291,16 @@ ephemeral to the acting user while they are active in Slack; an uncertain send i
 recheck current identity, membership, mapping, and page permissions when delayed work runs; old buttons and
 saved modal state do not grant access.
 
+## Documents, task lists, and Slack capture
+
+Use the sidebar's contextual creation menu to create a Document, Table, Task List, or Diagram at the displayed destination. Document width is saved per page; sidebar width, collapse state, recent pages, and task view are saved per user in the browser. Home lists recent pages, and normal startup restores the last accessible page. The unified Inbox contains notifications and mentions. Background work is listed under **Imports & exports**.
+
+Task lists use existing table rows and linked documents. **Edit tasks** acquires the table's exclusive lease; **Finish editing** releases it. Table and Board show the same assignee, status, and due date. **My Tasks** lists assignments across accessible spaces. Task descriptions and comments use normal document collaboration. Task property changes from My Tasks or Slack acquire a short lease and return an actionable conflict while any table editor holds the lease. Retry is explicit; metadata changes are never silently queued. Due-date filters currently use UTC. Anonymous public task-list shares show “Assigned” without exposing account names or IDs.
+
+`/notes new` opens document creation, `/notes task-list` creates a task list, `/notes task` creates a task, and `/notes tasks` opens My Tasks with edit controls. Message shortcuts capture one message or a thread into a document or task at an explicit destination, with source attribution. Document content is copied asynchronously with a visible retry action; repeated form delivery and copy retries use stable receipts. Rich editing opens NoteFlare. App Home also shows recent Inbox updates and assigned tasks. Existing channel discussion mirroring and public-share controls continue to apply to task detail documents.
+
+Apply additive migration `0047_workspace_experience.sql` together with this release. Existing tables remain ordinary tables. Reimport the updated Slack manifest to expose the command hints; capture uses the existing channel/history permissions and requires current channel membership and verified identity. This release does not add external guest editing or simultaneous table editing.
+
 ## Environments
 
 `wrangler.jsonc` keeps local-safe defaults at the top level and defines two named environments:

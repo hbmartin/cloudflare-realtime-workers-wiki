@@ -347,7 +347,7 @@ describe("Slack security and integration", () => {
     expect((await start()).status).toBe(200);
   });
 
-  it("acknowledges signed shortcuts before opening the placeholder modal", async () => {
+  it("acknowledges signed shortcuts and explains how to connect an unverified identity", async () => {
     const installed = await bootstrap();
     await installSlack(installed.member);
     const payload = {
@@ -382,11 +382,9 @@ describe("Slack security and integration", () => {
     await waitOnExecutionContext(context);
     expect(fetchMock).toHaveBeenCalledWith(
       "https://slack.com/api/views.open",
-      expect.objectContaining({ body: expect.stringContaining("not available yet") }),
+      expect.objectContaining({ body: expect.stringContaining("Connect your Slack account") }),
     );
-    expect(
-      await env.DB.prepare(`SELECT processed_at IS NOT NULL processed FROM slack_interaction_receipts`).first(),
-    ).toEqual({ processed: 1 });
+    expect(await env.DB.prepare("SELECT count(*) count FROM slack_product_sessions").first()).toEqual({ count: 0 });
   });
 
   it("queues one Home publication and shows a safe linking state", async () => {
