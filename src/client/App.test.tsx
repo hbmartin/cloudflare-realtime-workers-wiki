@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { startTransition, StrictMode, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext, Job, Page, Space, Tag, WorkspaceEvent } from "../shared/types";
@@ -9,6 +9,9 @@ import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, Un
 import { App, fallbackPageId, useCommittedRef } from "./App";
 import { PAGE_NAVIGATE_EVENT } from "./mentions";
 import { PageLoadEventBuffer } from "./page-state";
+
+// Rendering the full workspace under coverage can exceed the default one-second wait on CI.
+configure({ asyncUtilTimeout: 3000 });
 
 const mocks = vi.hoisted(() => ({
   createWorkspaceEvents: vi.fn((_workspaceId: string, _onEvent: unknown, _onReconnect: () => void) => ({

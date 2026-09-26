@@ -127,14 +127,22 @@ test("keeps documents and the page panel usable at phone, tablet, and desktop wi
         await toggle.click();
       }
       const close = page.getByRole("button", { name: "Close navigation", exact: true });
-      if (width < 1000) await close.click();
+      if (width < 1000) {
+        await close.click();
+        await expect(
+          page.getByRole("complementary", { name: "Workspace navigation", includeHidden: true }),
+        ).toBeHidden();
+      }
       await expect(page.getByLabel("Page title")).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       await page.getByRole("button", { name: "Page details", exact: true }).click();
       await page.getByRole("button", { name: "Comments", exact: true }).click();
       await expect(page.getByRole("button", { name: "Close page panel", exact: true })).toBeInViewport();
       await expect(page.locator(".comments-panel")).toContainText(commentText);
-      await page.screenshot({ path: `test-results/workspace-${width}-${theme.toLowerCase()}.png` });
+      await page.screenshot({
+        path: `test-results/workspace-${width}-${theme.toLowerCase()}.png`,
+        animations: "disabled",
+      });
       const audit = await new AxeBuilder({ page }).exclude(".bn-editor").analyze();
       expect(audit.violations.filter((v) => v.impact === "critical" || v.impact === "serious")).toEqual([]);
       await page.getByRole("button", { name: "Close page panel", exact: true }).click();
