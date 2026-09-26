@@ -1,9 +1,11 @@
+import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 import type { Notification, NotificationEventType, NotificationPreference } from "../shared/types";
 import { api, apiErrorMessage, json } from "./api";
 
 const DATE_TIME_FORMAT = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const EVENT_LABELS: Record<NotificationEventType, string> = {
+  task_assigned: "Task assignments",
   mention: "Mentions",
   reply: "Replies",
   thread_resolved: "Resolved threads",
@@ -19,6 +21,7 @@ type PreferenceResponse = {
 
 function notificationCopy(notification: Notification) {
   const actor = notification.actor?.name ?? "A collaborator";
+  if (notification.eventType === "task_assigned") return `${actor} assigned you a task`;
   if (notification.eventType === "mention") return `${actor} mentioned you`;
   if (notification.eventType === "reply") return `${actor} replied to a thread`;
   if (notification.eventType === "thread_resolved") return `${actor} resolved a thread`;
@@ -28,15 +31,18 @@ function notificationCopy(notification: Notification) {
 
 export function NotificationsPanel({
   revision,
+  mentions,
   onClose,
   onSelectPage,
   onUnreadCountChange,
 }: {
   revision: number;
+  mentions?: ReactNode;
   onClose: () => void;
   onSelectPage: (pageId: string) => void;
   onUnreadCountChange: (count: number) => void;
 }) {
+  const [tab, setTab] = useState<"updates" | "mentions">("updates");
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [unreadOnly, setUnreadOnly] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -187,13 +193,14 @@ export function NotificationsPanel({
         <header>
           <div>
             <p className="eyebrow">Updates for you</p>
-            <h2 id="notifications-title">Notifications</h2>
+            <h2 id="notifications-title">Inbox</h2>
           </div>
           <button ref={closeButton} className="icon-button" aria-label="Close notifications" onClick={onClose}>
             ×
           </button>
         </header>
-        {settingsOpen ? (
+        {mentions && <div className="inbox-tabs"><button aria-pressed={tab === "updates"} onClick={() => setTab("updates")}>Updates</button><button aria-pressed={tab === "mentions"} onClick={() => setTab("mentions")}>Pages mentioning you</button></div>}
+        {tab === "mentions" ? mentions : settingsOpen ? (
           <div className="notification-settings">
             <button className="quiet-button notification-back" onClick={() => setSettingsOpen(false)}>
               ← Back to notifications

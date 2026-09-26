@@ -69,6 +69,8 @@ const PAGE_FIELD_VALIDATORS = {
   kind: (value: unknown) => typeof value === "string" && PAGE_KINDS.includes(value as PageKind),
   position: (value: unknown) => typeof value === "string",
   title: (value: unknown) => typeof value === "string",
+  taskList: (value: unknown) => value === undefined || typeof value === "boolean",
+  fullWidth: (value: unknown) => value === undefined || typeof value === "boolean",
   icon: (value: unknown) => value === null || typeof value === "string",
   revision: (value: unknown) => typeof value === "number",
   contentEpoch: (value: unknown) => typeof value === "number",

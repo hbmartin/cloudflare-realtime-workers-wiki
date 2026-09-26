@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+import { ActionMenu, PageTools } from "./WorkspaceUI";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { jitteredBackoff, jitteredInterval } from "../shared/retry";
 import { TABLE_MAX_ROWS, TABLE_PAGE_DEFAULT, TABLE_SORT_MAX_OFFSET } from "../shared/table-limits";
@@ -319,6 +321,7 @@ function isDefinitiveMutationRejection(cause: unknown): cause is ApiClientError 
 
 export type TablePageProps = {
   page: Page;
+  metadata?: ReactNode;
   member: ClientMemberContext;
   onPageChanged: (page: Page) => void;
   onPageUnavailable?: (pageId: string) => void;
@@ -328,6 +331,7 @@ export type TablePageProps = {
 
 export function TablePage({
   page,
+  metadata,
   member,
   onPageChanged,
   onPageUnavailable,
@@ -2053,7 +2057,7 @@ export function TablePage({
 
   return (
     <main className="page-canvas table-canvas">
-      <div className="page-tools">
+      <PageTools><ActionMenu label="Page details" icon="comment">
         <span className={`lease-state ${editingReady ? "lease-active" : ""}`}>
           {editingReady ? "Editing lease active" : leaseToken ? "Editing paused while table reloads" : "Read-only"}
         </span>
@@ -2086,13 +2090,14 @@ export function TablePage({
         <button className="quiet-button" onClick={() => setBacklinksOpen((open) => !open)}>
           Backlinks
         </button>
-      </div>
+      </ActionMenu></PageTools>
       {notices.map((notice) => (
         <div className={`notice${notice.danger ? " notice-danger" : ""}`} key={notice.message}>
           {notice.message}
         </div>
       ))}
       <article className="table-paper">
+        {page.icon && <div className="page-heading-icon">{page.icon}</div>}
         <input
           className="page-title"
           value={title}
@@ -2103,6 +2108,7 @@ export function TablePage({
           }}
           readOnly={!canEdit}
         />
+        {metadata}
         <div className="table-toolbar">
           <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter loaded rows…" />
           <span>

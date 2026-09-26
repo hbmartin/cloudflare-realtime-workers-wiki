@@ -1,0 +1,95 @@
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import type { ClientMemberContext, Page, TableData, TableLeaseResponse } from "../shared/types";
+import { TASK_STATUSES, TASK_STATUS_LABELS, type Task, type TaskFields, type TaskResponse } from "../shared/tasks";
+import { api, apiErrorMessage, json } from "./api";
+import { ActionMenu, Icon, PageTools, readPreference, savePreference } from "./WorkspaceUI";
+
+type Person = {id:string;name:string};
+type Change = Partial<TaskFields> & {archived?:boolean};
+
+export function TasksView({page,member,metadata,onSelectPage,onPageChanged}:{page?:Page;member:ClientMemberContext;metadata?:ReactNode;onSelectPage:(id:string)=>void;onPageChanged?:(page:Page)=>void}) {
+  const [data,setData]=useState<TaskResponse>({tasks:[],hasMore:false,nextCursor:null});
+  const dataRef=useRef(data); dataRef.current=data;
+  const [mode,setMode]=useState<"table"|"board">(()=>readPreference(`notes:tasks-view:${member.user.id}:${page?.id??"mine"}`,"table"));
+  const [status,setStatus]=useState(""); const [due,setDue]=useState(""); const [query,setQuery]=useState("");
+  const [error,setError]=useState(""); const [loading,setLoading]=useState(false); const [busy,setBusy]=useState(false);
+  const [revision,setRevision]=useState(1); const revisionRef=useRef(revision); revisionRef.current=revision;
+  const [members,setMembers]=useState<Record<string,Person[]>>({});
+  const [refresh,setRefresh]=useState(0); const [newTitle,setNewTitle]=useState("");
+  const retryRef=useRef<(()=>Promise<boolean>)|null>(null);
+  const [lease,setLease]=useState<string|null>(null); const leaseRef=useRef<string|null>(null);
+  const [holder,setHolder]=useState<string|null>(null); const generation=useRef(0); const active=useRef(true);
+  const editable=page ? member.role!=="viewer" : true;
+  const key=`notes:tasks-view:${member.user.id}:${page?.id??"mine"}`;
+  useEffect(()=>{savePreference(key,mode);},[key,mode]);
+  const load=useCallback(async(cursor?:string)=>{
+    const request=++generation.current;setLoading(true);
+    const params=new URLSearchParams(page?{listId:page.id}:{mine:"true"});
+    if(status)params.set("status",status);if(due)params.set("due",due);if(query.trim())params.set("q",query.trim());if(cursor)params.set("cursor",cursor);
+    try {
+      const result=await api<TaskResponse>(`/api/tasks?${params}`);
+      if(!active.current||request!==generation.current)return;
+      setData((current)=>cursor?{...result,tasks:[...current.tasks,...result.tasks.filter((task)=>!current.tasks.some((p)=>p.id===task.id))]}:result);
+      if(page){const response=await api<{table:TableData}>(`/api/tables/${page.id}?limit=1`);if(!active.current||request!==generation.current)return;setRevision(response.table.revision);setHolder(response.table.lease.holderName);}
+      const ids=[...new Set(result.tasks.map((task)=>task.listId)),...(page?[page.id]:[])];
+      const entries=await Promise.all([...new Set(ids)].map(async(id)=>{const result=await api<{members:Person[]}>(`/api/task-lists/${id}/assignees`);return [id,result.members] as const;}));
+      if(active.current&&request===generation.current)setMembers(Object.fromEntries(entries));
+    }catch(cause){if(active.current&&request===generation.current)setError(apiErrorMessage(cause,"Tasks could not be loaded."));}
+    finally{if(active.current&&request===generation.current)setLoading(false);}
+  },[page?.id,status,due,query]);
+  useEffect(()=>{active.current=true;const timer=setTimeout(()=>void load(),150);return()=>{clearTimeout(timer);generation.current++;};},[load,refresh]);
+  useEffect(()=>{
+    const timer=setInterval(()=>{if(!document.hidden&&!busy)void load();},30_000);
+    return()=>clearInterval(timer);
+  },[load,busy]);
+  const release=useCallback((token:string)=>{if(page)void api(`/api/tables/${page.id}/lease`,{method:"DELETE",body:json({leaseToken:token}),keepalive:true}).catch(()=>undefined);},[page?.id]);
+  useEffect(()=>()=>{active.current=false;generation.current++;if(leaseRef.current)release(leaseRef.current);leaseRef.current=null;},[release]);
+  useEffect(()=>{
+    if(!lease||!page)return;
+    const timer=setInterval(()=>{void api(`/api/tables/${page.id}/lease`,{method:"PATCH",body:json({leaseToken:lease})}).catch((cause)=>{if(active.current&&leaseRef.current===lease){leaseRef.current=null;setLease(null);setError(apiErrorMessage(cause,"The edit lock expired. Acquire it again to continue."));}});},20_000);
+    return()=>clearInterval(timer);
+  },[lease,page?.id]);
+  async function toggleLease(){
+    if(!page)return;
+    if(lease){release(lease);leaseRef.current=null;setLease(null);setHolder(null);return;}
+    setBusy(true);setError("");
+    try{const result=await api<TableLeaseResponse>(`/api/tables/${page.id}/lease`,{method:"POST"});if(!active.current){release(result.leaseToken);return;}leaseRef.current=result.leaseToken;setLease(result.leaseToken);await load();}
+    catch(cause){setError(apiErrorMessage(cause,"This task list is being edited. Try again when it is available."));}finally{if(active.current)setBusy(false);}
+  }
+  async function save(task:Task|null,changes:Change,operationId=crypto.randomUUID()):Promise<boolean>{
+    const listId=task?.listId??page?.id;if(!listId)return false;
+    const current=task?dataRef.current.tasks.find((item)=>item.id===task.id)??task:null;
+    const expectedRevision=page?revisionRef.current:current!.revision;
+    setBusy(true);setError("");
+    retryRef.current=()=>save(task,changes,operationId);
+    try{
+      const result=await api<{revision:number;detailPageId:string}>(`/api/task-lists/${listId}/tasks${task?`/${task.id}`:""}`,{method:task?"PATCH":"POST",body:json({...changes,operationId,expectedRevision,...(leaseRef.current?{leaseToken:leaseRef.current}:{})})});
+      if(!active.current)return false;
+      setRevision(result.revision);revisionRef.current=result.revision;retryRef.current=null;setError("");await load();return true;
+    }catch(cause){if(active.current){setError(apiErrorMessage(cause,"The task could not be saved. Your change is ready to retry."));void load();}return false;}
+    finally{if(active.current)setBusy(false);}
+  }
+  const ready=editable&&(!page||Boolean(lease));
+  const controls=(task:Task)=><TaskControls task={task} members={members[task.listId]??[]} disabled={busy||!ready||!task.editable} onChange={(changes)=>void save(task,changes)} />;
+  return <main className={page?"page-canvas tasks-canvas":"utility-view tasks-canvas"}>
+    {page&&<PageTools><span className="lease-state" role="status">{lease?"Editing tasks":holder?`${holder} is editing`:"Read-only"}</span>{editable&&<button className="quiet-button" disabled={busy} onClick={()=>void toggleLease()}>{lease?"Finish editing":"Edit tasks"}</button>}</PageTools>}
+    {page?<input className="page-title" aria-label="Page title" defaultValue={page.title} key={`${page.id}:${page.title}`} readOnly={!editable} onBlur={(event)=>{const title=event.target.value.trim()||"Untitled tasks";if(title!==page.title)void api<{page:Page}>(`/api/pages/${page.id}`,{method:"PATCH",body:json({title,revision:page.revision})}).then((result)=>onPageChanged?.(result.page)).catch((cause)=>setError(apiErrorMessage(cause,"Title could not be saved.")));}}/>:<><p className="eyebrow">Across your spaces</p><h1>My Tasks</h1></>}
+    {metadata}
+    <div className="task-toolbar">
+      <div className="view-switch"><button aria-pressed={mode==="table"} onClick={()=>setMode("table")}><Icon name="table"/>Table</button><button aria-pressed={mode==="board"} onClick={()=>setMode("board")}><Icon name="tasks"/>Board</button></div>
+      <input aria-label="Find tasks" placeholder="Find tasks…" value={query} onChange={(event)=>setQuery(event.target.value)}/>
+      <select aria-label="Task status filter" value={status} onChange={(event)=>setStatus(event.target.value)}><option value="">All statuses</option>{TASK_STATUSES.map((s)=><option key={s} value={s}>{TASK_STATUS_LABELS[s]}</option>)}</select>
+      <select aria-label="Task due date filter" value={due} onChange={(event)=>setDue(event.target.value)}><option value="">Any due date</option><option value="overdue">Overdue</option><option value="today">Due today (UTC)</option><option value="undated">No due date</option></select>
+      <button className="quiet-button" disabled={loading} onClick={()=>setRefresh((n)=>n+1)}>Refresh</button>
+    </div>
+    {error&&<div className="notice notice-danger" role="alert">{error}<button className="quiet-button" disabled={busy||loading} onClick={()=>{if(retryRef.current)void retryRef.current();else void load();}}>Retry</button></div>}
+    {page&&editable&&<form className="new-task-form" onSubmit={(event)=>{event.preventDefault();if(newTitle.trim())void save(null,{title:newTitle.trim()}).then((ok)=>{if(ok)setNewTitle("");});}}><input aria-label="New task title" placeholder={lease?"Add a task…":"Choose Edit tasks to add a task"} value={newTitle} disabled={!ready||busy} onChange={(event)=>setNewTitle(event.target.value)} maxLength={500}/><button className="primary-small" disabled={!ready||busy||!newTitle.trim()}>Add task</button></form>}
+    {mode==="table"?<div className="data-table-wrap"><table className="data-table task-table"><thead><tr><th>Task</th>{!page&&<th>Project</th>}<th>Assignee · Status · Due date</th><th><span className="visually-hidden">Actions</span></th></tr></thead><tbody>{data.tasks.map((task)=><tr key={task.id}><td><button className="task-title" onClick={()=>onSelectPage(task.detailPageId)}>{task.title}</button></td>{!page&&<td><button className="quiet-button" onClick={()=>onSelectPage(task.listId)}>{task.listTitle}</button></td>}<td>{controls(task)}</td><td><ActionMenu label={`Actions for ${task.title}`}><button data-close-menu onClick={()=>onSelectPage(task.detailPageId)}>Open details & comments</button><button disabled={!ready||busy||!task.editable} onClick={()=>{const title=prompt("Task title",task.title);if(title?.trim())void save(task,{title:title.trim()});}}>Rename</button><button disabled={!ready||busy||!task.editable} data-close-menu onClick={()=>void save(task,{archived:true})}>Move to trash</button></ActionMenu></td></tr>)}</tbody></table></div>:<div className="task-board">{TASK_STATUSES.map((s)=><section key={s} className="task-column" aria-label={TASK_STATUS_LABELS[s]} onDragOver={(event)=>{if(ready&&!busy)event.preventDefault();}} onDrop={(event)=>{event.preventDefault();const task=data.tasks.find((t)=>t.id===event.dataTransfer.getData("text/task-id"));if(task&&ready&&task.editable&&!busy&&task.status!==s)void save(task,{status:s});}}><h2>{TASK_STATUS_LABELS[s]} <span>{data.tasks.filter((t)=>t.status===s).length}</span></h2>{data.tasks.filter((t)=>t.status===s).map((task)=><article key={task.id} className="task-card" draggable={ready&&!busy&&task.editable} onDragStart={(event)=>event.dataTransfer.setData("text/task-id",task.id)}><button className="task-title" onClick={()=>onSelectPage(task.detailPageId)}>{task.title}</button>{!page&&<button className="task-project" onClick={()=>onSelectPage(task.listId)}>{task.listTitle}</button>}{controls(task)}</article>)}</section>)}</div>}
+    {loading&&<p className="muted" role="status">Loading tasks…</p>}{!loading&&!data.tasks.length&&<p className="empty-copy">{page?"No tasks match this view.":"No assigned tasks match this view. Tasks assigned to you will appear here."}</p>}
+    {data.hasMore&&data.nextCursor&&<button className="quiet-button" disabled={loading} onClick={()=>void load(data.nextCursor!)}>Load more tasks</button>}
+  </main>;
+}
+
+function TaskControls({task,members,disabled,onChange}:{task:Task;members:Person[];disabled:boolean;onChange:(change:Change)=>void}){
+  return <div className="task-fields"><select aria-label={`Assignee for ${task.title}`} value={task.assigneeId??""} disabled={disabled} onChange={(event)=>onChange({assigneeId:event.target.value||null})}><option value="">Unassigned</option>{members.map((m)=><option key={m.id} value={m.id}>{m.name}</option>)}</select><select aria-label={`Status for ${task.title}`} value={task.status} disabled={disabled} onChange={(event)=>onChange({status:event.target.value as TaskFields["status"]})}>{TASK_STATUSES.map((s)=><option key={s} value={s}>{TASK_STATUS_LABELS[s]}</option>)}</select><input type="date" aria-label={`Due date for ${task.title}`} value={task.dueDate??""} disabled={disabled} onChange={(event)=>onChange({dueDate:event.target.value||null})}/></div>;
+}

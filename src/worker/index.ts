@@ -1,3 +1,4 @@
+import { taskListStatements, listTasks, mutateTask, taskAssignees } from "./tasks";
 import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror } from "./slack-threads";
 import { acceptSlackWorkspaceInteraction, openSlackSearch, purgeExpiredSlackSearchSessions } from "./slack-workspace";
 import { pageForMember, effectiveSpaceRole, type PageRow } from "./page-access";
@@ -267,6 +268,8 @@ const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
   position: "position",
   title: "title",
   icon: "icon",
+  fullWidth: "full_width",
+  taskList: "is_task_list",
   revision: "revision",
   contentEpoch: "content_epoch",
   isTemplate: "is_template",
@@ -517,7 +520,7 @@ async function readPageCreateReplay(
   const existing = await database
     .prepare(
       `SELECT p.id, p.workspace_id, p.space_id, p.parent_id, p.kind, p.position, p.title, p.icon,
-              p.revision, p.content_epoch, p.is_template, p.archived_at, p.created_at, p.updated_at,
+              p.revision, p.content_epoch, p.is_template, p.archived_at, p.created_at, p.updated_at, p.full_width, p.is_task_list,
               r.request_hash receipt_request_hash
          FROM pages p
          LEFT JOIN page_create_receipts r ON r.page_id = p.id AND r.workspace_id = ?
@@ -2973,6 +2976,7 @@ app.get("/api/pages/tree", async (c) => {
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE p.workspace_id = ? AND p.archived_at IS ${archived ? "NOT " : ""}NULL
        AND p.is_template = 0 AND p.import_job_id IS NULL
+       AND NOT EXISTS (SELECT 1 FROM table_row_pages row_page WHERE row_page.page_id=p.id)
        AND NOT EXISTS (
          SELECT 1 FROM page_import_sources source
           WHERE source.page_id = p.id AND source.source_role = 'table_row_detail'
@@ -3003,8 +3007,10 @@ app.post("/api/pages", async (c) => {
   const id = clientProvidedId ? text(body.id, "id", 100) : crypto.randomUUID();
   if (!ID_PATTERN.test(id)) throw new HttpError(422, "invalid_input", "id is not a valid resource id.");
   const kind = pageKind(body.kind ?? "document");
-  const title = typeof body.title === "string" ? text(body.title, "title", PAGE_TITLE_MAX) : "Untitled";
-  const requestHash = await pageCreateRequestHash({ spaceId, parentId, kind, title });
+  const taskList = body.taskList === true;
+  if (taskList && kind !== "table") throw new HttpError(422,"table_required","Task lists must be tables.");
+  const title = typeof body.title === "string" ? text(body.title, "title", PAGE_TITLE_MAX) : taskList ? "Untitled tasks" : "Untitled";
+  const requestHash = await pageCreateRequestHash(taskList ? { spaceId, parentId, kind, title, taskList: true } : { spaceId, parentId, kind, title });
   const requested = [{ id, spaceId, parentId, kind, title }];
   const conflictMessage = "That page id already describes a different page.";
   const initialReplay = clientProvidedId
@@ -3025,8 +3031,8 @@ app.post("/api/pages", async (c) => {
     const results = await c.env.DB.batch<PageRow>([
       c.env.DB.prepare(
         `INSERT INTO pages
-          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          (id, workspace_id, space_id, parent_id, kind, position, title, created_by, updated_by, created_at, updated_at, is_task_list)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       ).bind(
         id,
         member.workspace.id,
@@ -3039,6 +3045,7 @@ app.post("/api/pages", async (c) => {
         member.user.id,
         timestamp,
         timestamp,
+        Number(taskList),
       ),
       c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
         id,
@@ -3057,6 +3064,7 @@ app.post("/api/pages", async (c) => {
          ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
       ).bind(`page:${id}:${member.user.id}`, member.workspace.id, member.user.id, id, member.user.id, timestamp),
       ...(kind === "table" ? [c.env.DB.prepare(`INSERT INTO table_state (page_id) VALUES (?)`).bind(id)] : []),
+      ...(taskList ? taskListStatements(c.env.DB, id) : []),
       c.env.DB.prepare(
         `INSERT INTO page_create_receipts
          (workspace_id, page_id, request_hash) VALUES (?, ?, ?)`,
@@ -3237,7 +3245,7 @@ app.get("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   const hidden = await c.env.DB.prepare(
-    `SELECT 1 hidden FROM page_import_sources WHERE page_id = ? AND source_role = 'table_row_detail'`,
+    `SELECT 1 hidden FROM table_row_pages WHERE page_id = ?`,
   )
     .bind(page.id)
     .first();
@@ -3675,13 +3683,16 @@ app.patch("/api/pages/:id", async (c) => {
   requirePageEditor(page);
   const body = await jsonBody(c.req.raw);
   const revision = Number(body.revision);
+  if (body.title !== undefined && body.title !== page.title && await c.env.DB.prepare("SELECT 1 FROM table_row_pages link JOIN table_rows r ON r.id=link.row_id JOIN pages p ON p.id=r.page_id WHERE link.page_id=? AND p.is_task_list=1").bind(page.id).first()) throw new HttpError(422,"task_title_required","Rename this task from its task list so its title stays consistent.");
   const titleValue = body.title === undefined ? page.title : text(body.title, "title", PAGE_TITLE_MAX);
   const iconValue = body.icon === undefined ? page.icon : body.icon === null ? null : text(body.icon, "icon", 20);
+  if (body.fullWidth !== undefined && typeof body.fullWidth !== "boolean") throw new HttpError(422, "invalid_input", "fullWidth must be a boolean.");
+  const fullWidth = body.fullWidth === undefined ? (page.full_width ?? 0) : Number(body.fullWidth);
   const result = await c.env.DB.prepare(
-    `UPDATE pages SET title = ?, icon = ?, revision = revision + 1, updated_by = ?, updated_at = ?
+    `UPDATE pages SET title = ?, icon = ?, full_width = ?, revision = revision + 1, updated_by = ?, updated_at = ?
       WHERE id = ? AND workspace_id = ? AND revision = ?`,
   )
-    .bind(titleValue, iconValue, member.user.id, now(), page.id, member.workspace.id, revision)
+    .bind(titleValue, iconValue, fullWidth, member.user.id, now(), page.id, member.workspace.id, revision)
     .run();
   if (!result.meta.changes)
     throw new HttpError(409, "stale_revision", "The page metadata changed. Reload and try again.");
@@ -5240,6 +5251,29 @@ function collectRowCells(results: Record<string, unknown>[]) {
   return [...rows.values()];
 }
 
+app.get("/api/tasks", async (c) => {
+  const member = await requireMember(c.req.raw,c.env);
+  return c.json(await listTasks(c.env,member,{listId:c.req.query("listId"),mine:c.req.query("mine")==="true",status:c.req.query("status"),due:c.req.query("due"),q:c.req.query("q"),cursor:c.req.query("cursor")}));
+});
+app.get("/api/task-lists/:pageId/assignees", async (c) => {
+  const member = await requireMember(c.req.raw,c.env);
+  return c.json({members:await taskAssignees(c.env,member,c.req.param("pageId"))});
+});
+app.post("/api/task-lists/:pageId/tasks", async (c) => {
+  const member = await requireMember(c.req.raw,c.env);
+  const result=await mutateTask(c.env,member,c.req.param("pageId"),null,await jsonBody(c.req.raw));
+  sendWorkspaceEvent(c,member.workspace.id,{type:"workspace-invalidated"});
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json(result,201);
+});
+app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
+  const member = await requireMember(c.req.raw,c.env);
+  const result=await mutateTask(c.env,member,c.req.param("pageId"),c.req.param("rowId"),await jsonBody(c.req.raw));
+  sendWorkspaceEvent(c,member.workspace.id,{type:"workspace-invalidated"});
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json(result);
+});
+
 app.get("/api/tables/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const wantsCount = c.req.query("count") === "true";
@@ -6148,6 +6182,7 @@ async function guardedBatch(
   prepareMutation: (guardedAt: number) => D1PreparedStatement | D1PreparedStatement[],
   options: { requireChanges?: boolean } = {},
 ) {
+  if (await env.DB.prepare("SELECT 1 FROM pages WHERE id=? AND is_task_list=1").bind(pageId).first()) throw new HttpError(422,"task_action_required","Use task actions to edit a task list.");
   const requireChanges = options.requireChanges ?? true;
   const guardedAt = now();
   const prepared = prepareMutation(guardedAt);

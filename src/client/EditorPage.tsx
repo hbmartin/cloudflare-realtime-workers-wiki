@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+import { ActionMenu, PageTools } from "./WorkspaceUI";
 import { CommentsExtension } from "@blocknote/core/comments";
 import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
 import { withCollaboration } from "@blocknote/core/yjs";
@@ -27,6 +29,7 @@ import { useEffectiveColorScheme } from "./ThemeControl";
 
 export type EditorPageProps = {
   page: Page;
+  metadata?: ReactNode;
   member: ClientMemberContext;
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
@@ -38,6 +41,7 @@ export type EditorPageProps = {
 
 export function EditorPage({
   page,
+  metadata,
   member,
   onPageChanged,
   onPageUnavailable,
@@ -189,12 +193,9 @@ export function EditorPage({
   }
 
   return (
-    <main className="page-canvas">
-      <div className="page-tools">
-        <span className={`sync-state sync-${status}`}>
-          <i />
-          {status}
-        </span>
+    <main className={`page-canvas ${page.fullWidth ? "full-width" : ""}`}>
+      <PageTools>{status !== "connected" && <span className={`sync-state sync-${status}`} role="status">{status === "connecting" ? "Connecting…" : "Offline"}</span>}<ActionMenu label="Page details" icon="comment">
+
         {editable && (
           <button
             className="quiet-button"
@@ -255,7 +256,7 @@ export function EditorPage({
         >
           Backlinks
         </button>
-      </div>
+      </ActionMenu></PageTools>
       {sizeWarning && (
         <div className={`notice ${sizeWarning.readOnly ? "notice-danger" : ""}`}>
           This document is {(sizeWarning.bytes / 1024 / 1024).toFixed(1)} MiB.
@@ -318,6 +319,7 @@ export function EditorPage({
         className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}
       >
         <article className="document-paper">
+          {page.icon && <div className="page-heading-icon">{page.icon}</div>}
           <input
             ref={titleRef}
             className="page-title"
@@ -335,6 +337,7 @@ export function EditorPage({
             readOnly={!editable}
             aria-label="Page title"
           />
+          {metadata}
           {titleError && <p className="form-error">{titleError}</p>}
           {editorError && (
             <p className="form-error" role="alert">

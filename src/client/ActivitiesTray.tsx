@@ -204,7 +204,7 @@ export function ActivitiesTray({
         <header>
           <div>
             <p className="eyebrow">Background work</p>
-            <h2 id="activities-title">Activities</h2>
+            <h2 id="activities-title">Imports & exports</h2>
           </div>
           <button ref={closeButton} className="icon-button" aria-label="Close activities" onClick={onClose}>
             ×

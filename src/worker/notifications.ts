@@ -18,6 +18,7 @@ export const NOTIFICATION_EVENT_TYPES = [
   "thread_resolved",
   "thread_reopened",
   "page_edit",
+  "task_assigned",
 ] as const satisfies readonly NotificationEventType[];
 
 export type NotificationFanout = {
@@ -29,6 +30,7 @@ export type NotificationFanout = {
   actorId: string | null;
   eventType: NotificationEventType;
   sourceId: string;
+  taskOperationId?: string;
   recipientIds: string[];
   emitSlackChannel: boolean;
   data?: Record<string, unknown>;
@@ -103,6 +105,7 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
            LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = recipient.value
           WHERE (? IS NULL OR recipient.value <> ?) AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
             AND (? IS NULL OR p.content_epoch = ?)
+            AND (? IS NULL OR EXISTS(SELECT 1 FROM task_mutation_receipts tr WHERE tr.workspace_id=p.workspace_id AND tr.actor_id=? AND tr.operation_id=? AND tr.detail_page_id=p.id))
             AND (wm.role = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
             AND NOT EXISTS (
               SELECT 1 FROM notifications recent
@@ -128,6 +131,9 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         fanout.actorId,
         fanout.contentEpoch ?? null,
         fanout.contentEpoch ?? null,
+        fanout.taskOperationId ?? null,
+        fanout.actorId,
+        fanout.taskOperationId ?? null,
         coalesceAfter,
         fanout.pageId,
         fanout.eventType,
@@ -612,6 +618,7 @@ function escapeHtml(value: string) {
 
 function notificationCopy(row: DeliveryRow) {
   const actor = row.actor_name ?? "A collaborator";
+  if (row.event_type === "task_assigned") return `${actor} assigned you a task: ${row.page_title}`;
   if (row.event_type === "mention") return `${actor} mentioned you on ${row.page_title}`;
   if (row.event_type === "reply") return `${actor} replied on ${row.page_title}`;
   if (row.event_type === "thread_resolved") return `${actor} resolved a thread on ${row.page_title}`;

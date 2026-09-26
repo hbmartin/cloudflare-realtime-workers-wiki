@@ -9,6 +9,8 @@ export type PageJsonRow = {
   position: string;
   title: string;
   icon: string | null;
+  full_width?: number;
+  is_task_list?: number;
   revision: number;
   content_epoch: number;
   is_template?: number;
@@ -29,6 +31,8 @@ export function pageJson(row: PageJsonRow): Page {
     position: row.position,
     title: row.title,
     icon: row.icon,
+    fullWidth: Boolean(row.full_width),
+    taskList: Boolean(row.is_task_list),
     revision: row.revision,
     contentEpoch: row.content_epoch,
     isTemplate: Boolean(row.is_template),
