@@ -253,4 +253,29 @@ describe("EditorPage close reconciliation", () => {
       .insertAdjacentHTML("beforeend", '<div role="textbox" contenteditable="false"></div>');
     expect(await screen.findByRole("textbox", { name: "Comment content" })).toBeInTheDocument();
   });
+
+  it.each([
+    [new ApiClientError(422, "invalid_icon", "Choose one emoji."), "Choose one emoji."],
+    [new Error("offline"), "The page icon could not be saved."],
+  ])("reports page-icon PATCH failures without an unhandled rejection", async (failure, message) => {
+    vi.useRealTimers();
+    vi.spyOn(window, "prompt").mockReturnValue("🔥");
+    mocks.api.mockRejectedValue(failure);
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Page details" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(message);
+  });
 });

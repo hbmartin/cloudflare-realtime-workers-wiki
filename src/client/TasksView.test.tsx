@@ -110,6 +110,7 @@ describe("task views", () => {
     revision = 2;
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled());
+    expect(screen.getByRole("alert")).toHaveTextContent("Another editor");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
     const writes = vi
@@ -118,6 +119,67 @@ describe("task views", () => {
       .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
     expect(writes).toHaveLength(2);
     expect(writes[1]).toMatchObject({ operationId: writes[0]!.operationId, status: "done", expectedRevision: 2 });
+  });
+  it("preserves a failed save and its retry when reconciliation also fails", async () => {
+    const original = vi.mocked(api).getMockImplementation()!;
+    let rejectLoads = false;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (rejectLoads && path.startsWith("/api/tasks?"))
+        throw new ApiClientError(503, "tasks_unavailable", "Refresh failed.");
+      return original(path, init);
+    });
+    blocked = true;
+    render(<TasksView member={member} onSelectPage={vi.fn()} />);
+    const status = await screen.findByLabelText("Status for Ship release");
+    rejectLoads = true;
+    fireEvent.change(status, { target: { value: "done" } });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Another editor");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled());
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Refresh failed");
+
+    blocked = false;
+    rejectLoads = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    const writes = vi
+      .mocked(api)
+      .mock.calls.filter(([path]) => path.endsWith("/tasks/task"))
+      .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
+    expect(writes).toHaveLength(2);
+    expect(writes[1]).toMatchObject({ operationId: writes[0]!.operationId, status: "done" });
+  });
+  it("abandons an older task retry when saving the list title fails", async () => {
+    blocked = true;
+    render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit tasks" }));
+    const status = await screen.findByLabelText("Status for Ship release");
+    await waitFor(() => expect(status).toBeEnabled());
+    fireEvent.change(status, { target: { value: "done" } });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Another editor");
+    const taskWritesBeforeTitle = vi.mocked(api).mock.calls.filter(([path]) => path.endsWith("/tasks/task")).length;
+    const loadsBeforeRetry = vi.mocked(api).mock.calls.filter(([path]) => path.startsWith("/api/tasks?")).length;
+
+    fireEvent.change(screen.getByLabelText("Page title"), { target: { value: "Renamed list" } });
+    fireEvent.blur(screen.getByLabelText("Page title"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Title could not be saved");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() =>
+      expect(vi.mocked(api).mock.calls.filter(([path]) => path.startsWith("/api/tasks?")).length).toBeGreaterThan(
+        loadsBeforeRetry,
+      ),
+    );
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith("/tasks/task"))).toHaveLength(
+      taskWritesBeforeTitle,
+    );
+  });
+  it("uses submit semantics and the shared page-title limit for new tasks", async () => {
+    render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit tasks" }));
+    await waitFor(() => expect(screen.getByLabelText("New task title")).toBeEnabled());
+    expect(screen.getByLabelText("New task title")).toHaveAttribute("maxlength", "200");
+    expect(screen.getByRole("button", { name: "Add task" })).toHaveAttribute("type", "submit");
   });
   it("keeps viewer properties read-only while allowing access to details", async () => {
     render(<TasksView page={page} member={{ ...member, role: "viewer" }} onSelectPage={vi.fn()} />);

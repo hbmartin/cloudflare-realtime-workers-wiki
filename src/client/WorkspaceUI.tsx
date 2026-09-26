@@ -218,6 +218,7 @@ export function QuickSwitcher({
     ? pages.filter((p) => !p.archivedAt && p.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()))
     : recentIds.flatMap((id) => pages.find((p) => p.id === id) ?? []);
   const results = [...local, ...remote.filter((r) => !local.some((p) => p.id === r.id))].slice(0, 20);
+  const selectedIndex = Math.max(0, Math.min(index, results.length - 1));
   return (
     <dialog
       ref={ref}
@@ -237,7 +238,7 @@ export function QuickSwitcher({
           role="combobox"
           aria-expanded={true}
           aria-controls="quick-switcher-options"
-          aria-activedescendant={results[index] ? `quick-result-${index}` : undefined}
+          aria-activedescendant={results[selectedIndex] ? `quick-result-${selectedIndex}` : undefined}
           autoComplete="off"
           value={query}
           onChange={(event) => {
@@ -251,8 +252,8 @@ export function QuickSwitcher({
               event.preventDefault();
               setIndex((i) => Math.max(0, Math.min(results.length - 1, i + (event.key === "ArrowDown" ? 1 : -1))));
             }
-            if (event.key === "Enter" && results[index]) {
-              onSelect(results[index].id);
+            if (event.key === "Enter" && results[selectedIndex]) {
+              onSelect(results[selectedIndex].id);
               onClose();
             }
           }}
@@ -270,9 +271,9 @@ export function QuickSwitcher({
             id={`quick-result-${i}`}
             // eslint-disable-next-line jsx-a11y/prefer-tag-over-role
             role="option"
-            aria-selected={i === index}
+            aria-selected={i === selectedIndex}
             key={page.id}
-            className={i === index ? "active" : ""}
+            className={i === selectedIndex ? "active" : ""}
             onMouseEnter={() => setIndex(i)}
             onClick={() => {
               onSelect(page.id);

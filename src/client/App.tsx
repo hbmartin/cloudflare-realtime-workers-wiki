@@ -169,14 +169,39 @@ function formatErrorMessages(errors: WorkspaceError[]) {
   return [...messages.values()].join(" ");
 }
 
-function archivePageIds(value: unknown, rootPageId: string) {
-  const pageIds =
-    value !== null && typeof value === "object" && "pageIds" in value ? (value as { pageIds?: unknown }).pageIds : null;
+type ArchiveResponse = {
+  pageIds: string[];
+  cleanupPending: boolean;
+  pendingPageCount: number;
+};
+
+function responsePageIds(value: unknown, rootPageId: string) {
+  const response = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  const pageIds = response && "pageIds" in response ? response.pageIds : null;
   if (!Array.isArray(pageIds) || !pageIds.every((pageId) => typeof pageId === "string" && pageId.length > 0)) {
     return null;
   }
   const uniquePageIds = [...new Set(pageIds)];
   return uniquePageIds.includes(rootPageId) ? uniquePageIds : null;
+}
+
+function archiveResponse(value: unknown, rootPageId: string): ArchiveResponse | null {
+  const response = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  const uniquePageIds = responsePageIds(value, rootPageId);
+  if (!uniquePageIds) return null;
+  if (response?.cleanupPending === undefined) {
+    return { pageIds: uniquePageIds, cleanupPending: false, pendingPageCount: 0 };
+  }
+  if (typeof response.cleanupPending !== "boolean") return null;
+  const pendingPageCount = response.pendingPageCount;
+  if (typeof pendingPageCount !== "number" || !Number.isSafeInteger(pendingPageCount) || pendingPageCount < 0)
+    return null;
+  if (response.cleanupPending !== pendingPageCount > 0) return null;
+  return {
+    pageIds: uniquePageIds,
+    cleanupPending: response.cleanupPending,
+    pendingPageCount,
+  };
 }
 
 function restoreResponsePages(value: unknown, rootPageId: string, workspaceId: string) {
@@ -1052,6 +1077,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     savePreference(`${preferencesKey}:width`, sidebarWidth);
   }, [preferencesKey, sidebarCollapsed, sidebarWidth]);
   useEffect(() => {
+    savePreference(`${preferencesKey}:recent`, recentIds);
+  }, [preferencesKey, recentIds]);
+  useEffect(() => {
     const handle = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
@@ -1105,6 +1133,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [backlinksRevision, setBacklinksRevision] = useState(0);
   const [commentsRevision, setCommentsRevision] = useState(0);
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
+  const [archiveCleanupNotice, setArchiveCleanupNotice] = useState<{
+    operationId: string;
+    pendingPageCount: number;
+  } | null>(null);
   const [trashRefreshVersion, setTrashRefreshVersion] = useState(0);
   const [trashLoading, setTrashLoading] = useState(false);
   const [pageTreeRetrying, setPageTreeRetrying] = useState(false);
@@ -1138,6 +1170,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [pendingOrganizationAction, setPendingOrganizationAction] = useState<string | null>(null);
   const [spaceFormOpen, setSpaceFormOpen] = useState(false);
   const sidebarOpenRef = useRef(false);
+  useEffect(() => {
+    if (!archiveCleanupNotice) return undefined;
+    const notice = archiveCleanupNotice;
+    const timer = setTimeout(() => {
+      setArchiveCleanupNotice((current) => (current === notice ? null : current));
+    }, 10_000);
+    return () => clearTimeout(timer);
+  }, [archiveCleanupNotice]);
   const sidebarRef = useRef<HTMLElement>(null);
   const sidebarTriggerRef = useRef<HTMLButtonElement>(null);
   const activityTriggerRef = useRef<HTMLButtonElement>(null);
@@ -2440,12 +2480,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (view === "pages")
         // eslint-disable-next-line react/set-state-in-effect
         setRecentIds((current) => {
-          const next = [resolvedSelectedId, ...current.filter((id) => id !== resolvedSelectedId)].slice(0, 30);
-          savePreference(`${preferencesKey}:recent`, next);
-          return next;
+          return [resolvedSelectedId, ...current.filter((id) => id !== resolvedSelectedId)].slice(0, 30);
         });
     }
-  }, [rememberSelected, lastPageStorageKey, resolvedSelectedId, view, preferencesKey]);
+  }, [rememberSelected, lastPageStorageKey, resolvedSelectedId, view]);
   useEffect(() => {
     if (!pagesLoaded && !pendingSelectionId) return;
     const url = new URL(window.location.href);
@@ -2718,7 +2756,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const result = await requestMutation(
         `/api/pages/${page.id}`,
         { method: "DELETE", headers: { "x-notes-operation-id": removalOperationId } },
-        (value) => archivePageIds(value, page.id),
+        (value) => archiveResponse(value, page.id),
       );
       const pageAlreadyGone = result.kind === "rejected" && isPageNotFoundError(result.error);
       archiveOutcome =
@@ -2730,7 +2768,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       archiveWasUnverified = result.kind === "uncertain" || (result.kind === "committed" && result.value === null);
       const removedIds =
         result.kind === "committed"
-          ? new Set(result.value ?? knownPageIds)
+          ? new Set(result.value?.pageIds ?? knownPageIds)
           : pageAlreadyGone
             ? new Set(knownPageIds)
             : null;
@@ -2739,6 +2777,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         for (const pageId of previewIds) invalidatePagePreview(pageId);
       }
       if (signal.aborted) return;
+      if (result.kind === "committed" && result.value?.cleanupPending) {
+        setArchiveCleanupNotice({
+          operationId: removalOperationId,
+          pendingPageCount: result.value.pendingPageCount,
+        });
+      }
       if (result.kind === "committed" && result.value === null) {
         logUnverifiedMutation(
           "Archive result could not be verified",
@@ -3074,7 +3118,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const attempt = startClearedWorkspaceErrorAttempt({ source: "trash-mutation", scope: errorScope });
     try {
       const result = await requestMutation(`/api/pages/${page.id}/permanent-delete`, { method: "POST" }, (value) =>
-        archivePageIds(value, page.id),
+        responsePageIds(value, page.id),
       );
       const deletedIds = result.kind === "committed" ? new Set(result.value ?? knownPageIds) : null;
       const previewIds = deletedIds ?? (result.kind === "uncertain" ? knownPageIds : null);
@@ -3364,6 +3408,22 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               ×
             </button>
           </div>
+        )}
+        {archiveCleanupNotice && (
+          <output className="notice workspace-notice">
+            <span>
+              Page archived. Realtime cleanup is continuing in the background for{" "}
+              {archiveCleanupNotice.pendingPageCount} {archiveCleanupNotice.pendingPageCount === 1 ? "page" : "pages"}.
+            </span>
+            <button
+              type="button"
+              className="workspace-error-dismiss"
+              aria-label="Dismiss archive cleanup notice"
+              onClick={() => setArchiveCleanupNotice(null)}
+            >
+              ×
+            </button>
+          </output>
         )}
         <header className="topbar">
           {sidebarCollapsed && (

@@ -3,7 +3,7 @@ import type { Env, MemberContext } from "./env";
 import { HttpError, sha256 } from "./http";
 import { effectiveSpaceRole, pageForMember } from "./page-access";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
-import { ID_PATTERN } from "../shared/validation";
+import { ID_PATTERN, PAGE_TITLE_MAX } from "../shared/validation";
 import {
   TASK_STATUSES,
   TASK_STATUS_LABELS,
@@ -15,7 +15,7 @@ import {
 } from "../shared/tasks";
 import { TABLE_MAX_ROWS } from "../shared/table-limits";
 import { notificationFanoutStatements } from "./notifications";
-import { refreshPageSearchV2Statements } from "./search-index";
+import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 
 export function taskListStatements(db: D1Database, pageId: string) {
   const columns = taskColumns(pageId);
@@ -87,7 +87,7 @@ export async function listTasks(
   if (query.status) {
     if (!TASK_STATUSES.includes(query.status as TaskStatus))
       throw new HttpError(422, "invalid_task_status", "Choose a valid status.");
-    filter += " AND status.select_value=list.id||'-'||?";
+    filter += " AND coalesce(status.select_value,list.id||'-todo')=list.id||'-'||?";
     binds.push(query.status);
   }
   if (query.q) {
@@ -95,7 +95,7 @@ export async function listTasks(
     binds.push(query.q.slice(0, 200));
   }
   if (query.due === "overdue") {
-    filter += " AND due.date_value < ? AND status.select_value<>list.id||'-done'";
+    filter += " AND due.date_value < ? AND coalesce(status.select_value,'')<>list.id||'-done'";
     binds.push(new Date().toISOString().slice(0, 10));
   } else if (query.due === "undated") filter += " AND due.date_value IS NULL";
   else if (query.due === "today") {
@@ -107,7 +107,8 @@ export async function listTasks(
     binds.push(query.cursor);
   }
   const rows = await env.DB.prepare(`SELECT r.id,list.id list_id,list.title list_title,list.space_id,
-    title.text_value title,assignee.text_value assignee_id,u.name assignee_name,status.select_value status,
+    title.text_value title,assignee.text_value assignee_id,u.name assignee_name,
+    coalesce(status.select_value,list.id||'-todo') status,
     due.date_value due_date,detail.id detail_page_id,state.revision,s.visibility,sm.role space_role
     ${TASK_FROM}${filter} ORDER BY r.id LIMIT ?`)
     .bind(...binds, limit + 1)
@@ -163,8 +164,8 @@ function fields(value: Record<string, unknown>, previous?: Task): TaskFields {
   const assigneeId = value.assigneeId === undefined ? (previous?.assigneeId ?? null) : value.assigneeId;
   const status = value.status === undefined ? (previous?.status ?? "todo") : value.status;
   const dueDate = value.dueDate === undefined ? (previous?.dueDate ?? null) : value.dueDate;
-  if (typeof title !== "string" || !title.trim() || title.length > 500)
-    throw new HttpError(422, "invalid_task_title", "Enter a task title of up to 500 characters.");
+  if (typeof title !== "string" || !title.trim() || title.length > PAGE_TITLE_MAX)
+    throw new HttpError(422, "invalid_task_title", `Enter a task title of up to ${PAGE_TITLE_MAX} characters.`);
   if (assigneeId !== null && (typeof assigneeId !== "string" || !ID_PATTERN.test(assigneeId)))
     throw new HttpError(422, "invalid_assignee", "Choose an assignee.");
   if (!TASK_STATUSES.includes(status as TaskStatus))
@@ -392,13 +393,31 @@ export async function mutateTask(
             ...guards,
           ),
         );
+        statements.push(
+          env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (${subtree}) AND ${guard}`).bind(
+            detailId,
+            ...guards,
+          ),
+        );
+        statements.push(
+          env.DB.prepare(
+            `INSERT INTO page_search(page_id,workspace_id,title,body)
+             SELECT id,workspace_id,title,coalesce(plain_text,'') FROM pages
+              WHERE id IN (${subtree}) AND archived_at IS NULL AND import_job_id IS NULL AND ${guard}`,
+          ).bind(detailId, ...guards),
+        );
+      } else {
+        statements.push(
+          env.DB.prepare(`DELETE FROM page_search WHERE page_id=? AND ${guard}`).bind(detailId, ...guards),
+        );
+        statements.push(
+          env.DB.prepare(
+            `INSERT INTO page_search(page_id,workspace_id,title,body)
+             SELECT id,workspace_id,title,coalesce(plain_text,'') FROM pages
+              WHERE id=? AND archived_at IS NULL AND import_job_id IS NULL AND ${guard}`,
+          ).bind(detailId, ...guards),
+        );
       }
-      statements.push(env.DB.prepare(`DELETE FROM page_search WHERE page_id=? AND ${guard}`).bind(detailId, ...guards));
-      statements.push(
-        env.DB.prepare(
-          `INSERT INTO page_search(page_id,workspace_id,title,body) SELECT id,workspace_id,title,coalesce(plain_text,'') FROM pages WHERE id=? AND ${guard}`,
-        ).bind(detailId, ...guards),
-      );
     }
     statements.push(
       env.DB.prepare(`INSERT INTO task_mutation_receipts(workspace_id,actor_id,operation_id,request_hash,row_id,detail_page_id,revision,created_at)
@@ -449,7 +468,11 @@ export async function mutateTask(
       );
     if (receipt.request_hash !== hash)
       throw new HttpError(409, "idempotency_key_reused", "That operation ID describes another change.");
-    await env.DB.batch(refreshPageSearchV2Statements(env.DB, detailId));
+    await env.DB.batch(
+      typeof body.archived === "boolean"
+        ? refreshPageSearchV2SubtreeStatements(env.DB, detailId)
+        : refreshPageSearchV2Statements(env.DB, detailId),
+    );
     return { rowId: id, detailPageId: detailId, revision: receipt.revision, replayed: false };
   } finally {
     if (shortLease)

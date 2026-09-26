@@ -1860,7 +1860,14 @@ export async function consumeDeliveryMessage(
     await deliverSlackDenial(env, payload);
   } else if (row.topic === "slack_product_copy") {
     if (typeof payload.sessionId !== "string") return await rejectPayload("Slack capture session is invalid.");
-    await deliverSlackProductCopy(env, payload.sessionId);
+    try {
+      await deliverSlackProductCopy(env, payload.sessionId);
+    } catch (error) {
+      if (error instanceof HttpError && error.status >= 400 && error.status < 500 && error.status !== 429) {
+        return await rejectPayload(error.code);
+      }
+      throw error;
+    }
   } else if (row.topic === "slack_workspace_action") {
     if (typeof payload.receiptId !== "string") return await rejectPayload("Slack workspace receipt is invalid.");
     if ((await deliverSlackWorkspaceAction(env, payload.receiptId)) === "deferred") return await deferSlackView();

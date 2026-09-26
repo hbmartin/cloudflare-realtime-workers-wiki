@@ -210,11 +210,15 @@ export function EditorPage({
               onClick={async () => {
                 const icon = prompt("Page icon (one emoji, or leave blank to remove)", page.icon ?? "")?.trim();
                 if (icon === undefined) return;
-                const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
-                  method: "PATCH",
-                  body: json({ icon: icon || null, revision: page.revision }),
-                });
-                onPageChanged(result.page);
+                try {
+                  const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
+                    method: "PATCH",
+                    body: json({ icon: icon || null, revision: page.revision }),
+                  });
+                  onPageChanged(result.page);
+                } catch (error) {
+                  setEditorError(apiErrorMessage(error, "The page icon could not be saved."));
+                }
               }}
             >
               {page.icon ?? "Add icon"}

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type { ClientMemberContext, Page, TableData, TableLeaseResponse } from "../shared/types";
 import { TASK_STATUSES, TASK_STATUS_LABELS, type Task, type TaskFields, type TaskResponse } from "../shared/tasks";
+import { PAGE_TITLE_MAX } from "../shared/validation";
 import { api, apiErrorMessage, json } from "./api";
 import { ActionMenu, Icon, PageTools, readPreference, savePreference } from "./WorkspaceUI";
 
@@ -91,8 +92,10 @@ export function TasksView({
         );
         if (active.current && request === generation.current) setMembers(Object.fromEntries(entries));
       } catch (cause) {
-        if (active.current && request === generation.current)
+        if (active.current && request === generation.current && !retryRef.current) {
+          retryRef.current = null;
           setError(apiErrorMessage(cause, "Tasks could not be loaded."));
+        }
       } finally {
         if (active.current && request === generation.current) setLoading(false);
       }
@@ -250,7 +253,10 @@ export function TasksView({
                 body: json({ title, revision: page.revision }),
               })
                 .then((result) => onPageChanged?.(result.page))
-                .catch((cause) => setError(apiErrorMessage(cause, "Title could not be saved.")));
+                .catch((cause) => {
+                  retryRef.current = null;
+                  setError(apiErrorMessage(cause, "Title could not be saved."));
+                });
           }}
         />
       ) : (
@@ -327,9 +333,9 @@ export function TasksView({
             value={newTitle}
             disabled={!ready || busy}
             onChange={(event) => setNewTitle(event.target.value)}
-            maxLength={500}
+            maxLength={PAGE_TITLE_MAX}
           />
-          <button className="primary-small" disabled={!ready || busy || !newTitle.trim()}>
+          <button type="submit" className="primary-small" disabled={!ready || busy || !newTitle.trim()}>
             Add task
           </button>
         </form>

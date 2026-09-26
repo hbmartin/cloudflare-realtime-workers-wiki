@@ -7,16 +7,18 @@ import { effectiveSpaceRole, pageForMember } from "./page-access";
 import { listTasks, mutateTask, taskAssignees, taskListStatements } from "./tasks";
 import { identityFor, verifiedMember, validateChannel, requireChannelMember } from "./slack-threads";
 import { slackApi, type SlackInstallation, type SlackInteractionPayload, type SlackHistoryMessage } from "./slack";
-import { safeSlackText } from "./slack-blocks";
+import { safeSlackText, slackLabel } from "./slack-blocks";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import type { ProseMirrorJson } from "../shared/document-projection";
+import { PAGE_TITLE_MAX } from "../shared/validation";
 
 const plain = (text: string) => ({ type: "plain_text", text: text.slice(0, 150) });
-const option = (text: string, value: string) => ({ text: plain(text), value });
+
+const option = (text: string, value: string) => ({ text: plain(slackLabel(text)), value });
 const button = (text: string, action_id: string, value: string) => ({
   type: "button",
-  text: plain(text),
+  text: plain(slackLabel(text)),
   action_id,
   value,
 });
@@ -161,9 +163,9 @@ async function composeView(env: Env, id: string, state: State, member: MemberCon
   blocks.push(
     input("title", "Title", {
       type: "plain_text_input",
-      max_length: 500,
+      max_length: PAGE_TITLE_MAX,
       ...(task?.title || state.source?.text
-        ? { initial_value: (task?.title ?? state.source!.text).slice(0, 150) }
+        ? { initial_value: (task?.title ?? state.source!.text).slice(0, PAGE_TITLE_MAX) }
         : {}),
     }),
   );
@@ -351,7 +353,8 @@ function resultView(env: Env, id: string, pageId: string, pending: boolean) {
 async function submit(env: Env, payload: SlackInteractionPayload) {
   const { session, member, state } = await sessionFor(env, payload);
   const title = textValue(payload, "title").trim();
-  if (!title || title.length > 500) throw new HttpError(422, "invalid_title", "Enter a title of up to 500 characters.");
+  if (!title || title.length > PAGE_TITLE_MAX)
+    throw new HttpError(422, "invalid_title", `Enter a title of up to ${PAGE_TITLE_MAX} characters.`);
   const kind = state.task ? "task" : selection(payload, "kind");
   if (kind !== "task" && kind !== "document" && kind !== "task-list")
     throw new HttpError(422, "invalid_kind", "Choose Document, Task, or Task List.");
@@ -731,17 +734,18 @@ export async function acceptSlackProductInteraction(env: Env, payload: SlackInte
     return await acceptProductInteraction(env, payload, deadlineAt);
   } catch (error) {
     if (typeof payload.trigger_id === "string") {
-      const installation = await installationForTeam(env, payload.team?.id);
-      await slackApi(
-        env,
-        installation,
-        "views.open",
-        {
-          trigger_id: payload.trigger_id,
-          view: modal("", [{ type: "section", text: { type: "plain_text", text: errorText(error) } }]),
-        },
-        Math.max(1, deadlineAt - Date.now() - 150),
-      ).catch(() => undefined);
+      const installation = await installationForTeam(env, payload.team?.id).catch(() => null);
+      if (installation)
+        await slackApi(
+          env,
+          installation,
+          "views.open",
+          {
+            trigger_id: payload.trigger_id,
+            view: modal("", [{ type: "section", text: { type: "plain_text", text: errorText(error) } }]),
+          },
+          Math.max(1, deadlineAt - Date.now() - 150),
+        ).catch(() => undefined);
     }
     return { handled: true, response: {} };
   }

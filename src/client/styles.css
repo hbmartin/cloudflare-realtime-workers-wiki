@@ -243,6 +243,13 @@ select:focus-visible {
   gap: 12px;
 }
 
+.workspace-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .workspace-error-dismiss {
   border: 0;
   padding: 0;

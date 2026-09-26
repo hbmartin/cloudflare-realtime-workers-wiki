@@ -7926,6 +7926,57 @@ describe("calm workspace task lists", () => {
     );
     expect(updated.status).toBe(200);
   });
+  it("treats a missing status cell as todo for results and filters", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    const created = await change(installed, list.id, {
+      title: "Unclassified task",
+      dueDate: yesterday,
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    expect(created.status).toBe(201);
+    const result = await created.json<{ rowId: string }>();
+    await env.DB.prepare(`DELETE FROM table_cells WHERE row_id = ? AND column_id = ?`)
+      .bind(result.rowId, `${list.id}-status`)
+      .run();
+
+    for (const query of [
+      `/api/tasks?listId=${list.id}`,
+      `/api/tasks?listId=${list.id}&status=todo`,
+      `/api/tasks?listId=${list.id}&due=overdue`,
+    ]) {
+      const response = await SELF.fetch(authenticatedRequest(installed.cookie, query));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        tasks: [expect.objectContaining({ id: result.rowId, status: "todo" })],
+      });
+    }
+    await expect(
+      env.DB.prepare(`SELECT 1 FROM table_cells WHERE row_id = ? AND column_id = ?`)
+        .bind(result.rowId, `${list.id}-status`)
+        .first(),
+    ).resolves.toBeNull();
+  });
+  it("accepts 200-character task titles and rejects 201 characters", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const accepted = await change(installed, list.id, {
+      title: "a".repeat(200),
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    expect(accepted.status).toBe(201);
+
+    const rejected = await change(installed, list.id, {
+      title: "a".repeat(201),
+      expectedRevision: 2,
+      operationId: crypto.randomUUID(),
+    });
+    expect(rejected.status).toBe(422);
+    expect(await rejected.json()).toMatchObject({ error: { message: "Enter a task title of up to 200 characters." } });
+  });
   it("keeps task assignee identities private in anonymous shares", async () => {
     const installed = await bootstrap();
     const list = await taskList(installed);
@@ -8044,6 +8095,165 @@ describe("calm workspace task lists", () => {
     ).json<{ tasks: unknown[] }>();
     expect(tasks.tasks).toHaveLength(1);
     expect(await (await SELF.fetch(share.url)).text()).toContain("Completed task");
+  });
+  it("bounds task-detail subtree disconnects and reports persisted overflow", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const created = await change(installed, list.id, {
+      title: "Archive a large task subtree",
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    const result = await created.json<{ detailPageId: string }>();
+    const descendantIds = Array.from({ length: 51 }, (_, index) => `task-archive-child-${index}`);
+    await env.DB.batch(
+      descendantIds.map((id, index) =>
+        env.DB.prepare(
+          `INSERT INTO pages
+            (id,workspace_id,space_id,parent_id,kind,position,title,created_by,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        ).bind(
+          id,
+          installed.workspaceId,
+          list.spaceId,
+          result.detailPageId,
+          index % 2 ? "diagram" : "document",
+          `child-${String(index).padStart(2, "0")}`,
+          `Child ${index}`,
+          installed.userId,
+          1,
+          1,
+        ),
+      ),
+    );
+    const attemptedRooms: string[] = [];
+    const documents = {
+      getByName(room: string) {
+        return {
+          fetch: async () => {
+            attemptedRooms.push(room);
+            return new Response(null, { status: 200 });
+          },
+        };
+      },
+    } as unknown as Env["DOCUMENT"];
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "DOCUMENT") return documents;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const operationId = "large-task-detail-archive";
+    const archive = () => {
+      const context = createExecutionContext();
+      return {
+        context,
+        response: worker.fetch(
+          authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}`, {
+            method: "DELETE",
+            headers: { "x-notes-operation-id": operationId },
+          }),
+          bindings,
+          context,
+        ),
+      };
+    };
+
+    const first = archive();
+    const firstResponse = await first.response;
+    await waitOnExecutionContext(first.context);
+    expect(firstResponse.status).toBe(202);
+    const firstBody = await firstResponse.json<{
+      pageIds: string[];
+      cleanupPending: boolean;
+      pendingPageCount: number;
+      pendingPageIds: string[];
+      pendingPageIdsTruncated: boolean;
+    }>();
+    expect(firstBody.pageIds).toHaveLength(52);
+    expect(firstBody).toMatchObject({ cleanupPending: true, pendingPageCount: 2 });
+    expect(firstBody.pendingPageIds).toHaveLength(2);
+    expect(firstBody.pendingPageIdsTruncated).toBe(false);
+    expect(attemptedRooms).toHaveLength(50);
+    await expect(
+      env.DB.prepare(`SELECT COUNT(*) count FROM archive_disconnect_targets`).first<{ count: number }>(),
+    ).resolves.toEqual({ count: 2 });
+
+    const repeated = archive();
+    const repeatedResponse = await repeated.response;
+    await waitOnExecutionContext(repeated.context);
+    expect(repeatedResponse.status).toBe(200);
+    expect(await repeatedResponse.json()).toMatchObject({
+      ok: true,
+      cleanupPending: false,
+      pendingPageCount: 0,
+      pendingPageIds: [],
+      pendingPageIdsTruncated: false,
+    });
+    expect(attemptedRooms).toHaveLength(52);
+  });
+  it("rebuilds legacy and v2 search rows for a restored task subtree", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const created = await change(installed, list.id, {
+      title: "Restore task search",
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    const result = await created.json<{ rowId: string; detailPageId: string }>();
+    const activeChild = await createPage(installed.cookie, "document", result.detailPageId);
+    const independentChild = await createPage(installed.cookie, "diagram", result.detailPageId);
+    await env.DB.prepare(
+      `UPDATE pages SET archived_at = 10, archived_by = ?, archive_operation_id = 'independent-child'
+        WHERE id = ?`,
+    )
+      .bind(installed.userId, independentChild.id)
+      .run();
+    const archived = await change(
+      installed,
+      list.id,
+      { archived: true, expectedRevision: 2, operationId: "task-search-archive" },
+      result.rowId,
+    );
+    expect(archived.status).toBe(200);
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (?, ?, ?)`).bind(
+        result.detailPageId,
+        activeChild.id,
+        independentChild.id,
+      ),
+      env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id IN (?, ?, ?)`).bind(
+        result.detailPageId,
+        activeChild.id,
+        independentChild.id,
+      ),
+      env.DB.prepare(`INSERT INTO page_search(page_id,workspace_id,title,body) VALUES(?,?,?,'stale')`).bind(
+        independentChild.id,
+        installed.workspaceId,
+        "Stale archived child",
+      ),
+    ]);
+
+    const restored = await change(
+      installed,
+      list.id,
+      { archived: false, expectedRevision: 3, operationId: "task-search-restore" },
+      result.rowId,
+    );
+    expect(restored.status).toBe(200);
+    const legacy = await env.DB.prepare(`SELECT page_id FROM page_search WHERE page_id IN (?, ?, ?) ORDER BY page_id`)
+      .bind(result.detailPageId, activeChild.id, independentChild.id)
+      .all<{ page_id: string }>();
+    expect(legacy.results.map((row) => row.page_id)).toEqual([result.detailPageId, activeChild.id].sort());
+    const v2 = await env.DB.prepare(`SELECT page_id FROM page_search_v2 WHERE page_id IN (?, ?, ?) ORDER BY page_id`)
+      .bind(result.detailPageId, activeChild.id, independentChild.id)
+      .all<{ page_id: string }>();
+    expect(v2.results.map((row) => row.page_id)).toEqual(
+      [result.detailPageId, activeChild.id, independentChild.id].sort(),
+    );
+    await expect(
+      env.DB.prepare(`SELECT archived_at FROM pages WHERE id = ?`).bind(independentChild.id).first(),
+    ).resolves.toEqual({ archived_at: 10 });
   });
   it("persists content width and filters beyond the first loaded table page", async () => {
     const installed = await bootstrap();

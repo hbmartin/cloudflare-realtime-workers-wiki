@@ -4067,6 +4067,70 @@ async function taskDetail(env: Env, pageId: string) {
     .first<{ row_id: string; list_id: string; revision: number }>();
 }
 
+type ArchiveDisconnectOwnership = { operationId: string } | { archivedAt: number };
+
+async function processArchiveSubtreeDisconnects(
+  env: Env,
+  rootPageId: string,
+  ownership: ArchiveDisconnectOwnership,
+  timestamp: number,
+) {
+  const ownershipSql =
+    "operationId" in ownership
+      ? "archived_page.archive_operation_id = ?"
+      : "archived_page.archive_operation_id IS NULL AND archived_page.archived_at = ?";
+  const ownershipValue = "operationId" in ownership ? ownership.operationId : ownership.archivedAt;
+  const dueTargets = await env.DB.prepare(
+    `WITH RECURSIVE subtree(id) AS (
+       SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+     )
+     SELECT target.page_id, target.content_epoch
+       FROM archive_disconnect_targets target
+       JOIN subtree ON subtree.id = target.page_id
+       JOIN pages archived_page ON archived_page.id = target.page_id
+      WHERE ${ownershipSql} AND target.next_attempt_at <= ?
+      ORDER BY target.created_at, target.page_id LIMIT ?`,
+  )
+    .bind(rootPageId, ownershipValue, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT)
+    .all<{ page_id: string; content_epoch: number }>();
+  await processArchiveDisconnectTargets(env, dueTargets.results);
+
+  type PendingArchiveTargetResult = { page_id?: string; target_count?: number };
+  const [pendingCount, pendingTargets] = await env.DB.batch<PendingArchiveTargetResult>([
+    env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       )
+       SELECT COUNT(*) target_count
+         FROM archive_disconnect_targets target
+         JOIN subtree ON subtree.id = target.page_id
+         JOIN pages archived_page ON archived_page.id = target.page_id
+        WHERE ${ownershipSql}`,
+    ).bind(rootPageId, ownershipValue),
+    env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+       )
+       SELECT target.page_id
+         FROM archive_disconnect_targets target
+         JOIN subtree ON subtree.id = target.page_id
+         JOIN pages archived_page ON archived_page.id = target.page_id
+        WHERE ${ownershipSql}
+        ORDER BY target.next_attempt_at > ?, target.created_at, target.page_id LIMIT ?`,
+    ).bind(rootPageId, ownershipValue, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT),
+  ]);
+  const pendingPageCount = pendingCount?.results[0]?.target_count ?? 0;
+  const pendingPageIds = (pendingTargets?.results ?? []).flatMap((target) =>
+    target.page_id === undefined ? [] : [target.page_id],
+  );
+  return {
+    cleanupPending: pendingPageCount > 0,
+    pendingPageCount,
+    pendingPageIds,
+    pendingPageIdsTruncated: pendingPageCount > pendingPageIds.length,
+  };
+}
+
 app.delete("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
@@ -4074,8 +4138,9 @@ app.delete("/api/pages/:id", async (c) => {
   requirePageEditor(page);
   const task = await taskDetail(c.env, page.id);
   if (task && page.archived_at === null) {
+    const taskArchiveOperationId = c.req.header("x-notes-operation-id") ?? crypto.randomUUID();
     await mutateTask(c.env, member, task.list_id, task.row_id, {
-      operationId: c.req.header("x-notes-operation-id") ?? crypto.randomUUID(),
+      operationId: taskArchiveOperationId,
       expectedRevision: task.revision,
       archived: true,
     });
@@ -4086,8 +4151,13 @@ app.delete("/api/pages/:id", async (c) => {
       .all<{ id: string }>();
     const pageIds = archived.results.map((p) => p.id);
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
-    await processArchiveDisconnectTargets(c.env, [{ page_id: page.id, content_epoch: page.content_epoch }]);
-    return c.json({ ok: true, pageIds });
+    const cleanup = await processArchiveSubtreeDisconnects(
+      c.env,
+      page.id,
+      { operationId: taskArchiveOperationId },
+      now(),
+    );
+    return c.json({ ok: true, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
   }
   const requestedOperationId = c.req.header("x-notes-operation-id");
   const operationId = requestedOperationId && ID_PATTERN.test(requestedOperationId) ? requestedOperationId : undefined;
@@ -4095,10 +4165,9 @@ app.delete("/api/pages/:id", async (c) => {
   const archiveTimestamp = page.archived_at ?? timestamp;
   const archiveOperationId = page.archived_at === null ? crypto.randomUUID() : (page.archive_operation_id ?? null);
   const archiveOwner = page.archived_at === null ? member.user.id : (page.archived_by ?? member.user.id);
-  const archiveOwnershipSql = archiveOperationId
-    ? "archived_page.archive_operation_id = ?"
-    : "archived_page.archive_operation_id IS NULL AND archived_page.archived_at = ?";
-  const archiveOwnership = archiveOperationId ?? archiveTimestamp;
+  const archiveOwnership: ArchiveDisconnectOwnership = archiveOperationId
+    ? { operationId: archiveOperationId }
+    : { archivedAt: archiveTimestamp };
   await c.env.DB.batch([
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
@@ -4134,28 +4203,13 @@ app.delete("/api/pages/:id", async (c) => {
       SELECT id FROM subtree
     )`).bind(page.id),
   ]);
-  const [archived, dueTargets] = await Promise.all([
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
-         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
-    )
-      .bind(page.id)
-      .all<{ id: string; kind: PageKind; content_epoch: number }>(),
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
-         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       )
-       SELECT target.page_id, target.content_epoch
-         FROM archive_disconnect_targets target
-         JOIN subtree ON subtree.id = target.page_id
-         JOIN pages archived_page ON archived_page.id = target.page_id
-        WHERE ${archiveOwnershipSql} AND target.next_attempt_at <= ?
-        ORDER BY target.created_at, target.page_id LIMIT ?`,
-    )
-      .bind(page.id, archiveOwnership, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT)
-      .all<{ page_id: string; content_epoch: number }>(),
-  ]);
+  const archived = await c.env.DB.prepare(
+    `WITH RECURSIVE subtree(id) AS (
+       SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
+     ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
+  )
+    .bind(page.id)
+    .all<{ id: string; kind: PageKind; content_epoch: number }>();
   const pageIds = archived.results.map((item) => item.id);
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
@@ -4163,49 +4217,14 @@ app.delete("/api/pages/:id", async (c) => {
     permanently: false,
     ...(operationId ? { operationId } : {}),
   });
-  await processArchiveDisconnectTargets(
-    c.env,
-    dueTargets.results.map((target) => ({ page_id: target.page_id, content_epoch: target.content_epoch })),
-  );
-  type PendingArchiveTargetResult = { page_id?: string; target_count?: number };
-  const [pendingCount, pendingTargets] = await c.env.DB.batch<PendingArchiveTargetResult>([
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
-         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       )
-       SELECT COUNT(*) target_count
-         FROM archive_disconnect_targets target
-         JOIN subtree ON subtree.id = target.page_id
-         JOIN pages archived_page ON archived_page.id = target.page_id
-        WHERE ${archiveOwnershipSql}`,
-    ).bind(page.id, archiveOwnership),
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
-         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       )
-       SELECT target.page_id
-         FROM archive_disconnect_targets target
-         JOIN subtree ON subtree.id = target.page_id
-         JOIN pages archived_page ON archived_page.id = target.page_id
-        WHERE ${archiveOwnershipSql}
-        ORDER BY target.next_attempt_at > ?, target.created_at, target.page_id LIMIT ?`,
-    ).bind(page.id, archiveOwnership, timestamp, ARCHIVE_DISCONNECT_RUN_LIMIT),
-  ]);
-  const pendingPageCount = pendingCount?.results[0]?.target_count ?? 0;
-  const pendingPageIds = (pendingTargets?.results ?? []).flatMap((target) =>
-    target.page_id === undefined ? [] : [target.page_id],
-  );
-  const pendingPageIdsTruncated = pendingPageCount > pendingPageIds.length;
+  const cleanup = await processArchiveSubtreeDisconnects(c.env, page.id, archiveOwnership, timestamp);
   return c.json(
     {
       ok: true,
       pageIds,
-      cleanupPending: pendingPageCount > 0,
-      pendingPageCount,
-      pendingPageIds,
-      pendingPageIdsTruncated,
+      ...cleanup,
     },
-    pendingPageCount ? 202 : 200,
+    cleanup.cleanupPending ? 202 : 200,
   );
 });
 

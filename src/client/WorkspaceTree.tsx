@@ -131,8 +131,11 @@ export function WorkspaceTree({
               onMove(node.id, node.parentId, items[index - 1]!.id, items[index - 2]?.id ?? null);
             else if (event.key === "ArrowDown" && index < items.length - 1)
               onMove(node.id, node.parentId, items[index + 2]?.id ?? null, items[index + 1]!.id);
-            else if (event.key === "ArrowRight" && index > 0) onMove(node.id, items[index - 1]!.id, null, null);
-            else if (event.key === "ArrowLeft" && node.parentId) {
+            else if (event.key === "ArrowRight" && index > 0) {
+              const previousId = items[index - 1]!.id;
+              setCollapsed((current) => current.filter((id) => id !== previousId));
+              onMove(node.id, previousId, null, null);
+            } else if (event.key === "ArrowLeft" && node.parentId) {
               const parent = visible.find((p) => p.id === node.parentId);
               onMove(node.id, parent?.parentId ?? null, null, null);
             } else return;
