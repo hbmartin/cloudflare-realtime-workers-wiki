@@ -4617,6 +4617,49 @@ describe("Slack documents and tasks", () => {
       ),
     ).resolves.toEqual({ handled: true, response: {} });
   });
+  it("keeps submitted values available when the Slack installation disconnects", async () => {
+    const id = await open("new");
+    await env.DB.prepare("UPDATE slack_installations SET disconnected_at=? WHERE id='installation'")
+      .bind(Date.now())
+      .run();
+    const payload = submission(id, "document", "space:workspace-general", "Unsaved draft");
+    expect((await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500)).response).toMatchObject({
+      response_action: "errors",
+      errors: { title: expect.stringMatching(/Reconnect.*reopen this form/) },
+    });
+    expect(await env.DB.prepare("SELECT count(*) count FROM pages WHERE title='Unsaved draft'").first()).toEqual({
+      count: 0,
+    });
+    expect(
+      await acceptSlackProductInteraction(
+        runtime(),
+        {
+          type: "block_actions",
+          trigger_id: "disconnected-trigger",
+          team: { id: "T123" },
+          user: { id: "UOWNER" },
+          actions: [{ action_id: "noteflare_compose_page", value: "compose" }],
+        },
+        Date.now() + 2500,
+      ),
+    ).toEqual({ handled: true, response: {} });
+  });
+  it("keeps an expired Slack form open with an inline error", async () => {
+    const id = await open("new");
+    await env.DB.prepare("UPDATE slack_product_sessions SET created_at=1 WHERE id=?").bind(id).run();
+    expect(
+      (
+        await acceptSlackProductInteraction(
+          runtime(),
+          submission(id, "document", "space:workspace-general", "Expired draft"),
+          Date.now() + 2500,
+        )
+      ).response,
+    ).toMatchObject({ response_action: "errors", errors: { title: expect.stringContaining("Reopen") } });
+    expect(await env.DB.prepare("SELECT count(*) count FROM pages WHERE title='Expired draft'").first()).toEqual({
+      count: 0,
+    });
+  });
   it("acknowledges permanent product-copy errors and keeps transient failures retryable", async () => {
     const bodySubmission = (id: string, title: string) => {
       const payload = submission(id, "document", "space:workspace-general", title);
