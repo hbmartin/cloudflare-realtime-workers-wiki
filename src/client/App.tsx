@@ -216,7 +216,15 @@ function restoreResponsePages(value: unknown, rootPageId: string, workspaceId: s
   ) {
     return null;
   }
-  return pages;
+  const sidebarHiddenPageIds =
+    value !== null &&
+    typeof value === "object" &&
+    "sidebarHiddenPageIds" in value &&
+    Array.isArray((value as { sidebarHiddenPageIds?: unknown }).sidebarHiddenPageIds) &&
+    (value as { sidebarHiddenPageIds: unknown[] }).sidebarHiddenPageIds.every((id) => typeof id === "string")
+      ? ((value as { sidebarHiddenPageIds: string[] }).sidebarHiddenPageIds.filter((id) => pageIds.has(id)) as string[])
+      : [];
+  return { pages, sidebarHiddenPageIds };
 }
 
 type PageMutationExpectation = {
@@ -1081,7 +1089,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   }, [preferencesKey, recentIds]);
   useEffect(() => {
     const handle = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      const target = event.target instanceof Element ? event.target : null;
+      const editableTarget = target?.closest("input, textarea, select, [contenteditable='true']");
+      const shortcutModifier = /Mac|iPhone|iPad/.test(navigator.platform) ? event.metaKey : event.ctrlKey;
+      if (!event.defaultPrevented && !editableTarget && shortcutModifier && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setQuickSwitcherOpen((open) => !open);
       }
@@ -1147,6 +1158,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [notificationsRevision, setNotificationsRevision] = useState(0);
+  const [taskRefresh, setTaskRefresh] = useState<{ version: number; pageId: string | null }>({
+    version: 0,
+    pageId: null,
+  });
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [jobsLoading, setJobsLoading] = useState(false);
@@ -2237,6 +2252,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         if (event.pageId === selectedId) setCommentsRevision((current) => current + 1);
         return;
       }
+      if (event.type === "task-list-invalidated") {
+        setTaskRefresh((current) => ({ version: current.version + 1, pageId: event.pageId }));
+        return;
+      }
       if (event.type === "pages-upserted") {
         const restoredRootId = event.restored
           ? (event.restoredRootId ?? restoredEventRoot(event.pages)?.id ?? null)
@@ -2244,6 +2263,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         const restoredPagesNeedConfirmation =
           event.restored === true && event.pages.some((page) => archiveRemovalTombstones.has(page.id));
         recordPageUpserts(event.pages);
+        if (event.sidebarHiddenPageIds) {
+          const hidden = new Set(event.sidebarHiddenPageIds);
+          for (const page of event.pages) setSidebarHiddenPage(page.id, hidden.has(page.id));
+        }
         for (const page of event.pages) invalidatePagePreview(page.id);
         const visiblePages = event.pages.filter((page) => !archiveRemovalTombstones.has(page.id));
         if (visiblePages.length) {
@@ -2308,6 +2331,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       refreshTrash,
       refreshInvalidatedWorkspace,
       reportWorkspaceError,
+      setSidebarHiddenPage,
     ],
   );
 
@@ -2662,6 +2686,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       outcome = result.kind;
       if (result.kind === "committed" && result.value) {
         clearSettledCreateErrors();
+        if (resolvedParentId && sidebarHiddenPageIdsRef.current.has(resolvedParentId)) {
+          setSidebarHiddenPage(result.value.id, true);
+        }
         if (!mergePageMutationResult(result.value)) {
           closeSidebar(true);
           reportWorkspaceError(attempt, "The page was created, but it is no longer available.");
@@ -3054,14 +3081,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       try {
         result = await requestPageRestore(page.id, member.workspace.id);
         const previewIds =
-          result.kind === "committed" ? (result.value?.map((restored) => restored.id) ?? knownPageIds) : knownPageIds;
+          result.kind === "committed"
+            ? (result.value?.pages.map((restored) => restored.id) ?? knownPageIds)
+            : knownPageIds;
         for (const pageId of previewIds) invalidatePagePreview(pageId);
         if (signal.aborted) return;
         if (result.kind === "committed" && result.value) {
           archiveRemovalTombstones.release(
-            result.value.map((restored) => restored.id),
+            result.value.pages.map((restored) => restored.id),
             restoreTombstoneCheckpoint,
           );
+          const hidden = new Set(result.value.sidebarHiddenPageIds);
+          for (const restored of result.value.pages) setSidebarHiddenPage(restored.id, hidden.has(restored.id));
         }
         if (result.kind !== "committed") {
           reportWorkspaceError(attempt, apiErrorMessage(result.error, "The page could not be restored."));
@@ -3069,9 +3100,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           if (!result.value) {
             reportWorkspaceError(attempt, "The server returned an invalid restore response. Refreshing pages.");
           }
-          const restoredIds = new Set(result.value?.map((restored) => restored.id) ?? knownPageIds);
+          const restoredIds = new Set(result.value?.pages.map((restored) => restored.id) ?? knownPageIds);
           if (result.value) {
-            const restoredPages = result.value.filter((restored) => !archiveRemovalTombstones.has(restored.id));
+            const restoredPages = result.value.pages.filter((restored) => !archiveRemovalTombstones.has(restored.id));
             recordPageUpserts(restoredPages);
             dispatchPageAction({ type: "merge-restored", pages: restoredPages, rootPageId: page.id });
             excludeConfirmedRestoresFromTrash(restoredPages);
@@ -3083,7 +3114,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       } finally {
         endTrashMutation(knownPageIds, signal);
       }
-      const confirmedRestoredPages = result.kind === "committed" ? result.value : null;
+      const confirmedRestoredPages = result.kind === "committed" ? (result.value?.pages ?? null) : null;
       const responseConfirmedRestore = confirmedRestoredPages !== null;
       const responseConflictsWithRemoval =
         confirmedRestoredPages?.some((restored) => archiveRemovalTombstones.has(restored.id)) ?? false;
@@ -3479,18 +3510,26 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                     owner={member.role === "owner"}
                   />
                 )}
-                <button
-                  className="icon-button favorite-action"
-                  title="Favorite"
-                  aria-label="Favorite"
-                  aria-pressed={favorites.some((page) => page.id === activeSelected.id)}
-                  disabled={pendingOrganizationAction === `favorite:${activeSelected.id}`}
-                  onClick={() => void toggleFavorite(activeSelected)}
-                >
-                  <Icon name="star" />
-                </button>
+                {!activeSelected.isTemplate && (
+                  <button
+                    className="icon-button favorite-action"
+                    title="Favorite"
+                    aria-label="Favorite"
+                    aria-pressed={favorites.some((page) => page.id === activeSelected.id)}
+                    disabled={pendingOrganizationAction === `favorite:${activeSelected.id}`}
+                    onClick={() => void toggleFavorite(activeSelected)}
+                  >
+                    <Icon name="star" />
+                  </button>
+                )}
                 <ActionMenu label="Page actions">
-                  <WatchControl key={`watch:${activeSelected.id}`} resourceType="page" resourceId={activeSelected.id} />
+                  {!activeSelected.isTemplate && (
+                    <WatchControl
+                      key={`watch:${activeSelected.id}`}
+                      resourceType="page"
+                      resourceId={activeSelected.id}
+                    />
+                  )}
                   <button
                     data-close-menu
                     onClick={() =>
@@ -3506,30 +3545,38 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                   >
                     Copy link
                   </button>
-                  <button data-close-menu onClick={() => setExportOpen(true)}>
-                    Export
-                  </button>
+                  {!activeSelected.isTemplate && (
+                    <button data-close-menu onClick={() => setExportOpen(true)}>
+                      Export
+                    </button>
+                  )}
                   {canEditActiveSpace && (
                     <>
-                      <button
-                        disabled={pendingOrganizationAction === `pin:${activeSelected.id}`}
-                        aria-pressed={pins.some((page) => page.id === activeSelected.id)}
-                        onClick={() => void togglePin(activeSelected)}
-                      >
-                        {pins.some((page) => page.id === activeSelected.id) ? "Unpin from space" : "Pin in this space"}
-                      </button>
-                      <button
-                        disabled={pendingTemplateId === `save:${activeSelected.id}`}
-                        onClick={() =>
-                          void queueTemplateJob(
-                            "/api/templates",
-                            { pageId: activeSelected.id, title: activeSelected.title },
-                            `save:${activeSelected.id}`,
-                          )
-                        }
-                      >
-                        Save as template
-                      </button>
+                      {!activeSelected.isTemplate && (
+                        <>
+                          <button
+                            disabled={pendingOrganizationAction === `pin:${activeSelected.id}`}
+                            aria-pressed={pins.some((page) => page.id === activeSelected.id)}
+                            onClick={() => void togglePin(activeSelected)}
+                          >
+                            {pins.some((page) => page.id === activeSelected.id)
+                              ? "Unpin from space"
+                              : "Pin in this space"}
+                          </button>
+                          <button
+                            disabled={pendingTemplateId === `save:${activeSelected.id}`}
+                            onClick={() =>
+                              void queueTemplateJob(
+                                "/api/templates",
+                                { pageId: activeSelected.id, title: activeSelected.title },
+                                `save:${activeSelected.id}`,
+                              )
+                            }
+                          >
+                            Save as template
+                          </button>
+                        </>
+                      )}
                       {activeSelected.kind === "document" && (
                         <button
                           aria-pressed={Boolean(activeSelected.fullWidth)}
@@ -3550,10 +3597,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                           {activeSelected.fullWidth ? "Use reading width" : "Use full width"}
                         </button>
                       )}
-                      <button data-close-menu onClick={() => void archive(activeSelected)}>
-                        <Icon name="trash" />
-                        Move to trash
-                      </button>
+                      {!activeSelected.isTemplate && (
+                        <button data-close-menu onClick={() => void archive(activeSelected)}>
+                          <Icon name="trash" />
+                          Move to trash
+                        </button>
+                      )}
                     </>
                   )}
                 </ActionMenu>
@@ -3563,7 +3612,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         </header>
 
         {view === "tasks" ? (
-          <TasksView member={member} onSelectPage={navigateToPage} />
+          <TasksView member={member} onSelectPage={navigateToPage} refreshVersion={taskRefresh.version} />
         ) : view === "home" ? (
           <RecentPages pages={pages} recentIds={recentIds} onSelect={navigateToPage} />
         ) : view === "search" ? (
@@ -3627,6 +3676,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               metadata={metadata}
               onSelectPage={navigateToPage}
               onPageChanged={updatePage}
+              refreshVersion={taskRefresh.pageId === activeSelected.id ? taskRefresh.version : 0}
             />
           ) : activeSelected.kind === "document" ? (
             <EditorPage

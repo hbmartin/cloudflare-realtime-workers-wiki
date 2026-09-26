@@ -1111,7 +1111,7 @@ describe("job execution", () => {
       get(target, property, receiver) {
         if (property === "prepare") {
           return (query: string) => {
-            if (query.includes("SELECT id, workspace_id, content_epoch, kind, title FROM pages")) {
+            if (query.includes("SELECT id, workspace_id, content_epoch, kind, title, is_task_list FROM pages")) {
               return { bind: () => ({ first: async () => Promise.reject(diagnostic) }) };
             }
             return target.prepare(query);

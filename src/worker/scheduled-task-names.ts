@@ -12,6 +12,7 @@ export const SCHEDULED_TASK_NAMES = [
   "slack_security_records",
   "webhook_history",
   "security_state",
+  "table_search_values",
 ] as const;
 
 export type ScheduledTaskName = (typeof SCHEDULED_TASK_NAMES)[number];

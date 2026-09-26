@@ -2,7 +2,7 @@ import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
-import { TASK_STATUSES, TASK_STATUS_LABELS, type Task } from "../shared/tasks";
+import { TASK_STATUSES, TASK_STATUS_LABELS, type Task, type TaskFields } from "../shared/tasks";
 import { effectiveSpaceRole, pageForMember } from "./page-access";
 import { listTasks, mutateTask, taskAssignees, taskListStatements } from "./tasks";
 import { identityFor, verifiedMember, validateChannel, requireChannelMember } from "./slack-threads";
@@ -25,6 +25,7 @@ const button = (text: string, action_id: string, value: string) => ({
 const ID = /^[A-Za-z0-9:_-]{1,200}$/;
 const TS = /^\d{1,16}\.\d{1,16}$/;
 const CALLBACK = "noteflare_compose";
+const truncateTitle = (value: string) => Array.from(value).slice(0, PAGE_TITLE_MAX).join("");
 type Source = { channelId: string; ts: string; thread: boolean; text: string; author: string };
 type State = {
   kind: "document" | "task" | "task-list";
@@ -33,6 +34,7 @@ type State = {
   cursor?: string;
   body?: string;
   copied?: boolean;
+  conflicts?: Array<keyof TaskFields>;
 };
 type Session = {
   id: string;
@@ -64,7 +66,8 @@ function input(id: string, label: string, element: Record<string, unknown>, opti
 }
 function stateField(payload: SlackInteractionPayload, id: string): Record<string, unknown> {
   const values = payload.view?.state?.values as Record<string, Record<string, Record<string, unknown>>> | undefined;
-  return values?.[id]?.value ?? {};
+  const actions = values?.[id];
+  return actions?.value ?? Object.values(actions ?? {})[0] ?? {};
 }
 function selection(payload: SlackInteractionPayload, id: string) {
   const selected = stateField(payload, id).selected_option as { value?: unknown } | undefined;
@@ -128,10 +131,19 @@ async function newSession(env: Env, installation: SlackInstallation, userId: str
     .run();
   return { id, member };
 }
-async function composeView(env: Env, id: string, state: State, member: MemberContext) {
+function composeView(id: string, state: State) {
   const task = state.task;
-  const people = task ? await taskAssignees(env, member, task.listId) : [];
   const blocks: unknown[] = [];
+  if (state.conflicts?.length)
+    blocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "plain_text",
+          text: `Another editor changed ${state.conflicts.join(", ")}. Their values are shown; your other changes are preserved. Review and save again.`,
+        },
+      ],
+    });
   if (state.source)
     blocks.push({
       type: "section",
@@ -165,7 +177,9 @@ async function composeView(env: Env, id: string, state: State, member: MemberCon
       type: "plain_text_input",
       max_length: PAGE_TITLE_MAX,
       ...(task?.title || state.source?.text
-        ? { initial_value: (task?.title ?? state.source!.text).slice(0, PAGE_TITLE_MAX) }
+        ? {
+            initial_value: truncateTitle(task?.title ?? state.source!.text),
+          }
         : {}),
     }),
   );
@@ -202,9 +216,7 @@ async function composeView(env: Env, id: string, state: State, member: MemberCon
         action_id: "noteflare_assignee",
         min_query_length: 0,
         placeholder: plain("Search NoteFlare members"),
-        ...(task?.assigneeId && people.some((p) => p.id === task.assigneeId)
-          ? { initial_option: option(task.assigneeName ?? "Member", task.assigneeId) }
-          : {}),
+        ...(task?.assigneeId ? { initial_option: option(task.assigneeName ?? "Member", task.assigneeId) } : {}),
       },
       true,
     ),
@@ -267,7 +279,7 @@ export async function openSlackProduct(
   try {
     const state: State = { kind: command === "task" ? "task" : command === "task-list" ? "task-list" : "document" };
     const { id, member } = await newSession(env, installation, userId, state, triggerId);
-    const view = command === "tasks" ? await tasksView(env, id, member) : await composeView(env, id, state, member);
+    const view = command === "tasks" ? await tasksView(env, id, member) : composeView(id, state);
     const result = await slackApi(
       env,
       installation,
@@ -352,8 +364,9 @@ function resultView(env: Env, id: string, pageId: string, pending: boolean) {
 }
 async function submit(env: Env, payload: SlackInteractionPayload) {
   const { session, member, state } = await sessionFor(env, payload);
-  const title = textValue(payload, "title").trim();
-  if (!title || title.length > PAGE_TITLE_MAX)
+  const enteredTitle = textValue(payload, "title").trim();
+  const title = state.task?.title && enteredTitle === truncateTitle(state.task.title) ? state.task.title : enteredTitle;
+  if (!title || (title.length > PAGE_TITLE_MAX && title !== state.task?.title))
     throw new HttpError(422, "invalid_title", `Enter a title of up to ${PAGE_TITLE_MAX} characters.`);
   const kind = state.task ? "task" : selection(payload, "kind");
   if (kind !== "task" && kind !== "document" && kind !== "task-list")
@@ -361,11 +374,11 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
   const dest = state.task
     ? await destination(env, member, `page:${state.task.listId}`)
     : await destination(env, member, selection(payload, "destination"));
-  const taskFields = {
+  const taskFields: TaskFields = {
     title,
-    status: selection(payload, "status") ?? "todo",
+    status: (selection(payload, "status") ?? "todo") as TaskFields["status"],
     assigneeId: selection(payload, "assignee"),
-    dueDate: stateField(payload, "due").selected_date ?? null,
+    dueDate: (stateField(payload, "due").selected_date as string | undefined) ?? null,
   };
   const body = textValue(payload, "body");
   if (kind === "task-list" && (state.source || body))
@@ -398,12 +411,19 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
     const table = await env.DB.prepare("SELECT revision FROM table_state WHERE page_id=?")
       .bind(dest.parentId)
       .first<{ revision: number }>();
+    const mutationFields: Partial<TaskFields> = { ...taskFields };
+    if (state.task && state.task.title.length > PAGE_TITLE_MAX && taskFields.title === state.task.title)
+      delete mutationFields.title;
     const result = await mutateTask(
       env,
       member,
       dest.parentId,
       state.task?.id ?? null,
-      { ...taskFields, operationId: `slack-${session.id}`, expectedRevision: state.task?.revision ?? table?.revision },
+      {
+        ...mutationFields,
+        operationId: `slack-${session.id}`,
+        expectedRevision: state.task?.revision ?? table?.revision,
+      },
       auth,
     );
     pageId = result.detailPageId;
@@ -453,6 +473,18 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
           "INSERT INTO page_search(page_id,workspace_id,title,body) SELECT id,workspace_id,title,'' FROM pages WHERE id=?",
         ).bind(pageId),
         ...refreshPageSearchV2Statements(env.DB, pageId),
+        env.DB.prepare(`INSERT INTO subscriptions
+          (id,workspace_id,user_id,resource_type,resource_id,created_by,created_at)
+          SELECT ?,?,?,'page',?,?,? WHERE EXISTS(SELECT 1 FROM pages WHERE id=?)
+          ON CONFLICT(user_id,resource_type,resource_id) DO UPDATE SET muted_at=NULL`).bind(
+          `page:${pageId}:${member.user.id}`,
+          member.workspace.id,
+          member.user.id,
+          pageId,
+          member.user.id,
+          now,
+          pageId,
+        ),
       ]);
     } catch (error) {
       const saved = await env.DB.prepare(
@@ -466,8 +498,37 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
   }
   const pending = kind !== "task-list" && !!(state.source || body);
   if (pending) await queueCopy(env, session, member.workspace.id);
-  await broadcastWorkspaceEvent(env, member.workspace.id, { type: "workspace-invalidated" });
+  await broadcastWorkspaceEvent(
+    env,
+    member.workspace.id,
+    kind === "task" && dest.parentId
+      ? { type: "task-list-invalidated", pageId: dest.parentId }
+      : { type: "workspace-invalidated" },
+  );
   return { response_action: "update", view: resultView(env, session.id, pageId, pending) };
+}
+
+function submittedTaskFields(payload: SlackInteractionPayload, base?: Task): TaskFields {
+  const enteredTitle = textValue(payload, "title").trim();
+  return {
+    title: base && enteredTitle === truncateTitle(base.title) ? base.title : enteredTitle,
+    status: (selection(payload, "status") ?? "todo") as TaskFields["status"],
+    assigneeId: selection(payload, "assignee"),
+    dueDate: (stateField(payload, "due").selected_date as string | undefined) ?? null,
+  };
+}
+
+function mergeConflictedTask(base: Task, current: Task, submitted: TaskFields) {
+  const fields: Array<keyof TaskFields> = ["title", "status", "assigneeId", "dueDate"];
+  const conflicts: Array<keyof TaskFields> = [];
+  const merged = { ...current };
+  for (const field of fields) {
+    const localChanged = submitted[field] !== base[field];
+    const remoteChanged = current[field] !== base[field];
+    if (localChanged && remoteChanged && submitted[field] !== current[field]) conflicts.push(field);
+    else if (localChanged && !remoteChanged) Object.assign(merged, { [field]: submitted[field] });
+  }
+  return { task: merged, conflicts };
 }
 async function queueCopy(env: Env, session: Session, workspaceId: string) {
   const now = Date.now();
@@ -519,10 +580,24 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
         const current = await sessionFor(env, payload);
         if (current.state.task) {
           const task = (await listTasks(env, current.member, { rowId: current.state.task.id })).tasks[0];
-          if (task)
+          if (task) {
+            const merged = mergeConflictedTask(
+              current.state.task,
+              task,
+              submittedTaskFields(payload, current.state.task),
+            );
+            const nextState = { ...current.state, ...merged };
             await env.DB.prepare("UPDATE slack_product_sessions SET state_json=? WHERE id=?")
-              .bind(JSON.stringify({ ...current.state, task }), current.session.id)
+              .bind(JSON.stringify(nextState), current.session.id)
               .run();
+            return {
+              handled: true,
+              response: {
+                response_action: "update",
+                view: composeView(current.session.id, nextState),
+              },
+            };
+          }
         }
       }
       return { handled: true, response: { response_action: "errors", errors: { title: errorText(error) } } };
@@ -563,6 +638,8 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
       text: typeof payload.message.text === "string" ? payload.message.text.slice(0, 40_000) : "",
       author: typeof payload.message.user === "string" ? payload.message.user : "Slack member",
     };
+    await validateChannel(env, installation, state.source.channelId);
+    await requireChannelMember(env, installation, state.source.channelId, payload.user.id);
   }
   if (action?.action_id === "noteflare_edit_task") {
     if (typeof action.value !== "string" || !ID.test(action.value)) return { handled: true, response: {} };
@@ -584,7 +661,7 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
           member,
           typeof action.value === "string" && action.value !== "first" ? action.value : undefined,
         )
-      : await composeView(env, id, state, member);
+      : composeView(id, state);
   const remaining = Math.max(1, deadlineAt - Date.now() - 150);
   const opened =
     payload.view?.id && payload.view.callback_id === CALLBACK && !shortcut

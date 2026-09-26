@@ -3538,6 +3538,11 @@ button.mention-chip:focus-visible {
   border-radius: 8px;
   box-shadow: var(--shadow-dialog);
 }
+.action-menu-portal {
+  position: fixed;
+  right: auto;
+  z-index: 100;
+}
 .action-menu-content > button,
 .action-menu-content > .watch-control {
   display: flex;

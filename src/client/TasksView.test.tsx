@@ -181,6 +181,27 @@ describe("task views", () => {
     expect(screen.getByLabelText("New task title")).toHaveAttribute("maxlength", "200");
     expect(screen.getByRole("button", { name: "Add task" })).toHaveAttribute("type", "submit");
   });
+  it("commits a due date only after the date edit is complete", async () => {
+    render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit tasks" }));
+    const due = await screen.findByLabelText("Due date for Ship release");
+    await waitFor(() => expect(due).toBeEnabled());
+    fireEvent.focus(due);
+    fireEvent.change(due, { target: { value: "2027-04-09" } });
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith("/tasks/task"))).toHaveLength(0);
+    fireEvent.keyDown(due, { key: "Enter" });
+    await waitFor(() =>
+      expect(
+        JSON.parse(String(vi.mocked(api).mock.calls.find(([path]) => path.endsWith("/tasks/task"))?.[1]?.body)),
+      ).toMatchObject({ dueDate: "2027-04-09" }),
+    );
+  });
+  it("shows an inaccessible current assignee until the user changes it", async () => {
+    task = { ...task, assigneeId: "former", assigneeName: null };
+    render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
+    expect(await screen.findByLabelText("Assignee for Ship release")).toHaveValue("former");
+    expect(screen.getByRole("option", { name: "Former member" })).toHaveValue("former");
+  });
   it("keeps viewer properties read-only while allowing access to details", async () => {
     render(<TasksView page={page} member={{ ...member, role: "viewer" }} onSelectPage={vi.fn()} />);
     expect(await screen.findByLabelText("Status for Ship release")).toBeDisabled();

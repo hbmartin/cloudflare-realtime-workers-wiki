@@ -372,8 +372,9 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
          SELECT ? || ':column:' || id, ?, name, type, position FROM table_columns WHERE page_id = ?`,
       ).bind(target, target, source.id),
       env.DB.prepare(
-        `INSERT INTO table_select_options (id, column_id, label, position)
-         SELECT ? || ':option:' || option.id, ? || ':column:' || option.column_id, option.label, option.position
+        `INSERT INTO table_select_options (id, column_id, label, label_search_value, position)
+         SELECT ? || ':option:' || option.id, ? || ':column:' || option.column_id,
+                option.label, option.label_search_value, option.position
            FROM table_select_options option JOIN table_columns column ON column.id = option.column_id
           WHERE column.page_id = ?`,
       ).bind(target, target, source.id),
@@ -383,9 +384,9 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
       ).bind(target, target, job.requested_by, timestamp, timestamp, source.id),
       env.DB.prepare(
         `INSERT INTO table_cells
-          (row_id, column_id, text_value, number_value, boolean_value, date_value, select_value, updated_at)
+          (row_id, column_id, text_value, text_search_value, number_value, boolean_value, date_value, select_value, updated_at)
          SELECT ? || ':row:' || cell.row_id, ? || ':column:' || cell.column_id,
-                cell.text_value, cell.number_value, cell.boolean_value, cell.date_value,
+                cell.text_value, cell.text_search_value, cell.number_value, cell.boolean_value, cell.date_value,
                 CASE WHEN cell.select_value IS NULL THEN NULL ELSE ? || ':option:' || cell.select_value END, ?
            FROM table_cells cell JOIN table_rows row ON row.id = cell.row_id WHERE row.page_id = ?`,
       ).bind(target, target, target, timestamp, source.id),

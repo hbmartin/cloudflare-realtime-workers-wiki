@@ -139,7 +139,7 @@ function getRootCreation() {
   const trigger = screen.getByRole("button", { name: /^New page in / });
   const details = trigger.closest("details")!;
   if (!details.open) fireEvent.click(trigger);
-  return within(details).getByRole("button", { name: "Document" });
+  return screen.getAllByRole("button", { name: "Document" }).find((button) => button.closest(".action-menu-portal"))!;
 }
 async function findRootCreation() {
   await screen.findByRole("button", { name: /^New page in / });
@@ -1631,7 +1631,7 @@ describe("App error handling", () => {
     fireEvent.click(createButton);
     expect(await screen.findByText("First creation failed.")).toBeInTheDocument();
 
-    fireEvent.click(createButton);
+    fireEvent.click(await findRootCreation());
 
     expect((await screen.findAllByText("Created")).length).toBeGreaterThan(0);
     await waitFor(() => expect(screen.queryByText("First creation failed.")).not.toBeInTheDocument());

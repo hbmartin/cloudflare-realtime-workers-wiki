@@ -42,7 +42,7 @@ import { processDeletionJob } from "./cleanup";
 import { migrateLegacyColumns } from "./document";
 import type { Env } from "./env";
 import { HttpError } from "./http";
-import worker, { executeScheduledTasks } from "./index";
+import worker, { backfillTableSearchValues, executeScheduledTasks } from "./index";
 import { SCHEDULED_TASK_NAMES } from "./scheduled-task-names";
 import { broadcastWorkspaceEvent, eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
 
@@ -7892,10 +7892,15 @@ describe("calm workspace task lists", () => {
     expect(row).toEqual({ text_value: body.title });
     const detail = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}`));
     expect(await detail.json()).toMatchObject({ page: { title: body.title, parentId: list.id }, sidebarHidden: true });
+    const nested = await createPage(installed.cookie, "document", result.detailPageId);
+    expect(
+      await (await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${nested.id}`))).json(),
+    ).toMatchObject({ sidebarHidden: true });
     const tree = await (
       await SELF.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree"))
     ).json<{ pages: Page[] }>();
     expect(tree.pages.some((p) => p.id === result.detailPageId)).toBe(false);
+    expect(tree.pages.some((p) => p.id === nested.id)).toBe(false);
     const reused = await change(installed, list.id, { ...body, title: "Different" });
     expect(reused.status).toBe(409);
   });
@@ -8060,7 +8065,7 @@ describe("calm workspace task lists", () => {
       await env.DB.prepare("SELECT page_id FROM archive_disconnect_targets WHERE page_id=?")
         .bind(result.detailPageId)
         .first(),
-    ).toBeTruthy();
+    ).toBeNull();
     const shared = await SELF.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${list.id}/share`, {
         method: "POST",
@@ -8261,7 +8266,7 @@ describe("calm workspace task lists", () => {
     const { columnId } = await seedTable(installed, table.id, { column: "text" });
     await seedRows(installed, table.id, 601, {
       columnId: columnId!,
-      value: (i) => (i === 600 ? "Needle outside first page" : "ordinary"),
+      value: (i) => (i === 600 ? "Needle outside first page" : i === 599 ? "CafÉ Unicode" : "ordinary"),
     });
     const result = await SELF.fetch(
       authenticatedRequest(installed.cookie, `/api/tables/${table.id}?q=needle&limit=10`),
@@ -8270,6 +8275,11 @@ describe("calm workspace task lists", () => {
     const data = await result.json<{ table: TableData }>();
     expect(data.table.rows).toHaveLength(1);
     expect(data.table.hasMore).toBe(false);
+    await backfillTableSearchValues(env);
+    await backfillTableSearchValues(env);
+    const unicode = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tables/${table.id}?q=CAFé&limit=10`));
+    expect(unicode.status).toBe(200);
+    expect((await unicode.json<{ table: TableData }>()).table.rows).toHaveLength(1);
     const width = await SELF.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
         method: "PATCH",

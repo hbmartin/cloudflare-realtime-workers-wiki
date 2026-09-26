@@ -4521,10 +4521,10 @@ describe("Slack documents and tasks", () => {
       state: {
         values: {
           kind: { value: { selected_option: { value: kind } } },
-          destination: { value: { selected_option: { value: dest } } },
+          destination: { noteflare_destination: { selected_option: { value: dest } } },
           title: { value: { value: title } },
           status: { value: { selected_option: { value: "todo" } } },
-          assignee: { value: { selected_option: { value: "owner" } } },
+          assignee: { noteflare_assignee: { selected_option: { value: "owner" } } },
           due: { value: { selected_date: "2026-10-01" } },
         },
       },

@@ -118,6 +118,7 @@ import {
 import { constantTimeEqual } from "../shared/security";
 import { CLIENT_ERROR_EVENTS, isClientErrorName, isTelemetryIdentifier } from "../shared/client-telemetry-contract";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { normalizeSearchValue } from "../shared/search-normalization";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
@@ -1046,8 +1047,8 @@ function buildTableRowQuery(
   columns: { id: string; type: string }[],
   query: Record<string, string | undefined>,
 ): TableRowQuery {
-  const filter = (query.q ?? "").trim().slice(0, 200);
-  const filterSql = `AND NOT EXISTS(SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id JOIN pages list ON list.id=r.page_id WHERE link.row_id=r.id AND list.is_task_list=1 AND detail.archived_at IS NOT NULL) AND (? = '' OR EXISTS(SELECT 1 FROM table_cells fc LEFT JOIN table_select_options fo ON fo.id=fc.select_value WHERE fc.row_id=r.id AND instr(lower(coalesce(fc.text_value,CAST(fc.number_value AS TEXT),CASE WHEN fc.boolean_value IS NOT NULL THEN CASE WHEN fc.boolean_value=1 THEN 'true' ELSE 'false' END END,fc.date_value,fo.label,'')),lower(?))>0))`;
+  const filter = normalizeSearchValue((query.q ?? "").slice(0, 200));
+  const filterSql = `AND NOT EXISTS(SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id JOIN pages list ON list.id=r.page_id WHERE link.row_id=r.id AND list.is_task_list=1 AND detail.archived_at IS NOT NULL) AND (? = '' OR EXISTS(SELECT 1 FROM table_cells fc LEFT JOIN table_select_options fo ON fo.id=fc.select_value WHERE fc.row_id=r.id AND instr(coalesce(fc.text_search_value,fo.label_search_value,lower(coalesce(fc.text_value,CAST(fc.number_value AS TEXT),CASE WHEN fc.boolean_value IS NOT NULL THEN CASE WHEN fc.boolean_value=1 THEN 'true' ELSE 'false' END END,fc.date_value,fo.label,''))),?)>0))`;
   const limit = query.limit === undefined ? TABLE_PAGE_DEFAULT : Number(query.limit);
   if (!Number.isInteger(limit) || limit < 1 || limit > TABLE_PAGE_MAX) {
     throw new HttpError(422, "invalid_table_cursor", `limit must be an integer between 1 and ${TABLE_PAGE_MAX}.`);
@@ -1766,9 +1767,15 @@ app.get("/api/favorites", async (c) => {
   return c.json({ pages: rows.results.map(pageJson) });
 });
 
+function requireOrdinaryPage(page: Pick<PageRow, "is_template">) {
+  if (page.is_template)
+    throw new HttpError(409, "template_action_unsupported", "That action is not available for templates.");
+}
+
 app.post("/api/favorites/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  requireOrdinaryPage(page);
   const last = await c.env.DB.prepare(`SELECT position FROM favorites WHERE user_id = ? ORDER BY position DESC LIMIT 1`)
     .bind(member.user.id)
     .first<{ position: string }>();
@@ -1781,6 +1788,7 @@ app.post("/api/favorites/:pageId", async (c) => {
 
 app.delete("/api/favorites/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   await c.env.DB.prepare(
     `DELETE FROM favorites WHERE user_id = ? AND page_id IN (
        SELECT id FROM pages WHERE id = ? AND workspace_id = ?
@@ -1814,6 +1822,7 @@ app.post("/api/spaces/:id/pins/:pageId", async (c) => {
     throw new HttpError(403, "read_only", "Your role in this space is read-only.");
   }
   const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  requireOrdinaryPage(page);
   if (page.space_id !== space.id) throw new HttpError(422, "pin_space_mismatch", "A pin must belong to its space.");
   const last = await c.env.DB.prepare(
     `SELECT position FROM space_pins WHERE space_id = ? ORDER BY position DESC LIMIT 1`,
@@ -1836,6 +1845,7 @@ app.delete("/api/spaces/:id/pins/:pageId", async (c) => {
   if (effectiveSpaceRole(member.role, space.visibility, space.space_role) === "viewer") {
     throw new HttpError(403, "read_only", "Your role in this space is read-only.");
   }
+  requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   await c.env.DB.prepare(`DELETE FROM space_pins WHERE space_id = ? AND page_id = ?`)
     .bind(space.id, c.req.param("pageId"))
     .run();
@@ -2007,13 +2017,7 @@ app.post("/api/templates", async (c) => {
   const source = await pageForMember(c.env, member, text(body.pageId, "pageId", 100));
   requirePageEditor(source);
   if (source.is_template) throw new HttpError(409, "already_template", "This page is already a template.");
-  if (
-    await c.env.DB.prepare(
-      "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT 1 FROM pages WHERE id IN subtree AND is_task_list=1",
-    )
-      .bind(source.id)
-      .first()
-  )
+  if (source.is_task_list)
     throw new HttpError(
       422,
       "task_template_unsupported",
@@ -2972,6 +2976,7 @@ app.delete("/api/slack/channels/:id", async (c) => {
 app.post("/api/pages/:id/exports", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
+  requireOrdinaryPage(page);
   const body = await jsonBody(c.req.raw);
   const format = text(body.format, "format", 20) as ExportFormat;
   const allowedFormats: ExportFormat[] =
@@ -3016,11 +3021,19 @@ app.get("/api/pages/tree", async (c) => {
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE p.workspace_id = ? AND p.archived_at IS ${archived ? "NOT " : ""}NULL
        AND p.is_template = 0 AND p.import_job_id IS NULL
-       ${archived ? "" : "AND NOT EXISTS (SELECT 1 FROM table_row_pages row_page WHERE row_page.page_id=p.id)"}
-       AND NOT EXISTS (
-         SELECT 1 FROM page_import_sources source
-          WHERE source.page_id = p.id AND source.source_role = 'table_row_detail'
-       )
+       ${
+         archived
+           ? ""
+           : `AND p.id NOT IN (
+         WITH RECURSIVE hidden(id) AS (
+           SELECT page_id FROM table_row_pages
+           UNION
+           SELECT page_id FROM page_import_sources WHERE source_role = 'table_row_detail'
+           UNION ALL
+           SELECT child.id FROM pages child JOIN hidden ON child.parent_id = hidden.id
+         ) SELECT id FROM hidden
+       )`
+       }
        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
      ORDER BY p.position, p.id`,
   )
@@ -3028,6 +3041,25 @@ app.get("/api/pages/tree", async (c) => {
     .all<PageRow>();
   return c.json({ pages: rows.results.map(pageJson) });
 });
+
+async function sidebarHiddenPageIds(env: Env, workspaceId: string, pageIds: readonly string[]) {
+  if (!pageIds.length) return [];
+  const hidden = await env.DB.prepare(
+    `WITH RECURSIVE hidden(id) AS (
+       SELECT link.page_id FROM table_row_pages link JOIN pages root ON root.id=link.page_id
+        WHERE root.workspace_id=?
+       UNION
+       SELECT source.page_id FROM page_import_sources source JOIN pages root ON root.id=source.page_id
+        WHERE root.workspace_id=? AND source.source_role='table_row_detail'
+       UNION ALL
+       SELECT child.id FROM pages child JOIN hidden parent ON child.parent_id=parent.id
+        WHERE child.workspace_id=?
+     ) SELECT id FROM hidden WHERE id IN (SELECT value FROM json_each(?))`,
+  )
+    .bind(workspaceId, workspaceId, workspaceId, JSON.stringify(pageIds))
+    .all<{ id: string }>();
+  return hidden.results.map((row) => row.id);
+}
 
 app.post("/api/pages", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
@@ -3063,7 +3095,10 @@ app.post("/api/pages", async (c) => {
   const initialReplay = clientProvidedId
     ? await readInitialPageCreateReplay(c.env, member, requested, requestHash, conflictMessage)
     : null;
-  if (initialReplay) return c.json({ page: initialReplay[0]! });
+  if (initialReplay) {
+    const hidden = await sidebarHiddenPageIds(c.env, member.workspace.id, [initialReplay[0]!.id]);
+    return c.json({ page: initialReplay[0]!, sidebarHidden: hidden.length > 0 });
+  }
   await validatePageCreateParents(c.env, member, requested);
   const timestamp = now();
   let createdRow: PageRow | undefined;
@@ -3122,7 +3157,10 @@ app.post("/api/pages", async (c) => {
     // A failed batch response may be ambiguous after commit. The generated id is
     // known inside this invocation, so its receipt can still recover the result.
     const replay = await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage);
-    if (replay) return c.json({ page: replay[0]! });
+    if (replay) {
+      const hidden = await sidebarHiddenPageIds(c.env, member.workspace.id, [replay[0]!.id]);
+      return c.json({ page: replay[0]!, sidebarHidden: hidden.length > 0 });
+    }
     if (clientProvidedId && (await requestedPageIdsExist(c.env.DB, requested))) {
       throw new HttpError(409, "idempotency_key_reused", conflictMessage);
     }
@@ -3132,8 +3170,13 @@ app.post("/api/pages", async (c) => {
     ? pageJson(createdRow)
     : (await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage))?.[0];
   if (!created) throw new Error("The created page was not returned by its insert or its committed receipt.");
-  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [created] });
-  return c.json({ page: created }, 201);
+  const sidebarHidden = await sidebarHiddenPageIds(c.env, member.workspace.id, [created.id]);
+  sendWorkspaceEvent(c, member.workspace.id, {
+    type: "pages-upserted",
+    pages: [created],
+    ...(sidebarHidden.length ? { sidebarHiddenPageIds: sidebarHidden } : {}),
+  });
+  return c.json({ page: created, sidebarHidden: sidebarHidden.length > 0 }, 201);
 });
 
 // Creates a whole tree level at once.
@@ -3284,15 +3327,24 @@ app.post("/api/pages/batch", async (c) => {
   if (!createdPages) {
     throw new Error("The created page batch was not returned completely by its inserts or committed receipts.");
   }
-  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: createdPages });
-  return c.json({ pages: createdPages, replayed: false }, 201);
+  const sidebarHidden = await sidebarHiddenPageIds(
+    c.env,
+    member.workspace.id,
+    createdPages.map((page) => page.id),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, {
+    type: "pages-upserted",
+    pages: createdPages,
+    ...(sidebarHidden.length ? { sidebarHiddenPageIds: sidebarHidden } : {}),
+  });
+  return c.json({ pages: createdPages, sidebarHiddenPageIds: sidebarHidden, replayed: false }, 201);
 });
 
 app.get("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
-  const hidden = await c.env.DB.prepare(`SELECT 1 hidden FROM table_row_pages WHERE page_id = ?`).bind(page.id).first();
-  return c.json({ page: pageJson(page), sidebarHidden: Boolean(hidden) });
+  const hidden = await sidebarHiddenPageIds(c.env, member.workspace.id, [page.id]);
+  return c.json({ page: pageJson(page), sidebarHidden: hidden.length > 0 });
 });
 
 app.get("/api/pages/:id/breadcrumbs", async (c) => {
@@ -3362,12 +3414,14 @@ app.post("/api/transclusions/lookup", async (c) => {
 app.get("/api/pages/:pageId/share", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
+  requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   return c.json({ share: await getShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin) });
 });
 
 app.post("/api/pages/:pageId/share", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
+  requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   const body = await jsonBody(c.req.raw);
   return c.json(
     {
@@ -3380,6 +3434,7 @@ app.post("/api/pages/:pageId/share", async (c) => {
 app.patch("/api/pages/:pageId/share", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
+  requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   const body = await jsonBody(c.req.raw);
   return c.json({
     share: await updateShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin, shareOptions(body)),
@@ -3389,6 +3444,7 @@ app.patch("/api/pages/:pageId/share", async (c) => {
 app.delete("/api/pages/:pageId/share", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
+  requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   await revokeShare(c.env, member, c.req.param("pageId"));
   return c.body(null, 204);
 });
@@ -3648,12 +3704,14 @@ app.get("/api/subscriptions", async (c) => {
 app.get("/api/pages/:id/watch", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
+  requireOrdinaryPage(page);
   return c.json({ watch: await pageWatchState(c.env, member, page.id, page.space_id!) });
 });
 
 app.put("/api/pages/:id/watch", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
+  requireOrdinaryPage(page);
   const body = await jsonBody(c.req.raw);
   const state = text(body.state, "state", 20) as "watching" | "muted" | "none";
   await setSubscription(c.env, member, "page", page.id, state);
@@ -4136,6 +4194,7 @@ app.delete("/api/pages/:id", async (c) => {
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
+  requireOrdinaryPage(page);
   const task = await taskDetail(c.env, page.id);
   if (task && page.archived_at === null) {
     const taskArchiveOperationId = c.req.header("x-notes-operation-id") ?? crypto.randomUUID();
@@ -4244,10 +4303,20 @@ app.post("/api/pages/:id/restore", async (c) => {
     )
       .bind(page.id, member.workspace.id)
       .all<PageRow>();
-    return c.json({ pages: active.results.map(pageJson) });
+    const pages = active.results.map(pageJson);
+    const hidden = await sidebarHiddenPageIds(
+      c.env,
+      member.workspace.id,
+      pages.map((item) => item.id),
+    );
+    return c.json({ pages, sidebarHiddenPageIds: hidden });
   }
   const task = await taskDetail(c.env, page.id);
   if (task) {
+    const taskList = await pageForMember(c.env, member, task.list_id, true);
+    if (taskList.archived_at !== null) {
+      throw new HttpError(409, "task_list_archived", "Restore the task list before restoring this task.");
+    }
     await mutateTask(c.env, member, task.list_id, task.row_id, {
       operationId: crypto.randomUUID(),
       expectedRevision: task.revision,
@@ -4259,13 +4328,19 @@ app.post("/api/pages/:id/restore", async (c) => {
       .bind(page.id)
       .all<PageRow>();
     const restoredPages = restored.results.map(pageJson);
+    const hidden = await sidebarHiddenPageIds(
+      c.env,
+      member.workspace.id,
+      restoredPages.map((item) => item.id),
+    );
     sendWorkspaceEvent(c, member.workspace.id, {
       type: "pages-upserted",
       pages: restoredPages,
       restored: true,
       restoredRootId: page.id,
+      ...(hidden.length ? { sidebarHiddenPageIds: hidden } : {}),
     });
-    return c.json({ pages: restoredPages });
+    return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
   }
   const archiveTimestamp = page.archived_at;
   const archiveOperationId = page.archive_operation_id ?? null;
@@ -4322,13 +4397,19 @@ app.post("/api/pages/:id/restore", async (c) => {
     throw new Error("The restore batch did not return its authoritative page snapshot.");
   }
   const restoredPages = restored.results.map(pageJson);
+  const hidden = await sidebarHiddenPageIds(
+    c.env,
+    member.workspace.id,
+    restoredPages.map((item) => item.id),
+  );
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-upserted",
     pages: restoredPages,
     restored: true,
     restoredRootId: page.id,
+    ...(hidden.length ? { sidebarHiddenPageIds: hidden } : {}),
   });
-  return c.json({ pages: restoredPages });
+  return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
 });
 
 app.post("/api/pages/:id/permanent-delete", async (c) => {
@@ -5399,23 +5480,31 @@ app.get("/api/task-lists/:pageId/assignees", async (c) => {
 });
 app.post("/api/task-lists/:pageId/tasks", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const result = await mutateTask(c.env, member, c.req.param("pageId"), null, await jsonBody(c.req.raw));
-  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  const pageId = c.req.param("pageId");
+  const result = await mutateTask(c.env, member, pageId, null, await jsonBody(c.req.raw));
+  sendWorkspaceEvent(c, member.workspace.id, { type: "task-list-invalidated", pageId });
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json(result, 201);
 });
 app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const result = await mutateTask(
-    c.env,
-    member,
-    c.req.param("pageId"),
-    c.req.param("rowId"),
-    await jsonBody(c.req.raw),
-  );
-  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  const pageId = c.req.param("pageId");
+  const body = await jsonBody(c.req.raw);
+  const result = await mutateTask(c.env, member, pageId, c.req.param("rowId"), body);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "task-list-invalidated", pageId });
   c.executionCtx.waitUntil(sweepOutbox(c.env));
-  return c.json(result);
+  if (body.archived !== true) return c.json(result);
+  const archived = await c.env.DB.prepare(
+    `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id)
+     SELECT id FROM subtree`,
+  )
+    .bind(result.detailPageId)
+    .all<{ id: string }>();
+  const pageIds = archived.results.map((page) => page.id);
+  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
+  const operationId = typeof body.operationId === "string" ? body.operationId : "";
+  const cleanup = await processArchiveSubtreeDisconnects(c.env, result.detailPageId, { operationId }, now());
+  return c.json({ ...result, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
 });
 
 app.get("/api/tables/:pageId", async (c) => {
@@ -5695,14 +5784,15 @@ app.post("/api/tables/:pageId/columns/:columnId/options", async (c) => {
   const position = page.next_position;
   const revision = await guardedBatch(c.env, c.req.param("pageId"), input, (guardedAt) =>
     c.env.DB.prepare(
-      `INSERT INTO table_select_options (id, column_id, label, position)
-       SELECT ?, ?, ?, ? WHERE EXISTS (
+      `INSERT INTO table_select_options (id, column_id, label, label_search_value, position)
+       SELECT ?, ?, ?, ?, ? WHERE EXISTS (
          SELECT 1 FROM table_columns WHERE id = ? AND page_id = ? AND type = 'select'
        ) AND ${leaseGuards()}`,
     ).bind(
       id,
       c.req.param("columnId"),
       label,
+      normalizeSearchValue(label),
       position,
       c.req.param("columnId"),
       c.req.param("pageId"),
@@ -5836,7 +5926,7 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
   }
 
   const newColumns: { id: string; ref: string | null; name: string; type: string; position: number }[] = [];
-  const newOptions: { id: string; columnId: string; label: string; position: number }[] = [];
+  const newOptions: { id: string; columnId: string; label: string; search: string; position: number }[] = [];
 
   function declareOption(columnId: string, label: string) {
     const byLabel = optionIdsByLabel.get(columnId) ?? new Map<string, string>();
@@ -5848,7 +5938,7 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
     optionIdsByLabel.set(columnId, byLabel);
     nextOptionPosition.set(columnId, position + 1);
     optionIds.add(id);
-    newOptions.push({ id, columnId, label, position });
+    newOptions.push({ id, columnId, label, search: normalizeSearchValue(label), position });
     return id;
   }
 
@@ -5875,6 +5965,7 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
     r: string;
     c: string;
     t: string | null;
+    x: string | null;
     n: number | null;
     b: number | null;
     d: string | null;
@@ -5925,6 +6016,7 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
         r: rowId,
         c: column.id,
         t: textValue,
+        x: textValue === null ? null : normalizeSearchValue(textValue),
         n: numberValue,
         b: booleanValue,
         d: dateValue,
@@ -5983,9 +6075,10 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
         if (newOptions.length) {
           statements.push(
             c.env.DB.prepare(
-              `INSERT INTO table_select_options (id, column_id, label, position)
+              `INSERT INTO table_select_options (id, column_id, label, label_search_value, position)
              SELECT json_extract(item.value, '$.id'), json_extract(item.value, '$.columnId'),
-                    json_extract(item.value, '$.label'), json_extract(item.value, '$.position')
+                    json_extract(item.value, '$.label'), json_extract(item.value, '$.search'),
+                    json_extract(item.value, '$.position')
                FROM json_each(?) item WHERE ${leaseGuards()}`,
             ).bind(JSON.stringify(newOptions), ...guardBinds),
           );
@@ -6003,9 +6096,9 @@ app.post("/api/tables/:pageId/bulk", async (c) => {
           statements.push(
             c.env.DB.prepare(
               `INSERT INTO table_cells
-               (row_id, column_id, text_value, number_value, boolean_value, date_value, select_value, updated_at)
+               (row_id, column_id, text_value, text_search_value, number_value, boolean_value, date_value, select_value, updated_at)
              SELECT json_extract(item.value, '$.r'), json_extract(item.value, '$.c'),
-                    json_extract(item.value, '$.t'), json_extract(item.value, '$.n'),
+                    json_extract(item.value, '$.t'), json_extract(item.value, '$.x'), json_extract(item.value, '$.n'),
                     json_extract(item.value, '$.b'), json_extract(item.value, '$.d'),
                     json_extract(item.value, '$.s'), ?
                FROM json_each(?) item WHERE ${leaseGuards()}`,
@@ -6166,16 +6259,19 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
   const revision = await guardedBatch(c.env, pageId, input, (guardedAt) =>
     c.env.DB.prepare(
       `INSERT INTO table_cells
-       (row_id, column_id, text_value, number_value, boolean_value, date_value, select_value, updated_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${leaseGuards()}
+       (row_id, column_id, text_value, text_search_value, number_value, boolean_value, date_value, select_value, updated_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${leaseGuards()}
        ON CONFLICT(row_id, column_id) DO UPDATE SET
-         text_value = excluded.text_value, number_value = excluded.number_value,
+         text_value = excluded.text_value, text_search_value = excluded.text_search_value,
+         number_value = excluded.number_value,
          boolean_value = excluded.boolean_value, date_value = excluded.date_value,
          select_value = excluded.select_value, updated_at = excluded.updated_at`,
     ).bind(
       c.req.param("rowId"),
       c.req.param("columnId"),
-      ...values,
+      values[0],
+      values[0] === null ? null : normalizeSearchValue(values[0]),
+      ...values.slice(1),
       guardedAt,
       pageId,
       input.expectedRevision,
@@ -6599,6 +6695,31 @@ export async function executeScheduledTasks(env: Env, context: ExecutionContext,
     );
 }
 
+export async function backfillTableSearchValues(env: Env) {
+  const [cells, options] = await Promise.all([
+    env.DB.prepare(
+      "SELECT row_id,column_id,text_value FROM table_cells WHERE text_value IS NOT NULL AND text_search_value IS NULL LIMIT 500",
+    ).all<{ row_id: string; column_id: string; text_value: string }>(),
+    env.DB.prepare("SELECT id,label FROM table_select_options WHERE label_search_value IS NULL LIMIT 500").all<{
+      id: string;
+      label: string;
+    }>(),
+  ]);
+  const statements = [
+    ...cells.results.map((cell) =>
+      env.DB.prepare(
+        "UPDATE table_cells SET text_search_value=? WHERE row_id=? AND column_id=? AND text_search_value IS NULL",
+      ).bind(normalizeSearchValue(cell.text_value), cell.row_id, cell.column_id),
+    ),
+    ...options.results.map((option) =>
+      env.DB.prepare(
+        "UPDATE table_select_options SET label_search_value=? WHERE id=? AND label_search_value IS NULL",
+      ).bind(normalizeSearchValue(option.label), option.id),
+    ),
+  ];
+  if (statements.length) await env.DB.batch(statements);
+}
+
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext) {
     const requestId = crypto.randomUUID();
@@ -6691,6 +6812,7 @@ export default {
         slack_security_records: () => pruneSlackSecurityRecords(env),
         webhook_history: () => pruneWebhookHistory(env),
         security_state: () => pruneSecurityState(env),
+        table_search_values: () => backfillTableSearchValues(env),
       };
       const tasks: ScheduledTask[] = SCHEDULED_TASK_NAMES.map((name) => ({ name, run: runners[name] }));
       await executeScheduledTasks(env, context, tasks);

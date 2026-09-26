@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import type { ClientMemberContext, Page, TableData, TableLeaseResponse } from "../shared/types";
+import type { ClientMemberContext, Page, TableData, TableLeaseResponse, TableLeaseTiming } from "../shared/types";
 import { TASK_STATUSES, TASK_STATUS_LABELS, type Task, type TaskFields, type TaskResponse } from "../shared/tasks";
 import { PAGE_TITLE_MAX } from "../shared/validation";
-import { api, apiErrorMessage, json } from "./api";
+import { api, ApiClientError, apiErrorMessage, json } from "./api";
 import { ActionMenu, Icon, PageTools, readPreference, savePreference } from "./WorkspaceUI";
 
 type Person = { id: string; name: string };
@@ -14,12 +14,14 @@ export function TasksView({
   metadata,
   onSelectPage,
   onPageChanged,
+  refreshVersion = 0,
 }: {
   page?: Page;
   member: ClientMemberContext;
   metadata?: ReactNode;
   onSelectPage: (id: string) => void;
   onPageChanged?: (page: Page) => void;
+  refreshVersion?: number;
 }) {
   const [data, setData] = useState<TaskResponse>({ tasks: [], hasMore: false, nextCursor: null });
   const dataRef = useRef(data);
@@ -32,7 +34,7 @@ export function TasksView({
   const [status, setStatus] = useState("");
   const [due, setDue] = useState("");
   const [query, setQuery] = useState("");
-  const [error, setError] = useState("");
+  const [error, setError] = useState<{ owner: "load" | "save" | "lease" | "title"; message: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [revision, setRevision] = useState(1);
@@ -45,6 +47,7 @@ export function TasksView({
   const retryRef = useRef<(() => Promise<boolean>) | null>(null);
   const [lease, setLease] = useState<string | null>(null);
   const leaseRef = useRef<string | null>(null);
+  const leaseExpiresAtRef = useRef(0);
   const [holder, setHolder] = useState<string | null>(null);
   const generation = useRef(0);
   const active = useRef(true);
@@ -55,7 +58,7 @@ export function TasksView({
     savePreference(key, mode);
   }, [key, mode]);
   const load = useCallback(
-    async (cursor?: string) => {
+    async (cursor?: string, preserveLoaded = false) => {
       const request = ++generation.current;
       setLoading(true);
       const params = new URLSearchParams(pageId ? { listId: pageId } : { mine: "true" });
@@ -75,7 +78,16 @@ export function TasksView({
                   ...result.tasks.filter((task) => !current.tasks.some((p) => p.id === task.id)),
                 ],
               }
-            : result,
+            : preserveLoaded && current.tasks.length > result.tasks.length
+              ? {
+                  tasks: [
+                    ...result.tasks,
+                    ...current.tasks.filter((task) => !result.tasks.some((fresh) => fresh.id === task.id)),
+                  ],
+                  hasMore: current.hasMore,
+                  nextCursor: current.nextCursor,
+                }
+              : result,
         );
         if (pageId) {
           const response = await api<{ table: TableData }>(`/api/tables/${pageId}?limit=1`);
@@ -90,11 +102,14 @@ export function TasksView({
             return [id, people.members] as const;
           }),
         );
-        if (active.current && request === generation.current) setMembers(Object.fromEntries(entries));
+        if (active.current && request === generation.current) {
+          setMembers((current) => ({ ...current, ...Object.fromEntries(entries) }));
+          setError((current) => (current?.owner === "load" ? null : current));
+        }
       } catch (cause) {
         if (active.current && request === generation.current && !retryRef.current) {
           retryRef.current = null;
-          setError(apiErrorMessage(cause, "Tasks could not be loaded."));
+          setError({ owner: "load", message: apiErrorMessage(cause, "Tasks could not be loaded.") });
         }
       } finally {
         if (active.current && request === generation.current) setLoading(false);
@@ -114,10 +129,16 @@ export function TasksView({
   }, [load]);
   useEffect(() => {
     const timer = setInterval(() => {
-      if (!document.hidden && !busy && dataRef.current.tasks.length <= 100) void load();
+      if (!document.hidden && !busy) void load(undefined, true);
     }, 30_000);
     return () => clearInterval(timer);
   }, [load, busy]);
+  const observedRefreshVersion = useRef(refreshVersion);
+  useEffect(() => {
+    if (refreshVersion === observedRefreshVersion.current) return;
+    observedRefreshVersion.current = refreshVersion;
+    void load(undefined, true);
+  }, [load, refreshVersion]);
   const release = useCallback(
     (token: string) => {
       if (pageId)
@@ -135,33 +156,62 @@ export function TasksView({
       generation.current++;
       if (leaseRef.current) release(leaseRef.current);
       leaseRef.current = null;
+      leaseExpiresAtRef.current = 0;
     },
     [release],
   );
   useEffect(() => {
     if (!lease || !pageId) return undefined;
-    const timer = setInterval(() => {
-      void api(`/api/tables/${pageId}/lease`, { method: "PATCH", body: json({ leaseToken: lease }) }).catch((cause) => {
-        if (active.current && leaseRef.current === lease) {
-          leaseRef.current = null;
-          setLease(null);
-          setError(apiErrorMessage(cause, "The edit lock expired. Acquire it again to continue."));
-        }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const schedule = (delay: number) => {
+      timer = setTimeout(() => void renew(), delay);
+    };
+    const loseLease = (cause: unknown) => {
+      if (!active.current || leaseRef.current !== lease) return;
+      leaseRef.current = null;
+      leaseExpiresAtRef.current = 0;
+      setLease(null);
+      setError({
+        owner: "lease",
+        message: apiErrorMessage(cause, "The edit lock expired. Acquire it again to continue."),
       });
-    }, 20_000);
-    return () => clearInterval(timer);
+    };
+    const renew = async () => {
+      try {
+        const result = await api<TableLeaseTiming>(`/api/tables/${pageId}/lease`, {
+          method: "PATCH",
+          body: json({ leaseToken: lease }),
+        });
+        if (cancelled || leaseRef.current !== lease) return;
+        leaseExpiresAtRef.current = Date.now() + result.leaseDurationMs;
+        setError((current) => (current?.owner === "lease" ? null : current));
+        schedule(20_000);
+      } catch (cause) {
+        if (cancelled || leaseRef.current !== lease) return;
+        const authoritative = cause instanceof ApiClientError && [401, 403, 404, 409].includes(cause.status);
+        if (authoritative || Date.now() + 5_000 >= leaseExpiresAtRef.current) loseLease(cause);
+        else schedule(5_000);
+      }
+    };
+    schedule(20_000);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [lease, pageId]);
   async function toggleLease() {
     if (!page) return;
     if (lease) {
       release(lease);
       leaseRef.current = null;
+      leaseExpiresAtRef.current = 0;
       setLease(null);
       setHolder(null);
       return;
     }
     setBusy(true);
-    setError("");
+    setError(null);
     try {
       const result = await api<TableLeaseResponse>(`/api/tables/${page.id}/lease`, { method: "POST" });
       if (!active.current) {
@@ -169,10 +219,14 @@ export function TasksView({
         return;
       }
       leaseRef.current = result.leaseToken;
+      leaseExpiresAtRef.current = Date.now() + result.leaseDurationMs;
       setLease(result.leaseToken);
       await load();
     } catch (cause) {
-      setError(apiErrorMessage(cause, "This task list is being edited. Try again when it is available."));
+      setError({
+        owner: "lease",
+        message: apiErrorMessage(cause, "This task list is being edited. Try again when it is available."),
+      });
     } finally {
       if (active.current) setBusy(false);
     }
@@ -183,7 +237,7 @@ export function TasksView({
     const current = task ? (dataRef.current.tasks.find((item) => item.id === task.id) ?? task) : null;
     const expectedRevision = page ? revisionRef.current : current!.revision;
     setBusy(true);
-    setError("");
+    setError(null);
     retryRef.current = () => save(task, changes, operationId);
     try {
       const result = await api<{ revision: number; detailPageId: string }>(
@@ -202,13 +256,16 @@ export function TasksView({
       setRevision(result.revision);
       revisionRef.current = result.revision;
       retryRef.current = null;
-      setError("");
-      await load();
+      setError(null);
+      await load(undefined, true);
       return true;
     } catch (cause) {
       if (active.current) {
-        setError(apiErrorMessage(cause, "The task could not be saved. Your change is ready to retry."));
-        void load();
+        setError({
+          owner: "save",
+          message: apiErrorMessage(cause, "The task could not be saved. Your change is ready to retry."),
+        });
+        void load(undefined, true);
       }
       return false;
     } finally {
@@ -218,6 +275,7 @@ export function TasksView({
   const ready = editable && (!page || Boolean(lease));
   const controls = (task: Task) => (
     <TaskControls
+      key={`${task.id}:${task.dueDate ?? ""}`}
       task={task}
       members={members[task.listId] ?? []}
       disabled={busy || !ready || !task.editable}
@@ -255,7 +313,7 @@ export function TasksView({
                 .then((result) => onPageChanged?.(result.page))
                 .catch((cause) => {
                   retryRef.current = null;
-                  setError(apiErrorMessage(cause, "Title could not be saved."));
+                  setError({ owner: "title", message: apiErrorMessage(cause, "Title could not be saved.") });
                 });
           }}
         />
@@ -303,7 +361,7 @@ export function TasksView({
       </div>
       {error && (
         <div className="notice notice-danger" role="alert">
-          {error}
+          {error.message}
           <button
             className="quiet-button"
             disabled={busy || loading}
@@ -471,6 +529,15 @@ function TaskControls({
   disabled: boolean;
   onChange: (change: Change) => void;
 }) {
+  const [dueDraft, setDueDraft] = useState(task.dueDate ?? "");
+  const commitDueDate = () => {
+    const current = task.dueDate ?? "";
+    if (dueDraft !== current) onChange({ dueDate: dueDraft || null });
+  };
+  const currentAssignee =
+    task.assigneeId && !members.some((member) => member.id === task.assigneeId)
+      ? { id: task.assigneeId, name: task.assigneeName ?? "Former member" }
+      : null;
   return (
     <div className="task-fields">
       <select
@@ -480,6 +547,7 @@ function TaskControls({
         onChange={(event) => onChange({ assigneeId: event.target.value || null })}
       >
         <option value="">Unassigned</option>
+        {currentAssignee && <option value={currentAssignee.id}>{currentAssignee.name}</option>}
         {members.map((m) => (
           <option key={m.id} value={m.id}>
             {m.name}
@@ -501,9 +569,20 @@ function TaskControls({
       <input
         type="date"
         aria-label={`Due date for ${task.title}`}
-        value={task.dueDate ?? ""}
+        value={dueDraft}
         disabled={disabled}
-        onChange={(event) => onChange({ dueDate: event.target.value || null })}
+        onChange={(event) => setDueDraft(event.target.value)}
+        onBlur={commitDueDate}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            commitDueDate();
+          }
+          if (event.key === "Escape") {
+            setDueDraft(task.dueDate ?? "");
+            event.currentTarget.blur();
+          }
+        }}
       />
     </div>
   );

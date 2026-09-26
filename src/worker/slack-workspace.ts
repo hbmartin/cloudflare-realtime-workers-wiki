@@ -837,9 +837,7 @@ export async function deliverSlackSearchUpdate(env: Env, sessionId: string, revi
 }
 
 export async function purgeExpiredSlackSearchSessions(env: Env) {
-  await env.DB.prepare(
-    "DELETE FROM slack_product_sessions WHERE created_at<? AND (result_page_id IS NULL OR json_extract(state_json,'$.copied')=1 OR (json_extract(state_json,'$.source') IS NULL AND coalesce(json_extract(state_json,'$.body'),'')=''))",
-  )
+  await env.DB.prepare("DELETE FROM slack_product_sessions WHERE created_at<?")
     .bind(Date.now() - 7 * 86_400_000)
     .run();
   await env.DB.prepare(`DELETE FROM slack_view_sessions WHERE kind = 'search' AND created_at < ?`)
