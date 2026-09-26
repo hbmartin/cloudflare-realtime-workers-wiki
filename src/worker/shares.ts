@@ -466,20 +466,24 @@ async function publicTransclusions(
 
 async function publicTableHtml(env: Env, pageId: string) {
   const [columns, cells] = await Promise.all([
-    env.DB.prepare(`SELECT id, name FROM table_columns WHERE page_id = ? ORDER BY position, id`)
+    env.DB.prepare(
+      `SELECT column.id, column.name,
+              CASE WHEN page.is_task_list=1 AND column.id=page.id||'-assignee' THEN 1 ELSE 0 END private_assignee
+         FROM table_columns column JOIN pages page ON page.id=column.page_id
+        WHERE column.page_id = ? ORDER BY column.position, column.id`,
+    )
       .bind(pageId)
-      .all<{ id: string; name: string }>(),
+      .all<{ id: string; name: string; private_assignee: number }>(),
     env.DB.prepare(
       `SELECT row.id row_id, cell.column_id, cell.text_value, cell.number_value, cell.boolean_value,
-              cell.date_value, option.label select_label, assignee.name assignee_name
+              cell.date_value, option.label select_label
          FROM (
            SELECT id, position FROM table_rows WHERE page_id = ? AND NOT EXISTS (SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id JOIN pages list ON list.id=table_rows.page_id WHERE link.row_id=table_rows.id AND list.is_task_list=1 AND detail.archived_at IS NOT NULL) ORDER BY position, id LIMIT 501
          ) row LEFT JOIN table_cells cell ON cell.row_id = row.id
          LEFT JOIN table_select_options option ON option.id = cell.select_value
-         LEFT JOIN user assignee ON assignee.id=cell.text_value AND cell.column_id=?||'-assignee'
         ORDER BY row.position, row.id, cell.column_id`,
     )
-      .bind(pageId, pageId)
+      .bind(pageId)
       .all<Record<string, unknown>>(),
   ]);
   const rows = new Map<string, Map<string, string>>();
@@ -487,7 +491,6 @@ async function publicTableHtml(env: Env, pageId: string) {
     const rowId = String(raw.row_id);
     const values = rows.get(rowId) ?? new Map<string, string>();
     const value =
-      raw.assignee_name ??
       raw.text_value ??
       raw.number_value ??
       raw.date_value ??
@@ -503,7 +506,12 @@ async function publicTableHtml(env: Env, pageId: string) {
     .map((rowId) => rows.get(rowId)!)
     .map(
       (row) =>
-        `<tr>${columns.results.map((column) => `<td>${escapeHtml(row.get(column.id) ?? "")}</td>`).join("")}</tr>`,
+        `<tr>${columns.results
+          .map((column) => {
+            const value = row.get(column.id) ?? "";
+            return `<td>${escapeHtml(column.private_assignee ? (value ? "Assigned" : "") : value)}</td>`;
+          })
+          .join("")}</tr>`,
     )
     .join("")}</tbody></table>`;
   return { html, truncated };

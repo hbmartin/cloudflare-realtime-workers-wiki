@@ -4890,25 +4890,20 @@ describe("App error handling", () => {
   it("reports a failed direct page load and retries the same endpoint", async () => {
     const hiddenPage = { ...page, id: "hidden-page", position: "c0", title: "Hidden detail" };
     let pageLoads = 0;
-    vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/install") return { initialized: true };
-      if (path === "/api/security/status")
-        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
-      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
-      if (path === "/api/me") return member;
-      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
-      if (path === "/api/pages/tree") return { pages: [page] };
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === `/api/pages/${hiddenPage.id}`) {
         pageLoads += 1;
         if (pageLoads === 1) throw new ApiClientError(503, "page_unavailable", "Page lookup failed.");
         return { page: hiddenPage, sidebarHidden: true };
       }
-      throw new Error(`Unexpected API request: ${path}`);
+      return shellApi(path, init);
     });
     render(<App />);
 
     await findArchive("Archive Roadmap");
-    act(() => {
+    await act(async () => {
       window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
     });
 

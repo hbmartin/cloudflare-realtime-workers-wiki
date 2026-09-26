@@ -7926,6 +7926,42 @@ describe("calm workspace task lists", () => {
     );
     expect(updated.status).toBe(200);
   });
+  it("keeps task assignee identities private in anonymous shares", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const name = "Private task assignee";
+    await env.DB.prepare("UPDATE user SET name=? WHERE id=?").bind(name, installed.userId).run();
+    expect(
+      (
+        await change(installed, list.id, {
+          title: "Public milestone",
+          assigneeId: installed.userId,
+          expectedRevision: 1,
+          operationId: crypto.randomUUID(),
+        })
+      ).status,
+    ).toBe(201);
+    const shared = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${list.id}/share`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+    expect(shared.status).toBe(201);
+    const { share } = await shared.json<{ share: { url: string } }>();
+    const response = await SELF.fetch(share.url);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("Public milestone");
+    expect(html).toContain("<td>Assigned</td>");
+    expect(html).not.toContain(name);
+    expect(html).not.toContain(installed.userId);
+    const tasks = await (
+      await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tasks?listId=${list.id}`))
+    ).json<{ tasks: Array<{ assigneeId: string; assigneeName: string }> }>();
+    expect(tasks.tasks[0]).toMatchObject({ assigneeId: installed.userId, assigneeName: name });
+  });
   it("archives and restores task details without detaching their row", async () => {
     const installed = await bootstrap();
     const list = await taskList(installed);

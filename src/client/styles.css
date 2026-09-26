@@ -1260,7 +1260,7 @@ button.mention-chip:focus-visible {
 .comments-panel {
   top: 0;
   z-index: 5;
-  --mantine-color-dimmed: #5e6670;
+  --mantine-color-dimmed: var(--muted);
 }
 .muted {
   color: var(--muted);

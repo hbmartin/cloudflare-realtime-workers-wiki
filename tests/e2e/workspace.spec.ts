@@ -92,23 +92,48 @@ test("finds nested pages by keyboard, creates a child, and resumes after reload"
 test("keeps documents and the page panel usable at phone, tablet, and desktop widths", async ({ page }) => {
   test.setTimeout(90000);
   await signInOwner(page);
+  const created = await page.request.post("/api/pages", {
+    data: { kind: "document", title: "A long project document title for the team's coordinated workspace release" },
+  });
+  expect(created.status()).toBe(201);
+  const { page: createdPage } = (await created.json()) as { page: { id: string } };
+  const commentText = "Review the release details together.";
+  const comment = await page.request.post(`/api/pages/${createdPage.id}/comments`, {
+    data: {
+      initialComment: {
+        body: [
+          {
+            id: crypto.randomUUID(),
+            type: "paragraph",
+            props: {},
+            content: [{ type: "text", text: commentText, styles: {} }],
+            children: [],
+          },
+        ],
+      },
+    },
+  });
+  expect(comment.status()).toBe(201);
+  await page.goto(`/?page=${createdPage.id}`);
+  await expect(page.getByLabel("Page title")).toBeVisible();
   for (const width of [390, 768, 1440]) {
     await page.setViewportSize({ width, height: 900 });
     for (const theme of ["Light", "Dark"]) {
       const navigation = page.getByRole("button", { name: "Open navigation", exact: true });
-      if (await navigation.isVisible()) await navigation.click();
+      if (width < 1000) await navigation.click();
       for (let attempt = 0; attempt < 3; attempt++) {
         const toggle = page.getByRole("button", { name: /^Theme:/ });
         if ((await toggle.getAttribute("aria-label"))?.startsWith(`Theme: ${theme}.`)) break;
         await toggle.click();
       }
       const close = page.getByRole("button", { name: "Close navigation", exact: true });
-      if (await close.isVisible()) await close.click();
+      if (width < 1000) await close.click();
       await expect(page.getByLabel("Page title")).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       await page.getByRole("button", { name: "Page details", exact: true }).click();
       await page.getByRole("button", { name: "Comments", exact: true }).click();
       await expect(page.getByRole("button", { name: "Close page panel", exact: true })).toBeInViewport();
+      await expect(page.locator(".comments-panel")).toContainText(commentText);
       await page.screenshot({ path: `test-results/workspace-${width}-${theme.toLowerCase()}.png` });
       const audit = await new AxeBuilder({ page }).exclude(".bn-editor").analyze();
       expect(audit.violations.filter((v) => v.impact === "critical" || v.impact === "serious")).toEqual([]);
