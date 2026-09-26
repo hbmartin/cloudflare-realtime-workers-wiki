@@ -1248,6 +1248,27 @@ describe("App error handling", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
+  it("shows a generic cleanup notice when a committed archive has an unknown pending count", async () => {
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockWorkspaceApi();
+    const original = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE")
+        return { ok: true, pageIds: [page.id], cleanupPending: true, pendingPageCount: null };
+      return original(path, init);
+    });
+    render(<App />);
+
+    fireEvent.click(await findArchive("Archive Roadmap"));
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Page archived. Realtime cleanup may still be continuing in the background.",
+    );
+    expect(screen.getByRole("status")).not.toHaveTextContent("null");
+  });
+
   it("replaces a cleanup notice with a newer archive and restarts its ten-second timer", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.stubGlobal(
@@ -4504,6 +4525,41 @@ describe("App error handling", () => {
       expect(props?.page.id).toBe(child.id);
       expect(props?.taskList).toEqual(hidden ? taskList : undefined);
     });
+  });
+
+  it("refreshes only the invalidated selected task list and refreshes My Tasks for every list", async () => {
+    const first: Page = { ...page, id: "list-a", title: "First tasks", kind: "table", taskList: true };
+    const second: Page = { ...page, id: "list-b", title: "Second tasks", kind: "table", taskList: true };
+    localStorage.setItem("notes:last-page:workspace:user", first.id);
+    mockShellApi({ pages: [first, second] });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/tasks?")) return { tasks: [], hasMore: false, nextCursor: null };
+      if (path === `/api/tables/${first.id}?limit=1`) return { table: { revision: 1, lease: { holderName: null } } };
+      if (path === `/api/task-lists/${first.id}/assignees`) return { members: [] };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    const listLoads = () =>
+      vi.mocked(api).mock.calls.filter(([path]) => path.startsWith(`/api/tasks?listId=${first.id}`)).length;
+    const myLoads = () => vi.mocked(api).mock.calls.filter(([path]) => path.startsWith("/api/tasks?mine=true")).length;
+    await waitFor(() => expect(listLoads()).toBe(1));
+
+    act(() => {
+      dispatchWorkspaceEvent({ type: "task-list-invalidated", pageId: first.id });
+      dispatchWorkspaceEvent({ type: "task-list-invalidated", pageId: second.id });
+    });
+    await waitFor(() => expect(listLoads()).toBe(2));
+    act(() => dispatchWorkspaceEvent({ type: "task-list-invalidated", pageId: second.id }));
+    await act(async () => await new Promise((resolve) => window.setTimeout(resolve, 0)));
+    expect(listLoads()).toBe(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "My Tasks" }));
+    await waitFor(() => expect(myLoads()).toBe(1));
+    act(() => dispatchWorkspaceEvent({ type: "task-list-invalidated", pageId: first.id }));
+    await waitFor(() => expect(myLoads()).toBe(2));
+    act(() => dispatchWorkspaceEvent({ type: "task-list-invalidated", pageId: second.id }));
+    await waitFor(() => expect(myLoads()).toBe(3));
   });
 
   it("loads a hidden navigation target directly without adding it to the sidebar", async () => {

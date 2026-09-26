@@ -7,6 +7,7 @@ import { ActionMenu, Icon, PageTools, readPreference, savePreference } from "./W
 
 type Person = { id: string; name: string };
 type Change = Partial<TaskFields> & { archived?: boolean };
+const AUTO_REFRESH_PAGE_LIMIT = 2;
 
 export function TasksView({
   page,
@@ -50,6 +51,11 @@ export function TasksView({
   const leaseExpiresAtRef = useRef(0);
   const [holder, setHolder] = useState<string | null>(null);
   const generation = useRef(0);
+  const activeLoad = useRef<number | null>(null);
+  const loadedPageCount = useRef(1);
+  const eventEpoch = useRef(0);
+  const queuedAutoRefresh = useRef(false);
+  const [updatesAvailable, setUpdatesAvailable] = useState(false);
   const active = useRef(true);
   const pageId = page?.id;
   const editable = page ? member.role !== "viewer" : true;
@@ -58,44 +64,48 @@ export function TasksView({
     savePreference(key, mode);
   }, [key, mode]);
   const load = useCallback(
-    async (cursor?: string, preserveLoaded = false) => {
+    async (cursor?: string) => {
       const request = ++generation.current;
+      activeLoad.current = request;
+      const startingEventEpoch = eventEpoch.current;
       setLoading(true);
       const params = new URLSearchParams(pageId ? { listId: pageId } : { mine: "true" });
       if (status) params.set("status", status);
       if (due) params.set("due", due);
       if (query.trim()) params.set("q", query.trim());
-      if (cursor) params.set("cursor", cursor);
       try {
-        const result = await api<TaskResponse>(`/api/tasks?${params}`);
-        if (!active.current || request !== generation.current) return;
-        setData((current) =>
-          cursor
-            ? {
-                ...result,
-                tasks: [
-                  ...current.tasks,
-                  ...result.tasks.filter((task) => !current.tasks.some((p) => p.id === task.id)),
-                ],
-              }
-            : preserveLoaded && current.tasks.length > result.tasks.length
-              ? {
-                  tasks: [
-                    ...result.tasks,
-                    ...current.tasks.filter((task) => !result.tasks.some((fresh) => fresh.id === task.id)),
-                  ],
-                  hasMore: current.hasMore,
-                  nextCursor: current.nextCursor,
-                }
-              : result,
-        );
+        const tasks = cursor ? [...dataRef.current.tasks] : [];
+        const seen = new Set(tasks.map((task) => task.id));
+        const pagesToFetch = cursor ? 1 : loadedPageCount.current;
+        let nextCursor = cursor;
+        let result: TaskResponse = { tasks: [], hasMore: false, nextCursor: null };
+        let fetchedPages = 0;
+        for (let index = 0; index < pagesToFetch; index++) {
+          if (nextCursor) params.set("cursor", nextCursor);
+          else params.delete("cursor");
+          result = await api<TaskResponse>(`/api/tasks?${params}`);
+          if (!active.current || request !== generation.current) return;
+          fetchedPages++;
+          for (const task of result.tasks) {
+            if (!seen.has(task.id)) {
+              seen.add(task.id);
+              tasks.push(task);
+            }
+          }
+          if (!result.hasMore || !result.nextCursor) break;
+          nextCursor = result.nextCursor;
+        }
+        const refreshed = { tasks, hasMore: result.hasMore, nextCursor: result.nextCursor };
+        loadedPageCount.current = cursor ? loadedPageCount.current + 1 : fetchedPages;
+        dataRef.current = refreshed;
+        setData(refreshed);
         if (pageId) {
           const response = await api<{ table: TableData }>(`/api/tables/${pageId}?limit=1`);
           if (!active.current || request !== generation.current) return;
           setRevision(response.table.revision);
           setHolder(response.table.lease.holderName);
         }
-        const ids = [...new Set(result.tasks.map((task) => task.listId)), ...(pageId ? [pageId] : [])];
+        const ids = [...new Set(tasks.map((task) => task.listId)), ...(pageId ? [pageId] : [])];
         const entries = await Promise.all(
           [...new Set(ids)].map(async (id) => {
             const people = await api<{ members: Person[] }>(`/api/task-lists/${id}/assignees`);
@@ -105,6 +115,7 @@ export function TasksView({
         if (active.current && request === generation.current) {
           setMembers((current) => ({ ...current, ...Object.fromEntries(entries) }));
           setError((current) => (current?.owner === "load" ? null : current));
+          if (!cursor && startingEventEpoch === eventEpoch.current) setUpdatesAvailable(false);
         }
       } catch (cause) {
         if (active.current && request === generation.current && !retryRef.current) {
@@ -112,6 +123,7 @@ export function TasksView({
           setError({ owner: "load", message: apiErrorMessage(cause, "Tasks could not be loaded.") });
         }
       } finally {
+        if (activeLoad.current === request) activeLoad.current = null;
         if (active.current && request === generation.current) setLoading(false);
       }
     },
@@ -119,6 +131,9 @@ export function TasksView({
   );
   useEffect(() => {
     active.current = true;
+    loadedPageCount.current = 1;
+    eventEpoch.current++;
+    queuedAutoRefresh.current = false;
     const timer = setTimeout(() => void load(), 150);
     return () => {
       clearTimeout(timer);
@@ -129,16 +144,33 @@ export function TasksView({
   }, [load]);
   useEffect(() => {
     const timer = setInterval(() => {
-      if (!document.hidden && !busy) void load(undefined, true);
+      if (
+        !document.hidden &&
+        !busy &&
+        !loading &&
+        activeLoad.current === null &&
+        loadedPageCount.current <= AUTO_REFRESH_PAGE_LIMIT
+      )
+        void load();
     }, 30_000);
     return () => clearInterval(timer);
-  }, [load, busy]);
+  }, [load, busy, loading]);
+  useEffect(() => {
+    if (busy || loading || !queuedAutoRefresh.current) return;
+    queuedAutoRefresh.current = false;
+    if (loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT) {
+      setUpdatesAvailable(true);
+    } else void load();
+  }, [busy, loading, load]);
   const observedRefreshVersion = useRef(refreshVersion);
   useEffect(() => {
     if (refreshVersion === observedRefreshVersion.current) return;
     observedRefreshVersion.current = refreshVersion;
-    void load(undefined, true);
-  }, [load, refreshVersion]);
+    eventEpoch.current++;
+    if (loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT) setUpdatesAvailable(true);
+    else if (busy || activeLoad.current !== null) queuedAutoRefresh.current = true;
+    else void load();
+  }, [busy, load, refreshVersion]);
   const release = useCallback(
     (token: string) => {
       if (pageId)
@@ -257,7 +289,12 @@ export function TasksView({
       revisionRef.current = result.revision;
       retryRef.current = null;
       setError(null);
-      await load(undefined, true);
+      if (changes.archived === true && task) {
+        const remaining = { ...dataRef.current, tasks: dataRef.current.tasks.filter((item) => item.id !== task.id) };
+        dataRef.current = remaining;
+        setData(remaining);
+      }
+      await load();
       return true;
     } catch (cause) {
       if (active.current) {
@@ -265,7 +302,7 @@ export function TasksView({
           owner: "save",
           message: apiErrorMessage(cause, "The task could not be saved. Your change is ready to retry."),
         });
-        void load(undefined, true);
+        void load();
       }
       return false;
     } finally {
@@ -339,9 +376,21 @@ export function TasksView({
           aria-label="Find tasks"
           placeholder="Find tasks…"
           value={query}
-          onChange={(event) => setQuery(event.target.value)}
+          onChange={(event) => {
+            loadedPageCount.current = 1;
+            setQuery(event.target.value);
+            setUpdatesAvailable(false);
+          }}
         />
-        <select aria-label="Task status filter" value={status} onChange={(event) => setStatus(event.target.value)}>
+        <select
+          aria-label="Task status filter"
+          value={status}
+          onChange={(event) => {
+            loadedPageCount.current = 1;
+            setStatus(event.target.value);
+            setUpdatesAvailable(false);
+          }}
+        >
           <option value="">All statuses</option>
           {TASK_STATUSES.map((s) => (
             <option key={s} value={s}>
@@ -349,7 +398,15 @@ export function TasksView({
             </option>
           ))}
         </select>
-        <select aria-label="Task due date filter" value={due} onChange={(event) => setDue(event.target.value)}>
+        <select
+          aria-label="Task due date filter"
+          value={due}
+          onChange={(event) => {
+            loadedPageCount.current = 1;
+            setDue(event.target.value);
+            setUpdatesAvailable(false);
+          }}
+        >
           <option value="">Any due date</option>
           <option value="overdue">Overdue</option>
           <option value="today">Due today (UTC)</option>
@@ -358,6 +415,13 @@ export function TasksView({
         <button className="quiet-button" disabled={loading} onClick={() => void load()}>
           Refresh
         </button>
+        {loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT && (
+          <output className="muted">
+            {updatesAvailable
+              ? "Updates available. Refresh tasks to see them."
+              : "Automatic updates paused for this long view. Refresh to check for changes."}
+          </output>
+        )}
       </div>
       {error && (
         <div className="notice notice-danger" role="alert">
