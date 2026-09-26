@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
 import { ActionMenu, PageTools } from "./WorkspaceUI";
 import { CommentsExtension } from "@blocknote/core/comments";
@@ -30,6 +31,7 @@ import { useEffectiveColorScheme } from "./ThemeControl";
 export type EditorPageProps = {
   page: Page;
   metadata?: ReactNode;
+  taskList?: Page | undefined;
   member: ClientMemberContext;
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
@@ -42,6 +44,7 @@ export type EditorPageProps = {
 export function EditorPage({
   page,
   metadata,
+  taskList,
   member,
   onPageChanged,
   onPageUnavailable,
@@ -76,6 +79,7 @@ export function EditorPage({
   const titleDirtyRef = useRef(false);
   const editable = member.role !== "viewer" && !sizeWarning?.readOnly && !storageError;
   const commentsVisible = commentsOpen;
+  const [panelTarget, setPanelTarget] = useState<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (titlePageIdRef.current !== page.id) {
@@ -194,69 +198,78 @@ export function EditorPage({
 
   return (
     <main className={`page-canvas ${page.fullWidth ? "full-width" : ""}`}>
-      <PageTools>{status !== "connected" && <span className={`sync-state sync-${status}`} role="status">{status === "connecting" ? "Connecting…" : "Offline"}</span>}<ActionMenu label="Page details" icon="comment">
-
-        {editable && (
+      <PageTools>
+        {status !== "connected" && (
+          <output className={`sync-state sync-${status}`}>{status === "connecting" ? "Connecting…" : "Offline"}</output>
+        )}
+        <ActionMenu label="Page details" icon="comment">
+          {editable && (
+            <button
+              data-close-menu
+              className="quiet-button"
+              onClick={async () => {
+                const icon = prompt("Page icon (one emoji, or leave blank to remove)", page.icon ?? "")?.trim();
+                if (icon === undefined) return;
+                const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
+                  method: "PATCH",
+                  body: json({ icon: icon || null, revision: page.revision }),
+                });
+                onPageChanged(result.page);
+              }}
+            >
+              {page.icon ?? "Add icon"}
+            </button>
+          )}
           <button
+            data-close-menu
             className="quiet-button"
-            onClick={async () => {
-              const icon = prompt("Page icon (one emoji, or leave blank to remove)", page.icon ?? "")?.trim();
-              if (icon === undefined) return;
-              const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
-                method: "PATCH",
-                body: json({ icon: icon || null, revision: page.revision }),
-              });
-              onPageChanged(result.page);
+            onClick={() => {
+              setCommentsOpen((open) => !open);
+              setAttachmentsOpen(false);
+              setHistoryOpen(false);
+              setBacklinksOpen(false);
             }}
           >
-            {page.icon ?? "Add icon"}
+            Comments
           </button>
-        )}
-        <button
-          className="quiet-button"
-          onClick={() => {
-            setCommentsOpen((open) => !open);
-            setAttachmentsOpen(false);
-            setHistoryOpen(false);
-            setBacklinksOpen(false);
-          }}
-        >
-          Comments
-        </button>
-        <button
-          className="quiet-button"
-          onClick={() => {
-            setAttachmentsOpen((open) => !open);
-            setCommentsOpen(false);
-            setHistoryOpen(false);
-            setBacklinksOpen(false);
-          }}
-        >
-          Files
-        </button>
-        <button
-          className="quiet-button"
-          onClick={() => {
-            setHistoryOpen((open) => !open);
-            setCommentsOpen(false);
-            setAttachmentsOpen(false);
-            setBacklinksOpen(false);
-          }}
-        >
-          History
-        </button>
-        <button
-          className="quiet-button"
-          onClick={() => {
-            setBacklinksOpen((open) => !open);
-            setCommentsOpen(false);
-            setAttachmentsOpen(false);
-            setHistoryOpen(false);
-          }}
-        >
-          Backlinks
-        </button>
-      </ActionMenu></PageTools>
+          <button
+            data-close-menu
+            className="quiet-button"
+            onClick={() => {
+              setAttachmentsOpen((open) => !open);
+              setCommentsOpen(false);
+              setHistoryOpen(false);
+              setBacklinksOpen(false);
+            }}
+          >
+            Files
+          </button>
+          <button
+            data-close-menu
+            className="quiet-button"
+            onClick={() => {
+              setHistoryOpen((open) => !open);
+              setCommentsOpen(false);
+              setAttachmentsOpen(false);
+              setBacklinksOpen(false);
+            }}
+          >
+            History
+          </button>
+          <button
+            data-close-menu
+            className="quiet-button"
+            onClick={() => {
+              setBacklinksOpen((open) => !open);
+              setCommentsOpen(false);
+              setAttachmentsOpen(false);
+              setHistoryOpen(false);
+            }}
+          >
+            Backlinks
+          </button>
+        </ActionMenu>
+      </PageTools>
       {sizeWarning && (
         <div className={`notice ${sizeWarning.readOnly ? "notice-danger" : ""}`}>
           This document is {(sizeWarning.bytes / 1024 / 1024).toFixed(1)} MiB.
@@ -315,6 +328,11 @@ export function EditorPage({
           {recoveryPreview && <p>{recoveryPreview}</p>}
         </div>
       )}
+      {taskList && (
+        <button className="quiet-button task-detail-link" onClick={() => onSelectPage(taskList.id)}>
+          ← {taskList.title} · Task properties
+        </button>
+      )}
       <div
         className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}
       >
@@ -334,7 +352,7 @@ export function EditorPage({
             onKeyDown={(event) => {
               if (event.key === "Enter") event.currentTarget.blur();
             }}
-            readOnly={!editable}
+            readOnly={!editable || Boolean(taskList)}
             aria-label="Page title"
           />
           {metadata}
@@ -349,6 +367,7 @@ export function EditorPage({
               bundle={bundle}
               member={member}
               editable={editable}
+              panelTarget={panelTarget}
               commentsOpen={commentsVisible}
               pageId={page.id}
               commentsRevision={commentsRevision}
@@ -363,16 +382,33 @@ export function EditorPage({
             <div className="editor-loading">Opening your offline copy…</div>
           )}
         </article>
-        {historyOpen && (
-          <HistoryPanel
-            page={page}
-            member={member}
-            current={bundle?.doc ?? null}
-            onRestored={(epoch) => onPageChanged({ ...page, contentEpoch: epoch, revision: page.revision + 1 })}
-          />
+        {(commentsVisible || historyOpen || attachmentsOpen || backlinksOpen) && (
+          <aside className="side-panel page-side-panel" aria-label="Page panel">
+            <button
+              className="icon-button page-panel-close"
+              aria-label="Close page panel"
+              onClick={() => {
+                setCommentsOpen(false);
+                setHistoryOpen(false);
+                setAttachmentsOpen(false);
+                setBacklinksOpen(false);
+              }}
+            >
+              ×
+            </button>
+            <div ref={setPanelTarget} />
+            {historyOpen && (
+              <HistoryPanel
+                page={page}
+                member={member}
+                current={bundle?.doc ?? null}
+                onRestored={(epoch) => onPageChanged({ ...page, contentEpoch: epoch, revision: page.revision + 1 })}
+              />
+            )}
+            {attachmentsOpen && <AttachmentsPanel page={page} editable={editable} />}
+            {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
+          </aside>
         )}
-        {attachmentsOpen && <AttachmentsPanel page={page} editable={editable} />}
-        {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
       </div>
     </main>
   );
@@ -490,6 +526,7 @@ function CollaborativeEditor({
   member,
   editable,
   commentsOpen,
+  panelTarget,
   pageId,
   commentsRevision,
   onPageCreated,
@@ -499,13 +536,14 @@ function CollaborativeEditor({
   member: ClientMemberContext;
   editable: boolean;
   commentsOpen: boolean;
+  panelTarget: HTMLDivElement | null;
   pageId: string;
   commentsRevision: number;
   onPageCreated: (page: Page) => void;
   onError: (message: string) => void;
 }) {
   const [commentError, setCommentError] = useState("");
-  const commentsPanel = useRef<HTMLElement>(null);
+  const commentsPanel = useRef<HTMLDivElement>(null);
   const threadStore = useMemo(
     () => new ServerThreadStore(pageId, member.user.id, setCommentError),
     [member.user.id, pageId],
@@ -515,7 +553,7 @@ function CollaborativeEditor({
   }, [commentsRevision, threadStore]);
   useEffect(() => {
     const panel = commentsPanel.current;
-    if (!commentsOpen || !panel) return undefined;
+    if (!commentsOpen || !panelTarget || !panel) return undefined;
     const labelGeneratedEditors = () => {
       for (const textbox of panel.querySelectorAll<HTMLElement>('[role="textbox"]:not([aria-label])')) {
         textbox.setAttribute(
@@ -528,7 +566,7 @@ function CollaborativeEditor({
     const observer = new MutationObserver(labelGeneratedEditors);
     observer.observe(panel, { childList: true, subtree: true });
     return () => observer.disconnect();
-  }, [commentsOpen]);
+  }, [commentsOpen, panelTarget]);
   const options = useMemo(
     () => editorOptions(bundle, member, editable, pageId, threadStore),
     [bundle, editable, member, pageId, threadStore],
@@ -559,10 +597,17 @@ function CollaborativeEditor({
             insertOrUpdateBlockForSlashMenu(editor, { type: item.type });
           },
         })),
-        {
-          title: "Sub-page",
-          subtext: "Create a real child page and insert a link",
-          aliases: ["child page", "page inside"],
+        ...(
+          [
+            ["document", "Sub-page"],
+            ["table", "Table page"],
+            ["tasks", "Task List"],
+            ["diagram", "Diagram page"],
+          ] as const
+        ).map(([kind, title]) => ({
+          title,
+          subtext: "Create inside this page and insert a link",
+          aliases: [kind, "child page", "page inside"],
           group: "NoteFlare blocks",
           icon: <span>⊞</span>,
           onItemClick: () => {
@@ -571,7 +616,12 @@ function CollaborativeEditor({
               try {
                 const result = await api<{ page: Page }>("/api/pages", {
                   method: "POST",
-                  body: json({ kind: "document", parentId: pageId }),
+                  body: json({
+                    id: crypto.randomUUID(),
+                    kind: kind === "tasks" ? "table" : kind,
+                    parentId: pageId,
+                    ...(kind === "tasks" ? { taskList: true } : {}),
+                  }),
                 });
                 createdPage = result.page;
               } catch (error) {
@@ -595,7 +645,7 @@ function CollaborativeEditor({
               onPageCreated(createdPage);
             })();
           },
-        },
+        })),
         {
           title: "Inline math",
           subtext: "Insert a KaTeX formula in this line",
@@ -640,18 +690,21 @@ function CollaborativeEditor({
     <BlockNoteView editor={editor} editable={editable} className="notes-editor" theme={colorScheme} slashMenu={false}>
       {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
       {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
-      {commentsOpen && (
-        <aside ref={commentsPanel} className="side-panel comments-panel">
-          <h2>Comments</h2>
-          <p className="muted">
-            {editable
-              ? "Select text and use the formatting toolbar to start a thread."
-              : "You can comment and reply even while the document is read-only."}
-          </p>
-          {commentError && <p className="form-error">{commentError}</p>}
-          <ThreadsSidebar filter="all" sort="position" />
-        </aside>
-      )}
+      {commentsOpen &&
+        panelTarget &&
+        createPortal(
+          <div ref={commentsPanel} className="comments-panel">
+            <h2>Comments</h2>
+            <p className="muted">
+              {editable
+                ? "Select text and use the formatting toolbar to start a thread."
+                : "You can comment and reply even while the document is read-only."}
+            </p>
+            {commentError && <p className="form-error">{commentError}</p>}
+            <ThreadsSidebar filter="all" sort="position" />
+          </div>,
+          panelTarget,
+        )}
     </BlockNoteView>
   );
 }

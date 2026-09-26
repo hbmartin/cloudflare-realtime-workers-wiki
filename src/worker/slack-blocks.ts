@@ -1,3 +1,6 @@
+import type { Task } from "../shared/tasks";
+import { TASK_STATUS_LABELS } from "../shared/tasks";
+import type { Notification } from "../shared/types";
 import type { SearchResponse } from "../shared/types";
 import type { MentionCursor } from "./mentions-inbox";
 
@@ -220,6 +223,8 @@ export function searchModal(
 }
 
 export function homeView(input: {
+  tasks?: Task[];
+  notifications?: Notification[];
   sessionId: string;
   mentions: Array<{
     page: { id: string; title: string };
@@ -247,7 +252,28 @@ export function homeView(input: {
         },
       ],
     };
-  const blocks: unknown[] = [{ type: "header", text: plain("Mentions") }];
+  const blocks: unknown[] = [
+    { type: "header", text: plain("Inbox") },
+    {
+      type: "actions",
+      elements: [
+        button("noteflare_my_tasks", "My Tasks", "first"),
+        button("noteflare_compose_page", "Create page", input.sessionId),
+        button("noteflare_compose_task", "Create task", input.sessionId),
+      ],
+    },
+  ];
+  for (const item of input.notifications ?? [])
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        verbatim: true,
+        text: `${item.readAt ? "" : "*● Unread* · "}${safeSlackText(item.actor?.name ?? "A collaborator", 80)} · ${safeSlackText(item.eventType.replaceAll("_", " "), 50)}
+<${input.origin}/?page=${encodeURIComponent(item.page.id)}|${safeSlackText(item.page.title, 160)}>`,
+      },
+    });
+  blocks.push({ type: "section", text: { type: "mrkdwn", text: "*Pages mentioning you*" } });
   for (const item of input.mentions) {
     const url = `${input.origin}/?page=${encodeURIComponent(item.page.id)}`;
     blocks.push({
@@ -269,5 +295,17 @@ export function homeView(input: {
       button("noteflare_home_read", "Mark inbox read", input.sessionId),
     ],
   });
+  blocks.push({ type: "header", text: plain("My Tasks") });
+  for (const task of input.tasks ?? [])
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        verbatim: true,
+        text: `<${input.origin}/?page=${encodeURIComponent(task.detailPageId)}|${safeSlackText(task.title, 160)}> · ${TASK_STATUS_LABELS[task.status]}${task.dueDate ? ` · ${task.dueDate}` : ""}`,
+      },
+      ...(task.editable ? { accessory: button("noteflare_edit_task", "Edit task", task.id) } : {}),
+    });
+  if (!input.tasks?.length) blocks.push({ type: "section", text: { type: "plain_text", text: "No assigned tasks." } });
   return { type: "home", private_metadata: input.sessionId, blocks };
 }

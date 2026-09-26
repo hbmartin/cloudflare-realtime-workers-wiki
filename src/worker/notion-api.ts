@@ -195,7 +195,7 @@ async function pageRowsForSubtree(env: Env, workspaceId: string, rootPageId: str
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
        ) SELECT id, workspace_id, space_id, parent_id, kind, position, title, icon, revision,
-                content_epoch, is_template, archived_at, created_at, updated_at
+                content_epoch, is_template, full_width, is_task_list, archived_at, created_at, updated_at
            FROM pages WHERE id IN (SELECT id FROM tree) ORDER BY position, id`,
     )
       .bind(rootPageId, workspaceId)
@@ -800,6 +800,20 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
   capability(principal, "updateContent");
   const page = await accessiblePage(c.env, principal, c.req.param("pageId")!, true);
   const input = await body(c.req.raw, mode === "trash");
+  const taskDetail = await c.env.DB.prepare(
+    "SELECT 1 FROM table_row_pages link JOIN table_rows r ON r.id=link.row_id JOIN pages list ON list.id=r.page_id WHERE link.page_id=? AND list.is_task_list=1",
+  )
+    .bind(page.id)
+    .first();
+  if (
+    taskDetail &&
+    (mode || input.properties !== undefined || input.archived !== undefined || input.in_trash !== undefined)
+  )
+    throw new NotionError(
+      409,
+      "conflict_error",
+      "Update task properties and lifecycle through the task list. Document blocks and comments remain editable.",
+    );
   const timestamp = Date.now();
   let workspaceEvent: WorkspaceEvent | null = null;
   if (mode === "move") {

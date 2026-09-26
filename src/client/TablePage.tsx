@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { ActionMenu, PageTools } from "./WorkspaceUI";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { jitteredBackoff, jitteredInterval } from "../shared/retry";
 import { TABLE_MAX_ROWS, TABLE_PAGE_DEFAULT, TABLE_SORT_MAX_OFFSET } from "../shared/table-limits";
 import type { ClientMemberContext } from "../shared/types";
@@ -35,6 +35,7 @@ type RevisionRecoveryOptions = {
   background?: boolean;
 };
 type TableSortState = {
+  filter: string;
   column: string | null;
   dir: "asc" | "desc";
 };
@@ -140,12 +141,13 @@ function cellInputKey(rowId: string, columnId: string) {
   return `${rowId}:${columnId}`;
 }
 
-function tableSortKey(column: string | null, dir: "asc" | "desc") {
-  return column ? `${column}:${dir}` : "";
+function tableSortKey(column: string | null, dir: "asc" | "desc", filter = "") {
+  return `${column ? `${column}:${dir}` : ""}${filter ? `:filter:${filter}` : ""}`;
 }
 
-function firstTablePageParams(sort: string | null, dir: "asc" | "desc") {
+function firstTablePageParams(sort: string | null, dir: "asc" | "desc", filter = "") {
   const params = new URLSearchParams({ limit: String(TABLE_PAGE_DEFAULT), count: "true" });
+  if (filter) params.set("q", filter);
   if (sort) {
     params.set("sort", sort);
     params.set("dir", dir);
@@ -155,6 +157,7 @@ function firstTablePageParams(sort: string | null, dir: "asc" | "desc") {
 
 function nextTablePageParams(currentPage: TableData) {
   const params = new URLSearchParams({ limit: String(currentPage.limit) });
+  if (currentPage.filter) params.set("q", currentPage.filter);
   if (currentPage.sort) {
     if (currentPage.nextOffset === null) return null;
     params.set("sort", currentPage.sort);
@@ -358,20 +361,31 @@ export function TablePage({
   const [sortRequest, setSortRequest] = useState<TableSortState>({
     column: null,
     dir: "asc",
+    filter: "",
   });
-  const { column: sortColumn, dir: sortDir } = sortRequest;
-  const appliedSortKeyRef = useRef(tableSortKey(sortColumn, sortDir));
+  const { column: sortColumn, dir: sortDir, filter: appliedFilter } = sortRequest;
+  const appliedSortKeyRef = useRef(tableSortKey(sortColumn, sortDir, appliedFilter));
   // Mirrored so `load` can read the current sort without taking it as a dependency:
   // the mount effect keys off `load`, and rebuilding it would re-acquire the lease.
-  const sortRef = useRef<{ column: string | null; dir: "asc" | "desc" }>({ column: null, dir: "asc" });
+  const sortRef = useRef<TableSortState>({ column: null, dir: "asc", filter: "" });
   useEffect(() => {
-    sortRef.current = { column: sortColumn, dir: sortDir };
-  }, [sortColumn, sortDir]);
+    sortRef.current = { column: sortColumn, dir: sortDir, filter: appliedFilter };
+  }, [sortColumn, sortDir, appliedFilter]);
   const requestSort = useCallback((column: string | null, dir: "asc" | "desc") => {
     // Keep async request guards current before the state-driven load effect runs.
-    sortRef.current = { column, dir };
-    setSortRequest({ column, dir });
+    sortRef.current = { column, dir, filter: sortRef.current.filter };
+    setSortRequest(sortRef.current);
   }, []);
+  useEffect(() => {
+    if (filter.trim().slice(0, 200) === sortRef.current.filter) return undefined;
+    const timer = setTimeout(() => {
+      const next = filter.trim().slice(0, 200);
+      if (next === sortRef.current.filter) return;
+      sortRef.current = { ...sortRef.current, filter: next };
+      setSortRequest(sortRef.current);
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [filter]);
   const clearSort = useCallback(() => requestSort(null, sortRef.current.dir), [requestSort]);
   // Pages appended past the first. While any are loaded the background poll stands
   // down, so browsing deep into a table is not yanked back to the top every 5s.
@@ -475,8 +489,8 @@ export function TablePage({
     ) => {
       preserveRevisionFloor(currentRevisionFloor(recoveryPage?.revision, minimumRevision));
       const sortKey = recoveryPage
-        ? tableSortKey(recoveryPage.sort, recoveryPage.dir)
-        : tableSortKey(sortRef.current.column, sortRef.current.dir);
+        ? tableSortKey(recoveryPage.sort, recoveryPage.dir, recoveryPage.filter)
+        : tableSortKey(sortRef.current.column, sortRef.current.dir, sortRef.current.filter);
       const currentTarget = revisionRecoveryTargetRef.current;
       if (currentTarget?.sortKey === sortKey) {
         revisionRecoveryTargetRef.current = {
@@ -645,7 +659,7 @@ export function TablePage({
       const recoveryDir = sortRef.current.dir;
       // This recovery owns the replacement load directly. Mark the matching
       // state transition as applied so the sort effect does not issue a duplicate.
-      appliedSortKeyRef.current = tableSortKey(null, recoveryDir);
+      appliedSortKeyRef.current = tableSortKey(null, recoveryDir, sortRef.current.filter);
       requestSort(null, recoveryDir);
       setLoadError(null);
       return { minimumRevision: recoveryFloor };
@@ -695,7 +709,7 @@ export function TablePage({
       sortedSnapshotDirtyRef.current = false;
       unsortedSnapshotDirtyRef.current = false;
       const recoveryTarget = revisionRecoveryTargetRef.current;
-      const authoritativeSort = tableSortKey(authoritative.sort, authoritative.dir);
+      const authoritativeSort = tableSortKey(authoritative.sort, authoritative.dir, authoritative.filter);
       if (
         !background ||
         !recoveryTarget ||
@@ -731,7 +745,7 @@ export function TablePage({
         loadIsCurrent() && (!background || mutationGeneration === mutationGenerationRef.current);
       changeLoadCount(1, background);
       try {
-        const params = firstTablePageParams(sortRef.current.column, sortRef.current.dir);
+        const params = firstTablePageParams(sortRef.current.column, sortRef.current.dir, sortRef.current.filter);
         const result = await readWithStaleRevisionRetries(
           () =>
             api<{ table: TableData }>(`/api/tables/${page.id}?${params}`, {
@@ -806,11 +820,11 @@ export function TablePage({
         preserveDepthOnChurn = false,
         retryStaleRevision = true,
       } = options;
-      const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
+      const requestedSort = tableSortKey(currentPage.sort, currentPage.dir, currentPage.filter);
       if (
         !ownerIsCurrent() ||
         !mountedRef.current ||
-        requestedSort !== tableSortKey(sortRef.current.column, sortRef.current.dir)
+        requestedSort !== tableSortKey(sortRef.current.column, sortRef.current.dir, sortRef.current.filter)
       ) {
         return tableLoadResult("superseded");
       }
@@ -823,7 +837,7 @@ export function TablePage({
         ownerIsCurrent() &&
         mountedRef.current &&
         generation === loadGenerationRef.current &&
-        requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir);
+        requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir, sortRef.current.filter);
       const isCurrent = () =>
         recoveryIsCurrent() && (!background || mutationGeneration === mutationGenerationRef.current);
       const recoverAfterChurn = () => {
@@ -843,7 +857,7 @@ export function TablePage({
         });
       };
       try {
-        const firstParams = firstTablePageParams(currentPage.sort, currentPage.dir);
+        const firstParams = firstTablePageParams(currentPage.sort, currentPage.dir, currentPage.filter);
         const first = await readWithStaleRevisionRetries(
           () =>
             api<{ table: TableData }>(`/api/tables/${page.id}?${firstParams}`, {
@@ -858,7 +872,7 @@ export function TablePage({
           retryStaleRevision ? STALE_REVISION_RETRY_DELAYS_MS : [],
         );
         if (!first) return tableLoadResult("superseded");
-        if (tableSortKey(first.table.sort, first.table.dir) !== requestedSort) {
+        if (tableSortKey(first.table.sort, first.table.dir, first.table.filter) !== requestedSort) {
           return recoverAfterChurn();
         }
 
@@ -879,7 +893,7 @@ export function TablePage({
           if (!isCurrent()) return tableLoadResult("superseded");
           if (
             next.table.revision !== snapshotRevision ||
-            tableSortKey(next.table.sort, next.table.dir) !== requestedSort
+            tableSortKey(next.table.sort, next.table.dir, next.table.filter) !== requestedSort
           ) {
             // Another writer moved the table while its depth was being rebuilt. A
             // foreground action may fall back to page one, but a background poll
@@ -972,8 +986,8 @@ export function TablePage({
             mountedRef.current &&
             (options.ownerIsCurrent ?? isMounted)() &&
             authoritativeLoadGenerationRef.current <= queuedGeneration &&
-            tableSortKey(currentPage.sort, currentPage.dir) ===
-              tableSortKey(sortRef.current.column, sortRef.current.dir)
+            tableSortKey(currentPage.sort, currentPage.dir, currentPage.filter) ===
+              tableSortKey(sortRef.current.column, sortRef.current.dir, sortRef.current.filter)
           ) {
             deferRevisionRecovery(currentRevisionFloor(currentPage.revision), currentPage, appendedPageTarget);
           }
@@ -1007,13 +1021,13 @@ export function TablePage({
     // Advancing the generation discards a background refresh still in flight, so its
     // page-one result cannot land after this append and yank the view back to the top.
     const generation = ++loadGenerationRef.current;
-    const requestedSort = tableSortKey(currentPage.sort, currentPage.dir);
+    const requestedSort = tableSortKey(currentPage.sort, currentPage.dir, currentPage.filter);
     const snapshotRevision = pageSnapshotRevisionRef.current ?? currentPage.revision;
     const requestedAppendedPages = appendedPagesRef.current + 1;
     const isCurrent = () =>
       mountedRef.current &&
       generation === loadGenerationRef.current &&
-      requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir);
+      requestedSort === tableSortKey(sortRef.current.column, sortRef.current.dir, sortRef.current.filter);
     const canAppend = () => isCurrent() && revisionRef.current !== null;
     changeLoadCount(1, false);
     try {
@@ -1032,7 +1046,7 @@ export function TablePage({
         // Any sorted value can move a row across an offset boundary, so wait for
         // every mutation before deciding whether this snapshot is still usable.
         await mutationQueue.current;
-        if (!isCurrent() || tableSortKey(result.table.sort, result.table.dir) !== requestedSort) {
+        if (!isCurrent() || tableSortKey(result.table.sort, result.table.dir, result.table.filter) !== requestedSort) {
           return;
         }
         // Sorted offsets are positions in one exact snapshot. Saves that do not
@@ -1058,7 +1072,10 @@ export function TablePage({
             // Loaded-row cell edits do not disturb a keyset cursor; only additions
             // and removals need to settle before validating this response.
             await rowOrderMutationQueueRef.current;
-            if (!canAppend() || tableSortKey(candidate.table.sort, candidate.table.dir) !== requestedSort) {
+            if (
+              !canAppend() ||
+              tableSortKey(candidate.table.sort, candidate.table.dir, candidate.table.filter) !== requestedSort
+            ) {
               return "cancel";
             }
             if (unsortedSnapshotDirtyRef.current) {
@@ -1081,7 +1098,7 @@ export function TablePage({
         deferRevisionRecovery(currentRevisionFloor(result.table.revision), currentPage, requestedAppendedPages);
       }
       setTable((current) => {
-        if (!current || tableSortKey(current.sort, current.dir) !== requestedSort) {
+        if (!current || tableSortKey(current.sort, current.dir, current.filter) !== requestedSort) {
           return current;
         }
         const loaded = new Set(current.rows.map((row) => row.id));
@@ -1120,7 +1137,7 @@ export function TablePage({
     }
   }
 
-  const sortKey = tableSortKey(sortColumn, sortDir);
+  const sortKey = tableSortKey(sortColumn, sortDir, appliedFilter);
   useEffect(() => {
     if (appliedSortKeyRef.current === sortKey) return;
     appliedSortKeyRef.current = sortKey;
@@ -1133,7 +1150,7 @@ export function TablePage({
       ownerIsCurrent = isMounted,
       background = false,
     }: RevisionRecoveryOptions = {}): Promise<TableLoadResult> => {
-      const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir);
+      const activeSort = tableSortKey(sortRef.current.column, sortRef.current.dir, sortRef.current.filter);
       const pendingTarget = revisionRecoveryTargetRef.current;
       const currentPage =
         pendingTarget?.sortKey === activeSort ? (pendingTarget.page ?? tableRef.current) : tableRef.current;
@@ -1141,7 +1158,8 @@ export function TablePage({
         pendingTarget?.sortKey === activeSort ? pendingTarget.appendedPageTarget : appendedPagesRef.current;
       const recoveryFloor = currentRevisionFloor(minimumRevision, currentPage?.revision);
       preserveRevisionFloor(recoveryFloor);
-      const canRestoreCurrentDepth = currentPage && tableSortKey(currentPage.sort, currentPage.dir) === activeSort;
+      const canRestoreCurrentDepth =
+        currentPage && tableSortKey(currentPage.sort, currentPage.dir, currentPage.filter) === activeSort;
       if (background && canRestoreCurrentDepth) {
         // Every background revision-recovery poll is one bounded depth probe. Its
         // outer scheduler owns retries and backoff.
@@ -1180,7 +1198,8 @@ export function TablePage({
         appendedPageTarget > 0 &&
         revisionRef.current !== null &&
         ownerIsCurrent() &&
-        tableSortKey(currentPage.sort, currentPage.dir) === tableSortKey(sortRef.current.column, sortRef.current.dir)
+        tableSortKey(currentPage.sort, currentPage.dir, currentPage.filter) ===
+          tableSortKey(sortRef.current.column, sortRef.current.dir, sortRef.current.filter)
       ) {
         // Keep the rebuild outside mutationQueue so later edits are not blocked.
         // The mutation completion path wakes polling as soon as the queue drains.
@@ -1800,7 +1819,8 @@ export function TablePage({
           ) {
             sortedSnapshotDirtyRef.current = true;
           }
-          if (affectsSortedOrder === true) unsortedSnapshotDirtyRef.current = true;
+          if (affectsSortedOrder === true || sortRef.current.filter) unsortedSnapshotDirtyRef.current = true;
+          if (sortRef.current.filter) sortedSnapshotDirtyRef.current = true;
           setSaveError(null);
           setTable((current) => {
             if (!current) return current;
@@ -2008,22 +2028,7 @@ export function TablePage({
     return true;
   }
 
-  const visibleRows = useMemo(() => {
-    if (!table) return [];
-    const normalized = filter.toLowerCase();
-    const rows = normalized
-      ? table.rows.filter((row) =>
-          Object.values(row.cells).some((value) =>
-            String(value ?? "")
-              .toLowerCase()
-              .includes(normalized),
-          ),
-        )
-      : [...table.rows];
-    // Sorting is the server's job now, so the rows arrive already ordered. The filter
-    // stays local, which is why it is labelled as covering loaded rows only.
-    return rows;
-  }, [filter, table]);
+  const visibleRows = table?.rows ?? [];
   const tryAcquire = async () => {
     await acquire(isMounted).catch(reportLeaseError);
   };
@@ -2057,40 +2062,42 @@ export function TablePage({
 
   return (
     <main className="page-canvas table-canvas">
-      <PageTools><ActionMenu label="Page details" icon="comment">
-        <span className={`lease-state ${editingReady ? "lease-active" : ""}`}>
-          {editingReady ? "Editing lease active" : leaseToken ? "Editing paused while table reloads" : "Read-only"}
-        </span>
-        {canEdit && (
-          <button
-            className="quiet-button"
-            onClick={async () => {
-              const icon = prompt("Page icon (one emoji, or leave blank to remove)", page.icon ?? "")?.trim();
-              if (icon === undefined) return;
-              const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
-                method: "PATCH",
-                body: json({ icon: icon || null, revision: page.revision }),
-              });
-              onPageChanged(result.page);
-            }}
-          >
-            {page.icon ?? "Add icon"}
+      <PageTools>
+        <ActionMenu label="Page details" icon="comment">
+          <span className={`lease-state ${editingReady ? "lease-active" : ""}`}>
+            {editingReady ? "Editing lease active" : leaseToken ? "Editing paused while table reloads" : "Read-only"}
+          </span>
+          {canEdit && (
+            <button
+              className="quiet-button"
+              onClick={async () => {
+                const icon = prompt("Page icon (one emoji, or leave blank to remove)", page.icon ?? "")?.trim();
+                if (icon === undefined) return;
+                const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
+                  method: "PATCH",
+                  body: json({ icon: icon || null, revision: page.revision }),
+                });
+                onPageChanged(result.page);
+              }}
+            >
+              {page.icon ?? "Add icon"}
+            </button>
+          )}
+          {!terminalPageUnavailable && !leaseToken && canEdit && (
+            <button className="quiet-button" disabled={leasePending} onClick={() => void tryAcquire()}>
+              Try edit lock
+            </button>
+          )}
+          {member.role === "owner" && !terminalPageUnavailable && !leaseToken && (
+            <button className="quiet-button" disabled={leasePending} onClick={() => void forceUnlock()}>
+              Force unlock
+            </button>
+          )}
+          <button className="quiet-button" onClick={() => setBacklinksOpen((open) => !open)}>
+            Backlinks
           </button>
-        )}
-        {!terminalPageUnavailable && !leaseToken && canEdit && (
-          <button className="quiet-button" disabled={leasePending} onClick={() => void tryAcquire()}>
-            Try edit lock
-          </button>
-        )}
-        {member.role === "owner" && !terminalPageUnavailable && !leaseToken && (
-          <button className="quiet-button" disabled={leasePending} onClick={() => void forceUnlock()}>
-            Force unlock
-          </button>
-        )}
-        <button className="quiet-button" onClick={() => setBacklinksOpen((open) => !open)}>
-          Backlinks
-        </button>
-      </ActionMenu></PageTools>
+        </ActionMenu>
+      </PageTools>
       {notices.map((notice) => (
         <div className={`notice${notice.danger ? " notice-danger" : ""}`} key={notice.message}>
           {notice.message}
@@ -2110,9 +2117,14 @@ export function TablePage({
         />
         {metadata}
         <div className="table-toolbar">
-          <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter loaded rows…" />
+          <input
+            value={filter}
+            onChange={(event) => setFilter(event.target.value)}
+            placeholder="Filter all rows…"
+            aria-label="Filter all rows"
+          />
           <span>
-            {visibleRows.length} / {table?.rowCount ?? table?.rows.length ?? 0} rows
+            {visibleRows.length} loaded · {table?.rowCount ?? table?.rows.length ?? 0} total rows
           </span>
           {editingReady && <button onClick={() => void addColumn()}>+ Property</button>}
         </div>

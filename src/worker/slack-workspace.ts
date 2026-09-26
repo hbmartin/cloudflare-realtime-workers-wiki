@@ -1,3 +1,5 @@
+import { listTasks } from "./tasks";
+import { listNotifications } from "./notifications";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { mentionsInbox, type MentionCursor } from "./mentions-inbox";
@@ -835,6 +837,11 @@ export async function deliverSlackSearchUpdate(env: Env, sessionId: string, revi
 }
 
 export async function purgeExpiredSlackSearchSessions(env: Env) {
+  await env.DB.prepare(
+    "DELETE FROM slack_product_sessions WHERE created_at<? AND (result_page_id IS NULL OR json_extract(state_json,'$.copied')=1 OR (json_extract(state_json,'$.source') IS NULL AND coalesce(json_extract(state_json,'$.body'),'')=''))",
+  )
+    .bind(Date.now() - 7 * 86_400_000)
+    .run();
   await env.DB.prepare(`DELETE FROM slack_view_sessions WHERE kind = 'search' AND created_at < ?`)
     .bind(Date.now() - SEARCH_SESSION_TTL_MS)
     .run();
@@ -887,6 +894,8 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
     const result = await mentionsInbox(env, member, state.asOf, state.cursors[state.page] ?? null, 10);
     view = homeView({
       sessionId: id,
+      tasks: (await listTasks(env, member, { mine: true, limit: 5 })).tasks,
+      notifications: (await listNotifications(env, member, { unreadOnly: false, limit: 5, offset: 0 })).notifications,
       mentions: result.mentions,
       firstPage: state.page === 0,
       nextCursor: result.nextCursor,
@@ -1040,6 +1049,16 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
         `INSERT INTO mention_reads (workspace_id, user_id, read_at) VALUES (?, ?, ?)
           ON CONFLICT(workspace_id, user_id) DO UPDATE SET read_at = MAX(read_at, excluded.read_at)`,
       ).bind(member.workspace.id, member.user.id, state.asOf),
+      env.DB.prepare(`UPDATE notifications SET read_at=coalesce(read_at,?) WHERE workspace_id=? AND user_id=? AND created_at<=?
+        AND EXISTS(SELECT 1 FROM pages p JOIN spaces s ON s.id=p.space_id LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=?
+          WHERE p.id=notifications.page_id AND p.archived_at IS NULL AND p.import_job_id IS NULL AND (?='owner' OR s.visibility='workspace' OR sm.user_id IS NOT NULL))`).bind(
+        Date.now(),
+        member.workspace.id,
+        member.user.id,
+        state.asOf,
+        member.user.id,
+        member.role,
+      ),
       env.DB.prepare(
         `UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'accepted', payload_json = NULL WHERE id = ? AND processed_at IS NULL`,
       ).bind(Date.now(), receiptId),
@@ -1071,6 +1090,8 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
   const result = await mentionsInbox(env, member, next.asOf, next.cursors[next.page] ?? null, 10);
   const view = homeView({
     sessionId: session.id,
+    tasks: (await listTasks(env, member, { mine: true, limit: 5 })).tasks,
+    notifications: (await listNotifications(env, member, { unreadOnly: false, limit: 5, offset: 0 })).notifications,
     mentions: result.mentions,
     firstPage: next.page === 0,
     nextCursor: result.nextCursor,

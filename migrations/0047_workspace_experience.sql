@@ -11,3 +11,24 @@ CREATE TABLE task_mutation_receipts (
  created_at INTEGER NOT NULL,
  PRIMARY KEY(workspace_id,actor_id,operation_id)
 );
+
+-- Task details and their row have one lifecycle, including permanent deletion.
+CREATE TRIGGER task_detail_delete BEFORE DELETE ON pages
+WHEN EXISTS(SELECT 1 FROM table_row_pages link JOIN table_rows r ON r.id=link.row_id JOIN pages list ON list.id=r.page_id WHERE link.page_id=OLD.id AND list.is_task_list=1)
+BEGIN
+ DELETE FROM table_rows WHERE id IN (SELECT row_id FROM table_row_pages WHERE page_id=OLD.id);
+END;
+
+CREATE TABLE slack_product_sessions (
+ id TEXT PRIMARY KEY,
+ installation_id TEXT NOT NULL REFERENCES slack_installations(id) ON DELETE CASCADE,
+ generation INTEGER NOT NULL,
+ slack_user_id TEXT NOT NULL,
+ identity_json TEXT NOT NULL,
+ state_json TEXT NOT NULL,
+ view_id TEXT,
+ request_hash TEXT,
+ result_page_id TEXT,
+ created_at INTEGER NOT NULL
+);
+CREATE INDEX slack_product_session_age ON slack_product_sessions(created_at);

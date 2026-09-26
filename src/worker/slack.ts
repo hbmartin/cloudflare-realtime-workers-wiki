@@ -87,7 +87,7 @@ export type SlackInteractionPayload = {
   trigger_id?: unknown;
   action_ts?: unknown;
   channel?: { id?: unknown };
-  message?: { ts?: unknown };
+  message?: { ts?: unknown; text?: unknown; thread_ts?: unknown; user?: unknown };
   actions?: Array<{ action_id?: unknown; action_ts?: unknown; value?: unknown; selected_option?: { value?: unknown } }>;
   team?: { id?: unknown };
   user?: { id?: unknown };
@@ -167,6 +167,7 @@ export type SlackUser = {
 };
 
 export type SlackApiContracts = {
+  "chat.getPermalink": { input: { channel: string; message_ts: string }; output: { permalink: string } };
   "conversations.info": {
     input: { channel: string };
     output: {
@@ -259,6 +260,7 @@ export type SlackHistoryMessage = {
 
 export type SlackApiMethod = keyof SlackApiContracts;
 const SLACK_READ_METHODS = new Set<SlackApiMethod>([
+  "chat.getPermalink",
   "conversations.info",
   "conversations.members",
   "conversations.history",
@@ -2117,87 +2119,6 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     }
   }
   return { ok: true };
-}
-
-const SLACK_SHORTCUT_CALLBACKS = new Set(["noteflare_save_to_notes", "noteflare_new_page_from_thread"]);
-
-export async function handleSlackInteraction(
-  env: Env,
-  payload: SlackInteractionPayload,
-  deadlineAt = Date.now() + 2_400,
-  defer?: (work: Promise<void>) => void,
-) {
-  if (
-    payload.type !== "message_action" ||
-    typeof payload.callback_id !== "string" ||
-    !SLACK_SHORTCUT_CALLBACKS.has(payload.callback_id) ||
-    typeof payload.trigger_id !== "string" ||
-    typeof payload.team?.id !== "string" ||
-    typeof payload.user?.id !== "string"
-  ) {
-    return;
-  }
-  const installation = await activeInstallation(env, payload.team.id);
-  if (!installation) return;
-  const interactionId = `${payload.team.id}:${payload.trigger_id}`;
-  const inserted = await env.DB.prepare(
-    `INSERT OR IGNORE INTO slack_interaction_receipts
-      (id, installation_id, interaction_id, callback_id, received_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  )
-    .bind(crypto.randomUUID(), installation.id, interactionId, payload.callback_id, Date.now())
-    .run();
-  if (!inserted.meta.changes) return;
-  const remaining = deadlineAt - Date.now() - 150;
-  if (remaining <= 0) throw new HttpError(503, "slack_ack_timeout", "Slack modal trigger expired.");
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const opening = slackApi(
-      env,
-      installation,
-      "views.open",
-      {
-        trigger_id: payload.trigger_id,
-        view: {
-          type: "modal",
-          callback_id: "noteflare_milestone_zero_placeholder",
-          title: { type: "plain_text", text: "NoteFlare" },
-          close: { type: "plain_text", text: "Close" },
-          blocks: [
-            {
-              type: "section",
-              text: { type: "mrkdwn", text: "This Slack action is not available yet." },
-            },
-          ],
-        },
-      },
-      Math.min(1_800, remaining),
-      controller.signal,
-    );
-    defer?.(
-      opening.then(
-        () => undefined,
-        () => undefined,
-      ),
-    );
-    await Promise.race([
-      opening,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          controller.abort(new Error("Slack modal trigger expired."));
-          reject(new HttpError(503, "slack_ack_timeout", "Slack modal trigger expired."));
-        }, remaining);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-  const finish = env.DB.prepare(`UPDATE slack_interaction_receipts SET processed_at = ? WHERE interaction_id = ?`)
-    .bind(Date.now(), interactionId)
-    .run();
-  if (defer) defer(finish.then(() => undefined));
-  else await finish;
 }
 
 async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_message_ts", outboxId: string) {

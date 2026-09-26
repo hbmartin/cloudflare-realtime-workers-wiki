@@ -199,8 +199,19 @@ export function NotificationsPanel({
             ×
           </button>
         </header>
-        {mentions && <div className="inbox-tabs"><button aria-pressed={tab === "updates"} onClick={() => setTab("updates")}>Updates</button><button aria-pressed={tab === "mentions"} onClick={() => setTab("mentions")}>Pages mentioning you</button></div>}
-        {tab === "mentions" ? mentions : settingsOpen ? (
+        {mentions && (
+          <div className="inbox-tabs">
+            <button aria-pressed={tab === "updates"} onClick={() => setTab("updates")}>
+              Updates
+            </button>
+            <button aria-pressed={tab === "mentions"} onClick={() => setTab("mentions")}>
+              Pages mentioning you
+            </button>
+          </div>
+        )}
+        {tab === "mentions" ? (
+          mentions
+        ) : settingsOpen ? (
           <div className="notification-settings">
             <button className="quiet-button notification-back" onClick={() => setSettingsOpen(false)}>
               ← Back to notifications

@@ -180,7 +180,13 @@ export type CommentThread = {
   updatedAt: number;
 };
 
-export type NotificationEventType = "mention" | "reply" | "thread_resolved" | "thread_reopened" | "page_edit" | "task_assigned";
+export type NotificationEventType =
+  | "mention"
+  | "reply"
+  | "thread_resolved"
+  | "thread_reopened"
+  | "page_edit"
+  | "task_assigned";
 export type NotificationChannelMode = "off" | "immediate" | "digest";
 
 export type Notification = {
@@ -414,6 +420,7 @@ export type TableRow = {
 export type TableCursor = { position: number; rowId: string };
 
 export type TableData = {
+  filter?: string;
   pageId: string;
   revision: number;
   columns: TableColumn[];

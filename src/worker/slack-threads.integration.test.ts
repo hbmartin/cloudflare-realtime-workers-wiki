@@ -1,3 +1,5 @@
+import { acceptSlackProductInteraction, openSlackProduct, deliverSlackProductCopy } from "./slack-product";
+import { listTasks, mutateTask, taskListStatements } from "./tasks";
 import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env, MemberContext } from "./env";
@@ -153,6 +155,8 @@ async function mockSlack(input: RequestInfo | URL, init?: RequestInit) {
         ...channelExtra,
       },
     });
+  if (method === "chat.getPermalink")
+    return Response.json({ ok: true, permalink: "https://test.slack.com/archives/CSPACE/p1700000100000001" });
   if (method === "conversations.members") return Response.json({ ok: true, members });
   if (method === "chat.postMessage") {
     if (postFailure === "permission") return Response.json({ ok: false, error: "no_permission" });
@@ -1405,7 +1409,9 @@ describe("interactive Slack workspace", () => {
     const first = calls.find((call) => call.method === "views.publish")!;
     expect(JSON.stringify(first.payload.view)).toContain("Owner mentioned you");
     expect(
-      (first.payload.view as { blocks: Array<{ type: string }> }).blocks.filter((block) => block.type === "section"),
+      (first.payload.view as { blocks: Array<{ type: string; text?: { text: string } }> }).blocks.filter(
+        (block) => block.type === "section" && block.text?.text.includes("mentioned you"),
+      ),
     ).toHaveLength(10);
     const session = await env.DB.prepare(`SELECT id, view_hash FROM slack_view_sessions WHERE kind = 'home'`).first<{
       id: string;
@@ -4452,5 +4458,205 @@ describe("Slack delayed-work boundaries", () => {
     expect(calls).toHaveLength(0);
     expect(await env.DB.prepare(`SELECT 1 FROM outbox WHERE topic = 'slack_thread_action'`).first()).not.toBeNull();
     await waitOnExecutionContext(context);
+  });
+});
+
+describe("Slack documents and tasks", () => {
+  const submission = (id: string, kind: string, dest: string, title: string) => ({
+    type: "view_submission",
+    team: { id: "T123" },
+    user: { id: "UOWNER" },
+    view: {
+      id: "VSEARCH",
+      callback_id: "noteflare_compose",
+      private_metadata: id,
+      state: {
+        values: {
+          kind: { value: { selected_option: { value: kind } } },
+          destination: { value: { selected_option: { value: dest } } },
+          title: { value: { value: title } },
+          status: { value: { selected_option: { value: "todo" } } },
+          assignee: { value: { selected_option: { value: "owner" } } },
+          due: { value: { selected_date: "2026-10-01" } },
+        },
+      },
+    },
+  });
+  async function open(command: string, trigger = crypto.randomUUID()) {
+    const installation = (await env.DB.prepare(
+      "SELECT * FROM slack_installations WHERE id='installation'",
+    ).first<SlackInstallation>())!;
+    await openSlackProduct(runtime(), installation, "UOWNER", trigger, command);
+    const view = calls.findLast((c) => c.method === "views.open")?.payload.view as { private_metadata: string };
+    expect(view?.private_metadata).toBeTruthy();
+    return view.private_metadata;
+  }
+  async function list() {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,is_task_list,created_by,created_at,updated_at) VALUES('tasks','workspace','workspace-general','table','b0','Tasks',1,'owner',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO table_state(page_id) VALUES('tasks')"),
+      ...taskListStatements(env.DB, "tasks"),
+    ]);
+  }
+  it("creates one document for repeated form delivery and retains its explicit destination", async () => {
+    const id = await open("new");
+    const payload = submission(id, "document", "page:page", "Captured note");
+    const saved = await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500);
+    expect(saved.response).toMatchObject({ response_action: "update" });
+    expect((await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500)).response).toMatchObject({
+      response_action: "update",
+    });
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM pages WHERE title='Captured note' AND parent_id='page'").first(),
+    ).toEqual({ count: 1 });
+    const other = submission(id, "document", "space:workspace-general", "Different note");
+    expect((await acceptSlackProductInteraction(runtime(), other, Date.now() + 2500)).response).toMatchObject({
+      response_action: "errors",
+    });
+  });
+  it("does not queue locked task changes and permits explicit retry after release", async () => {
+    await list();
+    const id = await open("task");
+    const payload = submission(id, "task", "page:tasks", "Follow up");
+    await env.DB.prepare(
+      "INSERT INTO table_leases(page_id,token_hash,holder_user_id,holder_session_id,expires_at) VALUES('tasks','locked','owner','browser',?)",
+    )
+      .bind(Date.now() + 60000)
+      .run();
+    expect((await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500)).response).toMatchObject({
+      response_action: "errors",
+      errors: { title: expect.stringContaining("editing") },
+    });
+    expect((await listTasks(runtime(), owner)).tasks).toHaveLength(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM outbox WHERE topic='slack_product_copy'").first()).toEqual({
+      count: 0,
+    });
+    await env.DB.prepare("DELETE FROM table_leases WHERE page_id='tasks'").run();
+    expect((await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500)).response).toMatchObject({
+      response_action: "update",
+    });
+    await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500);
+    const tasks = (await listTasks(runtime(), owner, { mine: true })).tasks;
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({ title: "Follow up", status: "todo", assigneeId: "owner", dueDate: "2026-10-01" });
+    const task = tasks[0]!;
+    await mutateTask(runtime(), owner, "tasks", task.id, {
+      operationId: "web-change",
+      expectedRevision: task.revision,
+      status: "doing",
+    });
+    await open("tasks");
+    expect(JSON.stringify(calls.findLast((c) => c.method === "views.open")?.payload)).toContain("In progress");
+  });
+  it.each([false, true])(
+    "copies attributed message/thread content exactly once after a lost receipt (thread=%s)",
+    async (isThreadCapture) => {
+      threadHistoryReplies.push({
+        thread_ts: "1700000100.000001",
+        ts: "1700000100.000001",
+        text: "Decide launch date",
+        user: "UOWNER",
+      });
+      await acceptSlackProductInteraction(
+        runtime(),
+        {
+          type: "message_action",
+          callback_id: isThreadCapture ? "noteflare_new_page_from_thread" : "noteflare_save_to_notes",
+          trigger_id: "capture-trigger",
+          team: { id: "T123" },
+          user: { id: "UOWNER" },
+          channel: { id: "CSPACE" },
+          message: { ts: "1700000100.000001", text: "Decide launch date", user: "UOWNER" },
+        },
+        Date.now() + 2500,
+      );
+      const id = (calls.findLast((c) => c.method === "views.open")!.payload.view as { private_metadata: string })
+        .private_metadata;
+      expect(
+        (
+          await acceptSlackProductInteraction(
+            runtime(),
+            submission(id, "document", "space:workspace-general", "Launch decision"),
+            Date.now() + 2500,
+          )
+        ).response,
+      ).toMatchObject({ response_action: "update" });
+      await env.DB.prepare("DELETE FROM outbox WHERE topic='slack_product_copy'").run();
+      await acceptSlackProductInteraction(
+        runtime(),
+        submission(id, "document", "space:workspace-general", "Launch decision"),
+        Date.now() + 2500,
+      );
+      expect(
+        await env.DB.prepare("SELECT count(*) count FROM outbox WHERE topic='slack_product_copy'").first(),
+      ).toEqual({ count: 1 });
+      await deliverSlackProductCopy(runtime(), id);
+      await env.DB.prepare("UPDATE slack_product_sessions SET state_json=json_remove(state_json,'$.copied') WHERE id=?")
+        .bind(id)
+        .run();
+      await deliverSlackProductCopy(runtime(), id);
+      const projection = await env.DB.prepare("SELECT plain_text FROM pages WHERE id=?")
+        .bind(id)
+        .first<{ plain_text: string }>();
+      expect(projection?.plain_text.match(/Decide launch date/g)).toHaveLength(1);
+      expect(projection?.plain_text).toContain("Captured from Slack");
+    },
+  );
+  it("filters private task assignments, enforces viewers, and emits one assignment notification", async () => {
+    await list();
+    const input = {
+      operationId: "assign-viewer",
+      expectedRevision: 1,
+      title: "Review launch",
+      assigneeId: "viewer",
+      dueDate: "2026-10-01",
+    };
+    const saved = await mutateTask(runtime(), owner, "tasks", null, input);
+    await mutateTask(runtime(), owner, "tasks", null, input);
+    expect((await listTasks(runtime(), viewer, { mine: true })).tasks).toEqual([
+      expect.objectContaining({ id: saved.rowId, editable: false }),
+    ]);
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM notifications WHERE user_id='viewer' AND event_type='task_assigned'",
+      ).first(),
+    ).toEqual({ count: 1 });
+    await expect(
+      mutateTask(runtime(), viewer, "tasks", saved.rowId, {
+        operationId: "viewer-edit",
+        expectedRevision: 2,
+        status: "done",
+      }),
+    ).rejects.toMatchObject({ status: 403 });
+    await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id='workspace-general'").run();
+    expect((await listTasks(runtime(), viewer, { mine: true })).tasks).toHaveLength(0);
+    await expect(listTasks(runtime(), viewer, { listId: "tasks" })).rejects.toMatchObject({ status: 404 });
+  });
+  it("rechecks verified identity and viewer permissions when submitting a form", async () => {
+    const id = await open("new");
+    await env.DB.prepare("UPDATE workspace_members SET role='owner' WHERE user_id='viewer'").run();
+    await env.DB.prepare("UPDATE workspace_members SET role='viewer' WHERE user_id='owner'").run();
+    expect(
+      (
+        await acceptSlackProductInteraction(
+          runtime(),
+          submission(id, "document", "space:workspace-general", "Denied"),
+          Date.now() + 2500,
+        )
+      ).response,
+    ).toMatchObject({ response_action: "errors" });
+    await env.DB.prepare("UPDATE slack_user_links SET verified_at=2 WHERE user_id='owner'").run();
+    expect(
+      (
+        await acceptSlackProductInteraction(
+          runtime(),
+          submission(id, "document", "space:workspace-general", "Denied"),
+          Date.now() + 2500,
+        )
+      ).response,
+    ).toMatchObject({ response_action: "errors" });
+    expect(await env.DB.prepare("SELECT count(*) count FROM pages WHERE title='Denied'").first()).toEqual({ count: 0 });
   });
 });

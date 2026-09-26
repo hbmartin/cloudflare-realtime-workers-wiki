@@ -1139,21 +1139,23 @@ export function DiagramPage({
 
   return (
     <main className="page-canvas diagram-page">
-      <PageTools><ActionMenu label="Page details" icon="comment">
-        <span className={`sync-state sync-${connected ? "connected" : status}`}>
-          <i />
-          {connected ? "connected" : status === "connected" ? "syncing" : status}
-        </span>
-        {(["comments", "history", "backlinks"] as const).map((value) => (
-          <button
-            key={value}
-            className="quiet-button"
-            onClick={() => setPanel((current) => (current === value ? null : value))}
-          >
-            {value[0]!.toUpperCase() + value.slice(1)}
-          </button>
-        ))}
-      </ActionMenu></PageTools>
+      <PageTools>
+        <ActionMenu label="Page details" icon="comment">
+          <span className={`sync-state sync-${connected ? "connected" : status}`}>
+            <i />
+            {connected ? "connected" : status === "connected" ? "syncing" : status}
+          </span>
+          {(["comments", "history", "backlinks"] as const).map((value) => (
+            <button
+              key={value}
+              className="quiet-button"
+              onClick={() => setPanel((current) => (current === value ? null : value))}
+            >
+              {value[0]!.toUpperCase() + value.slice(1)}
+            </button>
+          ))}
+        </ActionMenu>
+      </PageTools>
       {!connected ? (
         <div className="notice">This diagram is read-only until the server reconnects and finishes syncing.</div>
       ) : null}

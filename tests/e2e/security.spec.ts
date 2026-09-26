@@ -47,12 +47,12 @@ test("passkey enrollment, passwordless sign-in, replay rejection, and mandatory 
   await expect(guest.getByLabel("I saved my recovery codes")).toBeVisible();
   await guest.getByLabel("I saved my recovery codes").check();
   await guest.getByRole("button", { name: "Continue", exact: true }).click();
-  await expect(guest.getByLabel("Page title")).toBeVisible();
+  await expect(guest.getByRole("heading", { name: "Home", exact: true })).toBeVisible();
   await guest.getByRole("button", { name: "Sign out", exact: true }).click();
   const assertion = guest.waitForRequest((request) => request.url().endsWith("/passkey/verify-authentication"));
   await guest.getByRole("button", { name: "Sign in with a passkey" }).click();
   const captured = await assertion;
-  await expect(guest.getByLabel("Page title")).toBeVisible();
+  await expect(guest.getByRole("heading", { name: "Home", exact: true })).toBeVisible();
   const replay = await context.request.post("/api/auth/passkey/verify-authentication", {
     data: captured.postDataJSON(),
   });
@@ -89,7 +89,7 @@ test("passkey enrollment, passwordless sign-in, replay rejection, and mandatory 
   expect((await context.request.get("/api/me")).status()).toBe(401);
   await cdp.send("WebAuthn.setUserVerified", { authenticatorId, isUserVerified: true });
   await guest.getByRole("button", { name: "Sign in with a passkey" }).click();
-  await expect(guest.getByLabel("Page title")).toBeVisible();
+  await expect(guest.getByRole("heading", { name: "Home", exact: true })).toBeVisible();
   const setup = await context.request.post("/api/security/setup-totp", { data: { password: "password123" } });
   expect(setup.ok()).toBe(true);
   const { totpURI } = await setup.json();

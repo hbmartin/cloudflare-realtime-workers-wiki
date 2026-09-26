@@ -1042,13 +1042,24 @@ export function useCommittedRef<T>(value: T) {
 function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
   const preferencesKey = `notes:ui:${member.workspace.id}:${member.user.id}`;
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readPreference(`${preferencesKey}:collapsed`, false));
-  const [sidebarWidth, setSidebarWidth] = useState(() => Math.max(220, Math.min(420, readPreference(`${preferencesKey}:width`, 260))));
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    Math.max(220, Math.min(420, readPreference(`${preferencesKey}:width`, 260))),
+  );
   const [recentIds, setRecentIds] = useState<string[]>(() => readPreference(`${preferencesKey}:recent`, []));
   const [quickSwitcherOpen, setQuickSwitcherOpen] = useState(false);
-  useEffect(() => { savePreference(`${preferencesKey}:collapsed`, sidebarCollapsed); savePreference(`${preferencesKey}:width`, sidebarWidth); }, [preferencesKey, sidebarCollapsed, sidebarWidth]);
   useEffect(() => {
-    const handle = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setQuickSwitcherOpen((open) => !open); } };
-    window.addEventListener("keydown", handle); return () => window.removeEventListener("keydown", handle);
+    savePreference(`${preferencesKey}:collapsed`, sidebarCollapsed);
+    savePreference(`${preferencesKey}:width`, sidebarWidth);
+  }, [preferencesKey, sidebarCollapsed, sidebarWidth]);
+  useEffect(() => {
+    const handle = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setQuickSwitcherOpen((open) => !open);
+      }
+    };
+    window.addEventListener("keydown", handle);
+    return () => window.removeEventListener("keydown", handle);
   }, []);
   const lastPageStorageKey = `notes:last-page:${member.workspace.id}:${member.user.id}`;
   const startupNavigation = useRef<{
@@ -1080,11 +1091,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [view, setView] = useState<"pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings">(() => {
+  const [view, setView] = useState<
+    "pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings"
+  >(() => {
     const requested = startupNavigation.current!.view;
     return requested && ["search", "home", "tasks", "mentions", "templates", "trash", "settings"].includes(requested)
       ? (requested as "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings")
-      : startupNavigation.current!.pageId ? "pages" : "home";
+      : startupNavigation.current!.pageId
+        ? "pages"
+        : "home";
   });
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
@@ -1355,6 +1370,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         if (activeRequest.restoring && (page.archivedAt !== null || page.isTemplate)) {
           localStorage.removeItem(lastPageStorageKey);
           dispatchPageAction({ type: "clear-pending-selection", pageId });
+          setView("home");
           return;
         }
         dispatchPageAction({ type: "merge", pages: [page] });
@@ -1372,6 +1388,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         if (activeRequest.restoring && error instanceof ApiClientError && [403, 404, 410].includes(error.status)) {
           localStorage.removeItem(lastPageStorageKey);
           dispatchPageAction({ type: "clear-pending-selection", pageId });
+          setView("home");
           return;
         }
         if (!activeRequest.controller.signal.aborted) {
@@ -2417,9 +2434,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const rememberSelected = Boolean(activeSelected && !activeSelected.isTemplate && activeSelected.archivedAt === null);
   useEffect(() => {
-    if (resolvedSelectedId && rememberSelected && view === "pages") {
+    if (resolvedSelectedId && rememberSelected && view !== "home") {
       localStorage.setItem(lastPageStorageKey, resolvedSelectedId);
-      setRecentIds((current) => { const next = [resolvedSelectedId, ...current.filter((id) => id !== resolvedSelectedId)].slice(0, 30); savePreference(`${preferencesKey}:recent`, next); return next; });
+      // A server-confirmed navigation updates this per-user history.
+      if (view === "pages")
+        // eslint-disable-next-line react/set-state-in-effect
+        setRecentIds((current) => {
+          const next = [resolvedSelectedId, ...current.filter((id) => id !== resolvedSelectedId)].slice(0, 30);
+          savePreference(`${preferencesKey}:recent`, next);
+          return next;
+        });
     }
   }, [rememberSelected, lastPageStorageKey, resolvedSelectedId, view, preferencesKey]);
   useEffect(() => {
@@ -2427,6 +2451,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const url = new URL(window.location.href);
     const pageId = pendingSelectionId ?? resolvedSelectedId;
     if (view === "pages") url.searchParams.delete("view");
+    else url.searchParams.set("view", view);
     if (pageId) url.searchParams.set("page", pageId);
     else url.searchParams.delete("page");
     if (url.href !== window.location.href) history.replaceState(null, "", url);
@@ -2584,7 +2609,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         "/api/pages",
         {
           method: "POST",
-          body: json({ id: operationId, kind, parentId: resolvedParentId, spaceId: currentSpaceId, ...(requestedKind === "tasks" ? {taskList:true} : {}) }),
+          body: json({
+            id: operationId,
+            kind,
+            parentId: resolvedParentId,
+            spaceId: currentSpaceId,
+            ...(requestedKind === "tasks" ? { taskList: true } : {}),
+          }),
           signal,
         },
         (value) => pageMutationResponse(value, expectation),
@@ -3082,9 +3113,22 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const initialPageLoadFailed = !pagesLoaded && workspaceErrors.some((error) => error.source === "page-tree");
   const pendingPageError = workspaceErrors.find((error) => error.source === "page-access")?.message;
 
-  const metadata = activeSelected ? <PageTags assigned={pageTags.pageId === activeSelected.id ? pageTags.tags : []} available={tags} editable={canEditActiveSpace} busy={pendingOrganizationAction?.startsWith("tag:") ?? false} onAdd={(tag) => setPageTag(activeSelected, tag, true)} onRemove={(tag) => setPageTag(activeSelected, tag, false)} onCreate={(name, color) => createAndAddTag(activeSelected, name, color)} /> : null;
+  const metadata = activeSelected ? (
+    <PageTags
+      assigned={pageTags.pageId === activeSelected.id ? pageTags.tags : []}
+      available={tags}
+      editable={canEditActiveSpace}
+      busy={pendingOrganizationAction?.startsWith("tag:") ?? false}
+      onAdd={(tag) => setPageTag(activeSelected, tag, true)}
+      onRemove={(tag) => setPageTag(activeSelected, tag, false)}
+      onCreate={(name, color) => createAndAddTag(activeSelected, name, color)}
+    />
+  ) : null;
   return (
-    <div className={`workspace-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`} style={{ gridTemplateColumns: sidebarCollapsed ? "0 minmax(0, 1fr)" : `${sidebarWidth}px minmax(0, 1fr)` }}>
+    <div
+      className={`workspace-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
+      style={{ gridTemplateColumns: sidebarCollapsed ? "0 minmax(0, 1fr)" : `${sidebarWidth}px minmax(0, 1fr)` }}
+    >
       <aside
         ref={sidebarRef}
         id="workspace-navigation"
@@ -3168,25 +3212,47 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             <p className="sidebar-load-error">Organization unavailable. Core pages remain usable.</p>
           )}
           <nav className="sidebar-nav">
-            <button className={view === "home" ? "active" : ""} onClick={() => showView("home")}><Icon name="home" />Home</button>
-            <button className={view === "tasks" ? "active" : ""} onClick={() => showView("tasks")}><Icon name="tasks" />My Tasks</button>
+            <button className={view === "home" ? "active" : ""} onClick={() => showView("home")}>
+              <Icon name="home" />
+              Home
+            </button>
+            <button className={view === "tasks" ? "active" : ""} onClick={() => showView("tasks")}>
+              <Icon name="tasks" />
+              My Tasks
+            </button>
             <button className={view === "search" ? "active" : ""} onClick={() => showView("search")}>
               <Icon name="search" /> Search
             </button>
-            <button ref={notificationTriggerRef} onClick={openNotifications} aria-label="Inbox" aria-haspopup="dialog"><Icon name="inbox" />Inbox {(unreadMentions > 0 || unreadNotifications > 0) && <b className="mention-badge" aria-label="Unread updates">•</b>}</button>
+            <button ref={notificationTriggerRef} onClick={openNotifications} aria-label="Inbox" aria-haspopup="dialog">
+              <Icon name="inbox" />
+              Inbox{" "}
+              {(unreadMentions > 0 || unreadNotifications > 0) && (
+                <b className="mention-badge" aria-label="Unread updates">
+                  •
+                </b>
+              )}
+            </button>
           </nav>
           {favorites.length > 0 && (
             <SidebarPageLinks label="Favorites" pages={favorites} icon="★" onSelect={navigateToPage} />
           )}
-          {pins.length > 0 && <SidebarPageLinks label="Pinned in this space" pages={pins} icon="⌖" onSelect={navigateToPage} />}
+          {pins.length > 0 && (
+            <SidebarPageLinks label="Pinned in this space" pages={pins} icon="⌖" onSelect={navigateToPage} />
+          )}
           <div className="sidebar-section-title">
             <span>{activeSpace?.name ?? "Pages"}</span>
             <span className="sidebar-section-actions">
               {activeSpace && (
-                <ActionMenu label="Space options"><WatchControl key={activeSpace.id} resourceType="space" resourceId={activeSpace.id} /></ActionMenu>
+                <ActionMenu label="Space options">
+                  <WatchControl key={activeSpace.id} resourceType="space" resourceId={activeSpace.id} />
+                </ActionMenu>
               )}
               {canEditActiveSpace && (
-                <CreationMenu label={`New page in ${activeSpace?.name ?? "this space"}`} disabled={!canCreatePage} onCreate={(kind) => void createPage(kind, null)} />
+                <CreationMenu
+                  label={`New page in ${activeSpace?.name ?? "this space"}`}
+                  disabled={!canCreatePage}
+                  onCreate={(kind) => void createPage(kind, null)}
+                />
               )}
             </span>
           </div>
@@ -3199,6 +3265,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             }}
           >
             <WorkspaceTree
+              key={`${preferencesKey}:${currentSpaceId}`}
               preferenceKey={`${preferencesKey}:tree:${currentSpaceId}`}
               nodes={tree}
               selectedId={resolvedSelectedId}
@@ -3215,10 +3282,24 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           </button>
         </div>
         <div className="sidebar-bottom-nav">
-          <button onClick={() => showView("templates")}><Icon name="page" />Templates</button>
-          <button ref={activityTriggerRef} onClick={openActivities}><Icon name="download" />Imports &amp; exports{activeJobCount > 0 && <span className="job-badge">{activeJobCount}</span>}</button>
-          {member.role !== "viewer" && <button disabled={!canCreatePage} onClick={() => setImportOpen(true)}><Icon name="download" />Import notes</button>}
-          <button onClick={() => showView("settings")}><Icon name="settings" />Members &amp; settings</button>
+          <button onClick={() => showView("templates")}>
+            <Icon name="page" />
+            Templates
+          </button>
+          <button ref={activityTriggerRef} onClick={openActivities}>
+            <Icon name="download" />
+            Imports &amp; exports{activeJobCount > 0 && <span className="job-badge">{activeJobCount}</span>}
+          </button>
+          {member.role !== "viewer" && (
+            <button disabled={!canCreatePage} onClick={() => setImportOpen(true)}>
+              <Icon name="download" />
+              Import notes
+            </button>
+          )}
+          <button onClick={() => showView("settings")}>
+            <Icon name="settings" />
+            Members &amp; settings
+          </button>
         </div>
         <footer className="sidebar-footer">
           <ThemeControl compact />
@@ -3231,12 +3312,39 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           >
             Sign out
           </button>
-          <button className="desktop-sidebar-toggle icon-button" aria-label="Collapse sidebar" onClick={() => setSidebarCollapsed(true)}><Icon name="sidebar" /></button>
+          <button
+            className="desktop-sidebar-toggle icon-button"
+            aria-label="Collapse sidebar"
+            onClick={() => setSidebarCollapsed(true)}
+          >
+            <Icon name="sidebar" />
+          </button>
         </footer>
-        <div className="sidebar-resize" role="separator" aria-label="Resize sidebar" aria-orientation="vertical" aria-valuemin={220} aria-valuemax={420} aria-valuenow={sidebarWidth} tabIndex={0}
-          onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSidebarWidth((width) => Math.max(220, Math.min(420, width + (event.key === "ArrowRight" ? 10 : -10)))); } }}
-          onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); }}
-          onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) setSidebarWidth(Math.max(220, Math.min(420, event.clientX))); }} />
+        {/* A focusable window splitter supports pointer dragging and arrow-key resizing. */}
+        {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
+        <hr
+          className="sidebar-resize"
+          aria-label="Resize sidebar"
+          aria-orientation="vertical"
+          aria-valuemin={220}
+          aria-valuemax={420}
+          aria-valuenow={sidebarWidth}
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+          tabIndex={0}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+              event.preventDefault();
+              setSidebarWidth((width) => Math.max(220, Math.min(420, width + (event.key === "ArrowRight" ? 10 : -10))));
+            }
+          }}
+          onPointerDown={(event) => {
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }}
+          onPointerMove={(event) => {
+            if (event.currentTarget.hasPointerCapture(event.pointerId))
+              setSidebarWidth(Math.max(220, Math.min(420, event.clientX)));
+          }}
+        />
       </aside>
 
       <section
@@ -3258,7 +3366,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           </div>
         )}
         <header className="topbar">
-          {sidebarCollapsed && <button className="icon-button desktop-sidebar-toggle" aria-label="Expand sidebar" onClick={() => setSidebarCollapsed(false)}><Icon name="sidebar" /></button>}
+          {sidebarCollapsed && (
+            <button
+              className="icon-button desktop-sidebar-toggle"
+              aria-label="Expand sidebar"
+              onClick={() => setSidebarCollapsed(false)}
+            >
+              <Icon name="sidebar" />
+            </button>
+          )}
           <button
             ref={sidebarTriggerRef}
             className="icon-button mobile-only"
@@ -3270,35 +3386,127 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             ☰
           </button>
           <div className="breadcrumbs">
-            {breadcrumbs.map((page, index) => (
-              <span key={page.id}>
-                {index > 0 && <i>/</i>}
-                <button title={page.title} onClick={() => navigateToPage(page.id)}>{page.icon && <span>{page.icon}</span>}{page.title}</button>
-              </span>
-            ))}
+            {view === "home" || view === "tasks" || view === "search" ? (
+              <span>{view === "home" ? "Home" : view === "tasks" ? "My Tasks" : "Search"}</span>
+            ) : (
+              breadcrumbs.map((page, index) => (
+                <span key={page.id}>
+                  {index > 0 && <i>/</i>}
+                  <button title={page.title} onClick={() => navigateToPage(page.id)}>
+                    {page.icon && <span>{page.icon}</span>}
+                    {page.title}
+                  </button>
+                </span>
+              ))
+            )}
           </div>
           <div className="topbar-actions">
-            <button className="icon-button" aria-label="Find a page (⌘K / Ctrl+K)" title="Find a page (⌘K / Ctrl+K)" onClick={() => setQuickSwitcherOpen(true)}><Icon name="search" /></button>
-            {view === "pages" && activeSelected && <>
-              <div id="page-tools-slot" />
-              {activeSelected.kind !== "diagram" && !activeSelected.isTemplate && <ShareControl key={`share:${activeSelected.id}`} pageId={activeSelected.id} owner={member.role === "owner"} />}
-              <button className="icon-button favorite-action" title="Favorite" aria-label="Favorite" aria-pressed={favorites.some((page) => page.id === activeSelected.id)} disabled={pendingOrganizationAction === `favorite:${activeSelected.id}`} onClick={() => void toggleFavorite(activeSelected)}><Icon name="star" /></button>
-              <ActionMenu label="Page actions">
-                <WatchControl key={`watch:${activeSelected.id}`} resourceType="page" resourceId={activeSelected.id} />
-                <button data-close-menu onClick={() => void navigator.clipboard.writeText(new URL(`/?page=${activeSelected.id}`, window.location.origin).href).catch((error) => reportWorkspaceError({source:"organization"}, apiErrorMessage(error, "The link could not be copied.")))}>Copy link</button>
-                <button data-close-menu onClick={() => setExportOpen(true)}>Export</button>
-                {canEditActiveSpace && <>
-                  <button disabled={pendingOrganizationAction === `pin:${activeSelected.id}`} aria-pressed={pins.some((page) => page.id === activeSelected.id)} onClick={() => void togglePin(activeSelected)}>{pins.some((page) => page.id === activeSelected.id) ? "Unpin from space" : "Pin in this space"}</button>
-                  <button disabled={pendingTemplateId === `save:${activeSelected.id}`} onClick={() => void queueTemplateJob("/api/templates", {pageId: activeSelected.id, title: activeSelected.title}, `save:${activeSelected.id}`)}>Save as template</button>
-                  {activeSelected.kind === "document" && <button aria-pressed={Boolean(activeSelected.fullWidth)} onClick={() => { void api<{page: Page}>(`/api/pages/${activeSelected.id}`, {method:"PATCH", body:json({fullWidth: !activeSelected.fullWidth, revision: activeSelected.revision})}).then(({page}) => updatePage(page)).catch((error) => reportWorkspaceError({source:"organization"}, apiErrorMessage(error, "The page width could not be saved."))); }}>{activeSelected.fullWidth ? "Use reading width" : "Use full width"}</button>}
-                  <button data-close-menu onClick={() => void archive(activeSelected)}><Icon name="trash" />Move to trash</button>
-                </>}
-              </ActionMenu>
-            </>}
+            <button
+              className="icon-button"
+              aria-label="Find a page (⌘K / Ctrl+K)"
+              title="Find a page (⌘K / Ctrl+K)"
+              onClick={() => setQuickSwitcherOpen(true)}
+            >
+              <Icon name="search" />
+            </button>
+            {view === "pages" && activeSelected && (
+              <>
+                <div id="page-tools-slot" />
+                {activeSelected.kind !== "diagram" && !activeSelected.isTemplate && (
+                  <ShareControl
+                    key={`share:${activeSelected.id}`}
+                    pageId={activeSelected.id}
+                    owner={member.role === "owner"}
+                  />
+                )}
+                <button
+                  className="icon-button favorite-action"
+                  title="Favorite"
+                  aria-label="Favorite"
+                  aria-pressed={favorites.some((page) => page.id === activeSelected.id)}
+                  disabled={pendingOrganizationAction === `favorite:${activeSelected.id}`}
+                  onClick={() => void toggleFavorite(activeSelected)}
+                >
+                  <Icon name="star" />
+                </button>
+                <ActionMenu label="Page actions">
+                  <WatchControl key={`watch:${activeSelected.id}`} resourceType="page" resourceId={activeSelected.id} />
+                  <button
+                    data-close-menu
+                    onClick={() =>
+                      void navigator.clipboard
+                        .writeText(new URL(`/?page=${activeSelected.id}`, window.location.origin).href)
+                        .catch((error) =>
+                          reportWorkspaceError(
+                            { source: "organization" },
+                            apiErrorMessage(error, "The link could not be copied."),
+                          ),
+                        )
+                    }
+                  >
+                    Copy link
+                  </button>
+                  <button data-close-menu onClick={() => setExportOpen(true)}>
+                    Export
+                  </button>
+                  {canEditActiveSpace && (
+                    <>
+                      <button
+                        disabled={pendingOrganizationAction === `pin:${activeSelected.id}`}
+                        aria-pressed={pins.some((page) => page.id === activeSelected.id)}
+                        onClick={() => void togglePin(activeSelected)}
+                      >
+                        {pins.some((page) => page.id === activeSelected.id) ? "Unpin from space" : "Pin in this space"}
+                      </button>
+                      <button
+                        disabled={pendingTemplateId === `save:${activeSelected.id}`}
+                        onClick={() =>
+                          void queueTemplateJob(
+                            "/api/templates",
+                            { pageId: activeSelected.id, title: activeSelected.title },
+                            `save:${activeSelected.id}`,
+                          )
+                        }
+                      >
+                        Save as template
+                      </button>
+                      {activeSelected.kind === "document" && (
+                        <button
+                          aria-pressed={Boolean(activeSelected.fullWidth)}
+                          onClick={() => {
+                            void api<{ page: Page }>(`/api/pages/${activeSelected.id}`, {
+                              method: "PATCH",
+                              body: json({ fullWidth: !activeSelected.fullWidth, revision: activeSelected.revision }),
+                            })
+                              .then(({ page }) => updatePage(page))
+                              .catch((error) =>
+                                reportWorkspaceError(
+                                  { source: "organization" },
+                                  apiErrorMessage(error, "The page width could not be saved."),
+                                ),
+                              );
+                          }}
+                        >
+                          {activeSelected.fullWidth ? "Use reading width" : "Use full width"}
+                        </button>
+                      )}
+                      <button data-close-menu onClick={() => void archive(activeSelected)}>
+                        <Icon name="trash" />
+                        Move to trash
+                      </button>
+                    </>
+                  )}
+                </ActionMenu>
+              </>
+            )}
           </div>
         </header>
 
-        {view === "tasks" ? <TasksView member={member} onSelectPage={navigateToPage} /> : view === "home" ? <RecentPages pages={pages} recentIds={recentIds} onSelect={navigateToPage} /> : view === "search" ? (
+        {view === "tasks" ? (
+          <TasksView member={member} onSelectPage={navigateToPage} />
+        ) : view === "home" ? (
+          <RecentPages pages={pages} recentIds={recentIds} onSelect={navigateToPage} />
+        ) : view === "search" ? (
           <SearchView spaces={spaces} tags={tags} onSelect={navigateToPage} />
         ) : view === "mentions" ? (
           <MentionsView onSelect={navigateToPage} onRead={handleMentionsRead} />
@@ -3351,10 +3559,24 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             retryingLabel="Loading…"
           />
         ) : activeSelected ? (
-          activeSelected.taskList ? <TasksView key={activeSelected.id} page={activeSelected} member={activeMember} metadata={metadata} onSelectPage={navigateToPage} onPageChanged={updatePage} /> : activeSelected.kind === "document" ? (
+          activeSelected.taskList ? (
+            <TasksView
+              key={activeSelected.id}
+              page={activeSelected}
+              member={activeMember}
+              metadata={metadata}
+              onSelectPage={navigateToPage}
+              onPageChanged={updatePage}
+            />
+          ) : activeSelected.kind === "document" ? (
             <EditorPage
               key={`${activeSelected.id}:${activeSelected.contentEpoch}`}
               page={activeSelected}
+              taskList={
+                sidebarHiddenPageIds.has(activeSelected.id)
+                  ? pages.find((parent) => parent.id === activeSelected.parentId && parent.taskList)
+                  : undefined
+              }
               metadata={metadata}
               member={activeMember}
               onPageChanged={updatePage}
@@ -3413,7 +3635,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       )}
       {notificationsOpen && (
         <NotificationsPanel
-          mentions={<MentionsView onSelect={(id) => { navigateToPage(id); closeNotifications(); }} onRead={handleMentionsRead} />}
+          mentions={
+            <MentionsView
+              onSelect={(id) => {
+                navigateToPage(id);
+                closeNotifications();
+              }}
+              onRead={handleMentionsRead}
+            />
+          }
           revision={notificationsRevision}
           onClose={closeNotifications}
           onSelectPage={navigateToPage}
@@ -3443,7 +3673,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           }}
         />
       )}
-      {quickSwitcherOpen && <QuickSwitcher pages={pages.filter((page) => !page.isTemplate && !page.archivedAt)} recentIds={recentIds} onSelect={navigateToPage} onClose={() => setQuickSwitcherOpen(false)} />}
+      {quickSwitcherOpen && (
+        <QuickSwitcher
+          pages={pages.filter((page) => !page.isTemplate && !page.archivedAt)}
+          recentIds={recentIds}
+          onSelect={navigateToPage}
+          onClose={() => setQuickSwitcherOpen(false)}
+        />
+      )}
       {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
     </div>
   );

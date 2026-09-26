@@ -24,7 +24,7 @@ export async function eventForCurrentWorkspaceState(
     if (!candidates.length) return null;
     const active = await env.DB.prepare(
       `SELECT id, workspace_id, space_id, parent_id, kind, position, title, icon, revision,
-              content_epoch, is_template, archived_at, created_at, updated_at FROM pages
+              content_epoch, is_template, full_width, is_task_list, archived_at, created_at, updated_at FROM pages
         WHERE workspace_id = ? AND archived_at IS NULL
           AND id IN (SELECT value FROM json_each(?))`,
     )

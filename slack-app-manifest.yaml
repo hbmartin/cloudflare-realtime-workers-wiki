@@ -1,6 +1,6 @@
 display_information:
   name: NoteFlare
-  description: Search notes, receive notifications, and safely unfurl page links.
+  description: Capture messages, manage tasks, search notes, and follow team discussions.
   background_color: "#5452a8"
 # The installed production Worker keeps its existing hostname through the NoteFlare rebrand.
 features:
@@ -14,8 +14,8 @@ features:
   slash_commands:
     - command: /notes
       url: https://cloudflare-realtime-notes.harold-martin.workers.dev/api/slack/commands
-      description: Search your accessible NoteFlare pages
-      usage_hint: <query> or link
+      description: Search notes, create pages, or manage tasks
+      usage_hint: <query> | new | task | tasks | task-list | link
       should_escape: false
   shortcuts:
     - name: Save to Notes

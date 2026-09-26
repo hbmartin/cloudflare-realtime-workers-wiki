@@ -7826,3 +7826,212 @@ describe("Worker integration", () => {
     });
   });
 });
+
+describe("calm workspace task lists", () => {
+  async function taskList(installed: InstalledWorkspace) {
+    const response = await SELF.fetch(
+      authenticatedRequest(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "table", taskList: true, title: "Release tasks" }),
+      }),
+    );
+    expect(response.status).toBe(201);
+    const { page } = await response.json<{ page: Page }>();
+    expect(page.taskList).toBe(true);
+    const broadcast = await eventForCurrentWorkspaceState(env, page.workspaceId, {
+      type: "pages-upserted",
+      pages: [page],
+    });
+    expect(broadcast).toMatchObject({ pages: [{ id: page.id, taskList: true }] });
+    return page;
+  }
+  async function change(installed: InstalledWorkspace, listId: string, body: Record<string, unknown>, rowId?: string) {
+    return SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/task-lists/${listId}/tasks${rowId ? `/${rowId}` : ""}`, {
+        method: rowId ? "PATCH" : "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    );
+  }
+  it("keeps task values, row details and idempotent receipts consistent", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const body = {
+      title: "Ship the release",
+      assigneeId: installed.userId,
+      status: "doing",
+      dueDate: "2026-10-01",
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    };
+    const created = await change(installed, list.id, body);
+    expect(created.status).toBe(201);
+    const result = await created.json<{ rowId: string; detailPageId: string; revision: number }>();
+    const replay = await change(installed, list.id, body);
+    expect(replay.status).toBe(201);
+    expect(await replay.json()).toMatchObject({ ...result, replayed: true });
+    const mine = await (
+      await SELF.fetch(authenticatedRequest(installed.cookie, "/api/tasks?mine=true"))
+    ).json<{
+      tasks: Array<{ title: string; status: string; detailPageId: string; dueDate: string; assigneeId: string }>;
+    }>();
+    expect(mine.tasks).toEqual([
+      expect.objectContaining({
+        title: body.title,
+        status: "doing",
+        dueDate: body.dueDate,
+        assigneeId: installed.userId,
+        detailPageId: result.detailPageId,
+      }),
+    ]);
+    const row = await env.DB.prepare("SELECT text_value FROM table_cells WHERE row_id=? AND column_id=?")
+      .bind(result.rowId, `${list.id}-title`)
+      .first();
+    expect(row).toEqual({ text_value: body.title });
+    const detail = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}`));
+    expect(await detail.json()).toMatchObject({ page: { title: body.title, parentId: list.id }, sidebarHidden: true });
+    const tree = await (
+      await SELF.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree"))
+    ).json<{ pages: Page[] }>();
+    expect(tree.pages.some((p) => p.id === result.detailPageId)).toBe(false);
+    const reused = await change(installed, list.id, { ...body, title: "Different" });
+    expect(reused.status).toBe(409);
+  });
+  it("respects other editors' locks, rejects stale revisions, and permits the lease holder", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const lease = await acquireLease(installed.cookie, list.id);
+    const body = { title: "Locked task", expectedRevision: 1, operationId: crypto.randomUUID() };
+    expect((await change(installed, list.id, body)).status).toBe(409);
+    const created = await change(installed, list.id, { ...body, leaseToken: lease.leaseToken });
+    expect(created.status).toBe(201);
+    const result = await created.json<{ rowId: string }>();
+    expect(
+      (
+        await change(
+          installed,
+          list.id,
+          { title: "Stale", expectedRevision: 1, operationId: crypto.randomUUID(), leaseToken: lease.leaseToken },
+          result.rowId,
+        )
+      ).status,
+    ).toBe(409);
+    const updated = await change(
+      installed,
+      list.id,
+      { status: "done", expectedRevision: 2, operationId: crypto.randomUUID(), leaseToken: lease.leaseToken },
+      result.rowId,
+    );
+    expect(updated.status).toBe(200);
+  });
+  it("archives and restores task details without detaching their row", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const created = await change(installed, list.id, {
+      title: "Completed task",
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    const result = await created.json<{ rowId: string; detailPageId: string }>();
+    const moved = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}/move`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ parentId: null }),
+      }),
+    );
+    expect(moved.status).toBe(422);
+    const held = await acquireLease(installed.cookie, list.id);
+    expect(
+      (
+        await SELF.fetch(
+          authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}`, { method: "DELETE" }),
+        )
+      ).status,
+    ).toBe(409);
+    await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/tables/${list.id}/lease`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ leaseToken: held.leaseToken }),
+      }),
+    );
+    const archived = await change(
+      installed,
+      list.id,
+      { archived: true, expectedRevision: 2, operationId: crypto.randomUUID() },
+      result.rowId,
+    );
+    expect(archived.status).toBe(200);
+    const tree = await (
+      await SELF.fetch(authenticatedRequest(installed.cookie, "/api/pages/tree?archived=true"))
+    ).json<{ pages: Page[] }>();
+    expect(tree.pages.some((p) => p.id === result.detailPageId)).toBe(true);
+    expect(
+      await env.DB.prepare("SELECT page_id FROM archive_disconnect_targets WHERE page_id=?")
+        .bind(result.detailPageId)
+        .first(),
+    ).toBeTruthy();
+    const shared = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${list.id}/share`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+    expect(shared.status).toBe(201);
+    const { share } = await shared.json<{ share: { url: string } }>();
+    expect(await (await SELF.fetch(share.url)).text()).not.toContain("Completed task");
+    const heldRestore = await acquireLease(installed.cookie, list.id);
+    expect(
+      (
+        await SELF.fetch(
+          authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}/restore`, { method: "POST" }),
+        )
+      ).status,
+    ).toBe(409);
+    await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/tables/${list.id}/lease`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ leaseToken: heldRestore.leaseToken }),
+      }),
+    );
+    const restored = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}/restore`, { method: "POST" }),
+    );
+    expect(restored.status).toBe(200);
+    const tasks = await (
+      await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tasks?listId=${list.id}`))
+    ).json<{ tasks: unknown[] }>();
+    expect(tasks.tasks).toHaveLength(1);
+    expect(await (await SELF.fetch(share.url)).text()).toContain("Completed task");
+  });
+  it("persists content width and filters beyond the first loaded table page", async () => {
+    const installed = await bootstrap();
+    const table = await createPage(installed.cookie, "table");
+    const { columnId } = await seedTable(installed, table.id, { column: "text" });
+    await seedRows(installed, table.id, 601, {
+      columnId: columnId!,
+      value: (i) => (i === 600 ? "Needle outside first page" : "ordinary"),
+    });
+    const result = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/tables/${table.id}?q=needle&limit=10`),
+    );
+    expect(result.status).toBe(200);
+    const data = await result.json<{ table: TableData }>();
+    expect(data.table.rows).toHaveLength(1);
+    expect(data.table.hasMore).toBe(false);
+    const width = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ fullWidth: true, revision: 1 }),
+      }),
+    );
+    expect(width.status).toBe(200);
+    expect(await width.json()).toMatchObject({ page: { fullWidth: true } });
+  });
+});
