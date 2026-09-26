@@ -172,7 +172,7 @@ function formatErrorMessages(errors: WorkspaceError[]) {
 type ArchiveResponse = {
   pageIds: string[];
   cleanupPending: boolean;
-  pendingPageCount: number;
+  pendingPageCount: number | null;
 };
 
 function responsePageIds(value: unknown, rootPageId: string) {
@@ -194,6 +194,9 @@ function archiveResponse(value: unknown, rootPageId: string): ArchiveResponse | 
   }
   if (typeof response.cleanupPending !== "boolean") return null;
   const pendingPageCount = response.pendingPageCount;
+  if (response.cleanupPending && pendingPageCount === null) {
+    return { pageIds: uniquePageIds, cleanupPending: true, pendingPageCount: null };
+  }
   if (typeof pendingPageCount !== "number" || !Number.isSafeInteger(pendingPageCount) || pendingPageCount < 0)
     return null;
   if (response.cleanupPending !== pendingPageCount > 0) return null;
@@ -1146,7 +1149,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
   const [archiveCleanupNotice, setArchiveCleanupNotice] = useState<{
     operationId: string;
-    pendingPageCount: number;
+    pendingPageCount: number | null;
   } | null>(null);
   const [trashRefreshVersion, setTrashRefreshVersion] = useState(0);
   const [trashLoading, setTrashLoading] = useState(false);
@@ -3449,8 +3452,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         {archiveCleanupNotice && (
           <output className="notice workspace-notice">
             <span>
-              Page archived. Realtime cleanup is continuing in the background for{" "}
-              {archiveCleanupNotice.pendingPageCount} {archiveCleanupNotice.pendingPageCount === 1 ? "page" : "pages"}.
+              {archiveCleanupNotice.pendingPageCount === null ? (
+                "Page archived. Realtime cleanup may still be continuing in the background."
+              ) : (
+                <>
+                  Page archived. Realtime cleanup is continuing in the background for{" "}
+                  {archiveCleanupNotice.pendingPageCount}{" "}
+                  {archiveCleanupNotice.pendingPageCount === 1 ? "page" : "pages"}.
+                </>
+              )}
             </span>
             <button
               type="button"

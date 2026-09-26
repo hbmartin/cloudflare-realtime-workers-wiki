@@ -7,6 +7,7 @@ import { ActionMenu, Icon, PageTools, readPreference, savePreference } from "./W
 
 type Person = { id: string; name: string };
 type Change = Partial<TaskFields> & { archived?: boolean };
+const AUTO_REFRESH_PAGE_LIMIT = 2;
 
 export function TasksView({
   page,
@@ -50,7 +51,11 @@ export function TasksView({
   const leaseExpiresAtRef = useRef(0);
   const [holder, setHolder] = useState<string | null>(null);
   const generation = useRef(0);
+  const activeLoad = useRef<number | null>(null);
   const loadedPageCount = useRef(1);
+  const eventEpoch = useRef(0);
+  const queuedAutoRefresh = useRef(false);
+  const [updatesAvailable, setUpdatesAvailable] = useState(false);
   const active = useRef(true);
   const pageId = page?.id;
   const editable = page ? member.role !== "viewer" : true;
@@ -61,6 +66,8 @@ export function TasksView({
   const load = useCallback(
     async (cursor?: string) => {
       const request = ++generation.current;
+      activeLoad.current = request;
+      const startingEventEpoch = eventEpoch.current;
       setLoading(true);
       const params = new URLSearchParams(pageId ? { listId: pageId } : { mine: "true" });
       if (status) params.set("status", status);
@@ -108,6 +115,7 @@ export function TasksView({
         if (active.current && request === generation.current) {
           setMembers((current) => ({ ...current, ...Object.fromEntries(entries) }));
           setError((current) => (current?.owner === "load" ? null : current));
+          if (!cursor && startingEventEpoch === eventEpoch.current) setUpdatesAvailable(false);
         }
       } catch (cause) {
         if (active.current && request === generation.current && !retryRef.current) {
@@ -115,6 +123,7 @@ export function TasksView({
           setError({ owner: "load", message: apiErrorMessage(cause, "Tasks could not be loaded.") });
         }
       } finally {
+        if (activeLoad.current === request) activeLoad.current = null;
         if (active.current && request === generation.current) setLoading(false);
       }
     },
@@ -123,6 +132,8 @@ export function TasksView({
   useEffect(() => {
     active.current = true;
     loadedPageCount.current = 1;
+    eventEpoch.current++;
+    queuedAutoRefresh.current = false;
     const timer = setTimeout(() => void load(), 150);
     return () => {
       clearTimeout(timer);
@@ -133,16 +144,33 @@ export function TasksView({
   }, [load]);
   useEffect(() => {
     const timer = setInterval(() => {
-      if (!document.hidden && !busy) void load();
+      if (
+        !document.hidden &&
+        !busy &&
+        !loading &&
+        activeLoad.current === null &&
+        loadedPageCount.current <= AUTO_REFRESH_PAGE_LIMIT
+      )
+        void load();
     }, 30_000);
     return () => clearInterval(timer);
-  }, [load, busy]);
+  }, [load, busy, loading]);
+  useEffect(() => {
+    if (busy || loading || !queuedAutoRefresh.current) return;
+    queuedAutoRefresh.current = false;
+    if (loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT) {
+      setUpdatesAvailable(true);
+    } else void load();
+  }, [busy, loading, load]);
   const observedRefreshVersion = useRef(refreshVersion);
   useEffect(() => {
     if (refreshVersion === observedRefreshVersion.current) return;
     observedRefreshVersion.current = refreshVersion;
-    void load();
-  }, [load, refreshVersion]);
+    eventEpoch.current++;
+    if (loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT) setUpdatesAvailable(true);
+    else if (busy || activeLoad.current !== null) queuedAutoRefresh.current = true;
+    else void load();
+  }, [busy, load, refreshVersion]);
   const release = useCallback(
     (token: string) => {
       if (pageId)
@@ -348,9 +376,21 @@ export function TasksView({
           aria-label="Find tasks"
           placeholder="Find tasks…"
           value={query}
-          onChange={(event) => setQuery(event.target.value)}
+          onChange={(event) => {
+            loadedPageCount.current = 1;
+            setQuery(event.target.value);
+            setUpdatesAvailable(false);
+          }}
         />
-        <select aria-label="Task status filter" value={status} onChange={(event) => setStatus(event.target.value)}>
+        <select
+          aria-label="Task status filter"
+          value={status}
+          onChange={(event) => {
+            loadedPageCount.current = 1;
+            setStatus(event.target.value);
+            setUpdatesAvailable(false);
+          }}
+        >
           <option value="">All statuses</option>
           {TASK_STATUSES.map((s) => (
             <option key={s} value={s}>
@@ -358,7 +398,15 @@ export function TasksView({
             </option>
           ))}
         </select>
-        <select aria-label="Task due date filter" value={due} onChange={(event) => setDue(event.target.value)}>
+        <select
+          aria-label="Task due date filter"
+          value={due}
+          onChange={(event) => {
+            loadedPageCount.current = 1;
+            setDue(event.target.value);
+            setUpdatesAvailable(false);
+          }}
+        >
           <option value="">Any due date</option>
           <option value="overdue">Overdue</option>
           <option value="today">Due today (UTC)</option>
@@ -367,6 +415,13 @@ export function TasksView({
         <button className="quiet-button" disabled={loading} onClick={() => void load()}>
           Refresh
         </button>
+        {loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT && (
+          <output className="muted">
+            {updatesAvailable
+              ? "Updates available. Refresh tasks to see them."
+              : "Automatic updates paused for this long view. Refresh to check for changes."}
+          </output>
+        )}
       </div>
       {error && (
         <div className="notice notice-danger" role="alert">

@@ -1248,6 +1248,27 @@ describe("App error handling", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
+  it("shows a generic cleanup notice when a committed archive has an unknown pending count", async () => {
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockWorkspaceApi();
+    const original = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${page.id}` && init?.method === "DELETE")
+        return { ok: true, pageIds: [page.id], cleanupPending: true, pendingPageCount: null };
+      return original(path, init);
+    });
+    render(<App />);
+
+    fireEvent.click(await findArchive("Archive Roadmap"));
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Page archived. Realtime cleanup may still be continuing in the background.",
+    );
+    expect(screen.getByRole("status")).not.toHaveTextContent("null");
+  });
+
   it("replaces a cleanup notice with a newer archive and restarts its ten-second timer", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.stubGlobal(

@@ -243,6 +243,32 @@ function envWithDatabase<Bindings extends Env>(bindings: Bindings, database: D1D
   });
 }
 
+function envWithFailedArchiveCleanup(bindings: Env, beforeFailure?: () => Promise<void>) {
+  const database = new Proxy(bindings.DB, {
+    get(target, property, receiver) {
+      if (property === "prepare")
+        return (query: string) => {
+          if (query.includes("SELECT target.page_id, target.content_epoch")) {
+            if (beforeFailure)
+              return {
+                bind: () => ({
+                  all: async () => {
+                    await beforeFailure();
+                    throw new Error("Injected archive cleanup failure");
+                  },
+                }),
+              };
+            throw new Error("Injected archive cleanup failure");
+          }
+          return target.prepare(query);
+        };
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return envWithDatabase(bindings, database);
+}
+
 type D1BatchResults = Awaited<ReturnType<D1Database["batch"]>>;
 
 function databaseWithBatchInterceptor(
@@ -7855,6 +7881,117 @@ describe("calm workspace task lists", () => {
       }),
     );
   }
+  it.each(["task_patch", "task_detail_delete", "page_delete"] as const)(
+    "keeps the %s archive committed when immediate cleanup throws",
+    async (route) => {
+      const installed = await bootstrap();
+      const operationId = "failed-cleanup-" + route;
+      let rootPageId = installed.pageId;
+      let listId: string | null = null;
+      let rowId: string | null = null;
+      if (route !== "page_delete") {
+        const list = await taskList(installed);
+        listId = list.id;
+        const created = await change(installed, list.id, {
+          title: "Archive after cleanup failure",
+          expectedRevision: 1,
+          operationId: "create-before-" + route,
+        });
+        const task = await created.json<{ rowId: string; detailPageId: string }>();
+        rootPageId = task.detailPageId;
+        rowId = task.rowId;
+      }
+      const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+      let announceCleanup!: () => void;
+      let resumeCleanup!: () => void;
+      const cleanupStarted = new Promise<void>((resolve) => {
+        announceCleanup = resolve;
+      });
+      const cleanupGate = new Promise<void>((resolve) => {
+        resumeCleanup = resolve;
+      });
+      const bindings = envWithFailedArchiveCleanup(
+        envWithCapturedWorkspaceEvents(env, delivered),
+        route === "task_patch"
+          ? async () => {
+              announceCleanup();
+              await cleanupGate;
+            }
+          : undefined,
+      );
+      const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const context = createExecutionContext();
+      try {
+        const request =
+          route === "task_patch"
+            ? authenticatedRequest(installed.cookie, "/api/task-lists/" + listId + "/tasks/" + rowId, {
+                method: "PATCH",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ archived: true, expectedRevision: 2, operationId }),
+              })
+            : authenticatedRequest(installed.cookie, "/api/pages/" + rootPageId, {
+                method: "DELETE",
+                headers: { "x-notes-operation-id": operationId },
+              });
+        const pendingResponse = worker.fetch(request, bindings, context);
+        let eventsBeforeCleanup: string[] | null = null;
+        if (route === "task_patch") {
+          await cleanupStarted;
+          try {
+            await waitOnExecutionContext(context);
+            eventsBeforeCleanup = delivered.map(({ event }) => event.type);
+          } finally {
+            resumeCleanup();
+          }
+        }
+        const expectedEarlyEvents = expect.arrayContaining(["task-list-invalidated", "pages-removed"]);
+        expect(eventsBeforeCleanup).toEqual(route === "task_patch" ? expectedEarlyEvents : null);
+        const response = await pendingResponse;
+        await waitOnExecutionContext(context);
+        expect(response.status).toBe(202);
+        const body = await response.json<Record<string, unknown>>();
+        expect(body).toMatchObject({ cleanupPending: true, pendingPageCount: null });
+        expect(body.pageIds).toContain(rootPageId);
+        expect(body).not.toHaveProperty("pendingPageIds");
+        expect(body).not.toHaveProperty("pendingPageIdsTruncated");
+        expect(body).toMatchObject(route === "task_patch" ? { detailPageId: rootPageId } : { ok: true });
+        const archivedPage = await env.DB.prepare("SELECT archived_at, archive_operation_id FROM pages WHERE id = ?")
+          .bind(rootPageId)
+          .first<{ archived_at: number; archive_operation_id: string }>();
+        expect(archivedPage).toEqual({
+          archived_at: expect.any(Number),
+          archive_operation_id: expect.any(String),
+        });
+        expect(
+          await env.DB.prepare("SELECT page_id FROM archive_disconnect_targets WHERE page_id = ?")
+            .bind(rootPageId)
+            .first(),
+        ).toEqual({ page_id: rootPageId });
+        expectStructuredLog(logged, "archive.cleanup.failed", {
+          route,
+          rootPageId,
+          operationId: archivedPage!.archive_operation_id,
+          errorMessage: "Injected archive cleanup failure",
+        });
+        expect(delivered.map(({ event }) => event.type)).toContain("pages-removed");
+        expect(delivered.filter(({ event }) => event.type === "task-list-invalidated")).toEqual(
+          listId
+            ? [{ workspaceId: installed.workspaceId, event: { type: "task-list-invalidated", pageId: listId } }]
+            : [],
+        );
+      } finally {
+        logged.mockRestore();
+      }
+      const scheduledContext = createExecutionContext();
+      await worker.scheduled(createScheduledController(), env, scheduledContext);
+      await waitOnExecutionContext(scheduledContext);
+      expect(
+        await env.DB.prepare("SELECT page_id FROM archive_disconnect_targets WHERE page_id = ?")
+          .bind(rootPageId)
+          .first(),
+      ).toBeNull();
+    },
+  );
   it("keeps task values, row details and idempotent receipts consistent", async () => {
     const installed = await bootstrap();
     const list = await taskList(installed);
