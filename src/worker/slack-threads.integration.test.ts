@@ -15,19 +15,28 @@ import {
   deliverSlackMutation,
   deliverSlackThread,
   setSlackMirror,
+  verifySlackMirrorRecovery,
   wakeNextSlackDelivery,
 } from "./slack-threads";
 import {
   encryptSlackToken,
   decryptSlackToken,
+  createSlackOAuthUrl,
+  finishSlackOAuth,
   deliverSlackChannelEvent,
   deliverSlackControlsExpiry,
   disconnectSlack,
+  acknowledgeSlackDeliveryFailures,
+  deleteSlackChannelSubscription,
   handleSlackEvent,
   recordVerifiedSlackIdentity,
+  slackWorkspaceStatus,
+  listSlackDeliveryFailureGroups,
   repairSlackChannelNotifications,
   sendDueSlackChannelDigests,
+  deliverSlackUnfurl,
   setSlackChannelPause,
+  usableBotToken,
   SlackApiError,
   SlackRateLimitError,
   upsertSlackChannelSubscription,
@@ -36,6 +45,7 @@ import {
   type SlackInstallation,
 } from "./slack";
 import { DeliveryInProgressError, notificationFanoutStatements } from "./notifications";
+import { classifyError } from "./http";
 import {
   acceptSlackWorkspaceInteraction,
   deliverSlackWorkspaceAction,
@@ -104,7 +114,7 @@ type Post = {
   blocks?: unknown[];
 };
 let posts: Post[] = [];
-let threadHistoryReplies: Array<{ ts: string; thread_ts: string; user: string; text: string }> = [];
+let threadHistoryReplies: Array<{ ts: string; thread_ts: string; user: string; text: string; subtype?: string }> = [];
 let calls: { method: string; payload: Record<string, unknown>; httpMethod: string; url: string }[] = [];
 let channelExtra: Record<string, unknown> = {};
 let userExtra: Record<string, unknown> = {};
@@ -112,7 +122,8 @@ let members = ["UOWNER", "UVIEWER"];
 let postFailure: "none" | "rate" | "lost" | "unrecorded" | "malformed" | "permission" = "none";
 let ephemeralFailure: "none" | "rate" | "lost" = "none";
 let userFailure: "none" | "transient" = "none";
-let viewFailure: "none" | "not_found" | "transient" | "hash_conflict" = "none";
+let viewFailure: "none" | "not_found" | "transient" | "hash_conflict" | "rate" = "none";
+let historyFailure: "none" | "internal_error" | "service_unavailable" | "no_permission" = "none";
 let homePublishFailure: "none" | "lost" = "none";
 let homeHash: string | null = null;
 let beforeResponse: ((method: string) => Promise<void>) | undefined;
@@ -159,6 +170,8 @@ async function mockSlack(input: RequestInfo | URL, init?: RequestInit) {
     if (postFailure === "malformed") return Response.json({ ok: true });
     return Response.json({ ok: true, channel: post.channel, ts: post.ts });
   }
+  if (method === "conversations.history" && historyFailure !== "none")
+    return Response.json({ ok: false, error: historyFailure });
   if (method === "conversations.history" || method === "conversations.replies")
     return Response.json({
       ok: true,
@@ -187,6 +200,8 @@ async function mockSlack(input: RequestInfo | URL, init?: RequestInit) {
     viewFailure = "none";
     return Response.json({ ok: false, error: "hash_conflict" });
   }
+  if (method === "views.update" && viewFailure === "rate")
+    return Response.json({ ok: false }, { status: 429, headers: { "retry-after": "1" } });
   if (method === "views.update")
     return Response.json({ ok: true, view: { id: payload.view_id, hash: `hash-${calls.length}` } });
   if (method === "views.publish") {
@@ -298,6 +313,7 @@ beforeEach(async () => {
   ephemeralFailure = "none";
   userFailure = "none";
   viewFailure = "none";
+  historyFailure = "none";
   homePublishFailure = "none";
   homeHash = null;
   beforeResponse = undefined;
@@ -371,6 +387,41 @@ describe("interactive Slack workspace", () => {
     expect(await env.DB.prepare(`SELECT muted_at FROM slack_channel_subscriptions WHERE id='space'`).first()).toEqual({
       muted_at: null,
     });
+    const denial = await env.DB.prepare(`SELECT payload_json FROM outbox
+      WHERE id=?`)
+      .bind(`outbox:slack-denial:${receiptId}`)
+      .first<{ payload_json: string }>();
+    await deliverSlackDenial(runtime(), JSON.parse(denial!.payload_json) as Record<string, unknown>);
+    const ephemeral = calls.find((call) => call.method === "chat.postEphemeral")!.payload;
+    expect(ephemeral.text).toContain("expired");
+    expect(ephemeral).not.toHaveProperty("thread_ts");
+  });
+
+  it("notifies the actor when a queued button expires during scheduled redrive", async () => {
+    const { link } = await activeThread();
+    const receiptId = await workspaceAction({ actionId: "noteflare_mapping_mute", value: link.id, link });
+    const stored = await env.DB.prepare(`SELECT payload_json FROM slack_interaction_receipts WHERE id=?`)
+      .bind(receiptId)
+      .first<{ payload_json: string }>();
+    expect(JSON.parse(stored!.payload_json)).toMatchObject({
+      installationId: "installation",
+      generation: 0,
+      channelId: "CSPACE",
+      slackUserId: "UOWNER",
+      messageTs: link.root_message_ts,
+    });
+    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=?`)
+      .bind(Date.now() - 1, `outbox:slack-workspace:${receiptId}`)
+      .run();
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id=?`).bind(receiptId).first(),
+    ).toEqual({ outcome: "expired" });
+    const denial = await env.DB.prepare(`SELECT payload_json FROM outbox WHERE id=?`)
+      .bind(`outbox:slack-denial:${receiptId}`)
+      .first<{ payload_json: string }>();
+    await deliverSlackDenial(runtime(), JSON.parse(denial!.payload_json) as Record<string, unknown>);
+    expect(calls.find((call) => call.method === "chat.postEphemeral")?.payload.text).toContain("expired");
   });
 
   it("deduplicates Watch and owner controls, then rechecks a revoked owner before execution", async () => {
@@ -609,6 +660,7 @@ describe("interactive Slack workspace", () => {
     };
     const initial = deliverSlackSearchUpdate(runtime(), session.id, 0);
     await entered;
+    await env.DB.prepare(`UPDATE slack_view_sessions SET opening_view_hash=NULL WHERE id=?`).bind(session.id).run();
     await acceptSlackWorkspaceInteraction(runtime(), {
       type: "block_actions",
       team: { id: "T123" },
@@ -616,7 +668,7 @@ describe("interactive Slack workspace", () => {
       view: {
         id: "VSEARCH",
         hash: session.view_hash,
-        private_metadata: session.id,
+        private_metadata: `${session.id}:0`,
         state: { values: { query: { value: { value: "Clicked while loading" } } } },
       },
       actions: [{ action_id: "noteflare_search_run", action_ts: "1700000993.000001", value: session.id }],
@@ -649,8 +701,8 @@ describe("interactive Slack workspace", () => {
     viewFailure = "transient";
     await expect(deliverSlackSearchUpdate(runtime(), session.id, 0)).rejects.toThrow("Slack views.update failed.");
     expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("deferred");
-    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`)
-      .bind(Date.now() - 16_000, session.id)
+    await env.DB.prepare(`UPDATE slack_view_sessions SET pending_lease_until=? WHERE id=?`)
+      .bind(Date.now() - 1, session.id)
       .run();
     expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("applied");
     expect(
@@ -689,8 +741,8 @@ describe("interactive Slack workspace", () => {
     viewFailure = "transient";
     await expect(deliverSlackWorkspaceAction(runtime(), receipt.id)).rejects.toThrow("Slack views.update failed.");
     expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("deferred");
-    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`)
-      .bind(Date.now() - 16_000, session.id)
+    await env.DB.prepare(`UPDATE slack_view_sessions SET pending_lease_until=? WHERE id=?`)
+      .bind(Date.now() - 1, session.id)
       .run();
     expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("completed");
     expect(
@@ -702,7 +754,7 @@ describe("interactive Slack workspace", () => {
     ).toEqual({ query: "Retry this search", pending_token: null });
   });
 
-  it("releases an expired Search owner so a current-view click can proceed", async () => {
+  it("keeps an expired Search owner's ambiguous intent fenced until the modal is reopened", async () => {
     const installation = (await env.DB.prepare(
       `SELECT * FROM slack_installations WHERE id='installation'`,
     ).first<SlackInstallation>())!;
@@ -738,7 +790,11 @@ describe("interactive Slack workspace", () => {
         Date.now(),
         first,
       ),
-      env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`).bind(Date.now() - 16_000, session.id),
+      env.DB.prepare(`UPDATE slack_view_sessions SET pending_started_at=?,pending_lease_until=? WHERE id=?`).bind(
+        Date.now() - 11 * 60_000,
+        Date.now() - 1,
+        session.id,
+      ),
     ]);
     const second = await click("Current", "1700000996.000002");
     expect(await deliverSlackWorkspaceAction(runtime(), second)).toBe("completed");
@@ -748,10 +804,10 @@ describe("interactive Slack workspace", () => {
       )
         .bind(session.id)
         .first(),
-    ).toEqual({ query: "Current", pending_token: null });
+    ).toEqual({ query: "Original", pending_token: first });
   });
 
-  it("releases an abandoned initial Search load after ten minutes", async () => {
+  it("keeps an abandoned initial Search load fenced after ten minutes", async () => {
     const installation = (await env.DB.prepare(
       `SELECT * FROM slack_installations WHERE id='installation'`,
     ).first<SlackInstallation>())!;
@@ -762,8 +818,8 @@ describe("interactive Slack workspace", () => {
     }>())!;
     viewFailure = "transient";
     await expect(deliverSlackSearchUpdate(runtime(), session.id, 0)).rejects.toThrow("Slack views.update failed.");
-    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`)
-      .bind(Date.now() - 11 * 60_000, session.id)
+    await env.DB.prepare(`UPDATE slack_view_sessions SET pending_started_at=?,pending_lease_until=? WHERE id=?`)
+      .bind(Date.now() - 11 * 60_000, Date.now() - 1, session.id)
       .run();
     await acceptSlackWorkspaceInteraction(runtime(), {
       type: "block_actions",
@@ -784,7 +840,7 @@ describe("interactive Slack workspace", () => {
       await env.DB.prepare(`SELECT json_extract(state_json,'$.query') query FROM slack_view_sessions WHERE id=?`)
         .bind(session.id)
         .first(),
-    ).toEqual({ query: "New request" });
+    ).toEqual({ query: "Original" });
   });
 
   it("stops polling an uncertain Search update while retaining its recovery intent", async () => {
@@ -797,19 +853,148 @@ describe("interactive Slack workspace", () => {
     }>())!;
     viewFailure = "transient";
     await expect(deliverSlackSearchUpdate(runtime(), session.id, 0)).rejects.toThrow("Slack views.update failed.");
-    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at=? WHERE id=?`)
-      .bind(Date.now() - 16_000, session.id)
+    await env.DB.prepare(`UPDATE slack_view_sessions SET pending_lease_until=? WHERE id=?`)
+      .bind(Date.now() - 1, session.id)
       .run();
     viewFailure = "hash_conflict";
     expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("uncertain");
     const updates = calls.filter((call) => call.method === "views.update").length;
-    expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("deferred");
+    expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("uncertain");
     expect(calls.filter((call) => call.method === "views.update")).toHaveLength(updates);
     expect(
       (await env.DB.prepare(`SELECT pending_token FROM slack_view_sessions WHERE id=?`)
         .bind(session.id)
         .first<{ pending_token: string }>())!.pending_token,
-    ).toMatch(/^initial-uncertain:/);
+    ).toMatch(/^initial:/);
+  });
+
+  it("refunds five definite Search rate limits and then completes the same update", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "rate-search", "Original");
+    const session = (await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+    }>())!;
+    viewFailure = "rate";
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await expect(deliverSlackSearchUpdate(runtime(), session.id, 0)).rejects.toMatchObject({ retryAfter: 1 });
+      expect(
+        await env.DB.prepare(`SELECT pending_attempts FROM slack_view_sessions WHERE id=?`).bind(session.id).first(),
+      ).toEqual({ pending_attempts: 0 });
+    }
+    viewFailure = "none";
+    expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("applied");
+    expect(calls.filter((call) => call.method === "views.update")).toHaveLength(6);
+  });
+
+  it("releases a first Search hash conflict and accepts a signed click with the current hash", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "conflict-search", "Original");
+    const session = (await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+    }>())!;
+    viewFailure = "hash_conflict";
+    expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("superseded");
+    expect(
+      await env.DB.prepare(`SELECT pending_token,revision FROM slack_view_sessions WHERE id=?`)
+        .bind(session.id)
+        .first(),
+    ).toEqual({ pending_token: null, revision: 0 });
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash: "hash-current",
+        private_metadata: `${session.id}:0`,
+        state: { values: { query: { value: { value: "Rebased" } } } },
+      },
+      actions: [{ action_id: "noteflare_search_run", action_ts: "1700000997.000001", value: session.id }],
+    });
+    const receipt = (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+      WHERE callback_id='noteflare_search_run'`).first<{ id: string }>())!;
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("completed");
+    expect(calls.filter((call) => call.method === "views.update").at(-1)?.payload.hash).toBe("hash-current");
+    expect(
+      await env.DB.prepare(`SELECT revision,json_extract(state_json,'$.query') query
+      FROM slack_view_sessions WHERE id=?`)
+        .bind(session.id)
+        .first(),
+    ).toEqual({ revision: 1, query: "Rebased" });
+  });
+
+  it("keeps a Search receipt pending when hash-conflict cleanup loses its lease", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "lease-conflict-search", "Original");
+    const session = (await env.DB.prepare(`SELECT id FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+    }>())!;
+    await deliverSlackSearchUpdate(runtime(), session.id, 0);
+    const hash = (await env.DB.prepare(`SELECT view_hash FROM slack_view_sessions WHERE id=?`)
+      .bind(session.id)
+      .first<{ view_hash: string }>())!.view_hash;
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: {
+        id: "VSEARCH",
+        hash,
+        private_metadata: `${session.id}:1`,
+        state: { values: { query: { value: { value: "Keep this search" } } } },
+      },
+      actions: [{ action_id: "noteflare_search_run", action_ts: "1700000997.000002", value: session.id }],
+    });
+    const receipt = (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+      WHERE callback_id='noteflare_search_run'`).first<{ id: string }>())!;
+    viewFailure = "hash_conflict";
+    beforeResponse = async (method) => {
+      if (method === "views.update")
+        await env.DB.prepare(`UPDATE slack_view_sessions SET pending_lease_until=? WHERE id=?`)
+          .bind(Date.now() + 60_000, session.id)
+          .run();
+    };
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("deferred");
+    beforeResponse = undefined;
+    expect(
+      await env.DB.prepare(`SELECT processed_at FROM slack_interaction_receipts WHERE id=?`).bind(receipt.id).first(),
+    ).toEqual({ processed_at: null });
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("deferred");
+    await env.DB.prepare(`UPDATE slack_view_sessions SET pending_lease_until=1 WHERE id=?`).bind(session.id).run();
+    expect(await deliverSlackWorkspaceAction(runtime(), receipt.id)).toBe("completed");
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id=?`).bind(receipt.id).first(),
+    ).toEqual({ outcome: "accepted" });
+  });
+
+  it("bounds Search updates to five API attempts and retains the unresolved intent", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "five-attempts", "Original");
+    const session = (await env.DB.prepare(`SELECT id,created_at FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+      created_at: number;
+    }>())!;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      viewFailure = "transient";
+      await expect(deliverSlackSearchUpdate(runtime(), session.id, 0)).rejects.toThrow("Slack views.update failed.");
+      await env.DB.prepare(`UPDATE slack_view_sessions SET pending_lease_until=1 WHERE id=?`).bind(session.id).run();
+    }
+    expect(await deliverSlackSearchUpdate(runtime(), session.id, 0)).toBe("uncertain");
+    expect(calls.filter((call) => call.method === "views.update")).toHaveLength(5);
+    expect(
+      await env.DB.prepare(`SELECT pending_attempts,created_at,pending_token IS NOT NULL fenced
+      FROM slack_view_sessions WHERE id=?`)
+        .bind(session.id)
+        .first(),
+    ).toEqual({ pending_attempts: 5, created_at: session.created_at, fenced: 1 });
   });
 
   it("keeps concurrent Search clicks from replacing one another's pending intent", async () => {
@@ -1020,9 +1205,41 @@ describe("interactive Slack workspace", () => {
         `SELECT COUNT(*) count FROM slack_interaction_receipts WHERE callback_id = 'noteflare_search_done'`,
       ).first(),
     ).toEqual({ count: 1 });
-    await env.DB.prepare(`UPDATE slack_view_sessions SET updated_at = 1 WHERE id = ?`).bind(session!.id).run();
+    await env.DB.prepare(`UPDATE slack_view_sessions SET created_at = 1 WHERE id = ?`).bind(session!.id).run();
     await purgeExpiredSlackSearchSessions(runtime());
     expect(await env.DB.prepare(`SELECT 1 FROM slack_view_sessions WHERE id = ?`).bind(session!.id).first()).toBeNull();
+  });
+
+  it("rejects a Search click after creation-based expiry even when the session was updated recently", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await openSlackSearch(runtime(), installation, "UOWNER", "expired-search", "Original");
+    const session = (await env.DB.prepare(`SELECT id,view_hash FROM slack_view_sessions WHERE kind='search'`).first<{
+      id: string;
+      view_hash: string;
+    }>())!;
+    await deliverSlackSearchUpdate(runtime(), session.id, 0);
+    const current = (await env.DB.prepare(`SELECT view_hash,revision FROM slack_view_sessions WHERE id=?`)
+      .bind(session.id)
+      .first<{ view_hash: string; revision: number }>())!;
+    await env.DB.prepare(`UPDATE slack_view_sessions SET created_at=1,updated_at=? WHERE id=?`)
+      .bind(Date.now(), session.id)
+      .run();
+    await expect(
+      acceptSlackWorkspaceInteraction(runtime(), {
+        type: "block_actions",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        view: {
+          id: "VSEARCH",
+          hash: current.view_hash,
+          private_metadata: `${session.id}:${current.revision}`,
+          state: { values: { query: { value: { value: "Too late" } } } },
+        },
+        actions: [{ action_id: "noteflare_search_run", action_ts: "1700000998.000001", value: session.id }],
+      }),
+    ).rejects.toMatchObject({ status: 403 });
   });
 
   it("clears the query when Slack submits a null input value", async () => {
@@ -1519,6 +1736,183 @@ describe("interactive Slack workspace", () => {
     expect(await decryptSlackToken(runtime(), rotated!.bot_refresh_token_ciphertext)).toBe("xoxr-new");
   });
 
+  it("serializes competing bot-token refreshes and records a definitively invalid refresh token", async () => {
+    await env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1,
+      bot_refresh_token_ciphertext=? WHERE id='installation'`)
+      .bind(await encryptSlackToken(runtime(), "xoxr-old"))
+      .run();
+    let refreshes = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/oauth.v2.access")) {
+          refreshes++;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: 3600 });
+        }
+        return mockSlack(input, init);
+      }),
+    );
+    const one = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    const two = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    expect(await Promise.all([usableBotToken(runtime(), one), usableBotToken(runtime(), two)])).toEqual([
+      "xoxb-new",
+      "xoxb-new",
+    ]);
+    expect(refreshes).toBe(1);
+    await env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1,
+      bot_refresh_token_ciphertext=? WHERE id='installation'`)
+      .bind(await encryptSlackToken(runtime(), "xoxr-invalid"))
+      .run();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith("/oauth.v2.access")
+          ? Response.json({ ok: false, error: "invalid_refresh_token" })
+          : mockSlack(input, init),
+      ),
+    );
+    const invalid = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    await expect(usableBotToken(runtime(), invalid)).rejects.toMatchObject({ code: "invalid_refresh_token" });
+    expect(
+      await env.DB.prepare(`SELECT auth_error,refresh_lease_token FROM slack_installations
+      WHERE id='installation'`).first(),
+    ).toEqual({ auth_error: "invalid_refresh_token", refresh_lease_token: null });
+  });
+
+  it("uses a valid bot token without a generation and requires one for refresh", async () => {
+    const installation = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    const incomplete = { ...installation, generation: undefined } as unknown as SlackInstallation;
+    expect(await usableBotToken(runtime(), incomplete)).toBe("xoxb-test");
+    incomplete.token_expires_at = 1;
+    await expect(usableBotToken(runtime(), incomplete)).rejects.toThrow("generation is unavailable");
+  });
+
+  it("persists token rotations for unfurls and digests", async () => {
+    const refreshTokens = ["xoxr-unfurl", "xoxr-digest"];
+    const refreshed: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/oauth.v2.access")) {
+          refreshed.push(new URLSearchParams(String(init?.body)).get("refresh_token")!);
+          const index = refreshed.length - 1;
+          return Response.json({
+            ok: true,
+            access_token: `xoxb-${index}`,
+            refresh_token: refreshTokens[index],
+            expires_in: 3600,
+          });
+        }
+        return mockSlack(input, init);
+      }),
+    );
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?
+        WHERE id='installation'`).bind(await encryptSlackToken(runtime(), "xoxr-old")),
+      env.DB.prepare(`INSERT INTO slack_unfurls
+        (id,installation_id,installation_generation,workspace_id,user_id,channel_id,message_ts,unfurls_json,created_at)
+        VALUES ('rotate-unfurl','installation',0,'workspace','owner','CSPACE','1700000700.000001',?,?)`).bind(
+        JSON.stringify({ "http://example.test/?page=page": { blocks: [] } }),
+        Date.now(),
+      ),
+    ]);
+    await deliverSlackUnfurl(runtime(), "rotate-unfurl", "outbox:rotate-unfurl");
+    expect(refreshed).toEqual(["xoxr-old"]);
+    expect(
+      await env.DB.prepare(`SELECT delivered_at IS NOT NULL delivered FROM slack_unfurls
+      WHERE id='rotate-unfurl'`).first(),
+    ).toEqual({ delivered: 1 });
+    const unfurlTokens = await env.DB.prepare(`SELECT bot_token_ciphertext,bot_refresh_token_ciphertext,
+      credential_revision FROM slack_installations WHERE id='installation'`).first<{
+      bot_token_ciphertext: string;
+      bot_refresh_token_ciphertext: string;
+      credential_revision: number;
+    }>();
+    expect(await decryptSlackToken(runtime(), unfurlTokens!.bot_token_ciphertext)).toBe("xoxb-0");
+    expect(await decryptSlackToken(runtime(), unfurlTokens!.bot_refresh_token_ciphertext)).toBe("xoxr-unfurl");
+    expect(unfurlTokens!.credential_revision).toBe(1);
+    const cutoff = Date.UTC(2026, 8, 24, 9);
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1 WHERE id='installation'`),
+      env.DB.prepare(`UPDATE slack_channel_subscriptions SET cadence='digest' WHERE id='space'`),
+      env.DB.prepare(`INSERT INTO slack_channel_events
+        (id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+        VALUES ('rotate-digest','space','workspace','page_edit','owner','page','digest',?)`).bind(cutoff - 1000),
+    ]);
+    await sendDueSlackChannelDigests(runtime(), cutoff + 3_600_000);
+    expect(refreshed).toEqual(["xoxr-old", "xoxr-unfurl"]);
+    expect(
+      await env.DB.prepare(`SELECT delivered_at IS NOT NULL delivered FROM slack_channel_events
+      WHERE id='rotate-digest'`).first(),
+    ).toEqual({ delivered: 1 });
+    const row = await env.DB.prepare(`SELECT bot_refresh_token_ciphertext,credential_revision
+      FROM slack_installations WHERE id='installation'`).first<{
+      bot_refresh_token_ciphertext: string;
+      credential_revision: number;
+    }>();
+    expect(await decryptSlackToken(runtime(), row!.bot_refresh_token_ciphertext)).toBe("xoxr-digest");
+    expect(row!.credential_revision).toBe(2);
+  });
+
+  it("stops waiting for a token lease when its caller aborts", async () => {
+    await env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1,
+      bot_refresh_token_ciphertext=?,refresh_lease_token='other',refresh_lease_until=? WHERE id='installation'`)
+      .bind(await encryptSlackToken(runtime(), "xoxr-old"), Date.now() + 30_000)
+      .run();
+    const installed = (await env.DB.prepare(
+      `SELECT * FROM slack_installations WHERE id='installation'`,
+    ).first<SlackInstallation>())!;
+    const controller = new AbortController();
+    const pending = usableBotToken(runtime(), installed, controller.signal);
+    setTimeout(() => controller.abort(new Error("cancelled")), 20);
+    await expect(pending).rejects.toThrow("cancelled");
+  });
+
+  it.each(["missing_scope", "account_inactive"])(
+    "persists a successful token rotation after lease takeover and keeps %s",
+    async (authError) => {
+      await env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1,
+      bot_refresh_token_ciphertext=?,auth_error=?,auth_error_at=? WHERE id='installation'`)
+        .bind(await encryptSlackToken(runtime(), "xoxr-old"), authError, Date.now() - 1000)
+        .run();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).endsWith("/oauth.v2.access")) {
+            await env.DB.prepare(`UPDATE slack_installations SET refresh_lease_token='takeover',
+          refresh_lease_until=? WHERE id='installation'`)
+              .bind(Date.now() + 30_000)
+              .run();
+            return Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: 3600 });
+          }
+          return mockSlack(input, init);
+        }),
+      );
+      const installed = (await env.DB.prepare(
+        `SELECT * FROM slack_installations WHERE id='installation'`,
+      ).first<SlackInstallation>())!;
+      expect(await usableBotToken(runtime(), installed)).toBe("xoxb-new");
+      const rotated = (await env.DB.prepare(`SELECT bot_token_ciphertext,refresh_lease_token,auth_error
+      FROM slack_installations WHERE id='installation'`).first<{
+        bot_token_ciphertext: string;
+        refresh_lease_token: string | null;
+        auth_error: string | null;
+      }>())!;
+      expect(await decryptSlackToken(runtime(), rotated.bot_token_ciphertext)).toBe("xoxb-new");
+      expect(rotated.refresh_lease_token).toBeNull();
+      expect(rotated.auth_error).toBe(authError);
+    },
+  );
+
   it("creates one public share from a root and an unfurl without trusting stale button state", async () => {
     const { link } = await activeThread();
     const create = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
@@ -1552,6 +1946,10 @@ describe("interactive Slack workspace", () => {
         links: [{ url: "http://example.test/?page=page" }],
       },
     });
+    expect(
+      await env.DB.prepare(`SELECT slack_redrive_due_at IS NOT NULL scheduled FROM outbox
+      WHERE topic='slack_unfurl'`).first(),
+    ).toEqual({ scheduled: 1 });
     const reference = await env.DB.prepare(`SELECT id FROM slack_share_references WHERE page_id = 'page'`).first<{
       id: string;
     }>();
@@ -1575,6 +1973,117 @@ describe("interactive Slack workspace", () => {
     expect(
       await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(receipt!.id).first(),
     ).toEqual({ outcome: "accepted" });
+  });
+  it("defers an unfurl through auth failure and redrives it after reauthorization", async () => {
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_installations SET credential_revision=7 WHERE id='installation'`),
+      env.DB.prepare(`INSERT INTO slack_unfurls
+        (id,installation_id,installation_generation,workspace_id,user_id,channel_id,message_ts,unfurls_json,created_at)
+        VALUES ('unfurl-auth','installation',0,'workspace','owner','CSPACE','1700000700.000001',?,?)`).bind(
+        JSON.stringify({ "http://example.test/?page=page": { blocks: [] } }),
+        Date.now(),
+      ),
+      env.DB.prepare(`INSERT INTO outbox
+        (id,workspace_id,topic,payload_json,available_at,enqueued_at,created_at,slack_redrive_due_at)
+        VALUES ('outbox:slack-unfurl:unfurl-auth','workspace','slack_unfurl',?,1,1,?,1)`).bind(
+        JSON.stringify({ unfurlId: "unfurl-auth" }),
+        Date.now(),
+      ),
+    ]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith("/chat.unfurl")
+          ? Response.json({ ok: false, error: "invalid_auth" })
+          : mockSlack(input, init),
+      ),
+    );
+    const ack = vi.fn();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId: "outbox:slack-unfurl:unfurl-auth" },
+      ack,
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: "invalid_auth",
+    });
+    expect(await env.DB.prepare(`SELECT delivered_at FROM slack_unfurls WHERE id='unfurl-auth'`).first()).toEqual({
+      delivered_at: null,
+    });
+    const oauthUrl = new URL(await createSlackOAuthUrl(runtime(), owner));
+    const state = oauthUrl.searchParams.get("state")!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith("/oauth.v2.access")
+          ? Response.json({
+              ok: true,
+              access_token: "xoxb-reauthorized",
+              bot_user_id: "UBOT",
+              team: { id: "T123", name: "Slack" },
+              scope: scopes,
+            })
+          : mockSlack(input, init),
+      ),
+    );
+    await finishSlackOAuth(runtime(), owner, "new-code", state);
+    expect(
+      await env.DB.prepare(`SELECT enqueued_at,slack_redrive_due_at FROM outbox
+      WHERE id='outbox:slack-unfurl:unfurl-auth'`).first(),
+    ).toEqual({ enqueued_at: null, slack_redrive_due_at: null });
+    await env.DB.prepare(`UPDATE outbox SET available_at=1 WHERE id='outbox:slack-unfurl:unfurl-auth'`).run();
+    vi.stubGlobal("fetch", vi.fn(mockSlack));
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId: "outbox:slack-unfurl:unfurl-auth" },
+      ack: vi.fn(),
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(
+      await env.DB.prepare(`SELECT delivered_at IS NOT NULL delivered FROM slack_unfurls
+      WHERE id='unfurl-auth'`).first(),
+    ).toEqual({ delivered: 1 });
+  });
+
+  it("pauses an unfurl on missing_scope without pausing the installation", async () => {
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO slack_unfurls
+        (id,installation_id,installation_generation,workspace_id,user_id,channel_id,message_ts,unfurls_json,created_at)
+        VALUES ('unfurl-scope','installation',0,'workspace','owner','CSPACE','1700000700.000001',?,?)`).bind(
+        JSON.stringify({ "http://example.test/?page=page": { blocks: [] } }),
+        Date.now(),
+      ),
+      env.DB.prepare(`INSERT INTO outbox
+        (id,workspace_id,topic,payload_json,available_at,enqueued_at,created_at,slack_redrive_due_at)
+        VALUES ('outbox:slack-unfurl:unfurl-scope','workspace','slack_unfurl',?,1,1,?,1)`).bind(
+        JSON.stringify({ unfurlId: "unfurl-scope" }),
+        Date.now(),
+      ),
+    ]);
+    beforeResponse = async (method) => {
+      if (method === "chat.unfurl") throw new SlackApiError(method, "missing_scope", 403);
+    };
+    const outboxId = "outbox:slack-unfurl:unfurl-scope";
+    const ack = vi.fn();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId },
+      ack,
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: null,
+    });
+    expect(
+      await env.DB.prepare(`SELECT slack_scope_paused_at IS NOT NULL paused,slack_redrive_due_at
+      FROM outbox WHERE id=?`)
+        .bind(outboxId)
+        .first(),
+    ).toEqual({ paused: 1, slack_redrive_due_at: null });
+    expect(
+      await env.DB.prepare(`SELECT delivered_at,retired_at FROM slack_unfurls WHERE id='unfurl-scope'`).first(),
+    ).toEqual({ delivered_at: null, retired_at: null });
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
   });
 
   it("sends share links outside the thread and distinguishes rate limits from uncertain sends", async () => {
@@ -1642,12 +2151,139 @@ describe("interactive Slack workspace", () => {
     await deliverSlackShareResponse(runtime(), JSON.parse(next!.payload_json) as Record<string, unknown>);
     expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(3);
   });
+  it("keeps digests running after a button click with missing mirror scopes", async () => {
+    const { link } = await activeThread();
+    await publishSlackHome(runtime(), "installation", "UOWNER");
+    const home = await env.DB.prepare(`SELECT id,view_hash FROM slack_view_sessions WHERE kind='home'`).first<{
+      id: string;
+      view_hash: string;
+    }>();
+    await env.DB.prepare(`UPDATE slack_installations SET scopes='chat:write' WHERE id='installation'`).run();
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      view: { id: "VHOME", hash: home!.view_hash, private_metadata: home!.id },
+      actions: [{ action_id: "noteflare_home_read", action_ts: "1700000909.000001", value: home!.id }],
+    });
+    const homeReceipt = await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+      WHERE callback_id='noteflare_home_read'`).first<{ id: string }>();
+    await deliverSlackWorkspaceAction(runtime(), homeReceipt!.id);
+    const receipt = await workspaceAction({ actionId: "noteflare_mapping_mute", value: link.id, link });
+    await deliverSlackWorkspaceAction(runtime(), receipt);
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: null,
+    });
+    const cutoff = Date.UTC(2026, 8, 24, 9);
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_channel_subscriptions SET cadence='digest' WHERE id='space'`),
+      env.DB.prepare(`INSERT INTO slack_channel_events
+        (id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+        VALUES ('scope-digest','space','workspace','page_edit','owner','page','digest',?)`).bind(cutoff - 1000),
+    ]);
+    await sendDueSlackChannelDigests(runtime(), cutoff + 3_600_000);
+    expect(
+      await env.DB.prepare(`SELECT delivered_at IS NOT NULL delivered FROM slack_channel_events
+      WHERE id='scope-digest'`).first(),
+    ).toEqual({ delivered: 1 });
+  });
 });
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("canonical Slack mirrors", () => {
+  it("keeps a scope-paused root beyond a day and posts it once after reauthorization", async () => {
+    await setSlackMirror(runtime(), owner, "space", true);
+    const created = await thread();
+    const root = (await deliveries(created.id))[0]!;
+    const outboxId = `outbox:${root.id}`;
+    await env.DB.prepare(`UPDATE slack_installations SET scopes=? WHERE id='installation'`)
+      .bind(`${scopes},reactions:read,files:write`)
+      .run();
+    beforeResponse = async (method) => {
+      if (method === "chat.postMessage") throw new SlackApiError(method, "missing_scope", 403);
+    };
+    const ack = vi.fn();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId },
+      ack,
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare(`SELECT slack_scope_paused_at IS NOT NULL paused,slack_redrive_due_at,
+        slack_redrive_count FROM outbox WHERE id=?`)
+        .bind(outboxId)
+        .first(),
+    ).toEqual({ paused: 1, slack_redrive_due_at: null, slack_redrive_count: 0 });
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: null,
+    });
+    expect((await slackWorkspaceStatus(runtime(), owner)).reauthorization.required).toBe(true);
+    await publishSlackHome(runtime(), "installation", "UOWNER");
+    expect(calls.some((call) => call.method === "views.publish")).toBe(true);
+    await env.DB.prepare(`UPDATE outbox SET slack_scope_paused_at=?,slack_eligible_started_at=? WHERE id=?`)
+      .bind(Date.now() - 25 * 60 * 60_000, Date.now() - 25 * 60 * 60_000, outboxId)
+      .run();
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
+    expect((await deliveries(created.id))[0]?.state).toBe("pending");
+    const oauthUrl = new URL(await createSlackOAuthUrl(runtime(), owner));
+    const state = oauthUrl.searchParams.get("state")!;
+    beforeResponse = undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith("/oauth.v2.access")
+          ? Response.json({
+              ok: true,
+              access_token: "xoxb-reauthorized",
+              bot_user_id: "UBOT",
+              team: { id: "T123", name: "Slack" },
+              scope: `${scopes},reactions:read,files:write`,
+            })
+          : mockSlack(input, init),
+      ),
+    );
+    await finishSlackOAuth(runtime(), owner, "new-code", state);
+    expect(
+      await env.DB.prepare(`SELECT slack_scope_paused_at,slack_scope_paused_ms,slack_redrive_count
+        FROM outbox WHERE id=?`)
+        .bind(outboxId)
+        .first(),
+    ).toEqual({ slack_scope_paused_at: null, slack_scope_paused_ms: expect.any(Number), slack_redrive_count: 0 });
+    await env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`).bind(outboxId).run();
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(1);
+    expect((await deliveries(created.id))[0]?.state).toBe("pending");
+    await env.DB.prepare(`UPDATE outbox SET available_at=1 WHERE id=?`).bind(outboxId).run();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId },
+      ack: vi.fn(),
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect((await deliveries(created.id))[0]?.state).toBe("sent");
+    expect(posts).toHaveLength(1);
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId },
+      ack: vi.fn(),
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(posts).toHaveLength(1);
+  });
+  it.each(["no_permission", "restricted_action"])("preserves mirrors on users.info %s", async (code) => {
+    const { created, link } = await activeThread();
+    beforeResponse = async (method) => {
+      if (method === "users.info") throw new SlackApiError(method, code, 403);
+    };
+    await expect(setSlackMirror(runtime(), owner, "space", true)).rejects.toMatchObject({ code });
+    expect(
+      await env.DB.prepare(`SELECT mirror_enabled FROM slack_channel_subscriptions WHERE id='space'`).first(),
+    ).toEqual({ mirror_enabled: 1 });
+    expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(link.id).first()).toEqual({
+      state: "active",
+    });
+    expect((await deliveries(created.id))[0]?.state).toBe("sent");
+  });
   it("lets an owner restore a mapping without a root and suppresses waiting digests on pause", async () => {
     const cutoff = Date.UTC(2026, 8, 24, 9);
     await env.DB.prepare(`INSERT INTO slack_channel_events
@@ -1720,6 +2356,121 @@ describe("canonical Slack mirrors", () => {
     expect(JSON.stringify((await deliverRefresh()).payload.blocks)).toContain("noteflare_mapping_mute");
   });
 
+  it("refreshes every active root from a Slack control and chooses a current owner at expiry", async () => {
+    const first = await activeThread();
+    const second = await thread();
+    await deliverSlackThread(runtime(), (await deliveries(second.id))[0]!.id);
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      channel: { id: "CSPACE" },
+      message: { ts: first.link.root_message_ts },
+      actions: [
+        {
+          action_id: "noteflare_mapping_snooze",
+          action_ts: "1700000809.000001",
+          selected_option: { value: `${first.link.id}:1` },
+        },
+      ],
+    });
+    const receipt = (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+      WHERE callback_id='noteflare_mapping_snooze'`).first<{ id: string }>())!;
+    await deliverSlackWorkspaceAction(runtime(), receipt.id);
+    expect(
+      (await env.DB.prepare(`SELECT COUNT(*) count FROM slack_thread_deliveries
+      WHERE operation='refresh' AND state='pending'`).first<{ count: number }>())!.count,
+    ).toBe(2);
+    const initialRefreshes = await env.DB.prepare(`SELECT id FROM slack_thread_deliveries
+      WHERE operation='refresh' AND state='pending'`).all<{ id: string }>();
+    for (const delivery of initialRefreshes.results) await deliverSlackThread(runtime(), delivery.id);
+    await env.DB.prepare(`UPDATE workspace_members SET role='owner' WHERE user_id='viewer'`).run();
+    await env.DB.prepare(`UPDATE workspace_members SET role='editor' WHERE user_id='owner'`).run();
+    const expired = Date.now() - 1;
+    await env.DB.prepare(`UPDATE slack_channel_subscriptions SET snoozed_until=? WHERE id='space'`).bind(expired).run();
+    await deliverSlackControlsExpiry(runtime(), {
+      mappingId: "space",
+      installationGeneration: 0,
+      snoozedUntil: expired,
+    });
+    expect(
+      (
+        await env.DB.prepare(`SELECT DISTINCT actor_id FROM slack_thread_deliveries
+      WHERE operation='refresh' AND state='pending'`).all<{ actor_id: string }>()
+      ).results,
+    ).toEqual([{ actor_id: "viewer" }]);
+    expect(
+      await env.DB.prepare(`SELECT controls_error FROM slack_channel_subscriptions WHERE id='space'`).first(),
+    ).toEqual({ controls_error: null });
+  });
+
+  it("queues an unchanged control click and lets a newer same-actor refresh win", async () => {
+    const { created, link } = await activeThread();
+    const click = async (actionId: string, actionTs: string) => {
+      await acceptSlackWorkspaceInteraction(runtime(), {
+        type: "block_actions",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        channel: { id: "CSPACE" },
+        message: { ts: link.root_message_ts },
+        actions: [{ action_id: actionId, action_ts: actionTs, value: link.id }],
+      });
+      const receipt = (await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+        WHERE callback_id=? ORDER BY rowid DESC LIMIT 1`)
+        .bind(actionId)
+        .first<{ id: string }>())!;
+      await deliverSlackWorkspaceAction(runtime(), receipt.id);
+    };
+    await click("noteflare_mapping_unmute", "1700000809.000011");
+    const first = (await deliveries(created.id)).find((delivery) => delivery.operation === "refresh")!;
+    expect(first.state).toBe("pending");
+    await click("noteflare_mapping_mute", "1700000809.000012");
+    const refreshes = (await deliveries(created.id)).filter((delivery) => delivery.operation === "refresh");
+    expect(refreshes).toHaveLength(2);
+    const newer = refreshes.find((delivery) => delivery.id !== first.id)!;
+    const previousOrder = (await env.DB.prepare(`SELECT created_at FROM slack_thread_deliveries WHERE id=?`)
+      .bind(first.id)
+      .first<{ created_at: number }>())!;
+    const currentOrder = (await env.DB.prepare(`SELECT created_at FROM slack_thread_deliveries WHERE id=?`)
+      .bind(newer.id)
+      .first<{ created_at: number }>())!;
+    expect(currentOrder.created_at).toBeGreaterThan(previousOrder.created_at);
+    await deliverSlackThread(runtime(), first.id);
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(first.id)
+        .first(),
+    ).toEqual({ state: "retired", failure_reason: "superseded" });
+    await deliverSlackThread(runtime(), newer.id);
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === newer.id)?.state).toBe("sent");
+    expect(JSON.stringify(calls.filter((call) => call.method === "chat.update").at(-1)?.payload.blocks)).toContain(
+      "noteflare_mapping_unmute",
+    );
+  });
+
+  it("refreshes only the clicked root when a control already has the requested state", async () => {
+    const first = await activeThread();
+    const second = await thread();
+    await deliverSlackThread(runtime(), (await deliveries(second.id))[0]!.id);
+    await acceptSlackWorkspaceInteraction(runtime(), {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      channel: { id: "CSPACE" },
+      message: { ts: first.link.root_message_ts },
+      actions: [{ action_id: "noteflare_mapping_unmute", action_ts: "1700000809.000099", value: first.link.id }],
+    });
+    const receipt = await env.DB.prepare(`SELECT id FROM slack_interaction_receipts
+      WHERE callback_id='noteflare_mapping_unmute'`).first<{ id: string }>();
+    await deliverSlackWorkspaceAction(runtime(), receipt!.id);
+    expect(
+      (
+        await env.DB.prepare(`SELECT link_id FROM slack_thread_deliveries
+      WHERE operation='refresh'`).all<{ link_id: string }>()
+      ).results,
+    ).toEqual([{ link_id: first.link.id }]);
+  });
+
   it("does not let fifty muted mappings starve an eligible digest", async () => {
     const cutoff = Date.UTC(2026, 8, 24, 9);
     await env.DB.prepare(`UPDATE slack_channel_subscriptions SET cadence = 'digest' WHERE id = 'space'`).run();
@@ -1744,6 +2495,28 @@ describe("canonical Slack mirrors", () => {
     expect(
       calls.filter((call) => call.method === "chat.postMessage" && call.payload.channel === "CSPACE"),
     ).toHaveLength(1);
+  });
+  it("records a digest auth failure against the live credential revision", async () => {
+    const cutoff = Date.UTC(2026, 8, 24, 9);
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_channel_subscriptions SET cadence='digest' WHERE id='space'`),
+      env.DB.prepare(`UPDATE slack_installations SET credential_revision=7 WHERE id='installation'`),
+      env.DB.prepare(`INSERT INTO slack_channel_events
+        (id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+        VALUES ('digest-auth','space','workspace','page_edit','owner','page','digest',?)`).bind(cutoff - 1000),
+    ]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith("/chat.postMessage")
+          ? Response.json({ ok: false, error: "invalid_auth" })
+          : mockSlack(input, init),
+      ),
+    );
+    await sendDueSlackChannelDigests(runtime(), cutoff + 3_600_000);
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: "invalid_auth",
+    });
   });
 
   it("defaults off, requires current owner and verified identity, and stores channel validation", async () => {
@@ -1787,6 +2560,18 @@ describe("canonical Slack mirrors", () => {
     await env.DB.prepare(`UPDATE slack_installations SET scopes = 'chat:write'`).run();
     await expect(setSlackMirror(runtime(), owner, "space", true)).rejects.toMatchObject({ status: 403 });
     await setSlackMirror(runtime(), owner, "space", false);
+  });
+  it("classifies mirror scope failures as client errors at both route boundaries", async () => {
+    await setSlackMirror(runtime(), owner, "space", true);
+    await env.DB.prepare(`UPDATE slack_installations SET scopes='chat:write' WHERE id='installation'`).run();
+    const verifyError = await verifySlackMirrorRecovery(runtime(), owner, "space").catch((error: unknown) => error);
+    expect(classifyError(verifyError)).toMatchObject({ expected: true, status: 403 });
+    await env.DB.prepare(`UPDATE slack_installations SET scopes=? WHERE id='installation'`).bind(scopes).run();
+    beforeResponse = async (method) => {
+      if (method === "users.info") throw new SlackApiError(method, "missing_scope", 403);
+    };
+    const enableError = await setSlackMirror(runtime(), owner, "space", true).catch((error: unknown) => error);
+    expect(classifyError(enableError)).toMatchObject({ expected: true, status: 403 });
   });
   it("enforces uniqueness and page precedence while keeping existing roots in their original channel", async () => {
     const old = await activeThread();
@@ -1898,6 +2683,36 @@ describe("canonical Slack mirrors", () => {
       await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id = ?`).bind(root.link_id).first(),
     ).toEqual({ state: "active" });
   });
+  it.each(["archived page", "disabled mirror", "removed actor"])(
+    "confirms a lost root before retiring its link after %s",
+    async (change) => {
+      await setSlackMirror(runtime(), owner, "space", true);
+      const created = await thread();
+      await addCommentReply(runtime(), owner, commentPage, created.id, body("Waiting"));
+      const [root, successor] = await deliveries(created.id);
+      postFailure = "lost";
+      await expect(deliverSlackThread(runtime(), root!.id)).rejects.toThrow("response lost");
+      if (change === "archived page")
+        await env.DB.prepare(`UPDATE pages SET archived_at=? WHERE id='page'`).bind(Date.now()).run();
+      else if (change === "disabled mirror")
+        await env.DB.prepare(`UPDATE slack_channel_subscriptions SET mirror_enabled=0 WHERE id='space'`).run();
+      else {
+        await env.DB.prepare(`UPDATE workspace_members SET role='owner' WHERE user_id='viewer'`).run();
+        await env.DB.prepare(`DELETE FROM workspace_members WHERE user_id='owner'`).run();
+      }
+      await deliverSlackThread(runtime(), root!.id);
+      expect(posts).toHaveLength(1);
+      expect(
+        await env.DB.prepare(`SELECT state FROM slack_thread_deliveries WHERE id=?`).bind(root!.id).first(),
+      ).toEqual({ state: "sent" });
+      expect(
+        await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(root!.link_id).first(),
+      ).toEqual({ state: "retired" });
+      expect(
+        await env.DB.prepare(`SELECT state FROM slack_thread_deliveries WHERE id=?`).bind(successor!.id).first(),
+      ).toEqual({ state: "retired" });
+    },
+  );
   it("uses query parameters for Slack reads and JSON bodies for writes", async () => {
     const { link } = await activeThread();
     await acceptSlackReply(runtime(), reply(link.root_message_ts));
@@ -1940,6 +2755,193 @@ describe("canonical Slack mirrors", () => {
       .run();
     expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
   });
+  it("rechecks blocked reconciliation after five minutes without requeueing", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Unconfirmed"));
+    const replyDelivery = (await deliveries(created.id)).find((delivery) => delivery.operation === "reply")!;
+    const outboxId = `outbox:${replyDelivery.id}`;
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+        failure_reason='reconciliation_no_permission',attempted_at=? WHERE id=?`).bind(Date.now(), replyDelivery.id),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`).bind(outboxId),
+    ]);
+    const before = Date.now();
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
+    const after = Date.now();
+    const row = await env.DB.prepare(`SELECT enqueued_at,slack_redrive_count,slack_redrive_due_at
+      FROM outbox WHERE id=?`)
+      .bind(outboxId)
+      .first<{
+        enqueued_at: number | null;
+        slack_redrive_count: number;
+        slack_redrive_due_at: number;
+      }>();
+    expect(row?.enqueued_at).toBe(1);
+    expect(row?.slack_redrive_count).toBe(0);
+    expect(row?.slack_redrive_due_at).toBeGreaterThanOrEqual(before + 5 * 60_000);
+    expect(row?.slack_redrive_due_at).toBeLessThanOrEqual(after + 5 * 60_000);
+  });
+  it("retains a redrive marker when an acknowledged uncertain send finds no Slack post", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Unconfirmed"));
+    const replyDelivery = (await deliveries(created.id)).find((delivery) => delivery.operation === "reply")!;
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',attempted_at=? WHERE id=?`).bind(
+        Date.now() - 60_000,
+        replyDelivery.id,
+      ),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`).bind(
+        `outbox:${replyDelivery.id}`,
+      ),
+    ]);
+    const ack = vi.fn();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId: `outbox:${replyDelivery.id}` },
+      ack,
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare(`SELECT state FROM slack_thread_deliveries WHERE id=?`).bind(replyDelivery.id).first(),
+    ).toEqual({ state: "sending" });
+    expect(
+      await env.DB.prepare(`SELECT slack_redrive_due_at>? scheduled FROM outbox WHERE id=?`)
+        .bind(Date.now(), `outbox:${replyDelivery.id}`)
+        .first(),
+    ).toEqual({ scheduled: 1 });
+  });
+  it("redrives a root before a same-batch refresh without charging the refresh wait", async () => {
+    await setSlackMirror(runtime(), owner, "space", true);
+    const created = await thread();
+    const root = (await deliveries(created.id))[0]!;
+    const rootTime = (await env.DB.prepare(`SELECT created_at FROM slack_thread_deliveries WHERE id=?`)
+      .bind(root.id)
+      .first<{ created_at: number }>())!.created_at;
+    const refreshId = `${root.link_id}:refresh:before-root`;
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO slack_thread_deliveries
+        (id,link_id,operation,source_id,actor_id,created_at,updated_at)
+        VALUES (?,?,'refresh','same-batch','owner',?,?)`).bind(refreshId, root.link_id, rootTime, rootTime),
+      env.DB.prepare(`INSERT INTO outbox (id,workspace_id,topic,payload_json,available_at,enqueued_at,
+        created_at,slack_redrive_due_at)
+        VALUES (?,'workspace','slack_thread_reply',?,1,1,1,1)`).bind(
+        `outbox:${refreshId}`,
+        JSON.stringify({ deliveryId: refreshId }),
+      ),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`).bind(`outbox:${root.id}`),
+    ]);
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(1);
+    expect(
+      await env.DB.prepare(`SELECT slack_redrive_count,slack_redrive_due_at>? due
+      FROM outbox WHERE id=?`)
+        .bind(Date.now(), `outbox:${refreshId}`)
+        .first(),
+    ).toEqual({ slack_redrive_count: 0, due: 0 });
+    expect(
+      await env.DB.prepare(`SELECT slack_redrive_count FROM outbox WHERE id=?`).bind(`outbox:${root.id}`).first(),
+    ).toEqual({ slack_redrive_count: 1 });
+  });
+  it("defers sixty waiting replies so later due work can run without a full sort", async () => {
+    const first = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, first.created.id, body("Blocked predecessor"));
+    const predecessor = (await deliveries(first.created.id)).find((delivery) => delivery.operation === "reply")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',failure_reason='reconciliation_no_permission'
+      WHERE id=?`)
+      .bind(predecessor.id)
+      .run();
+    const now = Date.now();
+    await env.DB.prepare(`WITH RECURSIVE sequence(n) AS
+      (SELECT 1 UNION ALL SELECT n+1 FROM sequence WHERE n<60)
+      INSERT INTO slack_thread_deliveries(id,link_id,operation,source_id,actor_id,created_at,updated_at)
+      SELECT 'waiting-' || n,?,'reply','waiting-' || n,'owner',?,? FROM sequence`)
+      .bind(first.link.id, now, now)
+      .run();
+    await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,enqueued_at,
+      created_at,slack_redrive_due_at)
+      SELECT 'outbox:' || id,'workspace','slack_thread_reply',json_object('deliveryId',id),1,1,1,1
+      FROM slack_thread_deliveries WHERE link_id=? AND id LIKE 'waiting-%'`)
+      .bind(first.link.id)
+      .run();
+    const second = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, second.created.id, body("Runnable"));
+    const runnable = (await deliveries(second.created.id)).find((delivery) => delivery.operation === "reply")!;
+    await env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=2 WHERE id=?`)
+      .bind(`outbox:${runnable.id}`)
+      .run();
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(1);
+    expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
+    expect(
+      await env.DB.prepare(`SELECT enqueued_at FROM outbox WHERE id=?`).bind(`outbox:${runnable.id}`).first(),
+    ).toEqual({ enqueued_at: null });
+  });
+  it("starts a waiting reply's clock when it becomes runnable after a day", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("First"));
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Second"));
+    const [first, second] = (await deliveries(created.id)).filter((delivery) => delivery.operation === "reply");
+    await env.DB.prepare(`UPDATE outbox SET created_at=?,enqueued_at=1,slack_redrive_due_at=1
+      WHERE id=?`)
+      .bind(Date.now() - 25 * 60 * 60_000, `outbox:${second!.id}`)
+      .run();
+    expect(
+      await env.DB.prepare(`SELECT slack_eligible_started_at eligible FROM outbox WHERE id=?`)
+        .bind(`outbox:${second!.id}`)
+        .first(),
+    ).toEqual({ eligible: null });
+    await redriveStaleSlackOutbox(runtime());
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === second!.id)?.state).toBe("pending");
+    await env.DB.prepare(`UPDATE slack_installations SET auth_error='invalid_auth',auth_error_at=?
+      WHERE id='installation'`)
+      .bind(Date.now() - 60 * 60_000)
+      .run();
+    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=1 WHERE id=?`).bind(`outbox:${second!.id}`).run();
+    await redriveStaleSlackOutbox(runtime());
+    await env.DB.prepare(`UPDATE slack_installations SET auth_error=NULL,auth_error_at=NULL,
+      auth_paused_ms=60*60_000 WHERE id='installation'`).run();
+    await deliverSlackThread(runtime(), first!.id);
+    const eligible = await env.DB.prepare(`SELECT slack_eligible_started_at eligible,
+      slack_auth_pause_baseline_ms baseline FROM outbox WHERE id=?`)
+      .bind(`outbox:${second!.id}`)
+      .first<{ eligible: number | null; baseline: number | null }>();
+    expect(eligible!.eligible).toBeGreaterThan(Date.now() - 60_000);
+    expect(eligible!.baseline).toBe(60 * 60_000);
+    await env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`)
+      .bind(`outbox:${second!.id}`)
+      .run();
+    await redriveStaleSlackOutbox(runtime());
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === second!.id)?.state).toBe("pending");
+  });
+  it("wakes the first reply and refresh independently", async () => {
+    const { created, link } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("First"));
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Second"));
+    const [first, second] = (await deliveries(created.id)).filter((delivery) => delivery.operation === "reply");
+    const refreshId = `${link.id}:refresh:dual-wake`;
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO slack_thread_deliveries
+        (id,link_id,operation,source_id,actor_id,created_at,updated_at)
+        VALUES (?,?,'refresh','dual-wake','owner',?,?)`).bind(refreshId, link.id, Date.now(), Date.now()),
+      env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,enqueued_at,created_at)
+        VALUES (?,'workspace','slack_thread_reply',?,1,1,?)`).bind(
+        `outbox:${refreshId}`,
+        JSON.stringify({ deliveryId: refreshId }),
+        Date.now(),
+      ),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1 WHERE id IN (?,?)`).bind(
+        `outbox:${first!.id}`,
+        `outbox:${second!.id}`,
+      ),
+    ]);
+    await wakeNextSlackDelivery(runtime(), link.id);
+    const rows = await env.DB.prepare(`SELECT id,enqueued_at,slack_eligible_started_at FROM outbox
+      WHERE id IN (?,?,?) ORDER BY id`)
+      .bind(`outbox:${first!.id}`, `outbox:${second!.id}`, `outbox:${refreshId}`)
+      .all<{ id: string; enqueued_at: number | null; slack_eligible_started_at: number | null }>();
+    expect(rows.results.find((row) => row.id === `outbox:${first!.id}`)?.enqueued_at).toBeNull();
+    expect(rows.results.find((row) => row.id === `outbox:${refreshId}`)?.enqueued_at).toBeNull();
+    expect(rows.results.find((row) => row.id === `outbox:${second!.id}`)?.enqueued_at).toBe(1);
+    expect(rows.results.find((row) => row.id === `outbox:${refreshId}`)?.slack_eligible_started_at).not.toBeNull();
+  });
   it("ends redrive after eight attempts and lets later replies follow a definite failure", async () => {
     const { created } = await activeThread();
     await addCommentReply(runtime(), owner, commentPage, created.id, body("First"));
@@ -1961,7 +2963,7 @@ describe("canonical Slack mirrors", () => {
     await deliverSlackThread(runtime(), second.id);
     expect(posts.at(-1)?.text).toContain("Second");
   });
-  it("blocks successors behind any blocked predecessor and releases them in order", async () => {
+  it("keeps successors pending behind any uncertain predecessor and releases them in order", async () => {
     const { created, link } = await activeThread();
     for (let index = 0; index < 4; index++)
       await addCommentReply(runtime(), owner, commentPage, created.id, body(`Reply ${index}`));
@@ -1971,7 +2973,7 @@ describe("canonical Slack mirrors", () => {
       WHERE id=?`)
       .bind(blocked!.id)
       .run();
-    await deliverSlackThread(runtime(), next!.id);
+    await expect(deliverSlackThread(runtime(), next!.id)).rejects.toThrow("Delivery is already in progress");
     expect(
       await env.DB.prepare(`SELECT id,state,failure_reason FROM slack_thread_deliveries
       WHERE id IN (?,?) ORDER BY id`)
@@ -1979,8 +2981,8 @@ describe("canonical Slack mirrors", () => {
         .all(),
     ).toMatchObject({
       results: expect.arrayContaining([
-        { id: next!.id, state: "blocked", failure_reason: "predecessor_blocked" },
-        { id: last!.id, state: "blocked", failure_reason: "predecessor_blocked" },
+        { id: next!.id, state: "pending", failure_reason: null },
+        { id: last!.id, state: "pending", failure_reason: null },
       ]),
     });
     expect((await deliveries(created.id)).find((delivery) => delivery.id === earlierPending!.id)?.state).toBe(
@@ -1991,7 +2993,7 @@ describe("canonical Slack mirrors", () => {
       .run();
     await wakeNextSlackDelivery(runtime(), link.id);
     expect((await deliveries(created.id)).find((delivery) => delivery.id === next!.id)?.state).toBe("pending");
-    expect((await deliveries(created.id)).find((delivery) => delivery.id === last!.id)?.state).toBe("blocked");
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === last!.id)?.state).toBe("pending");
     await deliverSlackThread(runtime(), earlierPending!.id);
     await deliverSlackThread(runtime(), next!.id);
     expect((await deliveries(created.id)).find((delivery) => delivery.id === last!.id)?.state).toBe("pending");
@@ -2002,7 +3004,7 @@ describe("canonical Slack mirrors", () => {
         .every((delivery) => delivery.state === "sent"),
     ).toBe(true);
   });
-  it("releases a derived block after its reply predecessor is definitively retired", async () => {
+  it("releases a pending reply after its uncertain predecessor is definitively retired", async () => {
     const { created, link } = await activeThread();
     await addCommentReply(runtime(), owner, commentPage, created.id, body("Rejected predecessor"));
     await addCommentReply(runtime(), owner, commentPage, created.id, body("Waiting successor"));
@@ -2011,8 +3013,8 @@ describe("canonical Slack mirrors", () => {
       WHERE id=?`)
       .bind(first!.id)
       .run();
-    await deliverSlackThread(runtime(), second!.id);
-    expect((await deliveries(created.id)).find((delivery) => delivery.id === second!.id)?.state).toBe("blocked");
+    await expect(deliverSlackThread(runtime(), second!.id)).rejects.toThrow("Delivery is already in progress");
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === second!.id)?.state).toBe("pending");
     await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',failure_reason='invalid_blocks'
       WHERE id=?`)
       .bind(first!.id)
@@ -2022,7 +3024,52 @@ describe("canonical Slack mirrors", () => {
     await deliverSlackThread(runtime(), second!.id);
     expect((await deliveries(created.id)).find((delivery) => delivery.id === second!.id)?.state).toBe("sent");
   });
-  it("blocks later pending replies when an uncertain predecessor exhausts redrive", async () => {
+  it("reconciles a possibly sent reply before inspecting a blocked predecessor", async () => {
+    const { created, link } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Earlier"));
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Maybe posted"));
+    const [earlier, second] = (await deliveries(created.id)).filter((d) => d.operation === "reply");
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',failure_reason='reconciliation_no_permission'
+        WHERE id=?`).bind(earlier!.id),
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',attempted_at=?
+        WHERE id=?`).bind(Date.now() - 60_000, second!.id),
+    ]);
+    posts.push({
+      channel: "CSPACE",
+      ts: "1700000999.000001",
+      thread_ts: link.root_message_ts!,
+      text: "Maybe posted",
+      user: "UBOT",
+      metadata: {
+        event_type: "noteflare_thread_delivery",
+        event_payload: { delivery_id: second!.id },
+      },
+    });
+    await deliverSlackThread(runtime(), second!.id);
+    expect((await deliveries(created.id)).find((d) => d.id === second!.id)?.state).toBe("sent");
+    expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(1);
+  });
+  it("refreshes a confirmed root while its replies wait, using the current root state", async () => {
+    const { created, link } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Waiting reply"));
+    const waitingReply = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',failure_reason='reconciliation_no_permission'
+      WHERE id=?`)
+      .bind(waitingReply.id)
+      .run();
+    const refreshId = `${link.id}:refresh:bypass`;
+    await env.DB.prepare(`INSERT INTO slack_thread_deliveries
+      (id,link_id,operation,source_id,actor_id,created_at,updated_at)
+      VALUES (?,?,'refresh','bypass','owner',?,?)`)
+      .bind(refreshId, link.id, Date.now(), Date.now())
+      .run();
+    await deliverSlackThread(runtime(), refreshId);
+    expect((await deliveries(created.id)).find((d) => d.id === refreshId)?.state).toBe("sent");
+    expect(calls.some((call) => call.method === "chat.update" && call.payload.ts === link.root_message_ts)).toBe(true);
+    expect((await deliveries(created.id)).find((d) => d.id === waitingReply.id)?.state).toBe("blocked");
+  });
+  it("keeps uncertain replies fenced past eight redrives while successors remain pending", async () => {
     const { created } = await activeThread();
     for (let index = 0; index < 2; index++)
       await addCommentReply(runtime(), owner, commentPage, created.id, body(`Waiting ${index}`));
@@ -2043,14 +3090,164 @@ describe("canonical Slack mirrors", () => {
       await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
         .bind(first!.id)
         .first(),
-    ).toEqual({ state: "blocked", failure_reason: "redrive_exhausted_uncertain" });
+    ).toEqual({ state: "sending", failure_reason: null });
     expect(
       await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
         .bind(second!.id)
         .first(),
-    ).toEqual({ state: "blocked", failure_reason: "predecessor_blocked" });
+    ).toEqual({ state: "pending", failure_reason: null });
   });
-  it("redrive detects a blocked predecessor even behind an earlier pending reply", async () => {
+  it("skips a reply after 24 eligible reconciliation hours and releases its successor", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Unconfirmed"));
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Later"));
+    const [first, second] = (await deliveries(created.id)).filter((d) => d.operation === "reply");
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',attempted_at=?,
+        auth_pause_baseline_ms=0 WHERE id=?`).bind(Date.now() - 24 * 60 * 60_000 - 5_000, first!.id),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`).bind(`outbox:${first!.id}`),
+    ]);
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(first!.id)
+        .first(),
+    ).toEqual({ state: "retired", failure_reason: "reconciliation_expired" });
+    expect((await deliveries(created.id)).find((d) => d.id === second!.id)?.state).toBe("pending");
+    await deliverSlackThread(runtime(), second!.id);
+    expect(posts.at(-1)?.text).toContain("Later");
+    expect(
+      await env.DB.prepare(`SELECT reason,acknowledged_at FROM slack_delivery_failures WHERE delivery_id=?`)
+        .bind(first!.id)
+        .first(),
+    ).toEqual({ reason: "reconciliation_expired", acknowledged_at: null });
+  });
+  it("expires blocked uncertainty after 24 eligible hours and wakes the next reply", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Blocked"));
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Later"));
+    const [first, second] = (await deliveries(created.id)).filter((delivery) => delivery.operation === "reply");
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+        failure_reason='reconciliation_no_permission',attempted_at=?,auth_pause_baseline_ms=0 WHERE id=?`).bind(
+        Date.now() - 24 * 60 * 60_000 - 5_000,
+        first!.id,
+      ),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`).bind(`outbox:${first!.id}`),
+    ]);
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(first!.id)
+        .first(),
+    ).toEqual({ state: "retired", failure_reason: "reconciliation_expired" });
+    expect(
+      await env.DB.prepare(`SELECT reason FROM slack_delivery_failures WHERE delivery_id=?`).bind(first!.id).first(),
+    ).toEqual({ reason: "reconciliation_expired" });
+    await deliverSlackThread(runtime(), second!.id);
+    expect(posts.at(-1)?.text).toContain("Later");
+  });
+  it("pauses pending and uncertain delivery clocks during installation authentication failure", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Wait through reauthorization"));
+    const authReply = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
+    const now = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',attempted_at=?,
+        auth_pause_baseline_ms=0 WHERE id=?`).bind(now - 25 * 60 * 60_000, authReply.id),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1,slack_redrive_count=8
+        WHERE id=?`).bind(`outbox:${authReply.id}`),
+      env.DB.prepare(`UPDATE slack_installations SET auth_error='invalid_auth',auth_error_at=?
+        WHERE workspace_id='workspace'`).bind(now - 2 * 60 * 60_000),
+    ]);
+    await redriveStaleSlackOutbox(runtime());
+    expect((await deliveries(created.id)).find((d) => d.id === authReply.id)?.state).toBe("sending");
+    await env.DB.prepare(`UPDATE slack_installations SET auth_error=NULL,auth_error_at=NULL,
+      auth_paused_ms=auth_paused_ms+? WHERE workspace_id='workspace'`)
+      .bind(2 * 60 * 60_000)
+      .run();
+    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=1 WHERE id=?`).bind(`outbox:${authReply.id}`).run();
+    await redriveStaleSlackOutbox(runtime());
+    expect((await deliveries(created.id)).find((d) => d.id === authReply.id)?.state).toBe("sending");
+  });
+  it("keeps terminal failure health after a mapping is removed until its owner acknowledges it", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Uncertain"));
+    const failedReply = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+      failure_reason='reconciliation_inconclusive' WHERE id=?`)
+      .bind(failedReply.id)
+      .run();
+    await deleteSlackChannelSubscription(runtime(), owner, "space");
+    expect(await listSlackDeliveryFailureGroups(runtime(), owner)).toMatchObject([
+      { id: "space", failedDeliveries: 1 },
+    ]);
+    expect((await deliveries(created.id)).find((d) => d.id === failedReply.id)?.state).toBe("retired");
+    expect(
+      await env.DB.prepare(`SELECT reason FROM slack_delivery_failures WHERE delivery_id=?`)
+        .bind(failedReply.id)
+        .first(),
+    ).toEqual({ reason: "mapping_removed_unconfirmed" });
+    await acknowledgeSlackDeliveryFailures(runtime(), owner, "space");
+    expect(await listSlackDeliveryFailureGroups(runtime(), owner)).toEqual([]);
+  });
+  it("retires blocked uncertainty on mirror disable", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Uncertain"));
+    const failedReply = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+      failure_reason='reconciliation_inconclusive' WHERE id=?`)
+      .bind(failedReply.id)
+      .run();
+    await setSlackMirror(runtime(), owner, "space", false);
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(failedReply.id)
+        .first(),
+    ).toEqual({ state: "retired", failure_reason: "mirror_disabled_unconfirmed" });
+    expect(
+      await env.DB.prepare(`SELECT reason FROM slack_delivery_failures WHERE delivery_id=?`)
+        .bind(failedReply.id)
+        .first(),
+    ).toEqual({ reason: "mirror_disabled_unconfirmed" });
+  });
+  it("groups a disconnected orphaned link by a usable health identifier", async () => {
+    const { created, link } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Uncertain"));
+    const failedReply = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+      failure_reason='reconciliation_inconclusive' WHERE id=?`)
+      .bind(failedReply.id)
+      .run();
+    await env.DB.prepare(`UPDATE slack_thread_links SET subscription_id=NULL WHERE id=?`).bind(link.id).run();
+    await disconnectSlack(runtime(), owner);
+    expect(await listSlackDeliveryFailureGroups(runtime(), owner)).toEqual(
+      expect.arrayContaining([{ id: `orphan:${link.id}`, channelName: "CSPACE", failedDeliveries: 1 }]),
+    );
+    await acknowledgeSlackDeliveryFailures(runtime(), owner, `orphan:${link.id}`);
+    expect(await listSlackDeliveryFailureGroups(runtime(), owner)).toEqual([]);
+  });
+  it("does not resume blocked deliveries after the verifying owner loses access", async () => {
+    const { created } = await activeThread();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Held"));
+    const held = (await deliveries(created.id)).find((row) => row.operation === "reply")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',
+      failure_reason='reconciliation_no_permission' WHERE id=?`)
+      .bind(held.id)
+      .run();
+    await env.DB.prepare(`UPDATE workspace_members SET role='owner'
+      WHERE workspace_id='workspace' AND user_id='viewer'`).run();
+    beforeResponse = async (method) => {
+      if (method === "conversations.info")
+        await env.DB.prepare(`DELETE FROM workspace_members WHERE workspace_id='workspace' AND user_id='owner'`).run();
+    };
+    await expect(verifySlackMirrorRecovery(runtime(), owner, "space")).rejects.toMatchObject({
+      status: 403,
+      code: "slack_thread_unavailable",
+    });
+    expect((await deliveries(created.id)).find((row) => row.id === held.id)?.state).toBe("blocked");
+  });
+  it("redrive keeps a successor pending behind an earlier pending and blocked reply", async () => {
     const { created } = await activeThread();
     for (let index = 0; index < 3; index++)
       await addCommentReply(runtime(), owner, commentPage, created.id, body(`Queued ${index}`));
@@ -2070,9 +3267,9 @@ describe("canonical Slack mirrors", () => {
       await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
         .bind(last!.id)
         .first(),
-    ).toEqual({ state: "blocked", failure_reason: "predecessor_blocked" });
+    ).toEqual({ state: "pending", failure_reason: null });
   });
-  it("blocks replies already pending when an uncertain root cannot be reconciled", async () => {
+  it("keeps replies pending when an uncertain root cannot be reconciled", async () => {
     await setSlackMirror(runtime(), owner, "space", true);
     const created = await thread();
     await addCommentReply(runtime(), owner, commentPage, created.id, body("Waiting for root"));
@@ -2085,7 +3282,7 @@ describe("canonical Slack mirrors", () => {
       await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
         .bind(waiting!.id)
         .first(),
-    ).toEqual({ state: "blocked", failure_reason: "predecessor_blocked" });
+    ).toEqual({ state: "pending", failure_reason: null });
   });
   it("retires a rejected root and its waiting replies when redrive is exhausted", async () => {
     await setSlackMirror(runtime(), owner, "space", true);
@@ -2107,6 +3304,57 @@ describe("canonical Slack mirrors", () => {
         .bind(waiting!.id)
         .first(),
     ).toEqual({ state: "retired", failure_reason: "root_rejected" });
+  });
+  it("keeps a sending root fenced after eight redrives while eligible time remains", async () => {
+    await setSlackMirror(runtime(), owner, "space", true);
+    const created = await thread();
+    const root = (await deliveries(created.id))[0]!;
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',attempted_at=? WHERE id=?`).bind(
+        Date.now(),
+        root.id,
+      ),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1,slack_redrive_count=8
+        WHERE id=?`).bind(`outbox:${root.id}`),
+    ]);
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`).bind(root.id).first(),
+    ).toEqual({ state: "sending", failure_reason: null });
+    expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(root.link_id).first()).toEqual({
+      state: "pending",
+    });
+  });
+  it("does not retire an uncertain root while its link claim is live", async () => {
+    await setSlackMirror(runtime(), owner, "space", true);
+    const created = await thread();
+    const root = (await deliveries(created.id))[0]!;
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',attempted_at=?,
+        auth_pause_baseline_ms=0 WHERE id=?`).bind(Date.now() - 25 * 60 * 60_000, root.id),
+      env.DB.prepare(`UPDATE slack_thread_links SET claim_token='live',claimed_at=? WHERE id=?`).bind(
+        Date.now(),
+        root.link_id,
+      ),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?`).bind(`outbox:${root.id}`),
+    ]);
+    await redriveStaleSlackOutbox(runtime());
+    expect((await deliveries(created.id))[0]?.state).toBe("sending");
+    expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(root.link_id).first()).toEqual({
+      state: "pending",
+    });
+    await env.DB.prepare(`UPDATE slack_thread_links SET claim_token=NULL,claimed_at=NULL WHERE id=?`)
+      .bind(root.link_id)
+      .run();
+    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=1 WHERE id=?`).bind(`outbox:${root.id}`).run();
+    await redriveStaleSlackOutbox(runtime());
+    expect((await deliveries(created.id))[0]?.state).toBe("retired");
+    expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(root.link_id).first()).toEqual({
+      state: "retired",
+    });
+    expect(
+      await env.DB.prepare(`SELECT 1 FROM slack_delivery_failures WHERE delivery_id=?`).bind(root.id).first(),
+    ).not.toBeNull();
   });
   it("acknowledges ordering waits and wakes more than six serialized replies", async () => {
     const { created } = await activeThread();
@@ -2140,7 +3388,7 @@ describe("canonical Slack mirrors", () => {
     expect((await deliveries(created.id))[0]?.state).toBe("sending");
     beforeResponse = undefined;
     await deliverSlackThread(runtime(), root.id);
-    expect((await deliveries(created.id))[0]?.state).toBe("blocked");
+    expect((await deliveries(created.id))[0]?.state).toBe("sending");
 
     await mapping("other", "COTHER", "page");
     await setSlackMirror(runtime(), owner, "space", false);
@@ -2158,6 +3406,29 @@ describe("canonical Slack mirrors", () => {
     ).toEqual({ mirror_enabled: 0, validation_state: "invalid" });
     expect((await deliveries(another.id))[0]?.state).toBe("retired");
   });
+  it.each(["internal_error", "service_unavailable"] as const)(
+    "retries a %s reconciliation error returned with HTTP 200",
+    async (code) => {
+      await setSlackMirror(runtime(), owner, "space", true);
+      const created = await thread();
+      const root = (await deliveries(created.id))[0]!;
+      postFailure = "unrecorded";
+      await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("connection lost");
+      postFailure = "none";
+      historyFailure = code;
+      await expect(deliverSlackThread(runtime(), root.id)).rejects.toMatchObject({ code });
+      expect(
+        await env.DB.prepare(`SELECT state FROM slack_thread_deliveries WHERE id=?`).bind(root.id).first(),
+      ).toEqual({ state: "sending" });
+      historyFailure = "no_permission";
+      await deliverSlackThread(runtime(), root.id);
+      expect(
+        await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+          .bind(root.id)
+          .first(),
+      ).toEqual({ state: "blocked", failure_reason: "reconciliation_no_permission" });
+    },
+  );
   it("blocks a permanent reconciliation failure without reposting an uncertain root", async () => {
     await setSlackMirror(runtime(), owner, "space", true);
     const created = await thread();
@@ -2174,7 +3445,7 @@ describe("canonical Slack mirrors", () => {
     ).toEqual({ state: "blocked", failure_reason: "reconciliation_no_permission" });
     expect(posts).toHaveLength(0);
   });
-  it("keeps an uncertain send blocked when the mirror definitively loses channel access", async () => {
+  it("keeps an uncertain send fenced when channel validation would fail", async () => {
     await setSlackMirror(runtime(), owner, "space", true);
     const created = await thread();
     const root = (await deliveries(created.id))[0]!;
@@ -2184,11 +3455,25 @@ describe("canonical Slack mirrors", () => {
     await deliverSlackThread(runtime(), root.id);
     expect(
       await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`).bind(root.id).first(),
-    ).toEqual({ state: "blocked", failure_reason: "reconciliation_channel_unavailable" });
+    ).toEqual({ state: "sending", failure_reason: null });
     expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(root.link_id).first()).toEqual({
-      state: "retired",
+      state: "pending",
     });
     expect(posts).toHaveLength(0);
+  });
+  it("reconciles a posted root before reacting to its author's revoked access", async () => {
+    await setSlackMirror(runtime(), owner, "space", true);
+    const created = await thread(viewer);
+    const root = (await deliveries(created.id))[0]!;
+    postFailure = "lost";
+    await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("response lost");
+    expect(posts).toHaveLength(1);
+    await env.DB.prepare(`DELETE FROM workspace_members WHERE user_id='viewer'`).run();
+    await deliverSlackThread(runtime(), root.id);
+    expect(posts).toHaveLength(1);
+    expect(await env.DB.prepare(`SELECT state FROM slack_thread_deliveries WHERE id=?`).bind(root.id).first()).toEqual({
+      state: "sent",
+    });
   });
   it("skips a definitively rejected reply and preserves later replies", async () => {
     const { created } = await activeThread();
@@ -2221,9 +3506,11 @@ describe("canonical Slack mirrors", () => {
     await deliverSlackThread(runtime(), root.id);
     await deliverSlackThread(runtime(), root.id);
     await addCommentReply(runtime(), owner, commentPage, created.id, body("Pending"));
-    await deliverSlackThread(runtime(), (await deliveries(created.id)).find((d) => d.operation === "reply")!.id);
+    await expect(
+      deliverSlackThread(runtime(), (await deliveries(created.id)).find((d) => d.operation === "reply")!.id),
+    ).rejects.toThrow("Delivery is already in progress");
     expect(posts).toHaveLength(0);
-    expect((await deliveries(created.id)).every((d) => d.state === "blocked")).toBe(true);
+    expect((await deliveries(created.id)).map((d) => d.state)).toEqual(["sending", "pending"]);
   });
   it("reconciles reply sends and stale send claims, requiring a bot-authored matching marker", async () => {
     const { created } = await activeThread();
@@ -2235,6 +3522,27 @@ describe("canonical Slack mirrors", () => {
     await deliverSlackThread(runtime(), next.id);
     expect(posts).toHaveLength(2);
     expect((await deliveries(created.id)).find((d) => d.id === next.id)!.state).toBe("sent");
+  });
+  it("keeps the root and later replies after reconciling a revoked author's reply", async () => {
+    const { created, link } = await activeThread();
+    await addCommentReply(runtime(), viewer, { ...commentPage, effective_role: "viewer" }, created.id, body("Leaving"));
+    const recovered = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
+    postFailure = "lost";
+    await expect(deliverSlackThread(runtime(), recovered.id)).rejects.toThrow("response lost");
+    await env.DB.prepare(`DELETE FROM workspace_members WHERE user_id='viewer'`).run();
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Still here"));
+    const next = (await deliveries(created.id)).find((d) => d.operation === "reply" && d.id !== recovered.id)!;
+    await deliverSlackThread(runtime(), recovered.id);
+    expect((await deliveries(created.id)).find((d) => d.id === recovered.id)).toMatchObject({
+      state: "retired",
+      failure_reason: "reply_unavailable",
+    });
+    expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(link.id).first()).toEqual({
+      state: "active",
+    });
+    await deliverSlackThread(runtime(), next.id);
+    expect(posts).toHaveLength(3);
+    expect(posts.at(-1)?.thread_ts).toBe(link.root_message_ts);
   });
   it("keeps mapping receipts and retires old links across disable/re-enable and removal", async () => {
     const { created, link } = await activeThread();
@@ -2431,6 +3739,15 @@ describe("Slack inbound replies and actions", () => {
   );
   it("records a terminal content outcome when a broadcast reply is absent from thread history", async () => {
     const { link } = await activeThread();
+    threadHistoryReplies = [
+      {
+        ts: "1700000100.000001",
+        thread_ts: link.root_message_ts,
+        user: "UVIEWER",
+        subtype: "thread_broadcast",
+        text: "Pointer text",
+      },
+    ];
     await acceptSlackReply(
       runtime(),
       reply(link.root_message_ts, { subtype: "thread_broadcast", text: "Pointer text" }, "EvMissingBroadcast"),
@@ -2464,9 +3781,17 @@ describe("Slack inbound replies and actions", () => {
     const { link } = await activeThread();
     await acceptSlackReply(runtime(), reply(link.root_message_ts));
     await env.DB.prepare(mutation).run();
-    await deliverSlackMutation(runtime(), await inboundId(), false);
+    const error = await deliverSlackMutation(runtime(), await inboundId(), false).then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    expect((error as { code?: string } | null)?.code ?? null).toBe(
+      mutation.includes("scopes =") ? "slack_mirror_missing_scope" : null,
+    );
     expect(await env.DB.prepare(`SELECT 1 FROM comments WHERE slack_source_receipt_id IS NOT NULL`).first()).toBeNull();
-    expect(await env.DB.prepare(`SELECT outcome FROM slack_inbound_receipts`).first()).toEqual({ outcome: "denied" });
+    expect(await env.DB.prepare(`SELECT outcome FROM slack_inbound_receipts`).first()).toEqual({
+      outcome: mutation.includes("scopes =") ? null : "denied",
+    });
   });
   it.each([
     { deleted: true },
@@ -2510,6 +3835,67 @@ describe("Slack inbound replies and actions", () => {
     expect(denial[0]!.payload.user).toBe("UVIEWER");
     expect(denial[0]!.payload.thread_ts).toBe(link.root_message_ts);
   });
+  it("retries transient channel validation before claiming an ephemeral denial", async () => {
+    const { link } = await activeThread();
+    await acceptSlackReply(runtime(), reply(link.root_message_ts));
+    members = ["UOWNER"];
+    await deliverSlackMutation(runtime(), await inboundId(), false);
+    const payloadJson = (await env.DB.prepare(`SELECT payload_json FROM outbox
+      WHERE topic='slack_interaction_response'`).first<{ payload_json: string }>())!.payload_json;
+    beforeResponse = async (method) => {
+      if (method === "conversations.info") throw new SlackApiError(method, "network_error", 503);
+    };
+    await expect(deliverSlackDenial(runtime(), JSON.parse(payloadJson))).rejects.toMatchObject({
+      code: "network_error",
+    });
+    expect(await env.DB.prepare(`SELECT denial_sent_at FROM slack_inbound_receipts`).first()).toEqual({
+      denial_sent_at: null,
+    });
+    beforeResponse = undefined;
+    await deliverSlackDenial(runtime(), JSON.parse(payloadJson));
+    expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(1);
+  });
+  it.each(["invalid_auth", "missing_scope"])("keeps an inbound reply receipt pending during %s", async (authError) => {
+    const { link } = await activeThread();
+    await acceptSlackReply(runtime(), reply(link.root_message_ts));
+    const receiptId = await inboundId();
+    const outboxId = `outbox:slack-inbound:${receiptId}`;
+    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=1,enqueued_at=1 WHERE id=?`).bind(outboxId).run();
+    if (authError === "missing_scope")
+      await env.DB.prepare(`UPDATE slack_installations SET scopes='chat:write' WHERE id='installation'`).run();
+    else
+      beforeResponse = async (method) => {
+        if (method === "conversations.info") throw new SlackApiError(method, "invalid_auth", 200);
+      };
+    const ack = vi.fn();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId },
+      ack,
+      retry: vi.fn(),
+    } as unknown as Message<DeliveryQueueMessage>);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare(`SELECT processed_at FROM slack_inbound_receipts WHERE id=?`).bind(receiptId).first(),
+    ).toEqual({ processed_at: null });
+    expect(
+      await env.DB.prepare(`SELECT slack_redrive_due_at IS NOT NULL due,slack_scope_paused_at IS NOT NULL paused
+        FROM outbox WHERE id=?`)
+        .bind(outboxId)
+        .first(),
+    ).toEqual(authError === "missing_scope" ? { due: 0, paused: 1 } : { due: 1, paused: 0 });
+  });
+  it("denies a time-limited thread action when its mirror scopes are missing", async () => {
+    const { link } = await activeThread();
+    const receiptId = await action(link);
+    await env.DB.prepare(`UPDATE slack_installations SET scopes='chat:write' WHERE id='installation'`).run();
+    await deliverSlackMutation(runtime(), receiptId, true);
+    expect(
+      await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id=?`).bind(receiptId).first(),
+    ).toEqual({ outcome: "denied" });
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: null,
+    });
+  });
   it("resolves and reopens through durable actions, deduplicates retries, and refreshes the same root", async () => {
     const { created, link } = await activeThread();
     const first = await action(link);
@@ -2528,6 +3914,51 @@ describe("Slack inbound replies and actions", () => {
         .filter((c) => c.method === "chat.update")
         .every((c) => c.payload.ts === link.root_message_ts && String(c.payload.text).startsWith("Open")),
     ).toBe(true);
+  });
+  it("retires a timed-out refresh after its page loses authority", async () => {
+    const { created, link } = await activeThread();
+    await deliverSlackMutation(runtime(), await action(link), true);
+    const refresh = (await deliveries(created.id)).find((delivery) => delivery.operation === "refresh")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',attempted_at=? WHERE id=?`)
+      .bind(Date.now() - 60_000, refresh.id)
+      .run();
+    await env.DB.prepare(`UPDATE pages SET archived_at=? WHERE id='page'`).bind(Date.now()).run();
+    await deliverSlackThread(runtime(), refresh.id);
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(refresh.id)
+        .first(),
+    ).toEqual({ state: "retired", failure_reason: "slack_thread_unavailable" });
+  });
+  it("retires a timed-out refresh superseded by a newer one", async () => {
+    const { created, link } = await activeThread();
+    const oldId = `${link.id}:refresh:older`;
+    const newId = `${link.id}:refresh:newer`;
+    const now = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO slack_thread_deliveries
+        (id,link_id,operation,source_id,actor_id,state,created_at,updated_at,attempted_at)
+        VALUES (?,?,'refresh','older','owner','sending',?,?,?)`).bind(oldId, link.id, now - 2, now - 2, now - 60_000),
+      env.DB.prepare(`INSERT INTO slack_thread_deliveries
+        (id,link_id,operation,source_id,actor_id,created_at,updated_at)
+        VALUES (?,?,'refresh','newer','owner',?,?)`).bind(newId, link.id, now - 1, now - 1),
+      env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,enqueued_at,created_at)
+        VALUES (?,'workspace','slack_thread_reply',?,1,1,?)`).bind(
+        `outbox:${newId}`,
+        JSON.stringify({ deliveryId: newId }),
+        now,
+      ),
+    ]);
+    await deliverSlackThread(runtime(), oldId);
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`).bind(oldId).first(),
+    ).toEqual({ state: "retired", failure_reason: "superseded" });
+    expect(await env.DB.prepare(`SELECT enqueued_at FROM outbox WHERE id=?`).bind(`outbox:${newId}`).first()).toEqual({
+      enqueued_at: null,
+    });
+    expect(calls.filter((call) => call.method === "chat.update")).toHaveLength(0);
+    await deliverSlackThread(runtime(), newId);
+    expect((await deliveries(created.id)).find((delivery) => delivery.id === newId)?.state).toBe("sent");
   });
   it("denies resolution for a viewer who did not create the thread and rejects a forged root", async () => {
     const { link } = await activeThread();
@@ -2644,6 +4075,23 @@ describe("Slack inbound replies and actions", () => {
     await deliverSlackChannelEvent(runtime(), second!.id);
     expect(posts).toHaveLength(1);
   });
+  it("blocks only a notification mapping on missing_scope", async () => {
+    await env.DB.prepare(`INSERT INTO slack_channel_events
+      (id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+      VALUES ('scope-event','space','workspace','page_edit','owner','page','immediate',?)`)
+      .bind(Date.now())
+      .run();
+    beforeResponse = async (method) => {
+      if (method === "chat.postMessage") throw new SlackApiError(method, "missing_scope", 403);
+    };
+    await deliverSlackChannelEvent(runtime(), "scope-event");
+    expect(
+      await env.DB.prepare(`SELECT notification_error FROM slack_channel_subscriptions WHERE id='space'`).first(),
+    ).toEqual({ notification_error: "missing_scope" });
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: null,
+    });
+  });
   it("keeps shared-channel one-way delivery separate from mirror validation and repairs blocked notifications", async () => {
     await mapping("shared", "CSHARED");
     await env.DB.prepare(`UPDATE slack_channel_subscriptions SET validation_state='invalid',
@@ -2687,6 +4135,10 @@ describe("Slack inbound replies and actions", () => {
       .bind(first!.id)
       .first<{ id: string }>();
     expect(next).not.toBeNull();
+    await repairSlackChannelNotifications(runtime(), owner, "shared");
+    expect(
+      await env.DB.prepare(`SELECT suppressed_at FROM slack_channel_events WHERE id=?`).bind(next!.id).first(),
+    ).toEqual({ suppressed_at: null });
     await deliverSlackChannelEvent(runtime(), next!.id);
     expect(posts.at(-1)?.channel).toBe("CSHARED");
   });
@@ -2708,9 +4160,22 @@ describe("Slack inbound replies and actions", () => {
     });
     expect((await deliveries(created.id))[0]?.state).toBe("pending");
     beforeResponse = undefined;
-    await env.DB.prepare(`UPDATE slack_installations SET auth_error=NULL WHERE id='installation'`).run();
+    await env.DB.prepare(
+      `UPDATE slack_installations SET auth_error=NULL,auth_error_at=NULL WHERE id='installation'`,
+    ).run();
     await deliverSlackThread(runtime(), root.id);
     expect((await deliveries(created.id))[0]?.state).toBe("sent");
+    expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(2);
+  });
+  it("leaves a root pending when token acquisition fails before the send fence", async () => {
+    await setSlackMirror(runtime(), owner, "space", true);
+    const created = await thread();
+    const root = (await deliveries(created.id))[0]!;
+    await env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=NULL
+      WHERE id='installation'`).run();
+    await expect(deliverSlackThread(runtime(), root.id)).rejects.toMatchObject({ code: "invalid_auth" });
+    expect((await deliveries(created.id))[0]?.state).toBe("pending");
+    expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(0);
   });
   it("refreshes a resolved root with a placeholder after its original author leaves", async () => {
     const { created, link } = await activeThread(viewer);
@@ -2725,6 +4190,12 @@ describe("Slack inbound replies and actions", () => {
     const { created, link } = await activeThread();
     await setThreadResolved(runtime(), owner, commentPage, created.id, true);
     const refresh = (await deliveries(created.id)).find((delivery) => delivery.operation === "refresh")!;
+    await addCommentReply(runtime(), owner, commentPage, created.id, body("Unconfirmed reply"));
+    const replyDelivery = (await deliveries(created.id)).find((delivery) => delivery.operation === "reply")!;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='blocked',failure_reason='reconciliation_inconclusive'
+      WHERE id=?`)
+      .bind(replyDelivery.id)
+      .run();
     beforeResponse = async (method) => {
       if (method === "chat.update") throw new SlackApiError(method, "message_not_found", 200);
     };
@@ -2733,6 +4204,22 @@ describe("Slack inbound replies and actions", () => {
       state: "retired",
     });
     expect((await deliveries(created.id)).find((delivery) => delivery.id === refresh.id)?.state).toBe("retired");
+    expect(
+      await env.DB.prepare(`SELECT state,failure_reason FROM slack_thread_deliveries WHERE id=?`)
+        .bind(replyDelivery.id)
+        .first(),
+    ).toEqual({ state: "retired", failure_reason: "root_message_not_found_unconfirmed" });
+    expect(
+      await env.DB.prepare(`SELECT reason FROM slack_delivery_failures WHERE delivery_id=?`)
+        .bind(replyDelivery.id)
+        .first(),
+    ).toEqual({ reason: "root_message_not_found_unconfirmed" });
+    expect(
+      await env.DB.prepare(`SELECT reason FROM slack_delivery_failures WHERE delivery_id=?`).bind(refresh.id).first(),
+    ).toEqual({ reason: "root_message_not_found" });
+    expect(
+      await env.DB.prepare(`SELECT failure_reason FROM slack_thread_deliveries WHERE id=?`).bind(refresh.id).first(),
+    ).toEqual({ failure_reason: "root_message_not_found" });
   });
   it("preserves one-way mappings when the owner edits their legacy notification settings", async () => {
     await upsertSlackChannelSubscription(runtime(), owner, {
@@ -2798,10 +4285,35 @@ describe("Slack delayed-work boundaries", () => {
     beforeResponse = async (method) => {
       if (method === "users.info" && calls.at(-1)?.payload.user === "UOWNER") await env.DB.prepare(mutation).run();
     };
-    await deliverSlackMutation(runtime(), await inboundId(), false);
-    expect(await env.DB.prepare(`SELECT outcome FROM slack_inbound_receipts`).first()).toEqual({ outcome: "denied" });
+    const error = await deliverSlackMutation(runtime(), await inboundId(), false).then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    expect((error as { code?: string } | null)?.code ?? null).toBe(
+      mutation.includes("scopes =") ? "slack_mirror_missing_scope" : null,
+    );
+    expect(await env.DB.prepare(`SELECT outcome FROM slack_inbound_receipts`).first()).toEqual({
+      outcome: mutation.includes("scopes =") ? null : "denied",
+    });
     expect(await env.DB.prepare(`SELECT 1 FROM comments WHERE slack_source_receipt_id IS NOT NULL`).first()).toBeNull();
     expect(await env.DB.prepare(`SELECT 1 FROM slack_mutation_commits`).first()).toBeNull();
+  });
+  it("does not recast an unrelated SQL authority failure as a stale installation error", async () => {
+    const { link } = await activeThread();
+    await acceptSlackReply(runtime(), reply(link.root_message_ts, { text: "Hello <@UOWNER>" }));
+    await env.DB.prepare(`UPDATE slack_installations SET auth_error='invalid_auth',auth_error_at=?
+      WHERE id='installation'`)
+      .bind(Date.now())
+      .run();
+    beforeResponse = async (method) => {
+      if (method === "users.info" && calls.at(-1)?.payload.user === "UOWNER")
+        await env.DB.prepare(`UPDATE pages SET archived_at=1 WHERE id='page'`).run();
+    };
+    await deliverSlackMutation(runtime(), await inboundId(), false);
+    expect(await env.DB.prepare(`SELECT outcome FROM slack_inbound_receipts`).first()).toEqual({ outcome: "denied" });
+    expect(await env.DB.prepare(`SELECT auth_error FROM slack_installations WHERE id='installation'`).first()).toEqual({
+      auth_error: "invalid_auth",
+    });
   });
   it("translates verified mentions both ways and preserves unknown mentions as plain text", async () => {
     const { created, link } = await activeThread();
@@ -2839,6 +4351,30 @@ describe("Slack delayed-work boundaries", () => {
     expect(posts.at(-1)!.text).toContain("@Viewer");
     expect(posts.at(-1)!.text).not.toContain("<@UVIEWER>");
   });
+  it.each(["no_permission", "restricted_action"])(
+    "keeps a mirror active when outbound mention lookup returns %s",
+    async (code) => {
+      const { created, link } = await activeThread();
+      await addCommentReply(runtime(), owner, commentPage, created.id, [
+        { type: "mention", props: { entityType: "user", entityId: "viewer", label: "Viewer" } },
+      ]);
+      beforeResponse = async (method) => {
+        if (method === "users.info" && calls.at(-1)?.payload.user === "UVIEWER")
+          throw new SlackApiError(method, code, 403);
+      };
+      const delivery = (await deliveries(created.id)).find((row) => row.operation === "reply")!;
+      await deliverSlackThread(runtime(), delivery.id);
+      expect(posts.at(-1)!.text).toContain("@Viewer");
+      expect(posts.at(-1)!.text).not.toContain("<@UVIEWER>");
+      expect((await deliveries(created.id)).find((row) => row.id === delivery.id)?.state).toBe("sent");
+      expect(
+        await env.DB.prepare(`SELECT mirror_enabled FROM slack_channel_subscriptions WHERE id='space'`).first(),
+      ).toEqual({ mirror_enabled: 1 });
+      expect(await env.DB.prepare(`SELECT state FROM slack_thread_links WHERE id=?`).bind(link.id).first()).toEqual({
+        state: "active",
+      });
+    },
+  );
   it("retires a moved page's old root and selects its new space mapping", async () => {
     const { created, link } = await activeThread();
     await env.DB.prepare(
@@ -2866,7 +4402,7 @@ describe("Slack delayed-work boundaries", () => {
     await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("Slack message result is incomplete");
     posts[0]!.user = "UOWNER";
     await deliverSlackThread(runtime(), root.id);
-    expect((await deliveries(created.id))[0]!.state).toBe("blocked");
+    expect((await deliveries(created.id))[0]!.state).toBe("sending");
     expect(posts).toHaveLength(1);
   });
   it("rechecks a queued resolution after the actor loses editor permission", async () => {

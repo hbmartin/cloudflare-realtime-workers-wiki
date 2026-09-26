@@ -6,6 +6,128 @@ import { createAuth } from "./auth";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("repairs a stale recovery claim after its pending key was pruned", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0046"),
+    );
+    await env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+      VALUES ('owner','Owner','owner@example.test',1,1)`).run();
+    await env.DB.prepare(`UPDATE account_security SET recovery_resume_key_hash='saved',
+      recovery_resume_claim_session_id='stranded' WHERE user_id='owner'`).run();
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_key_hash saved,recovery_resume_claim_session_id claim
+        FROM account_security WHERE user_id='owner'`).first(),
+    ).toEqual({ saved: "saved", claim: null });
+    expect(
+      await env.DB.prepare(`SELECT slack_scope_paused_at,slack_scope_paused_ms FROM outbox LIMIT 1`).all(),
+    ).toMatchObject({ success: true });
+  });
+  it("repairs legacy Slack scope pauses, stranded claims, and blocked redrive markers", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0045"),
+    );
+    const now = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+        VALUES ('owner','Owner','owner@example.test',1,1)`),
+      env.DB.prepare(`INSERT INTO workspaces(id,name,created_at) VALUES ('workspace','Notes',1)`),
+      env.DB.prepare(`INSERT INTO workspace_members(workspace_id,user_id,role,created_at)
+        VALUES ('workspace','owner','owner',1)`),
+      env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+        VALUES ('page','workspace','workspace-general','document','a0','Page','owner',1,1)`),
+      env.DB.prepare(`INSERT INTO comment_threads(id,workspace_id,space_id,page_id,created_by,created_at,updated_at)
+        VALUES ('thread','workspace','workspace-general','page','owner',1,1)`),
+      env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,
+        bot_token_ciphertext,scopes,installed_by,created_at,updated_at,auth_error,auth_error_at)
+        VALUES ('installation','workspace','T123','Slack','UBOT','cipher','chat:write','owner',1,1,'missing_scope',?)`).bind(
+        now - 1000,
+      ),
+      env.DB.prepare(`INSERT OR IGNORE INTO account_security(user_id) VALUES ('owner')`),
+      env.DB.prepare(`UPDATE account_security SET recovery_resume_key_hash='saved',
+        recovery_resume_claim_session_id='stranded',recovery_pending_key_hash='unsaved' WHERE user_id='owner'`),
+      env.DB.prepare(`INSERT INTO slack_thread_links(id,installation_id,workspace_id,page_id,thread_id,
+        channel_id,root_message_ts,state,created_at,updated_at)
+        VALUES ('link','installation','workspace','page','thread','C123','1700000000.000001','active',1,1)`),
+      env.DB.prepare(`INSERT INTO slack_thread_deliveries
+        (id,link_id,operation,source_id,actor_id,state,attempted_at,created_at,updated_at)
+        VALUES ('blocked','link','reply','blocked','owner','blocked',? ,1,1),
+          ('waiting','link','reply','waiting','owner','pending',NULL,2,2),
+          ('root-a','link','root','root-a','owner','pending',NULL,3,3),
+          ('root-b','link','root','root-b','owner','pending',NULL,4,4)`).bind(now - 25 * 60 * 60_000),
+      env.DB.prepare(`UPDATE slack_thread_deliveries SET failure_reason='reconciliation_inconclusive'
+        WHERE id='blocked'`),
+      env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,enqueued_at,created_at,
+        slack_redrive_due_at) VALUES
+        ('outbox:blocked','workspace','slack_thread_reply',json_object('deliveryId','blocked'),1,1,1,NULL),
+        ('outbox:waiting','workspace','slack_thread_reply',json_object('deliveryId','waiting'),1,1,1,1)`),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      await env.DB.prepare(`SELECT auth_error,auth_error_at,auth_paused_ms FROM slack_installations
+      WHERE id='installation'`).first(),
+    ).toMatchObject({ auth_error: null, auth_error_at: null, auth_paused_ms: expect.any(Number) });
+    expect(
+      await env.DB.prepare(`SELECT recovery_resume_claim_session_id claim FROM account_security
+      WHERE user_id='owner'`).first(),
+    ).toEqual({ claim: null });
+    expect(
+      await env.DB.prepare(`SELECT slack_redrive_due_at IS NOT NULL due FROM outbox
+      WHERE id='outbox:blocked'`).first(),
+    ).toEqual({ due: 1 });
+    expect(
+      await env.DB.prepare(`SELECT slack_redrive_due_at>? deferred FROM outbox
+      WHERE id='outbox:waiting'`)
+        .bind(Date.now())
+        .first(),
+    ).toEqual({ deferred: 1 });
+    expect(
+      (
+        await env.DB.prepare(`SELECT id FROM slack_thread_delivery_runnable
+      WHERE id IN ('root-a','root-b') ORDER BY id`).all()
+      ).results,
+    ).toEqual([{ id: "root-a" }, { id: "root-b" }]);
+  });
+  it("repairs mention introduction epochs from matching projections after a restore", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0042"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+        VALUES ('owner','Owner','owner@example.test',1,1),('target','Target','target@example.test',1,1)`),
+      env.DB.prepare(`INSERT INTO workspaces(id,name,created_at) VALUES ('workspace','Notes',1)`),
+      env.DB
+        .prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,content_epoch)
+        VALUES ('document','workspace','workspace-general','document','a0','Document','owner',1,1,2),
+          ('diagram','workspace','workspace-general','diagram','a1','Diagram','owner',1,1,2),
+          ('unknown','workspace','workspace-general','document','a2','Unknown','owner',1,1,2)`),
+      env.DB.prepare(`INSERT INTO document_projections
+        (page_id,content_epoch,sequence,schema_version,r2_key,content_hash,byte_size,updated_at)
+        VALUES ('document',1,7,1,'r2-document','hash',1,1)`),
+      env.DB.prepare(`INSERT INTO diagram_projections
+        (page_id,content_epoch,sequence,schema_version,r2_key,content_hash,byte_size,
+         thumbnail_r2_key,thumbnail_hash,thumbnail_byte_size,updated_at)
+        VALUES ('diagram',1,9,1,'r2-diagram','hash',1,'thumbnail','hash',1,1)`),
+      env.DB.prepare(`INSERT INTO member_mentions
+        (workspace_id,source_page_id,target_user_id,first_seen_at,projection_seq,introduction_epoch,introduction_seq)
+        VALUES ('workspace','document','target',1,7,2,7),('workspace','diagram','target',1,9,2,9),
+          ('workspace','unknown','target',1,11,2,11)`),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      (
+        await env.DB.prepare(`SELECT source_page_id,introduction_epoch,introduction_seq
+      FROM member_mentions ORDER BY source_page_id`).all()
+      ).results,
+    ).toEqual([
+      { source_page_id: "diagram", introduction_epoch: 1, introduction_seq: 9 },
+      { source_page_id: "document", introduction_epoch: 1, introduction_seq: 7 },
+      { source_page_id: "unknown", introduction_epoch: null, introduction_seq: null },
+    ]);
+  });
   it("repairs only unedited imported Slack comments and indexes pending redrive", async () => {
     await applyD1Migrations(
       env.DB,

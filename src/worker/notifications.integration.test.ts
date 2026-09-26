@@ -6,8 +6,14 @@ import { DIAGRAM_NODES_ROOT } from "../shared/diagram";
 import { PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import type { CommentThread, Notification, NotificationPreference, Page } from "../shared/types";
 import type { Env } from "./env";
-import { deliverNotification, digestCandidates, sendDueNotificationDigests } from "./notifications";
+import {
+  deliverNotification,
+  digestCandidates,
+  notificationFanoutStatements,
+  sendDueNotificationDigests,
+} from "./notifications";
 import { encryptSlackToken } from "./slack";
+import { webhookEventStatements } from "./webhooks";
 
 const SLACK_SECRETS = {
   SLACK_CLIENT_ID: "123.456",
@@ -113,6 +119,77 @@ afterEach(async () => {
 });
 
 describe("notification feed and subscriptions", () => {
+  it.each(["document", "diagram"] as const)("does not fan out stale %s page effects", async (kind) => {
+    const installed = await bootstrap();
+    const viewer = await invite(installed.cookie, `epoch-${kind}`);
+    const pageId = kind === "document" ? installed.page.id : `stale-${kind}`;
+    if (kind === "diagram")
+      await env.DB.prepare(`INSERT INTO pages
+        (id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,content_epoch)
+        VALUES (?,?,?,'diagram','z2','Diagram',?,1,1,2)`)
+        .bind(pageId, installed.workspaceId, installed.page.spaceId, installed.userId)
+        .run();
+    else await env.DB.prepare(`UPDATE pages SET content_epoch=2 WHERE id=?`).bind(pageId).run();
+    const now = Date.now();
+    await env.DB.batch([
+      ...notificationFanoutStatements(env.DB, {
+        workspaceId: installed.workspaceId,
+        spaceId: installed.page.spaceId,
+        pageId,
+        contentEpoch: 1,
+        threadId: null,
+        actorId: installed.userId,
+        eventType: "page_edit",
+        sourceId: `stale:${kind}`,
+        recipientIds: [viewer.userId],
+        emitSlackChannel: false,
+        createdAt: now,
+      }),
+      ...webhookEventStatements(env.DB, {
+        workspaceId: installed.workspaceId,
+        type: "page.content_updated",
+        entityType: "page",
+        entityId: pageId,
+        pageId,
+        contentEpoch: 1,
+        actorId: installed.userId,
+        sourceKey: `stale:${kind}`,
+        createdAt: now,
+      }),
+    ]);
+    expect(
+      await env.DB.prepare(`SELECT 1 FROM notifications WHERE dedupe_key LIKE ?`)
+        .bind(`page_edit:stale:${kind}:%`)
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare(`SELECT 1 FROM webhook_events WHERE source_key=?`).bind(`stale:${kind}`).first(),
+    ).toBeNull();
+    await env.DB.batch(
+      webhookEventStatements(env.DB, {
+        workspaceId: installed.workspaceId,
+        type: "page.content_updated",
+        entityType: "page",
+        entityId: pageId,
+        pageId,
+        contentEpoch: 2,
+        actorId: installed.userId,
+        sourceKey: `current:${kind}`,
+        createdAt: now,
+      }),
+    );
+    const current = await env.DB.prepare(`SELECT id FROM webhook_events WHERE source_key=?`)
+      .bind(`current:${kind}`)
+      .first<{ id: string }>();
+    expect(current).not.toBeNull();
+    expect(
+      await env.DB.prepare(
+        `SELECT 1 FROM outbox WHERE topic='webhook_event' AND json_extract(payload_json,'$.eventId')=?`,
+      )
+        .bind(current!.id)
+        .first(),
+    ).not.toBeNull();
+  });
   it("fans out comment events with mention precedence and supports inbox actions", async () => {
     const installed = await bootstrap();
     const viewer = await invite(installed.cookie, "comments");
@@ -347,6 +424,10 @@ describe("notification feed and subscriptions", () => {
         headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
       }),
     );
+    await env.DB.prepare(`UPDATE member_mentions SET introduction_epoch=NULL,introduction_seq=NULL
+      WHERE source_page_id=? AND target_user_id=?`)
+      .bind(installed.page.id, target.userId)
+      .run();
     await add(second.userId, "atomic");
     await stub.fetch(
       new Request("https://document.internal/content", {
@@ -427,6 +508,30 @@ describe("notification feed and subscriptions", () => {
         { target_user_id: installed.userId, first_seen_actor_id: second.userId },
       ].sort((a, b) => (a.target_user_id < b.target_user_id ? -1 : 1)),
     );
+    await env.DB.prepare(`UPDATE member_mentions SET introduction_epoch=NULL,introduction_seq=NULL
+      WHERE source_page_id='diagram-actors' AND target_user_id=?`)
+      .bind(first.userId)
+      .run();
+    await runInDurableObject(stub, async (instance) => {
+      const nodes = (instance as unknown as { document: Y.Doc }).document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT);
+      nodes.delete("node-one");
+      const replacement = new Y.Map<unknown>();
+      const mentions = new Y.Map<string>();
+      mentions.set(first.userId, "Mentioned collaborator");
+      replacement.set("mentions", mentions);
+      (instance as unknown as { document: Y.Doc }).document.transact(() => nodes.set("node-three", replacement), {
+        state: { userId: second.userId },
+      });
+    });
+    await stub.fetch(
+      new Request("https://document.internal/content", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+    );
+    expect(
+      await env.DB.prepare(`SELECT first_seen_actor_id,introduction_epoch FROM member_mentions
+      WHERE source_page_id='diagram-actors' AND target_user_id=?`)
+        .bind(first.userId)
+        .first(),
+    ).toEqual({ first_seen_actor_id: second.userId, introduction_epoch: 1 });
   });
 
   it.each(["document", "diagram"] as const)(
@@ -450,6 +555,11 @@ describe("notification feed and subscriptions", () => {
           }),
         );
       await content();
+      await runInDurableObject(stub, async (instance) => {
+        const room = instance as unknown as { onStart: () => Promise<void> };
+        await room.onStart();
+        await room.onStart();
+      });
       const add = async (targetId: string, actorId: string, key: string) =>
         runInDurableObject(stub, async (instance) => {
           const document = (instance as unknown as { document: Y.Doc }).document;

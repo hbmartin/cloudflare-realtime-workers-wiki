@@ -25,6 +25,25 @@ export function slackThreadFanoutStatements(
           AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0)`)
       .bind(createdAt, threadId),
     db
+      .prepare(`INSERT OR IGNORE INTO slack_delivery_failures
+      (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
+      SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
+        COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'mapping_retired_unconfirmed',?
+      FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
+      LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
+      WHERE link.thread_id=? AND link.state='retired' AND link.updated_at=?
+        AND (delivery.state='sending' OR
+          (delivery.state='blocked' AND delivery.failure_reason LIKE 'reconciliation_%'))`)
+      .bind(createdAt, threadId, createdAt),
+    db
+      .prepare(`UPDATE slack_thread_deliveries SET state='retired',updated_at=?,
+      failure_reason=CASE WHEN state IN ('sending','blocked') THEN 'mapping_retired_unconfirmed' ELSE 'mapping_retired' END
+      WHERE link_id IN (SELECT id FROM slack_thread_links
+        WHERE thread_id=? AND state='retired' AND updated_at=?)
+        AND (state IN ('pending','sending') OR
+          (state='blocked' AND failure_reason LIKE 'reconciliation_%'))`)
+      .bind(createdAt, threadId, createdAt),
+    db
       .prepare(`INSERT OR IGNORE INTO slack_thread_links
       (id, installation_id, installation_generation, subscription_id, workspace_id, page_id, thread_id, channel_id, created_at, updated_at)
       SELECT ?, i.id, i.generation, s.id, i.workspace_id, p.id, ?, s.channel_id, ?, ?
@@ -58,7 +77,9 @@ export function slackThreadFanoutStatements(
     db
       .prepare(`INSERT OR IGNORE INTO slack_thread_deliveries
       (id, link_id, operation, source_id, actor_id, comment_id, created_at, updated_at)
-      SELECT l.id || ':' || ? || ':' || ?, l.id, ?, ?, ?, ?, ?, ? FROM slack_thread_links l
+      SELECT l.id || ':' || ? || ':' || ?, l.id, ?, ?, ?, ?,
+        MAX(?, COALESCE((SELECT MAX(prior.created_at)+1 FROM slack_thread_deliveries prior
+          WHERE prior.link_id=l.id AND prior.operation=?), ?)), ? FROM slack_thread_links l
       WHERE l.thread_id = ? AND l.state IN ('pending', 'active')
         AND (? = 1 OR NOT EXISTS (SELECT 1 FROM slack_thread_deliveries root WHERE root.link_id = l.id AND root.operation = 'root' AND root.comment_id = ?))
         AND NOT EXISTS (SELECT 1 FROM comments WHERE id = ? AND slack_source_receipt_id IS NOT NULL)`)
@@ -69,6 +90,8 @@ export function slackThreadFanoutStatements(
         sourceId,
         actorId,
         event.commentId ?? null,
+        createdAt,
+        event.refresh ? "refresh" : "reply",
         createdAt,
         createdAt,
         threadId,

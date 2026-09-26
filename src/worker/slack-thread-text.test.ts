@@ -43,6 +43,19 @@ describe("Slack thread text", () => {
     ).rejects.toThrow("Reply has too many mentions");
     await expect(slackReplyBody("*bold* ".repeat(350), async () => null)).rejects.toThrow("Reply is too complex");
   });
+  it("accepts 200 plain lines while bounding inline complexity", async () => {
+    const imported = await slackReplyBody(
+      Array.from({ length: 200 }, () => "snake_case_name").join("\n"),
+      async () => null,
+    );
+    expect(imported).toHaveLength(200);
+    await expect(
+      slackReplyBody(Array.from({ length: 201 }, () => "line").join("\n"), async () => null),
+    ).rejects.toThrow("Reply has too many lines");
+    await expect(
+      slackReplyBody(Array.from({ length: 151 }, () => "*bold* plain").join("\n"), async () => null),
+    ).rejects.toThrow("Reply is too complex");
+  });
   it("escapes outbound text and permits only verified Slack identity tokens", async () => {
     const body = [
       {

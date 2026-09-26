@@ -186,7 +186,15 @@ export function searchModal(
             },
           }))
         : [{ type: "section", text: { type: "plain_text", text: "No accessible pages matched." } }]
-      : [{ type: "section", text: { type: "plain_text", text: "Searching…" } }];
+      : [
+          {
+            type: "section",
+            text: {
+              type: "plain_text",
+              text: "Searching… If results do not load, close this modal and reopen /notes.",
+            },
+          },
+        ];
   const nav =
     result && (filters.offset > 0 || result.hasMore)
       ? [

@@ -4,6 +4,21 @@ import { DIAGRAM_NODES_ROOT } from "../shared/diagram";
 import { MentionTargetTracker } from "./mention-targets";
 
 describe("incremental mention targets", () => {
+  it("ignores mention elements embedded in text outside the XML child tree", () => {
+    const document = new Y.Doc();
+    const root = document.getXmlFragment("document-store");
+    const text = new Y.XmlText();
+    root.insert(0, [text]);
+    const tracker = new MentionTargetTracker(document, "document");
+    root.observeDeep((events, transaction) => tracker.update(transaction, events));
+    const embedded = new Y.XmlElement("mention");
+    embedded.setAttribute("entityType", "user");
+    embedded.setAttribute("entityId", "phantom");
+    embedded.setAttribute("label", "Phantom");
+    text.insertEmbed(0, embedded);
+    embedded.setAttribute("label", "Changed");
+    expect([...tracker.targets]).toEqual([]);
+  });
   it("tracks duplicates, atomic replacement, and separate removal and reinsertion", () => {
     const document = new Y.Doc();
     const root = document.getXmlFragment("document-store");

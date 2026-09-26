@@ -122,8 +122,8 @@ function mentionProjection(
     return {
       ...mention,
       actorId: fresh ? (introduction?.actorId ?? null) : null,
-      introductionEpoch: fresh ? epoch : (previous?.introduction_epoch ?? epoch),
-      introductionSeq: fresh ? (introduction?.sequence ?? maximum) : (previous?.introduction_seq ?? maximum),
+      introductionEpoch: fresh ? epoch : (previous?.introduction_epoch ?? null),
+      introductionSeq: fresh ? (introduction?.sequence ?? maximum) : (previous?.introduction_seq ?? null),
     };
   });
   const groups = new Map<string | null, { recipientIds: string[]; latestSequence: number }>();
@@ -441,6 +441,16 @@ export class Document extends YServer {
   private pendingAuthorId: string | null = null;
   private pendingMentionActors = new Map<string, string | null>();
   private mentionTracker: MentionTargetTracker | null = null;
+  private observedMentionRoot: Y.XmlFragment | Y.Map<Y.Map<unknown>> | null = null;
+  private observedMentionDocument: Y.Doc | null = null;
+  private readonly mentionObserver = (events: Y.YEvent<any>[], transaction: Y.Transaction) =>
+    this.captureMentionTargets(events, transaction);
+  private readonly updateObserver = (
+    update: Uint8Array,
+    origin: unknown,
+    _document: Y.Doc,
+    transaction: Y.Transaction,
+  ) => this.bufferUpdate(update, origin, transaction);
   private currentMentionTargets = new Set<string>();
   private pendingNotifyEdit = false;
   private purged = false;
@@ -472,6 +482,10 @@ export class Document extends YServer {
   }
 
   async onStart() {
+    this.observedMentionRoot?.unobserveDeep(this.mentionObserver);
+    this.observedMentionDocument?.off("update", this.updateObserver);
+    this.observedMentionRoot = null;
+    this.observedMentionDocument = null;
     const sql = this.state.storage.sql;
     sql.exec(`CREATE TABLE IF NOT EXISTS document_meta (
       id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -566,10 +580,10 @@ export class Document extends YServer {
       this.metadata.content_kind === "diagram"
         ? this.document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT)
         : this.document.getXmlFragment("document-store");
-    mentionRoot.observeDeep((events, transaction) => this.captureMentionTargets(events, transaction));
-    this.document.on("update", (update: Uint8Array, origin: unknown, _document: Y.Doc, transaction: Y.Transaction) => {
-      this.bufferUpdate(update, origin, transaction);
-    });
+    mentionRoot.observeDeep(this.mentionObserver);
+    this.document.on("update", this.updateObserver);
+    this.observedMentionRoot = mentionRoot;
+    this.observedMentionDocument = this.document;
     // A restored epoch starts with an R2 snapshot but no local update log. Seed
     // one idempotent Yjs update so the new room regenerates search projections,
     // references, thumbnails, and the epoch-scoped current projection.
@@ -1414,14 +1428,18 @@ export class Document extends YServer {
                WHERE EXISTS (SELECT 1 FROM pages source WHERE source.id = ? AND source.content_epoch = ?)
               ON CONFLICT(source_page_id, target_user_id) DO UPDATE SET
                 excerpt = excluded.excerpt, projection_seq = excluded.projection_seq,
-                first_seen_actor_id = CASE WHEN excluded.introduction_epoch <> member_mentions.introduction_epoch
-                  OR excluded.introduction_seq > member_mentions.introduction_seq
+                first_seen_actor_id = CASE WHEN excluded.introduction_epoch IS NOT member_mentions.introduction_epoch
+                  OR COALESCE(excluded.introduction_seq,-1) > COALESCE(member_mentions.introduction_seq,-1)
                   THEN excluded.first_seen_actor_id ELSE member_mentions.first_seen_actor_id END,
-                first_seen_at = CASE WHEN excluded.introduction_epoch <> member_mentions.introduction_epoch
-                  OR excluded.introduction_seq > member_mentions.introduction_seq
+                first_seen_at = CASE WHEN excluded.introduction_epoch IS NOT member_mentions.introduction_epoch
+                  OR COALESCE(excluded.introduction_seq,-1) > COALESCE(member_mentions.introduction_seq,-1)
                   THEN excluded.first_seen_at ELSE member_mentions.first_seen_at END,
-                introduction_epoch = excluded.introduction_epoch,
-                introduction_seq = excluded.introduction_seq`,
+                introduction_epoch = CASE WHEN excluded.introduction_epoch IS NOT member_mentions.introduction_epoch
+                  OR COALESCE(excluded.introduction_seq,-1) > COALESCE(member_mentions.introduction_seq,-1)
+                  THEN excluded.introduction_epoch ELSE member_mentions.introduction_epoch END,
+                introduction_seq = CASE WHEN excluded.introduction_epoch IS NOT member_mentions.introduction_epoch
+                  OR COALESCE(excluded.introduction_seq,-1) > COALESCE(member_mentions.introduction_seq,-1)
+                  THEN excluded.introduction_seq ELSE member_mentions.introduction_seq END`,
           ).bind(
             page.workspace_id,
             pageId,
@@ -1520,6 +1538,7 @@ export class Document extends YServer {
                 entityType: "page",
                 entityId: pageId,
                 pageId,
+                contentEpoch: epoch,
                 actorId: metadataAtStart.last_editor_id,
                 sourceKey: `page.content_updated:${pageId}:${epoch}:${maximum}`,
                 data: { sequence: maximum },
@@ -1549,6 +1568,7 @@ export class Document extends YServer {
                 workspaceId: page.workspace_id,
                 spaceId: page.space_id,
                 pageId,
+                contentEpoch: epoch,
                 threadId: null,
                 actorId: metadataAtStart.last_editor_id ?? "",
                 eventType: "page_edit",
@@ -1934,14 +1954,18 @@ export class Document extends YServer {
                WHERE EXISTS (SELECT 1 FROM pages source WHERE source.id = ? AND source.content_epoch = ?)
               ON CONFLICT(source_page_id, target_user_id) DO UPDATE SET
                 excerpt = excluded.excerpt, projection_seq = excluded.projection_seq,
-                first_seen_actor_id = CASE WHEN excluded.introduction_epoch <> member_mentions.introduction_epoch
-                  OR excluded.introduction_seq > member_mentions.introduction_seq
+                first_seen_actor_id = CASE WHEN excluded.introduction_epoch IS NOT member_mentions.introduction_epoch
+                  OR COALESCE(excluded.introduction_seq,-1) > COALESCE(member_mentions.introduction_seq,-1)
                   THEN excluded.first_seen_actor_id ELSE member_mentions.first_seen_actor_id END,
-                first_seen_at = CASE WHEN excluded.introduction_epoch <> member_mentions.introduction_epoch
-                  OR excluded.introduction_seq > member_mentions.introduction_seq
+                first_seen_at = CASE WHEN excluded.introduction_epoch IS NOT member_mentions.introduction_epoch
+                  OR COALESCE(excluded.introduction_seq,-1) > COALESCE(member_mentions.introduction_seq,-1)
                   THEN excluded.first_seen_at ELSE member_mentions.first_seen_at END,
-                introduction_epoch = excluded.introduction_epoch,
-                introduction_seq = excluded.introduction_seq`,
+                introduction_epoch = CASE WHEN excluded.introduction_epoch IS NOT member_mentions.introduction_epoch
+                  OR COALESCE(excluded.introduction_seq,-1) > COALESCE(member_mentions.introduction_seq,-1)
+                  THEN excluded.introduction_epoch ELSE member_mentions.introduction_epoch END,
+                introduction_seq = CASE WHEN excluded.introduction_epoch IS NOT member_mentions.introduction_epoch
+                  OR COALESCE(excluded.introduction_seq,-1) > COALESCE(member_mentions.introduction_seq,-1)
+                  THEN excluded.introduction_seq ELSE member_mentions.introduction_seq END`,
           ).bind(
             page.workspace_id,
             pageId,
@@ -1974,6 +1998,7 @@ export class Document extends YServer {
             entityType: "page",
             entityId: pageId,
             pageId,
+            contentEpoch: epoch,
             actorId: metadataAtStart.last_editor_id,
             sourceKey: `page.content_updated:${pageId}:${epoch}:${maximum}`,
             data: { sequence: maximum },
@@ -2001,6 +2026,7 @@ export class Document extends YServer {
             workspaceId: page.workspace_id,
             spaceId: page.space_id,
             pageId,
+            contentEpoch: epoch,
             threadId: null,
             actorId: metadataAtStart.last_editor_id ?? "",
             eventType: "page_edit",

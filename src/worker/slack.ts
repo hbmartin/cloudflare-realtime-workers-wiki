@@ -6,6 +6,16 @@ import { HttpError } from "./http";
 import { safeSlackText, unfurlBlocks } from "./slack-blocks";
 import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
 
+export const SLACK_REDRIVE_STALE_MS = 30 * 60_000;
+export const SLACK_MIRROR_SCOPES = [
+  "chat:write",
+  "channels:read",
+  "groups:read",
+  "channels:history",
+  "groups:history",
+  "users:read",
+] as const;
+
 const OAUTH_STATE_TTL_MS = 10 * 60_000;
 const LINK_TOKEN_TTL_MS = 10 * 60_000;
 const REQUEST_WINDOW_SECONDS = 5 * 60;
@@ -36,6 +46,7 @@ const SLACK_CAPABILITY_SCOPES: Record<SlackCapability, readonly string[]> = {
 
 export type SlackInstallation = {
   generation: number;
+  credential_revision: number;
   id: string;
   workspace_id: string;
   team_id: string;
@@ -108,13 +119,14 @@ export class SlackApiError extends Error {
     readonly method: string,
     readonly code: string,
     readonly status: number,
+    readonly credentialRevision = 0,
   ) {
     super(`Slack ${method} failed.`);
     this.name = "SlackApiError";
   }
 }
 
-const INSTALLATION_ERRORS = new Set(["invalid_auth", "token_revoked", "account_inactive", "missing_scope"]);
+const INSTALLATION_ERRORS = new Set(["invalid_auth", "token_revoked", "account_inactive", "invalid_refresh_token"]);
 const CHANNEL_ERRORS = new Set([
   "channel_not_found",
   "not_in_channel",
@@ -124,15 +136,23 @@ const CHANNEL_ERRORS = new Set([
 ]);
 export const slackInstallationError = (error: unknown): boolean =>
   error instanceof SlackApiError && INSTALLATION_ERRORS.has(error.code);
+export const slackMissingScope = (error: unknown): error is SlackApiError =>
+  error instanceof SlackApiError && error.code === "missing_scope";
+export const slackHasScopes = (scopes: string, required: readonly string[]): boolean => {
+  const granted = new Set(scopes.split(",").map((scope) => scope.trim()));
+  return required.every((scope) => granted.has(scope));
+};
 export const slackChannelError = (error: unknown): boolean =>
   error instanceof SlackApiError && CHANNEL_ERRORS.has(error.code);
 
 export async function recordSlackInstallationError(env: Env, installationId: string, error: SlackApiError) {
-  await env.DB.prepare(
-    `UPDATE slack_installations SET auth_error=?, auth_error_at=? WHERE id=? AND disconnected_at IS NULL`,
+  const result = await env.DB.prepare(
+    `UPDATE slack_installations SET auth_error=?, auth_error_at=COALESCE(auth_error_at,?)
+      WHERE id=? AND disconnected_at IS NULL AND credential_revision=?`,
   )
-    .bind(error.code, Date.now(), installationId)
+    .bind(error.code, Date.now(), installationId, error.credentialRevision)
     .run();
+  return result.meta.changes > 0;
 }
 
 export type SlackUser = {
@@ -445,6 +465,10 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
          token_expires_at = excluded.token_expires_at,
          scopes = excluded.scopes, installed_by = excluded.installed_by, disconnected_at = NULL,
          auth_error = NULL, auth_error_at = NULL,
+         credential_revision = slack_installations.credential_revision + 1,
+         auth_paused_ms = slack_installations.auth_paused_ms +
+           CASE WHEN slack_installations.auth_error_at IS NULL THEN 0
+             ELSE MAX(0, excluded.updated_at - slack_installations.auth_error_at) END,
          updated_at = excluded.updated_at`,
     )
       .bind(
@@ -463,6 +487,32 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
       )
       .run();
     stored = true;
+    await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',failure_reason=NULL,updated_at=?
+      WHERE state='blocked' AND failure_reason LIKE 'reconciliation_%'
+        AND link_id IN (SELECT link.id FROM slack_thread_links link
+          JOIN slack_installations installation ON installation.id=link.installation_id
+          JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
+          WHERE installation.workspace_id=? AND installation.disconnected_at IS NULL
+            AND link.state IN ('pending','active') AND mapping.mirror_enabled=1)`)
+      .bind(timestamp, member.workspace.id)
+      .run();
+    await env.DB.prepare(`UPDATE outbox SET
+      slack_scope_paused_ms=slack_scope_paused_ms+MAX(0,?-slack_scope_paused_at),
+      slack_scope_paused_at=NULL,slack_redrive_count=0,
+      enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
+      WHERE workspace_id=? AND slack_scope_paused_at IS NOT NULL`)
+      .bind(timestamp, timestamp, member.workspace.id)
+      .run();
+    await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
+      WHERE workspace_id=? AND
+        ((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl')
+          AND (slack_redrive_due_at IS NOT NULL OR id IN
+            (SELECT 'outbox:' || d.id FROM slack_thread_deliveries d WHERE d.state='sending')))
+        OR (topic='slack_channel' AND EXISTS (SELECT 1 FROM slack_channel_events event
+          WHERE event.id=json_extract(outbox.payload_json,'$.eventId')
+            AND event.delivered_at IS NULL AND event.suppressed_at IS NULL)))`)
+      .bind(timestamp, member.workspace.id)
+      .run();
   } finally {
     if (!stored) await revokeRejectedOAuthTokens(result.team.id, result.access_token, result.refresh_token);
   }
@@ -502,6 +552,22 @@ export async function disconnectSlack(env: Env, member: MemberContext) {
     .bind(member.workspace.id)
     .first<SlackInstallation>();
   await env.DB.batch([
+    env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
+      (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
+      SELECT delivery.id,link.workspace_id,COALESCE(link.subscription_id,'orphan:' || link.id),
+        COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),'disconnect_unconfirmed',?
+      FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
+      LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
+      WHERE link.workspace_id=? AND (delivery.state='sending' OR
+        (delivery.state='blocked' AND delivery.failure_reason LIKE 'reconciliation_%'))`).bind(
+      Date.now(),
+      member.workspace.id,
+    ),
+    env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',updated_at=?,
+      failure_reason=CASE WHEN state IN ('sending','blocked') THEN 'disconnect_unconfirmed' ELSE 'disconnected' END
+      WHERE link_id IN (SELECT id FROM slack_thread_links WHERE workspace_id=?)
+        AND (state IN ('pending','sending') OR
+          (state='blocked' AND failure_reason LIKE 'reconciliation_%'))`).bind(Date.now(), member.workspace.id),
     env.DB.prepare(
       `UPDATE slack_installations SET generation = generation + 1, disconnected_at = ?, updated_at = ? WHERE workspace_id = ? AND disconnected_at IS NULL`,
     ).bind(Date.now(), Date.now(), member.workspace.id),
@@ -546,7 +612,9 @@ export async function disconnectSlack(env: Env, member: MemberContext) {
 
 export async function slackWorkspaceStatus(env: Env, member: MemberContext) {
   const installation = await env.DB.prepare(
-    `SELECT id, team_id, team_name, bot_user_id, scopes, disconnected_at, created_at, updated_at, auth_error, auth_error_at
+    `SELECT id, team_id, team_name, bot_user_id, scopes, disconnected_at, created_at, updated_at, auth_error, auth_error_at,
+      EXISTS(SELECT 1 FROM outbox work WHERE work.workspace_id=slack_installations.workspace_id
+        AND work.slack_scope_paused_at IS NOT NULL) scope_work_paused
        FROM slack_installations WHERE workspace_id = ?`,
   )
     .bind(member.workspace.id)
@@ -561,6 +629,7 @@ export async function slackWorkspaceStatus(env: Env, member: MemberContext) {
       updated_at: number;
       auth_error: string | null;
       auth_error_at: number | null;
+      scope_work_paused: number;
     }>();
   const link = installation
     ? await env.DB.prepare(
@@ -607,7 +676,10 @@ export async function slackWorkspaceStatus(env: Env, member: MemberContext) {
       verifiedAt: link?.verified_at ?? null,
     },
     reauthorization: {
-      required: Boolean(connected && (scopeHealth?.reauthorizationRequired || installation?.auth_error)),
+      required: Boolean(
+        connected &&
+        (scopeHealth?.reauthorizationRequired || installation?.auth_error || installation?.scope_work_paused),
+      ),
       available: configured(env),
     },
   } satisfies SlackStatus;
@@ -620,9 +692,21 @@ export async function listSlackChannelSubscriptions(env: Env, member: MemberCont
             subscription.channel_type, subscription.validation_state, subscription.validated_at,
             subscription.validation_error, subscription.bot_is_member, subscription.mirror_enabled,
             subscription.muted_at, subscription.snoozed_until,
-            subscription.notification_blocked_at, subscription.notification_error,
-            (SELECT COUNT(*) FROM slack_thread_deliveries d JOIN slack_thread_links l ON l.id = d.link_id WHERE l.subscription_id = subscription.id AND d.state = 'blocked') blocked_deliveries,
-            (SELECT COUNT(*) FROM slack_thread_deliveries d JOIN slack_thread_links l ON l.id = d.link_id WHERE l.subscription_id = subscription.id AND d.state = 'retired' AND d.failure_reason IS NOT NULL) failed_deliveries,
+            subscription.notification_blocked_at, subscription.notification_error, subscription.controls_error,
+            (SELECT COUNT(*) FROM slack_thread_deliveries d JOIN slack_thread_links l ON l.id=d.link_id
+              WHERE l.subscription_id=subscription.id AND l.state IN ('pending','active')
+                AND (d.state='blocked' OR (d.state='sending' AND
+                  d.attempted_at<=unixepoch('subsec')*1000-60000))) blocked_deliveries,
+            (SELECT COUNT(*) FROM slack_thread_deliveries d JOIN slack_thread_links l ON l.id=d.link_id
+              WHERE l.subscription_id=subscription.id AND l.state IN ('pending','active') AND d.state='pending'
+                AND EXISTS (SELECT 1 FROM slack_thread_deliveries prior
+                  WHERE prior.link_id=d.link_id AND prior.id<>d.id
+                    AND prior.state IN ('pending','sending','blocked') AND
+                    (prior.operation='root' OR (d.operation='reply' AND prior.operation='reply' AND
+                      (prior.created_at<d.created_at OR
+                        (prior.created_at=d.created_at AND prior.id<d.id)))))) waiting_deliveries,
+            (SELECT COUNT(*) FROM slack_delivery_failures failure WHERE failure.subscription_id=subscription.id
+              AND failure.workspace_id=installation.workspace_id AND failure.acknowledged_at IS NULL) failed_deliveries,
             subscription.created_at, subscription.updated_at
        FROM slack_channel_subscriptions subscription
        JOIN slack_installations installation ON installation.id = subscription.installation_id
@@ -645,11 +729,13 @@ export async function listSlackChannelSubscriptions(env: Env, member: MemberCont
       bot_is_member: number | null;
       mirror_enabled: number;
       blocked_deliveries: number;
+      waiting_deliveries: number;
       failed_deliveries: number;
       muted_at: number | null;
       snoozed_until: number | null;
       notification_blocked_at: number | null;
       notification_error: string | null;
+      controls_error: string | null;
       created_at: number;
       updated_at: number;
     }>();
@@ -668,14 +754,42 @@ export async function listSlackChannelSubscriptions(env: Env, member: MemberCont
     botIsMember: row.bot_is_member === null ? null : Boolean(row.bot_is_member),
     mirrorEnabled: Boolean(row.mirror_enabled),
     blockedDeliveries: row.blocked_deliveries,
+    waitingDeliveries: row.waiting_deliveries,
     failedDeliveries: row.failed_deliveries,
     mutedAt: row.muted_at,
     snoozedUntil: row.snoozed_until,
     notificationBlockedAt: row.notification_blocked_at,
     notificationError: row.notification_error,
+    controlsError: row.controls_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }));
+}
+
+export async function listSlackDeliveryFailureGroups(env: Env, member: MemberContext) {
+  if (member.role !== "owner")
+    throw new HttpError(403, "owner_required", "Only an owner can view Slack delivery health.");
+  const rows = await env.DB.prepare(`SELECT failure.subscription_id id,
+    MAX(failure.channel_name) channel_name,COUNT(*) failures
+    FROM slack_delivery_failures failure
+    LEFT JOIN slack_channel_subscriptions mapping ON mapping.id=failure.subscription_id
+    LEFT JOIN slack_installations installation ON installation.id=mapping.installation_id
+    WHERE failure.workspace_id=? AND failure.acknowledged_at IS NULL
+      AND (mapping.id IS NULL OR installation.disconnected_at IS NOT NULL)
+    GROUP BY failure.subscription_id ORDER BY channel_name,id`)
+    .bind(member.workspace.id)
+    .all<{ id: string; channel_name: string; failures: number }>();
+  return rows.results.map((row) => ({ id: row.id, channelName: row.channel_name, failedDeliveries: row.failures }));
+}
+
+export async function acknowledgeSlackDeliveryFailures(env: Env, member: MemberContext, mappingId: string) {
+  if (member.role !== "owner")
+    throw new HttpError(403, "owner_required", "Only an owner can clear Slack delivery health.");
+  await env.DB.prepare(`UPDATE slack_delivery_failures SET acknowledged_at=?
+    WHERE workspace_id=? AND subscription_id=? AND acknowledged_at IS NULL
+      AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`)
+    .bind(Date.now(), member.workspace.id, mappingId, member.workspace.id, member.user.id)
+    .run();
 }
 
 export async function upsertSlackChannelSubscription(
@@ -754,7 +868,13 @@ export async function repairSlackChannelNotifications(env: Env, member: MemberCo
   const now = Date.now();
   await env.DB.batch([
     env.DB.prepare(`UPDATE slack_channel_events SET suppressed_at=?
-      WHERE subscription_id=? AND delivered_at IS NULL AND suppressed_at IS NULL`).bind(now, subscriptionId),
+      WHERE subscription_id=? AND delivered_at IS NULL AND suppressed_at IS NULL
+        AND EXISTS (SELECT 1 FROM slack_channel_subscriptions mapping
+          WHERE mapping.id=? AND mapping.notification_blocked_at IS NOT NULL)`).bind(
+      now,
+      subscriptionId,
+      subscriptionId,
+    ),
     env.DB.prepare(`UPDATE slack_channel_subscriptions SET notification_blocked_at=NULL,
       notification_error=NULL, updated_at=? WHERE id=? AND EXISTS (
       SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`).bind(
@@ -767,40 +887,82 @@ export async function repairSlackChannelNotifications(env: Env, member: MemberCo
 }
 
 export async function deleteSlackChannelSubscription(env: Env, member: MemberContext, id: string) {
-  const deleted = await env.DB.prepare(
-    `DELETE FROM slack_channel_subscriptions WHERE id = ? AND installation_id IN
-      (SELECT id FROM slack_installations WHERE workspace_id = ?)`,
-  )
-    .bind(id, member.workspace.id)
-    .run();
-  if (!deleted.meta.changes) throw new HttpError(404, "slack_channel_not_found", "Slack channel mapping not found.");
+  const now = Date.now();
+  const result = await env.DB.batch([
+    env.DB.prepare(`INSERT OR IGNORE INTO slack_delivery_failures
+      (delivery_id,workspace_id,subscription_id,channel_name,reason,created_at)
+      SELECT delivery.id,link.workspace_id,?,COALESCE(NULLIF(mapping.channel_name,''),link.channel_id),
+        'mapping_removed_unconfirmed',?
+      FROM slack_thread_deliveries delivery JOIN slack_thread_links link ON link.id=delivery.link_id
+      JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
+      WHERE mapping.id=? AND link.workspace_id=? AND (delivery.state='sending' OR
+        (delivery.state='blocked' AND delivery.failure_reason LIKE 'reconciliation_%'))
+        AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`).bind(
+      id,
+      now,
+      id,
+      member.workspace.id,
+      member.workspace.id,
+      member.user.id,
+    ),
+    env.DB.prepare(`UPDATE slack_thread_deliveries SET state='retired',updated_at=?,
+      failure_reason=CASE WHEN state IN ('sending','blocked') THEN 'mapping_removed_unconfirmed' ELSE 'mapping_removed' END
+      WHERE link_id IN (SELECT link.id FROM slack_thread_links link
+        WHERE link.subscription_id=? AND link.workspace_id=?)
+        AND (state IN ('pending','sending') OR
+          (state='blocked' AND failure_reason LIKE 'reconciliation_%'))
+        AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`).bind(
+      now,
+      id,
+      member.workspace.id,
+      member.workspace.id,
+      member.user.id,
+    ),
+    env.DB.prepare(`DELETE FROM slack_channel_subscriptions WHERE id = ? AND installation_id IN
+      (SELECT id FROM slack_installations WHERE workspace_id = ?)
+      AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`).bind(
+      id,
+      member.workspace.id,
+      member.workspace.id,
+      member.user.id,
+    ),
+  ]);
+  if (!result[2]!.meta.changes) throw new HttpError(404, "slack_channel_not_found", "Slack channel mapping not found.");
 }
 
-function rootControlRefreshStatements(
+export function rootControlRefreshStatements(
   env: Env,
   mappingId: string,
   workspaceId: string,
   actorId: string,
   sourceId: string,
   now: number,
+  linkId?: string,
 ) {
   return [
     env.DB.prepare(`INSERT OR IGNORE INTO slack_thread_deliveries
       (id, link_id, operation, source_id, actor_id, created_at, updated_at)
-      SELECT link.id || ':refresh:' || ?, link.id, 'refresh', ?, ?, ?, ?
+      SELECT link.id || ':refresh:' || ?, link.id, 'refresh', ?, ?,
+        MAX(?, COALESCE((SELECT MAX(prior.created_at)+1 FROM slack_thread_deliveries prior
+          WHERE prior.link_id=link.id AND prior.operation='refresh'), ?)), ?
         FROM slack_thread_links link
         JOIN slack_channel_subscriptions mapping ON mapping.id = link.subscription_id
         JOIN slack_installations installation ON installation.id = mapping.installation_id
+        JOIN pages page ON page.id = link.page_id AND page.archived_at IS NULL
        WHERE mapping.id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL
          AND link.installation_generation = installation.generation AND mapping.mirror_enabled = 1
-         AND mapping.validation_state = 'valid' AND link.state = 'active' AND link.root_message_ts IS NOT NULL`).bind(
+         AND mapping.validation_state = 'valid' AND link.state = 'active' AND link.root_message_ts IS NOT NULL
+         AND (? IS NULL OR link.id = ?)`).bind(
       sourceId,
       sourceId,
       actorId,
       now,
       now,
+      now,
       mappingId,
       workspaceId,
+      linkId ?? null,
+      linkId ?? null,
     ),
     env.DB.prepare(`INSERT OR IGNORE INTO outbox
       (id, workspace_id, topic, payload_json, available_at, created_at)
@@ -818,6 +980,53 @@ function rootControlRefreshStatements(
   ];
 }
 
+export function slackPauseStatements(
+  env: Env,
+  mappingId: string,
+  workspaceId: string,
+  actorId: string,
+  generation: number,
+  mode: "mute" | "unmute" | "snooze",
+  now: number,
+  sourceId: string,
+  hours?: 1 | 8 | 24,
+) {
+  const mutedAt = mode === "mute" ? now : null;
+  const snoozedUntil = mode === "snooze" ? now + hours! * 3_600_000 : null;
+  return [
+    env.DB.prepare(`UPDATE slack_channel_subscriptions SET muted_at=?,snoozed_until=?,controls_error=NULL,updated_at=?
+      WHERE id=? AND installation_id IN
+        (SELECT id FROM slack_installations WHERE workspace_id=? AND generation=? AND disconnected_at IS NULL)`).bind(
+      mutedAt,
+      snoozedUntil,
+      now,
+      mappingId,
+      workspaceId,
+      generation,
+    ),
+    ...(mode === "unmute"
+      ? []
+      : [
+          env.DB.prepare(`UPDATE slack_channel_events SET suppressed_at=?
+      WHERE subscription_id=? AND delivered_at IS NULL AND suppressed_at IS NULL`).bind(now, mappingId),
+        ]),
+    ...rootControlRefreshStatements(env, mappingId, workspaceId, actorId, sourceId, now),
+    ...(snoozedUntil === null
+      ? []
+      : [
+          env.DB.prepare(`INSERT OR IGNORE INTO outbox
+      (id,workspace_id,topic,payload_json,available_at,created_at)
+      VALUES (?,?,'slack_controls_expire',?,?,?)`).bind(
+            `outbox:slack-controls-expire:${sourceId}`,
+            workspaceId,
+            JSON.stringify({ mappingId, installationGeneration: generation, snoozedUntil }),
+            snoozedUntil,
+            now,
+          ),
+        ]),
+  ];
+}
+
 export async function setSlackChannelPause(
   env: Env,
   member: MemberContext,
@@ -830,81 +1039,58 @@ export async function setSlackChannelPause(
   if (mode === "snooze" && hours !== 1 && hours !== 8 && hours !== 24)
     throw new HttpError(422, "invalid_snooze", "Choose 1, 8, or 24 hours.");
   const mapping = await env.DB.prepare(
-    `SELECT mapping.id, installation.generation FROM slack_channel_subscriptions mapping
+    `SELECT mapping.id, mapping.muted_at, mapping.snoozed_until, installation.generation FROM slack_channel_subscriptions mapping
        JOIN slack_installations installation ON installation.id = mapping.installation_id
       WHERE mapping.id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL`,
   )
     .bind(id, member.workspace.id)
-    .first<{ id: string; generation: number }>();
+    .first<{ id: string; generation: number; muted_at: number | null; snoozed_until: number | null }>();
   if (!mapping) throw new HttpError(404, "slack_channel_not_found", "Slack channel mapping not found.");
   const now = Date.now();
-  const mutedAt = mode === "mute" ? now : null;
-  const snoozedUntil = mode === "snooze" ? now + hours! * 3_600_000 : null;
+  if (mode === "mute" && mapping.muted_at !== null && mapping.snoozed_until === null) return;
+  if (mode === "unmute" && mapping.muted_at === null && (mapping.snoozed_until ?? 0) <= now) return;
   const sourceId = `settings:${crypto.randomUUID()}`;
-  await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE slack_channel_subscriptions SET muted_at = ?, snoozed_until = ?, updated_at = ?
-        WHERE id = ? AND installation_id IN
-          (SELECT id FROM slack_installations WHERE workspace_id = ? AND disconnected_at IS NULL)`,
-    ).bind(mutedAt, snoozedUntil, now, id, member.workspace.id),
-    ...(mode === "unmute"
-      ? []
-      : [
-          env.DB.prepare(
-            `UPDATE slack_channel_events SET suppressed_at = ?
-        WHERE subscription_id = ? AND delivered_at IS NULL AND suppressed_at IS NULL`,
-          ).bind(now, id),
-        ]),
-    ...rootControlRefreshStatements(env, id, member.workspace.id, member.user.id, sourceId, now),
-    ...(snoozedUntil === null
-      ? []
-      : [
-          env.DB.prepare(`INSERT OR IGNORE INTO outbox
-            (id, workspace_id, topic, payload_json, available_at, created_at)
-            VALUES (?, ?, 'slack_controls_expire', ?, ?, ?)`).bind(
-            `outbox:slack-controls-expire:${sourceId}`,
-            member.workspace.id,
-            JSON.stringify({
-              mappingId: id,
-              installationGeneration: mapping.generation,
-              actorId: member.user.id,
-              snoozedUntil,
-            }),
-            snoozedUntil,
-            now,
-          ),
-        ]),
-  ]);
+  await env.DB.batch(
+    slackPauseStatements(env, id, member.workspace.id, member.user.id, mapping.generation, mode, now, sourceId, hours),
+  );
 }
 
 export async function deliverSlackControlsExpiry(env: Env, payload: Record<string, unknown>) {
   if (
     typeof payload.mappingId !== "string" ||
     typeof payload.installationGeneration !== "number" ||
-    typeof payload.actorId !== "string" ||
     typeof payload.snoozedUntil !== "number"
   )
     return;
-  const mapping = await env.DB.prepare(`SELECT installation.workspace_id
+  const mapping = await env.DB.prepare(`SELECT installation.workspace_id,
+      (SELECT owner.user_id FROM workspace_members owner
+        WHERE owner.workspace_id=installation.workspace_id AND owner.role='owner'
+        ORDER BY owner.user_id LIMIT 1) owner_id
     FROM slack_channel_subscriptions mapping
     JOIN slack_installations installation ON installation.id = mapping.installation_id
-    JOIN workspace_members owner ON owner.workspace_id = installation.workspace_id
-      AND owner.user_id = ? AND owner.role = 'owner'
     WHERE mapping.id = ? AND installation.generation = ? AND installation.disconnected_at IS NULL
       AND mapping.snoozed_until = ? AND mapping.snoozed_until <= ?`)
-    .bind(payload.actorId, payload.mappingId, payload.installationGeneration, payload.snoozedUntil, Date.now())
-    .first<{ workspace_id: string }>();
+    .bind(payload.mappingId, payload.installationGeneration, payload.snoozedUntil, Date.now())
+    .first<{ workspace_id: string; owner_id: string | null }>();
   if (!mapping) return;
-  await env.DB.batch(
-    rootControlRefreshStatements(
+  if (!mapping.owner_id) {
+    await env.DB.prepare(`UPDATE slack_channel_subscriptions SET controls_error='no_authorized_owner',updated_at=?
+      WHERE id=? AND snoozed_until=?`)
+      .bind(Date.now(), payload.mappingId, payload.snoozedUntil)
+      .run();
+    return;
+  }
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE slack_channel_subscriptions SET controls_error=NULL WHERE id=?`).bind(payload.mappingId),
+    ...rootControlRefreshStatements(
       env,
       payload.mappingId,
       mapping.workspace_id,
-      payload.actorId,
+      mapping.owner_id,
       `expiry:${payload.mappingId}:${payload.snoozedUntil}`,
       Date.now(),
     ),
-  );
+  ]);
 }
 
 export async function verifySlackRequest(env: Env, request: Request, body: string) {
@@ -948,67 +1134,150 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
   if (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000) {
     return decryptSlackToken(env, installation.bot_token_ciphertext);
   }
+  if (!Number.isSafeInteger(installation.generation))
+    throw new Error("Slack installation generation is unavailable for token refresh.");
   if (!installation.bot_refresh_token_ciphertext) {
-    throw new SlackApiError("oauth.v2.access", "invalid_auth", 401);
+    throw new SlackApiError("oauth.v2.access", "invalid_auth", 401, installation.credential_revision);
   }
-  const response = await fetch("https://slack.com/api/oauth.v2.access", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: env.SLACK_CLIENT_ID!,
-      client_secret: env.SLACK_CLIENT_SECRET!,
-      grant_type: "refresh_token",
-      refresh_token: await decryptSlackToken(env, installation.bot_refresh_token_ciphertext),
-    }),
-    // Once Slack accepts a refresh token, persist its replacement even if the
-    // caller's short acknowledgment deadline expires.
-    signal: AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
-  });
-  const result = await response.json<{
-    ok?: boolean;
-    error?: string;
-    access_token?: string;
-    refresh_token?: string;
-    expires_in?: number;
-  }>();
-  if (!response.ok || !result.ok || !result.access_token) {
-    if (typeof result.error === "string" && INSTALLATION_ERRORS.has(result.error))
-      throw new SlackApiError("oauth.v2.access", result.error, response.status);
-    throw new Error(`Slack token refresh failed (${result.error ?? response.status}).`);
-  }
-  const updatedAt = Date.now();
-  const accessTokenCiphertext = await encryptSlackToken(env, result.access_token);
-  const refreshTokenCiphertext = result.refresh_token
-    ? await encryptSlackToken(env, result.refresh_token)
-    : installation.bot_refresh_token_ciphertext;
-  const expiresAt = result.expires_in ? updatedAt + result.expires_in * 1000 : null;
-  const updated = await env.DB.prepare(
-    `UPDATE slack_installations SET bot_token_ciphertext = ?, bot_refresh_token_ciphertext = ?,
-      token_expires_at = ?, updated_at = ? WHERE id = ? AND bot_token_ciphertext = ?`,
-  )
-    .bind(
-      accessTokenCiphertext,
-      refreshTokenCiphertext,
-      expiresAt,
-      updatedAt,
-      installation.id,
-      installation.bot_token_ciphertext,
-    )
-    .run();
-  if (!updated.meta.changes) {
-    const current = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id = ? AND disconnected_at IS NULL`)
+  const oldCiphertext = installation.bot_token_ciphertext;
+  const leaseToken = crypto.randomUUID();
+  let claimed = false;
+  for (let attempt = 0; attempt < 15; attempt++) {
+    signal?.throwIfAborted();
+    const now = Date.now();
+    const lease = await env.DB.prepare(`UPDATE slack_installations SET refresh_lease_token=?,refresh_lease_until=?
+      WHERE id=? AND generation=? AND disconnected_at IS NULL AND bot_token_ciphertext=?
+        AND (refresh_lease_token IS NULL OR refresh_lease_until<=?)`)
+      .bind(leaseToken, now + 30_000, installation.id, installation.generation, oldCiphertext, now)
+      .run();
+    if (lease.meta.changes) {
+      claimed = true;
+      break;
+    }
+    const current = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL`)
       .bind(installation.id)
       .first<SlackInstallation>();
-    if (!current) throw new Error("The Slack installation was disconnected.");
-    installation.bot_token_ciphertext = current.bot_token_ciphertext;
-    installation.bot_refresh_token_ciphertext = current.bot_refresh_token_ciphertext;
-    installation.token_expires_at = current.token_expires_at;
-    return decryptSlackToken(env, current.bot_token_ciphertext);
+    if (!current || current.generation !== installation.generation)
+      throw new Error("The Slack installation changed during token refresh.");
+    if (current.bot_token_ciphertext !== oldCiphertext) {
+      Object.assign(installation, current);
+      return decryptSlackToken(env, current.bot_token_ciphertext);
+    }
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal!.reason);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, 1_000);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
   }
-  installation.bot_token_ciphertext = accessTokenCiphertext;
-  installation.bot_refresh_token_ciphertext = refreshTokenCiphertext;
-  installation.token_expires_at = expiresAt;
-  return result.access_token;
+  if (!claimed) throw new Error("Slack token refresh is already in progress.");
+  try {
+    const response = await fetch("https://slack.com/api/oauth.v2.access", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: env.SLACK_CLIENT_ID!,
+        client_secret: env.SLACK_CLIENT_SECRET!,
+        grant_type: "refresh_token",
+        refresh_token: await decryptSlackToken(env, installation.bot_refresh_token_ciphertext),
+      }),
+      // Once Slack accepts a refresh token, persist its replacement even if the
+      // caller's short acknowledgment deadline expires.
+      signal: AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
+    });
+    const result = await response.json<{
+      ok?: boolean;
+      error?: string;
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+    }>();
+    if (!response.ok || !result.ok || !result.access_token) {
+      if (result.error === "invalid_refresh_token") {
+        // A worker from the previous deployment may still have won the refresh.
+        for (let attempt = 0; attempt < 15; attempt++) {
+          const current = await env.DB.prepare(
+            `SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL`,
+          )
+            .bind(installation.id)
+            .first<SlackInstallation>();
+          if (current?.generation === installation.generation && current.bot_token_ciphertext !== oldCiphertext) {
+            Object.assign(installation, current);
+            return decryptSlackToken(env, current.bot_token_ciphertext);
+          }
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        const error = new SlackApiError(
+          "oauth.v2.access",
+          "invalid_refresh_token",
+          response.status,
+          installation.credential_revision,
+        );
+        await recordSlackInstallationError(env, installation.id, error);
+        throw error;
+      }
+      if (typeof result.error === "string" && INSTALLATION_ERRORS.has(result.error))
+        throw new SlackApiError("oauth.v2.access", result.error, response.status, installation.credential_revision);
+      throw new Error(`Slack token refresh failed (${result.error ?? response.status}).`);
+    }
+    const updatedAt = Date.now();
+    const accessTokenCiphertext = await encryptSlackToken(env, result.access_token);
+    const refreshTokenCiphertext = result.refresh_token
+      ? await encryptSlackToken(env, result.refresh_token)
+      : installation.bot_refresh_token_ciphertext;
+    const expiresAt = result.expires_in ? updatedAt + result.expires_in * 1000 : null;
+    const updated = await env.DB.prepare(
+      `UPDATE slack_installations SET bot_token_ciphertext = ?, bot_refresh_token_ciphertext = ?,
+      token_expires_at = ?, updated_at = ?, refresh_lease_token=NULL, refresh_lease_until=NULL,
+      auth_error=CASE WHEN auth_error IN ('missing_scope','account_inactive') THEN auth_error ELSE NULL END,
+      auth_error_at=CASE WHEN auth_error IN ('missing_scope','account_inactive') THEN auth_error_at ELSE NULL END,
+      auth_paused_ms=auth_paused_ms+CASE
+        WHEN auth_error IN ('missing_scope','account_inactive') OR auth_error_at IS NULL THEN 0
+        ELSE MAX(0,?-auth_error_at) END,
+      credential_revision=credential_revision+1
+      WHERE id = ? AND generation=? AND disconnected_at IS NULL AND bot_token_ciphertext = ?`,
+    )
+      .bind(
+        accessTokenCiphertext,
+        refreshTokenCiphertext,
+        expiresAt,
+        updatedAt,
+        updatedAt,
+        installation.id,
+        installation.generation,
+        installation.bot_token_ciphertext,
+      )
+      .run();
+    if (!updated.meta.changes) {
+      const current = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id = ? AND disconnected_at IS NULL`)
+        .bind(installation.id)
+        .first<SlackInstallation>();
+      if (!current || current.generation !== installation.generation)
+        throw new Error("The Slack installation changed during token refresh.");
+      if (current.bot_token_ciphertext === oldCiphertext) throw new Error("Slack token refresh was not persisted.");
+      installation.bot_token_ciphertext = current.bot_token_ciphertext;
+      installation.bot_refresh_token_ciphertext = current.bot_refresh_token_ciphertext;
+      installation.token_expires_at = current.token_expires_at;
+      installation.credential_revision = current.credential_revision;
+      return decryptSlackToken(env, current.bot_token_ciphertext);
+    }
+    installation.bot_token_ciphertext = accessTokenCiphertext;
+    installation.bot_refresh_token_ciphertext = refreshTokenCiphertext;
+    installation.token_expires_at = expiresAt;
+    installation.credential_revision += 1;
+    return result.access_token;
+  } finally {
+    await env.DB.prepare(`UPDATE slack_installations SET refresh_lease_token=NULL,refresh_lease_until=NULL
+      WHERE id=? AND refresh_lease_token=?`)
+      .bind(installation.id, leaseToken)
+      .run();
+  }
 }
 
 export async function slackApi<Method extends SlackApiMethod>(
@@ -1018,6 +1287,7 @@ export async function slackApi<Method extends SlackApiMethod>(
   payload: SlackApiContracts[Method]["input"],
   timeoutMs = SLACK_FETCH_TIMEOUT_MS,
   signal?: AbortSignal,
+  preparedToken?: string,
 ): Promise<SlackApiContracts[Method]["output"]> {
   const response = await traced(tracing, "notes.integration.slack", { "notes.operation": method }, async () => {
     const read = SLACK_READ_METHODS.has(method);
@@ -1028,7 +1298,7 @@ export async function slackApi<Method extends SlackApiMethod>(
     const token =
       method === "auth.revoke"
         ? await decryptSlackToken(env, installation.bot_token_ciphertext)
-        : await usableBotToken(env, installation, signal);
+        : (preparedToken ?? (await usableBotToken(env, installation, signal)));
     signal?.throwIfAborted();
     return fetch(url.toString(), {
       method: read ? "GET" : "POST",
@@ -1039,10 +1309,13 @@ export async function slackApi<Method extends SlackApiMethod>(
       ...(read ? {} : { body: JSON.stringify(payload) }),
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     }).catch((error: unknown) => {
-      if (isTimeoutAbort(error)) throw new Error(`Slack ${method} timed out.`);
+      if (isTimeoutAbort(error)) throw new SlackApiError(method, "timeout", 504, installation.credential_revision);
+      if (error instanceof TypeError)
+        throw new SlackApiError(method, "network_error", 503, installation.credential_revision);
       throw error;
     });
   });
+  const credentialRevision = installation.credential_revision;
   if (response.status === 429) {
     // Retry-After may legally be an HTTP date, which Number() turns into NaN and
     // carries all the way into the queue's delaySeconds.
@@ -1054,10 +1327,15 @@ export async function slackApi<Method extends SlackApiMethod>(
   try {
     result = await response.json<typeof result>();
   } catch {
-    throw new SlackApiError(method, "invalid_response", response.status);
+    throw new SlackApiError(method, "invalid_response", response.status, credentialRevision);
   }
   if (!response.ok || !result.ok) {
-    throw new SlackApiError(method, typeof result.error === "string" ? result.error : "http_error", response.status);
+    throw new SlackApiError(
+      method,
+      typeof result.error === "string" ? result.error : "http_error",
+      response.status,
+      credentialRevision,
+    );
   }
   const { ok: _ok, error: _error, ...body } = result;
   return body as SlackApiContracts[Method]["output"];
@@ -1475,7 +1753,8 @@ async function channelEvent(env: Env, eventId: string) {
             actor.name actor_name, subscription.channel_id, subscription.id subscription_id,
             installation.id, installation.workspace_id, installation.team_id, installation.team_name,
             installation.bot_user_id, installation.bot_token_ciphertext,
-            installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at
+            installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at,
+            installation.generation, installation.credential_revision, installation.scopes
        FROM slack_channel_events event
        JOIN slack_channel_subscriptions subscription ON subscription.id = event.subscription_id
        JOIN slack_installations installation ON installation.id = subscription.installation_id
@@ -1513,11 +1792,6 @@ async function blockSlackNotifications(env: Env, subscriptionId: string, code: s
 
 async function blockSlackInstallationNotifications(env: Env, installationId: string, error: SlackApiError) {
   await recordSlackInstallationError(env, installationId, error);
-  await env.DB.prepare(`UPDATE slack_channel_events SET suppressed_at=?
-    WHERE subscription_id IN (SELECT id FROM slack_channel_subscriptions WHERE installation_id=?)
-      AND delivered_at IS NULL AND suppressed_at IS NULL`)
-    .bind(Date.now(), installationId)
-    .run();
 }
 
 function eventCopy(eventType: NotificationEventType, actorName: string | null, pageTitle: string) {
@@ -1581,9 +1855,13 @@ export async function deliverSlackChannelEvent(env: Env, eventId: string) {
       await blockSlackNotifications(env, row.subscription_id, error.code);
       return;
     }
+    if (slackMissingScope(error)) {
+      await blockSlackNotifications(env, row.subscription_id, error.code);
+      return;
+    }
     if (error instanceof SlackApiError && slackInstallationError(error)) {
       await blockSlackInstallationNotifications(env, row.id, error);
-      return;
+      throw error;
     }
     throw error;
   }
@@ -1829,8 +2107,10 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     try {
       const correlationId = currentObservabilityContext()?.correlationId;
       await env.DELIVERY_QUEUE.send({ outboxId, ...(correlationId ? { correlationId } : {}) });
-      await env.DB.prepare(`UPDATE outbox SET enqueued_at = ? WHERE id = ? AND enqueued_at IS NULL`)
-        .bind(Date.now(), outboxId)
+      const queuedAt = Date.now();
+      await env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?
+        WHERE id=? AND enqueued_at IS NULL`)
+        .bind(queuedAt, queuedAt + SLACK_REDRIVE_STALE_MS, outboxId)
         .run();
     } catch {
       // The scheduled outbox sweep recovers this enqueue after a D1/Queue split failure.
@@ -1873,29 +2153,36 @@ export async function handleSlackInteraction(
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Promise.race([
-      slackApi(
-        env,
-        installation,
-        "views.open",
-        {
-          trigger_id: payload.trigger_id,
-          view: {
-            type: "modal",
-            callback_id: "noteflare_milestone_zero_placeholder",
-            title: { type: "plain_text", text: "NoteFlare" },
-            close: { type: "plain_text", text: "Close" },
-            blocks: [
-              {
-                type: "section",
-                text: { type: "mrkdwn", text: "This Slack action is not available yet." },
-              },
-            ],
-          },
+    const opening = slackApi(
+      env,
+      installation,
+      "views.open",
+      {
+        trigger_id: payload.trigger_id,
+        view: {
+          type: "modal",
+          callback_id: "noteflare_milestone_zero_placeholder",
+          title: { type: "plain_text", text: "NoteFlare" },
+          close: { type: "plain_text", text: "Close" },
+          blocks: [
+            {
+              type: "section",
+              text: { type: "mrkdwn", text: "This Slack action is not available yet." },
+            },
+          ],
         },
-        Math.min(1_800, remaining),
-        controller.signal,
+      },
+      Math.min(1_800, remaining),
+      controller.signal,
+    );
+    defer?.(
+      opening.then(
+        () => undefined,
+        () => undefined,
       ),
+    );
+    await Promise.race([
+      opening,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           controller.abort(new Error("Slack modal trigger expired."));
@@ -1927,9 +2214,10 @@ async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_me
 export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: string) {
   const row = await env.DB.prepare(
     `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.message_ts, unfurl.unfurls_json,
-            installation.id, installation.workspace_id, installation.team_id, installation.team_name,
+            installation.id, installation.generation, installation.workspace_id, installation.team_id, installation.team_name,
             installation.bot_user_id, installation.bot_token_ciphertext,
-            installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at
+            installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at,
+            installation.credential_revision
        FROM slack_unfurls unfurl
        JOIN slack_installations installation ON installation.id = unfurl.installation_id
          AND installation.generation = unfurl.installation_generation
@@ -1989,6 +2277,8 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
       await slackApi(env, row, "chat.unfurl", { channel: row.channel_id, ts: row.message_ts, unfurls });
     } catch (error) {
       await releaseSlackClaims(env, "slack_unfurls", [unfurlId], claim.token);
+      if (error instanceof SlackApiError && slackInstallationError(error))
+        await recordSlackInstallationError(env, row.id, error);
       throw error;
     }
     await env.DB.prepare(
@@ -2035,10 +2325,10 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
       const events = await env.DB.prepare(
         `SELECT event.id, event.event_type, event.page_id, page.title page_title, actor.name actor_name,
               subscription.channel_id,
-              installation.id installation_id, installation.workspace_id, installation.team_id,
+              installation.id installation_id, installation.generation, installation.workspace_id, installation.team_id,
               installation.team_name, installation.bot_user_id, installation.bot_token_ciphertext,
               installation.bot_refresh_token_ciphertext, installation.token_expires_at,
-              installation.disconnected_at
+              installation.disconnected_at, installation.credential_revision
          FROM slack_channel_events event
          JOIN slack_channel_subscriptions subscription ON subscription.id = event.subscription_id
          JOIN slack_installations installation ON installation.id = subscription.installation_id
@@ -2094,6 +2384,10 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
           claim.token,
         );
         if (error instanceof SlackApiError && slackChannelError(error)) {
+          await blockSlackNotifications(env, subscriptionId, error.code);
+          continue;
+        }
+        if (slackMissingScope(error)) {
           await blockSlackNotifications(env, subscriptionId, error.code);
           continue;
         }
