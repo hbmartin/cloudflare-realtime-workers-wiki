@@ -9,6 +9,7 @@ import {
   type ImportedTable,
 } from "../shared/import-content";
 import { documentProjectionHash, sha256Hex, tableContentHash } from "../shared/import-integrity";
+import { normalizeSearchValue } from "../shared/search-normalization";
 import {
   hasCurrentImportConfirmation,
   NOTION_GROUPING_VERSION,
@@ -1017,8 +1018,10 @@ function cellColumns(
   value: string | number | boolean | null,
   options: ReadonlyMap<string, string>,
 ) {
+  const text = column.type === "text" && typeof value === "string" ? value : null;
   return {
-    text: column.type === "text" && typeof value === "string" ? value : null,
+    text,
+    textSearch: text === null ? null : normalizeSearchValue(text),
     number: column.type === "number" && typeof value === "number" ? value : null,
     boolean: column.type === "checkbox" && typeof value === "boolean" ? (value ? 1 : 0) : null,
     date: column.type === "date" && typeof value === "string" ? value : null,
@@ -1039,12 +1042,12 @@ async function initializeTable(env: Env, job: JobRow, page: ImportPage) {
     })),
   );
   const options = new Map<string, string>();
-  const optionRows: Array<{ id: string; columnId: string; label: string; position: number }> = [];
+  const optionRows: Array<{ id: string; columnId: string; label: string; labelSearch: string; position: number }> = [];
   for (const column of columns) {
     for (const [position, label] of column.options.entries()) {
       const id = await stableId(job.id, "option", `${page.source}:${column.position}:${label}`);
       options.set(`${column.id}:${label}`, id);
-      optionRows.push({ id, columnId: column.id, label, position });
+      optionRows.push({ id, columnId: column.id, label, labelSearch: normalizeSearchValue(label), position });
     }
   }
   await env.DB.batch([
@@ -1055,8 +1058,9 @@ async function initializeTable(env: Env, job: JobRow, page: ImportPage) {
          FROM json_each(?)`,
     ).bind(page.id, JSON.stringify(columns)),
     env.DB.prepare(
-      `INSERT OR IGNORE INTO table_select_options (id, column_id, label, position)
-       SELECT json_extract(value, '$.id'), json_extract(value, '$.columnId'), json_extract(value, '$.label'), json_extract(value, '$.position')
+      `INSERT OR IGNORE INTO table_select_options (id, column_id, label, label_search_value, position)
+       SELECT json_extract(value, '$.id'), json_extract(value, '$.columnId'), json_extract(value, '$.label'),
+              json_extract(value, '$.labelSearch'), json_extract(value, '$.position')
          FROM json_each(?)`,
     ).bind(JSON.stringify(optionRows)),
   ]);
@@ -1084,9 +1088,10 @@ async function initializeTable(env: Env, job: JobRow, page: ImportPage) {
       ).bind(page.id, job.requested_by, timestamp, timestamp, JSON.stringify(values)),
       env.DB.prepare(
         `INSERT OR REPLACE INTO table_cells
-          (row_id, column_id, text_value, number_value, boolean_value, date_value, select_value, updated_at)
+          (row_id, column_id, text_value, text_search_value, number_value, boolean_value, date_value, select_value, updated_at)
          SELECT json_extract(cell.value, '$.rowId'), json_extract(cell.value, '$.columnId'),
-                json_extract(cell.value, '$.text'), json_extract(cell.value, '$.number'),
+                json_extract(cell.value, '$.text'), json_extract(cell.value, '$.textSearch'),
+                json_extract(cell.value, '$.number'),
                 json_extract(cell.value, '$.boolean'), json_extract(cell.value, '$.date'),
                 json_extract(cell.value, '$.select'), ?
            FROM json_each(?) row_data, json_each(json_extract(row_data.value, '$.cells')) cell`,
