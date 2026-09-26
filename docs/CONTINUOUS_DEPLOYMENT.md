@@ -120,6 +120,10 @@ Workers Observability Read, Workers Scripts Read, Analytics Engine Read, Queues 
 Scripts Read only to list authoritative Workflow instance states; it never deploys or writes Cloudflare state.
 Enable Actions failure email in each operator's GitHub notification settings.
 
+The five-minute schedule is currently disabled because the monitor job was failing while production
+itself was healthy; the workflow can still be run manually. Re-enable the `schedule` trigger in
+`observability.yml` once the monitor or its configuration is fixed.
+
 ```sh
 gh secret set CLOUDFLARE_OBSERVABILITY_TOKEN
 gh secret set OBSERVABILITY_PROBE_TOKEN

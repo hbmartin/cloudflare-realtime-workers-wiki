@@ -1,8 +1,14 @@
 name: Production observability
 
+# The five-minute schedule is disabled while the monitor itself is failing: the
+# "Probe and evaluate production" job was failing rapidly even though the root
+# endpoint returned 200 and readiness returned the expected 401 without a probe
+# token, which points at the monitor or its configuration rather than an outage.
+# Restore the schedule below once the monitor is fixed; manual runs remain
+# available for diagnosis.
 on:
-  schedule:
-    - cron: "*/5 * * * *"
+  # schedule:
+  #   - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
