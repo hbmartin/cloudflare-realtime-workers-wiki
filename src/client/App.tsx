@@ -365,6 +365,22 @@ function requestPageRestore(rootPageId: string, workspaceId: string) {
   );
 }
 
+function observeRestoredTemplate(pageId: string, signal: AbortSignal) {
+  return reconcileWithOneRetry(
+    async () => {
+      try {
+        const { page } = await api<{ page: Page }>(`/api/pages/${encodeURIComponent(pageId)}`, { signal });
+        return page.isTemplate && page.archivedAt === null ? page : null;
+      } catch (error) {
+        if (isPageNotFoundError(error)) return null;
+        throw error;
+      }
+    },
+    (page) => page === null,
+    signal,
+  );
+}
+
 function pageSubtreeIds(pages: Page[], rootPageId: string) {
   const children = new Map<string, string[]>();
   for (const page of pages) {
@@ -1823,6 +1839,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     async (restoredPages: Page[], tombstoneCheckpoint: number, restoredRootId?: string) => {
       const signal = workspaceAbortController.current.signal;
       const rootPageId = restoredRootId ?? restoredEventRoot(restoredPages)?.id ?? null;
+      if (rootPageId && restoredPages.some((page) => page.id === rootPageId && page.isTemplate)) {
+        const observed = await observeRestoredTemplate(rootPageId, signal);
+        if (observed && !signal.aborted) {
+          archiveRemovalTombstones.release([rootPageId], tombstoneCheckpoint);
+          if (!archiveRemovalTombstones.has(rootPageId)) {
+            dispatchPageAction({ type: "merge", pages: [observed] });
+            excludeConfirmedRestoresFromTrash([observed]);
+          }
+        }
+        return;
+      }
       if (!rootPageId) {
         const observe = async () => {
           try {
@@ -1844,7 +1871,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         signal,
       );
     },
-    [loadFreshPages, reconcileRestoredRoot],
+    [archiveRemovalTombstones, excludeConfirmedRestoresFromTrash, loadFreshPages, reconcileRestoredRoot],
   );
   const loadTrash = useCallback(
     (version: number) => {
@@ -2842,6 +2869,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         dispatchPageAction({ type: "remove", pageIds: removedIds });
       }
       if (removedIds || result.kind === "uncertain") refreshTrash();
+      if (page.isTemplate && (removedIds || result.kind === "uncertain")) void loadOrganization();
       const needsReconciliation = result.kind !== "rejected" || pageAlreadyGone;
       if (!needsReconciliation) return;
       await reconcileArchivePages();
@@ -3127,6 +3155,27 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const responseConfirmedRestore = confirmedRestoredPages !== null;
       const responseConflictsWithRemoval =
         confirmedRestoredPages?.some((restored) => archiveRemovalTombstones.has(restored.id)) ?? false;
+      if (page.isTemplate) {
+        if (result.kind === "rejected") return;
+        if (!responseConfirmedRestore || responseConflictsWithRemoval) {
+          try {
+            const observed = await observeRestoredTemplate(page.id, signal);
+            if (observed && !signal.aborted) {
+              archiveRemovalTombstones.release([page.id], restoreTombstoneCheckpoint);
+              if (!archiveRemovalTombstones.has(page.id)) {
+                dispatchPageAction({ type: "merge", pages: [observed] });
+                excludeConfirmedRestoresFromTrash([observed]);
+                clearWorkspaceErrors(attempt);
+              }
+            }
+          } catch (error) {
+            if (!signal.aborted)
+              reportWorkspaceError(attempt, apiErrorMessage(error, "The template restore could not be verified."));
+          }
+        }
+        if (!signal.aborted) await loadOrganization();
+        return;
+      }
       if (result.kind === "rejected" || (responseConfirmedRestore && !responseConflictsWithRemoval)) return;
       try {
         const { rootWasRestored } = await reconcileRestoredRoot(
@@ -3168,6 +3217,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (signal.aborted) return;
       if (result.kind === "committed" && deletedIds) {
         setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
+        if (page.isTemplate) void loadOrganization();
         if (!result.value) {
           logUnverifiedMutation(
             "Permanent-delete result could not be verified",
@@ -3613,12 +3663,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                           {activeSelected.fullWidth ? "Use reading width" : "Use full width"}
                         </button>
                       )}
-                      {!activeSelected.isTemplate && (
-                        <button data-close-menu onClick={() => void archive(activeSelected)}>
-                          <Icon name="trash" />
-                          Move to trash
-                        </button>
-                      )}
+                      <button data-close-menu onClick={() => void archive(activeSelected)}>
+                        <Icon name="trash" />
+                        Move to trash
+                      </button>
                     </>
                   )}
                 </ActionMenu>
@@ -3986,6 +4034,7 @@ function TrashView({
             <div key={page.id}>
               <span>{page.kind === "table" ? "▦" : page.kind === "diagram" ? "◇" : "□"}</span>
               <strong>{page.title}</strong>
+              {page.isTemplate && <small>Template</small>}
               <button disabled={actionsDisabled} onClick={() => void onRestore(page)}>
                 Restore
               </button>

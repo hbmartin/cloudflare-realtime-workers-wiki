@@ -250,6 +250,165 @@ describe("App error handling", () => {
     vi.unstubAllGlobals();
   });
 
+  it("lets an editor move a template to Trash and restore it without a page-tree error", async () => {
+    const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
+    let currentTemplate: Page | null = template;
+    let archivedTemplate: Page | null = null;
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
+      if (path === "/api/pages/tree?archived=true") return { pages: archivedTemplate ? [archivedTemplate] : [] };
+      if (path === "/api/templates") return { templates: currentTemplate ? [currentTemplate] : [] };
+      if (path === `/api/pages/${template.id}` && init?.method === "DELETE") {
+        archivedTemplate = { ...template, archivedAt: 2, revision: 2 };
+        currentTemplate = null;
+        return { ok: true, pageIds: [template.id], cleanupPending: false, pendingPageCount: 0 };
+      }
+      if (path === `/api/pages/${template.id}/restore` && init?.method === "POST") {
+        currentTemplate = { ...template, revision: 3 };
+        archivedTemplate = null;
+        return { pages: [currentTemplate] };
+      }
+      return shellApi(path, init);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Templates" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Page actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move to trash" }));
+    await waitFor(() => expect(currentTemplate).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("No templates in this space")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    expect(await screen.findByText("Template")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete forever" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+    await waitFor(() => expect(currentTemplate).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("Brief template")).toBeInTheDocument();
+    expect(screen.queryByText(/page tree could not be refreshed/i)).not.toBeInTheDocument();
+    expect(treeLoads).toBeGreaterThan(0);
+  });
+
+  it("verifies an unrecognized template restore response with a direct page read", async () => {
+    const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
+    let restored: Page | null = null;
+    let archived: Page | null = { ...template, archivedAt: 2, revision: 2 };
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/templates") return { templates: restored ? [restored] : [] };
+      if (path === "/api/pages/tree?archived=true") return { pages: archived ? [archived] : [] };
+      if (path === `/api/pages/${template.id}/restore` && init?.method === "POST") {
+        restored = { ...template, revision: 3 };
+        archived = null;
+        throw new InvalidApiResponseError(200, {
+          requestPath: path,
+          responseUrl: null,
+          contentType: "text/html",
+          cause: new SyntaxError("Unexpected token '<'"),
+        });
+      }
+      if (path === `/api/pages/${template.id}` && !init?.method) return { page: restored };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
+
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        `/api/pages/${template.id}`,
+        expect.objectContaining({ signal: expect.anything() }),
+      ),
+    );
+    await waitFor(() => expect(screen.queryByText(/restore result could not be verified/i)).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("Brief template")).toBeInTheDocument();
+    expect(screen.queryByText(/page tree could not be refreshed/i)).not.toBeInTheDocument();
+  });
+
+  it("confirms a template restored by another client without looking for it in the active tree", async () => {
+    const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
+    let restored: Page | null = null;
+    let archived: Page | null = { ...template, archivedAt: 2, revision: 2 };
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/templates") return { templates: restored ? [restored] : [] };
+      if (path === "/api/pages/tree?archived=true") return { pages: archived ? [archived] : [] };
+      if (path === `/api/pages/${template.id}` && !init?.method) return { page: restored };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
+
+    act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [template.id], permanently: false }));
+    restored = { ...template, revision: 3 };
+    archived = null;
+    act(() =>
+      dispatchWorkspaceEvent({
+        type: "pages-upserted",
+        pages: [restored!],
+        restored: true,
+        restoredRootId: template.id,
+      }),
+    );
+    act(() => dispatchWorkspaceEvent({ type: "organization-invalidated" }));
+
+    await waitFor(() => expect(api).toHaveBeenCalledWith(`/api/pages/${template.id}`, expect.anything()));
+    expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("Brief template")).toBeInTheDocument();
+    expect(screen.queryByText(/page tree could not be refreshed/i)).not.toBeInTheDocument();
+  });
+
+  it("refreshes the template library on a remote change and reserves permanent deletion for owners", async () => {
+    const owner = { ...member, role: "owner" as const };
+    const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
+    let currentTemplate: Page | null = template;
+    let archivedTemplate: Page | null = null;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockShellApi({ member: owner });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/templates") return { templates: currentTemplate ? [currentTemplate] : [] };
+      if (path === "/api/pages/tree?archived=true") return { pages: archivedTemplate ? [archivedTemplate] : [] };
+      if (path === `/api/pages/${template.id}/permanent-delete` && init?.method === "POST") {
+        archivedTemplate = null;
+        return { ok: true, pageIds: [template.id] };
+      }
+      return shellApi(path, init);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("Brief template")).toBeInTheDocument();
+
+    currentTemplate = null;
+    archivedTemplate = { ...template, archivedAt: 2 };
+    act(() => dispatchWorkspaceEvent({ type: "organization-invalidated" }));
+    expect(await screen.findByText("No templates in this space")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete forever" }));
+    await waitFor(() => expect(archivedTemplate).toBeNull());
+    expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
+  });
+
   it("clears a stale invite token and continues for an existing member", async () => {
     mockShellApi();
     const normal = vi.mocked(api).getMockImplementation()!;

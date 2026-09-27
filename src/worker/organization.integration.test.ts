@@ -54,6 +54,96 @@ beforeEach(async () => {
 });
 
 describe("organization APIs", () => {
+  it("archives templates in Trash and restores or permanently deletes them", async () => {
+    const installed = await bootstrap();
+    await env.DB.prepare(`UPDATE pages SET is_template = 1 WHERE id = ?`).bind(installed.pageId).run();
+
+    const templates = () => SELF.fetch(request(installed.cookie, "/api/templates"));
+    const trash = () => SELF.fetch(request(installed.cookie, "/api/pages/tree?archived=true"));
+    expect((await (await templates()).json<{ templates: Page[] }>()).templates.map((page) => page.id)).toContain(
+      installed.pageId,
+    );
+
+    const archived = await SELF.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }),
+    );
+    expect([200, 202]).toContain(archived.status);
+    expect((await (await templates()).json<{ templates: Page[] }>()).templates).toHaveLength(0);
+    expect((await (await trash()).json<{ pages: Page[] }>()).pages).toContainEqual(
+      expect.objectContaining({ id: installed.pageId, isTemplate: true }),
+    );
+
+    const restored = await SELF.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/restore`, { method: "POST" }),
+    );
+    expect(restored.status).toBe(200);
+    expect((await (await templates()).json<{ templates: Page[] }>()).templates.map((page) => page.id)).toContain(
+      installed.pageId,
+    );
+    expect(
+      (await (await SELF.fetch(request(installed.cookie, "/api/pages/tree"))).json<{ pages: Page[] }>()).pages,
+    ).not.toContainEqual(expect.objectContaining({ id: installed.pageId }));
+
+    expect([200, 202]).toContain(
+      (await SELF.fetch(request(installed.cookie, `/api/pages/${installed.pageId}`, { method: "DELETE" }))).status,
+    );
+    const deleted = await SELF.fetch(
+      request(installed.cookie, `/api/pages/${installed.pageId}/permanent-delete`, { method: "POST" }),
+    );
+    expect(deleted.status).toBe(202);
+    expect((await (await trash()).json<{ pages: Page[] }>()).pages).toHaveLength(0);
+    expect(await env.DB.prepare(`SELECT id FROM pages WHERE id = ?`).bind(installed.pageId).first()).toBeNull();
+  });
+
+  it("hides imported row pages and descendants from Trash without hiding ordinary archived pages", async () => {
+    const installed = await bootstrap();
+    const source = await env.DB.prepare(`SELECT workspace_id,space_id,created_by FROM pages WHERE id = ?`)
+      .bind(installed.pageId)
+      .first<{ workspace_id: string; space_id: string; created_by: string }>();
+    const importedId = crypto.randomUUID();
+    const childId = crypto.randomUUID();
+    const ordinaryId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.batch(
+      [
+        [importedId, installed.pageId, "Imported row"],
+        [childId, importedId, "Row child"],
+        [ordinaryId, installed.pageId, "Ordinary archived"],
+      ].map(([id, parentId, title]) =>
+        env.DB.prepare(
+          `INSERT INTO pages
+           (id,workspace_id,space_id,parent_id,kind,position,title,archived_at,created_by,created_at,updated_at)
+           VALUES (?,?,?,?,'document','a0',?,?,?,?,?)`,
+        ).bind(
+          id,
+          source!.workspace_id,
+          source!.space_id,
+          parentId,
+          title,
+          timestamp,
+          source!.created_by,
+          timestamp,
+          timestamp,
+        ),
+      ),
+    );
+    await env.DB.prepare(
+      `INSERT INTO page_import_sources (page_id,source_path,source_role,created_at)
+       VALUES (?,?,'table_row_detail',?)`,
+    )
+      .bind(importedId, "Imported row", timestamp)
+      .run();
+
+    const archived = await SELF.fetch(request(installed.cookie, "/api/pages/tree?archived=true"));
+    expect(archived.status).toBe(200);
+    expect((await archived.json<{ pages: Page[] }>()).pages.map((page) => page.id)).toEqual([ordinaryId]);
+
+    await env.DB.prepare(`UPDATE pages SET archived_at = NULL WHERE id IN (?, ?)`).bind(importedId, childId).run();
+    const active = await SELF.fetch(request(installed.cookie, "/api/pages/tree"));
+    expect(active.status).toBe(200);
+    expect((await active.json<{ pages: Page[] }>()).pages.map((page) => page.id)).toEqual([installed.pageId]);
+  });
+
   it("persists personal favorites and space-scoped pins without crossing spaces", async () => {
     const installed = await bootstrap();
     const spaces = await (await SELF.fetch(request(installed.cookie, "/api/spaces"))).json<{ spaces: Space[] }>();

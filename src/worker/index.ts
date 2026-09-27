@@ -235,6 +235,8 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 // Each page costs three or four statements, so this stays far inside D1's per-invocation
 // query ceiling while still collapsing a tree level into one request.
 const PAGE_BATCH_MAX = 50;
+// The shared scheduled invocation also runs other maintenance tasks.
+const TABLE_SEARCH_BACKFILL_PER_KIND = 25;
 const TABLE_LEASE_DURATION_MS = 60_000;
 const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple", "pink"] as const;
 const MAX_IMPORT_UPLOAD_BYTES = 24 * 1024 * 1024;
@@ -3020,20 +3022,15 @@ app.get("/api/pages/tree", async (c) => {
       JOIN spaces s ON s.id = p.space_id
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE p.workspace_id = ? AND p.archived_at IS ${archived ? "NOT " : ""}NULL
-       AND p.is_template = 0 AND p.import_job_id IS NULL
-       ${
-         archived
-           ? ""
-           : `AND p.id NOT IN (
+       ${archived ? "" : "AND p.is_template = 0"} AND p.import_job_id IS NULL
+       AND p.id NOT IN (
          WITH RECURSIVE hidden(id) AS (
-           SELECT page_id FROM table_row_pages
-           UNION
            SELECT page_id FROM page_import_sources WHERE source_role = 'table_row_detail'
+           ${archived ? "" : "UNION SELECT page_id FROM table_row_pages"}
            UNION ALL
            SELECT child.id FROM pages child JOIN hidden ON child.parent_id = hidden.id
          ) SELECT id FROM hidden
-       )`
-       }
+       )
        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
      ORDER BY p.position, p.id`,
   )
@@ -4215,7 +4212,6 @@ app.delete("/api/pages/:id", async (c) => {
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
-  requireOrdinaryPage(page);
   const task = await taskDetail(c.env, page.id);
   if (task && page.archived_at === null) {
     const taskArchiveOperationId = c.req.header("x-notes-operation-id") ?? crypto.randomUUID();
@@ -4299,6 +4295,7 @@ app.delete("/api/pages/:id", async (c) => {
     permanently: false,
     ...(operationId ? { operationId } : {}),
   });
+  if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   const cleanup = await archiveCleanupAfterCommit(c.env, page.id, archiveOwnership, timestamp, "page_delete");
   return c.json(
     {
@@ -4432,6 +4429,7 @@ app.post("/api/pages/:id/restore", async (c) => {
     restoredRootId: page.id,
     ...(hidden.length ? { sidebarHiddenPageIds: hidden } : {}),
   });
+  if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
 });
 
@@ -4536,6 +4534,7 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   }
   const pageIds = subtree.results.map((item) => item.id);
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: true });
+  if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   c.executionCtx.waitUntil(
     processDeletionJob(c.env, jobId).catch((error) => {
       logger.error("deletion.cleanup.failed", "deletion", "Immediate deletion cleanup failed.", { jobId }, error);
@@ -6721,9 +6720,11 @@ export async function executeScheduledTasks(env: Env, context: ExecutionContext,
 export async function backfillTableSearchValues(env: Env) {
   const [cells, options] = await Promise.all([
     env.DB.prepare(
-      "SELECT row_id,column_id,text_value FROM table_cells WHERE text_value IS NOT NULL AND text_search_value IS NULL LIMIT 500",
+      `SELECT row_id,column_id,text_value FROM table_cells WHERE text_value IS NOT NULL AND text_search_value IS NULL ORDER BY row_id,column_id LIMIT ${TABLE_SEARCH_BACKFILL_PER_KIND}`,
     ).all<{ row_id: string; column_id: string; text_value: string }>(),
-    env.DB.prepare("SELECT id,label FROM table_select_options WHERE label_search_value IS NULL LIMIT 500").all<{
+    env.DB.prepare(
+      `SELECT id,label FROM table_select_options WHERE label_search_value IS NULL ORDER BY id LIMIT ${TABLE_SEARCH_BACKFILL_PER_KIND}`,
+    ).all<{
       id: string;
       label: string;
     }>(),

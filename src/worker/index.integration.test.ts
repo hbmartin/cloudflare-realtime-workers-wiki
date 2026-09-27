@@ -8427,4 +8427,38 @@ describe("calm workspace task lists", () => {
     expect(width.status).toBe(200);
     expect(await width.json()).toMatchObject({ page: { fullWidth: true } });
   });
+
+  it("backfills at most 25 table cells and 25 select options per invocation", async () => {
+    const installed = await bootstrap();
+    const table = await createPage(installed.cookie, "table");
+    const text = await seedTable(installed, table.id, { column: "text" });
+    const select = await seedTable(installed, table.id, { column: "select" });
+    await seedRows(installed, table.id, 30, { columnId: text.columnId, value: () => "  CafÉ  " });
+    await env.DB.batch(
+      Array.from({ length: 30 }, (_, index) =>
+        env.DB.prepare(`INSERT INTO table_select_options (id,column_id,label,position) VALUES (?,?,?,?)`).bind(
+          crypto.randomUUID(),
+          select.columnId,
+          "  CafÉ  ",
+          index,
+        ),
+      ),
+    );
+
+    const counts = async () => {
+      const [cells, options] = await Promise.all([
+        env.DB.prepare(`SELECT COUNT(*) count FROM table_cells WHERE text_search_value = 'café'`).first<{
+          count: number;
+        }>(),
+        env.DB.prepare(`SELECT COUNT(*) count FROM table_select_options WHERE label_search_value = 'café'`).first<{
+          count: number;
+        }>(),
+      ]);
+      return [cells!.count, options!.count];
+    };
+    await backfillTableSearchValues(env);
+    expect(await counts()).toEqual([25, 25]);
+    await backfillTableSearchValues(env);
+    expect(await counts()).toEqual([30, 30]);
+  });
 });
