@@ -172,7 +172,7 @@ function formatErrorMessages(errors: WorkspaceError[]) {
 type ArchiveResponse = {
   pageIds: string[];
   cleanupPending: boolean;
-  pendingPageCount: number;
+  pendingPageCount: number | null;
 };
 
 function responsePageIds(value: unknown, rootPageId: string) {
@@ -194,6 +194,9 @@ function archiveResponse(value: unknown, rootPageId: string): ArchiveResponse | 
   }
   if (typeof response.cleanupPending !== "boolean") return null;
   const pendingPageCount = response.pendingPageCount;
+  if (response.cleanupPending && pendingPageCount === null) {
+    return { pageIds: uniquePageIds, cleanupPending: true, pendingPageCount: null };
+  }
   if (typeof pendingPageCount !== "number" || !Number.isSafeInteger(pendingPageCount) || pendingPageCount < 0)
     return null;
   if (response.cleanupPending !== pendingPageCount > 0) return null;
@@ -1146,7 +1149,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
   const [archiveCleanupNotice, setArchiveCleanupNotice] = useState<{
     operationId: string;
-    pendingPageCount: number;
+    pendingPageCount: number | null;
   } | null>(null);
   const [trashRefreshVersion, setTrashRefreshVersion] = useState(0);
   const [trashLoading, setTrashLoading] = useState(false);
@@ -1158,9 +1161,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [notificationsRevision, setNotificationsRevision] = useState(0);
-  const [taskRefresh, setTaskRefresh] = useState<{ version: number; pageId: string | null }>({
-    version: 0,
-    pageId: null,
+  const [taskRefresh, setTaskRefresh] = useState<{ allVersion: number; byPageId: Record<string, number> }>({
+    allVersion: 0,
+    byPageId: {},
   });
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -2253,7 +2256,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         return;
       }
       if (event.type === "task-list-invalidated") {
-        setTaskRefresh((current) => ({ version: current.version + 1, pageId: event.pageId }));
+        setTaskRefresh((current) => ({
+          allVersion: current.allVersion + 1,
+          byPageId: {
+            ...current.byPageId,
+            [event.pageId]: (current.byPageId[event.pageId] ?? 0) + 1,
+          },
+        }));
         return;
       }
       if (event.type === "pages-upserted") {
@@ -3443,8 +3452,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         {archiveCleanupNotice && (
           <output className="notice workspace-notice">
             <span>
-              Page archived. Realtime cleanup is continuing in the background for{" "}
-              {archiveCleanupNotice.pendingPageCount} {archiveCleanupNotice.pendingPageCount === 1 ? "page" : "pages"}.
+              {archiveCleanupNotice.pendingPageCount === null ? (
+                "Page archived. Realtime cleanup may still be continuing in the background."
+              ) : (
+                <>
+                  Page archived. Realtime cleanup is continuing in the background for{" "}
+                  {archiveCleanupNotice.pendingPageCount}{" "}
+                  {archiveCleanupNotice.pendingPageCount === 1 ? "page" : "pages"}.
+                </>
+              )}
             </span>
             <button
               type="button"
@@ -3612,7 +3628,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         </header>
 
         {view === "tasks" ? (
-          <TasksView member={member} onSelectPage={navigateToPage} refreshVersion={taskRefresh.version} />
+          <TasksView member={member} onSelectPage={navigateToPage} refreshVersion={taskRefresh.allVersion} />
         ) : view === "home" ? (
           <RecentPages pages={pages} recentIds={recentIds} onSelect={navigateToPage} />
         ) : view === "search" ? (
@@ -3676,7 +3692,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               metadata={metadata}
               onSelectPage={navigateToPage}
               onPageChanged={updatePage}
-              refreshVersion={taskRefresh.pageId === activeSelected.id ? taskRefresh.version : 0}
+              refreshVersion={taskRefresh.byPageId[activeSelected.id] ?? 0}
             />
           ) : activeSelected.kind === "document" ? (
             <EditorPage

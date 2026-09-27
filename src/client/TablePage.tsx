@@ -354,6 +354,7 @@ export function TablePage({
   // Kept apart from leaseError: a successful renewal clears the lease notice on
   // every interval and would otherwise erase an unsaved-edit warning.
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [iconError, setIconError] = useState<string | null>(null);
   // Mirrors revisionRef for rendering: a mutation that failed with an unknown
   // outcome drops the revision, and polling has to resume to recover it.
   const [revisionKnown, setRevisionKnown] = useState(false);
@@ -2055,6 +2056,7 @@ export function TablePage({
   const notices = uniqueTableNotices([
     leaseError ? { message: leaseError, danger: false } : null,
     saveError ? { message: saveError, danger: true } : null,
+    iconError ? { message: iconError, danger: true } : null,
     revisionRecoveryPending ? { message: STALE_REFRESH_MESSAGE, danger: false } : null,
     revisionRecoveryError ? { message: revisionRecoveryError, danger: true } : null,
     loadError ? { message: loadError.message, danger: true } : null,
@@ -2078,9 +2080,12 @@ export function TablePage({
                     method: "PATCH",
                     body: json({ icon: icon || null, revision: page.revision }),
                   });
-                  if (isMounted()) onPageChanged(result.page);
+                  if (isMounted()) {
+                    setIconError(null);
+                    onPageChanged(result.page);
+                  }
                 } catch (cause) {
-                  if (isMounted()) setSaveError(apiErrorMessage(cause, "The page icon could not be saved."));
+                  if (isMounted()) setIconError(apiErrorMessage(cause, "The page icon could not be saved."));
                 }
               }}
             >

@@ -4189,6 +4189,27 @@ async function processArchiveSubtreeDisconnects(
   };
 }
 
+async function archiveCleanupAfterCommit(
+  env: Env,
+  rootPageId: string,
+  ownership: ArchiveDisconnectOwnership,
+  timestamp: number,
+  route: "task_patch" | "task_detail_delete" | "page_delete",
+) {
+  try {
+    return await processArchiveSubtreeDisconnects(env, rootPageId, ownership, timestamp);
+  } catch (error) {
+    logger.error(
+      "archive.cleanup.failed",
+      "archive",
+      "Archive committed, but immediate disconnect cleanup could not be verified.",
+      { route, rootPageId, operationId: "operationId" in ownership ? ownership.operationId : null },
+      error,
+    );
+    return { cleanupPending: true as const, pendingPageCount: null };
+  }
+}
+
 app.delete("/api/pages/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireEditor(member);
@@ -4209,12 +4230,14 @@ app.delete("/api/pages/:id", async (c) => {
       .bind(page.id)
       .all<{ id: string }>();
     const pageIds = archived.results.map((p) => p.id);
+    sendWorkspaceEvent(c, member.workspace.id, { type: "task-list-invalidated", pageId: task.list_id });
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
-    const cleanup = await processArchiveSubtreeDisconnects(
+    const cleanup = await archiveCleanupAfterCommit(
       c.env,
       page.id,
       { operationId: taskArchiveOperationId },
       now(),
+      "task_detail_delete",
     );
     return c.json({ ok: true, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
   }
@@ -4276,7 +4299,7 @@ app.delete("/api/pages/:id", async (c) => {
     permanently: false,
     ...(operationId ? { operationId } : {}),
   });
-  const cleanup = await processArchiveSubtreeDisconnects(c.env, page.id, archiveOwnership, timestamp);
+  const cleanup = await archiveCleanupAfterCommit(c.env, page.id, archiveOwnership, timestamp, "page_delete");
   return c.json(
     {
       ok: true,
@@ -5503,7 +5526,7 @@ app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
   const pageIds = archived.results.map((page) => page.id);
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
   const operationId = typeof body.operationId === "string" ? body.operationId : "";
-  const cleanup = await processArchiveSubtreeDisconnects(c.env, result.detailPageId, { operationId }, now());
+  const cleanup = await archiveCleanupAfterCommit(c.env, result.detailPageId, { operationId }, now(), "task_patch");
   return c.json({ ...result, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
 });
 

@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext, Page } from "../shared/types";
-import type { Task } from "../shared/tasks";
+import type { Task, TaskResponse } from "../shared/tasks";
 import { api, ApiClientError } from "./api";
 import { TasksView } from "./TasksView";
 vi.mock("./api", async (original) => ({ ...(await original<typeof import("./api")>()), api: vi.fn() }));
@@ -201,6 +201,286 @@ describe("task views", () => {
     render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
     expect(await screen.findByLabelText("Assignee for Ship release")).toHaveValue("former");
     expect(screen.getByRole("option", { name: "Former member" })).toHaveValue("former");
+  });
+  it("refreshes loaded pages after archiving and uses the new cursor to load more", async () => {
+    const original = vi.mocked(api).getMockImplementation()!;
+    const later = { ...fixture, id: "later", title: "Later task", detailPageId: "later-details" };
+    const next = { ...fixture, id: "next", title: "Next task", detailPageId: "next-details" };
+    const final = { ...fixture, id: "final", title: "Final task", detailPageId: "final-details" };
+    let archived = false;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/tasks?")) {
+        const cursor = new URL(path, "https://example.test").searchParams.get("cursor");
+        if (!cursor) return { tasks: [fixture], hasMore: true, nextCursor: "second" };
+        if (cursor === "second")
+          return { tasks: [archived ? next : later], hasMore: true, nextCursor: archived ? "refreshed" : "old" };
+        if (cursor === "refreshed") return { tasks: [final], hasMore: false, nextCursor: null };
+        throw new Error(`Unexpected cursor ${cursor}`);
+      }
+      if (path === "/api/task-lists/list/tasks/later") {
+        archived = true;
+        return {
+          revision: ++revision,
+          detailPageId: later.detailPageId,
+          pageIds: [later.detailPageId],
+          cleanupPending: true,
+          pendingPageCount: null,
+        };
+      }
+      return original(path, init);
+    });
+    render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit tasks" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Load more tasks" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Load more tasks" }));
+    expect(await screen.findByRole("button", { name: "Later task" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Actions for Later task" }));
+    fireEvent.click(
+      within(document.querySelector(".action-menu-portal")!).getByRole("button", { name: "Move to trash" }),
+    );
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Later task" })).toBeNull());
+    expect(
+      JSON.parse(
+        String(vi.mocked(api).mock.calls.find(([path]) => path === "/api/task-lists/list/tasks/later")?.[1]?.body),
+      ),
+    ).toMatchObject({ archived: true });
+    expect(screen.getByRole("button", { name: "Ship release" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Next task" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Load more tasks" }));
+    expect(await screen.findByRole("button", { name: "Final task" })).toBeInTheDocument();
+    expect(vi.mocked(api).mock.calls.some(([path]) => path.includes("cursor=refreshed"))).toBe(true);
+  });
+  it("removes a task that leaves the selected filter", async () => {
+    const original = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/tasks?")) {
+        const status = new URL(path, "https://example.test").searchParams.get("status");
+        return { tasks: status === "todo" && task.status !== "todo" ? [] : [task], hasMore: false, nextCursor: null };
+      }
+      return original(path, init);
+    });
+    render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Task status filter"), { target: { value: "todo" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Edit tasks" }));
+    const status = await screen.findByLabelText("Status for Ship release");
+    await waitFor(() => expect(status).toBeEnabled());
+    fireEvent.change(status, { target: { value: "done" } });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Ship release" })).toBeNull());
+  });
+  it("resets loaded depth when filters change and ignores an older refresh", async () => {
+    const original = vi.mocked(api).getMockImplementation()!;
+    const later = { ...fixture, id: "later", title: "Later task", detailPageId: "later-details" };
+    const done = { ...fixture, id: "done", title: "Done task", detailPageId: "done-details", status: "done" as const };
+    let resolveOlder: ((value: { tasks: Task[]; hasMore: boolean; nextCursor: string | null }) => void) | null = null;
+    let pauseRefresh = false;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/tasks?")) {
+        const params = new URL(path, "https://example.test").searchParams;
+        if (params.get("status") === "done") {
+          if (params.has("cursor")) throw new Error("The new filter should start with one loaded page.");
+          return { tasks: [done], hasMore: true, nextCursor: "done-second" };
+        }
+        if (params.get("cursor") === "second") return { tasks: [later], hasMore: false, nextCursor: null };
+        if (pauseRefresh)
+          return new Promise((resolve) => {
+            resolveOlder = resolve;
+          });
+        return { tasks: [fixture], hasMore: true, nextCursor: "second" };
+      }
+      return original(path, init);
+    });
+    render(<TasksView member={member} onSelectPage={vi.fn()} />);
+    await screen.findByRole("button", { name: "Load more tasks" });
+    fireEvent.click(screen.getByRole("button", { name: "Load more tasks" }));
+    expect(await screen.findByRole("button", { name: "Later task" })).toBeInTheDocument();
+    pauseRefresh = true;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(resolveOlder).not.toBeNull());
+    fireEvent.change(screen.getByLabelText("Task status filter"), { target: { value: "done" } });
+    expect(await screen.findByRole("button", { name: "Done task" })).toBeInTheDocument();
+    expect(
+      vi
+        .mocked(api)
+        .mock.calls.filter(([path]) => path.startsWith("/api/tasks?") && path.includes("status=done"))
+        .every(([path]) => !path.includes("cursor=")),
+    ).toBe(true);
+    resolveOlder!({ tasks: [fixture], hasMore: true, nextCursor: "second" });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Ship release" })).toBeNull());
+    expect(screen.queryByRole("button", { name: "Later task" })).toBeNull();
+  });
+  it("keeps a confirmed archive removed when a later page fails to refresh", async () => {
+    const original = vi.mocked(api).getMockImplementation()!;
+    const later = { ...fixture, id: "later", title: "Later task", detailPageId: "later-details" };
+    let failLater = false;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/tasks?")) {
+        const cursor = new URL(path, "https://example.test").searchParams.get("cursor");
+        if (!cursor)
+          return {
+            tasks: [failLater ? { ...fixture, title: "Changed remotely" } : fixture],
+            hasMore: true,
+            nextCursor: "second",
+          };
+        if (failLater) throw new ApiClientError(503, "tasks_unavailable", "Refresh failed.");
+        return { tasks: [later], hasMore: false, nextCursor: null };
+      }
+      if (path === "/api/task-lists/list/tasks/later")
+        return { revision: ++revision, detailPageId: later.detailPageId };
+      return original(path, init);
+    });
+    render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit tasks" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Load more tasks" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Load more tasks" }));
+    expect(await screen.findByRole("button", { name: "Later task" })).toBeInTheDocument();
+    failLater = true;
+    fireEvent.click(screen.getByRole("button", { name: "Actions for Later task" }));
+    fireEvent.click(
+      within(document.querySelector(".action-menu-portal")!).getByRole("button", { name: "Move to trash" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("Refresh failed.");
+    expect(screen.queryByRole("button", { name: "Later task" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Ship release" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Changed remotely" })).toBeNull();
+  });
+  it("pauses automatic requests beyond two pages but refreshes all opened pages on demand and after saves", async () => {
+    const original = vi.mocked(api).getMockImplementation()!;
+    const second = { ...fixture, id: "second", title: "Second task", detailPageId: "second-details" };
+    const third = { ...fixture, id: "third", title: "Third task", detailPageId: "third-details" };
+    const poll = vi.spyOn(globalThis, "setInterval");
+    const cursors: Array<string | null> = [];
+    let failThird = false;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/tasks?")) {
+        const cursor = new URL(path, "https://example.test").searchParams.get("cursor");
+        cursors.push(cursor);
+        if (!cursor) return { tasks: [fixture], hasMore: true, nextCursor: "second" };
+        if (cursor === "second") return { tasks: [second], hasMore: true, nextCursor: "third" };
+        if (cursor === "third") {
+          if (failThird) throw new ApiClientError(503, "tasks_unavailable", "Later page unavailable.");
+          return { tasks: [third], hasMore: false, nextCursor: null };
+        }
+      }
+      if (path === "/api/task-lists/list/tasks/third" && init?.method === "PATCH") {
+        third.status = "done";
+        return { revision: 2, detailPageId: third.detailPageId };
+      }
+      return original(path, init);
+    });
+    const view = render(<TasksView member={member} onSelectPage={vi.fn()} refreshVersion={0} />);
+    await screen.findByRole("button", { name: "Load more tasks" });
+    fireEvent.click(screen.getByRole("button", { name: "Load more tasks" }));
+    await screen.findByRole("button", { name: "Second task" });
+    fireEvent.click(screen.getByRole("button", { name: "Load more tasks" }));
+    await screen.findByRole("button", { name: "Third task" });
+    expect(screen.getByText(/Automatic updates paused/)).toBeInTheDocument();
+    const beforeAuto = cursors.length;
+    const pollCallback = poll.mock.calls.find(([, delay]) => delay === 30_000)?.[0];
+    expect(pollCallback).toBeTypeOf("function");
+    act(() => (pollCallback as () => void)());
+    view.rerender(<TasksView member={member} onSelectPage={vi.fn()} refreshVersion={1} />);
+    expect(cursors).toHaveLength(beforeAuto);
+    expect(screen.getByText(/Updates available/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(cursors).toHaveLength(beforeAuto + 3));
+    expect(cursors.slice(-3)).toEqual([null, "second", "third"]);
+    expect(screen.getByText(/Automatic updates paused/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Third task" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Status for Third task"), { target: { value: "done" } });
+    await waitFor(() => expect(cursors).toHaveLength(beforeAuto + 6));
+    expect(cursors.slice(-3)).toEqual([null, "second", "third"]);
+    expect(screen.getByRole("button", { name: "Second task" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Third task" })).toBeInTheDocument();
+    failThird = true;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Later page unavailable.");
+    expect(cursors.slice(-3)).toEqual([null, "second", "third"]);
+    expect(screen.getByRole("button", { name: "Ship release" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Second task" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Third task" })).toBeInTheDocument();
+    poll.mockRestore();
+  });
+  it("keeps an event visible if it arrives during a long refresh, then resets depth on filter change", async () => {
+    const original = vi.mocked(api).getMockImplementation()!;
+    const second = { ...fixture, id: "second", title: "Second task", detailPageId: "second-details" };
+    const third = { ...fixture, id: "third", title: "Third task", detailPageId: "third-details" };
+    let holdRefresh = false;
+    let resolveSecond: ((value: TaskResponse) => void) | null = null;
+    const cursors: Array<string | null> = [];
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/tasks?")) {
+        const params = new URL(path, "https://example.test").searchParams;
+        const cursor = params.get("cursor");
+        cursors.push(cursor);
+        if (params.get("status") === "done") return { tasks: [], hasMore: false, nextCursor: null };
+        if (!cursor) return { tasks: [fixture], hasMore: true, nextCursor: "second" };
+        if (cursor === "second") {
+          if (holdRefresh)
+            return new Promise<TaskResponse>((resolve) => {
+              resolveSecond = resolve;
+            });
+          return { tasks: [second], hasMore: true, nextCursor: "third" };
+        }
+        if (cursor === "third") return { tasks: [third], hasMore: false, nextCursor: null };
+      }
+      return original(path, init);
+    });
+    const view = render(<TasksView member={member} onSelectPage={vi.fn()} refreshVersion={0} />);
+    await screen.findByRole("button", { name: "Load more tasks" });
+    fireEvent.click(screen.getByRole("button", { name: "Load more tasks" }));
+    await screen.findByRole("button", { name: "Second task" });
+    fireEvent.click(screen.getByRole("button", { name: "Load more tasks" }));
+    await screen.findByRole("button", { name: "Third task" });
+    holdRefresh = true;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(resolveSecond).not.toBeNull());
+    view.rerender(<TasksView member={member} onSelectPage={vi.fn()} refreshVersion={1} />);
+    expect(screen.getByText(/Updates available/)).toBeInTheDocument();
+    holdRefresh = false;
+    await act(async () => resolveSecond!({ tasks: [second], hasMore: true, nextCursor: "third" }));
+    await waitFor(() => expect(cursors.slice(-3)).toEqual([null, "second", "third"]));
+    expect(screen.getByText(/Updates available/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Task status filter"), { target: { value: "done" } });
+    await waitFor(() => expect(screen.queryByText(/Updates available/)).toBeNull());
+    expect(screen.queryByText(/Automatic updates paused/)).toBeNull();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Third task" })).toBeNull());
+    expect(cursors.at(-1)).toBeNull();
+  });
+  it("coalesces shallow task events into one trailing refresh and skips a poll during loading", async () => {
+    const original = vi.mocked(api).getMockImplementation()!;
+    const poll = vi.spyOn(globalThis, "setInterval");
+    let defer = false;
+    let resolveRefresh: ((value: TaskResponse) => void) | null = null;
+    let loads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/tasks?")) {
+        loads++;
+        if (defer) {
+          defer = false;
+          return new Promise<TaskResponse>((resolve) => {
+            resolveRefresh = resolve;
+          });
+        }
+        return { tasks: [fixture], hasMore: false, nextCursor: null };
+      }
+      return original(path, init);
+    });
+    const view = render(<TasksView member={member} onSelectPage={vi.fn()} refreshVersion={0} />);
+    await screen.findByRole("button", { name: "Ship release" });
+    defer = true;
+    view.rerender(<TasksView member={member} onSelectPage={vi.fn()} refreshVersion={1} />);
+    await waitFor(() => expect(resolveRefresh).not.toBeNull());
+    view.rerender(<TasksView member={member} onSelectPage={vi.fn()} refreshVersion={2} />);
+    view.rerender(<TasksView member={member} onSelectPage={vi.fn()} refreshVersion={3} />);
+    const pollCallback = poll.mock.calls.find(([, delay]) => delay === 30_000)?.[0];
+    act(() => (pollCallback as () => void)());
+    expect(loads).toBe(2);
+    await act(async () => resolveRefresh!({ tasks: [fixture], hasMore: false, nextCursor: null }));
+    await waitFor(() => expect(loads).toBe(3));
+    await act(async () => (pollCallback as () => void)());
+    await waitFor(() => expect(loads).toBe(4));
+    poll.mockRestore();
   });
   it("keeps viewer properties read-only while allowing access to details", async () => {
     render(<TasksView page={page} member={{ ...member, role: "viewer" }} onSelectPage={vi.fn()} />);

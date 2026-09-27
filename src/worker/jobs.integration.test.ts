@@ -2439,12 +2439,14 @@ describe("job execution", () => {
       },
       {
         path: "Project 0123456789abcdef0123456789abcdef/Tasks aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.csv",
-        bytes: encoder.encode("Task,Done,Estimate\nShip,yes,2\n"),
+        bytes: encoder.encode("Task,State,Done,Estimate\nCAFÉ Alpha,À faire,yes,2\n"),
       },
       {
         // Notion ships a view-filtered CSV next to the unfiltered `_all` CSV; only the latter is imported.
         path: "Project 0123456789abcdef0123456789abcdef/Tasks aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_all.csv",
-        bytes: encoder.encode("Task,Done,Estimate\nShip,yes,2\nTest,no,3\n"),
+        bytes: encoder.encode(
+          "Task,State,Done,Estimate\nCAFÉ Alpha,À faire,yes,2\nOther,Done,no,3\nCAFÉ Beta,À faire,yes,4\nThird,Done,no,5\n",
+        ),
       },
       {
         path: "Project 0123456789abcdef0123456789abcdef/photo.png",
@@ -2490,7 +2492,35 @@ describe("job execution", () => {
     expect(tasks).toMatchObject({ parentId: project.id, kind: "table" });
     expect(
       await env.DB.prepare(`SELECT COUNT(*) count FROM table_rows WHERE page_id = ?`).bind(tasks.id).first(),
-    ).toMatchObject({ count: 2 });
+    ).toMatchObject({ count: 4 });
+    const textSearchValues = await env.DB.prepare(
+      `SELECT cell.text_search_value value FROM table_cells cell
+       JOIN table_columns column ON column.id = cell.column_id
+       WHERE column.page_id = ? AND column.name = 'Task' ORDER BY value`,
+    )
+      .bind(tasks.id)
+      .all<{ value: string }>();
+    expect(textSearchValues.results.map((row) => row.value)).toContain("café alpha");
+    const optionSearchValues = await env.DB.prepare(
+      `SELECT option.label_search_value value FROM table_select_options option
+       JOIN table_columns column ON column.id = option.column_id
+       WHERE column.page_id = ? AND column.name = 'State' ORDER BY value`,
+    )
+      .bind(tasks.id)
+      .all<{ value: string }>();
+    expect(optionSearchValues.results.map((row) => row.value)).toContain("à faire");
+    for (const [query, count] of [
+      ["café", 2],
+      ["à faire", 2],
+    ] as const) {
+      const filtered = await worker.fetch(
+        request(installed.cookie, `/api/tables/${tasks.id}?q=${encodeURIComponent(query)}&limit=10`),
+        env,
+        createExecutionContext(),
+      );
+      expect(filtered.status).toBe(200);
+      expect((await filtered.json<{ table: { rows: unknown[] } }>()).table.rows).toHaveLength(count);
+    }
     expect(
       await env.DB.prepare(`SELECT name FROM attachments WHERE page_id = ?`).bind(project.id).first(),
     ).toMatchObject({ name: "photo.png" });

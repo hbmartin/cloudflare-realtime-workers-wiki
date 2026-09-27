@@ -235,6 +235,35 @@ describe("TablePage", () => {
     await act(async () => patch.reject(new Error("offline")));
   });
 
+  it("keeps a failed cell-save warning through an icon failure and successful retry", async () => {
+    let iconAttempts = 0;
+    vi.spyOn(window, "prompt").mockReturnValue("🔥");
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${page.id}` && init?.method === "PATCH") {
+        iconAttempts += 1;
+        if (iconAttempts === 1) throw new Error("offline");
+        return { page: { ...page, icon: "🔥", revision: 2 } };
+      }
+      if (path.includes("/cells/")) throw new ApiClientError(422, "invalid_cell", "This cell value is invalid.");
+      if (path.endsWith("/lease") && init?.method === "POST") return leaseResult();
+      return { table };
+    });
+    await renderActiveEditor();
+    const input = screen.getByDisplayValue("Ready");
+    fireEvent.change(input, { target: { value: "Invalid" } });
+    fireEvent.blur(input);
+    expect(await screen.findByText("This cell value is invalid.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Page details" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+    expect(await screen.findByText("The page icon could not be saved.")).toBeInTheDocument();
+    expect(screen.getByText("This cell value is invalid.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+    await waitFor(() => expect(screen.queryByText("The page icon could not be saved.")).not.toBeInTheDocument());
+    expect(screen.getByText("This cell value is invalid.")).toBeInTheDocument();
+  });
+
   it("keeps the read-only row-actions column aligned when only some rows have detail pages", async () => {
     const onSelectPage = vi.fn();
     vi.mocked(api).mockResolvedValue({

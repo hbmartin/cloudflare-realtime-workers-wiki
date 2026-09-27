@@ -12,6 +12,7 @@ import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import type { ProseMirrorJson } from "../shared/document-projection";
 import { PAGE_TITLE_MAX } from "../shared/validation";
+import { logger } from "./observability";
 
 const plain = (text: string) => ({ type: "plain_text", text: text.slice(0, 150) });
 
@@ -81,6 +82,18 @@ function errorText(error: unknown) {
   return error instanceof HttpError
     ? error.message
     : "This action could not be completed. Try again; repeated submissions are safe.";
+}
+function submissionErrorText(error: unknown) {
+  const message = errorText(error);
+  return error instanceof HttpError && error.code === "slack_unavailable"
+    ? `${message} Then reopen this form from /notes.`
+    : message;
+}
+function logInteractionFailure(payload: SlackInteractionPayload, error: unknown) {
+  logger.warn("slack.interaction.failed", "slack", "Slack product interaction failed.", {
+    interactionType: typeof payload.type === "string" ? payload.type : "unknown",
+    code: error instanceof HttpError ? error.code : "unexpected",
+  });
 }
 async function installationForTeam(env: Env, team: unknown) {
   if (typeof team !== "string")
@@ -600,7 +613,8 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
           }
         }
       }
-      return { handled: true, response: { response_action: "errors", errors: { title: errorText(error) } } };
+      logInteractionFailure(payload, error);
+      return { handled: true, response: { response_action: "errors", errors: { title: submissionErrorText(error) } } };
     }
   }
   const shortcut =
@@ -810,6 +824,15 @@ export async function acceptSlackProductInteraction(env: Env, payload: SlackInte
   try {
     return await acceptProductInteraction(env, payload, deadlineAt);
   } catch (error) {
+    logInteractionFailure(payload, error);
+    if (payload.type === "view_submission" && payload.view?.callback_id === CALLBACK)
+      return {
+        handled: true,
+        response: {
+          response_action: "errors",
+          errors: { title: submissionErrorText(error) },
+        },
+      };
     if (typeof payload.trigger_id === "string") {
       const installation = await installationForTeam(env, payload.team?.id).catch(() => null);
       if (installation)

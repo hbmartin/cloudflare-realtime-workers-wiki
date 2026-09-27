@@ -69,6 +69,7 @@ export function ActionMenu({
       menu.style.top = `${Math.max(8, Math.min(anchor.bottom + 4, window.innerHeight - menu.offsetHeight - 8))}px`;
     };
     position();
+    menu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
     const close = (event: PointerEvent) => {
       const target = event.target as Node;
       if (!details.contains(target) && !menu.contains(target)) {
@@ -118,6 +119,7 @@ export function ActionMenu({
             if (!details) return;
             details.open = !details.open;
             setOpen(details.open);
+            if (!details.open) details.querySelector("summary")?.focus();
           }}
         >
           <Icon name={icon} />

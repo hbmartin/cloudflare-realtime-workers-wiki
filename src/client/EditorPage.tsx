@@ -73,6 +73,7 @@ export function EditorPage({
   const [title, setTitle] = useState(page.title);
   const [titleError, setTitleError] = useState("");
   const [editorError, setEditorError] = useState("");
+  const [iconError, setIconError] = useState("");
   const titleRef = useRef<HTMLInputElement>(null);
   const titlePageIdRef = useRef(page.id);
   const titleRevisionRef = useRef(page.revision);
@@ -89,6 +90,7 @@ export function EditorPage({
       setTitle(page.title);
       setTitleError("");
       setEditorError("");
+      setIconError("");
       return;
     }
     if (!titleDirtyRef.current && document.activeElement !== titleRef.current) {
@@ -216,8 +218,9 @@ export function EditorPage({
                     body: json({ icon: icon || null, revision: page.revision }),
                   });
                   onPageChanged(result.page);
+                  setIconError("");
                 } catch (error) {
-                  setEditorError(apiErrorMessage(error, "The page icon could not be saved."));
+                  setIconError(apiErrorMessage(error, "The page icon could not be saved."));
                 }
               }}
             >
@@ -364,6 +367,11 @@ export function EditorPage({
           {editorError && (
             <p className="form-error" role="alert">
               {editorError}
+            </p>
+          )}
+          {iconError && (
+            <p className="form-error" role="alert">
+              {iconError}
             </p>
           )}
           {bundle ? (

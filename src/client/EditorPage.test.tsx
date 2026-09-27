@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
 import type { ClientMemberContext } from "../shared/types";
@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => {
     handlers,
     provider,
     ready: Promise.resolve() as Promise<void>,
+    slashItems: null as null | ((query: string) => Promise<Array<{ title: string; onItemClick: () => void }>>),
     unsynced: false,
   };
 });
@@ -75,7 +76,17 @@ vi.mock("@blocknote/mantine", () => ({
 }));
 
 vi.mock("@blocknote/react", () => ({
-  SuggestionMenuController: () => null,
+  getDefaultReactSlashMenuItems: () => [],
+  SuggestionMenuController: ({
+    getItems,
+    triggerCharacter,
+  }: {
+    getItems: typeof mocks.slashItems;
+    triggerCharacter: string;
+  }) => {
+    if (triggerCharacter === "/") mocks.slashItems = getItems;
+    return null;
+  },
   ThreadsSidebar: () => <div data-testid="thread-sidebar" />,
   useCreateBlockNote: () => ({ insertInlineContent: vi.fn() }),
 }));
@@ -133,6 +144,7 @@ describe("EditorPage close reconciliation", () => {
     mocks.provider.disconnect.mockReset();
     mocks.provider.on.mockClear();
     mocks.ready = Promise.resolve();
+    mocks.slashItems = null;
     mocks.unsynced = false;
     Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
     localStorage.clear();
@@ -277,5 +289,46 @@ describe("EditorPage close reconciliation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(message);
+  });
+
+  it("keeps an editor error through an icon failure and successful retry", async () => {
+    vi.useRealTimers();
+    let iconAttempts = 0;
+    vi.spyOn(window, "prompt").mockReturnValue("🔥");
+    mocks.api.mockImplementation(async (path, init) => {
+      if (path === "/api/pages" && init?.method === "POST")
+        throw new ApiClientError(503, "unavailable", "The sub-page could not be created now.");
+      if (path === `/api/pages/${page.id}` && init?.method === "PATCH") {
+        iconAttempts += 1;
+        if (iconAttempts === 1) throw new Error("offline");
+        return { page: { ...page, icon: "🔥", revision: 2 } };
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await waitFor(() => expect(mocks.slashItems).toBeTypeOf("function"));
+    const items = await mocks.slashItems!("");
+    await act(async () => items.find((item) => item.title === "Sub-page")!.onItemClick());
+    expect(await screen.findByText("The sub-page could not be created now.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Page details" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+    expect(await screen.findByText("The page icon could not be saved.")).toBeInTheDocument();
+    expect(screen.getByText("The sub-page could not be created now.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Page details" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+    await waitFor(() => expect(screen.queryByText("The page icon could not be saved.")).not.toBeInTheDocument());
+    expect(screen.getByText("The sub-page could not be created now.")).toBeInTheDocument();
   });
 });
