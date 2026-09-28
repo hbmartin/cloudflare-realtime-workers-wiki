@@ -13,6 +13,8 @@ export type Task = {
   dueDate: string | null;
   detailPageId: string;
   revision: number;
+  updatedAt: number;
+  position: number;
   editable: boolean;
 };
 export type TaskResponse = { tasks: Task[]; hasMore: boolean; nextCursor: string | null };

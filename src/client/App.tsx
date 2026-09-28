@@ -1177,10 +1177,52 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [notificationsRevision, setNotificationsRevision] = useState(0);
-  const [taskRefresh, setTaskRefresh] = useState<{ allVersion: number; byPageId: Record<string, number> }>({
+  const [taskRefresh, setTaskRefresh] = useState<{
+    allVersion: number;
+    byPageId: Record<string, number>;
+    mineForceVersion: number;
+    byPageForceId: Record<string, number>;
+    globalForceVersion: number;
+  }>({
     allVersion: 0,
     byPageId: {},
+    mineForceVersion: 0,
+    byPageForceId: {},
+    globalForceVersion: 0,
   });
+  const localTaskOperations = useRef(new Map<string, { pageId: string; echo: boolean; force: boolean }>());
+  const invalidateTaskList = useCallback((pageId: string, force: boolean) => {
+    setTaskRefresh((current) =>
+      force
+        ? {
+            ...current,
+            mineForceVersion: current.mineForceVersion + 1,
+            byPageForceId: { ...current.byPageForceId, [pageId]: (current.byPageForceId[pageId] ?? 0) + 1 },
+          }
+        : {
+            ...current,
+            allVersion: current.allVersion + 1,
+            byPageId: { ...current.byPageId, [pageId]: (current.byPageId[pageId] ?? 0) + 1 },
+          },
+    );
+  }, []);
+  const startTaskOperation = useCallback((operationId: string, pageId: string) => {
+    const operations = localTaskOperations.current;
+    operations.set(operationId, { pageId, echo: false, force: false });
+    if (operations.size > 100) operations.delete(operations.keys().next().value!);
+  }, []);
+  const settleTaskOperation = useCallback(
+    (operationId: string, reconciled: boolean) => {
+      const operations = localTaskOperations.current;
+      const operation = operations.get(operationId);
+      if (!operation) return;
+      if (!reconciled) {
+        operations.delete(operationId);
+        if (operation.echo) invalidateTaskList(operation.pageId, operation.force);
+      }
+    },
+    [invalidateTaskList],
+  );
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [jobsLoading, setJobsLoading] = useState(false);
@@ -2283,13 +2325,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         return;
       }
       if (event.type === "task-list-invalidated") {
-        setTaskRefresh((current) => ({
-          allVersion: current.allVersion + 1,
-          byPageId: {
-            ...current.byPageId,
-            [event.pageId]: (current.byPageId[event.pageId] ?? 0) + 1,
-          },
-        }));
+        const operation = event.operationId ? localTaskOperations.current.get(event.operationId) : undefined;
+        if (operation) {
+          operation.echo = true;
+          operation.force ||= Boolean(event.forceRefresh);
+          return;
+        }
+        invalidateTaskList(event.pageId, Boolean(event.forceRefresh));
+        return;
+      }
+      if (event.type === "tasks-invalidated") {
+        setTaskRefresh((current) => ({ ...current, globalForceVersion: current.globalForceVersion + 1 }));
         return;
       }
       if (event.type === "pages-upserted") {
@@ -2358,6 +2404,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       loadOrganization,
       loadUnreadNotifications,
       loadUnreadMentions,
+      invalidateTaskList,
       activitiesOpen,
       member.user.id,
       selectedId,
@@ -3676,7 +3723,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         </header>
 
         {view === "tasks" ? (
-          <TasksView member={member} onSelectPage={navigateToPage} refreshVersion={taskRefresh.allVersion} />
+          <TasksView
+            member={member}
+            onSelectPage={navigateToPage}
+            refreshVersion={taskRefresh.allVersion}
+            forceRefreshVersion={taskRefresh.mineForceVersion + taskRefresh.globalForceVersion}
+            onTaskOperationStart={startTaskOperation}
+            onTaskOperationSettled={settleTaskOperation}
+          />
         ) : view === "home" ? (
           <RecentPages pages={pages} recentIds={recentIds} onSelect={navigateToPage} />
         ) : view === "search" ? (
@@ -3741,6 +3795,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               onSelectPage={navigateToPage}
               onPageChanged={updatePage}
               refreshVersion={taskRefresh.byPageId[activeSelected.id] ?? 0}
+              forceRefreshVersion={(taskRefresh.byPageForceId[activeSelected.id] ?? 0) + taskRefresh.globalForceVersion}
+              onTaskOperationStart={startTaskOperation}
+              onTaskOperationSettled={settleTaskOperation}
             />
           ) : activeSelected.kind === "document" ? (
             <EditorPage

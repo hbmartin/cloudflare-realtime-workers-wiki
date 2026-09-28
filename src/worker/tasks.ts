@@ -17,6 +17,7 @@ import { TABLE_MAX_ROWS } from "../shared/table-limits";
 import { notificationFanoutStatements } from "./notifications";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import { normalizeSearchValue } from "../shared/search-normalization";
+import { logger } from "./observability";
 
 export function taskListStatements(db: D1Database, pageId: string) {
   const columns = taskColumns(pageId);
@@ -97,7 +98,7 @@ export async function listTasks(
     q?: string | undefined;
     cursor?: string | undefined;
     limit?: number;
-    rowId?: string;
+    rowId?: string | undefined;
     includeArchived?: boolean;
   } = {},
 ): Promise<TaskResponse> {
@@ -188,6 +189,8 @@ export async function listTasks(
     dueDate: r.due_date,
     detailPageId: r.detail_page_id,
     revision: r.revision,
+    updatedAt: r.updated_at,
+    position: r.position,
     editable: effectiveSpaceRole(member.role, r.visibility, r.space_role) !== "viewer",
   }));
   const last = rows.results.length > limit ? rows.results[limit - 1] : undefined;
@@ -276,7 +279,13 @@ export async function mutateTask(
   if (replay) {
     if (replay.request_hash !== hash)
       throw new HttpError(409, "idempotency_key_reused", "That operation ID describes a different change.");
-    return { rowId: replay.row_id, detailPageId: replay.detail_page_id, revision: replay.revision, replayed: true };
+    return {
+      rowId: replay.row_id,
+      detailPageId: replay.detail_page_id,
+      revision: replay.revision,
+      replayed: true,
+      pageIds: body.archived === true ? [replay.detail_page_id] : undefined,
+    };
   }
   const previous = rowId
     ? (await listTasks(env, member, { listId, rowId, includeArchived: body.archived === false })).tasks[0]
@@ -535,12 +544,27 @@ export async function mutateTask(
           taskOperationId: operationId,
         }),
       );
-    await env.DB.batch(statements);
-    const receipt = await env.DB.prepare(
-      "SELECT request_hash,revision FROM task_mutation_receipts WHERE workspace_id=? AND actor_id=? AND operation_id=?",
-    )
-      .bind(member.workspace.id, member.user.id, operationId)
-      .first<{ request_hash: string; revision: number }>();
+    statements.push(
+      ...(typeof body.archived === "boolean"
+        ? refreshPageSearchV2SubtreeStatements(env.DB, detailId)
+        : refreshPageSearchV2Statements(env.DB, detailId)),
+    );
+    const receiptIndex = statements.length;
+    statements.push(
+      env.DB.prepare(
+        "SELECT request_hash,revision FROM task_mutation_receipts WHERE workspace_id=? AND actor_id=? AND operation_id=?",
+      ).bind(member.workspace.id, member.user.id, operationId),
+    );
+    const subtreeIndex = body.archived === true ? statements.length : -1;
+    if (subtreeIndex !== -1)
+      statements.push(
+        env.DB.prepare(
+          `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id)
+       SELECT id FROM subtree`,
+        ).bind(detailId),
+      );
+    const batch = await env.DB.batch<Record<string, unknown>>(statements);
+    const receipt = batch[receiptIndex]?.results[0] as { request_hash: string; revision: number } | undefined;
     if (!receipt)
       throw new HttpError(
         409,
@@ -549,16 +573,21 @@ export async function mutateTask(
       );
     if (receipt.request_hash !== hash)
       throw new HttpError(409, "idempotency_key_reused", "That operation ID describes another change.");
-    await env.DB.batch(
-      typeof body.archived === "boolean"
-        ? refreshPageSearchV2SubtreeStatements(env.DB, detailId)
-        : refreshPageSearchV2Statements(env.DB, detailId),
-    );
-    return { rowId: id, detailPageId: detailId, revision: receipt.revision, replayed: false };
+    const pageIds = subtreeIndex === -1 ? undefined : batch[subtreeIndex]?.results.map((row) => String(row.id));
+    return { rowId: id, detailPageId: detailId, revision: receipt.revision, replayed: false, pageIds };
   } finally {
     if (shortLease)
       await env.DB.prepare("DELETE FROM table_leases WHERE page_id=? AND token_hash=? AND holder_session_id=?")
         .bind(listId, tokenHash, sessionId)
-        .run();
+        .run()
+        .catch((error) =>
+          logger.warn(
+            "task.lease_release.failed",
+            "tasks",
+            "Could not release a short task lease.",
+            { listId, operationId },
+            error,
+          ),
+        );
   }
 }

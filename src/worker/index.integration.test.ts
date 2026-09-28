@@ -7882,6 +7882,66 @@ describe("calm workspace task lists", () => {
     );
   }
   it.each(["task_patch", "task_detail_delete", "page_delete"] as const)(
+    "returns a committed %s archive when a later subtree read fails",
+    async (route) => {
+      const installed = await bootstrap();
+      let rootId = installed.pageId;
+      let listId = "";
+      let rowId = "";
+      if (route !== "page_delete") {
+        const list = await taskList(installed);
+        listId = list.id;
+        const created = await change(installed, list.id, {
+          title: "Commit before read failure",
+          expectedRevision: 1,
+          operationId: crypto.randomUUID(),
+        });
+        const task = await created.json<{ rowId: string; detailPageId: string }>();
+        rootId = task.detailPageId;
+        rowId = task.rowId;
+      }
+      let committed = false;
+      const database = new Proxy(env.DB, {
+        get(target, property) {
+          if (property === "batch")
+            return async (statements: D1PreparedStatement[]) => {
+              const archived = statements.some((statement) =>
+                /UPDATE pages\s+SET archived_at/.test(String(Reflect.get(statement, "statement"))),
+              );
+              const result = await target.batch(statements);
+              if (archived) committed = true;
+              return result;
+            };
+          if (property === "prepare")
+            return (sql: string) => {
+              if (committed && sql.includes("WITH RECURSIVE subtree(id)"))
+                throw new Error("Injected post-commit subtree read failure");
+              return target.prepare(sql);
+            };
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+      const bindings = envWithDatabase(envWithCapturedWorkspaceEvents(env, delivered), database);
+      const context = createExecutionContext();
+      const request =
+        route === "task_patch"
+          ? authenticatedRequest(installed.cookie, `/api/task-lists/${listId}/tasks/${rowId}`, {
+              method: "PATCH",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ archived: true, expectedRevision: 2, operationId: crypto.randomUUID() }),
+            })
+          : authenticatedRequest(installed.cookie, `/api/pages/${rootId}`, { method: "DELETE" });
+      const response = await worker.fetch(request, bindings, context);
+      await waitOnExecutionContext(context);
+      expect(committed).toBe(true);
+      expect([200, 202]).toContain(response.status);
+      expect((await response.json<{ pageIds: string[] }>()).pageIds).toContain(rootId);
+      expect(delivered.some(({ event }) => event.type === "pages-removed")).toBe(true);
+    },
+  );
+  it.each(["task_patch", "task_detail_delete", "page_delete"] as const)(
     "keeps the %s archive committed when immediate cleanup throws",
     async (route) => {
       const installed = await bootstrap();
@@ -7976,7 +8036,17 @@ describe("calm workspace task lists", () => {
         expect(delivered.map(({ event }) => event.type)).toContain("pages-removed");
         expect(delivered.filter(({ event }) => event.type === "task-list-invalidated")).toEqual(
           listId
-            ? [{ workspaceId: installed.workspaceId, event: { type: "task-list-invalidated", pageId: listId } }]
+            ? [
+                {
+                  workspaceId: installed.workspaceId,
+                  event: {
+                    type: "task-list-invalidated",
+                    pageId: listId,
+                    operationId,
+                    forceRefresh: true,
+                  },
+                },
+              ]
             : [],
         );
       } finally {
@@ -8023,6 +8093,18 @@ describe("calm workspace task lists", () => {
         detailPageId: result.detailPageId,
       }),
     ]);
+    const selected = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tasks?rowId=${result.rowId}`));
+    expect(selected.status).toBe(200);
+    expect(await selected.json()).toMatchObject({
+      tasks: [
+        expect.objectContaining({
+          id: result.rowId,
+          detailPageId: result.detailPageId,
+          updatedAt: expect.any(Number),
+          position: expect.any(Number),
+        }),
+      ],
+    });
     const row = await env.DB.prepare("SELECT text_value FROM table_cells WHERE row_id=? AND column_id=?")
       .bind(result.rowId, `${list.id}-title`)
       .first();
@@ -8045,6 +8127,14 @@ describe("calm workspace task lists", () => {
     const installed = await bootstrap();
     const list = await taskList(installed);
     const lease = await acquireLease(installed.cookie, list.id);
+    const status = await SELF.fetch(authenticatedRequest(installed.cookie, `/api/task-lists/${list.id}/lease`));
+    expect(await status.json()).toMatchObject({
+      lease: {
+        heldByMe: true,
+        holderName: "Owner",
+        expiresAt: expect.any(Number),
+      },
+    });
     const body = { title: "Locked task", expectedRevision: 1, operationId: crypto.randomUUID() };
     expect((await change(installed, list.id, body)).status).toBe(409);
     const created = await change(installed, list.id, { ...body, leaseToken: lease.leaseToken });
@@ -8228,15 +8318,73 @@ describe("calm workspace task lists", () => {
         body: JSON.stringify({ leaseToken: heldRestore.leaseToken }),
       }),
     );
-    const restored = await SELF.fetch(
+    const restoredEvents: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const restoreContext = createExecutionContext();
+    const restored = await worker.fetch(
       authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}/restore`, { method: "POST" }),
+      envWithCapturedWorkspaceEvents(env, restoredEvents),
+      restoreContext,
     );
+    await waitOnExecutionContext(restoreContext);
     expect(restored.status).toBe(200);
+    expect(restoredEvents).toContainEqual({
+      workspaceId: installed.workspaceId,
+      event: { type: "task-list-invalidated", pageId: list.id, forceRefresh: true },
+    });
     const tasks = await (
       await SELF.fetch(authenticatedRequest(installed.cookie, `/api/tasks?listId=${list.id}`))
     ).json<{ tasks: unknown[] }>();
     expect(tasks.tasks).toHaveLength(1);
     expect(await (await SELF.fetch(share.url)).text()).toContain("Completed task");
+  });
+  it("invalidates task views when a parent containing a task list is archived and restored", async () => {
+    const installed = await bootstrap();
+    const parent = await createPage(installed.cookie);
+    const createdList = await SELF.fetch(
+      authenticatedRequest(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "table", taskList: true, title: "Nested tasks", parentId: parent.id }),
+      }),
+    );
+    expect(createdList.status).toBe(201);
+    const list = (await createdList.json<{ page: Page }>()).page;
+    const createdTask = await change(installed, list.id, {
+      title: "Nested task",
+      assigneeId: installed.userId,
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    expect(createdTask.status).toBe(201);
+    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const bindings = envWithCapturedWorkspaceEvents(env, delivered);
+    const archiveContext = createExecutionContext();
+    const archived = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${parent.id}`, {
+        method: "DELETE",
+      }),
+      bindings,
+      archiveContext,
+    );
+    await waitOnExecutionContext(archiveContext);
+    expect(archived.status).toBe(200);
+    expect(delivered.some(({ event }) => event.type === "tasks-invalidated")).toBe(true);
+    const hidden = await SELF.fetch(authenticatedRequest(installed.cookie, "/api/tasks?mine=true"));
+    expect((await hidden.json<{ tasks: unknown[] }>()).tasks).toHaveLength(0);
+    delivered.length = 0;
+    const restoreContext = createExecutionContext();
+    const restored = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${parent.id}/restore`, {
+        method: "POST",
+      }),
+      bindings,
+      restoreContext,
+    );
+    await waitOnExecutionContext(restoreContext);
+    expect(restored.status).toBe(200);
+    expect(delivered.some(({ event }) => event.type === "tasks-invalidated")).toBe(true);
+    const visible = await SELF.fetch(authenticatedRequest(installed.cookie, "/api/tasks?mine=true"));
+    expect((await visible.json<{ tasks: unknown[] }>()).tasks).toHaveLength(1);
   });
   it("bounds task-detail subtree disconnects and reports persisted overflow", async () => {
     const installed = await bootstrap();
@@ -8405,6 +8553,13 @@ describe("calm workspace task lists", () => {
       columnId: columnId!,
       value: (i) => (i === 600 ? "Needle outside first page" : i === 599 ? "CafÉ Unicode" : "ordinary"),
     });
+    // This test targets the two distant matches; the bounded backfill should not
+    // spend its first 50 updates on the unrelated earlier rows.
+    await env.DB.prepare(
+      "UPDATE table_cells SET text_search_value='ordinary' WHERE column_id=? AND text_value='ordinary'",
+    )
+      .bind(columnId!)
+      .run();
     const result = await SELF.fetch(
       authenticatedRequest(installed.cookie, `/api/tables/${table.id}?q=needle&limit=10`),
     );

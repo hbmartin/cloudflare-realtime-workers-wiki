@@ -4215,18 +4215,18 @@ app.delete("/api/pages/:id", async (c) => {
   const task = await taskDetail(c.env, page.id);
   if (task && page.archived_at === null) {
     const taskArchiveOperationId = c.req.header("x-notes-operation-id") ?? crypto.randomUUID();
-    await mutateTask(c.env, member, task.list_id, task.row_id, {
+    const result = await mutateTask(c.env, member, task.list_id, task.row_id, {
       operationId: taskArchiveOperationId,
       expectedRevision: task.revision,
       archived: true,
     });
-    const archived = await c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree`,
-    )
-      .bind(page.id)
-      .all<{ id: string }>();
-    const pageIds = archived.results.map((p) => p.id);
-    sendWorkspaceEvent(c, member.workspace.id, { type: "task-list-invalidated", pageId: task.list_id });
+    const pageIds = result.pageIds ?? [page.id];
+    sendWorkspaceEvent(c, member.workspace.id, {
+      type: "task-list-invalidated",
+      pageId: task.list_id,
+      operationId: taskArchiveOperationId,
+      forceRefresh: true,
+    });
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
     const cleanup = await archiveCleanupAfterCommit(
       c.env,
@@ -4246,9 +4246,11 @@ app.delete("/api/pages/:id", async (c) => {
   const archiveOwnership: ArchiveDisconnectOwnership = archiveOperationId
     ? { operationId: archiveOperationId }
     : { archivedAt: archiveTimestamp };
-  await c.env.DB.batch([
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
+  const archived = await batchWithFinalResult<PageRow>(
+    c.env.DB,
+    [
+      c.env.DB.prepare(
+        `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        )
@@ -4266,29 +4268,36 @@ app.delete("/api/pages/:id", async (c) => {
          last_error = NULL,
          updated_at = excluded.updated_at
        RETURNING page_id, content_epoch`,
-    ).bind(page.id, member.workspace.id, timestamp, timestamp, timestamp),
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
+      ).bind(page.id, member.workspace.id, timestamp, timestamp, timestamp),
+      c.env.DB.prepare(
+        `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) UPDATE pages
            SET archived_at = ?, archived_by = ?, archive_operation_id = ?, revision = revision + 1,
                updated_by = ?, updated_at = ?
          WHERE id IN subtree AND archived_at IS NULL`,
-    ).bind(page.id, member.workspace.id, archiveTimestamp, archiveOwner, archiveOperationId, member.user.id, timestamp),
-    c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
+      ).bind(
+        page.id,
+        member.workspace.id,
+        archiveTimestamp,
+        archiveOwner,
+        archiveOperationId,
+        member.user.id,
+        timestamp,
+      ),
+      c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
       SELECT id FROM subtree
     )`).bind(page.id),
-  ]);
-  const archived = await c.env.DB.prepare(
-    `WITH RECURSIVE subtree(id) AS (
+    ],
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
        SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-     ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
-  )
-    .bind(page.id)
-    .all<{ id: string; kind: PageKind; content_epoch: number }>();
-  const pageIds = archived.results.map((item) => item.id);
+     ) SELECT * FROM pages WHERE id IN subtree`,
+    ).bind(page.id),
+  );
+  const pageIds = archived?.results.map((item) => item.id) ?? [page.id];
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
     pageIds,
@@ -4296,6 +4305,8 @@ app.delete("/api/pages/:id", async (c) => {
     ...(operationId ? { operationId } : {}),
   });
   if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  if (page.is_task_list || archived?.results.some((item) => item.is_task_list))
+    sendWorkspaceEvent(c, member.workspace.id, { type: "tasks-invalidated" });
   const cleanup = await archiveCleanupAfterCommit(c.env, page.id, archiveOwnership, timestamp, "page_delete");
   return c.json(
     {
@@ -4359,6 +4370,11 @@ app.post("/api/pages/:id/restore", async (c) => {
       restored: true,
       restoredRootId: page.id,
       ...(hidden.length ? { sidebarHiddenPageIds: hidden } : {}),
+    });
+    sendWorkspaceEvent(c, member.workspace.id, {
+      type: "task-list-invalidated",
+      pageId: task.list_id,
+      forceRefresh: true,
     });
     return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
   }
@@ -4430,6 +4446,8 @@ app.post("/api/pages/:id/restore", async (c) => {
     ...(hidden.length ? { sidebarHiddenPageIds: hidden } : {}),
   });
   if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  if (restored.results.some((item) => item.is_task_list))
+    sendWorkspaceEvent(c, member.workspace.id, { type: "tasks-invalidated" });
   return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
 });
 
@@ -5493,6 +5511,7 @@ app.get("/api/tasks", async (c) => {
       due: c.req.query("due"),
       q: c.req.query("q"),
       cursor: c.req.query("cursor"),
+      rowId: c.req.query("rowId") ?? undefined,
     }),
   );
 });
@@ -5500,11 +5519,34 @@ app.get("/api/task-lists/:pageId/assignees", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   return c.json({ members: await taskAssignees(c.env, member, c.req.param("pageId")) });
 });
+app.get("/api/task-lists/:pageId/lease", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (!page.is_task_list) throw new HttpError(422, "task_list_required", "Choose a task list.");
+  const lease = await c.env.DB.prepare(
+    `SELECT l.expires_at, l.holder_session_id, u.name holder_name
+       FROM table_leases l JOIN user u ON u.id=l.holder_user_id WHERE l.page_id=? AND l.expires_at>?`,
+  )
+    .bind(page.id, now())
+    .first<{ expires_at: number; holder_session_id: string; holder_name: string }>();
+  return c.json({
+    lease: {
+      heldByMe: lease?.holder_session_id === member.session.id,
+      holderName: lease?.holder_name ?? null,
+      expiresAt: lease?.expires_at ?? null,
+    },
+  });
+});
 app.post("/api/task-lists/:pageId/tasks", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const pageId = c.req.param("pageId");
-  const result = await mutateTask(c.env, member, pageId, null, await jsonBody(c.req.raw));
-  sendWorkspaceEvent(c, member.workspace.id, { type: "task-list-invalidated", pageId });
+  const body = await jsonBody(c.req.raw);
+  const result = await mutateTask(c.env, member, pageId, null, body);
+  sendWorkspaceEvent(c, member.workspace.id, {
+    type: "task-list-invalidated",
+    pageId,
+    ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
+  });
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json(result, 201);
 });
@@ -5513,16 +5555,15 @@ app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
   const pageId = c.req.param("pageId");
   const body = await jsonBody(c.req.raw);
   const result = await mutateTask(c.env, member, pageId, c.req.param("rowId"), body);
-  sendWorkspaceEvent(c, member.workspace.id, { type: "task-list-invalidated", pageId });
+  sendWorkspaceEvent(c, member.workspace.id, {
+    type: "task-list-invalidated",
+    pageId,
+    ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
+    forceRefresh: body.archived === true,
+  });
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   if (body.archived !== true) return c.json(result);
-  const archived = await c.env.DB.prepare(
-    `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id)
-     SELECT id FROM subtree`,
-  )
-    .bind(result.detailPageId)
-    .all<{ id: string }>();
-  const pageIds = archived.results.map((page) => page.id);
+  const pageIds = result.pageIds ?? [result.detailPageId];
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
   const operationId = typeof body.operationId === "string" ? body.operationId : "";
   const cleanup = await archiveCleanupAfterCommit(c.env, result.detailPageId, { operationId }, now(), "task_patch");

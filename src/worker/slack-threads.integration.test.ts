@@ -4647,18 +4647,106 @@ describe("Slack documents and tasks", () => {
   it("keeps an expired Slack form open with an inline error", async () => {
     const id = await open("new");
     await env.DB.prepare("UPDATE slack_product_sessions SET created_at=1 WHERE id=?").bind(id).run();
-    expect(
-      (
-        await acceptSlackProductInteraction(
-          runtime(),
-          submission(id, "document", "space:workspace-general", "Expired draft"),
-          Date.now() + 2500,
-        )
-      ).response,
-    ).toMatchObject({ response_action: "errors", errors: { title: expect.stringContaining("Reopen") } });
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      expect(
+        (
+          await acceptSlackProductInteraction(
+            runtime(),
+            submission(id, "document", "space:workspace-general", "Expired draft"),
+            Date.now() + 2500,
+          )
+        ).response,
+      ).toMatchObject({ response_action: "errors", errors: { title: expect.stringContaining("Reopen") } });
+      expect(warned.mock.calls.map(([record]) => record)).toContainEqual(
+        expect.objectContaining({
+          event: "slack.interaction.failed",
+          errorCode: "slack_form_expired",
+          errorMessage: expect.stringContaining("Reopen"),
+        }),
+      );
+    } finally {
+      warned.mockRestore();
+    }
     expect(await env.DB.prepare("SELECT count(*) count FROM pages WHERE title='Expired draft'").first()).toEqual({
       count: 0,
     });
+  });
+  it("logs once and returns a form error when task conflict recovery also fails", async () => {
+    await list();
+    const task = await mutateTask(runtime(), owner, "tasks", null, {
+      operationId: "slack-recovery-create",
+      expectedRevision: 1,
+      title: "Recover me",
+    });
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "block_actions",
+        trigger_id: "edit-task",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        actions: [{ action_id: "noteflare_edit_task", value: task.rowId }],
+      },
+      Date.now() + 2500,
+    );
+    const id = (
+      calls.findLast((call) => call.method === "views.open")!.payload.view as {
+        private_metadata: string;
+      }
+    ).private_metadata;
+    await mutateTask(runtime(), owner, "tasks", task.rowId, {
+      operationId: "slack-recovery-web-change",
+      expectedRevision: task.revision,
+      status: "doing",
+    });
+    let sessionReads = 0;
+    const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+      new Proxy(statement, {
+        get(target, property) {
+          if (property === "bind") return (...args: unknown[]) => wrap(target.bind(...args));
+          if (property === "first")
+            return async (...args: []) => {
+              sessionReads++;
+              if (sessionReads === 2) throw new Error("Recovery read unavailable");
+              return target.first(...args);
+            };
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            const statement = target.prepare(sql);
+            return sql.includes("SELECT * FROM slack_product_sessions WHERE id=?") ? wrap(statement) : statement;
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const result = await acceptSlackProductInteraction(
+        { ...runtime(), DB: database } as Env,
+        submission(id, "task", "page:tasks", "Recover me"),
+        Date.now() + 2500,
+      );
+      expect(result.response).toMatchObject({
+        response_action: "errors",
+        errors: {
+          title: expect.stringContaining("Try again"),
+        },
+      });
+      expect(
+        warned.mock.calls
+          .map(([record]) => record)
+          .filter((record) => (record as { event?: string }).event === "slack.interaction.failed"),
+      ).toEqual([expect.objectContaining({ errorMessage: "Recovery read unavailable" })]);
+    } finally {
+      warned.mockRestore();
+    }
   });
   it("acknowledges permanent product-copy errors and keeps transient failures retryable", async () => {
     const bodySubmission = (id: string, title: string) => {

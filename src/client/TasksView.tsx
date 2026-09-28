@@ -8,6 +8,38 @@ import { ActionMenu, Icon, PageTools, readPreference, savePreference } from "./W
 type Person = { id: string; name: string };
 type Change = Partial<TaskFields> & { archived?: boolean };
 const AUTO_REFRESH_PAGE_LIMIT = 2;
+const REQUEST_TIMEOUT_MS = 15_000;
+
+function taskApi<T>(path: string, init?: RequestInit) {
+  return api<T>(path, { ...init, signal: init?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+}
+
+const taskBucket = (task: Task) => (task.status === "done" ? 2 : task.dueDate ? 0 : 1);
+const taskDueSort = (task: Task) => (task.status === "done" ? "" : (task.dueDate ?? ""));
+
+function taskOrder(a: Task, b: Task, list: boolean) {
+  if (list) return a.position - b.position || a.id.localeCompare(b.id);
+  return (
+    taskBucket(a) - taskBucket(b) ||
+    taskDueSort(a).localeCompare(taskDueSort(b)) ||
+    b.updatedAt - a.updatedAt ||
+    a.id.localeCompare(b.id)
+  );
+}
+
+function matchesTask(
+  task: Task,
+  filters: { pageId?: string; status: string; due: string; query: string; userId: string },
+) {
+  if (filters.pageId ? task.listId !== filters.pageId : task.assigneeId !== filters.userId) return false;
+  if (filters.status && task.status !== filters.status) return false;
+  if (filters.query && !task.title.toLowerCase().includes(filters.query.toLowerCase())) return false;
+  const today = new Date().toISOString().slice(0, 10);
+  if (filters.due === "today" && task.dueDate !== today) return false;
+  if (filters.due === "undated" && task.dueDate !== null) return false;
+  if (filters.due === "overdue" && !(task.dueDate && task.dueDate < today && task.status !== "done")) return false;
+  return true;
+}
 
 export function TasksView({
   page,
@@ -16,6 +48,9 @@ export function TasksView({
   onSelectPage,
   onPageChanged,
   refreshVersion = 0,
+  forceRefreshVersion = 0,
+  onTaskOperationStart,
+  onTaskOperationSettled,
 }: {
   page?: Page;
   member: ClientMemberContext;
@@ -23,6 +58,9 @@ export function TasksView({
   onSelectPage: (id: string) => void;
   onPageChanged?: (page: Page) => void;
   refreshVersion?: number;
+  forceRefreshVersion?: number;
+  onTaskOperationStart?: (operationId: string, pageId: string) => void;
+  onTaskOperationSettled?: (operationId: string, reconciled: boolean) => void;
 }) {
   const [data, setData] = useState<TaskResponse>({ tasks: [], hasMore: false, nextCursor: null });
   const dataRef = useRef(data);
@@ -44,6 +82,7 @@ export function TasksView({
     revisionRef.current = revision;
   }, [revision]);
   const [members, setMembers] = useState<Record<string, Person[]>>({});
+  const membersRef = useRef<Record<string, Person[]>>({});
   const [newTitle, setNewTitle] = useState("");
   const retryRef = useRef<(() => Promise<boolean>) | null>(null);
   const [lease, setLease] = useState<string | null>(null);
@@ -55,19 +94,39 @@ export function TasksView({
   const loadedPageCount = useRef(1);
   const eventEpoch = useRef(0);
   const queuedAutoRefresh = useRef(false);
+  const queuedForceRefresh = useRef(false);
+  const paginationDirty = useRef(false);
+  const taskReadVersion = useRef(new Map<string, number>());
   const [updatesAvailable, setUpdatesAvailable] = useState(false);
   const active = useRef(true);
   const pageId = page?.id;
+  const filterKey = JSON.stringify([pageId, status, due, query.trim()]);
+  const filterKeyRef = useRef(filterKey);
+  const viewEpoch = useRef(0);
+  if (filterKeyRef.current !== filterKey) {
+    filterKeyRef.current = filterKey;
+    viewEpoch.current++;
+  }
+  const filtersRef = useRef({ pageId, status, due, query: query.trim(), userId: member.user.id });
+  filtersRef.current = { pageId, status, due, query: query.trim(), userId: member.user.id };
   const editable = page ? member.role !== "viewer" : true;
   const key = `notes:tasks-view:${member.user.id}:${page?.id ?? "mine"}`;
   useEffect(() => {
     savePreference(key, mode);
   }, [key, mode]);
   const load = useCallback(
-    async (cursor?: string) => {
+    async (cursor?: string): Promise<void> => {
+      if (cursor && paginationDirty.current) {
+        await load();
+        if (paginationDirty.current) return;
+        const next = dataRef.current.nextCursor;
+        if (next && filterKeyRef.current === filterKey) await load(next);
+        return;
+      }
       const request = ++generation.current;
       activeLoad.current = request;
       const startingEventEpoch = eventEpoch.current;
+      const requestedFilterKey = filterKey;
       setLoading(true);
       const params = new URLSearchParams(pageId ? { listId: pageId } : { mine: "true" });
       if (status) params.set("status", status);
@@ -75,7 +134,7 @@ export function TasksView({
       if (query.trim()) params.set("q", query.trim());
       try {
         const tasks = cursor ? [...dataRef.current.tasks] : [];
-        const seen = new Set(tasks.map((task) => task.id));
+        const seen = new Map(tasks.map((task, index) => [task.id, index]));
         const pagesToFetch = cursor ? 1 : loadedPageCount.current;
         let nextCursor = cursor;
         let result: TaskResponse = { tasks: [], hasMore: false, nextCursor: null };
@@ -83,42 +142,70 @@ export function TasksView({
         for (let index = 0; index < pagesToFetch; index++) {
           if (nextCursor) params.set("cursor", nextCursor);
           else params.delete("cursor");
-          result = await api<TaskResponse>(`/api/tasks?${params}`);
-          if (!active.current || request !== generation.current) return;
+          result = await taskApi<TaskResponse>(`/api/tasks?${params}`);
+          if (!active.current || request !== generation.current || requestedFilterKey !== filterKeyRef.current) return;
           fetchedPages++;
           for (const task of result.tasks) {
-            if (!seen.has(task.id)) {
-              seen.add(task.id);
+            const existing = seen.get(task.id);
+            if (existing === undefined) {
+              seen.set(task.id, tasks.length);
               tasks.push(task);
-            }
+            } else if (
+              task.updatedAt > tasks[existing]!.updatedAt ||
+              (task.updatedAt === tasks[existing]!.updatedAt && task.revision > tasks[existing]!.revision)
+            )
+              tasks[existing] = task;
           }
           if (!result.hasMore || !result.nextCursor) break;
           nextCursor = result.nextCursor;
         }
-        const refreshed = { tasks, hasMore: result.hasMore, nextCursor: result.nextCursor };
-        loadedPageCount.current = cursor ? loadedPageCount.current + 1 : fetchedPages;
-        dataRef.current = refreshed;
-        setData(refreshed);
         if (pageId) {
-          const response = await api<{ table: TableData }>(`/api/tables/${pageId}?limit=1`);
-          if (!active.current || request !== generation.current) return;
+          const response = await taskApi<{ table: TableData }>(`/api/tables/${pageId}?limit=1`);
+          if (!active.current || request !== generation.current || requestedFilterKey !== filterKeyRef.current) return;
           setRevision(response.table.revision);
+          revisionRef.current = response.table.revision;
           setHolder(response.table.lease.holderName);
         }
         const ids = [...new Set(tasks.map((task) => task.listId)), ...(pageId ? [pageId] : [])];
         const entries = await Promise.all(
-          [...new Set(ids)].map(async (id) => {
-            const people = await api<{ members: Person[] }>(`/api/task-lists/${id}/assignees`);
-            return [id, people.members] as const;
-          }),
+          [...new Set(ids)]
+            .filter((id) => !(id in membersRef.current))
+            .map(async (id) => {
+              try {
+                const people = await taskApi<{ members: Person[] }>(`/api/task-lists/${id}/assignees`);
+                return [id, people.members] as const;
+              } catch (cause) {
+                if (cause instanceof ApiClientError && cause.status === 404) return [id, null] as const;
+                throw cause;
+              }
+            }),
         );
-        if (active.current && request === generation.current) {
-          setMembers((current) => ({ ...current, ...Object.fromEntries(entries) }));
+        if (active.current && request === generation.current && requestedFilterKey === filterKeyRef.current) {
+          const missing = new Set(entries.filter((entry) => entry[1] === null).map((entry) => entry[0]));
+          const refreshed = {
+            tasks: tasks.filter((task) => !missing.has(task.listId)),
+            hasMore: result.hasMore,
+            nextCursor: result.nextCursor,
+          };
+          loadedPageCount.current = cursor ? loadedPageCount.current + 1 : fetchedPages;
+          dataRef.current = refreshed;
+          setData(refreshed);
+          membersRef.current = {
+            ...membersRef.current,
+            ...Object.fromEntries(entries.filter((entry) => entry[1] !== null)),
+          };
+          setMembers(membersRef.current);
+          if (!cursor) paginationDirty.current = false;
           setError((current) => (current?.owner === "load" ? null : current));
           if (!cursor && startingEventEpoch === eventEpoch.current) setUpdatesAvailable(false);
         }
       } catch (cause) {
-        if (active.current && request === generation.current && !retryRef.current) {
+        if (
+          active.current &&
+          request === generation.current &&
+          requestedFilterKey === filterKeyRef.current &&
+          !retryRef.current
+        ) {
           retryRef.current = null;
           setError({ owner: "load", message: apiErrorMessage(cause, "Tasks could not be loaded.") });
         }
@@ -127,13 +214,15 @@ export function TasksView({
         if (active.current && request === generation.current) setLoading(false);
       }
     },
-    [pageId, status, due, query],
+    [pageId, status, due, query, filterKey],
   );
   useEffect(() => {
     active.current = true;
     loadedPageCount.current = 1;
+    paginationDirty.current = false;
     eventEpoch.current++;
     queuedAutoRefresh.current = false;
+    queuedForceRefresh.current = false;
     const timer = setTimeout(() => void load(), 150);
     return () => {
       clearTimeout(timer);
@@ -156,9 +245,17 @@ export function TasksView({
     return () => clearInterval(timer);
   }, [load, busy, loading]);
   useEffect(() => {
-    if (busy || loading || !queuedAutoRefresh.current) return;
+    if (busy || loading) return;
+    if (queuedForceRefresh.current) {
+      queuedForceRefresh.current = false;
+      queuedAutoRefresh.current = false;
+      void load();
+      return;
+    }
+    if (!queuedAutoRefresh.current) return;
     queuedAutoRefresh.current = false;
     if (loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT) {
+      paginationDirty.current = true;
       setUpdatesAvailable(true);
     } else void load();
   }, [busy, loading, load]);
@@ -167,14 +264,26 @@ export function TasksView({
     if (refreshVersion === observedRefreshVersion.current) return;
     observedRefreshVersion.current = refreshVersion;
     eventEpoch.current++;
-    if (loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT) setUpdatesAvailable(true);
-    else if (busy || activeLoad.current !== null) queuedAutoRefresh.current = true;
-    else void load();
+    if (busy || activeLoad.current !== null) {
+      queuedAutoRefresh.current = true;
+      setUpdatesAvailable(true);
+    } else if (loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT) {
+      paginationDirty.current = true;
+      setUpdatesAvailable(true);
+    } else void load();
   }, [busy, load, refreshVersion]);
+  const observedForceVersion = useRef(forceRefreshVersion);
+  useEffect(() => {
+    if (forceRefreshVersion === observedForceVersion.current) return;
+    observedForceVersion.current = forceRefreshVersion;
+    eventEpoch.current++;
+    if (busy || activeLoad.current !== null) queuedForceRefresh.current = true;
+    else void load();
+  }, [busy, forceRefreshVersion, load]);
   const release = useCallback(
     (token: string) => {
       if (pageId)
-        void api(`/api/tables/${pageId}/lease`, {
+        void taskApi(`/api/tables/${pageId}/lease`, {
           method: "DELETE",
           body: json({ leaseToken: token }),
           keepalive: true,
@@ -182,6 +291,36 @@ export function TasksView({
     },
     [pageId],
   );
+  const refreshLease = useCallback(async () => {
+    if (!pageId) return;
+    try {
+      const response = await taskApi<{ lease: TableData["lease"] }>(`/api/task-lists/${pageId}/lease`);
+      if (active.current && filtersRef.current.pageId === pageId) {
+        setHolder(response.lease.holderName);
+        if (leaseRef.current && !response.lease.heldByMe) {
+          leaseRef.current = null;
+          leaseExpiresAtRef.current = 0;
+          setLease(null);
+          setError({ owner: "lease", message: "The edit lock expired. Acquire it again to continue." });
+        }
+      }
+    } catch (cause) {
+      if (
+        active.current &&
+        filtersRef.current.pageId === pageId &&
+        cause instanceof ApiClientError &&
+        cause.status === 404
+      )
+        setHolder(null);
+    }
+  }, [pageId]);
+  useEffect(() => {
+    if (!pageId) return undefined;
+    const timer = setInterval(() => {
+      if (!document.hidden) void refreshLease();
+    }, 30_000);
+    return () => clearInterval(timer);
+  }, [pageId, refreshLease]);
   useEffect(
     () => () => {
       active.current = false;
@@ -211,7 +350,7 @@ export function TasksView({
     };
     const renew = async () => {
       try {
-        const result = await api<TableLeaseTiming>(`/api/tables/${pageId}/lease`, {
+        const result = await taskApi<TableLeaseTiming>(`/api/tables/${pageId}/lease`, {
           method: "PATCH",
           body: json({ leaseToken: lease }),
         });
@@ -234,31 +373,36 @@ export function TasksView({
   }, [lease, pageId]);
   async function toggleLease() {
     if (!page) return;
+    const leasePageId = page.id;
     if (lease) {
       release(lease);
       leaseRef.current = null;
       leaseExpiresAtRef.current = 0;
       setLease(null);
       setHolder(null);
+      void refreshLease();
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      const result = await api<TableLeaseResponse>(`/api/tables/${page.id}/lease`, { method: "POST" });
-      if (!active.current) {
+      const result = await taskApi<TableLeaseResponse>(`/api/tables/${leasePageId}/lease`, { method: "POST" });
+      if (!active.current || filtersRef.current.pageId !== leasePageId) {
         release(result.leaseToken);
         return;
       }
       leaseRef.current = result.leaseToken;
       leaseExpiresAtRef.current = Date.now() + result.leaseDurationMs;
       setLease(result.leaseToken);
-      await load();
+      setHolder(null);
     } catch (cause) {
-      setError({
-        owner: "lease",
-        message: apiErrorMessage(cause, "This task list is being edited. Try again when it is available."),
-      });
+      if (active.current && filtersRef.current.pageId === leasePageId) {
+        await refreshLease();
+        setError({
+          owner: "lease",
+          message: apiErrorMessage(cause, "This task list is being edited. Try again when it is available."),
+        });
+      }
     } finally {
       if (active.current) setBusy(false);
     }
@@ -266,13 +410,18 @@ export function TasksView({
   async function save(task: Task | null, changes: Change, operationId = crypto.randomUUID()): Promise<boolean> {
     const listId = task?.listId ?? page?.id;
     if (!listId) return false;
+    const startedViewEpoch = viewEpoch.current;
+    const startedGeneration = generation.current;
     const current = task ? (dataRef.current.tasks.find((item) => item.id === task.id) ?? task) : null;
+    const readVersion = task ? (taskReadVersion.current.get(task.id) ?? 0) + 1 : 1;
+    if (task) taskReadVersion.current.set(task.id, readVersion);
     const expectedRevision = page ? revisionRef.current : current!.revision;
     setBusy(true);
     setError(null);
     retryRef.current = () => save(task, changes, operationId);
+    onTaskOperationStart?.(operationId, listId);
     try {
-      const result = await api<{ revision: number; detailPageId: string }>(
+      const result = await taskApi<{ revision: number; rowId: string; detailPageId: string }>(
         `/api/task-lists/${listId}/tasks${task ? `/${task.id}` : ""}`,
         {
           method: task ? "PATCH" : "POST",
@@ -284,25 +433,84 @@ export function TasksView({
           }),
         },
       );
-      if (!active.current) return false;
+      if (!active.current || viewEpoch.current !== startedViewEpoch || generation.current !== startedGeneration) {
+        onTaskOperationSettled?.(operationId, false);
+        return true;
+      }
       setRevision(result.revision);
       revisionRef.current = result.revision;
+      const revised = {
+        ...dataRef.current,
+        tasks: dataRef.current.tasks.map((item) =>
+          item.listId === listId ? { ...item, revision: result.revision } : item,
+        ),
+      };
+      dataRef.current = revised;
+      setData(revised);
       retryRef.current = null;
       setError(null);
+      setBusy(false);
+      paginationDirty.current = true;
       if (changes.archived === true && task) {
         const remaining = { ...dataRef.current, tasks: dataRef.current.tasks.filter((item) => item.id !== task.id) };
         dataRef.current = remaining;
         setData(remaining);
+        onTaskOperationSettled?.(operationId, true);
+        return true;
       }
-      await load();
+      const rowId = result.rowId;
+      if (!task) taskReadVersion.current.set(rowId, readVersion);
+      const reconcile = async () => {
+        const response = await taskApi<TaskResponse>(`/api/tasks?rowId=${encodeURIComponent(rowId)}`);
+        if (
+          !active.current ||
+          viewEpoch.current !== startedViewEpoch ||
+          generation.current !== startedGeneration ||
+          taskReadVersion.current.get(rowId) !== readVersion
+        )
+          return false;
+        const found = response.tasks.find((item) => item.id === rowId);
+        const currentListRevision = Math.max(
+          result.revision,
+          ...dataRef.current.tasks.filter((item) => item.listId === listId).map((item) => item.revision),
+        );
+        const authoritative = found ? { ...found, revision: Math.max(found.revision, currentListRevision) } : null;
+        const tasks = dataRef.current.tasks.filter((item) => item.id !== rowId);
+        if (authoritative && matchesTask(authoritative, filtersRef.current)) tasks.push(authoritative);
+        tasks.sort((a, b) => taskOrder(a, b, Boolean(filtersRef.current.pageId)));
+        const updated = { ...dataRef.current, tasks };
+        dataRef.current = updated;
+        setData(updated);
+        return true;
+      };
+      try {
+        const reconciled = await reconcile();
+        onTaskOperationSettled?.(operationId, reconciled);
+      } catch (cause) {
+        onTaskOperationSettled?.(operationId, false);
+        retryRef.current = async () => {
+          try {
+            const refreshed = await reconcile();
+            if (refreshed) {
+              retryRef.current = null;
+              setError(null);
+            }
+            return refreshed;
+          } catch {
+            return false;
+          }
+        };
+        setError({ owner: "load", message: apiErrorMessage(cause, "The task was saved, but could not be refreshed.") });
+      }
       return true;
     } catch (cause) {
-      if (active.current) {
+      onTaskOperationSettled?.(operationId, false);
+      if (active.current && viewEpoch.current === startedViewEpoch && generation.current === startedGeneration) {
         setError({
           owner: "save",
           message: apiErrorMessage(cause, "The task could not be saved. Your change is ready to retry."),
         });
-        void load();
+        // A timed-out mutation may have committed; its operation ID remains safe to retry.
       }
       return false;
     } finally {
@@ -343,7 +551,7 @@ export function TasksView({
           onBlur={(event) => {
             const title = event.target.value.trim() || "Untitled tasks";
             if (title !== page.title)
-              void api<{ page: Page }>(`/api/pages/${page.id}`, {
+              void taskApi<{ page: Page }>(`/api/pages/${page.id}`, {
                 method: "PATCH",
                 body: json({ title, revision: page.revision }),
               })
@@ -415,7 +623,7 @@ export function TasksView({
         <button className="quiet-button" disabled={loading} onClick={() => void load()}>
           Refresh
         </button>
-        {loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT && (
+        {(loadedPageCount.current > AUTO_REFRESH_PAGE_LIMIT || updatesAvailable) && (
           <output className="muted">
             {updatesAvailable
               ? "Updates available. Refresh tasks to see them."

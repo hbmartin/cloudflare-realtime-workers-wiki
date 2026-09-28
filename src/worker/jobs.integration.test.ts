@@ -2526,6 +2526,63 @@ describe("job execution", () => {
     ).toMatchObject({ name: "photo.png" });
   });
 
+  it("imports text-heavy table rows without an oversized D1 JSON bind", async () => {
+    const installed = await bootstrap();
+    const encoder = new TextEncoder();
+    const tableId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const csv = [
+      "First,Second",
+      ...Array.from({ length: 100 }, (_, index) => `CAFÉ ${index} ${"x".repeat(5980)},À ${index} ${"y".repeat(5980)}`),
+    ].join("\n");
+    const zip = createZip([
+      { path: `Large ${tableId}.md`, bytes: encoder.encode("# Large\n\nImported table\n") },
+      { path: `Large ${tableId}_all.csv`, bytes: encoder.encode(csv) },
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([zip], "large.zip", { type: "application/zip" }));
+    const uploadContext = createExecutionContext();
+    const uploaded = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      uploadContext,
+    );
+    expect(uploaded.status).toBe(202);
+    const jobId = (await uploaded.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      await importRequest(installed.cookie, "/api/imports", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jobId }),
+      }),
+      inlineBindings(),
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+    const completed = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job;
+    expect(completed.status).toBe("succeeded");
+    const table = await env.DB.prepare("SELECT id FROM pages WHERE title='Large' AND kind='table'").first<{
+      id: string;
+    }>();
+    expect(table).toBeTruthy();
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM table_rows WHERE page_id=?").bind(table!.id).first(),
+    ).toMatchObject({ count: 100 });
+    const value = await env.DB.prepare(`SELECT cell.text_search_value search FROM table_cells cell
+      JOIN table_columns col ON col.id=cell.column_id WHERE col.page_id=? AND col.name='First'
+      ORDER BY cell.row_id LIMIT 1`)
+      .bind(table!.id)
+      .first<{ search: string }>();
+    expect(value?.search).toContain("café");
+  });
+
   it("keeps wrapped exports nested, prioritizes IDs over titles, and warns on unresolved folders", async () => {
     const installed = await bootstrap();
     const encoder = new TextEncoder();

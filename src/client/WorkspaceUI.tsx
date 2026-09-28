@@ -69,7 +69,15 @@ export function ActionMenu({
       menu.style.top = `${Math.max(8, Math.min(anchor.bottom + 4, window.innerHeight - menu.offsetHeight - 8))}px`;
     };
     position();
-    menu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    menu.tabIndex = -1;
+    const enabledButtons = () => [...menu.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+    const focusFirst = () => (enabledButtons()[0] ?? menu).focus();
+    focusFirst();
+    const observer = new MutationObserver(() => {
+      if (document.activeElement === menu || document.activeElement === details.querySelector("summary"))
+        enabledButtons()[0]?.focus();
+    });
+    observer.observe(menu, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled"] });
     const close = (event: PointerEvent) => {
       const target = event.target as Node;
       if (!details.contains(target) && !menu.contains(target)) {
@@ -78,11 +86,35 @@ export function ActionMenu({
       }
     };
     const key = (event: KeyboardEvent) => {
+      if (event.repeat && (event.key === "Enter" || event.key === " ") && menu.contains(event.target as Node)) {
+        event.preventDefault();
+        return;
+      }
       if (event.key === "Escape") {
         event.stopPropagation();
         details.open = false;
         setOpen(false);
         details.querySelector("summary")?.focus();
+      } else if (event.key === "Tab" && (menu.contains(document.activeElement) || document.activeElement === menu)) {
+        const buttons = enabledButtons();
+        const first = buttons[0];
+        const last = buttons.at(-1);
+        if (!first || !last) {
+          event.preventDefault();
+          menu.focus();
+        } else if (event.shiftKey && (document.activeElement === first || document.activeElement === menu)) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === menu)) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    const focusOutside = (event: FocusEvent) => {
+      if (!menu.contains(event.target as Node) && !details.contains(event.target as Node)) {
+        details.open = false;
+        setOpen(false);
       }
     };
     const click = (event: MouseEvent) => {
@@ -94,12 +126,15 @@ export function ActionMenu({
     };
     document.addEventListener("pointerdown", close);
     document.addEventListener("keydown", key);
+    document.addEventListener("focusin", focusOutside);
     menu.addEventListener("click", click);
     window.addEventListener("resize", position);
     window.addEventListener("scroll", position, true);
     return () => {
       document.removeEventListener("pointerdown", close);
       document.removeEventListener("keydown", key);
+      document.removeEventListener("focusin", focusOutside);
+      observer.disconnect();
       menu.removeEventListener("click", click);
       window.removeEventListener("resize", position);
       window.removeEventListener("scroll", position, true);
@@ -120,6 +155,9 @@ export function ActionMenu({
             details.open = !details.open;
             setOpen(details.open);
             if (!details.open) details.querySelector("summary")?.focus();
+          }}
+          onKeyDown={(event) => {
+            if (event.repeat && (event.key === "Enter" || event.key === " ")) event.preventDefault();
           }}
         >
           <Icon name={icon} />

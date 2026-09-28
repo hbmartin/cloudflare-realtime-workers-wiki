@@ -90,10 +90,16 @@ function submissionErrorText(error: unknown) {
     : message;
 }
 function logInteractionFailure(payload: SlackInteractionPayload, error: unknown) {
-  logger.warn("slack.interaction.failed", "slack", "Slack product interaction failed.", {
-    interactionType: typeof payload.type === "string" ? payload.type : "unknown",
-    code: error instanceof HttpError ? error.code : "unexpected",
-  });
+  logger.warn(
+    "slack.interaction.failed",
+    "slack",
+    "Slack product interaction failed.",
+    {
+      interactionType: typeof payload.type === "string" ? payload.type : "unknown",
+      code: error instanceof HttpError ? error.code : "unexpected",
+    },
+    error,
+  );
 }
 async function installationForTeam(env: Env, team: unknown) {
   if (typeof team !== "string")
@@ -613,8 +619,7 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
           }
         }
       }
-      logInteractionFailure(payload, error);
-      return { handled: true, response: { response_action: "errors", errors: { title: submissionErrorText(error) } } };
+      throw error;
     }
   }
   const shortcut =
