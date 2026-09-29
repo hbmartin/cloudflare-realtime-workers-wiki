@@ -106,8 +106,7 @@ function markdownInline(
   if (!prepared) {
     const plain = unescapeMarkdown(value, true);
     if (plain !== null) return inline(plain);
-    if (value.length > 8192 || (value.match(/[<\\]/g)?.length ?? 0) > 128 || (value.match(/[*_`]/g)?.length ?? 0) > 512)
-      return boundedMarkdownInline(value, issues, references);
+    if (value.length > 8192) return boundedMarkdownInline(value, issues, references);
     if (value.includes("data:image/"))
       return markdownInline(value, issues, references, Lexer.lexInline(value, { gfm: false }), undefined, true);
   }
@@ -1035,7 +1034,10 @@ function markdownImage(value: string) {
   if (!trimmed.startsWith("![")) return null;
   if (trimmed.length > 64_000) {
     const recovered = longDataImage(trimmed, 0);
-    return recovered?.end === trimmed.length ? { label: recovered.label, href: recovered.href } : null;
+    return recovered?.end === trimmed.length &&
+      /^data:image\/(?:png|gif|jpeg|webp);base64,[A-Za-z0-9+/=]+$/i.test(recovered.href)
+      ? { label: recovered.label, href: recovered.href }
+      : null;
   }
   const labelEnd = linkLabelEnd(trimmed, 0, 8192);
   if (labelEnd === null) return null;
