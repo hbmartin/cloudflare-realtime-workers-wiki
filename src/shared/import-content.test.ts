@@ -269,6 +269,38 @@ describe("import content", () => {
     expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
   });
 
+  it("preserves formatted image labels in short paragraphs", () => {
+    const parsed = markdownToDocument("See ![**Fig 1**](data:image/png;base64,AAAA) here");
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toContainEqual({ type: "text", text: "Fig 1", marks: [{ type: "bold" }] });
+    expect(parsed.references).toEqual(["data:image/png;base64,AAAA"]);
+  });
+
+  it("does not close an unfinished link with an image marker", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`[a](http://x/![i](${image}) text ${"x".repeat(9_000)}`);
+    expect(parsed.references).toContain(image);
+    expect(JSON.stringify(parsed.document)).not.toMatch(/[\uE000-\uF8FF]/);
+  });
+
+  it("keeps a replaced image atomic across a CJK section cut", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`${"字".repeat(8_190)}![i](${image})${"字".repeat(100)}`);
+    const text = parsed.document
+      .content![0]!.content![0]!.content![0]!.content!.map((node) => node.text ?? "")
+      .join("");
+    expect(text).toBe(`${"字".repeat(8_190)}i${"字".repeat(100)}`);
+    expect(parsed.references).toEqual([image]);
+  });
+
+  it("skips image destinations inside a label code span", () => {
+    const image = "data:image/png;base64,CCCC";
+    const parsed = markdownToDocument(
+      `![a \`x](data:image/png;base64,AAAA) y](data:image/png;base64,BBBB) z\` w](${image}) ${"x".repeat(9_000)}`,
+    );
+    expect(parsed.references).toEqual([image]);
+  });
+
   it("keeps adjacent titled data images out of paragraph text", () => {
     const data = `data:image/png;base64,${"A".repeat(12_000)}`;
     const parsed = markdownToDocument(`See ![a](${data} "first")![b](${data}) below`);
