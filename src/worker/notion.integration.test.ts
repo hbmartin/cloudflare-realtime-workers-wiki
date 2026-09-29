@@ -320,7 +320,7 @@ describe("Notion-compatible API", () => {
     });
     expect((await client.pages.retrieveMarkdown({ page_id: installed.pageId })).markdown).toBe("After\n");
     await env.DB.prepare(
-      `UPDATE notion_markdown_tasks SET status='running',attempts=5,lease_token='stale',
+      `UPDATE notion_markdown_tasks SET status='running',attempts=10,lease_token='stale',
          lease_expires_at=?,next_attempt_at=?,result_json=NULL WHERE id=?`,
     )
       .bind(Date.now() - 1, Date.now() - 1, accepted.id)

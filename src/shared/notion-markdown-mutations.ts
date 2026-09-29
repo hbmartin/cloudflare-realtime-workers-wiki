@@ -1,7 +1,8 @@
 import { documentBlocks, type NotionBlock } from "./notion-blocks";
 import type { MarkdownEdit } from "./notion-markdown-commands";
 import type { NotionMarkdownProjection } from "./notion-markdown";
-import { MarkdownWriteError, parseWritableMarkdownWithSource } from "./notion-markdown-write";
+import { Lexer } from "marked";
+import { MAX_MARKDOWN_DELIMITERS, MarkdownWriteError, parseWritableMarkdownWithSource } from "./notion-markdown-write";
 import { serializeMarkdownNode } from "./document-projection";
 import type { ProseMirrorJson } from "./types";
 
@@ -207,13 +208,12 @@ function preserveNestedIds(block: NotionBlock, container: ProseMirrorJson) {
     for (let index = 0; index < retained; index += 1) {
       const prior = block.children[oldStart + index]!;
       const next = aligned[newStart + index]!;
-      aligned[newStart + index] = preserveNestedIds(
-        prior,
-        preserveBlockStyle(blockContainer(prior), {
-          ...next,
-          attrs: { ...next.attrs, id: prior.internalId },
-        }),
-      );
+      const styled =
+        oldEnd - oldStart === 1 && newEnd - newStart === 1 ? preserveBlockStyle(blockContainer(prior), next) : next;
+      aligned[newStart + index] = preserveNestedIds(prior, {
+        ...styled,
+        attrs: { ...styled.attrs, id: prior.internalId },
+      });
     }
     if (oldEnd < block.children.length) aligned[newEnd] = blockContainer(block.children[oldEnd]!);
     oldStart = oldEnd + 1;
@@ -239,21 +239,28 @@ function parseGroupPreservingMath(
   source: string,
   originals: Array<{ block: NotionBlock; span: NotionMarkdownProjection["spans"][number] }>,
   markdown: string,
+  edits: MarkdownEdit[],
+  allowDeletingContent: boolean,
 ) {
   const protectedMath = originals.filter(({ block }) => block.type === "math");
-  if (!protectedMath.length) return parseWritableMarkdownWithSource(source);
+  if (!protectedMath.length) return { ...parseWritableMarkdownWithSource(source), deletedMathIds: [] as string[] };
   if (new TextEncoder().encode(source).length > 128 * 1024)
     throw new MarkdownWriteError("Markdown content exceeds 128 KiB.");
-  const normalizedSource = source.replaceAll("\r\n", "\n");
+  const normalizedSource = source.replaceAll(/\r\n?/g, "\n");
+  const codeRanges: Array<{ from: number; to: number }> = [];
+  let tokenOffset = 0;
+  for (const token of Lexer.lex(normalizedSource, { gfm: true })) {
+    if (token.type === "code") codeRanges.push({ from: tokenOffset, to: tokenOffset + token.raw.length });
+    tokenOffset += token.raw.length;
+  }
   const blocks: ProseMirrorJson[] = [];
   const rawBlocks: string[] = [];
+  const deletedMathIds: string[] = [];
   let cursor = 0;
   let markupDelimiters = 0;
   const append = (segment: string) => {
-    for (const character of segment)
-      if ("<\\[]`*_!".includes(character) && ++markupDelimiters > 4096)
-        throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
-    const parsed = parseWritableMarkdownWithSource(segment);
+    const parsed = parseWritableMarkdownWithSource(segment, MAX_MARKDOWN_DELIMITERS - markupDelimiters);
+    markupDelimiters += parsed.delimiterCount;
     blocks.push(...parsed.blocks);
     if (blocks.length > 1000) throw new MarkdownWriteError("Markdown content exceeds 1000 blocks.");
     rawBlocks.push(...parsed.rawBlocks);
@@ -264,10 +271,17 @@ function parseGroupPreservingMath(
     while (
       found >= 0 &&
       ((found > 0 && normalizedSource[found - 1] !== "\n") ||
-        (found + raw.length < normalizedSource.length && normalizedSource[found + raw.length] !== "\n"))
+        (found + raw.length < normalizedSource.length && normalizedSource[found + raw.length] !== "\n") ||
+        codeRanges.some((range) => found < range.to && found + raw.length > range.from))
     )
       found = normalizedSource.indexOf(raw, found + 1);
-    if (found < 0) throw new MarkdownWriteError("Math blocks must be edited through the block API.");
+    if (found < 0) {
+      if (allowDeletingContent && edits.some((edit) => edit.from <= span.from && edit.to >= span.to)) {
+        deletedMathIds.push(block.internalId);
+        continue;
+      }
+      throw new MarkdownWriteError("Math blocks must be edited through the block API.");
+    }
     append(normalizedSource.slice(cursor, found));
     blocks.push(blockContainer(block));
     rawBlocks.push(raw);
@@ -275,7 +289,7 @@ function parseGroupPreservingMath(
     cursor = found + raw.length;
   }
   append(normalizedSource.slice(cursor));
-  return { blocks, rawBlocks };
+  return { blocks, rawBlocks, delimiterCount: markupDelimiters, deletedMathIds };
 }
 
 /** Build one document-room transaction without rewriting any unselected block. */
@@ -348,10 +362,25 @@ export function markdownMutations(
     }
     const groupSource = replacementText(projection.markdown, from, to, group.edits);
     const originalSpans = original.map((block, index) => ({ block, span: projection.spans[group.first + index]! }));
-    const parsed = parseGroupPreservingMath(groupSource, originalSpans, projection.markdown);
+    const parsed = parseGroupPreservingMath(
+      groupSource,
+      originalSpans,
+      projection.markdown,
+      group.edits,
+      allowDeletingContent,
+    );
     const replacement = parsed.blocks;
+    const deletedMathIds = new Set(parsed.deletedMathIds);
+    for (const { block } of originalSpans) {
+      if (!deletedMathIds.has(block.internalId)) continue;
+      if (blockHasProtectedContent(block, protectedBlockIds))
+        throw new MarkdownWriteError(
+          "A selected block has comments or comment anchors. Use the block API to edit it safely.",
+        );
+      operations.push({ type: "delete_block", internalId: block.internalId });
+    }
     const retainedOriginal = originalSpans.flatMap(({ block, span }) => {
-      return span.from !== span.to ? [{ block, span }] : [];
+      return span.from !== span.to && !deletedMathIds.has(block.internalId) ? [{ block, span }] : [];
     });
     const oldSignatures = retainedOriginal.map(({ span }) => projection.markdown.slice(span.from, span.to).trimEnd());
     const newSignatures = parsed.rawBlocks;

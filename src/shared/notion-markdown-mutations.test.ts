@@ -192,6 +192,47 @@ describe("Notion Markdown block mutations", () => {
     expect(() => markdownMutations(document, projection, command.edits, true)).toThrow("too many markup delimiters");
   });
 
+  it("can explicitly delete a math block without retaining its ID", () => {
+    const { first, second } = fixture();
+    const math = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "math", attrs: { formula: "a+b" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, math, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      {
+        type: "replace_content",
+        replace_content: { new_str: "Changed first\n\nChanged second\n", allow_deleting_content: true },
+      },
+      projection.markdown,
+    );
+    expect(markdownMutations(document, projection, command.edits, true)).toContainEqual({
+      type: "delete_block",
+      internalId: math.attrs.id,
+    });
+  });
+
+  it("ignores math text inside a fenced code block while preserving the real formula", () => {
+    const { first, second } = fixture();
+    const math = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "math", attrs: { formula: "a+b" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, math, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const changed = `\`\`\`\n$$\na+b\n$$\n\`\`\`\n\n${projection.markdown.replace("First", "Changed first").replace("Second", "Changed second")}`;
+    const command = parseMarkdownCommand(
+      { type: "replace_content", replace_content: { new_str: changed } },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false);
+    expect(JSON.stringify(operations)).not.toContain(math.attrs.id);
+    expect(operations.some((operation) => operation.type === "append_children")).toBe(true);
+  });
+
   it("does not carry style from a deleted block onto unrelated replacement content", () => {
     const { first, document, projection } = fixture();
     first.content![0]!.attrs = { ...first.content![0]!.attrs, textColor: "red" };

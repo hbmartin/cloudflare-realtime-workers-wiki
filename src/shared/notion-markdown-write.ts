@@ -4,6 +4,7 @@ import type { ProseMirrorJson } from "./types";
 const BLOCK_ATTRS = { backgroundColor: "default", textColor: "default", textAlignment: "left" };
 const MAX_INPUT_BYTES = 128 * 1024;
 const MAX_INPUT_BLOCKS = 1000;
+export const MAX_MARKDOWN_DELIMITERS = 4096;
 
 export class MarkdownWriteError extends Error {}
 
@@ -33,7 +34,7 @@ function textWithMath(value: string, marks: NonNullable<ProseMirrorJson["marks"]
     if (
       value[index] !== "$" ||
       escaped(index) ||
-      (value[index - 1] === "$" && index > cursor) ||
+      (value[index - 1] === "$" && !escaped(index - 1) && index > cursor) ||
       !value[index + 1] ||
       value[index + 1] === "$" ||
       /\s/.test(value[index + 1]!)
@@ -84,7 +85,7 @@ function splitCrossTokenMath(tokens: Token[]) {
     if (
       source[index] !== "$" ||
       escaped(index) ||
-      (source[index - 1] === "$" && lastClose !== index - 1) ||
+      (source[index - 1] === "$" && !escaped(index - 1) && lastClose !== index - 1) ||
       source[index + 1] === "$" ||
       !source[index + 1] ||
       /\s/.test(source[index + 1]!)
@@ -186,7 +187,10 @@ function list(token: Token): ProseMirrorJson[] {
 }
 
 /** Parse only Markdown structures that can be represented without changing their meaning. */
-export function parseWritableMarkdownWithSource(source: string): { blocks: ProseMirrorJson[]; rawBlocks: string[] } {
+export function parseWritableMarkdownWithSource(
+  source: string,
+  maxDelimiters = MAX_MARKDOWN_DELIMITERS,
+): { blocks: ProseMirrorJson[]; rawBlocks: string[]; delimiterCount: number } {
   if (new TextEncoder().encode(source).length > MAX_INPUT_BYTES)
     throw new MarkdownWriteError("Markdown content exceeds 128 KiB.");
   if (source.includes("\0")) throw new MarkdownWriteError("Markdown content contains an invalid character.");
@@ -206,7 +210,7 @@ export function parseWritableMarkdownWithSource(source: string): { blocks: Prose
       }
       const inlineSource = "text" in token && typeof token.text === "string" ? token.text : token.raw;
       for (const character of inlineSource)
-        if ("<\\[]`*_!".includes(character) && ++delimiterCount > 4096)
+        if ("<\\[]`*_!".includes(character) && ++delimiterCount > maxDelimiters)
           throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
     }
   };
@@ -275,7 +279,7 @@ export function parseWritableMarkdownWithSource(source: string): { blocks: Prose
     if (token.type !== "list") rawBlocks.push(token.raw.trimEnd());
     if (output.length > MAX_INPUT_BLOCKS) throw new MarkdownWriteError("Markdown content exceeds 1000 blocks.");
   }
-  return { blocks: output, rawBlocks };
+  return { blocks: output, rawBlocks, delimiterCount };
 }
 
 export function parseWritableMarkdown(source: string): ProseMirrorJson[] {

@@ -178,13 +178,13 @@ export async function claimExhaustedMarkdownTasks(env: Env) {
     const leaseToken = crypto.randomUUID();
     const task = await env.DB.prepare(
       `UPDATE notion_markdown_tasks SET status='running',
-         lease_token=?,lease_expires_at=?,updated_at=?
+         lease_token=?,lease_expires_at=?,next_attempt_at=?,updated_at=?
        WHERE id=? AND status IN ('queued','running','retrying')
          AND (attempts>=? OR expires_at<=?)
          AND next_attempt_at<=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)
        RETURNING *`,
     )
-      .bind(leaseToken, now + LEASE_MS, now, row.id, MAX_MARKDOWN_TASK_ATTEMPTS, now, now, now)
+      .bind(leaseToken, now + LEASE_MS, now + LEASE_MS, now, row.id, MAX_MARKDOWN_TASK_ATTEMPTS, now, now, now)
       .first<MarkdownTaskRow>();
     if (task) claimed.push(task);
   }

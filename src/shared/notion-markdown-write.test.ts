@@ -64,6 +64,14 @@ describe("writable Notion Markdown", () => {
     ]);
   });
 
+  it("parses inline math immediately after an escaped literal dollar", () => {
+    const content = parseWritableMarkdown("Price \\$$x$ today.\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "x" } },
+    ]);
+    expect(content.map((node) => node.text ?? "").join("")).toContain("Price $");
+  });
+
   it("keeps math inside a single emphasis token inside that formatting", () => {
     const content = parseWritableMarkdown("**Before $x+1$ after**\n")[0]!.content![0]!.content!;
     expect(content.filter((node) => node.type === "inlineMath")).toEqual([

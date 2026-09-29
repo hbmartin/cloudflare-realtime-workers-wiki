@@ -42,7 +42,6 @@ import {
   markdownTaskForIntegration,
   markdownTaskForRequestKey,
   markdownTaskJson,
-  MAX_MARKDOWN_TASK_ATTEMPTS,
   pruneMarkdownTasks,
   renewMarkdownTaskLease,
   type MarkdownTaskRow,
@@ -974,7 +973,8 @@ export async function runNotionMarkdownTask(env: Env, id: string) {
     }
   } catch (error) {
     const terminal = error instanceof NotionError && error.status !== 503;
-    const retry = !terminal && task.attempts < MAX_MARKDOWN_TASK_ATTEMPTS && task.expires_at > Date.now();
+    // After the final mutation attempt, recovery still needs one receipt check.
+    const retry = !terminal;
     if (retry)
       logger.warn(
         "notion_api.markdown_task.retry",
@@ -1028,6 +1028,9 @@ export async function recoverNotionMarkdownTasks(env: Env) {
         }
         await completeMarkdownFromReceipt(env, task, principal, page, receipt);
       } catch (error) {
+        const retry =
+          (!(error instanceof NotionError) || error.status === 503) &&
+          Date.now() <= task.expires_at + 7 * 24 * 60 * 60_000;
         await failMarkdownTask(
           env,
           task,
@@ -1037,7 +1040,7 @@ export async function recoverNotionMarkdownTasks(env: Env) {
             code: error instanceof NotionError ? error.code : "service_unavailable",
             message: error instanceof NotionError ? error.message : "The Markdown update could not be completed.",
           },
-          false,
+          retry,
         );
       } finally {
         stopLease();
