@@ -6,6 +6,15 @@ import { createAuth } from "./auth";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("replays the reminder absence migration after the original reminder table", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0059"),
+    );
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    const columns = await env.DB.prepare(`PRAGMA table_info(date_reminders)`).all<{ name: string }>();
+    expect(columns.results.map((column) => column.name)).toContain("missing_since");
+  });
   it("repairs a stale recovery claim after its pending key was pruned", async () => {
     await applyD1Migrations(
       env.DB,

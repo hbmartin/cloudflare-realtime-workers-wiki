@@ -293,7 +293,7 @@ describe("date reminders", () => {
     expect((await SELF.fetch(request(installed.cookie, path, { method: "DELETE" }))).status).toBe(404);
   });
 
-  it("cancels a due reminder after token removal", async () => {
+  it("does not deliver a missing token and cancels it after the absence window", async () => {
     const installed = await bootstrap();
     const token: DateMention = {
       tokenId: crypto.randomUUID(),
@@ -322,6 +322,15 @@ describe("date reminders", () => {
       .run();
     await processDueDateReminders(env as unknown as Env);
     expect(
+      await env.DB.prepare(`SELECT state,missing_since FROM date_reminders WHERE token_id=?`)
+        .bind(token.tokenId)
+        .first<{ state: string; missing_since: number | null }>(),
+    ).toMatchObject({ state: "active", missing_since: expect.any(Number) });
+    await env.DB.prepare(`UPDATE date_reminders SET missing_since=?,checked_at=? WHERE token_id=?`)
+      .bind(Date.now() - 3 * 60_000, 1, token.tokenId)
+      .run();
+    await processDueDateReminders(env as unknown as Env);
+    expect(
       await env.DB.prepare(`SELECT state FROM date_reminders WHERE token_id=?`).bind(token.tokenId).first(),
     ).toEqual({ state: "canceled" });
     expect(
@@ -331,6 +340,42 @@ describe("date reminders", () => {
         }>()
       )?.count,
     ).toBe(0);
+  });
+
+  it("keeps the same reminder when a cut token is pasted back after a save", async () => {
+    const installed = await bootstrap();
+    const token: DateMention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: installed.userId,
+      kind: "timed",
+      value: new Date(Date.now() + 3_600_000).toISOString(),
+      timezone: "UTC",
+    };
+    await addToken(installed.page.id, token);
+    const path = `/api/pages/${installed.page.id}/date-reminders/${token.tokenId}`;
+    expect(
+      (
+        await SELF.fetch(
+          request(installed.cookie, path, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ revision: token.revision, choice: "at_time" }),
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    await removeTokens(installed.page.id);
+    await env.DB.prepare(`UPDATE date_reminders SET checked_at=1 WHERE token_id=?`).bind(token.tokenId).run();
+    await processDueDateReminders(env as unknown as Env);
+    await addToken(installed.page.id, token);
+    await env.DB.prepare(`UPDATE date_reminders SET checked_at=1 WHERE token_id=?`).bind(token.tokenId).run();
+    await processDueDateReminders(env as unknown as Env);
+    expect(
+      await env.DB.prepare(`SELECT state,missing_since,generation FROM date_reminders WHERE token_id=?`)
+        .bind(token.tokenId)
+        .first(),
+    ).toEqual({ state: "active", missing_since: null, generation: 1 });
   });
 
   it("does not deliver when the author loses workspace access before the due scan", async () => {

@@ -23,12 +23,13 @@ type ReminderRow = {
   claim_id: string | null;
   claimed_at: number | null;
   delivery_receipt_id: string | null;
+  missing_since: number | null;
   checked_at: number;
 };
 
-const ACTIVE_SWEEP_INTERVAL = 15 * 60_000;
+const ACTIVE_SWEEP_INTERVAL = 14 * 60_000;
 const DELIVERED_SWEEP_INTERVAL = 24 * 60 * 60_000;
-const NEXT_SWEEP_SQL = `checked_at + CASE WHEN state='delivered' THEN ${DELIVERED_SWEEP_INTERVAL} ELSE ${ACTIVE_SWEEP_INTERVAL} END`;
+const MISSING_GRACE_MS = 2 * 60_000;
 
 export type ReminderInput = { revision: string; choice: ReminderChoice | { absolute: string } };
 
@@ -116,7 +117,7 @@ export async function putDateReminder(
        content_epoch=excluded.content_epoch,token_revision=excluded.token_revision,
        timezone=excluded.timezone,choice_json=excluded.choice_json,due_at=excluded.due_at,
        generation=date_reminders.generation+1,state='active',claim_id=NULL,claimed_at=NULL,
-       delivery_receipt_id=NULL,checked_at=excluded.checked_at,updated_at=excluded.updated_at
+       delivery_receipt_id=NULL,missing_since=NULL,checked_at=excluded.checked_at,updated_at=excluded.updated_at
      WHERE date_reminders.content_epoch!=excluded.content_epoch
         OR date_reminders.token_revision!=excluded.token_revision
         OR date_reminders.choice_json!=excluded.choice_json
@@ -181,7 +182,7 @@ export async function reconcileDateRemindersForPage(
 ) {
   const rows = await env.DB.prepare(
     `SELECT * FROM date_reminders WHERE page_id=? AND content_epoch=? AND state IN ('active','claimed','delivered')
-      ${sweepCutoff === undefined ? "" : `AND ((state IN ('active','claimed') AND checked_at<?) OR (state='delivered' AND checked_at<?)) ORDER BY ${NEXT_SWEEP_SQL} LIMIT 25`}`,
+      ${sweepCutoff === undefined ? "" : "AND ((state IN ('active','claimed') AND checked_at<?) OR (state='delivered' AND checked_at<?)) ORDER BY CASE WHEN state IN ('active','claimed') THEN 0 ELSE 1 END, checked_at LIMIT 25"}`,
   )
     .bind(pageId, epoch, ...(sweepCutoff === undefined ? [] : [sweepCutoff.active, sweepCutoff.delivered]))
     .all<ReminderRow>();
@@ -189,72 +190,91 @@ export async function reconcileDateRemindersForPage(
   const tokens = dateTokens(document);
   const timestamp = Date.now();
   const unchangedIds: string[] = [];
+  const sequenceGuard =
+    sequence === undefined
+      ? ""
+      : `AND EXISTS (SELECT 1 FROM document_projections
+      WHERE page_id=date_reminders.page_id AND content_epoch=date_reminders.content_epoch AND sequence=?)`;
+  const sequenceBind = sequence === undefined ? [] : [sequence];
   for (const row of rows.results) {
     const token = tokens.get(row.token_id);
+    if (!token) {
+      if (row.missing_since === null) {
+        await env.DB.prepare(
+          `UPDATE date_reminders SET missing_since=?,checked_at=?,
+             state=CASE WHEN state='claimed' THEN 'active' ELSE state END,
+             claim_id=NULL,claimed_at=NULL,updated_at=?
+           WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
+        )
+          .bind(timestamp, timestamp, timestamp, row.id, row.generation, ...sequenceBind)
+          .run();
+      } else if (timestamp - row.missing_since >= MISSING_GRACE_MS) {
+        await env.DB.prepare(
+          `UPDATE date_reminders SET state='canceled',generation=generation+1,claim_id=NULL,claimed_at=NULL,
+             delivery_receipt_id=NULL,missing_since=NULL,checked_at=?,updated_at=?
+           WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
+        )
+          .bind(timestamp, timestamp, row.id, row.generation, ...sequenceBind)
+          .run();
+      } else if (row.state === "claimed") {
+        await env.DB.prepare(
+          `UPDATE date_reminders SET state='active',claim_id=NULL,claimed_at=NULL,checked_at=?,updated_at=?
+           WHERE id=? AND generation=? AND state='claimed' ${sequenceGuard}`,
+        )
+          .bind(timestamp, timestamp, row.id, row.generation, ...sequenceBind)
+          .run();
+      }
+      continue;
+    }
     const choice = reminderChoice(JSON.parse(row.choice_json));
     const dueAt = token && choice ? dateMentionDueAt(token, choice) : null;
     const sameToken = token && token.createdBy === row.user_id && dueAt !== null && row.content_epoch === epoch;
     const unchanged =
       sameToken && token.revision === row.token_revision && token.timezone === row.timezone && dueAt === row.due_at;
-    const sequenceGuard =
-      sequence === undefined
-        ? ""
-        : `AND EXISTS (SELECT 1 FROM document_projections
-      WHERE page_id=date_reminders.page_id AND content_epoch=date_reminders.content_epoch AND sequence=?)`;
     if (!sameToken || (!unchanged && dueAt !== row.due_at && dueAt <= timestamp)) {
       await env.DB.prepare(
         `UPDATE date_reminders SET state='canceled',generation=generation+1,claim_id=NULL,claimed_at=NULL,
-           delivery_receipt_id=NULL,checked_at=?,updated_at=?
+           delivery_receipt_id=NULL,missing_since=NULL,checked_at=?,updated_at=?
          WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
       )
-        .bind(timestamp, timestamp, row.id, row.generation, ...(sequence === undefined ? [] : [sequence]))
+        .bind(timestamp, timestamp, row.id, row.generation, ...sequenceBind)
         .run();
     } else if (!unchanged && dueAt === row.due_at) {
       await env.DB.prepare(
-        `UPDATE date_reminders SET token_revision=?,timezone=?,checked_at=?,updated_at=?
+        `UPDATE date_reminders SET token_revision=?,timezone=?,missing_since=NULL,
+           state=CASE WHEN state='claimed' THEN 'active' ELSE state END,
+           claim_id=NULL,claimed_at=NULL,checked_at=?,updated_at=?
          WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
       )
-        .bind(
-          token.revision,
-          token.timezone,
-          timestamp,
-          timestamp,
-          row.id,
-          row.generation,
-          ...(sequence === undefined ? [] : [sequence]),
-        )
+        .bind(token.revision, token.timezone, timestamp, timestamp, row.id, row.generation, ...sequenceBind)
         .run();
     } else if (!unchanged) {
       await env.DB.prepare(
         `UPDATE date_reminders SET token_revision=?,timezone=?,due_at=?,generation=generation+1,
-           state='active',claim_id=NULL,claimed_at=NULL,delivery_receipt_id=NULL,checked_at=?,updated_at=?
+           state='active',claim_id=NULL,claimed_at=NULL,delivery_receipt_id=NULL,missing_since=NULL,
+           checked_at=?,updated_at=?
          WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
       )
-        .bind(
-          token.revision,
-          token.timezone,
-          dueAt,
-          timestamp,
-          timestamp,
-          row.id,
-          row.generation,
-          ...(sequence === undefined ? [] : [sequence]),
-        )
+        .bind(token.revision, token.timezone, dueAt, timestamp, timestamp, row.id, row.generation, ...sequenceBind)
+        .run();
+    } else if (row.missing_since !== null) {
+      await env.DB.prepare(
+        `UPDATE date_reminders SET missing_since=NULL,
+           state=CASE WHEN state='claimed' THEN 'active' ELSE state END,
+           claim_id=NULL,claimed_at=NULL,checked_at=?,updated_at=?
+         WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
+      )
+        .bind(timestamp, timestamp, row.id, row.generation, ...sequenceBind)
         .run();
     } else {
       unchangedIds.push(row.id);
     }
   }
   if (unchangedIds.length) {
-    const sequenceGuard =
-      sequence === undefined
-        ? ""
-        : `AND EXISTS (SELECT 1 FROM document_projections
-      WHERE page_id=date_reminders.page_id AND content_epoch=date_reminders.content_epoch AND sequence=?)`;
     await env.DB.prepare(
       `UPDATE date_reminders SET checked_at=? WHERE id IN (SELECT value FROM json_each(?)) ${sequenceGuard}`,
     )
-      .bind(timestamp, JSON.stringify(unchangedIds), ...(sequence === undefined ? [] : [sequence]))
+      .bind(timestamp, JSON.stringify(unchangedIds), ...sequenceBind)
       .run();
   }
 }
@@ -262,17 +282,28 @@ export async function reconcileDateRemindersForPage(
 async function sweepDateReminders(env: Env) {
   const timestamp = Date.now();
   const cutoffs = { active: timestamp - ACTIVE_SWEEP_INTERVAL, delivered: timestamp - DELIVERED_SWEEP_INTERVAL };
-  const rows = await env.DB.prepare(
-    `SELECT page_id,content_epoch,
-       MIN(${NEXT_SWEEP_SQL}) next_check FROM date_reminders
-       WHERE (state IN ('active','claimed') AND checked_at<?)
-          OR (state='delivered' AND checked_at<?)
-       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 5`,
-  )
-    .bind(cutoffs.active, cutoffs.delivered)
-    .all<{ page_id: string; content_epoch: number }>();
+  const [active, delivered] = await Promise.all([
+    env.DB.prepare(
+      `SELECT page_id,content_epoch,MIN(checked_at) next_check FROM date_reminders
+       WHERE state IN ('active','claimed') AND checked_at<?
+       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 4`,
+    )
+      .bind(cutoffs.active)
+      .all<{ page_id: string; content_epoch: number }>(),
+    env.DB.prepare(
+      `SELECT page_id,content_epoch,MIN(checked_at) next_check FROM date_reminders
+       WHERE state='delivered' AND checked_at<?
+       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 1`,
+    )
+      .bind(cutoffs.delivered)
+      .all<{ page_id: string; content_epoch: number }>(),
+  ]);
+  const rows = [...active.results, ...delivered.results].filter(
+    (row, index, all) =>
+      all.findIndex((other) => other.page_id === row.page_id && other.content_epoch === row.content_epoch) === index,
+  );
   const failures: unknown[] = [];
-  for (const row of rows.results) {
+  for (const row of rows) {
     try {
       const page = await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id=? AND archived_at IS NULL`)
         .bind(row.page_id)
@@ -323,6 +354,12 @@ async function sweepDateReminders(env: Env) {
         });
     }
   }
+  await env.DB.prepare(
+    `DELETE FROM date_reminders WHERE id IN
+      (SELECT id FROM date_reminders WHERE state='canceled' AND updated_at<? ORDER BY updated_at LIMIT 100)`,
+  )
+    .bind(timestamp - 30 * 24 * 60 * 60_000)
+    .run();
   if (failures.length) throw new AggregateError(failures, "Date reminder sweep failed.");
 }
 

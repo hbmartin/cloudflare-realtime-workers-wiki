@@ -34,6 +34,8 @@ import { sweepOutbox } from "./jobs";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { dateTokens } from "../shared/document-projection";
+import { dateMentionFromProps } from "../shared/date-mentions";
+import { reconcileDateRemindersForPage } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -1195,12 +1197,41 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   const located = await locatedBlock(c.env, principal, c.req.param("blockId"));
   const input = await body(c.req.raw);
   if (input.in_trash === true) {
-    await mutateDocument(c.env, located.page, principal, [{ type: "delete_block", internalId: located.internalId }]);
+    const mutated = await mutateDocument(c.env, located.page, principal, [
+      { type: "delete_block", internalId: located.internalId },
+    ]);
+    await reconcileDateRemindersForPage(c.env, located.page.id, located.page.content_epoch, mutated.document);
     return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
+  }
+  const blockDates = dateTokens(located.block!.node);
+  const liveDates = dateTokens((await liveDocument(c.env, located.page)).document);
+  for (const payload of Object.values(input)) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    const richText = (payload as { rich_text?: unknown }).rich_text;
+    if (!Array.isArray(richText)) continue;
+    for (const item of richText) {
+      const supplied = dateMentionFromProps(item?.mention?.noteFlare ?? {});
+      if (!supplied || blockDates.has(supplied.tokenId)) continue;
+      if (liveDates.has(supplied.tokenId))
+        throw new NotionError(409, "conflict_error", "Move the original date token before reusing its ID.");
+      const reminder = await c.env.DB.prepare(
+        `SELECT user_id,token_revision,timezone FROM date_reminders
+         WHERE page_id=? AND content_epoch=? AND token_id=?
+           AND state IN ('active','claimed','delivered') AND missing_since>=? LIMIT 1`,
+      )
+        .bind(located.page.id, located.page.content_epoch, supplied.tokenId, Date.now() - 2 * 60_000)
+        .first<{ user_id: string; token_revision: string; timezone: string }>();
+      if (
+        reminder?.user_id === supplied.createdBy &&
+        reminder.token_revision === supplied.revision &&
+        reminder.timezone === supplied.timezone
+      )
+        blockDates.set(supplied.tokenId, supplied);
+    }
   }
   let container;
   try {
-    container = notionInputToBlockContainer({ ...input, id: located.internalId }, 0, dateTokens(located.block!.node));
+    container = notionInputToBlockContainer({ ...input, id: located.internalId }, 0, blockDates);
   } catch (error) {
     throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid block.");
   }
@@ -1211,6 +1242,7 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   const mutated = await mutateDocument(c.env, located.page, principal, [
     { type: "update_block", internalId: located.internalId, node },
   ]);
+  await reconcileDateRemindersForPage(c.env, located.page.id, located.page.content_epoch, mutated.document);
   const updated = findDocumentBlock(mutated.document, located.internalId)!;
   return c.json(await blockObject(c.env, located.page, updated, await metadataForPage(c.env, located.page.id)));
 });
@@ -1219,7 +1251,10 @@ notionApi.delete("/blocks/:blockId", async (c) => {
   const principal = c.get("principal");
   capability(principal, "updateContent");
   const located = await locatedBlock(c.env, principal, c.req.param("blockId"));
-  await mutateDocument(c.env, located.page, principal, [{ type: "delete_block", internalId: located.internalId }]);
+  const mutated = await mutateDocument(c.env, located.page, principal, [
+    { type: "delete_block", internalId: located.internalId },
+  ]);
+  await reconcileDateRemindersForPage(c.env, located.page.id, located.page.content_epoch, mutated.document);
   return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
 });
 

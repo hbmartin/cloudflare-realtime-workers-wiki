@@ -213,6 +213,58 @@ describe("Notion-compatible API", () => {
       createdBy: mention.createdBy,
       value: "2026-10-05T14:00:00.000Z",
     });
+    const movedMention = JSON.parse(updated.paragraph.rich_text[0]!.mention.noteFlare.payload) as {
+      tokenId: string;
+      revision: string;
+    };
+    const reminderPath = `/api/pages/${installed.pageId}/date-reminders/${mention.tokenId}`;
+    expect(
+      (
+        await SELF.fetch(
+          authenticated(installed.cookie, reminderPath, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              revision: movedMention.revision,
+              choice: { absolute: new Date(Date.now() + 24 * 60 * 60_000).toISOString() },
+            }),
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const appended = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/blocks/${installed.pageId}/children`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ children: [{ paragraph: { rich_text: [] } }] }),
+      }),
+    );
+    expect(appended.status).toBe(200);
+    const target = await appended.json<{ results: Array<{ id: string }> }>();
+    expect(
+      (await SELF.fetch(notionRequest(createdIntegration.token, `/blocks/${block!.id}`, { method: "DELETE" }))).status,
+    ).toBe(200);
+    const moved = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/blocks/${target.results[0]!.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paragraph: { rich_text: updated.paragraph.rich_text } }),
+      }),
+    );
+    expect(moved.status).toBe(200);
+    const movedBlock = await moved.json<{
+      paragraph: { rich_text: Array<{ mention: { noteFlare: { payload: string } } }> };
+    }>();
+    expect(JSON.parse(movedBlock.paragraph.rich_text[0]!.mention.noteFlare.payload)).toMatchObject({
+      tokenId: mention.tokenId,
+      createdBy: mention.createdBy,
+    });
+    const afterMove = await (
+      await SELF.fetch(authenticated(installed.cookie, reminderPath))
+    ).json<{
+      reminder: { state: string } | null;
+    }>();
+    expect(afterMove.reminder?.state).toBe("active");
   });
   it("round-trips expanded embed URLs through /v1 while framing is disabled", async () => {
     const installed = await bootstrap();

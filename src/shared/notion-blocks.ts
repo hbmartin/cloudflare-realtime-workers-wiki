@@ -236,11 +236,7 @@ function pmMark(type: string, markAttrs?: Record<string, unknown>) {
 
 function notionDateStart(start: string, timezone: string): Pick<DateMention, "kind" | "value"> {
   if (validCalendarDate(start)) return { kind: "all-day", value: start };
-  const local = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?$/.exec(start);
-  const absolute = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(?:Z|[+-]\d{2}:\d{2})$/.exec(
-    start,
-  );
-  const parts = local ?? absolute;
+  const parts = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-]\d{2}:\d{2})?$/.exec(start);
   if (
     !parts ||
     !validCalendarDate(parts[1]!) ||
@@ -249,12 +245,12 @@ function notionDateStart(start: string, timezone: string): Pick<DateMention, "ki
     Number(parts[4] ?? 0) > 59
   )
     throw new Error("Date mention is invalid.");
-  const minute = local
-    ? resolveLocalDateTime(parts[1]!, timezone, Number(parts[2]), Number(parts[3]))
-    : Date.parse(start);
+  const minute = parts[6]
+    ? Date.parse(start)
+    : resolveLocalDateTime(parts[1]!, timezone, Number(parts[2]), Number(parts[3]));
   if (minute === null || !Number.isFinite(minute)) throw new Error("Date mention is invalid.");
-  const fractionalMs = Number((parts[5] ?? "").padEnd(3, "0").slice(0, 3));
-  const instant = local ? minute + Number(parts[4] ?? 0) * 1000 + fractionalMs : minute;
+  const fractionalMs = parts[6] ? 0 : Number((parts[5] ?? "").padEnd(3, "0").slice(0, 3));
+  const instant = parts[6] ? minute : minute + Number(parts[4] ?? 0) * 1000 + fractionalMs;
   return { kind: "timed", value: new Date(instant).toISOString() };
 }
 
