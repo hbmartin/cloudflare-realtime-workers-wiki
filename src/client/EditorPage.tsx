@@ -71,6 +71,12 @@ const ACCOUNT_CATALOG_WARNING = "The offline page list could not be updated yet.
 const PENDING_CATALOG_WARNING = "Local changes are saved, but the offline page list could not be updated yet.";
 const SYNCED_CATALOG_WARNING = "Changes are synced, but the offline page list could not be updated yet.";
 const OFFLINE_INIT_ERROR = "Offline storage is unavailable, so editing and collaboration are disabled for this page.";
+const liveRecoveryCopies = new Map<string, string>();
+export function clearLiveRecoveryCopies(accountKey: string) {
+  const [userId, workspaceId] = accountKey.split("\u0000");
+  const prefix = `account:${userId}:${workspaceId}:`;
+  for (const key of liveRecoveryCopies.keys()) if (key.startsWith(prefix)) liveRecoveryCopies.delete(key);
+}
 type RecoveryEntry = { key: string; epoch: number; reason?: "access" | "storage" | "epoch"; storageFailed?: boolean };
 function recoveryEntries(key: string): RecoveryEntry[] {
   try {
@@ -149,7 +155,11 @@ export function EditorPage({
   const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [storageWriteFailed, setStorageWriteFailed] = useState(false);
-  const [liveRecovery, setLiveRecovery] = useState<{ key: string; markdown: string } | null>(null);
+  const currentStorageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
+  const [liveRecovery, setLiveRecovery] = useState<{ key: string; markdown: string } | null>(() => {
+    const markdown = liveRecoveryCopies.get(currentStorageKey);
+    return markdown === undefined ? null : { key: currentStorageKey, markdown };
+  });
   const [recoveryPersistenceFailed, setRecoveryPersistenceFailed] = useState(false);
   const [storageLoadingSlow, setStorageLoadingSlow] = useState(false);
   const [storageRetry, setStorageRetry] = useState(0);
@@ -185,6 +195,7 @@ export function EditorPage({
   const [recovery, setRecovery] = useState<RecoveryEntry[]>(() => recoveryEntries(recoveryKey));
   const [recoveryPreview, setRecoveryPreview] = useState<{ key: string; text: string } | null>(null);
   const recoveryRef = useRef(recovery);
+  const dismissedRecovery = useRef<Record<string, number>>({});
   const replaceRecovery = useCallback(
     (next: RecoveryEntry[]) => {
       const previous = recoveryRef.current;
@@ -193,12 +204,20 @@ export function EditorPage({
       const stored = new Map(recoveryEntries(recoveryKey).map((entry) => [entry.key, entry]));
       for (const [key, prior] of previousByKey) {
         const changed = nextByKey.get(key);
-        if (!changed) stored.delete(key);
-        else if (JSON.stringify(changed) !== JSON.stringify(prior))
-          stored.set(key, mergedRecovery(stored.get(key), changed));
+        if (!changed) {
+          if (!stored.has(key) || JSON.stringify(stored.get(key)) === JSON.stringify(prior)) stored.delete(key);
+        } else if (JSON.stringify(changed) !== JSON.stringify(prior)) {
+          const merged = mergedRecovery(stored.get(key), changed);
+          if (changed.reason === "epoch" && changed.epoch !== page.contentEpoch) merged.reason = "epoch";
+          stored.set(key, merged);
+        }
       }
       for (const [key, changed] of nextByKey)
-        if (!previousByKey.has(key)) stored.set(key, mergedRecovery(stored.get(key), changed));
+        if (!previousByKey.has(key)) {
+          const merged = mergedRecovery(stored.get(key), changed);
+          if (changed.reason === "epoch" && changed.epoch !== page.contentEpoch) merged.reason = "epoch";
+          stored.set(key, merged);
+        }
       const merged = [...stored.values()].sort((left, right) => left.epoch - right.epoch);
       try {
         localStorage.setItem(recoveryKey, JSON.stringify(merged));
@@ -226,20 +245,23 @@ export function EditorPage({
       setRecoveryPreview((current) => (current && !retained.has(current.key) ? null : current));
       setPreparedRecoveryCopy((current) => (current && !retained.has(current.key) ? null : current));
       setLiveRecovery((current) => (current && !retained.has(current.key) ? null : current));
+      for (const entry of previous) if (!retained.has(entry.key)) liveRecoveryCopies.delete(entry.key);
     },
-    [recoveryKey],
+    [recoveryKey, page.contentEpoch],
   );
   useEffect(() => {
     const changed = (event: StorageEvent) => {
       if (event.key !== recoveryKey) return;
       const entries = recoveryEntries(recoveryKey);
-      recoveryRef.current = entries;
-      setRecovery(entries);
+      replaceRecovery(
+        recoveryPersistenceFailed
+          ? [...entries, ...recoveryRef.current.filter((entry) => !entries.some((saved) => saved.key === entry.key))]
+          : entries,
+      );
     };
     window.addEventListener("storage", changed);
     return () => window.removeEventListener("storage", changed);
-  }, [recoveryKey]);
-  const dismissedRecovery = useRef<Record<string, number>>({});
+  }, [recoveryKey, recoveryPersistenceFailed, replaceRecovery]);
   useEffect(() => {
     try {
       const saved: unknown = JSON.parse(localStorage.getItem(`${recoveryKey}:dismissed`) ?? "{}");
@@ -261,6 +283,16 @@ export function EditorPage({
     } catch {
       dismissedRecovery.current = {};
     }
+    const changed = (event: StorageEvent) => {
+      if (event.key !== `${recoveryKey}:dismissed`) return;
+      try {
+        dismissedRecovery.current = JSON.parse(localStorage.getItem(event.key) ?? "{}");
+      } catch {
+        dismissedRecovery.current = {};
+      }
+    };
+    window.addEventListener("storage", changed);
+    return () => window.removeEventListener("storage", changed);
   }, [recoveryKey, page.contentEpoch]);
   const [title, setTitle] = useState(page.title);
   const [titleError, setTitleError] = useState("");
@@ -271,7 +303,6 @@ export function EditorPage({
   const titleRevisionRef = useRef(page.revision);
   const titleDirtyRef = useRef(false);
   const titleSavingRef = useRef(0);
-  const currentStorageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
   const writeRecovery = recovery.some(
     (entry) => entry.key === currentStorageKey && (entry.storageFailed || entry.reason === "storage"),
   );
@@ -343,6 +374,7 @@ export function EditorPage({
       const current = recoveryRef.current;
       const prior = current.find((entry) => entry.key === key);
       const combined = mergedRecovery(prior, value);
+      if (reason === "epoch" && value.epoch !== page.contentEpoch) combined.reason = "epoch";
       if (prior && JSON.stringify(prior) === JSON.stringify(combined)) return;
       replaceRecovery([...current.filter((entry) => entry.key !== key), combined]);
     };
@@ -561,15 +593,15 @@ export function EditorPage({
     let seededUpdates = false;
     let compacting: Promise<void> | null = null;
     const failStorage = (error: unknown) => {
+      if (storageFailed) return;
       storageFailed = true;
       console.error("Unable to persist local document update", error);
       if (active) {
         setStorageWriteFailed(true);
         try {
-          setLiveRecovery({
-            key: currentStorageKey,
-            markdown: offlineCopyMarkdown(next.doc, offlineMetadata.current.page.title),
-          });
+          const markdown = offlineCopyMarkdown(next.doc, offlineMetadata.current.page.title);
+          liveRecoveryCopies.set(currentStorageKey, markdown);
+          setLiveRecovery({ key: currentStorageKey, markdown });
         } catch (exportError) {
           console.error("Unable to prepare the current editor for recovery", exportError);
         }
@@ -643,15 +675,15 @@ export function EditorPage({
       onPageChanged,
       onPageUnavailable,
       onAccessDenied: (id, error) => {
-        if (next.hasUnsyncedChanges) {
+        if (member.role !== "viewer" && next.hasUnsyncedChanges) {
           quarantine(currentStorageKey, "access");
           setAccessQuarantine(true);
         } else onAccessDenied(id, error);
       },
       onUnauthorized: () => {
-        if (next.hasUnsyncedChanges) {
+        setAccessQuarantine(true);
+        if (member.role !== "viewer" && next.hasUnsyncedChanges) {
           quarantine(currentStorageKey, "access");
-          setAccessQuarantine(true);
         }
       },
     });
@@ -940,6 +972,13 @@ export function EditorPage({
                 const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "preview");
                 const stillSelected = selectRecovery("preview");
                 try {
+                  if (liveRecovery?.key === entry.key) {
+                    if (stillCurrent() && stillSelected()) {
+                      setRecoveryPreview({ key: entry.key, text: liveRecovery.markdown });
+                      recoveryErrorFor(entry.key, "preview", null);
+                    }
+                    return;
+                  }
                   const liveDoc = entry.key === currentStorageKey && storageWriteFailed ? bundle?.doc : null;
                   const doc = liveDoc ?? (await loadOfflineCopy(entry.key));
                   try {
@@ -1057,8 +1096,11 @@ export function EditorPage({
                   ? "Copy prepared Markdown"
                   : "Prepare Markdown to copy"}
             </button>
-            {!(entry.key === currentStorageKey && (accessQuarantine || storageWriteFailed)) &&
-              (entry.epoch !== page.contentEpoch || entry.reason !== "access") && (
+            {!(
+              entry.key === currentStorageKey &&
+              (accessQuarantine || storageWriteFailed || (entry.storageFailed && liveRecovery?.key !== entry.key))
+            ) &&
+              (entry.epoch !== page.contentEpoch || entry.reason !== "access" || entry.storageFailed) && (
                 <button
                   className="quiet-button"
                   onClick={() => {

@@ -44,7 +44,7 @@ import {
   onApiUnauthorized,
 } from "./api";
 import { createWorkspaceEvents } from "./collaboration";
-import { EditorPage } from "./EditorPage";
+import { clearLiveRecoveryCopies, EditorPage } from "./EditorPage";
 import { errorMessageKey } from "./error-messages";
 import { invalidateAllPagePreviews, invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
 import {
@@ -900,6 +900,7 @@ export function App() {
       try {
         if (typeof indexedDB !== "undefined")
           await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
+        clearLiveRecoveryCopies(accountKey);
       } catch (error) {
         showState({
           screen: "signout-cleanup",
