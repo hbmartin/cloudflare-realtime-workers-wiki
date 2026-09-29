@@ -98,6 +98,60 @@ describe("Notion Markdown block mutations", () => {
     expect(projection.markdown).toContain("First paragraph");
   });
 
+  it("keeps zero-length spacer blocks while replacing surrounding text", () => {
+    const { first, second } = fixture();
+    const spacer = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "paragraph", attrs: { textColor: "red" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, spacer, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      {
+        type: "replace_content",
+        replace_content: {
+          new_str: projection.markdown.replace("First", "Updated first").replace("Second", "Updated second"),
+        },
+      },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false);
+    expect(operations.filter((operation) => operation.type === "replace_block")).toHaveLength(2);
+    expect(JSON.stringify(operations)).not.toContain(spacer.attrs.id);
+  });
+
+  it("keeps untouched styled and table-of-contents blocks within a replaced range", () => {
+    const { first, second } = fixture();
+    const styled = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [
+        {
+          type: "paragraph",
+          attrs: { textColor: "red" },
+          content: [{ type: "text", text: "Styled", marks: [{ type: "italic" }, { type: "bold" }] }],
+        },
+      ],
+    };
+    const toc = { type: "blockContainer", attrs: { id: crypto.randomUUID() }, content: [{ type: "tableOfContents" }] };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, styled, toc, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      {
+        type: "replace_content",
+        replace_content: {
+          new_str: projection.markdown.replace("First", "Updated first").replace("Second", "Updated second"),
+        },
+      },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false);
+    expect(operations.filter((operation) => operation.type === "replace_block")).toHaveLength(2);
+    expect(JSON.stringify(operations)).not.toContain(styled.attrs.id);
+    expect(JSON.stringify(operations)).not.toContain(toc.attrs.id);
+  });
+
   it("does not confuse literal unknown text in code with an unknown block", () => {
     const code = {
       type: "blockContainer",

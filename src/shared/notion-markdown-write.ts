@@ -23,28 +23,54 @@ function validHref(value: string) {
 
 function textWithMath(value: string, marks: NonNullable<ProseMirrorJson["marks"]>): ProseMirrorJson[] {
   const output: ProseMirrorJson[] = [];
-  const expression = /(?<!\\)\$((?:\\.|[^\\$\n])*?\S)\$/g;
   let cursor = 0;
-  for (const match of value.matchAll(expression)) {
-    const index = match.index;
+  const escaped = (position: number) => {
+    let slashes = 0;
+    for (let index = position - 1; index >= 0 && value[index] === "\\"; index -= 1) slashes += 1;
+    return slashes % 2 === 1;
+  };
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== "$" || escaped(index) || !value[index + 1] || /\s/.test(value[index + 1]!)) continue;
+    let close = index + 1;
+    while (close < value.length && value[close] !== "\n") {
+      if (value[close] === "$" && !escaped(close)) break;
+      close += 1;
+    }
+    if (value[close] !== "$" || /\s/.test(value[close - 1]!)) continue;
     if (index > cursor)
-      output.push({ type: "text", text: value.slice(cursor, index), ...(marks.length ? { marks } : {}) });
-    output.push({ type: "inlineMath", attrs: { formula: match[1]!.replaceAll("\\$", "$") } });
-    cursor = index + match[0].length;
+      output.push({
+        type: "text",
+        text: unescapeMarkdown(value.slice(cursor, index)),
+        ...(marks.length ? { marks } : {}),
+      });
+    output.push({ type: "inlineMath", attrs: { formula: value.slice(index + 1, close).replaceAll("\\$", "$") } });
+    cursor = close + 1;
+    index = close;
   }
   if (cursor < value.length)
-    output.push({ type: "text", text: value.slice(cursor), ...(marks.length ? { marks } : {}) });
+    output.push({ type: "text", text: unescapeMarkdown(value.slice(cursor)), ...(marks.length ? { marks } : {}) });
   return output;
+}
+
+function unescapeMarkdown(value: string) {
+  return value.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~])/g, "$1");
 }
 
 function inline(tokens: Token[], marks: NonNullable<ProseMirrorJson["marks"]> = []): ProseMirrorJson[] {
   const output: ProseMirrorJson[] = [];
+  let text = "";
+  const flushText = () => {
+    if (!text) return;
+    output.push(...textWithMath(text, marks));
+    text = "";
+  };
   for (const token of tokens) {
-    if (token.type === "text") {
-      output.push(...textWithMath(token.text, marks));
-    } else if (token.type === "escape") {
-      output.push({ type: "text", text: token.text, ...(marks.length ? { marks } : {}) });
-    } else if (token.type === "strong" || token.type === "em" || token.type === "del") {
+    if (token.type === "text" || token.type === "escape") {
+      text += token.raw;
+      continue;
+    }
+    flushText();
+    if (token.type === "strong" || token.type === "em" || token.type === "del") {
       const mark = token.type === "strong" ? "bold" : token.type === "em" ? "italic" : "strike";
       output.push(...inline(token.tokens ?? [], [...marks, { type: mark }]));
     } else if (token.type === "codespan") {
@@ -58,6 +84,7 @@ function inline(tokens: Token[], marks: NonNullable<ProseMirrorJson["marks"]> = 
       throw new MarkdownWriteError(`Markdown inline content of type ${token.type} cannot be edited.`);
     }
   }
+  flushText();
   return output;
 }
 
@@ -93,7 +120,7 @@ function list(token: Token): ProseMirrorJson[] {
 }
 
 /** Parse only Markdown structures that can be represented without changing their meaning. */
-export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
+export function parseWritableMarkdownWithSource(source: string): { blocks: ProseMirrorJson[]; rawBlocks: string[] } {
   if (new TextEncoder().encode(source).length > MAX_INPUT_BYTES)
     throw new MarkdownWriteError("Markdown content exceeds 128 KiB.");
   if (source.includes("\0")) throw new MarkdownWriteError("Markdown content contains an invalid character.");
@@ -101,8 +128,22 @@ export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
   let fence: { character: string; length: number } | null = null;
   for (const line of source.split("\n")) {
     const opening = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
-    if (opening && (!fence || (opening[0] === fence.character && opening.length >= fence.length))) {
-      fence = fence ? null : { character: opening[0]!, length: opening.length };
+    if (
+      opening &&
+      fence &&
+      opening[0] === fence.character &&
+      opening.length >= fence.length &&
+      /^\s*$/.test(line.slice(line.indexOf(opening) + opening.length))
+    ) {
+      fence = null;
+      continue;
+    }
+    if (
+      opening &&
+      !fence &&
+      (opening[0] === "~" || !line.slice(line.indexOf(opening) + opening.length).includes("`"))
+    ) {
+      fence = { character: opening[0]!, length: opening.length };
       continue;
     }
     if (fence) continue;
@@ -111,10 +152,12 @@ export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
         throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
   }
   const output: ProseMirrorJson[] = [];
+  const rawBlocks: string[] = [];
   for (const token of Lexer.lex(source.replaceAll("\r\n", "\n"), { gfm: true })) {
     if (token.type === "space") continue;
     if (token.type === "list") {
       output.push(...list(token));
+      rawBlocks.push(...token.items.map((item: Tokens.ListItem) => item.raw.trimEnd()));
     } else if (token.type === "heading") {
       output.push(
         container({
@@ -135,8 +178,8 @@ export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
             type: "image",
             attrs: {
               url: validHref(image.href),
-              caption: image.text,
-              name: image.text || "image",
+              caption: unescapeMarkdown(image.text),
+              name: unescapeMarkdown(image.text) || "image",
               showPreview: true,
               previewWidth: 512,
               ...BLOCK_ATTRS,
@@ -169,7 +212,12 @@ export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
     } else {
       throw new MarkdownWriteError(`Markdown blocks of type ${token.type} cannot be edited.`);
     }
+    if (token.type !== "list") rawBlocks.push(token.raw.trimEnd());
     if (output.length > MAX_INPUT_BLOCKS) throw new MarkdownWriteError("Markdown content exceeds 1000 blocks.");
   }
-  return output;
+  return { blocks: output, rawBlocks };
+}
+
+export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
+  return parseWritableMarkdownWithSource(source).blocks;
 }

@@ -3,6 +3,7 @@ import { Client } from "@notionhq/client";
 import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "./index";
+import { recoverNotionMarkdownTasks } from "./notion-api";
 
 function authenticated(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -318,6 +319,32 @@ describe("Notion-compatible API", () => {
       result: { object: "page_markdown", markdown: "After\n" },
     });
     expect((await client.pages.retrieveMarkdown({ page_id: installed.pageId })).markdown).toBe("After\n");
+    await env.DB.prepare(
+      `UPDATE notion_markdown_tasks SET status='running',attempts=5,lease_token='stale',
+         lease_expires_at=?,next_attempt_at=?,result_json=NULL WHERE id=?`,
+    )
+      .bind(Date.now() - 1, Date.now() - 1, accepted.id)
+      .run();
+    await recoverNotionMarkdownTasks(env);
+    const recovered = await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`));
+    expect((await recovered.json<{ status: string }>()).status).toBe("succeeded");
+    const revokeRead = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ readContent: false }),
+      }),
+    );
+    expect(revokeRead.status).toBe(200);
+    expect((await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))).status).toBe(403);
+    const restoreRead = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ readContent: true }),
+      }),
+    );
+    expect(restoreRead.status).toBe(200);
     await env.DB.prepare(`UPDATE notion_markdown_tasks SET expires_at=? WHERE id=?`)
       .bind(Date.now() - 1, accepted.id)
       .run();
@@ -738,7 +765,7 @@ describe("Notion-compatible API", () => {
     );
     await waitOnExecutionContext(context);
 
-    expect(failed.status).toBe(400);
+    expect(failed.status).toBe(503);
     expect(calls.map((call) => call.path)).toEqual([
       expect.stringMatching(/\/api-mutate$/),
       expect.stringMatching(/\/purge$/),

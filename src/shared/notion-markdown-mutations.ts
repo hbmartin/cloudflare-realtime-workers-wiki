@@ -1,7 +1,7 @@
 import { documentBlocks, type NotionBlock } from "./notion-blocks";
 import type { MarkdownEdit } from "./notion-markdown-commands";
 import type { NotionMarkdownProjection } from "./notion-markdown";
-import { MarkdownWriteError, parseWritableMarkdown } from "./notion-markdown-write";
+import { MarkdownWriteError, parseWritableMarkdownWithSource } from "./notion-markdown-write";
 import { serializeMarkdownNode } from "./document-projection";
 import type { ProseMirrorJson } from "./types";
 
@@ -224,7 +224,6 @@ export function markdownMutations(
   const groups = groupsFor(projection, edits);
   const operations: MarkdownMutation[] = [];
   for (const group of groups.toReversed()) {
-    const operationCount = operations.length;
     if (
       group.first === projection.spans.length &&
       group.first === group.after &&
@@ -241,27 +240,34 @@ export function markdownMutations(
         ? group.edits[0]!.from
         : (projection.spans[group.first]?.from ?? projection.markdown.length);
     const to = group.after > group.first ? projection.spans[group.after - 1]!.to : from;
-    const selectedMarkdown = projection.markdown.slice(from, to);
     for (const span of projection.spans.slice(group.first, group.after)) {
       const marker = projection.markdown.slice(span.from, span.to).trim();
       if (!marker.startsWith('<unknown url="notion://blocks/')) continue;
       if (!allowDeletingContent || !group.edits.some((edit) => edit.from <= span.from && edit.to >= span.to))
         throw new MarkdownWriteError("A range cannot partially overwrite unknown content.");
     }
-    const replacement = parseWritableMarkdown(replacementText(projection.markdown, from, to, group.edits));
-    const oldSignatures = original.map((_, index) => {
+    const parsed = parseWritableMarkdownWithSource(replacementText(projection.markdown, from, to, group.edits));
+    const replacement = parsed.blocks;
+    const retainedOriginal = original.filter((_, index) => {
       const span = projection.spans[group.first + index]!;
+      return span.from !== span.to;
+    });
+    const oldSignatures = retainedOriginal.map((block) => {
+      const span = projection.spans.find((candidate) => candidate.internalId === block.internalId)!;
       return projection.markdown.slice(span.from, span.to).trimEnd();
     });
-    const newSignatures = replacement.map((container) => serializeMarkdownNode(container).trimEnd());
-    const pairs = [...unchangedPairs(oldSignatures, newSignatures), [original.length, replacement.length] as const];
+    const newSignatures = parsed.rawBlocks;
+    const pairs = [
+      ...unchangedPairs(oldSignatures, newSignatures),
+      [retainedOriginal.length, replacement.length] as const,
+    ];
     let oldStart = 0;
     let newStart = 0;
     let precedingId = blocks[group.first - 1]?.internalId;
     for (const [oldEnd, newEnd] of pairs) {
       const retained = Math.min(oldEnd - oldStart, newEnd - newStart);
       for (let index = 0; index < retained; index += 1) {
-        const block = original[oldStart + index]!;
+        const block = retainedOriginal[oldStart + index]!;
         if (blockHasProtectedContent(block, protectedBlockIds))
           throw new MarkdownWriteError(
             "A selected block has comments or comment anchors. Use the block API to edit it safely.",
@@ -287,7 +293,7 @@ export function markdownMutations(
         });
         precedingId = block.internalId;
       }
-      for (const block of original.slice(oldStart + retained, oldEnd)) {
+      for (const block of retainedOriginal.slice(oldStart + retained, oldEnd)) {
         if (blockHasProtectedContent(block, protectedBlockIds))
           throw new MarkdownWriteError(
             "A selected block has comments or comment anchors. Use the block API to edit it safely.",
@@ -307,15 +313,10 @@ export function markdownMutations(
         });
         precedingId = String(added.at(-1)!.attrs?.id);
       }
-      if (oldEnd < original.length) precedingId = original[oldEnd]!.internalId;
+      if (oldEnd < retainedOriginal.length) precedingId = retainedOriginal[oldEnd]!.internalId;
       oldStart = oldEnd + 1;
       newStart = newEnd + 1;
     }
-    if (
-      operations.length === operationCount &&
-      replacementText(projection.markdown, from, to, group.edits) !== selectedMarkdown
-    )
-      throw new MarkdownWriteError("The Markdown edit cannot be represented without changing other content.");
   }
   if (operations.length > 100) throw new MarkdownWriteError("The Markdown edit has too many block operations.");
   return operations;

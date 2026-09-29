@@ -915,6 +915,17 @@ export class Document extends YServer {
         return Response.json({ error: "Document size limit exceeded." }, { status: 413 });
       }
       clone.destroy();
+      this.flushPendingUpdates();
+      if (
+        this.purged ||
+        this.metadata.retired ||
+        this.metadata.restore_pending ||
+        this.transition ||
+        this.metadata.read_only ||
+        (body.expectedSequence !== undefined &&
+          (this.metadata.dirty || this.metadata.snapshot_seq !== body.expectedSequence))
+      )
+        return Response.json({ error: "revision_changed" }, { status: 409 });
       this.pendingAuthorId = body.actorId;
       this.pendingNotifyEdit = false;
       this.document.transact(() => {
