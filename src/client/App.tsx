@@ -705,7 +705,7 @@ async function authenticatedWorkspace(member: ClientMemberContext): Promise<AppS
     await rememberOfflineAccount(member).catch((error) =>
       console.error("Unable to remember this account for offline use", error),
     );
-    await clearRevokedOfflinePages(offlineAccountKey(member)).catch((error) =>
+    void clearRevokedOfflinePages(offlineAccountKey(member)).catch((error) =>
       console.error("Unable to remove revoked offline copies", error),
     );
   }
@@ -768,11 +768,6 @@ async function resolveAppState(): Promise<AppState> {
   }
   if (status.state !== "ready") return { screen: "security", status };
   let currentMember: ClientMemberContext | null = null;
-  if (locallySignedOut) {
-    currentMember = await api<ClientMemberContext>("/api/me");
-    if (offlineAccountKey(currentMember) === locallySignedOut) return { screen: "signin" };
-    localStorage.removeItem("notes:local-signout");
-  }
   let inviteFailure: ApiClientError | null = null;
   if (invite || status.pendingInvite) {
     try {
@@ -792,6 +787,11 @@ async function resolveAppState(): Promise<AppState> {
         throw cause;
       }
     }
+  }
+  if (locallySignedOut) {
+    currentMember = await api<ClientMemberContext>("/api/me");
+    if (offlineAccountKey(currentMember) === locallySignedOut) return { screen: "signin" };
+    localStorage.removeItem("notes:local-signout");
   }
   try {
     const member = currentMember ?? (await api<ClientMemberContext>("/api/me"));
@@ -935,7 +935,6 @@ export function App() {
     async (accountKey: string) => {
       showState({ screen: "loading" });
       try {
-        await forgetOfflineAccount(accountKey);
         await load();
       } catch (error) {
         showState({
@@ -1268,10 +1267,14 @@ async function finishPendingServerSignOut() {
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state !== "signed_out") {
     if (status.state === "ready") {
-      const member = await api<ClientMemberContext>("/api/me");
-      if (offlineAccountKey(member) !== accountKey) {
-        localStorage.removeItem("notes:local-signout");
-        return;
+      try {
+        const member = await api<ClientMemberContext>("/api/me");
+        if (offlineAccountKey(member) !== accountKey) {
+          localStorage.removeItem("notes:local-signout");
+          return;
+        }
+      } catch {
+        // The account may have lost its workspace. End the server session anyway.
       }
     }
     const result = await authClient.signOut();

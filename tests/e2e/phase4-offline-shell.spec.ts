@@ -376,7 +376,7 @@ test("warns and offers export before offline sign-out removes pending edits", as
   ).toBe(0);
 });
 
-test("retains an older epoch draft in the sign-out review after a new copy syncs", async ({ page }) => {
+test("retains drafts from both epochs in the sign-out review", async ({ page, context }) => {
   await signInOwner(page);
   const previousPage = new URL(page.url()).searchParams.get("page");
   await page.getByRole("button", { name: /Find a page or command/ }).click();
@@ -471,6 +471,27 @@ test("retains an older epoch draft in the sign-out review after a new copy syncs
     )
     .toMatchObject({ epoch: 1, pendingChanges: false, pendingCopyKeys: [olderKey] });
 
+  await context.setOffline(true);
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type(" Current epoch draft");
+  await expect(page.locator(".bn-editor")).toContainText("Current epoch draft");
+  await expect
+    .poll(() =>
+      page.evaluate(async (id) => {
+        const request = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        const read = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const entries = await new Promise<Array<{ pageId: string; pendingCopyKeys: string[] }>>((resolve) =>
+          read.addEventListener("success", () => resolve(read.result)),
+        );
+        db.close();
+        return entries.find((entry) => entry.pageId === id)?.pendingCopyKeys.length ?? 0;
+      }, pageId),
+    )
+    .toBe(2);
+
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
   await expect(page.getByText("Older epoch draft")).toBeVisible();
@@ -479,6 +500,7 @@ test("retains an older epoch draft in the sign-out review after a new copy syncs
   const path = await (await download).path();
   expect(path).toBeTruthy();
   expect(await readFile(path!, "utf8")).toContain("Draft from prior epoch");
+  expect(await readFile(path!, "utf8")).toContain("Current epoch draft");
 });
 
 test("keeps an unscoped Yjs copy hidden without deleting it", async ({ page }) => {

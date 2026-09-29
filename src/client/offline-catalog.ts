@@ -30,6 +30,12 @@ export type OfflinePage = {
   storageKeys: string[];
 };
 
+export function pendingKeysOf(page: OfflinePage): string[] {
+  return (
+    page.pendingCopyKeys ?? (page.pendingChanges ? [page.storageKeys.at(-1)].filter((key): key is string => !!key) : [])
+  );
+}
+
 let connection: Promise<IDBDatabase> | null = null;
 const pageLocks = new Map<string, Promise<void>>();
 
@@ -181,7 +187,7 @@ export async function listPendingOfflinePages(accountKey: string): Promise<Offli
   const pages = await readAccountPages(accountKey);
   const available = await Promise.all(
     pages.map(async (page) => {
-      const keys = page.pendingCopyKeys ?? (page.pendingChanges ? [page.storageKeys.at(-1) ?? ""] : []);
+      const keys = pendingKeysOf(page);
       const pendingCopyKeys = (
         await Promise.all(keys.map(async (key) => (key && (await hasOfflineDocument(key)) ? key : null)))
       ).filter((key): key is string => key !== null);
@@ -233,9 +239,7 @@ export async function rememberOfflinePage(
     }
     const store = transaction.objectStore("pages");
     const previous = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
-    const previousPendingKeys =
-      previous?.pendingCopyKeys ??
-      (previous?.pendingChanges ? [previous.storageKeys.at(-1) ?? ""].filter(Boolean) : []);
+    const previousPendingKeys = previous ? pendingKeysOf(previous) : [];
     const entry: OfflinePage = {
       key,
       accountKey,
@@ -245,7 +249,7 @@ export async function rememberOfflinePage(
       kind: page.kind,
       epoch: page.contentEpoch,
       canEdit,
-      pendingChanges: previous?.epoch === page.contentEpoch && previous.pendingChanges === true,
+      pendingChanges: previousPendingKeys.includes(storageKey),
       pendingCopyKeys: previousPendingKeys,
       revoked: false,
       lastSyncedAt: Date.now(),
@@ -257,7 +261,12 @@ export async function rememberOfflinePage(
   });
 }
 
-export async function markOfflinePagePending(accountKey: string, pageId: string, pendingChanges: boolean) {
+export async function markOfflinePagePending(
+  accountKey: string,
+  pageId: string,
+  storageKey: string,
+  pendingChanges: boolean,
+) {
   const key = `${accountKey}\u0000${pageId}`;
   return withPageLock(key, async () => {
     const db = await openCatalog();
@@ -265,13 +274,16 @@ export async function markOfflinePagePending(accountKey: string, pageId: string,
     const store = transaction.objectStore("pages");
     const page = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
     if (page) {
-      const currentKey = page.storageKeys.at(-1);
-      const keys = new Set(page.pendingCopyKeys ?? (page.pendingChanges && currentKey ? [currentKey] : []));
-      if (currentKey) {
-        if (pendingChanges) keys.add(currentKey);
-        else keys.delete(currentKey);
-      }
-      store.put({ ...page, pendingChanges, pendingCopyKeys: [...keys] });
+      const keys = new Set(pendingKeysOf(page));
+      if (pendingChanges) keys.add(storageKey);
+      else keys.delete(storageKey);
+      const storageKeys = page.storageKeys.includes(storageKey) ? page.storageKeys : [...page.storageKeys, storageKey];
+      store.put({
+        ...page,
+        storageKeys,
+        pendingChanges: keys.has(storageKeys.at(-1) ?? ""),
+        pendingCopyKeys: [...keys],
+      });
     }
     await transactionDone(transaction);
   });

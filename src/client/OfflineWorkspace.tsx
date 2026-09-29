@@ -9,11 +9,12 @@ import type { ClientMemberContext, Page, Space } from "../shared/types";
 import { api, ApiClientError } from "./api";
 import { EmbedFeatureContext } from "./editor-blocks";
 import { notesSchema } from "./mentions";
-import { downloadOfflineMarkdown, offlineCopyMarkdown } from "./offline-export";
+import { downloadOfflineMarkdown, exportPendingOfflinePages, offlineCopyMarkdown } from "./offline-export";
 import { useEffectiveColorScheme } from "./ThemeControl";
 import {
   clearRevokedOfflinePages,
   getOfflinePage,
+  listPendingOfflinePages,
   markOfflinePagePending,
   markOfflinePageRevoked,
   type OfflineAccount,
@@ -42,6 +43,10 @@ export function OfflineWorkspace({
   const [quarantined, setQuarantined] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState("");
   const selectedId = useRef(selected?.pageId ?? null);
+  const editVersion = useRef(0);
+  const onLocalEdit = useCallback(() => {
+    editVersion.current += 1;
+  }, []);
   const reconnectController = useRef<AbortController | null>(null);
   const selectedReason = selected ? quarantined[selected.pageId] : undefined;
 
@@ -86,6 +91,7 @@ export function OfflineWorkspace({
     if (selectedReason) return;
     reconnectController.current?.abort();
     const controller = new AbortController();
+    const startingEditVersion = editVersion.current;
     reconnectController.current = controller;
     const deadline = window.setTimeout(() => controller.abort(), 10_000);
     const ownsSelection = () =>
@@ -100,22 +106,24 @@ export function OfflineWorkspace({
         return;
       }
       if (selected) {
-        const stored = await getOfflinePage(account.key, selected.pageId);
-        if (!isCurrent()) return;
         const [{ page }, { spaces }] = await Promise.all([
           api<{ page: Page }>(`/api/pages/${encodeURIComponent(selected.pageId)}`, { signal: controller.signal }),
           api<{ spaces: Space[] }>("/api/spaces", { signal: controller.signal }),
         ]);
         if (!isCurrent()) return;
+        const stored = await getOfflinePage(account.key, selected.pageId);
+        if (!isCurrent()) return;
+        if (editVersion.current !== startingEditVersion) {
+          setRecovery("offline");
+          return;
+        }
+        const hasDraft = Boolean(stored?.pendingChanges || stored?.pendingCopyKeys?.length);
         const space = spaces.find((item) => item.id === page.spaceId);
-        if (!space && !stored?.pendingChanges) {
+        if (!space && !hasDraft) {
           await discardRevokedCopy(selected.pageId);
           return;
         }
-        if (
-          !space ||
-          (stored?.pendingChanges && (page.contentEpoch !== selected.epoch || space.effectiveRole === "viewer"))
-        ) {
+        if (!space || (hasDraft && (page.contentEpoch !== selected.epoch || space.effectiveRole === "viewer"))) {
           setQuarantined((current) => ({
             ...current,
             [selected.pageId]:
@@ -160,7 +168,10 @@ export function OfflineWorkspace({
       setRecovery("offline");
     } finally {
       window.clearTimeout(deadline);
-      if (reconnectController.current === controller) reconnectController.current = null;
+      if (reconnectController.current === controller) {
+        reconnectController.current = null;
+        if (controller.signal.aborted && selectedId.current === (selected?.pageId ?? null)) setRecovery("offline");
+      }
     }
   }, [account.key, account.userId, account.workspaceId, discardRevokedCopy, onRetry, selected, selectedReason]);
 
@@ -230,12 +241,29 @@ export function OfflineWorkspace({
                   ? selectedReason
                   : "Offline copy. Changes stay on this device until access is checked and server sync is confirmed."}
               </output>
+              {selectedReason && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void listPendingOfflinePages(account.key)
+                      .then((pending) =>
+                        exportPendingOfflinePages(pending.filter((page) => page.pageId === selected.pageId)),
+                      )
+                      .catch((error) =>
+                        setNotice(error instanceof Error ? error.message : "Unable to export local changes."),
+                      );
+                  }}
+                >
+                  Export all unsynced copies of this page
+                </button>
+              )}
               <OfflineEditor
                 key={selected.pageId}
                 page={selected}
                 accountKey={account.key}
                 quarantined={Boolean(selectedReason)}
                 editingEnabled={account.offlineEditingEnabled}
+                onLocalEdit={onLocalEdit}
               />
             </>
           ) : (
@@ -252,11 +280,13 @@ function OfflineEditor({
   accountKey,
   quarantined,
   editingEnabled,
+  onLocalEdit,
 }: {
   page: OfflinePage;
   accountKey: string;
   quarantined: boolean;
   editingEnabled: boolean;
+  onLocalEdit: () => void;
 }) {
   const [copy, setCopy] = useState<{ doc: Y.Doc; persistence: IndexeddbPersistence; provider: YProvider } | null>(null);
   const [error, setError] = useState("");
@@ -266,6 +296,7 @@ function OfflineEditor({
     const key = page.storageKeys.at(-1);
     if (!key) return undefined;
     const persistence = new IndexeddbPersistence(key, doc);
+    doc.off("update", persistence["_storeUpdate"]);
     const provider = new YProvider(window.location.host, `${page.pageId}~${page.epoch}`, doc, {
       party: "document",
       connect: false,
@@ -312,6 +343,7 @@ function OfflineEditor({
           page={page}
           accountKey={accountKey}
           editable={page.canEdit && editingEnabled && !quarantined}
+          onLocalEdit={onLocalEdit}
         />
       ) : (
         !error && <p>Opening local document…</p>
@@ -325,12 +357,15 @@ function OfflineBlockEditor({
   page,
   accountKey,
   editable,
+  onLocalEdit,
 }: {
   copy: { doc: Y.Doc; persistence: IndexeddbPersistence; provider: YProvider };
   page: OfflinePage;
   accountKey: string;
   editable: boolean;
+  onLocalEdit: () => void;
 }) {
+  const storageKey = page.storageKeys.at(-1) ?? "";
   const [saveState, setSaveState] = useState<"ready" | "saving" | "saved" | "failed">(
     page.pendingChanges ? "saved" : "ready",
   );
@@ -357,8 +392,7 @@ function OfflineBlockEditor({
         while (updates.length) {
           const batch = updates.slice();
           const target = generation;
-          // y-indexeddb writes each update too, but does not expose write
-          // failures. This incremental write gives the UI a real commit ack.
+          // This incremental write gives the UI a real commit ack.
           const transaction = db.transaction("updates", "readwrite");
           transaction.objectStore("updates").add(batch.length === 1 ? batch[0] : Y.mergeUpdates(batch));
           await new Promise<void>((resolve, reject) => {
@@ -380,12 +414,13 @@ function OfflineBlockEditor({
     };
     const updated = (update: Uint8Array, origin: unknown) => {
       if (origin === copy.persistence || origin === copy.provider) return;
+      onLocalEdit();
       generation += 1;
       updates.push(update);
       setSaveState("saving");
       if (!pendingCommitted && !pendingMark) {
         pendingError = false;
-        pendingMark = markOfflinePagePending(accountKey, page.pageId, true)
+        pendingMark = markOfflinePagePending(accountKey, page.pageId, storageKey, true)
           .then(
             () => {
               pendingCommitted = true;
@@ -401,17 +436,13 @@ function OfflineBlockEditor({
       if (timer !== undefined) window.clearTimeout(timer);
       timer = window.setTimeout(() => void persistUpdates(), 100);
     };
-    // y-indexeddb can throw synchronously when IDB rejects a write. Observe
-    // edits first so our own acknowledged write can report the failure.
-    copy.doc.off("update", copy.persistence["_storeUpdate"]);
     copy.doc.on("update", updated);
-    copy.doc.on("update", copy.persistence["_storeUpdate"]);
     return () => {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
       copy.doc.off("update", updated);
     };
-  }, [accountKey, copy, page.pageId, page.pendingChanges]);
+  }, [accountKey, copy, onLocalEdit, page.pageId, page.pendingChanges, storageKey]);
   const options = useMemo(
     () =>
       withCollaboration({

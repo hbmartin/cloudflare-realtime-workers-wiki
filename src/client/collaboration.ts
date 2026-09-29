@@ -116,8 +116,10 @@ export function createCollaboration(
           return;
         }
         if (destroyed) return;
-        if (socketOnly && provider.shouldConnect) await reconnectWebSocket();
-        else await provider.connect();
+        if (socketOnly && provider.shouldConnect) {
+          if (!provider.bcconnected) provider.connectBc();
+          await reconnectWebSocket();
+        } else await provider.connect();
         if (destroyed) {
           provider.disconnect();
           return;

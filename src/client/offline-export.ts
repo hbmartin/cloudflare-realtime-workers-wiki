@@ -2,7 +2,7 @@ import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import type * as Y from "yjs";
 import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { loadOfflineCopy } from "./collaboration";
-import type { OfflinePage } from "./offline-catalog";
+import { pendingKeysOf, type OfflinePage } from "./offline-catalog";
 
 export function offlineCopyMarkdown(doc: Y.Doc, title: string) {
   const projection = yXmlFragmentToProsemirrorJSON(doc.getXmlFragment("document-store")) as ProseMirrorJson;
@@ -30,7 +30,7 @@ export async function exportOfflineCopyMarkdown(key: string, title: string, suff
 export async function exportPendingOfflinePages(pages: OfflinePage[]) {
   const sections: string[] = [];
   for (const page of pages) {
-    const keys = page.pendingCopyKeys ?? (page.pendingChanges ? [page.storageKeys.at(-1) ?? ""] : []);
+    const keys = pendingKeysOf(page);
     for (const key of keys) {
       if (!key) throw new Error(`The local copy of ${page.title} is unavailable.`);
       const doc = await loadOfflineCopy(key);

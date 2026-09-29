@@ -70,7 +70,6 @@ export function EditorPage({
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
-  const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
@@ -109,14 +108,13 @@ export function EditorPage({
   const offlineTitle = page.title;
   const offlineRole = member.role;
   useEffect(() => {
-    if (!hasConfirmedSync) return;
     void rememberOfflinePage(
       offlineMember.current,
       { ...offlineMetadata.current.page, title: offlineTitle },
       spaceName,
       offlineRole !== "viewer",
     ).catch((error) => console.error("Unable to remember this document for offline use", error));
-  }, [hasConfirmedSync, offlineTitle, spaceName, offlineRole]);
+  }, [offlineTitle, spaceName, offlineRole]);
 
   useEffect(() => {
     if (titlePageIdRef.current !== page.id) {
@@ -149,8 +147,17 @@ export function EditorPage({
     let next: CollaborationBundle;
     const beforeConnect = async () => {
       const accountKey = offlineAccountKey(offlineMember.current);
-      const catalogPage = await getOfflinePage(accountKey, page.id);
-      const hasLocalDraft = catalogPage?.pendingChanges === true || (!catalogPage && next.hasUnsyncedChanges);
+      let catalogPage;
+      try {
+        catalogPage = await getOfflinePage(accountKey, page.id);
+      } catch (error) {
+        console.error("Unable to read offline document state", error);
+        setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+        return false;
+      }
+      const hasLocalDraft = Boolean(
+        catalogPage?.pendingCopyKeys?.length || catalogPage?.pendingChanges || next.hasUnsyncedChanges,
+      );
       const controller = new AbortController();
       const deadline = window.setTimeout(() => controller.abort(), 10_000);
       try {
@@ -187,7 +194,7 @@ export function EditorPage({
           if (hasLocalDraft) {
             quarantine();
             setAccessQuarantine(true);
-          } else if (error.status === 403 || error.status === 401) onAccessDenied(page.id, error);
+          } else if (error.status === 403) onAccessDenied(page.id, error);
           else onPageUnavailable(page.id);
           return false;
         }
@@ -207,7 +214,21 @@ export function EditorPage({
     let pendingWrite = Promise.resolve();
     const writePending = (pending: boolean) => {
       pendingWrite = pendingWrite
-        .then(() => markOfflinePagePending(offlineAccountKey(offlineMember.current), page.id, pending))
+        .then(async () => {
+          const currentMember = offlineMember.current;
+          await rememberOfflinePage(
+            currentMember,
+            offlineMetadata.current.page,
+            offlineMetadata.current.spaceName,
+            currentMember.role !== "viewer",
+          );
+          await markOfflinePagePending(
+            offlineAccountKey(currentMember),
+            page.id,
+            offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch),
+            pending,
+          );
+        })
         .catch((error) => console.error("Unable to update offline sync state", error));
     };
     const documentUpdate = (_update: Uint8Array, origin: unknown) => {
@@ -237,7 +258,6 @@ export function EditorPage({
     const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
     const connectionSync = (synced: boolean) => {
       closeReconciler.handleSync(synced);
-      if (synced && active) setHasConfirmedSync(true);
     };
     next.provider.on("connection-close", connectionClose);
     next.provider.on("sync", connectionSync);
