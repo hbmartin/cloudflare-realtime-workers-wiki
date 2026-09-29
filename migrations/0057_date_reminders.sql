@@ -12,7 +12,7 @@ CREATE TABLE date_reminders (
   choice_json TEXT NOT NULL,
   due_at INTEGER NOT NULL,
   generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
-  state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'claimed', 'delivered', 'canceled')),
+  state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'claimed', 'delivered', 'missing', 'canceled')),
   claim_id TEXT,
   claimed_at INTEGER,
   delivery_receipt_id TEXT,

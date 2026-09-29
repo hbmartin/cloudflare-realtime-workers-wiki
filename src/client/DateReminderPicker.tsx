@@ -85,11 +85,11 @@ export function DateReminderPicker({
   }, [path, token.timezone]);
 
   useEffect(() => {
-    if (!busy && !focusedInitially.current) {
+    if (!busy && (!focusedInitially.current || (error && !dialog.current?.contains(document.activeElement)))) {
       focusedInitially.current = true;
       (dialog.current?.querySelector("select") as HTMLElement | null)?.focus();
     }
-  }, [busy]);
+  }, [busy, error]);
 
   const reminderChoice = (): ReminderChoice | { absolute: string } | null => {
     if (choice !== "custom") return choice;

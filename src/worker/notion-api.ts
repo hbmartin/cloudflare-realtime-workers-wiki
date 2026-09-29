@@ -33,7 +33,7 @@ import { sourceRateLimitKey } from "./source-rate-limit";
 import { sweepOutbox } from "./jobs";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
-import { dateTokens } from "./date-reminders";
+import { dateTokens } from "../shared/document-projection";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -1200,7 +1200,7 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   }
   let container;
   try {
-    container = notionInputToBlockContainer({ ...input, id: located.internalId }, 0, dateTokens(located.block!));
+    container = notionInputToBlockContainer({ ...input, id: located.internalId }, 0, dateTokens(located.block!.node));
   } catch (error) {
     throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid block.");
   }

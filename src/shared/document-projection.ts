@@ -37,6 +37,17 @@ export function dateMentionFromNode(node: ProseMirrorJson): DateMention | null {
   return dateMentionFromProps(node.attrs ?? {});
 }
 
+export function dateTokens(document: ProseMirrorJson) {
+  const tokens = new Map<string, DateMention | null>();
+  const visit = (node: ProseMirrorJson) => {
+    const token = dateMentionFromNode(node);
+    if (token) tokens.set(token.tokenId, tokens.has(token.tokenId) ? null : token);
+    for (const child of node.content ?? []) visit(child);
+  };
+  visit(document);
+  return tokens;
+}
+
 export function dateMentionText(node: ProseMirrorJson) {
   const mention = dateMentionFromNode(node);
   return mention ? readableDateMention(mention) : stringAttr(node, "value") || "Date";

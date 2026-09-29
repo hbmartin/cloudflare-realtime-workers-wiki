@@ -1,6 +1,6 @@
 import type { ProseMirrorJson } from "./types";
 import { resolveEmbed } from "./embed-providers";
-import { dateMentionFromProps, type DateMention } from "./date-mentions";
+import { dateMentionFromProps, dateMentionWireProps, validDateMention, type DateMention } from "./date-mentions";
 import { dateMentionText } from "./document-projection";
 
 export const NOTION_VERSION = "2026-03-11";
@@ -263,19 +263,19 @@ export function notionRichTextToProseMirror(
         const supplied = dateMentionFromProps(record(mention.noteFlare));
         const existing = supplied ? existingDates?.get(supplied.tokenId) : null;
         if (supplied && existing && supplied.createdBy === existing.createdBy) {
+          const date = record(mention.date);
+          const dateValue = string(date.start);
+          const kind = /^\d{4}-\d{2}-\d{2}$/.test(dateValue) ? "all-day" : "timed";
+          const timezone = string(date.time_zone, existing.timezone);
+          const updated: DateMention = { ...existing, kind, value: dateValue, timezone };
+          if (!validDateMention(updated)) throw new Error("Date mention is invalid.");
           const unchanged =
-            supplied.kind === existing.kind &&
-            supplied.value === existing.value &&
-            supplied.timezone === existing.timezone;
+            updated.kind === existing.kind &&
+            updated.value === existing.value &&
+            updated.timezone === existing.timezone;
           output.push({
             type: "dateMention",
-            attrs: {
-              payload: JSON.stringify({
-                ...supplied,
-                createdBy: existing.createdBy,
-                revision: unchanged ? existing.revision : crypto.randomUUID(),
-              }),
-            },
+            attrs: dateMentionWireProps({ ...updated, revision: unchanged ? existing.revision : crypto.randomUUID() }),
             ...(marks.length ? { marks } : {}),
           });
           continue;

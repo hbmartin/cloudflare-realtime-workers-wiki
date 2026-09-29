@@ -88,8 +88,15 @@ export function dateMentionPasteExtension(userId: string) {
               return false;
             },
             drop(view, event) {
-              const copyModifier = /Mac/.test(navigator.platform) ? event.altKey : event.ctrlKey;
-              preserveDrop = dragSource === view.dom.parentElement && Boolean(view.dragging?.move) && !copyModifier;
+              let dragCopies: boolean | undefined;
+              view.someProp("dragCopies", (test) => {
+                dragCopies = Boolean(dragCopies || test(event));
+              });
+              const copyModifier = /Mac|iPhone|iPad|iPod/.test(navigator.platform) ? event.altKey : event.ctrlKey;
+              preserveDrop =
+                dragSource === view.dom.parentElement &&
+                Boolean(view.dragging) &&
+                !(dragCopies === undefined ? copyModifier : dragCopies);
               dragSource = null;
               return false;
             },

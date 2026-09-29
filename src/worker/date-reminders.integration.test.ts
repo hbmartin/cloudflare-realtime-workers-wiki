@@ -293,7 +293,7 @@ describe("date reminders", () => {
     expect((await SELF.fetch(request(installed.cookie, path, { method: "DELETE" }))).status).toBe(404);
   });
 
-  it("cancels a due reminder after token removal", async () => {
+  it("suspends a due reminder while its token is cut and restores it on paste", async () => {
     const installed = await bootstrap();
     const token: DateMention = {
       tokenId: crypto.randomUUID(),
@@ -323,7 +323,7 @@ describe("date reminders", () => {
     await processDueDateReminders(env as unknown as Env);
     expect(
       await env.DB.prepare(`SELECT state FROM date_reminders WHERE token_id=?`).bind(token.tokenId).first(),
-    ).toEqual({ state: "canceled" });
+    ).toEqual({ state: "missing" });
     expect(
       (
         await env.DB.prepare(`SELECT COUNT(*) count FROM notifications WHERE event_type='reminder'`).first<{
@@ -331,6 +331,12 @@ describe("date reminders", () => {
         }>()
       )?.count,
     ).toBe(0);
+    await addToken(installed.page.id, token);
+    await env.DB.prepare(`UPDATE date_reminders SET checked_at=1 WHERE token_id=?`).bind(token.tokenId).run();
+    await processDueDateReminders(env as unknown as Env);
+    expect(
+      await env.DB.prepare(`SELECT state,due_at FROM date_reminders WHERE token_id=?`).bind(token.tokenId).first(),
+    ).toMatchObject({ state: "active" });
   });
 
   it("does not deliver when the author loses workspace access before the due scan", async () => {

@@ -3,6 +3,7 @@ import { Client } from "@notionhq/client";
 import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "./index";
+import { dateMentionWireProps } from "../shared/date-mentions";
 
 function authenticated(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -105,6 +106,85 @@ beforeEach(async () => {
 });
 
 describe("Notion-compatible API", () => {
+  it("preserves an authored date token through block reads and writes", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const me = await (await SELF.fetch(authenticated(installed.cookie, "/api/me"))).json<{ user: { id: string } }>();
+    const mention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: me.user.id,
+      kind: "timed" as const,
+      value: "2026-10-01T14:00:00.000Z",
+      timezone: "America/Chicago",
+    };
+    const inserted = await env.DOCUMENT.getByName(`${installed.pageId}~1`).fetch(
+      new Request("https://document.internal/api-mutate", {
+        method: "POST",
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "content-type": "application/json" },
+        body: JSON.stringify({
+          actorId: me.user.id,
+          operations: [
+            {
+              type: "append_children",
+              children: [
+                {
+                  type: "blockContainer",
+                  attrs: { id: crypto.randomUUID() },
+                  content: [
+                    {
+                      type: "paragraph",
+                      content: [{ type: "dateMention", attrs: dateMentionWireProps(mention) }],
+                    },
+                  ],
+                },
+              ],
+              position: { type: "end" },
+            },
+          ],
+        }),
+      }),
+    );
+    expect(inserted.status).toBe(200);
+    const read = await SELF.fetch(notionRequest(createdIntegration.token, `/blocks/${installed.pageId}/children`));
+    const blocks = await read.json<{
+      results: Array<{ id: string; paragraph: { rich_text: Array<Record<string, unknown>> } }>;
+    }>();
+    const block = blocks.results.find((entry) => entry.paragraph?.rich_text?.[0]?.type === "mention");
+    expect(block).toBeTruthy();
+    const originalRichText = block!.paragraph.rich_text;
+    const patched = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/blocks/${block!.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paragraph: { rich_text: originalRichText } }),
+      }),
+    );
+    expect(patched.status).toBe(200);
+    const preserved = await patched.json<{
+      paragraph: { rich_text: Array<{ mention: { noteFlare: { payload: string } } }> };
+    }>();
+    expect(JSON.parse(preserved.paragraph.rich_text[0]!.mention.noteFlare.payload)).toMatchObject(mention);
+    const editedRichText = structuredClone(originalRichText);
+    const editedMention = editedRichText[0]!.mention as { date: { start: string } };
+    editedMention.date.start = "2026-10-05T14:00:00.000Z";
+    const edited = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/blocks/${block!.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paragraph: { rich_text: editedRichText } }),
+      }),
+    );
+    expect(edited.status).toBe(200);
+    const updated = await edited.json<{
+      paragraph: { rich_text: Array<{ mention: { noteFlare: { payload: string } } }> };
+    }>();
+    expect(JSON.parse(updated.paragraph.rich_text[0]!.mention.noteFlare.payload)).toMatchObject({
+      tokenId: mention.tokenId,
+      createdBy: mention.createdBy,
+      value: "2026-10-05T14:00:00.000Z",
+    });
+  });
   it("round-trips expanded embed URLs through /v1 while framing is disabled", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);
