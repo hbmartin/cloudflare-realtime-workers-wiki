@@ -51,6 +51,20 @@ describe("Notion block adapter", () => {
     ]);
   });
 
+  it("keeps date tokens readable in Notion rich text reads", () => {
+    const payload = JSON.stringify({
+      tokenId: "date-1",
+      revision: "rev-1",
+      createdBy: "user-1",
+      kind: "timed",
+      value: "2026-10-01T14:00:00.000Z",
+      timezone: "America/Chicago",
+    });
+    expect(proseMirrorInlineToNotion([{ type: "dateMention", attrs: { payload } }])).toMatchObject([
+      { type: "text", text: { content: "2026-10-01 09:00 America/Chicago" } },
+    ]);
+  });
+
   it("returns unsupported for heading levels outside the API contract", () => {
     const block = documentBlocks(
       document({

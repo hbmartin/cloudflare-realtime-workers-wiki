@@ -87,6 +87,31 @@ describe("structured document projection", () => {
     expect(JSON.stringify(result)).not.toContain("user-1");
   });
 
+  it("exports a timed date in its stored timezone from the atomic payload", () => {
+    const result = serializeDocument(
+      document({
+        type: "paragraph",
+        content: [
+          {
+            type: "dateMention",
+            attrs: {
+              payload: JSON.stringify({
+                tokenId: "date-2",
+                revision: "rev-2",
+                createdBy: "user-1",
+                kind: "timed",
+                value: "2026-10-01T14:00:00.000Z",
+                timezone: "America/Chicago",
+              }),
+            },
+          },
+        ],
+      }),
+    );
+    expect(result.plainText).toContain("2026-10-01 09:00 America/Chicago");
+    expect(result.markdown).not.toContain("14:00:00.000Z");
+  });
+
   it("normalizes whitespace without joining separate blocks", () => {
     const projection = projectDocument(
       document(

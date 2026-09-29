@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { dateMentionDueAt, parseDatePhrase, resolveLocalDateTime, validCalendarDate } from "./date-mentions";
+import {
+  dateMentionDueAt,
+  dateMentionFromProps,
+  formatDateMention,
+  parseDatePhrase,
+  resolveLocalDateTime,
+  validCalendarDate,
+} from "./date-mentions";
 
 describe("date mentions", () => {
   it("resolves supported phrases in the member timezone", () => {
@@ -37,5 +44,47 @@ describe("date mentions", () => {
       timezone: "America/Chicago",
     };
     expect(new Date(dateMentionDueAt(mention, "at_time")!).toISOString()).toBe("2026-11-01T15:00:00.000Z");
+    expect(new Date(dateMentionDueAt(mention, "1d_before")!).toISOString()).toBe("2026-10-31T14:00:00.000Z");
+  });
+
+  it("keeps the stored local hour for a timed day-before reminder across DST", () => {
+    const mention = {
+      tokenId: "token",
+      revision: "revision",
+      createdBy: "author",
+      kind: "timed" as const,
+      value: "2026-11-01T15:00:00.000Z",
+      timezone: "America/Chicago",
+    };
+    expect(new Date(dateMentionDueAt(mention, "1d_before")!).toISOString()).toBe("2026-10-31T14:00:00.000Z");
+  });
+
+  it("reads one atomic payload and rejects a broken combined value", () => {
+    const mention = {
+      tokenId: "token",
+      revision: "revision",
+      createdBy: "author",
+      kind: "timed" as const,
+      value: "2026-10-01T14:00:00.000Z",
+      timezone: "America/Chicago",
+    };
+    expect(dateMentionFromProps({ payload: JSON.stringify(mention) })).toEqual(mention);
+    expect(dateMentionFromProps({ payload: JSON.stringify({ ...mention, value: "2026-10-01" }) })).toBeNull();
+  });
+
+  it("shows timed dates in their stored timezone with the viewer's locale", () => {
+    expect(
+      formatDateMention(
+        {
+          tokenId: "token",
+          revision: "revision",
+          createdBy: "author",
+          kind: "timed",
+          value: "2026-10-01T14:00:00.000Z",
+          timezone: "America/Chicago",
+        },
+        "en-US",
+      ),
+    ).toMatch(/Oct 1, 2026.*9:00 AM.*CDT/);
   });
 });

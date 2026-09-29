@@ -1,5 +1,6 @@
 import type { ProseMirrorJson } from "./types";
 import { resolveEmbed } from "./embed-providers";
+import { dateMentionFromProps, readableDateMention } from "./date-mentions";
 
 export const NOTION_VERSION = "2026-03-11";
 export const NOTION_PAGE_SIZE_MAX = 100;
@@ -183,6 +184,18 @@ export function proseMirrorInlineToNotion(nodes: ProseMirrorJson[] = []): Notion
         mention: { type, [type]: { id: entityId } },
         annotations: notionAnnotations(node),
         plain_text: label,
+        href: null,
+      });
+      continue;
+    }
+    if (node.type === "dateMention") {
+      const mention = dateMentionFromProps(node.attrs ?? {});
+      const content = mention ? readableDateMention(mention) : "Date";
+      output.push({
+        type: "text",
+        text: { content, link: null },
+        annotations: notionAnnotations(node),
+        plain_text: content,
         href: null,
       });
       continue;

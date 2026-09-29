@@ -1206,18 +1206,21 @@ button.mention-chip:focus-visible {
   border: 0;
   border-radius: 5px;
   background: var(--accent-soft);
-  color: #44429b;
+  color: var(--ink);
   padding: 1px 5px;
   font: inherit;
   cursor: pointer;
 }
 .date-mention-chip:hover,
 .date-mention-chip:focus-visible {
-  background: #d9d7ff;
+  background: var(--surface-hover);
+}
+.date-mention-chip:disabled {
+  cursor: default;
 }
 .date-mention-picker {
   position: fixed;
-  margin: 0;
+  margin: auto;
   z-index: 150;
   width: min(280px, calc(100vw - 24px));
   max-height: calc(100vh - 24px);
@@ -1230,6 +1233,12 @@ button.mention-chip:focus-visible {
   padding: 14px;
   box-shadow: 0 12px 36px #25231f24;
   color: var(--ink);
+}
+.date-mention-picker:not([open]) {
+  display: none;
+}
+.date-mention-picker::backdrop {
+  background: #0008;
 }
 .date-mention-picker label {
   display: grid;

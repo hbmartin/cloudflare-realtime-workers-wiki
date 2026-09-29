@@ -11,17 +11,28 @@ export type ReminderChoice = "at_time" | "5m_before" | "1h_before" | "1d_before"
 
 const CALENDAR_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+const calendarFormatters = new Map<string, Intl.DateTimeFormat>();
+
+function calendarFormatter(timezone: string) {
+  let formatter = calendarFormatters.get(timezone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US-u-ca-gregory", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    });
+    if (calendarFormatters.size >= 64) calendarFormatters.clear();
+    calendarFormatters.set(timezone, formatter);
+  }
+  return formatter;
+}
 
 function calendarParts(instant: Date, timezone: string) {
-  const parts = new Intl.DateTimeFormat("en-US-u-ca-gregory", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(instant);
+  const parts = calendarFormatter(timezone).formatToParts(instant);
   const number = (type: string) => Number(parts.find((part) => part.type === type)?.value);
   return {
     year: number("year"),
@@ -44,8 +55,7 @@ export function validCalendarDate(value: string) {
 
 export function validTimezone(value: string) {
   try {
-    const format = new Intl.DateTimeFormat("en-US", { timeZone: value });
-    format.resolvedOptions();
+    calendarFormatter(value);
     return true;
   } catch {
     return false;
@@ -64,6 +74,44 @@ export function validDateMention(value: DateMention) {
         !Number.isNaN(Date.parse(value.value)) &&
         new Date(value.value).toISOString() === value.value),
   );
+}
+
+export function dateMentionFromProps(props: Record<string, unknown>): DateMention | null {
+  let candidate: unknown = props;
+  if (typeof props.payload === "string" && props.payload) {
+    try {
+      candidate = JSON.parse(props.payload);
+    } catch {
+      return null;
+    }
+  }
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+  const record = candidate as Record<string, unknown>;
+  if (
+    typeof record.tokenId !== "string" ||
+    typeof record.revision !== "string" ||
+    typeof record.createdBy !== "string" ||
+    (record.kind !== "all-day" && record.kind !== "timed") ||
+    typeof record.value !== "string" ||
+    typeof record.timezone !== "string"
+  )
+    return null;
+  const mention: DateMention = {
+    tokenId: record.tokenId,
+    revision: record.revision,
+    createdBy: record.createdBy,
+    kind: record.kind,
+    value: record.value,
+    timezone: record.timezone,
+  };
+  return validDateMention(mention) ? mention : null;
+}
+
+export function readableDateMention(mention: DateMention) {
+  if (!validDateMention(mention)) return "Date";
+  if (mention.kind === "all-day") return mention.value;
+  const wall = calendarParts(new Date(mention.value), mention.timezone);
+  return `${calendarDate(wall.year, wall.month, wall.day)} ${String(wall.hour).padStart(2, "0")}:${String(wall.minute).padStart(2, "0")} ${mention.timezone}`;
 }
 
 export function parseDatePhrase(query: string, now: Date, timezone: string): string | null {
@@ -138,7 +186,15 @@ export function dateMentionDueAt(mention: DateMention, choice: ReminderChoice | 
   const atTime =
     mention.kind === "timed" ? Date.parse(mention.value) : resolveLocalDateTime(mention.value, mention.timezone, 9, 0);
   if (atTime === null) return null;
-  const offset = { at_time: 0, "5m_before": 300_000, "1h_before": 3_600_000, "1d_before": 86_400_000 }[choice];
+  if (choice === "1d_before") {
+    const local = dateMentionLocalFields(mention);
+    if (!local) return null;
+    const previous = new Date(`${local.date}T12:00:00.000Z`);
+    previous.setUTCDate(previous.getUTCDate() - 1);
+    const [hour, minute] = local.time.split(":").map(Number);
+    return resolveLocalDateTime(previous.toISOString().slice(0, 10), mention.timezone, hour!, minute!);
+  }
+  const offset = { at_time: 0, "5m_before": 300_000, "1h_before": 3_600_000 }[choice];
   return atTime - offset;
 }
 
@@ -148,7 +204,15 @@ export function formatDateMention(mention: DateMention, locale?: string) {
     ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeZone: "UTC" }).format(
         new Date(`${mention.value}T12:00:00Z`),
       )
-    : new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(mention.value));
+    : new Intl.DateTimeFormat(locale, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        timeZone: mention.timezone,
+        timeZoneName: "short",
+      }).format(new Date(mention.value));
 }
 
 export function dateMentionLocalFields(mention: DateMention) {

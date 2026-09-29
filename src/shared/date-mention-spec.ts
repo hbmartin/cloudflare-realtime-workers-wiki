@@ -3,11 +3,8 @@ export const dateMentionInlineConfig = {
   type: "dateMention",
   content: "none",
   propSchema: {
-    tokenId: { default: "" },
-    revision: { default: "" },
-    createdBy: { default: "" },
-    kind: { default: "all-day", values: ["all-day", "timed"] },
-    value: { default: "" },
-    timezone: { default: "UTC" },
+    // One Yjs attribute keeps date, timezone, and revision together when
+    // collaborators edit the same token concurrently.
+    payload: { default: "" },
   },
 } as const;

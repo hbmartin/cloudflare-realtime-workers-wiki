@@ -1,5 +1,5 @@
 import type { ProseMirrorJson } from "./types";
-import { validDateMention, type DateMention } from "./date-mentions";
+import { dateMentionFromProps, readableDateMention, type DateMention } from "./date-mentions";
 
 export type { ProseMirrorJson } from "./types";
 
@@ -34,17 +34,7 @@ function stringAttr(node: ProseMirrorJson, name: string) {
 
 export function dateMentionFromNode(node: ProseMirrorJson): DateMention | null {
   if (node.type !== "dateMention") return null;
-  const value = {
-    tokenId: stringAttr(node, "tokenId") ?? "",
-    revision: stringAttr(node, "revision") ?? "",
-    createdBy: stringAttr(node, "createdBy") ?? "",
-    kind: stringAttr(node, "kind"),
-    value: stringAttr(node, "value") ?? "",
-    timezone: stringAttr(node, "timezone") ?? "",
-  };
-  return (value.kind === "all-day" || value.kind === "timed") && validDateMention(value as DateMention)
-    ? (value as DateMention)
-    : null;
+  return dateMentionFromProps(node.attrs ?? {});
 }
 
 export function collectLinkedDiagramIds(
@@ -161,7 +151,10 @@ function markedText(node: ProseMirrorJson, format: "markdown" | "html") {
 function nodeText(node: ProseMirrorJson): string {
   if (typeof node.text === "string") return node.text;
   if (node.type === "mention") return stringAttr(node, "label") ?? "";
-  if (node.type === "dateMention") return dateMentionFromNode(node)?.value ?? stringAttr(node, "value") ?? "Date";
+  if (node.type === "dateMention") {
+    const mention = dateMentionFromNode(node);
+    return mention ? readableDateMention(mention) : stringAttr(node, "value") || "Date";
+  }
   return (node.content ?? []).map(nodeText).join("");
 }
 

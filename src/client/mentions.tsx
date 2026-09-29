@@ -9,7 +9,7 @@ import { createReactInlineContentSpec } from "@blocknote/react";
 import { useState } from "react";
 import { mentionInlineConfig } from "../shared/mention-spec";
 import { dateMentionInlineConfig } from "../shared/date-mention-spec";
-import { formatDateMention } from "../shared/date-mentions";
+import { dateMentionFromProps, formatDateMention } from "../shared/date-mentions";
 import type { PagePreview } from "../shared/types";
 import { api } from "./api";
 import { coreBlockSpecs, inlineMathSpec } from "./editor-blocks";
@@ -109,16 +109,22 @@ const mentionInlineSpec = createReactInlineContentSpec(mentionInlineConfig, {
 });
 
 const dateMentionInlineSpec = createReactInlineContentSpec(dateMentionInlineConfig, {
-  render: ({ inlineContent, contentRef, updateInlineContent }) => (
-    <DateMentionChip
-      value={inlineContent.props}
-      contentRef={contentRef}
-      update={(value) => updateInlineContent({ type: "dateMention", props: value })}
-    />
-  ),
-  toExternalHTML: ({ inlineContent, contentRef }) => (
-    <span ref={contentRef}>{formatDateMention(inlineContent.props)}</span>
-  ),
+  render: ({ inlineContent, contentRef, updateInlineContent }) => {
+    const value = dateMentionFromProps(inlineContent.props);
+    return value ? (
+      <DateMentionChip
+        value={value}
+        contentRef={contentRef}
+        update={(next) => updateInlineContent({ type: "dateMention", props: { payload: JSON.stringify(next) } })}
+      />
+    ) : (
+      <span ref={contentRef}>Date</span>
+    );
+  },
+  toExternalHTML: ({ inlineContent, contentRef }) => {
+    const value = dateMentionFromProps(inlineContent.props);
+    return <span ref={contentRef}>{value ? formatDateMention(value) : "Date"}</span>;
+  },
 });
 
 const codeLanguages = {
