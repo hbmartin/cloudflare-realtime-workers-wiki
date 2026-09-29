@@ -31,6 +31,7 @@ export type NotificationFanout = {
   eventType: NotificationEventType;
   sourceId: string;
   taskOperationId?: string;
+  taskRowId?: string;
   recipientIds: string[];
   emitSlackChannel: boolean;
   data?: Record<string, unknown>;
@@ -106,6 +107,7 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
           WHERE (? IS NULL OR recipient.value <> ?) AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
             AND (? IS NULL OR p.content_epoch = ?)
             AND (? IS NULL OR EXISTS(SELECT 1 FROM task_mutation_receipts tr WHERE tr.workspace_id=p.workspace_id AND tr.actor_id=? AND tr.operation_id=? AND tr.detail_page_id=p.id))
+            AND (? IS NULL OR EXISTS(SELECT 1 FROM table_row_pages link WHERE link.row_id=? AND link.page_id=p.id))
             AND (wm.role = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
             AND NOT EXISTS (
               SELECT 1 FROM notifications recent
@@ -134,6 +136,8 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         fanout.taskOperationId ?? null,
         fanout.actorId,
         fanout.taskOperationId ?? null,
+        fanout.taskRowId ?? null,
+        fanout.taskRowId ?? null,
         coalesceAfter,
         fanout.pageId,
         fanout.eventType,

@@ -1,4 +1,5 @@
 import { acceptSlackProductInteraction, openSlackProduct } from "./slack-product";
+import { authorizeSlackCaptureJobRetry } from "./slack-capture";
 import { taskListStatements, listTasks, mutateTask, taskAssignees } from "./tasks";
 import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror, verifySlackMirrorRecovery } from "./slack-threads";
 import { acceptSlackWorkspaceInteraction, openSlackSearch, purgeExpiredSlackSearchSessions } from "./slack-workspace";
@@ -2523,8 +2524,12 @@ app.post("/api/jobs/:id/retry", async (c) => {
   }
   const retryBody = job.type === "import" ? await optionalJsonBody(c.req.raw) : {};
   const parentOverride = Object.hasOwn(retryBody, "parentId") ? nullableId(retryBody.parentId, "parentId") : undefined;
+  const captureId = job.type === "import" ? parseImportOptions(storedJobOptions(job))?.captureId : undefined;
+  if (captureId && parentOverride !== undefined)
+    throw new HttpError(422, "slack_capture_destination_fixed", "Retry this capture at its original destination.");
   await authorizeJobRetry(c.env, member, job, parentOverride);
-  if (job.type === "import") {
+  if (captureId) await authorizeSlackCaptureJobRetry(c.env, captureId, job.id);
+  if (job.type === "import" && !captureId) {
     const options = storedJobOptions(job);
     const preview = savedImportPreview(job);
     const parsed = parseImportOptions(

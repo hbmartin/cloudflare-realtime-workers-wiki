@@ -209,6 +209,8 @@ export type SlackApiContracts = {
       channel: string;
       ts: string;
       oldest: string;
+      latest?: string;
+      inclusive?: boolean;
       cursor?: string;
       limit: number;
       include_all_metadata: boolean;

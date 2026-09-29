@@ -69,6 +69,7 @@ function messageText(value: string) {
 
 export function captureMarkdown(input: {
   title: string;
+  description?: string;
   permalink: string;
   capturedAt: number;
   messages: readonly SlackHistoryMessage[];
@@ -77,15 +78,17 @@ export function captureMarkdown(input: {
     throw new HttpError(422, "thread_too_large", "This thread exceeds the capture limit of 2,000 messages.");
   const permalink = safeHttpsLink(input.permalink, true);
   if (!permalink) throw new HttpError(422, "slack_source", "The Slack source link is unavailable.");
-  const lines = [
-    `# ${escapeMarkdown(input.title)}`,
+  const lines = [`# ${escapeMarkdown(input.title)}`, ""];
+  if (input.description?.trim()) lines.push("## Description", "", escapeMarkdown(input.description.trim()), "");
+  lines.push(
+    "## Slack source",
     "",
     `Captured from Slack on ${new Date(input.capturedAt).toISOString()}. ${link("View source", permalink)}`,
-  ];
+  );
   for (const message of input.messages) {
     if (!/^\d{1,16}\.\d{1,16}$/.test(message.ts))
       throw new HttpError(422, "slack_source", "A Slack message timestamp is invalid.");
-    lines.push("", `## ${escapeMarkdown(message.user ?? message.bot_id ?? "Slack member")} · ${message.ts}`, "");
+    lines.push("", `### ${escapeMarkdown(message.user ?? message.bot_id ?? "Slack member")} · ${message.ts}`, "");
     lines.push(messageText(message.text ?? ""));
     for (const reaction of message.reactions ?? []) {
       if (typeof reaction.name === "string" && Number.isSafeInteger(reaction.count) && reaction.count! > 0)

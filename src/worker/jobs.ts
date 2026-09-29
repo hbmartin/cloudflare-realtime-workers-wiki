@@ -138,7 +138,9 @@ export function jobJson(row: JobRow): Job {
     id: row.id,
     workspaceId: row.workspace_id,
     spaceId: row.space_id,
-    ...(typeof options.parentId === "string" ? { importParentId: options.parentId } : {}),
+    ...(typeof options.parentId === "string" && typeof options.captureId !== "string"
+      ? { importParentId: options.parentId }
+      : {}),
     type: row.type,
     status: row.status,
     progress: {
@@ -868,8 +870,10 @@ export async function finishPendingJobCleanup(
     if (job.type === "export") await cleanupExport(env, job, stillOwned);
     if (!(await stillOwned())) return false;
     const completedAt = Date.now();
-    const finished = await env.DB.prepare(
-      `UPDATE jobs SET
+    const captureId = job.type === "import" ? jsonRecord(job.options_json).captureId : null;
+    const finishedBatch = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE jobs SET
          status = cleanup_target,
          progress_label = CASE cleanup_target WHEN 'canceled' THEN 'Canceled' ELSE 'Failed' END,
          error_code = CASE cleanup_target WHEN 'canceled' THEN NULL ELSE error_code END,
@@ -877,9 +881,19 @@ export async function finishPendingJobCleanup(
          cleanup_token = NULL, cleanup_started_at = NULL, cleanup_target = NULL, updated_at = ?
        WHERE id = ? AND attempt = ? AND cleanup_token = ? AND cleanup_target IS NOT NULL
          AND status IN (${CLEANUP_JOB_STATUS_SQL})`,
-    )
-      .bind(completedAt, job.id, job.attempt, token)
-      .run();
+      ).bind(completedAt, job.id, job.attempt, token),
+      ...(typeof captureId === "string"
+        ? [
+            env.DB.prepare(
+              `UPDATE slack_captures SET state='failed',error_category='canceled',updated_at=?
+               WHERE id=? AND job_id=? AND state='running'
+                 AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND status='canceled')`,
+            ).bind(completedAt, captureId, job.id, job.id),
+            captureFeedbackStatement(env.DB, captureId, "failed", completedAt),
+          ]
+        : []),
+    ]);
+    const finished = finishedBatch[0]!;
     if (finished.meta.changes) await notifyJobs(env, job.workspace_id);
     return Boolean(finished.meta.changes);
   } catch (error) {

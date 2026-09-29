@@ -125,46 +125,60 @@ function markdownDestination(value: string, start: number) {
 }
 
 function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
+  // Protect backslash-escaped punctuation while the small inline parser scans
+  // delimiters. Restoring it only in text nodes keeps Slack capture text literal.
+  const sentinel = `\uE000${crypto.randomUUID()}\uE001`;
+  const escaped: string[] = [];
+  const protectedValue = value.replace(/\\([\\`*_{}[\]()#+\-.!|>~])/g, (_match, character: string) => {
+    const token = `${sentinel}${escaped.length}${sentinel}`;
+    escaped.push(character);
+    return token;
+  });
+  const restore = (text: string) =>
+    text.replace(
+      new RegExp(`${sentinel}(\\d+)${sentinel}`, "g"),
+      (_match, index: string) => escaped[Number(index)] ?? "",
+    );
   const output: ProseMirrorJson[] = [];
   const pattern = /(!?)\[([^\]]*)\]\(|\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|\*([^*]+)\*|_([^_]+)_/g;
   let offset = 0;
   let match: RegExpExecArray | null;
-  while ((match = pattern.exec(value))) {
-    output.push(...inline(value.slice(offset, match.index)));
+  while ((match = pattern.exec(protectedValue))) {
+    output.push(...inline(restore(protectedValue.slice(offset, match.index))));
     const [whole, image, label, boldA, boldB, code, italicA, italicB] = match;
     if (label !== undefined) {
-      const destination = markdownDestination(value, pattern.lastIndex);
+      const destination = markdownDestination(protectedValue, pattern.lastIndex);
       if (!destination) {
-        output.push(...inline(whole));
+        output.push(...inline(restore(whole)));
         offset = pattern.lastIndex;
         continue;
       }
       pattern.lastIndex = destination.end;
-      const rawUrl = destination.href;
+      const rawUrl = restore(destination.href);
       const url = safeLink(rawUrl);
       if (!url) {
         issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
-        output.push(...inline(label ?? ""));
+        output.push(...inline(restore(label ?? "")));
       } else if (image) {
         references.push(url);
         // Images are not inline nodes in this schema, so both branches degrade to the
         // label; the issue keeps that downgrade visible in the import warnings.
         issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
-        output.push(...inline(label ?? ""));
+        output.push(...inline(restore(label ?? "")));
       } else {
         references.push(url);
-        output.push(...inline(label ?? "", [{ type: "link", attrs: { href: url } }]));
+        output.push(...inline(restore(label ?? ""), [{ type: "link", attrs: { href: url } }]));
       }
     } else if (boldA !== undefined || boldB !== undefined) {
-      output.push(...inline(boldA ?? boldB ?? "", [{ type: "bold" }]));
+      output.push(...inline(restore(boldA ?? boldB ?? ""), [{ type: "bold" }]));
     } else if (code !== undefined) {
-      output.push(...inline(code, [{ type: "code" }]));
+      output.push(...inline(restore(code), [{ type: "code" }]));
     } else {
-      output.push(...inline(italicA ?? italicB ?? "", [{ type: "italic" }]));
+      output.push(...inline(restore(italicA ?? italicB ?? ""), [{ type: "italic" }]));
     }
     offset = pattern.lastIndex;
   }
-  output.push(...inline(value.slice(offset)));
+  output.push(...inline(restore(protectedValue.slice(offset))));
   return output;
 }
 

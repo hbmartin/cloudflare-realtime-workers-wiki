@@ -17,6 +17,17 @@ describe("import content", () => {
     expect(JSON.stringify(json)).toContain("mermaid");
   });
 
+  it("renders escaped Slack punctuation as literal text and keeps link labels intact", () => {
+    const parsed = markdownToDocument(
+      "Ship v1\\.2 \\- today\\! \\(see plan\\) and snake\\_case\\_x [Plan\\] draft](<https://example.com/plan>)",
+    );
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "Ship v1.2 - today! (see plan) and snake_case_x " },
+      { type: "text", text: "Plan] draft", marks: [{ type: "link", attrs: { href: "https://example.com/plan" } }] },
+    ]);
+  });
+
   it.each([
     ["Folder_(one)/Child.md", "Folder_(one)/Child.md"],
     ["Folder_\\(one\\)/Child.md", "Folder_(one)/Child.md"],

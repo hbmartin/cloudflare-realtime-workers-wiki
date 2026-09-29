@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { captureMarkdown, MAX_CAPTURE_MARKDOWN_BYTES, MAX_CAPTURE_MESSAGES } from "./slack-capture-content";
+import { markdownToDocument } from "../shared/import-content";
 
 const input = {
   title: "Launch decision",
@@ -51,5 +52,23 @@ describe("Slack capture Markdown", () => {
         messages: [{ ...input.messages[0]!, text: "a".repeat(MAX_CAPTURE_MARKDOWN_BYTES) }],
       }),
     ).toThrow("2 MiB");
+  });
+
+  it("keeps the user's description separate from attributed Slack messages", () => {
+    const markdown = captureMarkdown({ ...input, description: "# Follow up with legal" });
+    const blocks = markdownToDocument(markdown).document.content![0]!.content!.map(
+      (container) => container.content![0]!,
+    );
+    expect(blocks.map((block) => block.type)).toEqual([
+      "heading",
+      "heading",
+      "paragraph",
+      "heading",
+      "paragraph",
+      "heading",
+      "paragraph",
+    ]);
+    expect(blocks[2]?.content?.[0]?.text).toBe("# Follow up with legal");
+    expect(blocks[6]?.content?.[0]?.text).toContain("Ship");
   });
 });

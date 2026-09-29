@@ -58,7 +58,16 @@ import {
   purgeExpiredSlackSearchSessions,
   publishSlackHome,
 } from "./slack-workspace";
-import { consumeDeliveryMessage, redriveStaleSlackOutbox, startJobExecution, type DeliveryQueueMessage } from "./jobs";
+import {
+  beginJobCancellation,
+  consumeDeliveryMessage,
+  finishPendingJobCleanup,
+  jobJson,
+  redriveStaleSlackOutbox,
+  startJobExecution,
+  type DeliveryQueueMessage,
+  type JobRow,
+} from "./jobs";
 import worker from "./index";
 import { hmacSha256 } from "../shared/security";
 
@@ -180,6 +189,14 @@ async function mockSlack(input: RequestInfo | URL, init?: RequestInit) {
   if (method === "conversations.history" && historyFailure !== "none")
     return Response.json({ ok: false, error: historyFailure });
   if (method === "conversations.replies" && threadHistoryPages) {
+    if (payload.latest) {
+      return Response.json({
+        ok: true,
+        messages: threadHistoryPages.flat().filter((message) => message.ts === payload.latest),
+        has_more: false,
+        response_metadata: { next_cursor: "" },
+      });
+    }
     const index = payload.cursor ? Number(String(payload.cursor).replace("page-", "")) : 0;
     return Response.json({
       ok: true,
@@ -4578,7 +4595,7 @@ describe("Slack documents and tasks", () => {
       ...taskListStatements(env.DB, "tasks"),
     ]);
   }
-  async function startCapture(kind: "document" | "task", destination: string, title: string) {
+  async function startCapture(kind: "document" | "task", destination: string, title: string, assigneeId = "owner") {
     await acceptSlackProductInteraction(
       runtime(),
       {
@@ -4594,11 +4611,9 @@ describe("Slack documents and tasks", () => {
     );
     const id = (calls.findLast((call) => call.method === "views.open")!.payload.view as { private_metadata: string })
       .private_metadata;
-    const submitted = await acceptSlackProductInteraction(
-      runtime(),
-      submission(id, kind, destination, title),
-      Date.now() + 2500,
-    );
+    const payload = submission(id, kind, destination, title);
+    payload.view.state.values.assignee.noteflare_assignee.selected_option.value = assigneeId;
+    const submitted = await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500);
     expect(submitted.response).toMatchObject({ response_action: "update" });
     const capture = await env.DB.prepare("SELECT id FROM slack_captures WHERE source_ts='1700000101.000001'").first<{
       id: string;
@@ -5083,18 +5098,87 @@ describe("Slack documents and tasks", () => {
       count: 0,
     });
   });
+  it("fetches a selected reply directly even when its thread exceeds 2,000 messages", async () => {
+    threadHistoryPages = Array.from({ length: 21 }, (_pageValue, page) =>
+      Array.from({ length: 100 }, (_messageValue, index) => ({
+        ts: `${1700001000 + page * 100 + index}.000001`,
+        thread_ts: "1700000100.000001",
+        user: "UOWNER",
+        text: page === 20 && index === 99 ? "Selected reply" : "Other reply",
+      })),
+    );
+    const replyTs = threadHistoryPages.at(-1)!.at(-1)!.ts;
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "message_action",
+        callback_id: "noteflare_save_to_notes",
+        trigger_id: "single-reply-trigger",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        channel: { id: "CSPACE" },
+        message: { ts: replyTs, thread_ts: "1700000100.000001", text: "Selected reply", user: "UOWNER" },
+      },
+      Date.now() + 2500,
+    );
+    const id = (calls.findLast((call) => call.method === "views.open")!.payload.view as { private_metadata: string })
+      .private_metadata;
+    await acceptSlackProductInteraction(
+      runtime(),
+      submission(id, "document", "space:workspace-general", "Selected reply"),
+      Date.now() + 2500,
+    );
+    const capture = await env.DB.prepare("SELECT id FROM slack_captures").first<{ id: string }>();
+    const job = await prepareSlackCapture(runtime(), capture!.id);
+    expect(job).not.toBeNull();
+    expect(calls.filter((call) => call.method === "conversations.replies")).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ latest: replyTs, oldest: replyTs, limit: "1" }) }),
+    ]);
+    const staged = await env.BUCKET.get(job!.input_key!);
+    expect(await staged!.text()).toContain("Selected reply");
+    expect(await (await env.BUCKET.get(job!.input_key!))!.text()).not.toContain("Other reply");
+  });
+  it("rejects oversized thread text before staging an import", async () => {
+    threadHistoryPages = [[{ ts: "1700000100.000001", user: "UOWNER", text: "x".repeat(2 * 1024 * 1024 + 1) }]];
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "message_action",
+        callback_id: "noteflare_new_page_from_thread",
+        trigger_id: "large-content-trigger",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        channel: { id: "CSPACE" },
+        message: { ts: "1700000100.000001", text: "Large content", user: "UOWNER" },
+      },
+      Date.now() + 2500,
+    );
+    const id = (calls.findLast((call) => call.method === "views.open")!.payload.view as { private_metadata: string })
+      .private_metadata;
+    await acceptSlackProductInteraction(
+      runtime(),
+      submission(id, "document", "space:workspace-general", "Large content"),
+      Date.now() + 2500,
+    );
+    const capture = await env.DB.prepare("SELECT id FROM slack_captures").first<{ id: string }>();
+    await expect(prepareSlackCapture(runtime(), capture!.id)).rejects.toMatchObject({ status: 413 });
+    expect(await env.DB.prepare("SELECT count(*) count FROM jobs WHERE id=?").bind(capture!.id).first()).toEqual({
+      count: 0,
+    });
+  });
   it("publishes an explicitly selected task with its verified source in one transaction", async () => {
     await list();
-    const captureId = await startCapture("task", "page:tasks", "Prepare launch");
+    const captureId = await startCapture("task", "page:tasks", "Prepare launch", "viewer");
     expect((await listTasks(runtime(), owner)).tasks).toHaveLength(0);
     const job = await prepareSlackCapture(runtime(), captureId);
+    expect(jobJson(job!).importParentId).toBeUndefined();
     await startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!);
     const tasks = (await listTasks(runtime(), owner)).tasks;
     expect(tasks).toHaveLength(1);
     expect(tasks[0]).toMatchObject({
       title: "Prepare launch",
       status: "todo",
-      assigneeId: "owner",
+      assigneeId: "viewer",
       dueDate: "2026-10-01",
     });
     const page = await env.DB.prepare("SELECT plain_text FROM pages WHERE id=?")
@@ -5102,6 +5186,64 @@ describe("Slack documents and tasks", () => {
       .first<{ plain_text: string }>();
     expect(page?.plain_text).toContain("Captured from Slack");
     expect(page?.plain_text).toContain("Prepare launch");
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM notifications WHERE user_id='viewer' AND event_type='task_assigned'",
+      ).first(),
+    ).toEqual({ count: 1 });
+  });
+  it("preserves a Slack-entered title ending in a commit hash", async () => {
+    const title = `Revert ${"a".repeat(40)}`;
+    const captureId = await startCapture("document", "space:workspace-general", title);
+    const job = await prepareSlackCapture(runtime(), captureId);
+    await startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!);
+    expect(
+      await env.DB.prepare("SELECT title FROM pages WHERE import_job_id IS NULL AND title=?").bind(title).first(),
+    ).toEqual({ title });
+  });
+  it("rejects invalid task fields before claiming a Slack source", async () => {
+    await list();
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "message_action",
+        callback_id: "noteflare_save_to_notes",
+        trigger_id: "invalid-task-trigger",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        channel: { id: "CSPACE" },
+        message: { ts: "1700000101.000001", text: "Invalid task", user: "UOWNER" },
+      },
+      Date.now() + 2500,
+    );
+    const id = (calls.findLast((call) => call.method === "views.open")!.payload.view as { private_metadata: string })
+      .private_metadata;
+    const payload = submission(id, "task", "page:tasks", "Invalid task");
+    payload.view.state.values.status.value.selected_option.value = "invalid";
+    expect((await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500)).response).toMatchObject({
+      response_action: "errors",
+      errors: { title: expect.stringContaining("valid status") },
+    });
+    expect(await env.DB.prepare("SELECT count(*) count FROM slack_captures").first()).toEqual({ count: 0 });
+  });
+  it("rejects a malformed Slack thread timestamp before opening a capture form", async () => {
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "message_action",
+        callback_id: "noteflare_new_page_from_thread",
+        trigger_id: "invalid-thread-trigger",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        channel: { id: "CSPACE" },
+        message: { ts: "1700000100.000001", thread_ts: "invalid", text: "Invalid", user: "UOWNER" },
+      },
+      Date.now() + 2500,
+    );
+    expect(JSON.stringify(calls.findLast((call) => call.method === "views.open")?.payload.view)).toContain(
+      "Choose a channel message to capture",
+    );
+    expect(await env.DB.prepare("SELECT count(*) count FROM slack_captures").first()).toEqual({ count: 0 });
   });
   it.each(["source", "destination"])("keeps staging hidden when %s access is revoked", async (revoked) => {
     const captureId = await startCapture("document", "space:workspace-general", "Access controlled");
@@ -5172,6 +5314,194 @@ describe("Slack documents and tasks", () => {
       state: "succeeded",
     });
   });
+  it("records failure feedback for each separate capture attempt", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Repeated failure");
+    captureSourceAvailable = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) await retryFailedSlackCapture(runtime(), captureId);
+      const ack = vi.fn();
+      expect(
+        await consumeDeliveryMessage(runtime(), {
+          id: `capture-failure-${attempt}`,
+          timestamp: new Date(),
+          body: { outboxId: `slack-capture:${captureId}` },
+          attempts: 1,
+          ack,
+          retry: vi.fn(),
+        } as unknown as Message<DeliveryQueueMessage>),
+      ).toBe("discarded");
+      expect(ack).toHaveBeenCalledOnce();
+    }
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
+      ).first(),
+    ).toEqual({ count: 2 });
+  });
+  it("fails a deleted Slack source with feedback instead of retrying forever", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Deleted source");
+    beforeResponse = async (method) => {
+      if (method === "chat.getPermalink") throw new SlackApiError(method, "message_not_found", 404);
+    };
+    const ack = vi.fn();
+    expect(
+      await consumeDeliveryMessage(runtime(), {
+        id: "deleted-capture-source",
+        timestamp: new Date(),
+        body: { outboxId: `slack-capture:${captureId}` },
+        attempts: 1,
+        ack,
+        retry: vi.fn(),
+      } as unknown as Message<DeliveryQueueMessage>),
+    ).toBe("discarded");
+    expect(ack).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare("SELECT state,error_category FROM slack_captures WHERE id=?").bind(captureId).first(),
+    ).toEqual({ state: "failed", error_category: "slack_source" });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
+      ).first(),
+    ).toEqual({ count: 1 });
+  });
+  it("retries a failed capture job without discarding its source receipt", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Retry verified import");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    captureSourceAvailable = false;
+    await expect(startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!)).rejects.toThrow(
+      "Slack source is no longer available",
+    );
+    expect(await env.DB.prepare("SELECT state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      state: "failed",
+    });
+    captureSourceAvailable = true;
+    const retried = await env.DB.prepare(
+      `UPDATE jobs SET status='queued',attempt=attempt+1,workflow_instance_id=?,updated_at=?
+       WHERE id=? AND status='failed' RETURNING *`,
+    )
+      .bind(crypto.randomUUID(), Date.now(), captureId)
+      .first<JobRow>();
+    expect(retried).not.toBeNull();
+    await startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, retried!);
+    expect(await env.DB.prepare("SELECT state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      state: "succeeded",
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM pages WHERE title='Retry verified import' AND import_job_id IS NULL",
+      ).first(),
+    ).toEqual({ count: 1 });
+  });
+  it("rebinds a failed capture after Slack reconnection and restages its input", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Reconnected capture");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    expect(job!.input_key).toContain("slack-0.md");
+    captureSourceAvailable = false;
+    await expect(startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!)).rejects.toThrow(
+      "Slack source is no longer available",
+    );
+    captureSourceAvailable = true;
+    await env.DB.batch([
+      env.DB.prepare("UPDATE slack_installations SET generation=1 WHERE id='installation'"),
+      env.DB.prepare(
+        "UPDATE slack_user_links SET installation_generation=1,verified_at=? WHERE installation_id='installation' AND user_id='owner'",
+      ).bind(Date.now()),
+    ]);
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "message_action",
+        callback_id: "noteflare_save_to_notes",
+        trigger_id: "reconnected-capture-trigger",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        channel: { id: "CSPACE" },
+        message: { ts: "1700000101.000001", text: "Reconnected capture", user: "UOWNER" },
+      },
+      Date.now() + 2500,
+    );
+    const id = (calls.findLast((call) => call.method === "views.open")!.payload.view as { private_metadata: string })
+      .private_metadata;
+    expect(
+      (
+        await acceptSlackProductInteraction(
+          runtime(),
+          submission(id, "document", "space:workspace-general", "Reconnected capture"),
+          Date.now() + 2500,
+        )
+      ).response,
+    ).toMatchObject({ response_action: "update" });
+    expect(
+      await env.DB.prepare("SELECT installation_generation,job_id FROM slack_captures WHERE id=?")
+        .bind(captureId)
+        .first(),
+    ).toEqual({ installation_generation: 1, job_id: captureId });
+    const retried = await env.DB.prepare(
+      `UPDATE jobs SET status='queued',attempt=attempt+1,workflow_instance_id=?,updated_at=?
+       WHERE id=? AND status='failed' RETURNING *`,
+    )
+      .bind(crypto.randomUUID(), Date.now(), captureId)
+      .first<JobRow>();
+    await startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, retried!);
+    expect(await env.DB.prepare("SELECT state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      state: "succeeded",
+    });
+    const savedJob = await env.DB.prepare("SELECT input_key FROM jobs WHERE id=?")
+      .bind(captureId)
+      .first<{ input_key: string }>();
+    expect(savedJob!.input_key).toContain("slack-1.md");
+    expect(await env.BUCKET.get(savedJob!.input_key)).not.toBeNull();
+    expect(await env.DB.prepare("SELECT count(*) count FROM slack_captures").first()).toEqual({ count: 1 });
+  });
+  it("rebinds a pending capture only after a new verified Slack submission", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Pending reconnection");
+    await env.DB.batch([
+      env.DB.prepare("UPDATE slack_installations SET generation=1 WHERE id='installation'"),
+      env.DB.prepare(
+        "UPDATE slack_user_links SET installation_generation=1,verified_at=? WHERE installation_id='installation' AND user_id='owner'",
+      ).bind(Date.now()),
+    ]);
+    await expect(prepareSlackCapture(runtime(), captureId)).rejects.toMatchObject({ status: 403 });
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "message_action",
+        callback_id: "noteflare_save_to_notes",
+        trigger_id: "pending-reconnected-trigger",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        channel: { id: "CSPACE" },
+        message: { ts: "1700000101.000001", text: "Pending reconnection", user: "UOWNER" },
+      },
+      Date.now() + 2500,
+    );
+    const id = (calls.findLast((call) => call.method === "views.open")!.payload.view as { private_metadata: string })
+      .private_metadata;
+    expect(
+      (
+        await acceptSlackProductInteraction(
+          runtime(),
+          submission(id, "document", "space:workspace-general", "Pending reconnection"),
+          Date.now() + 2500,
+        )
+      ).response,
+    ).toMatchObject({ response_action: "update" });
+    const job = await prepareSlackCapture(runtime(), captureId);
+    expect(job!.input_key).toContain("slack-1.md");
+    expect(await env.DB.prepare("SELECT count(*) count FROM slack_captures").first()).toEqual({ count: 1 });
+  });
+  it("settles the capture receipt when its import job is canceled", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Canceled capture");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    await beginJobCancellation(runtime(), job!);
+    await finishPendingJobCleanup(runtime(), job!, { terminateWorkflow: false });
+    expect(
+      await env.DB.prepare("SELECT state,error_category FROM slack_captures WHERE id=?").bind(captureId).first(),
+    ).toEqual({ state: "failed", error_category: "canceled" });
+    expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
+      status: "canceled",
+    });
+  });
   it("continues an older queued copy instead of importing its Slack source again", async () => {
     const legacyId = await open("new");
     await env.DB.prepare("UPDATE slack_product_sessions SET state_json=?,result_page_id='page' WHERE id=?")
@@ -5183,6 +5513,16 @@ describe("Slack documents and tasks", () => {
         legacyId,
       )
       .run();
+    expect(
+      (
+        await acceptSlackProductInteraction(
+          runtime(),
+          submission(legacyId, "document", "space:workspace-general", "Old source"),
+          Date.now() + 2500,
+        )
+      ).response,
+    ).toMatchObject({ response_action: "update" });
+    expect(await env.DB.prepare("SELECT count(*) count FROM slack_captures").first()).toEqual({ count: 0 });
     await acceptSlackProductInteraction(
       runtime(),
       {
@@ -5212,6 +5552,78 @@ describe("Slack documents and tasks", () => {
     expect(await env.DB.prepare("SELECT id FROM outbox WHERE topic='slack_product_copy'").first()).toEqual({
       id: `slack-copy:${legacyId}`,
     });
+  });
+  it("does not reuse another member's legacy capture page", async () => {
+    const legacyId = await open("new");
+    await env.DB.prepare("UPDATE slack_product_sessions SET state_json=?,result_page_id='page' WHERE id=?")
+      .bind(
+        JSON.stringify({
+          kind: "document",
+          source: {
+            channelId: "CSPACE",
+            ts: "1700000101.000001",
+            thread: false,
+            text: "Shared source",
+            author: "UOWNER",
+          },
+        }),
+        legacyId,
+      )
+      .run();
+    await env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE user_id='viewer'").run();
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "message_action",
+        callback_id: "noteflare_save_to_notes",
+        trigger_id: "other-member-trigger",
+        team: { id: "T123" },
+        user: { id: "UVIEWER" },
+        channel: { id: "CSPACE" },
+        message: { ts: "1700000101.000001", text: "Shared source", user: "UOWNER" },
+      },
+      Date.now() + 2500,
+    );
+    const id = (calls.findLast((call) => call.method === "views.open")!.payload.view as { private_metadata: string })
+      .private_metadata;
+    const payload = submission(id, "document", "space:workspace-general", "Viewer copy");
+    payload.user.id = "UVIEWER";
+    expect((await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500)).response).toMatchObject({
+      response_action: "update",
+    });
+    expect(await env.DB.prepare("SELECT count(*) count FROM slack_captures").first()).toEqual({ count: 1 });
+  });
+  it("uses the newest verified Slack session when a pending capture is resubmitted", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Reverified identity");
+    await env.DB.prepare("UPDATE slack_user_links SET verified_at=2 WHERE user_id='owner'").run();
+    await acceptSlackProductInteraction(
+      runtime(),
+      {
+        type: "message_action",
+        callback_id: "noteflare_save_to_notes",
+        trigger_id: "reverified-trigger",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        channel: { id: "CSPACE" },
+        message: { ts: "1700000101.000001", text: "Reverified identity", user: "UOWNER" },
+      },
+      Date.now() + 2500,
+    );
+    const id = (calls.findLast((call) => call.method === "views.open")!.payload.view as { private_metadata: string })
+      .private_metadata;
+    expect(
+      (
+        await acceptSlackProductInteraction(
+          runtime(),
+          submission(id, "document", "space:workspace-general", "Reverified identity"),
+          Date.now() + 2500,
+        )
+      ).response,
+    ).toMatchObject({
+      response_action: "update",
+    });
+    const job = await prepareSlackCapture(runtime(), captureId);
+    expect(job).not.toBeNull();
   });
   it("filters private task assignments, enforces viewers, and emits one assignment notification", async () => {
     await list();

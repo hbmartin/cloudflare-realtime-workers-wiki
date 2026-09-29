@@ -218,7 +218,7 @@ export async function taskAssignees(env: Env, member: MemberContext, listId: str
   return rows.results;
 }
 
-function fields(value: Record<string, unknown>, previous?: Task): TaskFields {
+export function validateTaskFields(value: Record<string, unknown>, previous?: Task): TaskFields {
   const title = value.title === undefined ? previous?.title : value.title;
   const assigneeId = value.assigneeId === undefined ? (previous?.assigneeId ?? null) : value.assigneeId;
   const status = value.status === undefined ? (previous?.status ?? "todo") : value.status;
@@ -291,7 +291,7 @@ export async function mutateTask(
     ? (await listTasks(env, member, { listId, rowId, includeArchived: body.archived === false })).tasks[0]
     : undefined;
   if (rowId && !previous) throw new HttpError(404, "task_not_found", "The task no longer exists.");
-  const next = fields(body, previous);
+  const next = validateTaskFields(body, previous);
   if (
     body.assigneeId !== undefined &&
     next.assigneeId &&

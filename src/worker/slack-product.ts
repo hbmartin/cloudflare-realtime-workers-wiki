@@ -4,7 +4,7 @@ import { HttpError } from "./http";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import { TASK_STATUSES, TASK_STATUS_LABELS, type Task, type TaskFields } from "../shared/tasks";
 import { effectiveSpaceRole, pageForMember } from "./page-access";
-import { listTasks, mutateTask, taskAssignees, taskListStatements } from "./tasks";
+import { listTasks, mutateTask, taskAssignees, taskListStatements, validateTaskFields } from "./tasks";
 import { identityFor, verifiedMember, validateChannel, requireChannelMember } from "./slack-threads";
 import { slackApi, type SlackInstallation, type SlackInteractionPayload, type SlackHistoryMessage } from "./slack";
 import { safeSlackText, slackLabel } from "./slack-blocks";
@@ -392,7 +392,9 @@ function captureView(env: Env, id: string, capture: { state: string; page_id: st
         type: "mrkdwn",
         text:
           capture.state === "failed"
-            ? `Capture failed. Open <${new URL(env.BETTER_AUTH_URL).origin}/|NoteFlare> to review and retry it.`
+            ? capture.job_id
+              ? `Capture failed. <${new URL(env.BETTER_AUTH_URL).origin}/?activity=1|Open NoteFlare activities> to review and retry it.`
+              : "Capture failed. Use Retry capture below to try again."
             : "Capture queued. The page will become available after the source and imported content are verified.",
       },
     },
@@ -430,19 +432,43 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
     if (body.length > 3000) throw new HttpError(422, "invalid_body", "Keep the description under 3000 characters.");
     if (kind === "task" && (!dest.taskList || !dest.parentId))
       throw new HttpError(422, "task_destination", "Select a Task List as the destination for a task.");
+    if (kind === "task" && dest.parentId) {
+      validateTaskFields(taskFields);
+      if (
+        taskFields.assigneeId &&
+        !(await taskAssignees(env, member, dest.parentId)).some((user) => user.id === taskFields.assigneeId)
+      )
+        throw new HttpError(422, "invalid_assignee", "The assignee must have access to this task list.");
+    }
     await validateChannel(env, installation, state.source.channelId);
     await requireChannelMember(env, installation, state.source.channelId, session.slack_user_id);
+    if (session.result_page_id) {
+      await pageForMember(env, member, session.result_page_id);
+      if (!state.copied) await queueCopy(env, session, member.workspace.id);
+      return {
+        response_action: "update",
+        view: resultView(env, session.id, session.result_page_id, !state.copied),
+      };
+    }
     // A queued copy from the previous shortcut implementation already owns this
     // Slack source. Finish that page instead of creating a second imported page.
     const legacy = await env.DB.prepare(
-      `SELECT * FROM slack_product_sessions WHERE installation_id=? AND id<>?
+      `SELECT * FROM slack_product_sessions WHERE installation_id=? AND generation=? AND slack_user_id=? AND id<>?
         AND result_page_id IS NOT NULL AND capture_id IS NULL
         AND json_extract(state_json,'$.source.channelId')=?
         AND json_extract(state_json,'$.source.ts')=?
         AND json_extract(state_json,'$.source.thread')=?
         ORDER BY created_at DESC,id DESC LIMIT 1`,
     )
-      .bind(installation.id, session.id, state.source.channelId, state.source.ts, state.source.thread ? 1 : 0)
+      .bind(
+        installation.id,
+        installation.generation,
+        session.slack_user_id,
+        session.id,
+        state.source.channelId,
+        state.source.ts,
+        state.source.thread ? 1 : 0,
+      )
       .first<Session>();
     if (legacy?.result_page_id) {
       await pageForMember(env, member, legacy.result_page_id);
@@ -723,7 +749,9 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
     if (
       typeof payload.channel?.id !== "string" ||
       typeof payload.message?.ts !== "string" ||
-      !TS.test(payload.message.ts)
+      !TS.test(payload.message.ts) ||
+      (payload.message.thread_ts !== undefined &&
+        (typeof payload.message.thread_ts !== "string" || !TS.test(payload.message.thread_ts)))
     )
       throw new HttpError(422, "slack_source", "Choose a channel message to capture.");
     state.source = {

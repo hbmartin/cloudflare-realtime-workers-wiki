@@ -30,7 +30,8 @@ import { correlationHeaders, logger, traced } from "./observability";
 import { HttpError, normalizeFilename } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { sidebarHiddenPageIds } from "./page-access";
-import { captureFeedbackStatement, recheckSlackCapturePublication } from "./slack-capture";
+import { captureFeedbackStatement, recheckSlackCapturePublication, resumeSlackCaptureJob } from "./slack-capture";
+import { notificationFanoutStatements } from "./notifications";
 import { refreshPageSearchV2ForIdsStatements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
@@ -776,7 +777,9 @@ async function singlePageBundle(job: JobRow, options: ImportOptions, bytes: Uint
   const html = options.format === "html" ? htmlToDocument(source) : null;
   const parsed = html ?? markdownToDocument(source);
   const importedTitle = html?.title ?? "";
-  const title = cleanTitle((options.title ?? importedTitle) || stem(options.filename));
+  const title = options.title
+    ? options.title.replaceAll("\0", "").trim() || "Untitled"
+    : cleanTitle(importedTitle || stem(options.filename));
   const page: ImportPage = {
     source: options.filename,
     id: await stableId(job.id, "page", options.filename),
@@ -1408,6 +1411,21 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
         WHERE id IN (SELECT value FROM json_each(?)) AND import_job_id IS NULL AND is_template = 0`,
     ).bind(pageIds),
     ...refreshPageSearchV2ForIdsStatements(env.DB, pageIdValues),
+    ...(task?.assigneeId && taskRowId && publishedRootId
+      ? notificationFanoutStatements(env.DB, {
+          workspaceId: job.workspace_id,
+          spaceId: externalPage!.spaceId,
+          pageId: publishedRootId,
+          threadId: null,
+          actorId: job.requested_by,
+          eventType: "task_assigned",
+          sourceId: `task:${taskRowId}`,
+          recipientIds: [task.assigneeId],
+          emitSlackChannel: false,
+          createdAt: timestamp,
+          taskRowId,
+        })
+      : []),
     ...(options.captureId
       ? [
           env.DB.prepare(
@@ -1563,6 +1581,7 @@ export function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">)
 
 async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   let options = importOptions(job);
+  if (options.captureId) job.input_key = await resumeSlackCaptureJob(env, options.captureId, job.id, job.attempt);
   // A deployment can supersede confirmation while a workflow is queued or suspended.
   const refreshing = options.confirmed && !hasCurrentImportConfirmation(options);
   if (refreshing) {

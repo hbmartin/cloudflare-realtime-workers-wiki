@@ -1182,7 +1182,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [pageTreeRetrying, setPageTreeRetrying] = useState(false);
   const [pageAccessLoading, setPageAccessLoading] = useState(false);
   const [pendingTrashMutationIds, setPendingTrashMutationIds] = useState<ReadonlySet<string>>(() => new Set());
-  const [activitiesOpen, setActivitiesOpen] = useState(false);
+  const [activitiesOpen, setActivitiesOpen] = useState(
+    () => new URLSearchParams(window.location.search).get("activity") === "1",
+  );
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -2478,6 +2480,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     setNotificationsOpen(false);
     setActivitiesOpen(true);
     void loadJobs();
+  }, [loadJobs]);
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("activity") !== "1") return;
+    url.searchParams.delete("activity");
+    window.history.replaceState(window.history.state, "", url);
+    queueMicrotask(() => void loadJobs());
   }, [loadJobs]);
   const openNotifications = useCallback(() => {
     restoreNotificationTriggerFocus.current = false;
