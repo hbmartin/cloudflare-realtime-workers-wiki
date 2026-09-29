@@ -111,12 +111,12 @@ export async function putDateReminder(
   tokenId: string,
   input: ReminderInput,
 ) {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     let current: Awaited<ReturnType<typeof pageDateToken>>;
     try {
       current = await pageDateToken(env, page, tokenId);
     } catch (error) {
-      if (attempt === 0 && error instanceof HttpError && error.code === "content_changing") continue;
+      if (attempt < 2 && error instanceof HttpError && error.code === "content_changing") continue;
       throw error;
     }
     const { token, sequence } = current;
@@ -454,7 +454,6 @@ async function deliverDueDateReminders(env: Env) {
     .bind(timestamp, timestamp - 2 * 60_000)
     .all<{ id: string }>();
   const retried = new Set<string>();
-  const envelopes = new Map<string, Promise<DocumentContentEnvelope>>();
   const pendingIds = due.results.map((row) => row.id);
   for (let index = 0; index < pendingIds.length; index += 1) {
     const id = pendingIds[index]!;
@@ -489,13 +488,7 @@ async function deliverDueDateReminders(env: Env) {
           .run();
         continue;
       }
-      const pageKey = `${row.page_id}:${row.content_epoch}`;
-      let pendingEnvelope = envelopes.get(pageKey);
-      if (!pendingEnvelope) {
-        pendingEnvelope = roomEnvelope(env, row.page_id, row.content_epoch);
-        envelopes.set(pageKey, pendingEnvelope);
-      }
-      const envelope = await pendingEnvelope;
+      const envelope = await roomEnvelope(env, row.page_id, row.content_epoch);
       const document = envelope.document;
       const token = dateTokens(document).get(row.token_id);
       const choice = reminderChoice(JSON.parse(row.choice_json));

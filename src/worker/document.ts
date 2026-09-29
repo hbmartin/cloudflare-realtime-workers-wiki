@@ -851,18 +851,30 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
-      // Readers may use a coherent committed copy while websocket edits arrive.
-      // Side effects that require current content check the response header.
+      // Most callers use this endpoint as a current-content barrier. Public
+      // rendering may explicitly request the last coherent committed copy.
       try {
         this.flushPendingUpdates();
         if (this.compaction) await this.compaction.catch(() => undefined);
-        else if (this.metadata.dirty) await this.compact();
+        if (this.metadata.dirty) await this.compact();
         this.flushPendingUpdates();
-      } catch {
+      } catch (error) {
+        logger.error(
+          "document.content_compaction.failed",
+          "document",
+          "Document content could not be read.",
+          { pageId: this.ids.pageId, epoch: this.ids.epoch },
+          error,
+        );
         return Response.json({ error: "Document content is temporarily unavailable." }, { status: 503 });
       }
       const { pageId, epoch } = this.ids;
       if (this.metadata.dirty || this.compaction) {
+        if (request.headers.get("x-notes-allow-stale") !== "1")
+          return Response.json(
+            { error: "Document content is still changing." },
+            { status: 503, headers: { "x-notes-content-retry": "changing" } },
+          );
         const table = this.metadata.content_kind === "diagram" ? "diagram_projections" : "document_projections";
         const row = await this.bindings.DB.prepare(
           `SELECT sequence,r2_key,content_hash FROM ${table} WHERE page_id=? AND content_epoch=?`,
@@ -871,7 +883,12 @@ export class Document extends YServer {
           .first<{ sequence: number; r2_key: string; content_hash: string }>();
         const stored = row ? await this.bindings.BUCKET.get(row.r2_key) : null;
         if (!stored) return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
-        const envelope = await stored.json<{ pageId: string; contentEpoch: number; sequence: number }>();
+        let envelope: { pageId: string; contentEpoch: number; sequence: number };
+        try {
+          envelope = await stored.json();
+        } catch {
+          return Response.json({ error: "Committed document content is invalid." }, { status: 503 });
+        }
         if (envelope.pageId !== pageId || envelope.contentEpoch !== epoch || envelope.sequence !== row!.sequence)
           return Response.json({ error: "Committed document content is invalid." }, { status: 503 });
         return Response.json(envelope, {

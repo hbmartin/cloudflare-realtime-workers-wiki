@@ -138,10 +138,13 @@ describe("date reminders", () => {
   it("asks content readers to retry while edits arrive during compaction", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.page.id}~1`);
-    const content = () =>
+    const content = (allowStale = false) =>
       stub.fetch(
         new Request("https://document.internal/content", {
-          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+          headers: {
+            "x-notes-internal": env.BETTER_AUTH_SECRET,
+            ...(allowStale ? { "x-notes-allow-stale": "1" } : {}),
+          },
         }),
       );
     await content();
@@ -162,8 +165,11 @@ describe("date reminders", () => {
       });
     });
     const during = await content();
-    expect(during.status).toBe(200);
-    expect(during.headers.get("x-notes-content-current")).toBe("0");
+    expect(during.status).toBe(503);
+    expect(during.headers.get("x-notes-content-retry")).toBe("changing");
+    const committed = await content(true);
+    expect(committed.status).toBe(200);
+    expect(committed.headers.get("x-notes-content-current")).toBe("0");
     await runInDurableObject(stub, async (instance) => {
       (instance as unknown as { compact: () => Promise<void> }).compact = originalCompact!;
     });
