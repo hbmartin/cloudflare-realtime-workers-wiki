@@ -30,6 +30,9 @@ type ReminderRow = {
 const ACTIVE_SWEEP_INTERVAL = 14 * 60_000;
 const DELIVERED_SWEEP_INTERVAL = 24 * 60 * 60_000;
 export const MISSING_GRACE_MS = 2 * 60_000;
+export function withinMissingGrace(missingSince: number | null, now: number) {
+  return missingSince === null || now - missingSince < MISSING_GRACE_MS;
+}
 
 export type ReminderInput = { revision: string; choice: ReminderChoice | { absolute: string } };
 
@@ -212,18 +215,6 @@ function missingMarkStatement(
   ).bind(timestamp, timestamp, timestamp, pageId, epoch, JSON.stringify(targets), sequence);
 }
 
-export async function markRemindersMissing(
-  env: Env,
-  pageId: string,
-  epoch: number,
-  sequence: number,
-  targets: MissingTarget[],
-) {
-  if (!targets.length) return 0;
-  const result = await missingMarkStatement(env, pageId, epoch, sequence, targets, Date.now()).run();
-  return result.meta.changes;
-}
-
 export async function reconcileDateRemindersForPage(
   env: Env,
   pageId: string,
@@ -251,7 +242,7 @@ export async function reconcileDateRemindersForPage(
     if (!token) {
       if (row.missing_since === null) {
         missingTargets.push({ id: row.id, generation: row.generation });
-      } else if (timestamp - row.missing_since >= MISSING_GRACE_MS) {
+      } else if (!withinMissingGrace(row.missing_since, timestamp)) {
         statements.push(cancelReminderStatement(env, row, sequence, timestamp));
       } else if (row.state === "claimed") {
         statements.push(
@@ -351,7 +342,7 @@ async function sweepDateReminders(env: Env) {
         continue;
       }
       const envelope = await roomEnvelope(env, row.page_id, row.content_epoch);
-      await reconcileDateRemindersForPage(
+      const applied = await reconcileDateRemindersForPage(
         env,
         row.page_id,
         row.content_epoch,
@@ -359,6 +350,7 @@ async function sweepDateReminders(env: Env) {
         envelope.sequence,
         cutoffs,
       );
+      if (!applied) await rotateSweepRows(env, row.page_id, row.content_epoch, cutoffs);
     } catch (error) {
       failures.push(error);
       logger.error(
@@ -370,22 +362,16 @@ async function sweepDateReminders(env: Env) {
       );
       // Rotate a persistently unavailable room out of this bounded scan so
       // other pages still receive reconciliation on the next tick.
-      await env.DB.prepare(
-        `UPDATE date_reminders SET checked_at=? WHERE page_id=? AND content_epoch=?
-           AND state IN ('active','claimed','delivered')`,
-      )
-        .bind(Date.now(), row.page_id, row.content_epoch)
-        .run()
-        .catch((rotateError) => {
-          failures.push(rotateError);
-          logger.error(
-            "date_reminder.sweep_rotate.failed",
-            "scheduler",
-            "Reminder sweep rotation failed.",
-            { pageId: row.page_id },
-            rotateError,
-          );
-        });
+      await rotateSweepRows(env, row.page_id, row.content_epoch, cutoffs).catch((rotateError) => {
+        failures.push(rotateError);
+        logger.error(
+          "date_reminder.sweep_rotate.failed",
+          "scheduler",
+          "Reminder sweep rotation failed.",
+          { pageId: row.page_id },
+          rotateError,
+        );
+      });
     }
   }
   await env.DB.prepare(
@@ -395,6 +381,29 @@ async function sweepDateReminders(env: Env) {
     .bind(timestamp - 30 * 24 * 60 * 60_000)
     .run();
   if (failures.length) throw new AggregateError(failures, "Date reminder sweep failed.");
+}
+
+async function rotateSweepRows(
+  env: Env,
+  pageId: string,
+  epoch: number,
+  cutoffs: { active: number; delivered: number },
+) {
+  const now = Date.now();
+  await env.DB.prepare(
+    `UPDATE date_reminders SET checked_at=CASE WHEN state='delivered' THEN ? ELSE ? END
+     WHERE page_id=? AND content_epoch=?
+       AND ((state IN ('active','claimed') AND checked_at<?) OR (state='delivered' AND checked_at<?))`,
+  )
+    .bind(
+      now - DELIVERED_SWEEP_INTERVAL + 60_000,
+      now - ACTIVE_SWEEP_INTERVAL + 60_000,
+      pageId,
+      epoch,
+      cutoffs.active,
+      cutoffs.delivered,
+    )
+    .run();
 }
 
 async function releaseReminderClaim(env: Env, row: ReminderRow, claimId: string) {

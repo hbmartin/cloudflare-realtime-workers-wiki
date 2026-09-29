@@ -287,6 +287,20 @@ async function priorDateTokenBlocks(env: Env, pageId: string, epoch: number) {
   return dateTokenBlocks(envelope.document);
 }
 
+async function persistedContentEnvelope(env: Env, pageId: string, epoch: number, kind: "document" | "diagram") {
+  const table = kind === "diagram" ? "diagram_projections" : "document_projections";
+  const row = await env.DB.prepare(`SELECT r2_key,sequence FROM ${table} WHERE page_id=? AND content_epoch=?`)
+    .bind(pageId, epoch)
+    .first<{ r2_key: string; sequence: number }>();
+  if (!row) return null;
+  const stored = await env.BUCKET.get(row.r2_key);
+  if (!stored) return null;
+  const envelope = await stored.json<{ pageId?: string; contentEpoch?: number; sequence?: number }>();
+  return envelope.pageId === pageId && envelope.contentEpoch === epoch && envelope.sequence === row.sequence
+    ? envelope
+    : null;
+}
+
 function dateTokenBlocks(document: ProseMirrorJson) {
   const preferred = new Map<string, string>();
   for (const block of flattenDocumentBlocks(document))
@@ -852,12 +866,29 @@ export class Document extends YServer {
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
       this.flushPendingUpdates();
-      if (this.compaction) await this.compaction;
-      if (this.metadata.dirty) await this.compact();
+      if (this.metadata.dirty) await this.compact().catch(() => undefined);
       this.flushPendingUpdates();
-      if (this.metadata.dirty || this.compaction)
-        return Response.json({ error: "Document is still changing." }, { status: 503 });
       const { pageId, epoch } = this.ids;
+      if (this.metadata.dirty || this.compaction) {
+        const persisted = await persistedContentEnvelope(
+          this.bindings,
+          pageId,
+          epoch,
+          this.metadata.content_kind,
+        ).catch((error: unknown) => {
+          logger.warn(
+            "document.content_projection.unavailable",
+            "document",
+            "Persisted content could not be read.",
+            { pageId, epoch },
+            error,
+          );
+          return null;
+        });
+        if (persisted)
+          return Response.json(persisted, { headers: { etag: `"${await sha256Hex(canonicalJson(persisted))}"` } });
+        return Response.json({ error: "Document projection is temporarily unavailable." }, { status: 503 });
+      }
       if (this.metadata.content_kind === "diagram") {
         const envelope = diagramFromYDoc(this.document, {
           pageId,

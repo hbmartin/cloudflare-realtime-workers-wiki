@@ -35,7 +35,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { dateTokens } from "../shared/document-projection";
 import { dateMentionFromProps } from "../shared/date-mentions";
-import { MISSING_GRACE_MS } from "./date-reminders";
+import { withinMissingGrace } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -1263,9 +1263,10 @@ notionApi.patch("/blocks/:blockId", async (c) => {
         reminder.timezone !== supplied.timezone
       )
         continue;
-      guardMove = true;
-      if ((reminder.missing_since ?? Date.now()) >= Date.now() - MISSING_GRACE_MS)
+      if (withinMissingGrace(reminder.missing_since, Date.now())) {
+        guardMove = true;
         blockDates.set(supplied.tokenId, { ...supplied, revision: crypto.randomUUID() });
+      }
     }
   }
   let container;

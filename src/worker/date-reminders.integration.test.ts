@@ -6,7 +6,7 @@ import type { DateMention } from "../shared/date-mentions";
 import { dateTokens } from "../shared/document-projection";
 import { flattenDocumentBlocks } from "../shared/notion-blocks";
 import type { Env } from "./env";
-import { markRemindersMissing, processDueDateReminders, reconcileDateRemindersForPage } from "./date-reminders";
+import { processDueDateReminders, reconcileDateRemindersForPage } from "./date-reminders";
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -623,7 +623,15 @@ describe("date reminders", () => {
     await env.DB.prepare(`UPDATE date_reminders SET state='claimed',claim_id='claim',claimed_at=? WHERE id=?`)
       .bind(Date.now(), reminder.id)
       .run();
-    expect(await markRemindersMissing(env, installed.page.id, 1, projection!.sequence, [reminder])).toBe(1);
+    expect(
+      await reconcileDateRemindersForPage(
+        env,
+        installed.page.id,
+        1,
+        { type: "doc", content: [] },
+        projection!.sequence,
+      ),
+    ).toBe(true);
     const released = await env.DB.prepare(`SELECT state,claim_id,missing_since FROM date_reminders WHERE id=?`)
       .bind(reminder.id)
       .first<{ state: string; claim_id: string | null; missing_since: number | null }>();
@@ -634,7 +642,15 @@ describe("date reminders", () => {
     await env.DB.prepare(`UPDATE document_projections SET sequence=sequence+1 WHERE page_id=?`)
       .bind(installed.page.id)
       .run();
-    expect(await markRemindersMissing(env, installed.page.id, 1, projection!.sequence, [reminder])).toBe(0);
+    expect(
+      await reconcileDateRemindersForPage(
+        env,
+        installed.page.id,
+        1,
+        { type: "doc", content: [] },
+        projection!.sequence,
+      ),
+    ).toBe(false);
     const stale = await env.DB.prepare(`SELECT missing_since FROM date_reminders WHERE id=?`)
       .bind(reminder.id)
       .first<{ missing_since: number | null }>();
