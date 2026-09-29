@@ -414,14 +414,14 @@ function OfflineEditor({
         void persistence["_db"]
           .then(() => persistence.whenSynced)
           .then(
-            (lateError: unknown) => {
+            () => {
               if (!active) return;
-              void reportClientError("client.offline_storage_failed", lateError);
               setLoadingSlow(false);
               setCopy({ doc, persistence, provider });
             },
-            () => {
+            (lateError: unknown) => {
               if (!active) return;
+              void reportClientError("client.offline_storage_failed", lateError);
               setLoadingSlow(false);
               setError("This document copy could not be read from this device.");
             },

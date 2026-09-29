@@ -69,10 +69,12 @@ function beginRecoveryAction(
   actions: Map<string, number>,
   entries: { current: readonly { key: string }[] },
   entryKey: string,
+  action: "preview" | "export" | "copy",
 ) {
-  const attempt = (actions.get(entryKey) ?? 0) + 1;
-  actions.set(entryKey, attempt);
-  return () => actions.get(entryKey) === attempt && entries.current.some((entry) => entry.key === entryKey);
+  const key = `${entryKey}:${action}`;
+  const attempt = (actions.get(key) ?? 0) + 1;
+  actions.set(key, attempt);
+  return () => actions.get(key) === attempt && entries.current.some((entry) => entry.key === entryKey);
 }
 
 export type EditorPageProps = {
@@ -107,24 +109,25 @@ export function EditorPage({
   const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [storageLoadingSlow, setStorageLoadingSlow] = useState(false);
+  const [storageRetry, setStorageRetry] = useState(0);
   const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
-  const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [recoveryErrors, setRecoveryErrors] = useState<Record<string, string>>({});
   const [preparedRecoveryCopy, setPreparedRecoveryCopy] = useState<{ key: string; markdown: string } | null>(null);
   const recoveryActions = useRef(new Map<string, number>());
-  const recoverySelection = useRef({ key: "", sequence: 0 });
+  const recoverySelection = useRef({ preview: 0, prepare: 0 });
   const recoveryErrorFor = (entryKey: string, message: string | null) => {
     setRecoveryErrors((current) => {
+      if (message === null && !(entryKey in current)) return current;
       const next = { ...current };
       if (message === null) delete next[entryKey];
       else next[entryKey] = message;
       return next;
     });
   };
-  const selectRecovery = (entryKey: string) => {
-    const sequence = recoverySelection.current.sequence + 1;
-    recoverySelection.current = { key: entryKey, sequence };
-    return () => recoverySelection.current.key === entryKey && recoverySelection.current.sequence === sequence;
+  const selectRecovery = (action: "preview" | "prepare") => {
+    const sequence = recoverySelection.current[action] + 1;
+    recoverySelection.current[action] = sequence;
+    return () => recoverySelection.current[action] === sequence;
   };
   const clipboardItemSupported =
     typeof ClipboardItem !== "undefined" && Boolean(navigator.clipboard && "write" in navigator.clipboard);
@@ -148,6 +151,7 @@ export function EditorPage({
       return [];
     }
   });
+  const [recoveryPreview, setRecoveryPreview] = useState<{ key: string; text: string } | null>(null);
   const recoveryRef = useRef(recovery);
   const replaceRecovery = useCallback(
     (next: RecoveryEntry[]) => {
@@ -158,7 +162,13 @@ export function EditorPage({
         console.error("Unable to persist offline recovery details", error);
       }
       setRecovery(next);
-      if (!next.length) setRecoveryError(null);
+      const retained = new Set(next.map((entry) => entry.key));
+      setRecoveryErrors((current) =>
+        Object.keys(current).some((key) => !retained.has(key))
+          ? Object.fromEntries(Object.entries(current).filter(([key]) => retained.has(key)))
+          : current,
+      );
+      setRecoveryPreview((current) => (current && !retained.has(current.key) ? null : current));
     },
     [recoveryKey],
   );
@@ -185,7 +195,6 @@ export function EditorPage({
       dismissedRecovery.current = {};
     }
   }, [recoveryKey, page.contentEpoch]);
-  const [recoveryPreview, setRecoveryPreview] = useState<{ key: string; text: string } | null>(null);
   const [title, setTitle] = useState(page.title);
   const [titleError, setTitleError] = useState("");
   const [editorError, setEditorError] = useState("");
@@ -236,6 +245,7 @@ export function EditorPage({
 
   useEffect(() => {
     let active = true;
+    if (storageRetry > 0) queueMicrotask(() => active && setStorageError(null));
     let pendingWrite = Promise.resolve();
     const currentStorageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
     const quarantine = (key = currentStorageKey, reason: RecoveryEntry["reason"] = "epoch") => {
@@ -387,7 +397,6 @@ export function EditorPage({
       const remaining = current.filter((entry) => entry.key !== currentStorageKey);
       if (remaining.length !== current.length) {
         replaceRecovery(remaining);
-        setRecoveryError(null);
         setPreparedRecoveryCopy((prepared) => (prepared?.key === currentStorageKey ? null : prepared));
       }
       setStorageError("");
@@ -553,7 +562,7 @@ export function EditorPage({
         await next.ready;
         if (active) {
           setStorageLoadingSlow(false);
-          setStorageError((current) => (current === OFFLINE_INIT_ERROR ? null : current));
+          setStorageError(null);
           setBundle(next);
         }
       } catch (error) {
@@ -566,7 +575,7 @@ export function EditorPage({
             await next.lateReady;
             if (!active) return;
             setStorageLoadingSlow(false);
-            setStorageError((current) => (current === OFFLINE_INIT_ERROR ? null : current));
+            setStorageError(null);
             setBundle(next);
           } catch (lateError) {
             if (!active) return;
@@ -596,6 +605,7 @@ export function EditorPage({
         });
       setBundle(null);
       setStorageLoadingSlow(false);
+      setStorageError(null);
     };
   }, [
     member.role,
@@ -608,6 +618,7 @@ export function EditorPage({
     page.contentEpoch,
     recoveryKey,
     replaceRecovery,
+    storageRetry,
   ]);
 
   async function saveTitle() {
@@ -739,25 +750,12 @@ export function EditorPage({
       {storageLoadingSlow && (
         <div className="notice">
           Offline storage is still loading.{" "}
-          <button
-            type="button"
-            onClick={() => {
-              if (titleDirtyRef.current) {
-                if (!titleError) {
-                  setTitleError("Wait for the title to save before reloading.");
-                  return;
-                }
-                if (!window.confirm("The title has not been saved. Reload and discard it?")) return;
-              }
-              window.location.reload();
-            }}
-          >
-            Reload to retry
+          <button type="button" onClick={() => setStorageRetry((attempt) => attempt + 1)}>
+            Retry loading this copy
           </button>
         </div>
       )}
       {catalogWarning && <div className="notice">{catalogWarning}</div>}
-      {recoveryError && <div className="notice notice-danger">{recoveryError}</div>}
       {recovery
         .filter((entry) => entry.epoch !== page.contentEpoch || accessQuarantine || storageError)
         .map((entry) => (
@@ -776,8 +774,8 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={async () => {
-                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
-                const stillSelected = selectRecovery(entry.key);
+                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "preview");
+                const stillSelected = selectRecovery("preview");
                 try {
                   const doc = await loadOfflineCopy(entry.key);
                   try {
@@ -800,7 +798,7 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={() => {
-                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
+                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "export");
                 void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`).then(
                   () => {
                     if (stillCurrent()) recoveryErrorFor(entry.key, null);
@@ -818,13 +816,13 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={async () => {
-                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
-                const stillSelected = selectRecovery(entry.key);
+                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "copy");
                 const showError = (message: string) => {
                   if (stillCurrent()) recoveryErrorFor(entry.key, message);
                 };
                 if (!clipboardItemSupported) {
                   if (preparedRecoveryCopy?.key !== entry.key) {
+                    const stillSelected = selectRecovery("prepare");
                     try {
                       const markdown = await offlineCopyMarkdownFromKey(entry.key, page.title);
                       if (!stillCurrent() || !stillSelected()) return;
@@ -881,8 +879,6 @@ export function EditorPage({
               <button
                 className="quiet-button"
                 onClick={() => {
-                  beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
-                  if (recoverySelection.current.key === entry.key) recoverySelection.current.sequence += 1;
                   setPreparedRecoveryCopy((prepared) => (prepared?.key === entry.key ? null : prepared));
                   dismissedRecovery.current[entry.key] = page.contentEpoch;
                   try {

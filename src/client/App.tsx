@@ -793,7 +793,7 @@ async function resolveAppState(alreadyPurgedAccount?: string): Promise<AppState>
     try {
       pendingPurges = new Set(await purgingOfflineAccounts());
     } catch (error) {
-      if (locallySignedOut)
+      if (locallySignedOut && locallySignedOut !== alreadyPurgedAccount)
         return {
           screen: "signout-cleanup",
           accountKey: locallySignedOut,

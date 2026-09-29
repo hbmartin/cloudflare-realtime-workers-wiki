@@ -309,7 +309,7 @@ describe("EditorPage close reconciliation", () => {
       />,
     );
     expect(await screen.findByText("Offline storage is still loading.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reload to retry" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry loading this copy" })).toBeInTheDocument();
     await act(async () => finishLoading());
     await waitFor(() => {
       expect(screen.queryByText("Offline storage is still loading.")).not.toBeInTheDocument();
