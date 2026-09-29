@@ -150,6 +150,13 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
     // italic span. Only reject a second delimiter still in the plain text.
     const isItalic = match[7] !== undefined || match[8] !== undefined;
     const delimiter = match[7] !== undefined ? "*" : "_";
+    const closer = match.index + match[0].length - 1;
+    // Let a complete strong span starting at this delimiter take precedence.
+    // Otherwise closing an italic here consumes half its opening pair.
+    if (match[7] !== undefined && /^\*\*(?:\\.|[^\\*])+\*\*/.test(value.slice(closer))) {
+      pattern.lastIndex = match.index + 1;
+      continue;
+    }
     if (isItalic && match.index > offset && value[match.index - 1] === delimiter) {
       pattern.lastIndex = match.index + 1;
       continue;

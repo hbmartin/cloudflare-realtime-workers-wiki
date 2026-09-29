@@ -67,6 +67,7 @@ const SLACK_BLOCKED_RECHECK_MS = 5 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
+const QUEUED_JOB_RECOVERY_DELAY_MS = 30_000;
 
 export type JobWorkflowParams = { jobId: string; attempt?: number; correlationId?: string };
 export type DeliveryQueueMessage =
@@ -729,12 +730,6 @@ export async function startJobExecution(
   env: Env,
   job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt"> & Partial<Pick<JobRow, "correlation_id">>,
 ) {
-  const pendingCapture = await env.DB.prepare(
-    `SELECT 1 FROM slack_captures WHERE id=? AND state='pending' AND job_id IS NULL`,
-  )
-    .bind(job.id)
-    .first();
-  if (pendingCapture) return;
   if (env.WORKFLOW_INLINE !== "true") return startJobWorkflow(env, job);
   const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(job.id, job.attempt)
@@ -756,13 +751,7 @@ export async function startJobExecution(
     else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
     if (safeHttpError(error)?.code === "slack_capture_link_pending") {
-      const returned = await env.DB.prepare(
-        `UPDATE jobs SET status='queued',progress_label='Queued',updated_at=?
-         WHERE id=? AND attempt=? AND status='running'`,
-      )
-        .bind(Date.now() - 30_000, row.id, row.attempt)
-        .run();
-      if (returned.meta.changes) await notifyJobs(env, row.workspace_id);
+      await requeueUnlinkedCapture(env, row);
       return;
     }
     const current = await env.DB.prepare(
@@ -773,6 +762,24 @@ export async function startJobExecution(
     if (current?.status === "running") await failJobWithCleanup(env, current, error);
     throw error;
   }
+}
+
+async function requeueUnlinkedCapture(env: Env, job: JobRow) {
+  const returned = await env.DB.prepare(
+    `UPDATE jobs SET status='queued',workflow_instance_id=?,progress_label='Queued',
+       error_code=NULL,error_message=NULL,updated_at=?
+     WHERE id=? AND attempt=? AND status='running'
+       AND COALESCE(workflow_instance_id,id)=?`,
+  )
+    .bind(
+      crypto.randomUUID(),
+      Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS,
+      job.id,
+      job.attempt,
+      job.workflow_instance_id ?? job.id,
+    )
+    .run();
+  if (returned.meta.changes) await notifyJobs(env, job.workspace_id);
 }
 
 async function notifyJobs(env: Env, workspaceId: string) {
@@ -905,7 +912,7 @@ export async function finishPendingJobCleanup(
       ).bind(completedAt, job.id, job.attempt, token),
       ...(typeof captureId === "string"
         ? [
-            failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, completedAt),
+            failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, completedAt, null, "final"),
             captureFeedbackStatement(env.DB, captureId, "failed", completedAt),
           ]
         : []),
@@ -964,7 +971,7 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
     ).bind(errorCode, message, timestamp, job.id, job.attempt),
     ...(typeof captureId === "string"
       ? [
-          failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, timestamp),
+          failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, timestamp, null, "failed"),
           captureFeedbackStatement(env.DB, captureId, "failed", timestamp),
         ]
       : []),
@@ -1242,6 +1249,10 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         return;
       }
       if (current.status !== "running") return;
+      if (safeHttpError(error)?.code === "slack_capture_link_pending") {
+        await requeueUnlinkedCapture(this.env, current);
+        return;
+      }
       await failJobWithCleanup(this.env, current, error);
       throw error;
     }
@@ -1249,7 +1260,7 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
 }
 
 export async function recoverQueuedJobs(env: Env) {
-  const cutoff = Date.now() - 30_000;
+  const cutoff = Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS;
   const queued = await env.DB.prepare(
     `SELECT id, workflow_instance_id, attempt, correlation_id FROM jobs
       WHERE status = 'queued' AND updated_at <= ?

@@ -499,6 +499,7 @@ describe("D1 migrations", () => {
         "request_hash",
         "attempt",
         "error_category",
+        "last_failed_job_attempt",
         "published_at",
       ]),
     );

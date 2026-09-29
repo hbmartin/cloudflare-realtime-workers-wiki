@@ -83,6 +83,13 @@ describe("import content", () => {
     expect(content.some((node) => node.text === italic && node.marks?.[0]?.type === "italic")).toBe(true);
   });
 
+  it.each(["*a**b**", "*foo**bar**baz*"])("keeps a strong span after an unmatched star: %s", (source) => {
+    const content = markdownToDocument(source).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content.some((node) => node.text === "b" || node.text === "bar")).toBe(true);
+    expect(content.some((node) => node.marks?.[0]?.type === "bold")).toBe(true);
+    expect(content[0]?.text?.startsWith("*a") || content[0]?.text?.startsWith("*foo")).toBe(true);
+  });
+
   it("scans long unclosed emphasis with backslashes without backtracking", () => {
     const source = `**Path ${"\\alpha ".repeat(90)}`;
     const parsed = markdownToDocument(source);

@@ -66,6 +66,7 @@ import {
 } from "./slack-workspace";
 import {
   beginJobCancellation,
+  NotesJobWorkflow,
   consumeDeliveryMessage,
   finishPendingJobCleanup,
   jobJson,
@@ -5561,6 +5562,10 @@ describe("Slack documents and tasks", () => {
   });
   it("records a fresh capture failure when job retry fails before resume", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Retry access revoked");
+    await env.DB.prepare("UPDATE slack_captures SET state='failed',error_category='slack_source' WHERE id=?")
+      .bind(captureId)
+      .run();
+    await retryFailedSlackCapture(runtime(), captureId);
     const job = await prepareSlackCapture(runtime(), captureId);
     captureSourceAvailable = false;
     await expect(startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!)).rejects.toThrow(
@@ -5581,7 +5586,7 @@ describe("Slack documents and tasks", () => {
       await env.DB.prepare("SELECT state,attempt,error_category FROM slack_captures WHERE id=?")
         .bind(captureId)
         .first(),
-    ).toMatchObject({ state: "failed", attempt: 2 });
+    ).toMatchObject({ state: "failed", attempt: 3 });
     expect(
       await env.DB.prepare(
         "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
@@ -5775,6 +5780,39 @@ describe("Slack documents and tasks", () => {
     });
     expect(workflow).not.toHaveBeenCalled();
   });
+  it("requeues a production workflow when the Slack receipt is still unlinked", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Workflow link race");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    await env.DB.prepare("UPDATE slack_captures SET state='pending',job_id=NULL WHERE id=?").bind(captureId).run();
+    // Workerd owns the WorkflowEntrypoint constructor. Exercise its observed
+    // path directly with the same bindings and step callback.
+    const workflow = Object.assign(Object.create(NotesJobWorkflow.prototype) as object, {
+      env: runtime(),
+    }) as unknown as { runObserved: (event: unknown, step: unknown) => Promise<void> };
+    const step = {
+      async do<T>(_name: string, callback: () => Promise<T>) {
+        return callback();
+      },
+    };
+    await workflow.runObserved(
+      {
+        payload: { jobId: captureId, attempt: 1 },
+        instanceId: job!.workflow_instance_id!,
+        workflowName: "notes",
+        timestamp: new Date(),
+      },
+      step,
+    );
+    const queued = await env.DB.prepare("SELECT status,workflow_instance_id FROM jobs WHERE id=?")
+      .bind(captureId)
+      .first<{ status: string; workflow_instance_id: string }>();
+    expect(queued?.status).toBe("queued");
+    expect(queued?.workflow_instance_id).not.toBe(job!.workflow_instance_id);
+    expect(await env.DB.prepare("SELECT state,job_id FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      state: "pending",
+      job_id: null,
+    });
+  });
   it("links a pending orphan capture when failure cleanup finishes", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Orphan failure cleanup");
     const job = await prepareSlackCapture(runtime(), captureId);
@@ -5817,14 +5855,13 @@ describe("Slack documents and tasks", () => {
         "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
       ).first(),
     ).toEqual({ count: 1 });
-    await expect(retryFailedSlackCapture(runtime(), captureId)).rejects.toMatchObject({
-      status: 409,
-      code: "slack_capture_job_conflict",
-    });
     await deliverSlackCaptureFeedback(runtime(), captureId, "failed");
     expect(calls.findLast((call) => call.method === "chat.postEphemeral")?.payload.text).toContain(
       "Contact a workspace administrator",
     );
+    await env.DB.prepare("DELETE FROM jobs WHERE id=?").bind(captureId).run();
+    await retryFailedSlackCapture(runtime(), captureId);
+    expect(await prepareSlackCapture(runtime(), captureId)).toMatchObject({ id: captureId });
   });
   it("links an orphan failed job to a failed receipt for Activities retry", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Orphan failure");
@@ -5856,6 +5893,31 @@ describe("Slack documents and tasks", () => {
     expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
       status: "canceled",
     });
+  });
+  it("does not send a second failure notice for a canceled Activities retry", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Canceled retry");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    captureSourceAvailable = false;
+    await expect(startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!)).rejects.toThrow(
+      "Slack source is no longer available",
+    );
+    const retried = await env.DB.prepare(
+      `UPDATE jobs SET status='queued',attempt=attempt+1,workflow_instance_id=? WHERE id=? RETURNING *`,
+    )
+      .bind(crypto.randomUUID(), captureId)
+      .first<JobRow>();
+    await beginJobCancellation(runtime(), retried!);
+    await finishPendingJobCleanup(runtime(), retried!, { terminateWorkflow: false });
+    expect(
+      await env.DB.prepare("SELECT state,attempt,error_category FROM slack_captures WHERE id=?")
+        .bind(captureId)
+        .first(),
+    ).toEqual({ state: "failed", attempt: 1, error_category: "slack_source" });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
+      ).first(),
+    ).toEqual({ count: 1 });
   });
   it("repairs a linked capture left running by interrupted failure cleanup", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Interrupted cleanup");
