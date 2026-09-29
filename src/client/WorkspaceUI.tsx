@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import type { Page, SearchResponse } from "../shared/types";
-import { api, apiErrorMessage } from "./api";
+import type { Page } from "../shared/types";
 
 const paths = {
   search: "m21 21-5-5 M19 11a8 8 0 1 1-16 0 8 8 0 0 1 16 0",
@@ -69,7 +68,15 @@ export function ActionMenu({
       menu.style.top = `${Math.max(8, Math.min(anchor.bottom + 4, window.innerHeight - menu.offsetHeight - 8))}px`;
     };
     position();
-    menu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    menu.tabIndex = -1;
+    const enabledButtons = () => [...menu.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+    const focusFirst = () => (enabledButtons()[0] ?? menu).focus();
+    focusFirst();
+    const observer = new MutationObserver(() => {
+      if (document.activeElement === menu || document.activeElement === details.querySelector("summary"))
+        enabledButtons()[0]?.focus();
+    });
+    observer.observe(menu, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled"] });
     const close = (event: PointerEvent) => {
       const target = event.target as Node;
       if (!details.contains(target) && !menu.contains(target)) {
@@ -78,29 +85,47 @@ export function ActionMenu({
       }
     };
     const key = (event: KeyboardEvent) => {
+      if (event.repeat && (event.key === "Enter" || event.key === " ") && menu.contains(event.target as Node)) {
+        event.preventDefault();
+        return;
+      }
       if (event.key === "Escape") {
         event.stopPropagation();
         details.open = false;
         setOpen(false);
         details.querySelector("summary")?.focus();
+      } else if (event.key === "Tab" && (menu.contains(document.activeElement) || document.activeElement === menu)) {
+        const buttons = enabledButtons();
+        const first = buttons[0];
+        const last = buttons.at(-1);
+        if (!first || !last) {
+          event.preventDefault();
+          menu.focus();
+        } else if (event.shiftKey && (document.activeElement === first || document.activeElement === menu)) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === menu)) {
+          event.preventDefault();
+          first.focus();
+        }
       }
     };
-    const click = (event: MouseEvent) => {
-      if ((event.target as HTMLElement).closest("button[data-close-menu]")) {
+    const focusOutside = (event: FocusEvent) => {
+      if (!menu.contains(event.target as Node) && !details.contains(event.target as Node)) {
         details.open = false;
         setOpen(false);
-        details.querySelector("summary")?.focus();
       }
     };
     document.addEventListener("pointerdown", close);
     document.addEventListener("keydown", key);
-    menu.addEventListener("click", click);
+    document.addEventListener("focusin", focusOutside);
     window.addEventListener("resize", position);
     window.addEventListener("scroll", position, true);
     return () => {
       document.removeEventListener("pointerdown", close);
       document.removeEventListener("keydown", key);
-      menu.removeEventListener("click", click);
+      document.removeEventListener("focusin", focusOutside);
+      observer.disconnect();
       window.removeEventListener("resize", position);
       window.removeEventListener("scroll", position, true);
     };
@@ -121,6 +146,9 @@ export function ActionMenu({
             setOpen(details.open);
             if (!details.open) details.querySelector("summary")?.focus();
           }}
+          onKeyDown={(event) => {
+            if (event.repeat && (event.key === "Enter" || event.key === " ")) event.preventDefault();
+          }}
         >
           <Icon name={icon} />
           <span className="menu-label">{label}</span>
@@ -133,7 +161,20 @@ export function ActionMenu({
       </details>
       {open &&
         createPortal(
-          <div ref={menuRef} className="action-menu-content action-menu-portal">
+          // Child buttons supply keyboard behavior; React closes the menu after their click handlers run.
+          // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
+          <div
+            ref={menuRef}
+            className="action-menu-content action-menu-portal"
+            onClick={(event) => {
+              if (!(event.target as HTMLElement).closest("button[data-close-menu]")) return;
+              const details = ref.current;
+              if (!details) return;
+              details.open = false;
+              setOpen(false);
+              details.querySelector("summary")?.focus();
+            }}
+          >
             {children}
           </div>,
           document.body,
@@ -208,124 +249,5 @@ export function RecentPages({
         </p>
       )}
     </main>
-  );
-}
-
-export function QuickSwitcher({
-  pages,
-  recentIds,
-  onSelect,
-  onClose,
-}: {
-  pages: Page[];
-  recentIds: string[];
-  onSelect: (id: string) => void;
-  onClose: () => void;
-}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  const [query, setQuery] = useState("");
-  const [remote, setRemote] = useState<Array<{ id: string; title: string; icon: string | null }>>([]);
-  const [error, setError] = useState("");
-  const [index, setIndex] = useState(0);
-  useEffect(() => {
-    const dialog = ref.current;
-    dialog?.showModal();
-    return () => dialog?.close();
-  }, []);
-  useEffect(() => {
-    if (!query.trim()) return undefined;
-    const controller = new AbortController();
-    const timer = setTimeout(() => {
-      void api<SearchResponse>(`/api/search?q=${encodeURIComponent(query)}&limit=20`, { signal: controller.signal })
-        .then((result) => {
-          if (!controller.signal.aborted)
-            setRemote(result.results.map((r) => ({ id: r.page.id, title: r.page.title, icon: r.page.icon })));
-        })
-        .catch((cause) => {
-          if (!controller.signal.aborted) setError(apiErrorMessage(cause, "Search unavailable."));
-        });
-    }, 200);
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [query]);
-  const local = query.trim()
-    ? pages.filter((p) => !p.archivedAt && p.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()))
-    : recentIds.flatMap((id) => pages.find((p) => p.id === id) ?? []);
-  const results = [...local, ...remote.filter((r) => !local.some((p) => p.id === r.id))].slice(0, 20);
-  const selectedIndex = Math.max(0, Math.min(index, results.length - 1));
-  return (
-    <dialog
-      ref={ref}
-      className="quick-switcher"
-      aria-label="Find a page"
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
-    >
-      <div className="quick-switcher-heading">
-        <Icon name="search" />
-        <input
-          autoFocus
-          placeholder="Find a page…"
-          aria-label="Find a page"
-          role="combobox"
-          aria-expanded={true}
-          aria-controls="quick-switcher-options"
-          aria-activedescendant={results[selectedIndex] ? `quick-result-${selectedIndex}` : undefined}
-          autoComplete="off"
-          value={query}
-          onChange={(event) => {
-            setQuery(event.target.value);
-            setIndex(0);
-            setRemote([]);
-            setError("");
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-              event.preventDefault();
-              setIndex((i) => Math.max(0, Math.min(results.length - 1, i + (event.key === "ArrowDown" ? 1 : -1))));
-            }
-            if (event.key === "Enter" && results[selectedIndex]) {
-              onSelect(results[selectedIndex].id);
-              onClose();
-            }
-          }}
-        />
-        <button className="icon-button" aria-label="Close search" onClick={onClose}>
-          <Icon name="close" />
-        </button>
-      </div>
-      <p className="eyebrow">{query ? "Pages" : "Recently opened"}</p>
-      {/* A searchable rich result list needs ARIA listbox/option semantics. */}
-      {/* eslint-disable-next-line jsx-a11y/prefer-tag-over-role */}
-      <div className="quick-switcher-results" id="quick-switcher-options" role="listbox">
-        {results.map((page, i) => (
-          <button
-            id={`quick-result-${i}`}
-            // eslint-disable-next-line jsx-a11y/prefer-tag-over-role
-            role="option"
-            aria-selected={i === selectedIndex}
-            key={page.id}
-            className={i === selectedIndex ? "active" : ""}
-            onMouseEnter={() => setIndex(i)}
-            onClick={() => {
-              onSelect(page.id);
-              onClose();
-            }}
-          >
-            <span>{page.icon || <Icon name="page" />}</span>
-            {page.title}
-          </button>
-        ))}
-      </div>
-      {error && <p role="alert">{error}</p>}
-      {!results.length && (
-        <p className="empty-copy">{query ? "No matching pages." : "Search your workspace to get started."}</p>
-      )}
-      <footer>↑ ↓ to choose · Enter to open · Esc to close</footer>
-    </dialog>
   );
 }

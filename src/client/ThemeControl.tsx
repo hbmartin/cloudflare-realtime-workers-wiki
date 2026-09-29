@@ -1,5 +1,5 @@
 import { MantineContext, type MantineColorScheme } from "@mantine/core";
-import { useContext, useEffect, useState } from "react";
+import { useCallback, useContext, useEffect, useState } from "react";
 
 const STORAGE_KEY = "notes:color-scheme";
 
@@ -39,18 +39,29 @@ export function ThemeControl({ compact = false }: { compact?: boolean }) {
     }
   });
   const colorScheme = context?.colorScheme ?? fallbackScheme;
-  const setColorScheme = (value: MantineColorScheme) => {
-    if (context) {
-      context.setColorScheme(value);
-      return;
-    }
-    setFallbackScheme(value);
-    try {
-      localStorage.setItem(STORAGE_KEY, value);
-    } catch {
-      // A storage-denied environment still receives the in-memory preference.
-    }
-  };
+  const effectiveScheme = useEffectiveColorScheme();
+  const setColorScheme = useCallback(
+    (value: MantineColorScheme) => {
+      if (context) {
+        context.setColorScheme(value);
+        return;
+      }
+      setFallbackScheme(value);
+      try {
+        localStorage.setItem(STORAGE_KEY, value);
+      } catch {
+        // A storage-denied environment still receives the in-memory preference.
+      }
+    },
+    [context],
+  );
+  useEffect(() => {
+    if (!compact) return undefined;
+    const toggle = () =>
+      setColorScheme((colorScheme === "auto" ? effectiveScheme : colorScheme) === "dark" ? "light" : "dark");
+    window.addEventListener("notes:toggle-theme", toggle);
+    return () => window.removeEventListener("notes:toggle-theme", toggle);
+  }, [colorScheme, compact, effectiveScheme, setColorScheme]);
   if (compact) {
     const current = OPTIONS.find((option) => option.value === colorScheme) ?? OPTIONS[2]!;
     const next = colorScheme === "auto" ? "light" : colorScheme === "light" ? "dark" : "auto";

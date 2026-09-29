@@ -163,11 +163,19 @@ export function parseWorkspaceEvent(value: unknown): WorkspaceEvent | null {
     return { type: "comments-invalidated", pageId: event.pageId };
   }
   if (event.type === "task-list-invalidated" && typeof event.pageId === "string" && ID_PATTERN.test(event.pageId)) {
-    return { type: "task-list-invalidated", pageId: event.pageId };
+    return {
+      type: "task-list-invalidated",
+      pageId: event.pageId,
+      ...(typeof event.operationId === "string" && ID_PATTERN.test(event.operationId)
+        ? { operationId: event.operationId }
+        : {}),
+      ...(event.forceRefresh === true ? { forceRefresh: true } : {}),
+    };
   }
   if (
     event.type === "workspace-invalidated" ||
     event.type === "organization-invalidated" ||
+    event.type === "tasks-invalidated" ||
     event.type === "notifications-invalidated" ||
     event.type === "jobs-invalidated"
   ) {

@@ -2,7 +2,11 @@ import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
 import { ActionMenu, PageTools } from "./WorkspaceUI";
 import { CommentsExtension } from "@blocknote/core/comments";
-import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
+import {
+  filterSuggestionItems,
+  insertOrUpdateBlockForSlashMenu,
+  SyntaxHighlightingExtension,
+} from "@blocknote/core/extensions";
 import { withCollaboration } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
 import {
@@ -22,7 +26,8 @@ import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
 import { createDocumentCloseReconciler } from "./document-connection";
-import { editorBlockFactories } from "./editor-blocks";
+import { editorBlockFactories, EmbedFeatureContext, safeBookmarkUrl } from "./editor-blocks";
+import { resolveEmbed } from "../shared/embed-providers";
 import { notesCommentSchema, notesSchema } from "./mentions";
 import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
@@ -523,6 +528,32 @@ function editorOptions(
       showCursorLabels: "activity" as const,
     },
     extensions: [
+      SyntaxHighlightingExtension({
+        createHighlighter: async () => {
+          const [{ createHighlighterCore }, { createJavaScriptRegexEngine }, light, dark, ...langs] = await Promise.all(
+            [
+              import("shiki/core"),
+              import("@shikijs/engine-javascript"),
+              import("@shikijs/themes/github-light"),
+              import("@shikijs/themes/github-dark"),
+              import("@shikijs/langs/javascript"),
+              import("@shikijs/langs/typescript"),
+              import("@shikijs/langs/json"),
+              import("@shikijs/langs/html"),
+              import("@shikijs/langs/css"),
+              import("@shikijs/langs/bash"),
+              import("@shikijs/langs/python"),
+              import("@shikijs/langs/sql"),
+              import("@shikijs/langs/markdown"),
+            ],
+          );
+          return createHighlighterCore({
+            themes: [light.default, dark.default],
+            langs: langs.map((language) => language.default),
+            engine: createJavaScriptRegexEngine(),
+          });
+        },
+      }),
       CommentsExtension({
         threadStore,
         schema: notesCommentSchema,
@@ -555,6 +586,10 @@ function CollaborativeEditor({
   onError: (message: string) => void;
 }) {
   const [commentError, setCommentError] = useState("");
+  const [pasteChoice, setPasteChoice] = useState<{ url: string; blockId: string } | null>(null);
+  const [pasteNotice, setPasteNotice] = useState("");
+  const editorShellRef = useRef<HTMLDivElement>(null);
+  const pasteChoiceRef = useRef<HTMLFieldSetElement>(null);
   const commentsPanel = useRef<HTMLDivElement>(null);
   const threadStore = useMemo(
     () => new ServerThreadStore(pageId, member.user.id, setCommentError),
@@ -584,6 +619,106 @@ function CollaborativeEditor({
     [bundle, editable, member, pageId, threadStore],
   );
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
+  useEffect(() => {
+    if (!pasteChoice) return undefined;
+    const choice = pasteChoiceRef.current;
+    choice?.querySelector("button")?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      setPasteChoice(null);
+      setPasteNotice("");
+      editor.focus();
+    };
+    choice?.addEventListener("keydown", onKeyDown);
+    return () => choice?.removeEventListener("keydown", onKeyDown);
+  }, [editor, pasteChoice]);
+  useEffect(() => {
+    const root = editorShellRef.current;
+    if (!root) return undefined;
+    const attachCopyButtons = () => {
+      for (const content of root.querySelectorAll<HTMLElement>('[data-content-type="codeBlock"]')) {
+        if (content.querySelector(".code-copy-button")) continue;
+        const code = content.querySelector("pre code");
+        if (!code) continue;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "code-copy-button";
+        button.textContent = "Copy code";
+        button.contentEditable = "false";
+        button.setAttribute("aria-label", "Copy code");
+        button.addEventListener("click", () => {
+          void navigator.clipboard
+            .writeText(code.textContent ?? "")
+            .then(() => {
+              button.textContent = "Copied";
+              window.setTimeout(() => {
+                if (button.isConnected) button.textContent = "Copy code";
+              }, 2_000);
+            })
+            .catch(() => {
+              button.textContent = "Copy failed";
+            });
+        });
+        content.appendChild(button);
+      }
+    };
+    attachCopyButtons();
+    const observer = new MutationObserver(attachCopyButtons);
+    observer.observe(root, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, []);
+  const choosePaste = (kind: "link" | "preview" | "embed") => {
+    if (!pasteChoice) return;
+    const { url, blockId } = pasteChoice;
+    if (!editable || !editor.isEditable) {
+      setPasteNotice(`This page is read-only. Paste this URL when editing is available: ${url}`);
+      setPasteChoice(null);
+      editor.focus();
+      return;
+    }
+    const block = editor.getBlock(blockId);
+    const linkBlock = { type: "paragraph", content: [{ type: "link", href: url, content: url }] };
+    if (!block || block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) {
+      const alreadyHasUrl =
+        Array.isArray(block?.content) &&
+        block.content.some(
+          (item) =>
+            item &&
+            typeof item === "object" &&
+            (("href" in item && item.href === url) || ("text" in item && item.text === url)),
+        );
+      if (alreadyHasUrl) {
+        setPasteNotice(
+          `The paragraph changed and already contains this URL. Paste it again to choose a different format: ${url}`,
+        );
+      } else {
+        const last = editor.document.at(-1);
+        try {
+          if (!last) throw new Error("No block to insert after.");
+          editor.insertBlocks([linkBlock] as never, last, "after");
+          setPasteNotice(`The paragraph changed, so the URL was added as a link at the end of the page: ${url}`);
+        } catch {
+          setPasteNotice(`The paragraph changed. Paste this URL again: ${url}`);
+        }
+      }
+      setPasteChoice(null);
+      editor.focus();
+      return;
+    }
+    if (kind === "link") {
+      editor.replaceBlocks([block], [linkBlock] as never);
+    } else if (kind === "embed") {
+      editor.replaceBlocks([block], [{ type: "embed", props: { url, title: "Embedded link" } }] as never);
+    } else {
+      // Store the URL immediately; the bookmark resolves disposable metadata in the background.
+      editor.replaceBlocks([block], [{ type: "bookmark", props: { url, title: url } }] as never);
+    }
+    setPasteNotice("");
+    setPasteChoice(null);
+    editor.focus();
+  };
   const colorScheme = useEffectiveColorScheme();
   const getSlashItems = async (query: string) =>
     filterSuggestionItems(
@@ -699,25 +834,90 @@ function CollaborativeEditor({
     }));
   };
   return (
-    <BlockNoteView editor={editor} editable={editable} className="notes-editor" theme={colorScheme} slashMenu={false}>
-      {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
-      {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
-      {commentsOpen &&
-        panelTarget &&
-        createPortal(
-          <div ref={commentsPanel} className="comments-panel">
-            <h2>Comments</h2>
-            <p className="muted">
-              {editable
-                ? "Select text and use the formatting toolbar to start a thread."
-                : "You can comment and reply even while the document is read-only."}
-            </p>
-            {commentError && <p className="form-error">{commentError}</p>}
-            <ThreadsSidebar filter="all" sort="position" />
-          </div>,
-          panelTarget,
+    <EmbedFeatureContext.Provider value={member.features?.expandedEmbeds ?? false}>
+      <div
+        ref={editorShellRef}
+        onPasteCapture={(event) => {
+          if (!editable || event.clipboardData.files.length || event.isDefaultPrevented()) return;
+          if (
+            !(event.target instanceof Element) ||
+            !editorShellRef.current?.contains(event.target) ||
+            !event.target.closest('.bn-editor[contenteditable="true"]')
+          )
+            return;
+          const value = event.clipboardData.getData("text/plain").trim();
+          if (!safeBookmarkUrl(value) || /\s/.test(value)) return;
+          if (
+            !(
+              (member.features?.expandedEmbeds && value.startsWith("https://")) ||
+              resolveEmbed(value, member.features?.expandedEmbeds)
+            )
+          )
+            return;
+          const block = editor.getTextCursorPosition().block;
+          if (block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) return;
+          event.preventDefault();
+          event.stopPropagation();
+          setPasteNotice("");
+          setPasteChoice({ url: value, blockId: block.id });
+        }}
+      >
+        <BlockNoteView
+          editor={editor}
+          editable={editable}
+          className="notes-editor"
+          theme={colorScheme}
+          slashMenu={false}
+        >
+          {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
+          {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
+          {commentsOpen &&
+            panelTarget &&
+            createPortal(
+              <div ref={commentsPanel} className="comments-panel">
+                <h2>Comments</h2>
+                <p className="muted">
+                  {editable
+                    ? "Select text and use the formatting toolbar to start a thread."
+                    : "You can comment and reply even while the document is read-only."}
+                </p>
+                {commentError && <p className="form-error">{commentError}</p>}
+                <ThreadsSidebar filter="all" sort="position" />
+              </div>,
+              panelTarget,
+            )}
+        </BlockNoteView>
+        {pasteChoice && (
+          <fieldset ref={pasteChoiceRef} className="paste-url-choice">
+            <legend>Paste as</legend>
+            <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("link")}>
+              Link
+            </button>
+            {member.features?.expandedEmbeds && pasteChoice.url.startsWith("https://") && (
+              <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("preview")}>
+                Preview card
+              </button>
+            )}
+            {resolveEmbed(pasteChoice.url, member.features?.expandedEmbeds) && (
+              <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("embed")}>
+                Embed
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setPasteChoice(null);
+                setPasteNotice("");
+                editor.focus();
+              }}
+            >
+              Cancel
+            </button>
+          </fieldset>
         )}
-    </BlockNoteView>
+        {pasteNotice && <output className="muted">{pasteNotice}</output>}
+      </div>
+    </EmbedFeatureContext.Provider>
   );
 }
 

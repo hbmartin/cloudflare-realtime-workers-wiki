@@ -1,5 +1,6 @@
 import { TasksView } from "./TasksView";
-import { ActionMenu, Icon, QuickSwitcher, RecentPages, readPreference, savePreference } from "./WorkspaceUI";
+import { ActionMenu, Icon, RecentPages, readPreference, savePreference } from "./WorkspaceUI";
+import { CommandPalette, type AppCommand, type PaletteMode } from "./CommandPalette";
 import { CreationMenu, WorkspaceTree } from "./WorkspaceTree";
 import {
   lazy,
@@ -362,6 +363,22 @@ async function requestMutation<T>(
 function requestPageRestore(rootPageId: string, workspaceId: string) {
   return requestMutation(`/api/pages/${rootPageId}/restore`, { method: "POST" }, (value) =>
     restoreResponsePages(value, rootPageId, workspaceId),
+  );
+}
+
+function observeRestoredTemplate(pageId: string, signal: AbortSignal) {
+  return reconcileWithOneRetry(
+    async () => {
+      try {
+        const { page } = await api<{ page: Page }>(`/api/pages/${encodeURIComponent(pageId)}`, { signal });
+        return page.isTemplate && page.archivedAt === null ? page : null;
+      } catch (error) {
+        if (isPageNotFoundError(error)) return null;
+        throw error;
+      }
+    },
+    (page) => page === null,
+    signal,
   );
 }
 
@@ -1082,7 +1099,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     Math.max(220, Math.min(420, readPreference(`${preferencesKey}:width`, 260))),
   );
   const [recentIds, setRecentIds] = useState<string[]>(() => readPreference(`${preferencesKey}:recent`, []));
-  const [quickSwitcherOpen, setQuickSwitcherOpen] = useState(false);
+  const [paletteMode, setPaletteMode] = useState<PaletteMode | null>(null);
+  const [moveDialogOpen, setMoveDialogOpen] = useState(false);
   useEffect(() => {
     savePreference(`${preferencesKey}:collapsed`, sidebarCollapsed);
     savePreference(`${preferencesKey}:width`, sidebarWidth);
@@ -1095,10 +1113,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const target = event.target instanceof Element ? event.target : null;
       const editableTarget = target?.closest("input, textarea, select, [contenteditable='true']");
       const shortcutModifier = /Mac|iPhone|iPad/.test(navigator.platform) ? event.metaKey : event.ctrlKey;
-      if (!event.defaultPrevented && !editableTarget && shortcutModifier && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        setQuickSwitcherOpen((open) => !open);
+      if (event.defaultPrevented || event.isComposing || event.key === "Process") return;
+      if (document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) return;
+      let mode: PaletteMode | null = null;
+      if (shortcutModifier && !event.altKey) {
+        if (event.key.toLowerCase() === "k" && !event.shiftKey) mode = "all";
+        if (event.key.toLowerCase() === "p") mode = event.shiftKey ? "commands" : "pages";
+      } else if (!editableTarget && !event.metaKey && !event.ctrlKey && !event.altKey && event.key === "?") {
+        mode = "help";
       }
+      if (!mode) return;
+      event.preventDefault();
+      setPaletteMode(mode);
     };
     window.addEventListener("keydown", handle);
     return () => window.removeEventListener("keydown", handle);
@@ -1161,10 +1187,52 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [notificationsRevision, setNotificationsRevision] = useState(0);
-  const [taskRefresh, setTaskRefresh] = useState<{ allVersion: number; byPageId: Record<string, number> }>({
+  const [taskRefresh, setTaskRefresh] = useState<{
+    allVersion: number;
+    byPageId: Record<string, number>;
+    mineForceVersion: number;
+    byPageForceId: Record<string, number>;
+    globalForceVersion: number;
+  }>({
     allVersion: 0,
     byPageId: {},
+    mineForceVersion: 0,
+    byPageForceId: {},
+    globalForceVersion: 0,
   });
+  const localTaskOperations = useRef(new Map<string, { pageId: string; echo: boolean; force: boolean }>());
+  const invalidateTaskList = useCallback((pageId: string, force: boolean) => {
+    setTaskRefresh((current) =>
+      force
+        ? {
+            ...current,
+            mineForceVersion: current.mineForceVersion + 1,
+            byPageForceId: { ...current.byPageForceId, [pageId]: (current.byPageForceId[pageId] ?? 0) + 1 },
+          }
+        : {
+            ...current,
+            allVersion: current.allVersion + 1,
+            byPageId: { ...current.byPageId, [pageId]: (current.byPageId[pageId] ?? 0) + 1 },
+          },
+    );
+  }, []);
+  const startTaskOperation = useCallback((operationId: string, pageId: string) => {
+    const operations = localTaskOperations.current;
+    operations.set(operationId, { pageId, echo: false, force: false });
+    if (operations.size > 100) operations.delete(operations.keys().next().value!);
+  }, []);
+  const settleTaskOperation = useCallback(
+    (operationId: string, reconciled: boolean) => {
+      const operations = localTaskOperations.current;
+      const operation = operations.get(operationId);
+      if (!operation) return;
+      if (!reconciled) {
+        operations.delete(operationId);
+        if (operation.echo) invalidateTaskList(operation.pageId, operation.force);
+      }
+    },
+    [invalidateTaskList],
+  );
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [jobsLoading, setJobsLoading] = useState(false);
@@ -1823,6 +1891,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     async (restoredPages: Page[], tombstoneCheckpoint: number, restoredRootId?: string) => {
       const signal = workspaceAbortController.current.signal;
       const rootPageId = restoredRootId ?? restoredEventRoot(restoredPages)?.id ?? null;
+      if (rootPageId && restoredPages.some((page) => page.id === rootPageId && page.isTemplate)) {
+        const observed = await observeRestoredTemplate(rootPageId, signal);
+        if (observed && !signal.aborted) {
+          archiveRemovalTombstones.release([rootPageId], tombstoneCheckpoint);
+          if (!archiveRemovalTombstones.has(rootPageId)) {
+            dispatchPageAction({ type: "merge", pages: [observed] });
+            excludeConfirmedRestoresFromTrash([observed]);
+          }
+        }
+        return;
+      }
       if (!rootPageId) {
         const observe = async () => {
           try {
@@ -1844,7 +1923,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         signal,
       );
     },
-    [loadFreshPages, reconcileRestoredRoot],
+    [archiveRemovalTombstones, excludeConfirmedRestoresFromTrash, loadFreshPages, reconcileRestoredRoot],
   );
   const loadTrash = useCallback(
     (version: number) => {
@@ -2256,13 +2335,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         return;
       }
       if (event.type === "task-list-invalidated") {
-        setTaskRefresh((current) => ({
-          allVersion: current.allVersion + 1,
-          byPageId: {
-            ...current.byPageId,
-            [event.pageId]: (current.byPageId[event.pageId] ?? 0) + 1,
-          },
-        }));
+        const operation = event.operationId ? localTaskOperations.current.get(event.operationId) : undefined;
+        if (operation) {
+          operation.echo = true;
+          operation.force ||= Boolean(event.forceRefresh);
+          return;
+        }
+        invalidateTaskList(event.pageId, Boolean(event.forceRefresh));
+        return;
+      }
+      if (event.type === "tasks-invalidated") {
+        setTaskRefresh((current) => ({ ...current, globalForceVersion: current.globalForceVersion + 1 }));
         return;
       }
       if (event.type === "pages-upserted") {
@@ -2331,6 +2414,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       loadOrganization,
       loadUnreadNotifications,
       loadUnreadMentions,
+      invalidateTaskList,
       activitiesOpen,
       member.user.id,
       selectedId,
@@ -2505,6 +2589,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     () => (activeSpace ? { ...member, role: activeSpace.effectiveRole } : member),
     [activeSpace, member],
   );
+  useEffect(() => {
+    if (!pagesLoaded) return;
+    const accessible = new Set(pages.filter((page) => !page.archivedAt && !page.isTemplate).map((page) => page.id));
+    // Access can change after local recents have already been persisted.
+    // eslint-disable-next-line react/set-state-in-effect
+    setRecentIds((current) => {
+      const filtered = current.filter((id) => accessible.has(id));
+      return filtered.length === current.length ? current : filtered;
+    });
+  }, [pages, pagesLoaded]);
   const rememberSelected = Boolean(activeSelected && !activeSelected.isTemplate && activeSelected.archivedAt === null);
   useEffect(() => {
     if (resolvedSelectedId && rememberSelected && view !== "home") {
@@ -2842,6 +2936,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         dispatchPageAction({ type: "remove", pageIds: removedIds });
       }
       if (removedIds || result.kind === "uncertain") refreshTrash();
+      if (page.isTemplate && (removedIds || result.kind === "uncertain")) void loadOrganization();
       const needsReconciliation = result.kind !== "rejected" || pageAlreadyGone;
       if (!needsReconciliation) return;
       await reconcileArchivePages();
@@ -3127,6 +3222,27 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const responseConfirmedRestore = confirmedRestoredPages !== null;
       const responseConflictsWithRemoval =
         confirmedRestoredPages?.some((restored) => archiveRemovalTombstones.has(restored.id)) ?? false;
+      if (page.isTemplate) {
+        if (result.kind === "rejected") return;
+        if (!responseConfirmedRestore || responseConflictsWithRemoval) {
+          try {
+            const observed = await observeRestoredTemplate(page.id, signal);
+            if (observed && !signal.aborted) {
+              archiveRemovalTombstones.release([page.id], restoreTombstoneCheckpoint);
+              if (!archiveRemovalTombstones.has(page.id)) {
+                dispatchPageAction({ type: "merge", pages: [observed] });
+                excludeConfirmedRestoresFromTrash([observed]);
+                clearWorkspaceErrors(attempt);
+              }
+            }
+          } catch (error) {
+            if (!signal.aborted)
+              reportWorkspaceError(attempt, apiErrorMessage(error, "The template restore could not be verified."));
+          }
+        }
+        if (!signal.aborted) await loadOrganization();
+        return;
+      }
       if (result.kind === "rejected" || (responseConfirmedRestore && !responseConflictsWithRemoval)) return;
       try {
         const { rootWasRestored } = await reconcileRestoredRoot(
@@ -3168,6 +3284,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       if (signal.aborted) return;
       if (result.kind === "committed" && deletedIds) {
         setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
+        if (page.isTemplate) void loadOrganization();
         if (!result.value) {
           logUnverifiedMutation(
             "Permanent-delete result could not be verified",
@@ -3196,6 +3313,60 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const trashLoadFailed = workspaceErrors.some((error) => error.source === "trash-load");
   const initialPageLoadFailed = !pagesLoaded && workspaceErrors.some((error) => error.source === "page-tree");
   const pendingPageError = workspaceErrors.find((error) => error.source === "page-access")?.message;
+
+  const commands: AppCommand[] = [
+    {
+      id: "create-document",
+      label: "Create document",
+      shortcut: "",
+      isAvailable: () => canCreatePage,
+      run: () => void createPage("document"),
+    },
+    {
+      id: "create-table",
+      label: "Create table",
+      shortcut: "",
+      isAvailable: () => canCreatePage,
+      run: () => void createPage("table"),
+    },
+    {
+      id: "create-diagram",
+      label: "Create diagram",
+      shortcut: "",
+      isAvailable: () => canCreatePage,
+      run: () => void createPage("diagram"),
+    },
+    {
+      id: "create-task-list",
+      label: "Create task list",
+      shortcut: "",
+      isAvailable: () => canCreatePage,
+      run: () => void createPage("tasks"),
+    },
+    { id: "search", label: "Search workspace", shortcut: "", isAvailable: () => true, run: () => showView("search") },
+    { id: "inbox", label: "Open inbox", shortcut: "", isAvailable: () => true, run: openNotifications },
+    {
+      id: "theme",
+      label: "Toggle theme",
+      shortcut: "",
+      isAvailable: () => true,
+      run: () => window.dispatchEvent(new Event("notes:toggle-theme")),
+    },
+    {
+      id: "export",
+      label: "Export current page",
+      shortcut: "",
+      isAvailable: () => Boolean(activeSelected && !activeSelected.isTemplate),
+      run: () => setExportOpen(true),
+    },
+    {
+      id: "move",
+      label: "Move current page",
+      shortcut: "",
+      isAvailable: () => Boolean(activeSelected && !activeSelected.isTemplate && canEditActiveSpace),
+      run: () => setMoveDialogOpen(true),
+    },
+  ];
 
   const metadata = activeSelected ? (
     <PageTags
@@ -3510,9 +3681,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <div className="topbar-actions">
             <button
               className="icon-button"
-              aria-label="Find a page (⌘K / Ctrl+K)"
-              title="Find a page (⌘K / Ctrl+K)"
-              onClick={() => setQuickSwitcherOpen(true)}
+              aria-label="Find a page or command (⌘K / Ctrl+K)"
+              title="Find a page or command (⌘K / Ctrl+K)"
+              onClick={() => setPaletteMode("all")}
             >
               <Icon name="search" />
             </button>
@@ -3613,12 +3784,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                           {activeSelected.fullWidth ? "Use reading width" : "Use full width"}
                         </button>
                       )}
-                      {!activeSelected.isTemplate && (
-                        <button data-close-menu onClick={() => void archive(activeSelected)}>
-                          <Icon name="trash" />
-                          Move to trash
-                        </button>
-                      )}
+                      <button data-close-menu onClick={() => void archive(activeSelected)}>
+                        <Icon name="trash" />
+                        Move to trash
+                      </button>
                     </>
                   )}
                 </ActionMenu>
@@ -3628,7 +3797,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         </header>
 
         {view === "tasks" ? (
-          <TasksView member={member} onSelectPage={navigateToPage} refreshVersion={taskRefresh.allVersion} />
+          <TasksView
+            member={member}
+            onSelectPage={navigateToPage}
+            refreshVersion={taskRefresh.allVersion}
+            forceRefreshVersion={taskRefresh.mineForceVersion + taskRefresh.globalForceVersion}
+            onTaskOperationStart={startTaskOperation}
+            onTaskOperationSettled={settleTaskOperation}
+          />
         ) : view === "home" ? (
           <RecentPages pages={pages} recentIds={recentIds} onSelect={navigateToPage} />
         ) : view === "search" ? (
@@ -3693,6 +3869,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               onSelectPage={navigateToPage}
               onPageChanged={updatePage}
               refreshVersion={taskRefresh.byPageId[activeSelected.id] ?? 0}
+              forceRefreshVersion={(taskRefresh.byPageForceId[activeSelected.id] ?? 0) + taskRefresh.globalForceVersion}
+              onTaskOperationStart={startTaskOperation}
+              onTaskOperationSettled={settleTaskOperation}
             />
           ) : activeSelected.kind === "document" ? (
             <EditorPage
@@ -3799,16 +3978,95 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           }}
         />
       )}
-      {quickSwitcherOpen && (
-        <QuickSwitcher
+      {paletteMode && (
+        <CommandPalette
+          mode={paletteMode}
           pages={pages.filter((page) => !page.isTemplate && !page.archivedAt)}
           recentIds={recentIds}
-          onSelect={navigateToPage}
-          onClose={() => setQuickSwitcherOpen(false)}
+          commands={commands}
+          onSelectPage={navigateToPage}
+          onClose={() => setPaletteMode(null)}
+        />
+      )}
+      {moveDialogOpen && activeSelected && (
+        <MovePageDialog
+          page={activeSelected}
+          pages={pages}
+          onMove={(parentId) => void move(activeSelected.id, parentId)}
+          onClose={() => setMoveDialogOpen(false)}
         />
       )}
       {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
     </div>
+  );
+}
+
+function MovePageDialog({
+  page,
+  pages,
+  onMove,
+  onClose,
+}: {
+  page: Page;
+  pages: Page[];
+  onMove: (parentId: string | null) => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const [parentId, setParentId] = useState(page.parentId ?? "");
+  useEffect(() => {
+    const dialog = ref.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+  const byId = new Map(pages.map((item) => [item.id, item]));
+  const eligible = pages.filter((candidate) => {
+    if (candidate.id === page.id || candidate.spaceId !== page.spaceId || candidate.archivedAt || candidate.isTemplate)
+      return false;
+    let parent: Page | undefined = candidate;
+    while (parent) {
+      if (parent.id === page.id) return false;
+      parent = parent.parentId ? byId.get(parent.parentId) : undefined;
+    }
+    return true;
+  });
+  return (
+    <dialog
+      ref={ref}
+      className="move-page-dialog"
+      aria-label={`Move ${page.title}`}
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+    >
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          onMove(parentId || null);
+          onClose();
+        }}
+      >
+        <h2>Move “{page.title}”</h2>
+        <label>
+          Destination
+          <select value={parentId} onChange={(event) => setParentId(event.target.value)}>
+            <option value="">Top level of this space</option>
+            {eligible.map((candidate) => (
+              <option key={candidate.id} value={candidate.id}>
+                {candidate.title}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="dialog-actions">
+          <button type="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit">Move page</button>
+        </div>
+      </form>
+    </dialog>
   );
 }
 
@@ -3986,6 +4244,7 @@ function TrashView({
             <div key={page.id}>
               <span>{page.kind === "table" ? "▦" : page.kind === "diagram" ? "◇" : "□"}</span>
               <strong>{page.title}</strong>
+              {page.isTemplate && <small>Template</small>}
               <button disabled={actionsDisabled} onClick={() => void onRestore(page)}>
                 Restore
               </button>

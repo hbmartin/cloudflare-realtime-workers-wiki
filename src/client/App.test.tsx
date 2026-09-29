@@ -4,6 +4,7 @@ import { act, cleanup, configure, fireEvent, render, screen, waitFor, within } f
 import { startTransition, StrictMode, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ClientMemberContext, Job, Page, Space, Tag, WorkspaceEvent } from "../shared/types";
+import type { Task } from "../shared/tasks";
 import type { EditorPageProps } from "./EditorPage";
 import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
 import { App, fallbackPageId, useCommittedRef } from "./App";
@@ -248,6 +249,165 @@ describe("App error handling", () => {
     cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("lets an editor move a template to Trash and restore it without a page-tree error", async () => {
+    const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
+    let currentTemplate: Page | null = template;
+    let archivedTemplate: Page | null = null;
+    let treeLoads = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/pages/tree") {
+        treeLoads += 1;
+        return { pages: [page] };
+      }
+      if (path === "/api/pages/tree?archived=true") return { pages: archivedTemplate ? [archivedTemplate] : [] };
+      if (path === "/api/templates") return { templates: currentTemplate ? [currentTemplate] : [] };
+      if (path === `/api/pages/${template.id}` && init?.method === "DELETE") {
+        archivedTemplate = { ...template, archivedAt: 2, revision: 2 };
+        currentTemplate = null;
+        return { ok: true, pageIds: [template.id], cleanupPending: false, pendingPageCount: 0 };
+      }
+      if (path === `/api/pages/${template.id}/restore` && init?.method === "POST") {
+        currentTemplate = { ...template, revision: 3 };
+        archivedTemplate = null;
+        return { pages: [currentTemplate] };
+      }
+      return shellApi(path, init);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Templates" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Page actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move to trash" }));
+    await waitFor(() => expect(currentTemplate).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("No templates in this space")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    expect(await screen.findByText("Template")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete forever" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+    await waitFor(() => expect(currentTemplate).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("Brief template")).toBeInTheDocument();
+    expect(screen.queryByText(/page tree could not be refreshed/i)).not.toBeInTheDocument();
+    expect(treeLoads).toBeGreaterThan(0);
+  });
+
+  it("verifies an unrecognized template restore response with a direct page read", async () => {
+    const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
+    let restored: Page | null = null;
+    let archived: Page | null = { ...template, archivedAt: 2, revision: 2 };
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/templates") return { templates: restored ? [restored] : [] };
+      if (path === "/api/pages/tree?archived=true") return { pages: archived ? [archived] : [] };
+      if (path === `/api/pages/${template.id}/restore` && init?.method === "POST") {
+        restored = { ...template, revision: 3 };
+        archived = null;
+        throw new InvalidApiResponseError(200, {
+          requestPath: path,
+          responseUrl: null,
+          contentType: "text/html",
+          cause: new SyntaxError("Unexpected token '<'"),
+        });
+      }
+      if (path === `/api/pages/${template.id}` && !init?.method) return { page: restored };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
+
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        `/api/pages/${template.id}`,
+        expect.objectContaining({ signal: expect.anything() }),
+      ),
+    );
+    await waitFor(() => expect(screen.queryByText(/restore result could not be verified/i)).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("Brief template")).toBeInTheDocument();
+    expect(screen.queryByText(/page tree could not be refreshed/i)).not.toBeInTheDocument();
+  });
+
+  it("confirms a template restored by another client without looking for it in the active tree", async () => {
+    const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
+    let restored: Page | null = null;
+    let archived: Page | null = { ...template, archivedAt: 2, revision: 2 };
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/templates") return { templates: restored ? [restored] : [] };
+      if (path === "/api/pages/tree?archived=true") return { pages: archived ? [archived] : [] };
+      if (path === `/api/pages/${template.id}` && !init?.method) return { page: restored };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
+
+    act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [template.id], permanently: false }));
+    restored = { ...template, revision: 3 };
+    archived = null;
+    act(() =>
+      dispatchWorkspaceEvent({
+        type: "pages-upserted",
+        pages: [restored!],
+        restored: true,
+        restoredRootId: template.id,
+      }),
+    );
+    act(() => dispatchWorkspaceEvent({ type: "organization-invalidated" }));
+
+    await waitFor(() => expect(api).toHaveBeenCalledWith(`/api/pages/${template.id}`, expect.anything()));
+    expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("Brief template")).toBeInTheDocument();
+    expect(screen.queryByText(/page tree could not be refreshed/i)).not.toBeInTheDocument();
+  });
+
+  it("refreshes the template library on a remote change and reserves permanent deletion for owners", async () => {
+    const owner = { ...member, role: "owner" as const };
+    const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
+    let currentTemplate: Page | null = template;
+    let archivedTemplate: Page | null = null;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    mockShellApi({ member: owner });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/templates") return { templates: currentTemplate ? [currentTemplate] : [] };
+      if (path === "/api/pages/tree?archived=true") return { pages: archivedTemplate ? [archivedTemplate] : [] };
+      if (path === `/api/pages/${template.id}/permanent-delete` && init?.method === "POST") {
+        archivedTemplate = null;
+        return { ok: true, pageIds: [template.id] };
+      }
+      return shellApi(path, init);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Templates" }));
+    expect(await screen.findByText("Brief template")).toBeInTheDocument();
+
+    currentTemplate = null;
+    archivedTemplate = { ...template, archivedAt: 2 };
+    act(() => dispatchWorkspaceEvent({ type: "organization-invalidated" }));
+    expect(await screen.findByText("No templates in this space")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete forever" }));
+    await waitFor(() => expect(archivedTemplate).toBeNull());
+    expect(await screen.findByText("Trash is empty.")).toBeInTheDocument();
   });
 
   it("clears a stale invite token and continues for an existing member", async () => {
@@ -4560,6 +4720,65 @@ describe("App error handling", () => {
     await waitFor(() => expect(myLoads()).toBe(2));
     act(() => dispatchWorkspaceEvent({ type: "task-list-invalidated", pageId: second.id }));
     await waitFor(() => expect(myLoads()).toBe(3));
+  });
+
+  it("suppresses a successful task mutation echo but refreshes for remote and structural events", async () => {
+    const list: Page = { ...page, id: "task-list", title: "Tasks", kind: "table", taskList: true };
+    localStorage.setItem("notes:last-page:workspace:user", list.id);
+    mockShellApi({ pages: [list] });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    let task: Task = {
+      id: "task",
+      listId: list.id,
+      listTitle: list.title,
+      spaceId: list.spaceId,
+      title: "Ship",
+      assigneeId: member.user.id,
+      assigneeName: member.user.name,
+      status: "todo" as const,
+      dueDate: null,
+      detailPageId: "detail",
+      revision: 1,
+      updatedAt: 1,
+      position: 0,
+      editable: true,
+    };
+    let operationId = "";
+    let finishMutation!: (result: { revision: number; rowId: string; detailPageId: string }) => void;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/tasks?")) return { tasks: [task], hasMore: false, nextCursor: null };
+      if (path === `/api/tables/${list.id}?limit=1`)
+        return { table: { revision: task.revision, lease: { holderName: null } } };
+      if (path === `/api/task-lists/${list.id}/assignees`)
+        return { members: [{ id: member.user.id, name: member.user.name }] };
+      if (path === `/api/tables/${list.id}/lease` && init?.method === "POST")
+        return { leaseToken: "lease", leaseDurationMs: 60_000 };
+      if (path === `/api/task-lists/${list.id}/tasks/${task.id}`) {
+        operationId = (JSON.parse(String(init?.body)) as { operationId: string }).operationId;
+        return new Promise((resolve) => {
+          finishMutation = resolve;
+        });
+      }
+      return shellApi(path, init);
+    });
+    render(<App />);
+    const listLoads = () =>
+      vi.mocked(api).mock.calls.filter(([path]) => path.startsWith(`/api/tasks?listId=${list.id}`)).length;
+    await waitFor(() => expect(listLoads()).toBe(1));
+    fireEvent.click(screen.getByRole("button", { name: "Edit tasks" }));
+    await waitFor(() => expect(screen.getByLabelText("Status for Ship")).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("Status for Ship"), { target: { value: "done" } });
+    await waitFor(() => expect(operationId).not.toBe(""));
+    act(() => dispatchWorkspaceEvent({ type: "task-list-invalidated", pageId: list.id, operationId }));
+    expect(listLoads()).toBe(1);
+    task = { ...task, status: "done", revision: 2, updatedAt: 2 };
+    await act(async () => finishMutation({ revision: 2, rowId: task.id, detailPageId: task.detailPageId }));
+    await waitFor(() => expect(screen.getByLabelText("Status for Ship")).toHaveValue("done"));
+    expect(listLoads()).toBe(1);
+    act(() => dispatchWorkspaceEvent({ type: "task-list-invalidated", pageId: list.id, operationId: "remote-task" }));
+    await waitFor(() => expect(listLoads()).toBe(2));
+    act(() => dispatchWorkspaceEvent({ type: "tasks-invalidated" }));
+    await waitFor(() => expect(listLoads()).toBe(3));
   });
 
   it("loads a hidden navigation target directly without adding it to the sidebar", async () => {

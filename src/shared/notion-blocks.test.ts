@@ -91,8 +91,28 @@ describe("Notion block adapter", () => {
   });
 
   it("rejects disallowed embeds and oversized rich text", () => {
-    expect(() => notionInputToBlockContainer({ embed: { url: "https://untrusted.example/embed" } })).toThrow(/YouTube/);
+    expect(() => notionInputToBlockContainer({ embed: { url: "https://untrusted.example/embed" } })).toThrow(
+      /supported HTTPS provider/,
+    );
+    expect(() =>
+      notionInputToBlockContainer({
+        embed: { url: `https://www.youtube.com/watch?v=dQw4w9WgXcQ&x=${"a".repeat(2_000)}` },
+      }),
+    ).toThrow(/2000/);
+    expect(() =>
+      notionInputToBlockContainer({
+        embed: { url: `https://www.youtube.com/watch?v=dQw4w9WgXcQ&x=${"a".repeat(1_500)}${"語".repeat(60)}` },
+      }),
+    ).toThrow(/2000/);
     expect(() => notionRichTextToProseMirror([{ text: { content: "x".repeat(2_001) } }])).toThrow(/2000/);
+  });
+
+  it("preserves expanded embed URLs in nested Notion writes", () => {
+    const loom = { embed: { url: "https://www.loom.com/share/be3f4b20127d47be9f884c3fab71d030" } };
+    const nested = { paragraph: { children: [loom] } };
+    expect(notionInputToBlockContainer(nested).content?.[1]?.content?.[0]?.content?.[0]?.attrs?.url).toBe(
+      loom.embed.url,
+    );
   });
 
   it("infers only supported payload keys when type is omitted", () => {

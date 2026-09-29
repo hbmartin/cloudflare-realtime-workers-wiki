@@ -3,7 +3,7 @@ import { createOTP } from "@better-auth/utils/otp";
 import { base32 } from "@better-auth/utils/base32";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
-const ownerCookies = ".wrangler/e2e/owner-cookies.json";
+const ownerCookies = process.env.NOTES_E2E_COOKIES ?? ".wrangler/e2e/owner-cookies.json";
 const WORKSPACE_READY_TIMEOUT_MS = 20_000;
 
 export async function completeEnrollment(page: Page, trust = false) {

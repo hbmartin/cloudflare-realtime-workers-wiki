@@ -1,4 +1,10 @@
-import { BlockNoteSchema, defaultBlockSpecs, defaultInlineContentSpecs, defaultStyleSpecs } from "@blocknote/core";
+import {
+  BlockNoteSchema,
+  createCodeBlockSpec,
+  defaultBlockSpecs,
+  defaultInlineContentSpecs,
+  defaultStyleSpecs,
+} from "@blocknote/core";
 import { createReactInlineContentSpec } from "@blocknote/react";
 import { useState } from "react";
 import { mentionInlineConfig } from "../shared/mention-spec";
@@ -99,8 +105,48 @@ const mentionInlineSpec = createReactInlineContentSpec(mentionInlineConfig, {
   toExternalHTML: ({ inlineContent, contentRef }) => <span ref={contentRef}>@{inlineContent.props.label}</span>,
 });
 
+const codeLanguages = {
+  text: { name: "Plain text" },
+  javascript: { name: "JavaScript", aliases: ["js"] },
+  typescript: { name: "TypeScript", aliases: ["ts"] },
+  json: { name: "JSON" },
+  html: { name: "HTML" },
+  css: { name: "CSS" },
+  bash: { name: "Bash", aliases: ["sh"] },
+  python: { name: "Python", aliases: ["py"] },
+  sql: { name: "SQL" },
+  markdown: { name: "Markdown", aliases: ["md"] },
+};
+export function codeLanguageForPicker(language: string) {
+  return Object.hasOwn(codeLanguages, language) ? language : "text";
+}
+const codeBlockBase = createCodeBlockSpec({ supportedLanguages: codeLanguages });
+const codeBlock = {
+  ...codeBlockBase,
+  implementation: {
+    ...codeBlockBase.implementation,
+    render: function (
+      this: unknown,
+      block: Parameters<typeof codeBlockBase.implementation.render>[0],
+      editor: Parameters<typeof codeBlockBase.implementation.render>[1],
+    ) {
+      return codeBlockBase.implementation.render.call(
+        this as never,
+        {
+          ...block,
+          props: {
+            ...block.props,
+            language: codeLanguageForPicker(block.props.language),
+          },
+        },
+        editor,
+      );
+    },
+  },
+};
+
 export const notesSchema = BlockNoteSchema.create({
-  blockSpecs: { ...defaultBlockSpecs, ...coreBlockSpecs },
+  blockSpecs: { ...defaultBlockSpecs, codeBlock, ...coreBlockSpecs },
   inlineContentSpecs: { ...defaultInlineContentSpecs, mention: mentionInlineSpec, inlineMath: inlineMathSpec },
   styleSpecs: defaultStyleSpecs,
 });

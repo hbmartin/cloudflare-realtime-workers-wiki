@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page, PageNode } from "../shared/types";
 import { WorkspaceTree } from "./WorkspaceTree";
-import { QuickSwitcher } from "./WorkspaceUI";
+import { CommandPalette } from "./CommandPalette";
 
 const page = (id: string, title: string, parentId: string | null = null): Page => ({
   id,
@@ -88,24 +88,81 @@ describe("workspace navigation", () => {
     );
   });
 
-  it("clamps Quick Switcher selection when its results shrink", () => {
+  it("clamps palette selection when its results shrink", () => {
     const pages = [page("one", "One"), page("two", "Two"), page("three", "Three")];
     const onSelect = vi.fn();
     const onClose = vi.fn();
     const view = render(
-      <QuickSwitcher pages={pages} recentIds={["one", "two", "three"]} onSelect={onSelect} onClose={onClose} />,
+      <CommandPalette
+        mode="pages"
+        pages={pages}
+        recentIds={["one", "two", "three"]}
+        commands={[]}
+        onSelectPage={onSelect}
+        onClose={onClose}
+      />,
     );
     const input = screen.getByRole("combobox", { name: "Find a page" });
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "ArrowDown" });
-    expect(input).toHaveAttribute("aria-activedescendant", "quick-result-2");
+    expect(input).toHaveAttribute("aria-activedescendant", "palette-result-2");
 
-    view.rerender(<QuickSwitcher pages={pages} recentIds={["one"]} onSelect={onSelect} onClose={onClose} />);
+    view.rerender(
+      <CommandPalette
+        mode="pages"
+        pages={pages}
+        recentIds={["one"]}
+        commands={[]}
+        onSelectPage={onSelect}
+        onClose={onClose}
+      />,
+    );
 
-    expect(input).toHaveAttribute("aria-activedescendant", "quick-result-0");
-    expect(screen.getByRole("option", { name: "One" })).toHaveAttribute("aria-selected", "true");
+    expect(input).toHaveAttribute("aria-activedescendant", "palette-result-0");
+    expect(screen.getByRole("option", { name: /One/ })).toHaveAttribute("aria-selected", "true");
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onSelect).toHaveBeenCalledWith("one");
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("shows accessible pages and available commands in the requested mode", () => {
+    const pages = [page("allowed", "Allowed"), { ...page("archived", "Archived"), archivedAt: 1 }];
+    const commands = [
+      { id: "search", label: "Search workspace", shortcut: "", isAvailable: () => true, run: vi.fn() },
+      { id: "move", label: "Move current page", shortcut: "", isAvailable: () => false, run: vi.fn() },
+    ];
+    const props = {
+      pages,
+      recentIds: ["missing", "allowed", "archived"],
+      commands,
+      onSelectPage: vi.fn(),
+      onClose: vi.fn(),
+    };
+    const view = render(<CommandPalette mode="all" {...props} />);
+    expect(screen.getByRole("option", { name: /Allowed/ })).toBeVisible();
+    expect(screen.getByRole("option", { name: /Search workspace/ })).toBeVisible();
+    expect(screen.queryByRole("option", { name: /Archived|Move current page/ })).toBeNull();
+    view.rerender(<CommandPalette mode="pages" {...props} />);
+    expect(screen.queryByRole("option", { name: /Search workspace/ })).toBeNull();
+    view.rerender(<CommandPalette mode="commands" {...props} />);
+    expect(screen.queryByRole("option", { name: /Allowed/ })).toBeNull();
+    view.rerender(<CommandPalette mode="help" {...props} />);
+    expect(screen.getByRole("option", { name: /Find a page or command/ })).toBeVisible();
+  });
+
+  it("restores the preceding focus when Escape closes the palette", () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    const onClose = vi.fn();
+    const view = render(
+      <CommandPalette mode="all" pages={[]} recentIds={[]} commands={[]} onSelectPage={vi.fn()} onClose={onClose} />,
+    );
+    expect(screen.getByRole("combobox")).toHaveFocus();
+    fireEvent(screen.getByRole("dialog"), new Event("cancel", { bubbles: true, cancelable: true }));
+    expect(onClose).toHaveBeenCalledOnce();
+    view.unmount();
+    expect(opener).toHaveFocus();
+    opener.remove();
   });
 });

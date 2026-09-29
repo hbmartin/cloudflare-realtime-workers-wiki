@@ -20,6 +20,7 @@ import {
   UPLOAD_SESSION_TTL_MS,
 } from "./attachments";
 import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
+import { linkPreview, linkPreviewImage, pruneLinkPreviews } from "./link-previews";
 import {
   createIntegration,
   integrationGrants,
@@ -235,6 +236,8 @@ const DELETION_TARGET_BATCH_SIZE = 50;
 // Each page costs three or four statements, so this stays far inside D1's per-invocation
 // query ceiling while still collapsing a tree level into one request.
 const PAGE_BATCH_MAX = 50;
+// The shared scheduled invocation also runs other maintenance tasks.
+const TABLE_SEARCH_BACKFILL_PER_KIND = 25;
 const TABLE_LEASE_DURATION_MS = 60_000;
 const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "blue", "purple", "pink"] as const;
 const MAX_IMPORT_UPLOAD_BYTES = 24 * 1024 * 1024;
@@ -1516,6 +1519,7 @@ app.get("/api/me", async (c) => {
     user: member.user,
     workspace: member.workspace,
     role: member.role,
+    features: { expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true" },
   };
   return c.json(context);
 });
@@ -3020,20 +3024,15 @@ app.get("/api/pages/tree", async (c) => {
       JOIN spaces s ON s.id = p.space_id
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE p.workspace_id = ? AND p.archived_at IS ${archived ? "NOT " : ""}NULL
-       AND p.is_template = 0 AND p.import_job_id IS NULL
-       ${
-         archived
-           ? ""
-           : `AND p.id NOT IN (
+       ${archived ? "" : "AND p.is_template = 0"} AND p.import_job_id IS NULL
+       AND p.id NOT IN (
          WITH RECURSIVE hidden(id) AS (
-           SELECT page_id FROM table_row_pages
-           UNION
            SELECT page_id FROM page_import_sources WHERE source_role = 'table_row_detail'
+           ${archived ? "" : "UNION SELECT page_id FROM table_row_pages"}
            UNION ALL
            SELECT child.id FROM pages child JOIN hidden ON child.parent_id = hidden.id
          ) SELECT id FROM hidden
-       )`
-       }
+       )
        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
      ORDER BY p.position, p.id`,
   )
@@ -4215,22 +4214,21 @@ app.delete("/api/pages/:id", async (c) => {
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
-  requireOrdinaryPage(page);
   const task = await taskDetail(c.env, page.id);
   if (task && page.archived_at === null) {
     const taskArchiveOperationId = c.req.header("x-notes-operation-id") ?? crypto.randomUUID();
-    await mutateTask(c.env, member, task.list_id, task.row_id, {
+    const result = await mutateTask(c.env, member, task.list_id, task.row_id, {
       operationId: taskArchiveOperationId,
       expectedRevision: task.revision,
       archived: true,
     });
-    const archived = await c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree`,
-    )
-      .bind(page.id)
-      .all<{ id: string }>();
-    const pageIds = archived.results.map((p) => p.id);
-    sendWorkspaceEvent(c, member.workspace.id, { type: "task-list-invalidated", pageId: task.list_id });
+    const pageIds = result.pageIds ?? [page.id];
+    sendWorkspaceEvent(c, member.workspace.id, {
+      type: "task-list-invalidated",
+      pageId: task.list_id,
+      operationId: taskArchiveOperationId,
+      forceRefresh: true,
+    });
     sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
     const cleanup = await archiveCleanupAfterCommit(
       c.env,
@@ -4250,9 +4248,11 @@ app.delete("/api/pages/:id", async (c) => {
   const archiveOwnership: ArchiveDisconnectOwnership = archiveOperationId
     ? { operationId: archiveOperationId }
     : { archivedAt: archiveTimestamp };
-  await c.env.DB.batch([
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
+  const archived = await batchWithFinalResult<PageRow>(
+    c.env.DB,
+    [
+      c.env.DB.prepare(
+        `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        )
@@ -4270,35 +4270,45 @@ app.delete("/api/pages/:id", async (c) => {
          last_error = NULL,
          updated_at = excluded.updated_at
        RETURNING page_id, content_epoch`,
-    ).bind(page.id, member.workspace.id, timestamp, timestamp, timestamp),
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
+      ).bind(page.id, member.workspace.id, timestamp, timestamp, timestamp),
+      c.env.DB.prepare(
+        `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
          UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
        ) UPDATE pages
            SET archived_at = ?, archived_by = ?, archive_operation_id = ?, revision = revision + 1,
                updated_by = ?, updated_at = ?
          WHERE id IN subtree AND archived_at IS NULL`,
-    ).bind(page.id, member.workspace.id, archiveTimestamp, archiveOwner, archiveOperationId, member.user.id, timestamp),
-    c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
+      ).bind(
+        page.id,
+        member.workspace.id,
+        archiveTimestamp,
+        archiveOwner,
+        archiveOperationId,
+        member.user.id,
+        timestamp,
+      ),
+      c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
       SELECT id FROM subtree
     )`).bind(page.id),
-  ]);
-  const archived = await c.env.DB.prepare(
-    `WITH RECURSIVE subtree(id) AS (
+    ],
+    c.env.DB.prepare(
+      `WITH RECURSIVE subtree(id) AS (
        SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-     ) SELECT id, kind, content_epoch FROM pages WHERE id IN subtree`,
-  )
-    .bind(page.id)
-    .all<{ id: string; kind: PageKind; content_epoch: number }>();
-  const pageIds = archived.results.map((item) => item.id);
+     ) SELECT * FROM pages WHERE id IN subtree`,
+    ).bind(page.id),
+  );
+  const pageIds = archived?.results.map((item) => item.id) ?? [page.id];
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "pages-removed",
     pageIds,
     permanently: false,
     ...(operationId ? { operationId } : {}),
   });
+  if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  if (page.is_task_list || archived?.results.some((item) => item.is_task_list))
+    sendWorkspaceEvent(c, member.workspace.id, { type: "tasks-invalidated" });
   const cleanup = await archiveCleanupAfterCommit(c.env, page.id, archiveOwnership, timestamp, "page_delete");
   return c.json(
     {
@@ -4362,6 +4372,11 @@ app.post("/api/pages/:id/restore", async (c) => {
       restored: true,
       restoredRootId: page.id,
       ...(hidden.length ? { sidebarHiddenPageIds: hidden } : {}),
+    });
+    sendWorkspaceEvent(c, member.workspace.id, {
+      type: "task-list-invalidated",
+      pageId: task.list_id,
+      forceRefresh: true,
     });
     return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
   }
@@ -4432,6 +4447,9 @@ app.post("/api/pages/:id/restore", async (c) => {
     restoredRootId: page.id,
     ...(hidden.length ? { sidebarHiddenPageIds: hidden } : {}),
   });
+  if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
+  if (restored.results.some((item) => item.is_task_list))
+    sendWorkspaceEvent(c, member.workspace.id, { type: "tasks-invalidated" });
   return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
 });
 
@@ -4536,6 +4554,7 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   }
   const pageIds = subtree.results.map((item) => item.id);
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: true });
+  if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   c.executionCtx.waitUntil(
     processDeletionJob(c.env, jobId).catch((error) => {
       logger.error("deletion.cleanup.failed", "deletion", "Immediate deletion cleanup failed.", { jobId }, error);
@@ -4552,6 +4571,31 @@ app.get("/api/search", async (c) => {
 app.get("/api/search/titles", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   return c.json(await searchTitles(c.env.DB, member, c.req.url));
+});
+
+app.post("/api/link-previews", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
+  if (c.env.EXPANDED_EMBEDS_ENABLED !== "true")
+    throw new HttpError(404, "preview_disabled", "Link previews are unavailable.");
+  const body = await jsonBody(c.req.raw);
+  const url = object(body).url;
+  if (typeof url !== "string") throw new HttpError(400, "preview_url_invalid", "Use a public HTTPS URL.");
+  return c.json({
+    preview: await linkPreview(c.env, member.workspace.id, url, async () => {
+      const { success } = await c.env.API_BURST_LIMIT.limit({
+        key: `link-preview:${member.workspace.id}:${member.user.id}`,
+      });
+      if (!success) throw new HttpError(429, "preview_rate_limited", "Link preview rate limit exceeded.");
+    }),
+  });
+});
+
+app.get("/api/link-previews/:id/image", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  if (c.env.EXPANDED_EMBEDS_ENABLED !== "true")
+    throw new HttpError(404, "preview_disabled", "Link previews are unavailable.");
+  return linkPreviewImage(c.env, member.workspace.id, c.req.param("id"));
 });
 
 app.get("/api/mentions/suggestions", async (c) => {
@@ -5494,6 +5538,7 @@ app.get("/api/tasks", async (c) => {
       due: c.req.query("due"),
       q: c.req.query("q"),
       cursor: c.req.query("cursor"),
+      rowId: c.req.query("rowId") ?? undefined,
     }),
   );
 });
@@ -5501,11 +5546,34 @@ app.get("/api/task-lists/:pageId/assignees", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   return c.json({ members: await taskAssignees(c.env, member, c.req.param("pageId")) });
 });
+app.get("/api/task-lists/:pageId/lease", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (!page.is_task_list) throw new HttpError(422, "task_list_required", "Choose a task list.");
+  const lease = await c.env.DB.prepare(
+    `SELECT l.expires_at, l.holder_session_id, u.name holder_name
+       FROM table_leases l JOIN user u ON u.id=l.holder_user_id WHERE l.page_id=? AND l.expires_at>?`,
+  )
+    .bind(page.id, now())
+    .first<{ expires_at: number; holder_session_id: string; holder_name: string }>();
+  return c.json({
+    lease: {
+      heldByMe: lease?.holder_session_id === member.session.id,
+      holderName: lease?.holder_name ?? null,
+      expiresAt: lease?.expires_at ?? null,
+    },
+  });
+});
 app.post("/api/task-lists/:pageId/tasks", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const pageId = c.req.param("pageId");
-  const result = await mutateTask(c.env, member, pageId, null, await jsonBody(c.req.raw));
-  sendWorkspaceEvent(c, member.workspace.id, { type: "task-list-invalidated", pageId });
+  const body = await jsonBody(c.req.raw);
+  const result = await mutateTask(c.env, member, pageId, null, body);
+  sendWorkspaceEvent(c, member.workspace.id, {
+    type: "task-list-invalidated",
+    pageId,
+    ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
+  });
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json(result, 201);
 });
@@ -5514,16 +5582,15 @@ app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
   const pageId = c.req.param("pageId");
   const body = await jsonBody(c.req.raw);
   const result = await mutateTask(c.env, member, pageId, c.req.param("rowId"), body);
-  sendWorkspaceEvent(c, member.workspace.id, { type: "task-list-invalidated", pageId });
+  sendWorkspaceEvent(c, member.workspace.id, {
+    type: "task-list-invalidated",
+    pageId,
+    ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
+    forceRefresh: body.archived === true,
+  });
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   if (body.archived !== true) return c.json(result);
-  const archived = await c.env.DB.prepare(
-    `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id)
-     SELECT id FROM subtree`,
-  )
-    .bind(result.detailPageId)
-    .all<{ id: string }>();
-  const pageIds = archived.results.map((page) => page.id);
+  const pageIds = result.pageIds ?? [result.detailPageId];
   sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
   const operationId = typeof body.operationId === "string" ? body.operationId : "";
   const cleanup = await archiveCleanupAfterCommit(c.env, result.detailPageId, { operationId }, now(), "task_patch");
@@ -6721,9 +6788,11 @@ export async function executeScheduledTasks(env: Env, context: ExecutionContext,
 export async function backfillTableSearchValues(env: Env) {
   const [cells, options] = await Promise.all([
     env.DB.prepare(
-      "SELECT row_id,column_id,text_value FROM table_cells WHERE text_value IS NOT NULL AND text_search_value IS NULL LIMIT 500",
+      `SELECT row_id,column_id,text_value FROM table_cells WHERE text_value IS NOT NULL AND text_search_value IS NULL ORDER BY row_id,column_id LIMIT ${TABLE_SEARCH_BACKFILL_PER_KIND}`,
     ).all<{ row_id: string; column_id: string; text_value: string }>(),
-    env.DB.prepare("SELECT id,label FROM table_select_options WHERE label_search_value IS NULL LIMIT 500").all<{
+    env.DB.prepare(
+      `SELECT id,label FROM table_select_options WHERE label_search_value IS NULL ORDER BY id LIMIT ${TABLE_SEARCH_BACKFILL_PER_KIND}`,
+    ).all<{
       id: string;
       label: string;
     }>(),
@@ -6827,6 +6896,7 @@ export default {
         outbox: async () => {
           await sweepOutbox(env);
           await purgeExpiredSlackSearchSessions(env);
+          await pruneLinkPreviews(env);
         },
         slack_redrive: () => redriveStaleSlackOutbox(env),
         job_artifacts: () => expireJobArtifacts(env),

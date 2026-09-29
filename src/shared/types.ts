@@ -51,7 +51,9 @@ export type MemberContext = {
   role: Role;
 };
 
-export type ClientMemberContext = Omit<MemberContext, "session">;
+export type ClientMemberContext = Omit<MemberContext, "session"> & {
+  features?: { expandedEmbeds: boolean };
+};
 
 export type Page = {
   id: string;
@@ -402,7 +404,8 @@ export type WorkspaceEvent =
       sidebarHiddenPageIds?: string[];
     }
   | { type: "pages-removed"; pageIds: string[]; permanently: boolean; operationId?: string }
-  | { type: "task-list-invalidated"; pageId: string }
+  | { type: "task-list-invalidated"; pageId: string; operationId?: string; forceRefresh?: boolean }
+  | { type: "tasks-invalidated" }
   | { type: "workspace-invalidated" }
   | { type: "organization-invalidated" }
   | { type: "notifications-invalidated" }

@@ -1064,6 +1064,33 @@ async function initializeTable(env: Env, job: JobRow, page: ImportPage) {
          FROM json_each(?)`,
     ).bind(JSON.stringify(optionRows)),
   ]);
+  const encoder = new TextEncoder();
+  // Leave room below D1's 2 MB bound for the SQL statement and transport envelope.
+  const maxJsonBindBytes = 1_800_000;
+  const insertChunks = async (items: unknown[], label: string, insert: (json: string) => Promise<unknown>) => {
+    let chunk: string[] = [];
+    let chunkBytes = 2;
+    const flush = async () => {
+      if (!chunk.length) return;
+      await insert(`[${chunk.join(",")}]`);
+      chunk = [];
+      chunkBytes = 2;
+    };
+    for (const item of items) {
+      const serialized = JSON.stringify(item);
+      const bytes = encoder.encode(serialized).byteLength;
+      if (bytes + 2 > maxJsonBindBytes)
+        throw new HttpError(
+          413,
+          "import_table_value_too_large",
+          `An imported table ${label} exceeds the safe D1 value size.`,
+        );
+      if (chunkBytes + bytes + (chunk.length ? 1 : 0) > maxJsonBindBytes) await flush();
+      chunk.push(serialized);
+      chunkBytes += bytes + (chunk.length > 1 ? 1 : 0);
+    }
+    await flush();
+  };
   for (let offset = 0; offset < table.rows.length; offset += 100) {
     await assertImportActive(env, job);
     const values = await Promise.all(
@@ -1081,22 +1108,27 @@ async function initializeTable(env: Env, job: JobRow, page: ImportPage) {
         };
       }),
     );
-    await env.DB.batch([
-      env.DB.prepare(
-        `INSERT OR IGNORE INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
+    const insertRows = env.DB.prepare(
+      `INSERT OR IGNORE INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
          SELECT json_extract(value, '$.id'), ?, json_extract(value, '$.position'), ?, ?, ? FROM json_each(?)`,
-      ).bind(page.id, job.requested_by, timestamp, timestamp, JSON.stringify(values)),
-      env.DB.prepare(
-        `INSERT OR REPLACE INTO table_cells
+    );
+    await insertChunks(
+      values.map(({ id, position }) => ({ id, position })),
+      "row",
+      (json) => insertRows.bind(page.id, job.requested_by, timestamp, timestamp, json).run(),
+    );
+    const cells = values.flatMap((row) => row.cells);
+    const insertCells = env.DB.prepare(
+      `INSERT OR REPLACE INTO table_cells
           (row_id, column_id, text_value, text_search_value, number_value, boolean_value, date_value, select_value, updated_at)
          SELECT json_extract(cell.value, '$.rowId'), json_extract(cell.value, '$.columnId'),
                 json_extract(cell.value, '$.text'), json_extract(cell.value, '$.textSearch'),
                 json_extract(cell.value, '$.number'),
                 json_extract(cell.value, '$.boolean'), json_extract(cell.value, '$.date'),
                 json_extract(cell.value, '$.select'), ?
-           FROM json_each(?) row_data, json_each(json_extract(row_data.value, '$.cells')) cell`,
-      ).bind(timestamp, JSON.stringify(values)),
-    ]);
+           FROM json_each(?) cell`,
+    );
+    await insertChunks(cells, "cell", (json) => insertCells.bind(timestamp, json).run());
   }
 }
 

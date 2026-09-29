@@ -105,6 +105,38 @@ beforeEach(async () => {
 });
 
 describe("Notion-compatible API", () => {
+  it("round-trips expanded embed URLs through /v1 while framing is disabled", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const disabledEnv = new Proxy(env, {
+      get(target, property, receiver) {
+        return property === "EXPANDED_EMBEDS_ENABLED" ? "false" : Reflect.get(target, property, receiver);
+      },
+    });
+    const request = async (path: string, init: RequestInit = {}) => {
+      const context = createExecutionContext();
+      const response = await worker.fetch(notionRequest(createdIntegration.token, path, init), disabledEnv, context);
+      await waitOnExecutionContext(context);
+      return response;
+    };
+    const url = "https://www.loom.com/share/be3f4b20127d47be9f884c3fab71d030";
+    const appended = await request(`/blocks/${installed.pageId}/children`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ children: [{ embed: { url } }] }),
+    });
+    expect(appended.status).toBe(200);
+    const { results } = await appended.json<{ results: Array<{ id: string; embed: { url: string } }> }>();
+    expect(results[0]?.embed.url).toBe(url);
+    const read = await request(`/blocks/${installed.pageId}/children`);
+    expect((await read.json<{ results: Array<{ embed: { url: string } }> }>()).results[0]?.embed.url).toBe(url);
+    const updated = await request(`/blocks/${results[0]!.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ embed: { url } }),
+    });
+    expect(updated.status).toBe(200);
+  });
   it("uses responding templates for overlapping users and file routes", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);

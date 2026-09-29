@@ -6,6 +6,7 @@ import {
   nullableId,
   pageKind,
   pageWithoutUnknownFields,
+  parseWorkspaceEvent,
   role,
   text,
   ValidationError,
@@ -52,5 +53,20 @@ describe("request validation", () => {
     expect(nullableId("", "parentId")).toBeNull();
     expect(() => text("", "title")).toThrow(ValidationError);
     expect(() => nullableId("bad/id", "parentId")).toThrow(ValidationError);
+  });
+
+  it("keeps task invalidation identity and urgency while stripping unknown fields", () => {
+    expect(
+      parseWorkspaceEvent({
+        type: "task-list-invalidated",
+        pageId: "list",
+        operationId: "operation",
+        forceRefresh: true,
+        secret: "discard",
+      }),
+    ).toEqual({ type: "task-list-invalidated", pageId: "list", operationId: "operation", forceRefresh: true });
+    expect(parseWorkspaceEvent({ type: "tasks-invalidated", secret: "discard" })).toEqual({
+      type: "tasks-invalidated",
+    });
   });
 });

@@ -1,12 +1,24 @@
 import { renderToString } from "katex";
 import { createReactBlockSpec, createReactInlineContentSpec } from "@blocknote/react";
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import { notionBlockRegistry } from "../shared/notion-blocks";
-import { api, apiErrorMessage, json } from "./api";
+import { resolveEmbed } from "../shared/embed-providers";
+import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import type { Page, SearchTitleSuggestion } from "../shared/types";
 import "katex/dist/katex.min.css";
 
 const CALLOUT_TONES = ["info", "success", "warning", "danger"] as const;
+export const EmbedFeatureContext = createContext(false);
 
 export function renderedMath(formula: string, displayMode: boolean) {
   return renderToString(formula || "\\text{Empty formula}", {
@@ -226,25 +238,8 @@ const columns = createReactBlockSpec(
   },
 )();
 
-export function allowedEmbedUrl(value: string) {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:") return null;
-    if (url.hostname === "youtu.be") return `https://www.youtube-nocookie.com/embed/${url.pathname.slice(1)}`;
-    if (url.hostname === "www.youtube.com" || url.hostname === "youtube.com") {
-      const id = url.pathname.startsWith("/embed/") ? url.pathname.slice(7) : url.searchParams.get("v");
-      return id ? `https://www.youtube-nocookie.com/embed/${id}` : null;
-    }
-    if (url.hostname === "vimeo.com" && /^\/\d+$/.test(url.pathname)) {
-      return `https://player.vimeo.com/video/${url.pathname.slice(1)}`;
-    }
-    if (url.hostname === "www.figma.com" || url.hostname === "figma.com") {
-      return `https://www.figma.com/embed?embed_host=notes&url=${encodeURIComponent(url.href)}`;
-    }
-    return null;
-  } catch {
-    return null;
-  }
+export function allowedEmbedUrl(value: string, expanded = false) {
+  return resolveEmbed(value, expanded)?.frameUrl ?? null;
 }
 
 export function safeBookmarkUrl(value: string) {
@@ -258,30 +253,39 @@ export function safeBookmarkUrl(value: string) {
 
 export function safePdfUrl(value: string) {
   try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+    const url = new URL(value, window.location.origin);
+    return url.origin === window.location.origin && /^\/api\/attachments\/[A-Za-z0-9_-]+$/.test(url.pathname)
+      ? url.pathname
+      : null;
   } catch {
     return null;
   }
 }
 
 function EmbedBlock({ url, title, update }: { url: string; title: string; update?: (url: string) => void }) {
-  const embedded = allowedEmbedUrl(url);
+  const expanded = useContext(EmbedFeatureContext);
+  const embedded = resolveEmbed(url, expanded);
   const bookmark = safeBookmarkUrl(url);
   return (
     <div className="editor-embed">
       {embedded ? (
         <iframe
           title={title || "Embedded content"}
-          src={embedded}
-          sandbox="allow-scripts allow-presentation"
-          referrerPolicy="no-referrer"
+          src={embedded.frameUrl}
+          sandbox={embedded.provider.sandbox}
+          allow={embedded.provider.allow}
+          referrerPolicy="strict-origin-when-cross-origin"
           allowFullScreen
         />
       ) : (
         <a href={bookmark ?? undefined} target="_blank" rel="noreferrer">
           <strong>{title || "Bookmark"}</strong>
           <span>{url || "Add a supported HTTPS URL"}</span>
+        </a>
+      )}
+      {embedded && (
+        <a href={bookmark ?? undefined} target="_blank" rel="noreferrer">
+          Open original
         </a>
       )}
       {update && (
@@ -312,29 +316,96 @@ const embed = createReactBlockSpec(
   },
 )();
 
+type LinkPreview = {
+  id: string;
+  url: string;
+  title: string;
+  description: string;
+  siteName: string;
+  imageUrl: string | null;
+  expiresAt: number;
+};
+
+export function BookmarkBlock({ url, title, update }: { url: string; title: string; update?: (url: string) => void }) {
+  const expanded = useContext(EmbedFeatureContext);
+  const [loaded, setLoaded] = useState<{ url: string; preview: LinkPreview } | null>(null);
+  const [failedImage, setFailedImage] = useState<string | null>(null);
+  const preview = loaded?.url === url ? loaded.preview : null;
+  useEffect(() => {
+    if (!expanded || !url.startsWith("https://")) return undefined;
+    const controller = new AbortController();
+    let retries = 0;
+    let retryTimer: number | undefined;
+    const load = () => {
+      void api<{ preview: LinkPreview }>("/api/link-previews", {
+        method: "POST",
+        body: json({ url }),
+        signal: controller.signal,
+      })
+        .then((result) => setLoaded({ url, preview: result.preview }))
+        .catch((cause: unknown) => {
+          if (controller.signal.aborted) return;
+          setLoaded(null);
+          if (cause instanceof ApiClientError && cause.code === "preview_pending" && retries++ < 2) {
+            retryTimer = window.setTimeout(load, 30_000);
+          }
+        });
+    };
+    const timer = window.setTimeout(load, 500);
+    return () => {
+      window.clearTimeout(timer);
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      controller.abort();
+    };
+  }, [expanded, url]);
+  const displayTitle = title && title !== "Bookmark" && title !== url ? title : preview?.title || title || "Bookmark";
+  return (
+    <div className="editor-bookmark">
+      <a href={safeBookmarkUrl(url) ?? undefined} target="_blank" rel="noreferrer">
+        {preview?.imageUrl && preview.imageUrl !== failedImage && (
+          <img src={preview.imageUrl} alt="" loading="lazy" onError={() => setFailedImage(preview.imageUrl)} />
+        )}
+        <strong>{displayTitle}</strong>
+        {preview?.description && <span>{preview.description}</span>}
+        <span>{preview?.siteName || url || "Add an HTTP, HTTPS, or mail link"}</span>
+      </a>
+      {update && (
+        <input
+          contentEditable={false}
+          aria-label="Bookmark URL"
+          type="url"
+          value={url}
+          onChange={(event) => update(event.target.value)}
+        />
+      )}
+    </div>
+  );
+}
+
 const bookmark = createReactBlockSpec(
   {
     type: "bookmark",
-    propSchema: { url: { default: "" }, title: { default: "Bookmark" } },
+    propSchema: { url: { default: "" }, title: { default: "Bookmark" }, previewId: { default: "" } },
     content: "none",
   },
   {
     render: ({ block, editor }) => (
-      <div className="editor-bookmark">
-        <a href={safeBookmarkUrl(block.props.url) ?? undefined} target="_blank" rel="noreferrer">
-          <strong>{block.props.title || "Bookmark"}</strong>
-          <span>{block.props.url || "Add an HTTP, HTTPS, or mail link"}</span>
-        </a>
-        {editor.isEditable && (
-          <input
-            contentEditable={false}
-            aria-label="Bookmark URL"
-            type="url"
-            value={block.props.url}
-            onChange={(event) => editor.updateBlock(block, { props: { url: event.target.value } })}
-          />
-        )}
-      </div>
+      <BookmarkBlock
+        url={block.props.url}
+        title={block.props.title}
+        update={
+          editor.isEditable
+            ? (url) =>
+                editor.updateBlock(block, {
+                  props: {
+                    url,
+                    title: block.props.title === block.props.url ? url : block.props.title,
+                    ...(block.props.previewId ? { previewId: "" } : {}),
+                  },
+                })
+            : undefined
+        }
+      />
     ),
     toExternalHTML: ({ block }) => (
       <a href={safeBookmarkUrl(block.props.url) ?? undefined}>{block.props.title || block.props.url}</a>
@@ -740,7 +811,15 @@ const pdf = createReactBlockSpec(
       const url = safePdfUrl(block.props.url);
       return (
         <div className="editor-pdf">
-          {url ? <iframe title={block.props.caption} src={url} sandbox="" /> : <span>Add a PDF URL</span>}
+          {url ? (
+            <iframe title={block.props.caption} src={url} sandbox="" />
+          ) : safeBookmarkUrl(block.props.url) ? (
+            <a href={block.props.url} target="_blank" rel="noreferrer">
+              Open PDF
+            </a>
+          ) : (
+            <span>Add a PDF URL</span>
+          )}
           {editor.isEditable && (
             <input
               contentEditable={false}
@@ -753,7 +832,9 @@ const pdf = createReactBlockSpec(
         </div>
       );
     },
-    toExternalHTML: ({ block }) => <a href={safePdfUrl(block.props.url) ?? undefined}>{block.props.caption}</a>,
+    toExternalHTML: ({ block }) => (
+      <a href={safeBookmarkUrl(block.props.url) ?? safePdfUrl(block.props.url) ?? undefined}>{block.props.caption}</a>
+    ),
   },
 )();
 

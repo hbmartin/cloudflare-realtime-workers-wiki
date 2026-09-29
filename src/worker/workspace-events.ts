@@ -153,6 +153,7 @@ export class WorkspaceEvents extends YServer {
       event.type === "comments-invalidated" ||
       event.type === "workspace-invalidated" ||
       event.type === "organization-invalidated" ||
+      event.type === "tasks-invalidated" ||
       event.type === "notifications-invalidated" ||
       event.type === "jobs-invalidated"
     ) {
@@ -216,6 +217,7 @@ export class WorkspaceEvents extends YServer {
     if (
       event.type === "workspace-invalidated" ||
       event.type === "organization-invalidated" ||
+      event.type === "tasks-invalidated" ||
       event.type === "notifications-invalidated" ||
       event.type === "jobs-invalidated"
     ) {

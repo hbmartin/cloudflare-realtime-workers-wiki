@@ -1,4 +1,5 @@
 import type { ProseMirrorJson } from "./types";
+import { resolveEmbed } from "./embed-providers";
 
 export const NOTION_VERSION = "2026-03-11";
 export const NOTION_PAGE_SIZE_MAX = 100;
@@ -398,32 +399,24 @@ function notionMediaUrl(payload: Record<string, unknown>) {
 
 function validatedExternalUrl(value: string, label: string) {
   if (!value || value.length > 2_000) throw new Error(`${label} URL is required and must be at most 2000 characters.`);
+  let url: URL;
   try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error();
-    return url.href;
+    url = new URL(value);
   } catch {
     throw new Error(`${label} URL must be an HTTP or HTTPS URL.`);
   }
+  if (url.protocol !== "https:" && url.protocol !== "http:")
+    throw new Error(`${label} URL must be an HTTP or HTTPS URL.`);
+  if (url.href.length > 2_000) throw new Error(`${label} URL must be at most 2000 characters.`);
+  return url.href;
 }
 
 function validatedEmbedUrl(value: string) {
-  const href = validatedExternalUrl(value, "Embed");
-  const hostname = new URL(href).hostname.toLowerCase();
-  if (
-    ![
-      "youtu.be",
-      "youtube.com",
-      "www.youtube.com",
-      "vimeo.com",
-      "www.vimeo.com",
-      "figma.com",
-      "www.figma.com",
-    ].includes(hostname)
-  ) {
-    throw new Error("Embeds are limited to YouTube, Vimeo, and Figma URLs.");
-  }
-  return href;
+  // An embed URL is durable content. The feature flag controls framing at render time,
+  // so an API client can round-trip an existing URL while expanded embeds are disabled.
+  const canonical = validatedExternalUrl(value, "Embed");
+  if (!resolveEmbed(canonical, true)) throw new Error("Embeds require a supported HTTPS provider URL.");
+  return canonical;
 }
 
 function notionPlainText(value: unknown) {

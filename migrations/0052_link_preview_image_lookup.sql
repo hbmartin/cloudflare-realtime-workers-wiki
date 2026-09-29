@@ -1,0 +1,1 @@
+CREATE INDEX idx_link_preview_cache_image_key ON link_preview_cache(image_key);

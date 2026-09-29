@@ -4,8 +4,11 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { createElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
+import { ApiClientError } from "./api";
 import {
   allowedEmbedUrl,
+  BookmarkBlock,
+  EmbedFeatureContext,
   editorBlockFactories,
   LinkedDiagramView,
   MermaidBlock,
@@ -19,7 +22,8 @@ const renderMermaid = vi.hoisted(() => vi.fn(async (id: string) => ({ svg: `<svg
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
 
 vi.mock("mermaid", () => ({ default: { initialize: vi.fn(), render: renderMermaid } }));
-vi.mock("./api", () => ({
+vi.mock("./api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./api")>()),
   api: mocks.api,
   apiErrorMessage: (_cause: unknown, fallback: string) => fallback,
   json: (value: unknown) => JSON.stringify(value),
@@ -52,12 +56,76 @@ describe("core editor blocks", () => {
     expect(safeBookmarkUrl("javascript:alert(1)")).toBeNull();
   });
 
-  it("accepts only canonical HTTP and HTTPS URLs for PDF frames", () => {
-    expect(safePdfUrl(" https://example.com/manual.pdf ")).toBe("https://example.com/manual.pdf");
-    expect(safePdfUrl("http://localhost/manual.pdf")).toBe("http://localhost/manual.pdf");
+  it("frames only same-origin attachments and links remote PDFs", () => {
+    expect(safePdfUrl(" https://example.com/manual.pdf ")).toBeNull();
+    expect(safePdfUrl("http://localhost/manual.pdf")).toBeNull();
     expect(safePdfUrl("mailto:owner@example.test")).toBeNull();
     expect(safePdfUrl("javascript:alert(1)")).toBeNull();
-    expect(safePdfUrl("/api/attachments/file-id")).toBeNull();
+    expect(safePdfUrl("/api/attachments/file-id")).toBe("/api/attachments/file-id");
+  });
+
+  it("debounces preview fetches, keeps a saved title, and leaves failed URLs usable", async () => {
+    const url = "https://example.com/article";
+    const update = vi.fn();
+    mocks.api.mockResolvedValueOnce({
+      preview: {
+        id: "preview-id",
+        url,
+        title: "Article",
+        description: "Summary",
+        siteName: "Example",
+        imageUrl: null,
+        expiresAt: Date.now() + 1000,
+      },
+    });
+    const block = (value: string) =>
+      createElement(
+        EmbedFeatureContext.Provider,
+        { value: true },
+        createElement(BookmarkBlock, { url: value, title: "Saved title", update }),
+      );
+    const view = render(block("https://example.com/arti"));
+    view.rerender(block(url));
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledTimes(1), { timeout: 3_000 });
+    expect(JSON.parse(String(mocks.api.mock.calls[0]?.[1]?.body))).toEqual({ url });
+    expect(screen.getByRole("link")).toHaveAttribute("href", url);
+    expect(screen.getByRole("link")).toHaveTextContent("Saved title");
+    fireEvent.change(screen.getByLabelText("Bookmark URL"), { target: { value: "https://example.com/other" } });
+    expect(update).toHaveBeenCalledWith("https://example.com/other");
+    mocks.api.mockRejectedValueOnce(new Error("proxy unavailable"));
+    view.rerender(block("https://example.com/other"));
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledTimes(2), { timeout: 3_000 });
+    expect(screen.getByRole("link")).toHaveAttribute("href", "https://example.com/other");
+  });
+
+  it("retries an unfinished preview after the refresh lease", async () => {
+    vi.useFakeTimers();
+    try {
+      const url = "https://example.com/pending";
+      mocks.api
+        .mockRejectedValueOnce(new ApiClientError(503, "preview_pending", "Still fetching"))
+        .mockResolvedValueOnce({
+          preview: {
+            id: "preview-id",
+            url,
+            title: "Finished article",
+            description: "Summary",
+            siteName: "Example",
+            imageUrl: null,
+            expiresAt: Date.now() + 60_000,
+          },
+        });
+      render(
+        createElement(EmbedFeatureContext.Provider, { value: true }, createElement(BookmarkBlock, { url, title: url })),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(500));
+      expect(mocks.api).toHaveBeenCalledOnce();
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      expect(mocks.api).toHaveBeenCalledTimes(2);
+      expect(screen.getByRole("link")).toHaveTextContent("Finished article");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("uses a fresh Mermaid DOM id for every render invocation", async () => {
