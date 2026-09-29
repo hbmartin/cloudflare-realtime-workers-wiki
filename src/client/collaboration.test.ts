@@ -10,8 +10,10 @@ const mocks = vi.hoisted(() => ({
     synced: boolean;
     wsconnected: boolean;
     wsconnecting: boolean;
+    shouldConnect: boolean;
     sendMessage: ReturnType<typeof vi.fn>;
     connect: ReturnType<typeof vi.fn>;
+    reconnect: ReturnType<typeof vi.fn>;
     _reconnectWS: () => Promise<void>;
     disconnect: ReturnType<typeof vi.fn>;
     destroy: ReturnType<typeof vi.fn>;
@@ -42,10 +44,18 @@ vi.mock("y-partyserver/provider", () => ({
     synced = false;
     wsconnected = false;
     wsconnecting = false;
+    shouldConnect = false;
     sendMessage = vi.fn();
-    connect = vi.fn(async () => undefined);
-    _reconnectWS = async () => undefined;
-    disconnect = vi.fn();
+    connect = vi.fn(async () => {
+      this.shouldConnect = true;
+    });
+    reconnect = vi.fn(async () => undefined);
+    _reconnectWS = async () => {
+      await this.reconnect();
+    };
+    disconnect = vi.fn(() => {
+      this.shouldConnect = false;
+    });
     destroy = vi.fn();
     awareness = { setLocalState: vi.fn() };
     private readonly handlers = new Map<string, Set<(value: unknown) => void>>();
@@ -211,6 +221,36 @@ describe("collaboration durability barriers", () => {
     expect(beforeConnect).toHaveBeenCalledTimes(2);
     expect(provider.connect).toHaveBeenCalledOnce();
     expect(provider.disconnect).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
+  it("uses the provider's socket-only reconnect after checking access", async () => {
+    mocks.whenSynced = Promise.resolve();
+    const beforeConnect = vi.fn().mockResolvedValue(true);
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user", beforeConnect);
+    const provider = mocks.providers[0]!;
+    await bundle.ready;
+    await provider["_reconnectWS"]();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(beforeConnect).toHaveBeenCalledTimes(2);
+    expect(provider.connect).toHaveBeenCalledOnce();
+    expect(provider.reconnect).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
+  it("re-enables a connection when a hidden tab returns before its socket closes", async () => {
+    mocks.whenSynced = Promise.resolve();
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user");
+    const provider = mocks.providers[0]!;
+    await bundle.ready;
+    provider.wsconnected = true;
+    (provider.disconnect as () => void)();
+    document.dispatchEvent(new Event("visibilitychange"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(provider.connect).toHaveBeenCalledTimes(2);
+    expect(provider.shouldConnect).toBe(true);
     bundle.destroy();
   });
 

@@ -1,16 +1,15 @@
 import { withCollaboration } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
 import { useCreateBlockNote } from "@blocknote/react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IndexeddbPersistence } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
-import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
-import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { api, ApiClientError } from "./api";
 import { EmbedFeatureContext } from "./editor-blocks";
 import { notesSchema } from "./mentions";
+import { downloadOfflineMarkdown, offlineCopyMarkdown } from "./offline-export";
 import { useEffectiveColorScheme } from "./ThemeControl";
 import {
   clearRevokedOfflinePages,
@@ -42,48 +41,72 @@ export function OfflineWorkspace({
   const [recovery, setRecovery] = useState<RecoveryState>("offline");
   const [quarantined, setQuarantined] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState("");
+  const selectedId = useRef(selected?.pageId ?? null);
+  const reconnectController = useRef<AbortController | null>(null);
   const selectedReason = selected ? quarantined[selected.pageId] : undefined;
 
   const discardRevokedCopy = useCallback(
     async (pageId: string) => {
-      if (!(await markOfflinePageRevoked(account.key, pageId))) {
+      try {
+        if (!(await markOfflinePageRevoked(account.key, pageId))) {
+          setQuarantined((current) => ({
+            ...current,
+            [pageId]: "The server could not confirm access to this edited copy. It remains available for export.",
+          }));
+          return;
+        }
+        setAvailablePages((current) => current.filter((page) => page.pageId !== pageId));
+        if (selectedId.current === pageId) {
+          selectedId.current = null;
+          setSelected(null);
+          const next = new URL(window.location.href);
+          next.searchParams.delete("page");
+          window.history.replaceState(null, "", next);
+        }
+        setNotice("Access to that document was removed. Its local copy is being deleted.");
+        window.setTimeout(() => {
+          void clearRevokedOfflinePages(account.key).catch((error) =>
+            console.error("Unable to remove a revoked offline copy", error),
+          );
+        }, 100);
+      } catch (error) {
+        console.error("Unable to remove a revoked offline copy", error);
         setQuarantined((current) => ({
           ...current,
           [pageId]: "The server could not confirm access to this edited copy. It remains available for export.",
         }));
-        setRecovery("offline");
-        return;
+      } finally {
+        if (selectedId.current === pageId || selectedId.current === null) setRecovery("offline");
       }
-      setAvailablePages((current) => current.filter((page) => page.pageId !== pageId));
-      setSelected(null);
-      setNotice("Access to that document was removed. Its local copy is being deleted.");
-      const next = new URL(window.location.href);
-      next.searchParams.delete("page");
-      window.history.replaceState(null, "", next);
-      window.setTimeout(() => {
-        void clearRevokedOfflinePages(account.key).catch((error) =>
-          console.error("Unable to remove a revoked offline copy", error),
-        );
-      }, 100);
     },
     [account.key],
   );
 
   const reconnect = useCallback(async () => {
     if (selectedReason) return;
+    reconnectController.current?.abort();
+    const controller = new AbortController();
+    reconnectController.current = controller;
+    const deadline = window.setTimeout(() => controller.abort(), 10_000);
+    const ownsSelection = () =>
+      reconnectController.current === controller && selectedId.current === (selected?.pageId ?? null);
+    const isCurrent = () => !controller.signal.aborted && ownsSelection();
     setRecovery("checking");
     try {
-      const member = await api<ClientMemberContext>("/api/me");
+      const member = await api<ClientMemberContext>("/api/me", { signal: controller.signal });
+      if (!isCurrent()) return;
       if (member.user.id !== account.userId || member.workspace.id !== account.workspaceId) {
         onRetry();
         return;
       }
       if (selected) {
         const stored = await getOfflinePage(account.key, selected.pageId);
+        if (!isCurrent()) return;
         const [{ page }, { spaces }] = await Promise.all([
-          api<{ page: Page }>(`/api/pages/${encodeURIComponent(selected.pageId)}`),
-          api<{ spaces: Space[] }>("/api/spaces"),
+          api<{ page: Page }>(`/api/pages/${encodeURIComponent(selected.pageId)}`, { signal: controller.signal }),
+          api<{ spaces: Space[] }>("/api/spaces", { signal: controller.signal }),
         ]);
+        if (!isCurrent()) return;
         const space = spaces.find((item) => item.id === page.spaceId);
         if (!space && !stored?.pendingChanges) {
           await discardRevokedCopy(selected.pageId);
@@ -107,6 +130,11 @@ export function OfflineWorkspace({
       }
       onRetry();
     } catch (error) {
+      if (!ownsSelection()) return;
+      if (controller.signal.aborted) {
+        setRecovery("offline");
+        return;
+      }
       if (error instanceof ApiClientError && error.status === 401) {
         onRetry();
         return;
@@ -130,6 +158,9 @@ export function OfflineWorkspace({
         }));
       }
       setRecovery("offline");
+    } finally {
+      window.clearTimeout(deadline);
+      if (reconnectController.current === controller) reconnectController.current = null;
     }
   }, [account.key, account.userId, account.workspaceId, discardRevokedCopy, onRetry, selected, selectedReason]);
 
@@ -138,6 +169,7 @@ export function OfflineWorkspace({
     const interval = window.setInterval(() => void reconnect(), 15_000);
     window.addEventListener("online", handleOnline);
     return () => {
+      reconnectController.current?.abort();
       window.removeEventListener("online", handleOnline);
       window.clearInterval(interval);
     };
@@ -173,6 +205,8 @@ export function OfflineWorkspace({
               key={page.pageId}
               aria-current={selected?.pageId === page.pageId ? "page" : undefined}
               onClick={() => {
+                reconnectController.current?.abort();
+                selectedId.current = page.pageId;
                 setSelected(page);
                 const next = new URL(window.location.href);
                 next.searchParams.set("page", page.pageId);
@@ -200,7 +234,7 @@ export function OfflineWorkspace({
                 key={selected.pageId}
                 page={selected}
                 accountKey={account.key}
-                quarantined={Boolean(selectedReason) || recovery === "checking"}
+                quarantined={Boolean(selectedReason)}
                 editingEnabled={account.offlineEditingEnabled}
               />
             </>
@@ -254,17 +288,10 @@ function OfflineEditor({
 
   const markdown = () => {
     if (!copy) return "";
-    const document = yXmlFragmentToProsemirrorJSON(copy.doc.getXmlFragment("document-store")) as ProseMirrorJson;
-    return `# ${page.title.replaceAll("\n", " ")}\n\n${serializeDocument(document).markdown}`;
+    return offlineCopyMarkdown(copy.doc, page.title);
   };
   const exportMarkdown = () => {
-    const blob = new Blob([markdown()], { type: "text/markdown; charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${page.title.replaceAll(/[\\/:*?"<>|]/g, "-")}-offline.md`;
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    downloadOfflineMarkdown(markdown(), `${page.title}-offline.md`);
   };
 
   return (
@@ -311,31 +338,50 @@ function OfflineBlockEditor({
     let active = true;
     let timer: number | undefined;
     let generation = 0;
+    let savedGeneration = 0;
+    let writing = false;
+    const updates: Uint8Array[] = [];
     let pendingCommitted = page.pendingChanges === true;
     let pendingMark: Promise<void> | null = null;
     let pendingError = false;
-    const verifyStored = async (target: number) => {
+    const persistUpdates = async () => {
+      if (writing || !active || !updates.length) return;
+      writing = true;
+      let failed = false;
+      if (timer !== undefined) window.clearTimeout(timer);
       try {
         await pendingMark;
         if (pendingError) throw new Error("Offline catalog could not record pending changes.");
         const db = copy.persistence.db;
         if (!db) throw new Error("Offline document storage is unavailable.");
-        // y-indexeddb writes each update first. A later transaction on the
-        // same store completes only after those update transactions commit.
-        const transaction = db.transaction("updates", "readonly");
-        await new Promise<void>((resolve, reject) => {
-          transaction.addEventListener("complete", () => resolve());
-          transaction.addEventListener("abort", () => reject(transaction.error));
-          transaction.addEventListener("error", () => reject(transaction.error));
-        });
-        if (active && target === generation) setSaveState("saved");
+        while (updates.length) {
+          const batch = updates.slice();
+          const target = generation;
+          // y-indexeddb writes each update too, but does not expose write
+          // failures. This incremental write gives the UI a real commit ack.
+          const transaction = db.transaction("updates", "readwrite");
+          transaction.objectStore("updates").add(batch.length === 1 ? batch[0] : Y.mergeUpdates(batch));
+          await new Promise<void>((resolve, reject) => {
+            transaction.addEventListener("complete", () => resolve());
+            transaction.addEventListener("abort", () => reject(transaction.error));
+            transaction.addEventListener("error", () => reject(transaction.error));
+          });
+          updates.splice(0, batch.length);
+          savedGeneration = target;
+        }
+        if (active && savedGeneration === generation) setSaveState("saved");
       } catch {
+        failed = true;
         if (active) setSaveState("failed");
+      } finally {
+        writing = false;
+        if (active && !failed && updates.length) timer = window.setTimeout(() => void persistUpdates(), 100);
       }
     };
-    const updated = (_update: Uint8Array, origin: unknown) => {
+    const updated = (update: Uint8Array, origin: unknown) => {
       if (origin === copy.persistence || origin === copy.provider) return;
       generation += 1;
+      updates.push(update);
       setSaveState("saving");
       if (!pendingCommitted && !pendingMark) {
         pendingError = false;
@@ -353,10 +399,13 @@ function OfflineBlockEditor({
           });
       }
       if (timer !== undefined) window.clearTimeout(timer);
-      const target = generation;
-      timer = window.setTimeout(() => void verifyStored(target), 100);
+      timer = window.setTimeout(() => void persistUpdates(), 100);
     };
+    // y-indexeddb can throw synchronously when IDB rejects a write. Observe
+    // edits first so our own acknowledged write can report the failure.
+    copy.doc.off("update", copy.persistence["_storeUpdate"]);
     copy.doc.on("update", updated);
+    copy.doc.on("update", copy.persistence["_storeUpdate"]);
     return () => {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);

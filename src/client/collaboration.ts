@@ -96,13 +96,14 @@ export function createCollaboration(
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
   const barrier = createDurabilityBarrier(provider, durability, 1_000);
-  const connect = () => {
+  const reconnectWebSocket = provider["_reconnectWS"].bind(provider);
+  const connect = (socketOnly = false) => {
     if (destroyed) return;
-    if (provider.wsconnected) {
+    if (provider.wsconnected && provider.shouldConnect) {
       onStatus("connected");
       return;
     }
-    if (connecting || provider.wsconnecting) return;
+    if (connecting || (provider.wsconnecting && provider.shouldConnect)) return;
     connecting = true;
     if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
     connectionTimer = undefined;
@@ -115,7 +116,8 @@ export function createCollaboration(
           return;
         }
         if (destroyed) return;
-        await provider.connect();
+        if (socketOnly && provider.shouldConnect) await reconnectWebSocket();
+        else await provider.connect();
         if (destroyed) {
           provider.disconnect();
           return;
@@ -137,7 +139,7 @@ export function createCollaboration(
   // The provider reconnects internally after a socket closes. Route that
   // path through the same access check as an explicit connection attempt.
   provider["_reconnectWS"] = async () => {
-    connect();
+    connect(true);
   };
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {

@@ -74,6 +74,7 @@ import {
   forgetOfflineAccount,
   latestOfflineAccount,
   listOfflinePages,
+  listPendingOfflinePages,
   markOfflineAccountPurging,
   offlineAccountKey,
   purgingOfflineAccounts,
@@ -704,7 +705,7 @@ async function authenticatedWorkspace(member: ClientMemberContext): Promise<AppS
     await rememberOfflineAccount(member).catch((error) =>
       console.error("Unable to remember this account for offline use", error),
     );
-    void clearRevokedOfflinePages(offlineAccountKey(member)).catch((error) =>
+    await clearRevokedOfflinePages(offlineAccountKey(member)).catch((error) =>
       console.error("Unable to remove revoked offline copies", error),
     );
   }
@@ -766,10 +767,17 @@ async function resolveAppState(): Promise<AppState> {
     return invite ? { screen: "invite", token: invite } : { screen: "signin" };
   }
   if (status.state !== "ready") return { screen: "security", status };
+  let currentMember: ClientMemberContext | null = null;
+  if (locallySignedOut) {
+    currentMember = await api<ClientMemberContext>("/api/me");
+    if (offlineAccountKey(currentMember) === locallySignedOut) return { screen: "signin" };
+    localStorage.removeItem("notes:local-signout");
+  }
   let inviteFailure: ApiClientError | null = null;
   if (invite || status.pendingInvite) {
     try {
       await api("/api/invites/complete", { method: "POST", body: json(invite ? { token: invite } : {}) });
+      currentMember = null;
       clearPendingInvite();
     } catch (cause) {
       if (invite && cause instanceof ApiClientError && cause.code === "invite_invalid") {
@@ -786,7 +794,7 @@ async function resolveAppState(): Promise<AppState> {
     }
   }
   try {
-    const member = await api<ClientMemberContext>("/api/me");
+    const member = currentMember ?? (await api<ClientMemberContext>("/api/me"));
     return await authenticatedWorkspace(member);
   } catch (error) {
     if (error instanceof ApiClientError && error.status === 401) {
@@ -858,7 +866,7 @@ export function App() {
         return;
       }
       try {
-        const pending = (await listOfflinePages(accountKey)).filter((page) => page.pendingChanges);
+        const pending = await listPendingOfflinePages(accountKey);
         if (pending.length > 0) {
           showState({ screen: "signout-review", accountKey, pages: pending });
           return;
@@ -922,6 +930,23 @@ export function App() {
       })
       .then((next) => commitState(transition, next));
   }, [commitState]);
+
+  const retryLocalPurge = useCallback(
+    async (accountKey: string) => {
+      showState({ screen: "loading" });
+      try {
+        await forgetOfflineAccount(accountKey);
+        await load();
+      } catch (error) {
+        showState({
+          screen: "signout-cleanup",
+          accountKey,
+          message: apiErrorMessage(error, "Close other NoteFlare tabs, then retry local data removal."),
+        });
+      }
+    },
+    [load, showState],
+  );
 
   useEffect(() => {
     if (state.screen === "workspace") return onApiUnauthorized(sessionExpired);
@@ -1008,7 +1033,7 @@ export function App() {
         copy="Your account is closed in this tab. Local document copies still need to be removed from this device."
       >
         <p role="alert">{state.message}</p>
-        <button type="button" onClick={() => void completeSignOut(state.accountKey)}>
+        <button type="button" onClick={() => void retryLocalPurge(state.accountKey)}>
           Retry removal
         </button>
       </AuthLayout>
@@ -1238,9 +1263,17 @@ function InviteScreen({ token, onComplete }: { token: string; onComplete: () => 
 }
 
 async function finishPendingServerSignOut() {
-  if (!localStorage.getItem("notes:local-signout")) return;
+  const accountKey = localStorage.getItem("notes:local-signout");
+  if (!accountKey) return;
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state !== "signed_out") {
+    if (status.state === "ready") {
+      const member = await api<ClientMemberContext>("/api/me");
+      if (offlineAccountKey(member) !== accountKey) {
+        localStorage.removeItem("notes:local-signout");
+        return;
+      }
+    }
     const result = await authClient.signOut();
     if (result.error) throw new Error(result.error.message || "Finish signing out before using another account.");
   }

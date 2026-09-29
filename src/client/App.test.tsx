@@ -760,6 +760,27 @@ describe("App error handling", () => {
     expect(localStorage.getItem("notes:local-signout")).toBeNull();
   });
 
+  it("keeps a new account signed in when an older account left a local sign-out marker", async () => {
+    const nextMember = { ...member, user: { ...member.user, id: "next-user" } };
+    mockShellApi({ member: nextMember });
+    localStorage.setItem("notes:local-signout", "user\u0000workspace");
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Sign out" });
+    expect(localStorage.getItem("notes:local-signout")).toBeNull();
+    expect(mocks.signOut).not.toHaveBeenCalled();
+  });
+
+  it("does not accept an invite into an account whose sign-out is pending", async () => {
+    mockShellApi();
+    localStorage.setItem("notes:local-signout", "user\u0000workspace");
+    history.replaceState(null, "", "/?invite=invite-token");
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Sign in" });
+    expect(vi.mocked(api).mock.calls.some(([path]) => path === "/api/invites/complete")).toBe(false);
+  });
+
   it("resolves a global security-policy 401 through status", async () => {
     mockShellApi();
     const normal = vi.mocked(api).getMockImplementation()!;

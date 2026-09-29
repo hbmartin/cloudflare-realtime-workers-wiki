@@ -24,12 +24,34 @@ export type OfflinePage = {
   epoch: number;
   canEdit: boolean;
   pendingChanges?: boolean;
+  pendingCopyKeys?: string[];
   revoked?: boolean;
   lastSyncedAt: number;
   storageKeys: string[];
 };
 
 let connection: Promise<IDBDatabase> | null = null;
+const pageLocks = new Map<string, Promise<void>>();
+
+async function withPageLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const run = async () => {
+    const previous = pageLocks.get(key);
+    let release!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    pageLocks.set(key, finished);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (pageLocks.get(key) === finished) pageLocks.delete(key);
+    }
+  };
+  if (navigator.locks) return navigator.locks.request(`noteflare-offline:${encodeURIComponent(key)}`, run);
+  return run();
+}
 
 export function offlineAccountKey(member: Pick<ClientMemberContext, "user" | "workspace">) {
   return `${member.user.id}\u0000${member.workspace.id}`;
@@ -37,33 +59,6 @@ export function offlineAccountKey(member: Pick<ClientMemberContext, "user" | "wo
 
 export function offlineDocumentKey(userId: string, workspaceId: string, pageId: string, epoch: number) {
   return `account:${userId}:${workspaceId}:${pageId}:${epoch}:2`;
-}
-
-export function legacyOfflineDocumentKey(workspaceId: string, pageId: string, epoch: number) {
-  return `${workspaceId}:${pageId}:${epoch}:1`;
-}
-
-export async function legacyOfflineCopies(workspaceId: string, pageId: string, epoch: number) {
-  const candidates = new Set([legacyOfflineDocumentKey(workspaceId, pageId, epoch)]);
-  try {
-    const pointer = JSON.parse(localStorage.getItem(`notes:recovery:${workspaceId}:${pageId}`) ?? "null") as {
-      key?: unknown;
-    } | null;
-    if (
-      typeof pointer?.key === "string" &&
-      pointer.key.startsWith(`${workspaceId}:${pageId}:`) &&
-      /^\d+:1$/.test(pointer.key.slice(`${workspaceId}:${pageId}:`.length))
-    )
-      candidates.add(pointer.key);
-  } catch {
-    // A corrupt pointer must not hide the current-epoch legacy copy.
-  }
-  const copies = await Promise.all(
-    [...candidates].map(async (key) =>
-      (await hasOfflineDocument(key)) ? { key, epoch: Number(key.split(":").at(-2)) } : null,
-    ),
-  );
-  return copies.filter((copy): copy is { key: string; epoch: number } => copy !== null);
 }
 
 function openCatalog() {
@@ -182,6 +177,20 @@ export async function listOfflinePages(accountKey: string): Promise<OfflinePage[
     .sort((left, right) => right.lastSyncedAt - left.lastSyncedAt);
 }
 
+export async function listPendingOfflinePages(accountKey: string): Promise<OfflinePage[]> {
+  const pages = await readAccountPages(accountKey);
+  const available = await Promise.all(
+    pages.map(async (page) => {
+      const keys = page.pendingCopyKeys ?? (page.pendingChanges ? [page.storageKeys.at(-1) ?? ""] : []);
+      const pendingCopyKeys = (
+        await Promise.all(keys.map(async (key) => (key && (await hasOfflineDocument(key)) ? key : null)))
+      ).filter((key): key is string => key !== null);
+      return pendingCopyKeys.length ? { ...page, pendingCopyKeys } : null;
+    }),
+  );
+  return available.filter((page): page is OfflinePage & { pendingCopyKeys: string[] } => page !== null);
+}
+
 async function readAccountPages(accountKey: string): Promise<OfflinePage[]> {
   const db = await openCatalog();
   const transaction = db.transaction("pages", "readonly");
@@ -209,77 +218,103 @@ export async function rememberOfflinePage(
   canEdit: boolean,
 ) {
   if (page.kind !== "document") return undefined;
-  const db = await openCatalog();
   const accountKey = offlineAccountKey(member);
   const key = `${accountKey}\u0000${page.id}`;
-  const storageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
-  const transaction = db.transaction(["accounts", "pages"], "readwrite");
-  const account = await requestResult(
-    transaction.objectStore("accounts").get(accountKey) as IDBRequest<OfflineAccount | undefined>,
-  );
-  if (!account || account.purging) {
+  return withPageLock(key, async () => {
+    const db = await openCatalog();
+    const storageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
+    const transaction = db.transaction(["accounts", "pages"], "readwrite");
+    const account = await requestResult(
+      transaction.objectStore("accounts").get(accountKey) as IDBRequest<OfflineAccount | undefined>,
+    );
+    if (!account || account.purging) {
+      await transactionDone(transaction);
+      return undefined;
+    }
+    const store = transaction.objectStore("pages");
+    const previous = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
+    const previousPendingKeys =
+      previous?.pendingCopyKeys ??
+      (previous?.pendingChanges ? [previous.storageKeys.at(-1) ?? ""].filter(Boolean) : []);
+    const entry: OfflinePage = {
+      key,
+      accountKey,
+      pageId: page.id,
+      title: page.title,
+      spaceName,
+      kind: page.kind,
+      epoch: page.contentEpoch,
+      canEdit,
+      pendingChanges: previous?.epoch === page.contentEpoch && previous.pendingChanges === true,
+      pendingCopyKeys: previousPendingKeys,
+      revoked: false,
+      lastSyncedAt: Date.now(),
+      storageKeys: [...new Set([...(previous?.storageKeys ?? []), storageKey])],
+    };
+    store.put(entry);
     await transactionDone(transaction);
-    return undefined;
-  }
-  const store = transaction.objectStore("pages");
-  const previous = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
-  const entry: OfflinePage = {
-    key,
-    accountKey,
-    pageId: page.id,
-    title: page.title,
-    spaceName,
-    kind: page.kind,
-    epoch: page.contentEpoch,
-    canEdit,
-    pendingChanges: previous?.epoch === page.contentEpoch && previous.pendingChanges === true,
-    revoked: false,
-    lastSyncedAt: Date.now(),
-    storageKeys: [...new Set([...(previous?.storageKeys ?? []), storageKey])],
-  };
-  store.put(entry);
-  await transactionDone(transaction);
-  return entry;
+    return entry;
+  });
 }
 
 export async function markOfflinePagePending(accountKey: string, pageId: string, pendingChanges: boolean) {
-  const db = await openCatalog();
-  const transaction = db.transaction("pages", "readwrite");
-  const store = transaction.objectStore("pages");
   const key = `${accountKey}\u0000${pageId}`;
-  const page = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
-  if (page) store.put({ ...page, pendingChanges });
-  await transactionDone(transaction);
+  return withPageLock(key, async () => {
+    const db = await openCatalog();
+    const transaction = db.transaction("pages", "readwrite");
+    const store = transaction.objectStore("pages");
+    const page = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
+    if (page) {
+      const currentKey = page.storageKeys.at(-1);
+      const keys = new Set(page.pendingCopyKeys ?? (page.pendingChanges && currentKey ? [currentKey] : []));
+      if (currentKey) {
+        if (pendingChanges) keys.add(currentKey);
+        else keys.delete(currentKey);
+      }
+      store.put({ ...page, pendingChanges, pendingCopyKeys: [...keys] });
+    }
+    await transactionDone(transaction);
+  });
 }
 
 export async function markOfflinePageRevoked(accountKey: string, pageId: string) {
-  const db = await openCatalog();
-  const transaction = db.transaction("pages", "readwrite");
-  const store = transaction.objectStore("pages");
   const key = `${accountKey}\u0000${pageId}`;
-  const page = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
-  const revoked = Boolean(page && !page.pendingChanges);
-  if (page && !page.pendingChanges) store.put({ ...page, revoked: true });
-  await transactionDone(transaction);
-  return revoked;
+  return withPageLock(key, async () => {
+    const db = await openCatalog();
+    const transaction = db.transaction("pages", "readwrite");
+    const store = transaction.objectStore("pages");
+    const page = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
+    const revoked = Boolean(page && !page.pendingChanges && !page.pendingCopyKeys?.length);
+    if (revoked && page) store.put({ ...page, revoked: true });
+    await transactionDone(transaction);
+    return revoked;
+  });
 }
 
 export async function clearRevokedOfflinePages(accountKey: string) {
   const db = await openCatalog();
-  for (const page of (await readAccountPages(accountKey)).filter((entry) => entry.revoked && !entry.pendingChanges)) {
-    for (const key of page.storageKeys) {
-      await new Promise<void>((resolve, reject) => {
-        const request = indexedDB.deleteDatabase(key);
-        request.addEventListener("success", () => resolve());
-        request.addEventListener("error", () => reject(request.error ?? new Error("Offline document removal failed.")));
-        request.addEventListener("blocked", () =>
-          reject(new Error("Close other NoteFlare tabs to remove old copies.")),
-        );
-      });
-    }
-    const transaction = db.transaction("pages", "readwrite");
-    transaction.objectStore("pages").delete(page.key);
-    await transactionDone(transaction);
+  for (const page of (await readAccountPages(accountKey)).filter(
+    (entry) => entry.revoked && !entry.pendingChanges && !entry.pendingCopyKeys?.length,
+  )) {
+    await withPageLock(page.key, async () => {
+      const current = await getOfflinePage(accountKey, page.pageId);
+      if (!current?.revoked || current.pendingChanges || current.pendingCopyKeys?.length) return;
+      for (const key of current.storageKeys) {
+        await new Promise<void>((resolve, reject) => {
+          const request = indexedDB.deleteDatabase(key);
+          request.addEventListener("success", () => resolve());
+          request.addEventListener("error", () =>
+            reject(request.error ?? new Error("Offline document removal failed.")),
+          );
+          request.addEventListener("blocked", () =>
+            reject(new Error("Close other NoteFlare tabs to remove old copies.")),
+          );
+        });
+      }
+      const transaction = db.transaction("pages", "readwrite");
+      transaction.objectStore("pages").delete(current.key);
+      await transactionDone(transaction);
+    });
   }
 }
 

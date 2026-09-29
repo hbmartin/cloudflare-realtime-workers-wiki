@@ -245,6 +245,54 @@ test("opens two visited documents offline and keeps local edits through refresh"
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
 });
 
+test("reports an offline write failure instead of claiming a local save", async ({ page, context }) => {
+  await signInOwner(page);
+  const previousPage = new URL(page.url()).searchParams.get("page");
+  await page.getByRole("button", { name: /Find a page or command/ }).click();
+  await page
+    .getByRole("dialog", { name: "Find a page or command" })
+    .getByRole("option", { name: /Create document/ })
+    .click();
+  await page.waitForURL((url) =>
+    Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
+  );
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type("Online seed");
+  await expect(page.locator(".bn-editor")).toContainText("Online seed");
+  await expect
+    .poll(() =>
+      page.evaluate(async (id) => {
+        const request = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        const read = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const entries = await new Promise<Array<{ pageId: string }>>((resolve) =>
+          read.addEventListener("success", () => resolve(read.result)),
+        );
+        db.close();
+        return entries.some((entry) => entry.pageId === id);
+      }, new URL(page.url()).searchParams.get("page")),
+    )
+    .toBe(true);
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
+  await expect(page.locator(".offline-document .bn-editor")).toBeVisible();
+  await page.evaluate(() => {
+    const add = IDBObjectStore.prototype.add;
+    IDBObjectStore.prototype.add = function (value, key) {
+      if (this.name === "updates" && this.transaction.db.name.startsWith("account:"))
+        throw new DOMException("Storage is full", "QuotaExceededError");
+      return add.call(this, value, key);
+    };
+  });
+  await page.locator(".offline-document .bn-editor").click();
+  await page.keyboard.type(" cannot be persisted");
+  await expect(page.getByText("Local save failed. Export this copy before closing it.")).toBeVisible();
+  await expect(page.getByText("Saved locally · pending server sync")).toHaveCount(0);
+});
+
 test("shows an online-required state for table and diagram links", async ({ page, context }) => {
   await signInOwner(page);
   await expect
@@ -328,7 +376,112 @@ test("warns and offers export before offline sign-out removes pending edits", as
   ).toBe(0);
 });
 
-test("offers an older unscoped Yjs copy for explicit export after authentication", async ({ page }) => {
+test("retains an older epoch draft in the sign-out review after a new copy syncs", async ({ page }) => {
+  await signInOwner(page);
+  const previousPage = new URL(page.url()).searchParams.get("page");
+  await page.getByRole("button", { name: /Find a page or command/ }).click();
+  await page
+    .getByRole("dialog", { name: "Find a page or command" })
+    .getByRole("option", { name: /Create document/ })
+    .click();
+  await page.waitForURL((url) =>
+    Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
+  );
+  const pageId = new URL(page.url()).searchParams.get("page")!;
+  await page.getByLabel("Page title").fill("Older epoch draft");
+  await page.getByLabel("Page title").blur();
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type("Draft from prior epoch");
+  await expect(page.locator(".bn-editor")).toContainText("Draft from prior epoch");
+  await expect
+    .poll(() =>
+      page.evaluate(async (id) => {
+        const request = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        const read = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const entries = await new Promise<Array<{ pageId: string }>>((resolve) =>
+          read.addEventListener("success", () => resolve(read.result)),
+        );
+        db.close();
+        return entries.some((entry) => entry.pageId === id);
+      }, pageId),
+    )
+    .toBe(true);
+
+  const olderKey = await page.evaluate(async (id) => {
+    const catalogRequest = indexedDB.open("noteflare-offline-catalog");
+    const catalog = await new Promise<IDBDatabase>((resolve) =>
+      catalogRequest.addEventListener("success", () => resolve(catalogRequest.result)),
+    );
+    const read = catalog.transaction("pages", "readonly").objectStore("pages").getAll();
+    const entries = await new Promise<Array<{ key: string; pageId: string; storageKeys: string[]; epoch: number }>>(
+      (resolve) => read.addEventListener("success", () => resolve(read.result)),
+    );
+    const entry = entries.find((item) => item.pageId === id);
+    if (!entry) throw new Error("Offline catalog entry is missing.");
+    const currentKey = entry.storageKeys.at(-1)!;
+    const draftKey = currentKey.replace(`:${entry.epoch}:2`, ":0:2");
+    const sourceRequest = indexedDB.open(currentKey);
+    const source = await new Promise<IDBDatabase>((resolve) =>
+      sourceRequest.addEventListener("success", () => resolve(sourceRequest.result)),
+    );
+    const updatesRequest = source.transaction("updates", "readonly").objectStore("updates").getAll();
+    const updates = await new Promise<Uint8Array[]>((resolve) =>
+      updatesRequest.addEventListener("success", () => resolve(updatesRequest.result)),
+    );
+    source.close();
+    const olderRequest = indexedDB.open(draftKey);
+    olderRequest.addEventListener("upgradeneeded", () => {
+      olderRequest.result.createObjectStore("updates", { autoIncrement: true });
+      olderRequest.result.createObjectStore("custom");
+    });
+    const older = await new Promise<IDBDatabase>((resolve) =>
+      olderRequest.addEventListener("success", () => resolve(olderRequest.result)),
+    );
+    const write = older.transaction("updates", "readwrite");
+    for (const update of updates) write.objectStore("updates").add(update);
+    await new Promise<void>((resolve) => write.addEventListener("complete", () => resolve()));
+    older.close();
+    const catalogWrite = catalog.transaction("pages", "readwrite");
+    catalogWrite
+      .objectStore("pages")
+      .put({ ...entry, epoch: 0, pendingChanges: true, pendingCopyKeys: [draftKey], storageKeys: [draftKey] });
+    await new Promise<void>((resolve) => catalogWrite.addEventListener("complete", () => resolve()));
+    catalog.close();
+    return draftKey;
+  }, pageId);
+
+  await page.reload();
+  await expect
+    .poll(() =>
+      page.evaluate(async (id) => {
+        const request = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        const read = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const entries = await new Promise<
+          Array<{ pageId: string; epoch: number; pendingChanges?: boolean; pendingCopyKeys?: string[] }>
+        >((resolve) => read.addEventListener("success", () => resolve(read.result)));
+        db.close();
+        return entries.find((entry) => entry.pageId === id);
+      }, pageId),
+    )
+    .toMatchObject({ epoch: 1, pendingChanges: false, pendingCopyKeys: [olderKey] });
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
+  await expect(page.getByText("Older epoch draft")).toBeVisible();
+  const download = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export pending copies as Markdown" }).click();
+  const path = await (await download).path();
+  expect(path).toBeTruthy();
+  expect(await readFile(path!, "utf8")).toContain("Draft from prior epoch");
+});
+
+test("keeps an unscoped Yjs copy hidden without deleting it", async ({ page }) => {
   await signInOwner(page);
   const previousPage = new URL(page.url()).searchParams.get("page");
   await page.getByRole("button", { name: /Find a page or command/ }).click();
@@ -395,12 +548,11 @@ test("offers an older unscoped Yjs copy for explicit export after authentication
     return `${member.workspace.id}:${id}:${metadata.page.contentEpoch}:1`;
   }, pageId);
   expect(legacyName).toBe(currentLegacyName);
-  await expect(page.getByText("Earlier local copy available")).toBeVisible();
-  const download = page.waitForEvent("download");
-  await page.getByRole("button", { name: /Export earlier copy from epoch/ }).click();
-  const path = await (await download).path();
-  expect(path).toBeTruthy();
-  expect(await readFile(path!, "utf8")).toContain("Older local content");
+  await expect(page.getByText("Earlier local copy available")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Export earlier copy from epoch/ })).toHaveCount(0);
+  expect(
+    await page.evaluate(async (name) => (await indexedDB.databases()).some((entry) => entry.name === name), legacyName),
+  ).toBe(true);
 });
 
 test("removes a clean cached copy when live page access is revoked", async ({ page, context }) => {
