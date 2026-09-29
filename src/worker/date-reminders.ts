@@ -1,6 +1,5 @@
 import { dateMentionDueAt, type ReminderChoice } from "../shared/date-mentions";
 import { dateTokens, type ProseMirrorJson } from "../shared/document-projection";
-export { dateTokens } from "../shared/document-projection";
 import type { DocumentContentEnvelope } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
@@ -62,7 +61,7 @@ async function roomDocument(env: Env, pageId: string, epoch: number) {
   return envelope.document;
 }
 
-export async function pageDateToken(env: Env, page: Pick<PageRow, "id" | "content_epoch">, tokenId: string) {
+async function pageDateToken(env: Env, page: Pick<PageRow, "id" | "content_epoch">, tokenId: string) {
   const tokens = dateTokens(await roomDocument(env, page.id, page.content_epoch));
   return tokens.get(tokenId) ?? null;
 }
@@ -147,6 +146,10 @@ export async function putDateReminder(
   const latestToken = dateTokens(latestDocument).get(tokenId);
   if (!latestToken || latestToken.revision !== token.revision || latestToken.createdBy !== member.user.id) {
     await reconcileDateRemindersForPage(env, page.id, page.content_epoch, latestDocument);
+    const effective = await env.DB.prepare(`SELECT * FROM date_reminders WHERE id=?`)
+      .bind(savedRow.id)
+      .first<ReminderRow>();
+    if (effective?.state === "active" && latestToken?.createdBy === member.user.id) return reminderJson(effective);
     throw new HttpError(409, "date_token_changed", "This date changed. Reopen the reminder and try again.");
   }
   return reminderJson(savedRow);
@@ -172,14 +175,24 @@ export async function reconcileDateRemindersForPage(
   sequence?: number,
   sweepCutoff?: { active: number; delivered: number },
 ) {
+  const tokens = dateTokens(document);
   const rows = await env.DB.prepare(
     `SELECT * FROM date_reminders WHERE page_id=? AND content_epoch=? AND state IN ('active','claimed','delivered','missing')
-      ${sweepCutoff === undefined ? "" : "AND ((state IN ('active','claimed') AND checked_at<?) OR (state IN ('delivered','missing') AND checked_at<?)) ORDER BY checked_at LIMIT 25"}`,
+      ${
+        sweepCutoff === undefined
+          ? "AND (state!='missing' OR token_id IN (SELECT value FROM json_each(?)))"
+          : "AND ((state IN ('active','claimed','missing') AND checked_at<?) OR (state='delivered' AND checked_at<?)) ORDER BY CASE WHEN state IN ('active','claimed') THEN 0 WHEN state='missing' THEN 1 ELSE 2 END,checked_at LIMIT 25"
+      }`,
   )
-    .bind(pageId, epoch, ...(sweepCutoff === undefined ? [] : [sweepCutoff.active, sweepCutoff.delivered]))
+    .bind(
+      pageId,
+      epoch,
+      ...(sweepCutoff === undefined
+        ? [JSON.stringify([...tokens.keys()])]
+        : [sweepCutoff.active, sweepCutoff.delivered]),
+    )
     .all<ReminderRow>();
   if (!rows.results.length) return;
-  const tokens = dateTokens(document);
   const timestamp = Date.now();
   const unchangedIds: string[] = [];
   for (const row of rows.results) {
@@ -195,16 +208,31 @@ export async function reconcileDateRemindersForPage(
         : `AND EXISTS (SELECT 1 FROM document_projections
       WHERE page_id=date_reminders.page_id AND content_epoch=date_reminders.content_epoch AND sequence=?)`;
     if (!sameToken && row.state === "missing") {
-      unchangedIds.push(row.id);
+      if (sweepCutoff !== undefined) unchangedIds.push(row.id);
     } else if (!sameToken) {
       await env.DB.prepare(
         `UPDATE date_reminders SET state='missing',generation=generation+1,claim_id=NULL,claimed_at=NULL,
-           delivery_receipt_id=NULL,checked_at=?,updated_at=?
+           checked_at=?,updated_at=?
          WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
       )
         .bind(timestamp, timestamp, row.id, row.generation, ...(sequence === undefined ? [] : [sequence]))
         .run();
-    } else if (dueAt <= timestamp && (row.state === "missing" || (!unchanged && dueAt !== row.due_at))) {
+    } else if (row.state === "missing" && row.delivery_receipt_id && dueAt === row.due_at) {
+      await env.DB.prepare(
+        `UPDATE date_reminders SET state='delivered',token_revision=?,timezone=?,checked_at=?,updated_at=?
+         WHERE id=? AND generation=? AND state='missing' ${sequenceGuard}`,
+      )
+        .bind(
+          token.revision,
+          token.timezone,
+          timestamp,
+          timestamp,
+          row.id,
+          row.generation,
+          ...(sequence === undefined ? [] : [sequence]),
+        )
+        .run();
+    } else if (dueAt <= timestamp && !unchanged && dueAt !== row.due_at) {
       await env.DB.prepare(
         `UPDATE date_reminders SET state='canceled',generation=generation+1,claim_id=NULL,claimed_at=NULL,
            delivery_receipt_id=NULL,checked_at=?,updated_at=?
@@ -262,16 +290,19 @@ export async function reconcileDateRemindersForPage(
   }
 }
 
-export async function sweepDateReminders(env: Env) {
+async function sweepDateReminders(env: Env) {
   const timestamp = Date.now();
   const cutoffs = { active: timestamp - 15 * 60_000, delivered: timestamp - 24 * 60 * 60_000 };
   const rows = await env.DB.prepare(
-    `SELECT page_id,content_epoch,MIN(checked_at) oldest_check FROM date_reminders
+    `SELECT page_id,content_epoch,MIN(checked_at) oldest_check,
+       MIN(CASE WHEN state IN ('active','claimed') THEN 0 WHEN state='missing' THEN 1 ELSE 2 END) priority
+       FROM date_reminders
        WHERE (state IN ('active','claimed') AND checked_at<?)
-          OR (state IN ('delivered','missing') AND checked_at<?)
-       GROUP BY page_id,content_epoch ORDER BY oldest_check LIMIT 5`,
+          OR (state='missing' AND checked_at<?)
+          OR (state='delivered' AND checked_at<?)
+       GROUP BY page_id,content_epoch ORDER BY priority,oldest_check LIMIT 5`,
   )
-    .bind(cutoffs.active, cutoffs.delivered)
+    .bind(cutoffs.active, cutoffs.active, cutoffs.delivered)
     .all<{ page_id: string; content_epoch: number }>();
   const failures: unknown[] = [];
   for (const row of rows.results) {
@@ -325,10 +356,10 @@ export async function sweepDateReminders(env: Env) {
         });
     }
   }
-  if (failures.length) throw new AggregateError(failures, "Date reminder sweep failed.");
   await env.DB.prepare(`DELETE FROM date_reminders WHERE state='missing' AND updated_at<?`)
     .bind(timestamp - 30 * 24 * 60 * 60_000)
     .run();
+  if (failures.length) throw new AggregateError(failures, "Date reminder sweep failed.");
 }
 
 async function deliverDueDateReminders(env: Env) {
@@ -445,9 +476,20 @@ async function deliverDueDateReminders(env: Env) {
 }
 
 export async function processDueDateReminders(env: Env) {
+  let deliveryFailure: unknown;
   try {
     await deliverDueDateReminders(env);
-  } finally {
-    await sweepDateReminders(env);
+  } catch (error) {
+    deliveryFailure = error;
   }
+  try {
+    await sweepDateReminders(env);
+  } catch (error) {
+    if (deliveryFailure)
+      throw new AggregateError([deliveryFailure, error], "Date reminder delivery and sweep failed.", {
+        cause: error,
+      });
+    throw error;
+  }
+  if (deliveryFailure) throw deliveryFailure;
 }

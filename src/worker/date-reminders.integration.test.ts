@@ -336,7 +336,7 @@ describe("date reminders", () => {
     await processDueDateReminders(env as unknown as Env);
     expect(
       await env.DB.prepare(`SELECT state,due_at FROM date_reminders WHERE token_id=?`).bind(token.tokenId).first(),
-    ).toMatchObject({ state: "active" });
+    ).toEqual({ state: "active", due_at: Date.parse(token.value) });
   });
 
   it("does not deliver when the author loses workspace access before the due scan", async () => {
@@ -470,6 +470,52 @@ describe("date reminders", () => {
         }>()
       )?.count,
     ).toBe(0);
+  });
+
+  it("restores a delivered reminder after its date token is moved", async () => {
+    const installed = await bootstrap();
+    const token: DateMention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: installed.userId,
+      kind: "timed",
+      value: new Date(Date.now() + 3_600_000).toISOString(),
+      timezone: "UTC",
+    };
+    await addToken(installed.page.id, token);
+    const path = `/api/pages/${installed.page.id}/date-reminders/${token.tokenId}`;
+    expect(
+      (
+        await SELF.fetch(
+          request(installed.cookie, path, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ revision: token.revision, choice: "at_time" }),
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    await env.DB.prepare(
+      `UPDATE date_reminders SET state='delivered',delivery_receipt_id='prior-delivery' WHERE token_id=?`,
+    )
+      .bind(token.tokenId)
+      .run();
+    await removeTokens(installed.page.id);
+    await env.DB.prepare(`UPDATE date_reminders SET checked_at=1 WHERE token_id=?`).bind(token.tokenId).run();
+    await processDueDateReminders(env as unknown as Env);
+    expect(
+      await env.DB.prepare(`SELECT state,delivery_receipt_id FROM date_reminders WHERE token_id=?`)
+        .bind(token.tokenId)
+        .first(),
+    ).toEqual({ state: "missing", delivery_receipt_id: "prior-delivery" });
+    await addToken(installed.page.id, token);
+    await env.DB.prepare(`UPDATE date_reminders SET checked_at=1 WHERE token_id=?`).bind(token.tokenId).run();
+    await processDueDateReminders(env as unknown as Env);
+    expect(
+      await env.DB.prepare(`SELECT state,delivery_receipt_id FROM date_reminders WHERE token_id=?`)
+        .bind(token.tokenId)
+        .first(),
+    ).toEqual({ state: "delivered", delivery_receipt_id: "prior-delivery" });
   });
 
   it("keeps existing reminder rows when migrations are replayed", async () => {

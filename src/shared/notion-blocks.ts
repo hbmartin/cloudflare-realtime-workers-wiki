@@ -1,6 +1,13 @@
 import type { ProseMirrorJson } from "./types";
 import { resolveEmbed } from "./embed-providers";
-import { dateMentionFromProps, dateMentionWireProps, validDateMention, type DateMention } from "./date-mentions";
+import {
+  dateMentionFromProps,
+  dateMentionWireProps,
+  resolveLocalDateTime,
+  validCalendarDate,
+  validDateMention,
+  type DateMention,
+} from "./date-mentions";
 import { dateMentionText } from "./document-projection";
 
 export const NOTION_VERSION = "2026-03-11";
@@ -265,9 +272,23 @@ export function notionRichTextToProseMirror(
         if (supplied && existing && supplied.createdBy === existing.createdBy) {
           const date = record(mention.date);
           const dateValue = string(date.start);
-          const kind = /^\d{4}-\d{2}-\d{2}$/.test(dateValue) ? "all-day" : "timed";
           const timezone = string(date.time_zone, existing.timezone);
-          const updated: DateMention = { ...existing, kind, value: dateValue, timezone };
+          const local = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(dateValue);
+          const instant = local
+            ? Number(local[4] ?? 0) < 60
+              ? resolveLocalDateTime(local[1]!, timezone, Number(local[2]), Number(local[3]))
+              : null
+            : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/.test(dateValue)
+              ? Date.parse(dateValue)
+              : null;
+          const kind = validCalendarDate(dateValue) ? "all-day" : "timed";
+          const normalizedValue =
+            kind === "all-day"
+              ? dateValue
+              : instant !== null && Number.isFinite(instant)
+                ? new Date(instant + (local ? Number(local[4] ?? 0) * 1000 : 0)).toISOString()
+                : dateValue;
+          const updated: DateMention = { ...existing, kind, value: normalizedValue, timezone };
           if (!validDateMention(updated)) throw new Error("Date mention is invalid.");
           const unchanged =
             updated.kind === existing.kind &&

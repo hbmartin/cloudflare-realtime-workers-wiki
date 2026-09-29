@@ -32,7 +32,7 @@ function stringAttr(node: ProseMirrorJson, name: string) {
   return typeof value === "string" ? value : null;
 }
 
-export function dateMentionFromNode(node: ProseMirrorJson): DateMention | null {
+function dateMentionFromNode(node: ProseMirrorJson): DateMention | null {
   if (node.type !== "dateMention") return null;
   return dateMentionFromProps(node.attrs ?? {});
 }
