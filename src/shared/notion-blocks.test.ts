@@ -97,6 +97,14 @@ describe("Notion block adapter", () => {
     expect(() => notionRichTextToProseMirror([{ text: { content: "x".repeat(2_001) } }])).toThrow(/2000/);
   });
 
+  it("gates expanded embeds in nested Notion writes", () => {
+    const loom = { embed: { url: "https://www.loom.com/share/be3f4b20127d47be9f884c3fab71d030" } };
+    const nested = { paragraph: { children: [loom] } };
+    expect(() => notionInputToBlockContainer(loom)).toThrow(/supported HTTPS provider/);
+    expect(() => notionInputToBlockContainer(nested)).toThrow(/supported HTTPS provider/);
+    expect(notionInputToBlockContainer(nested, true).content?.[1]?.content?.[0]?.content?.[0]?.type).toBe("embed");
+  });
+
   it("infers only supported payload keys when type is omitted", () => {
     const container = notionInputToBlockContainer({
       object: "block",

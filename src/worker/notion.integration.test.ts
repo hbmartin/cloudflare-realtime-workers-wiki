@@ -105,6 +105,28 @@ beforeEach(async () => {
 });
 
 describe("Notion-compatible API", () => {
+  it("rejects expanded embeds through /v1 while the production flag is off", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const disabledEnv = new Proxy(env, {
+      get(target, property, receiver) {
+        return property === "EXPANDED_EMBEDS_ENABLED" ? "false" : Reflect.get(target, property, receiver);
+      },
+    });
+    const append = (url: string, bindings = disabledEnv) =>
+      worker.fetch(
+        notionRequest(createdIntegration.token, `/blocks/${installed.pageId}/children`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ children: [{ embed: { url } }] }),
+        }),
+        bindings,
+        createExecutionContext(),
+      );
+    expect((await append("https://www.loom.com/share/be3f4b20127d47be9f884c3fab71d030")).status).toBe(400);
+    expect((await append("https://www.youtube.com/watch?v=dQw4w9WgXcQ")).status).toBe(200);
+    expect((await append("https://www.loom.com/share/be3f4b20127d47be9f884c3fab71d030", env)).status).toBe(200);
+  });
   it("uses responding templates for overlapping users and file routes", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);

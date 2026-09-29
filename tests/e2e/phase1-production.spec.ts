@@ -164,6 +164,32 @@ test("offers safe paste choices and keeps the link when preview fetch fails", as
   await expect(page.locator(".editor-bookmark a")).toHaveAttribute("href", embedProviders[0]!.fixture);
 });
 
+test("hides expanded paste actions when bootstrap disables them", async ({ page }) => {
+  await page.route("**/api/me", async (route) => {
+    const response = await route.fetch();
+    const member = (await response.json()) as { features?: { expandedEmbeds?: boolean } };
+    await route.fulfill({
+      response,
+      json: { ...member, features: { ...member.features, expandedEmbeds: false } },
+    });
+  });
+  await signInOwner(page);
+  await createDocument(page);
+  const paragraph = page.locator('.bn-editor [data-content-type="paragraph"]').last();
+  await paragraph.click();
+  await page.evaluate((url) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", url);
+    document.activeElement?.dispatchEvent(
+      new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }),
+    );
+  }, "https://www.loom.com/share/be3f4b20127d47be9f884c3fab71d030");
+  const choices = page.locator(".paste-url-choice");
+  await expect(choices.getByRole("button", { name: "Link" })).toBeVisible();
+  await expect(choices.getByRole("button", { name: "Preview card" })).toHaveCount(0);
+  await expect(choices.getByRole("button", { name: "Embed" })).toHaveCount(0);
+});
+
 test("@touch opens the palette and runs a command", async ({ page }) => {
   await signInOwner(page);
   await page.getByRole("button", { name: /Find a page or command/ }).tap();

@@ -698,6 +698,39 @@ afterEach(async () => {
 });
 
 describe("Worker integration", () => {
+  it("keeps preview routes closed when the production feature flag is off", async () => {
+    const installed = await bootstrap();
+    const disabledEnv = new Proxy(env, {
+      get(target, property, receiver) {
+        return property === "EXPANDED_EMBEDS_ENABLED" ? "false" : Reflect.get(target, property, receiver);
+      },
+    });
+    const me = await worker.fetch(
+      authenticatedRequest(installed.cookie, "/api/me"),
+      disabledEnv,
+      createExecutionContext(),
+    );
+    expect((await me.json<{ features: { expandedEmbeds: boolean } }>()).features.expandedEmbeds).toBe(false);
+    const preview = await worker.fetch(
+      authenticatedRequest(installed.cookie, "/api/link-previews", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: "https://example.org/article" }),
+      }),
+      disabledEnv,
+      createExecutionContext(),
+    );
+    expect(preview.status).toBe(404);
+    const image = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/link-previews/${"a".repeat(64)}/image`),
+      disabledEnv,
+      createExecutionContext(),
+    );
+    expect(image.status).toBe(404);
+    expect(
+      (await env.DB.prepare("SELECT COUNT(*) AS count FROM link_preview_cache").first<{ count: number }>())?.count,
+    ).toBe(0);
+  });
   it("reports a healthy empty installation", async () => {
     const [health, install] = await Promise.all([
       SELF.fetch("http://example.test/api/health"),
