@@ -432,9 +432,42 @@ describe("import content", () => {
     expect(JSON.stringify(parsed.document)).not.toContain("B".repeat(10_000));
   });
 
+  it("keeps medium data images atomic when a label has an unmatched backtick", () => {
+    const first = `data:image/png;base64,${"A".repeat(5_000)}`;
+    const second = `data:image/png;base64,${"B".repeat(5_000)}`;
+    const parsed = markdownToDocument(`See ![a \` tick](${first}) ![b](${second}) then \`one\``);
+    expect(parsed.references).toEqual([first, second]);
+    expect(JSON.stringify(parsed.document)).not.toContain("B".repeat(1_000));
+  });
+
+  it("re-pairs code around an image with unmatched label punctuation", () => {
+    const first = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const second = `data:image/png;base64,${"B".repeat(12_000)}`;
+    const parsed = markdownToDocument(`![a \` tick](${first}) \`start \`end  ![b](${second}) \`tail`);
+    expect(parsed.references).toEqual([first, second]);
+    expect(JSON.stringify(parsed.document)).not.toContain("B".repeat(1_000));
+  });
+
+  it("closes a multi-backtick code span after a literal backslash without swallowing a later link", () => {
+    const parsed = markdownToDocument("Path ``C:\\`` " + "word ".repeat(1_700) + "[later](later.md) more `x` tail");
+    expect(parsed.references).toContain("later.md");
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: "C:\\",
+      marks: [{ type: "code" }],
+    });
+  });
+
   it("strips a small data image after the dense link candidate limit", () => {
     const data = `data:image/png;base64,${"A".repeat(7_000)}`;
     const parsed = markdownToDocument(`${"\\.[".repeat(140)} ![i](${data}) ${"x".repeat(8192)}`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
+  });
+
+  it("strips a case-insensitive data image at the maximum label length after dense candidates", () => {
+    const data = `DATA:image/png;base64,${"A".repeat(7_000)}`;
+    const parsed = markdownToDocument(`${"\\.[".repeat(140)} ![${"x".repeat(511)}](${data}) ${"x".repeat(8_192)}`);
     expect(parsed.references).toContain(data);
     expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
   });

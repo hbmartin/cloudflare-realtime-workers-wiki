@@ -18,7 +18,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import * as Y from "yjs";
 import { DIAGRAM_EDGES_ROOT, DIAGRAM_META_ROOT, DIAGRAM_NODES_ROOT } from "../shared/diagram";
-import { boundedLogString, PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
+import { boundedLogString, prefixedErrorLogFields, PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import { sha256Hex } from "../shared/import-integrity";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
@@ -824,22 +824,13 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
         "workflow.capture_import.unresolved",
         "workflow",
         "Capture import failed while receipt lookup was unavailable.",
-        { jobId: job.id, attempt: job.attempt },
+        {
+          jobId: job.id,
+          attempt: job.attempt,
+          ...prefixedErrorLogFields("firstLookup", lookupError),
+          ...prefixedErrorLogFields("retryLookup", retryError),
+        },
         error,
-      );
-      logger.error(
-        "workflow.capture_lookup.first_failed",
-        "workflow",
-        "First capture receipt lookup failed.",
-        { jobId: job.id, attempt: job.attempt },
-        lookupError,
-      );
-      logger.error(
-        "workflow.capture_lookup.failed",
-        "workflow",
-        "Capture lookup failed during job recovery.",
-        { jobId: job.id, attempt: job.attempt },
-        retryError,
       );
       // The scheduled pass will retry when D1 can answer authoritatively.
     }
@@ -1456,6 +1447,22 @@ export async function recoverQueuedJobs(env: Env) {
   )
     .bind(cutoff)
     .all<Pick<JobRow, "id" | "workflow_instance_id" | "attempt" | "correlation_id">>();
+  const cleanTerminal = async (job: Pick<JobRow, "id" | "attempt">) => {
+    try {
+      await finishPendingJobCleanup(env, job, { terminateWorkflow: false });
+    } catch (error) {
+      logger.error(
+        "workflow.pending_cleanup.failed",
+        "workflow",
+        "Pending job cleanup failed.",
+        { jobId: job.id },
+        error,
+      );
+    }
+  };
+  let cleaned = 0;
+  for (; cleaned < Math.min(2, terminalCleanups.length); cleaned += 1) await cleanTerminal(terminalCleanups[cleaned]!);
+  let started = 0;
   for (const job of queued.results) {
     try {
       await startJobExecution(env, job);
@@ -1476,20 +1483,10 @@ export async function recoverQueuedJobs(env: Env) {
         );
       }
     }
+    started += 1;
+    if (started % 5 === 0 && cleaned < terminalCleanups.length) await cleanTerminal(terminalCleanups[cleaned++]!);
   }
-  for (const job of terminalCleanups) {
-    try {
-      await finishPendingJobCleanup(env, job, { terminateWorkflow: false });
-    } catch (error) {
-      logger.error(
-        "workflow.pending_cleanup.failed",
-        "workflow",
-        "Pending job cleanup failed.",
-        { jobId: job.id },
-        error,
-      );
-    }
-  }
+  for (; cleaned < terminalCleanups.length; cleaned += 1) await cleanTerminal(terminalCleanups[cleaned]!);
   const cleanups = await env.DB.prepare(
     `SELECT id, attempt FROM jobs WHERE cleanup_target IS NOT NULL
       AND status IN (${CLEANUP_JOB_STATUS_SQL}) AND updated_at <= ?
