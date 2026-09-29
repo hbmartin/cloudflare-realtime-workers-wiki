@@ -261,6 +261,26 @@ describe("import content", () => {
     expect(parsed.references).toEqual([data]);
   });
 
+  it("keeps a long inline data image from spilling its payload into text", () => {
+    const data = `data:image/png;base64,${"A".repeat(50_000)}`;
+    const parsed = markdownToDocument(`See ![chart](${data}) below`);
+    expect(parsed.references).toContain(data);
+    expect(parsed.issues).toContainEqual({ code: "image_not_imported", detail: data.slice(0, 120) });
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("keeps a long data-image example inside code as code", () => {
+    const data = `data:image/png;base64,${"A".repeat(10_000)}`;
+    const parsed = markdownToDocument(`\`example ![chart](${data})\``);
+    expect(parsed.references).toEqual([]);
+    expect(parsed.issues.some((issue) => issue.code === "image_not_imported")).toBe(false);
+  });
+
+  it("bounds a hostile image label before asking Marked to tokenize it", () => {
+    const parsed = markdownToDocument(`![\\](${"<? ".repeat(20_000)}](img.png)`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+  });
+
   it("keeps links that follow earlier link destinations near a long-content boundary", () => {
     const parsed = markdownToDocument(
       `[first](first.md) ${"word ".repeat(1634)}[second](https://example.com/second) ${"word ".repeat(1000)}`,
@@ -313,9 +333,31 @@ describe("import content", () => {
     expect(content).toContainEqual({ type: "text", text: "code", marks: [{ type: "code" }] });
   });
 
+  it("keeps a link whose label crosses the long-content cut", () => {
+    const parsed = markdownToDocument(`${"a".repeat(8170)} [see the full design doc](design.md) ${"b ".repeat(100)}*`);
+    expect(parsed.references).toContain("design.md");
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: "see the full design doc",
+      marks: [{ type: "link", attrs: { href: "design.md" } }],
+    });
+  });
+
   it("keeps a link after dense escaped content without lexing the whole paragraph", () => {
     const parsed = markdownToDocument(`${"\\.".repeat(10_000)} [late](late.md)`);
     expect(parsed.references).toContain("late.md");
+  });
+
+  it("keeps links after unmatched backticks and backslashes in dense content", () => {
+    const unmatched = markdownToDocument(`${"\\.".repeat(200)} it's [late](late.md) ${"x ".repeat(4200)}`);
+    expect(unmatched.references).toContain("late.md");
+    const code = markdownToDocument(`${"\\.".repeat(200)} \`C:\\ a\` [after](after.md) ${"x ".repeat(4200)}`);
+    expect(code.references).toContain("after.md");
+  });
+
+  it("keeps a dense long link label without invoking recursive Marked label parsing", () => {
+    const parsed = markdownToDocument(`[${"<? ".repeat(2_000)}](dense.md) ${"\\.".repeat(5_000)}`);
+    expect(parsed.references).toContain("dense.md");
   });
 
   it("finishes malformed tags and escapes in a long paragraph", () => {
@@ -325,8 +367,9 @@ describe("import content", () => {
 
   it("finishes a long paragraph without spaces", () => {
     const parsed = markdownToDocument(`*${"a".repeat(1_000_000)}`);
-    expect(parsed.document.content![0]!.content![0]!.content![0]!.content!.map((node) => node.text).join(""))
-      .toHaveLength(1_000_001);
+    expect(
+      parsed.document.content![0]!.content![0]!.content![0]!.content!.map((node) => node.text).join(""),
+    ).toHaveLength(1_000_001);
   });
 
   it("keeps code-span brackets in a block image caption", () => {

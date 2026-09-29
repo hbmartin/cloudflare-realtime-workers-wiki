@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { Lexer, type Token, type Tokenizer } from "marked";
+import { Lexer, Tokenizer, type Token } from "marked";
 import type { ColumnType, ProseMirrorJson } from "./types";
 
 export type ImportedTable = {
@@ -145,9 +145,153 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
   return output;
 }
 
+function safeInlineCut(value: string, start: number, maximum: number) {
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  let ticks = 0;
+  let whitespace = 0;
+  for (let index = start; index < maximum; index += 1) {
+    const character = value[index];
+    if (character === "\\" && !ticks) {
+      index += 1;
+      continue;
+    }
+    if (character === "`") {
+      let end = index + 1;
+      while (end < maximum && value[end] === "`") end += 1;
+      const run = end - index;
+      if (ticks === run) ticks = 0;
+      else if (!ticks) ticks = run;
+      index = end - 1;
+      continue;
+    }
+    if (!ticks) {
+      if (character === "[") bracketDepth += 1;
+      else if (character === "]" && bracketDepth) bracketDepth -= 1;
+      else if (character === "(" && (parenDepth || value[index - 1] === "]")) parenDepth += 1;
+      else if (character === ")" && parenDepth) parenDepth -= 1;
+      if (character === " " && !bracketDepth && !parenDepth && index >= start + 1024) whitespace = index + 1;
+    }
+  }
+  return whitespace || maximum;
+}
+
+function trailingEscape(value: string, boundary: number) {
+  let count = 0;
+  for (let index = boundary - 1; index >= 0 && value[index] === "\\"; index -= 1) count += 1;
+  return count % 2 === 1;
+}
+
+function safeDenseBoundary(value: string, boundary: number) {
+  const brackets: number[] = [];
+  let ticks = 0;
+  let tickStart = 0;
+  for (let index = 0; index < boundary; index += 1) {
+    const character = value[index];
+    if (character === "\\" && !ticks) {
+      index += 1;
+      continue;
+    }
+    if (character === "`") {
+      let end = index + 1;
+      while (end < boundary && value[end] === "`") end += 1;
+      const run = end - index;
+      if (ticks === run) ticks = 0;
+      else if (!ticks) {
+        ticks = run;
+        tickStart = index;
+      }
+      index = end - 1;
+      continue;
+    }
+    if (!ticks && character === "[") brackets.push(index);
+    else if (!ticks && character === "]") brackets.pop();
+  }
+  return ticks ? tickStart : (brackets[0] ?? boundary);
+}
+
+function longDataImage(value: string, start: number) {
+  if (!value.startsWith("![", start) || (start > 0 && value[start - 1] === "\\")) return null;
+  let labelEnd = start + 2;
+  while (labelEnd < Math.min(start + 514, value.length)) {
+    if (value[labelEnd] === "\\") labelEnd += 2;
+    else if (value[labelEnd] === "]") break;
+    else labelEnd += 1;
+  }
+  if (value.slice(labelEnd, labelEnd + 2) !== "](") return null;
+  const destinationStart = labelEnd + 2;
+  if (!/^data:image\/(?:png|gif|jpeg|webp);base64,/i.test(value.slice(destinationStart, destinationStart + 40)))
+    return null;
+  const end = value.indexOf(")", destinationStart);
+  if (end < 0 || end - start > 64_000 || end - start <= 8192) return null;
+  const href = safeLink(value.slice(destinationStart, end));
+  if (!href) return null;
+  return { label: unescapeMarkdown(value.slice(start + 2, labelEnd)), href, end: end + 1 };
+}
+
+function linkLabelEnd(value: string, start: number, maximum: number) {
+  let depth = 1;
+  let ticks = 0;
+  let index = start + (value[start] === "!" ? 2 : 1);
+  for (; index < Math.min(value.length, start + maximum) && depth; index += 1) {
+    const character = value[index];
+    if (character === "`") {
+      let end = index + 1;
+      while (value[end] === "`") end += 1;
+      ticks = ticks ? 0 : end - index;
+      index = end - 1;
+    } else if (!ticks && character === "\\") index += 1;
+    else if (!ticks && character === "[") depth += 1;
+    else if (!ticks && character === "]") depth -= 1;
+  }
+  return !depth && value[index] === "(" ? index - 1 : null;
+}
+
+function simpleLongLink(value: string, start: number, labelEnd: number) {
+  let depth = 1;
+  let end = labelEnd + 2;
+  for (; end < value.length && depth; end += 1) {
+    if (value[end] === "\\") end += 1;
+    else if (value[end] === "(") depth += 1;
+    else if (value[end] === ")") depth -= 1;
+  }
+  if (depth) return null;
+  const rawDestination = value.slice(labelEnd + 2, end - 1).trim();
+  const destination =
+    rawDestination.startsWith("<") && rawDestination.endsWith(">") ? rawDestination.slice(1, -1) : rawDestination;
+  if (/\s/.test(destination)) return null;
+  return {
+    label: unescapeMarkdown(value.slice(start + (value[start] === "!" ? 2 : 1), labelEnd)),
+    href: destination,
+    end,
+  };
+}
+
+function markdownLexer() {
+  const tokenizer = new Tokenizer({ gfm: false });
+  return { tokenizer, lexer: new Lexer({ gfm: false, tokenizer }) };
+}
+
 function boundedMarkdownInline(value: string, issues: ImportIssue[], references: string[]) {
   issues.push({ code: "inline_markup_simplified", detail: "Long inline content was parsed in bounded sections." });
   const output: ProseMirrorJson[] = [];
+  const outsideCodeAt = (position: number) => {
+    let codeTicks = 0;
+    for (let index = 0; index < position; index += 1) {
+      if (value[index] === "\\" && !codeTicks) {
+        index += 1;
+        continue;
+      }
+      if (value[index] !== "`") continue;
+      let end = index + 1;
+      while (value[end] === "`") end += 1;
+      const run = end - index;
+      if (codeTicks === run) codeTicks = 0;
+      else if (!codeTicks) codeTicks = run;
+      index = end - 1;
+    }
+    return !codeTicks;
+  };
   const append = (section: ProseMirrorJson[]) => {
     for (const node of section) {
       const previous = output.at(-1);
@@ -157,13 +301,27 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
     }
   };
   const appendDense = (section: string) => {
-    const lexer = new Lexer({ gfm: false });
+    const { tokenizer } = markdownLexer();
+    const futureRuns = new Map<number, number>();
+    const pairedRuns = new Set<number>();
+    for (let index = section.length - 1; index >= 0;) {
+      if (section[index] !== "`") {
+        index -= 1;
+        continue;
+      }
+      let start = index;
+      while (start > 0 && section[start - 1] === "`") start -= 1;
+      const run = index - start + 1;
+      if (futureRuns.has(run)) pairedRuns.add(start);
+      futureRuns.set(run, start);
+      index = start - 1;
+    }
     let cursor = 0;
     let ticks = 0;
     let candidates = 0;
     for (let index = 0; index < section.length; index += 1) {
       const character = section[index];
-      if (character === "\\") {
+      if (character === "\\" && !ticks) {
         index += 1;
         continue;
       }
@@ -171,14 +329,38 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
         let end = index + 1;
         while (section[end] === "`") end += 1;
         const run = end - index;
-        if (!ticks || ticks === run) ticks = ticks ? 0 : run;
+        if (ticks === run) ticks = 0;
+        else if (!ticks && pairedRuns.has(index)) ticks = run;
         index = end - 1;
         continue;
       }
       if (ticks || (character !== "[" && !(character === "!" && section[index + 1] === "["))) continue;
       const start = index;
       if (++candidates > 128) break;
-      const token = (lexer as unknown as { tokenizer: Tokenizer }).tokenizer.link(section.slice(start));
+      const labelEnd = linkLabelEnd(section, start, 8192);
+      if (labelEnd === null) continue;
+      const label = section.slice(start, labelEnd);
+      if (label.length > 512 && (label.match(/[<\\*_`]/g)?.length ?? 0) > 32) {
+        const simple = simpleLongLink(section, start, labelEnd);
+        if (!simple) continue;
+        const href = safeLink(simple.href);
+        append(inline(unescapeMarkdown(section.slice(cursor, start))));
+        if (!href) {
+          issues.push({ code: "unsafe_url", detail: simple.href.slice(0, 120) });
+          append(inline(simple.label));
+        } else if (section[start] === "!") {
+          references.push(href);
+          issues.push({ code: "image_not_imported", detail: href.slice(0, 120) });
+          append(inline(simple.label));
+        } else {
+          references.push(href);
+          append(inline(simple.label, [{ type: "link", attrs: { href } }]));
+        }
+        cursor = simple.end;
+        index = cursor - 1;
+        continue;
+      }
+      const token = tokenizer.link(section.slice(start));
       if (!token || (token.type !== "link" && token.type !== "image")) continue;
       append(inline(unescapeMarkdown(section.slice(cursor, start))));
       append(markdownInline("", issues, references, [token]));
@@ -190,12 +372,21 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
   // Bound every Marked call. A malformed tag or escape can make its inline
   // scanner revisit the remainder of its input for each delimiter.
   for (let start = 0; start < value.length;) {
+    const dataImage = value.startsWith("![", start) && outsideCodeAt(start) ? longDataImage(value, start) : null;
+    if (dataImage) {
+      references.push(dataImage.href);
+      issues.push({ code: "image_not_imported", detail: dataImage.href.slice(0, 120) });
+      append(inline(dataImage.label));
+      start = dataImage.end;
+      continue;
+    }
     let cut = Math.min(start + 8192, value.length);
+    const nextImage = value.indexOf("![", start + 1);
+    if (nextImage > start && nextImage < cut && outsideCodeAt(nextImage) && longDataImage(value, nextImage))
+      cut = nextImage;
     if (cut < value.length) {
-      const windowStart = start + 1024;
-      const whitespace = value.slice(windowStart, cut).lastIndexOf(" ");
-      if (whitespace >= 0) cut = windowStart + whitespace + 1;
-      else if (value[cut - 1] === "\\") cut -= 1;
+      cut = safeInlineCut(value, start, cut);
+      if (trailingEscape(value, cut) && value[cut] !== undefined) cut -= 1;
     }
     const section = value.slice(start, cut);
     if ((section.match(/[<\\]/g)?.length ?? 0) > 128) {
@@ -205,14 +396,16 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
         if (section[boundary] === "<" || section[boundary] === "\\") count += 1;
         boundary += 1;
       }
-      if (section[boundary - 1] === "\\" && boundary < section.length) boundary += 1;
+      boundary = safeDenseBoundary(section, boundary);
+      if (trailingEscape(section, boundary) && boundary < section.length) boundary += 1;
       const prefix = section.slice(0, boundary);
-      append(markdownInline(prefix, issues, references, new Lexer({ gfm: false }).inlineTokens(prefix)));
+      const { tokenizer: prefixTokenizer, lexer: prefixLexer } = markdownLexer();
+      if ((prefix.match(/[*_`]/g)?.length ?? 0) > 512) prefixTokenizer.emStrong = () => undefined;
+      append(markdownInline(prefix, issues, references, prefixLexer.inlineTokens(prefix)));
       appendDense(section.slice(boundary));
     } else {
-      const lexer = new Lexer({ gfm: false });
-      if ((section.match(/[*_`]/g)?.length ?? 0) > 512)
-        (lexer as unknown as { tokenizer: Tokenizer }).tokenizer.emStrong = () => undefined;
+      const { tokenizer, lexer } = markdownLexer();
+      if ((section.match(/[*_`]/g)?.length ?? 0) > 512) tokenizer.emStrong = () => undefined;
       append(markdownInline(section, issues, references, lexer.inlineTokens(section)));
     }
     start = cut;
@@ -222,28 +415,15 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
 
 function markdownImage(value: string) {
   const trimmed = value.trim();
-  // Use Marked's image grammar directly, without lexing hostile trailing text.
-  const destination = trimmed.indexOf("](");
-  if (!trimmed.startsWith("![") || trimmed.length > 64_000 || destination < 0 || destination > 8192) return null;
-  const image = (new Lexer({ gfm: false }) as unknown as { tokenizer: Tokenizer }).tokenizer.link(trimmed);
+  // Bound the label before Marked tokenizes it: Marked lexes image labels
+  // recursively, and a hostile long label can otherwise dominate the import.
+  if (!trimmed.startsWith("![") || trimmed.length > 64_000) return null;
+  const labelEnd = linkLabelEnd(trimmed, 0, 8192);
+  if (labelEnd === null) return null;
+  const { tokenizer } = markdownLexer();
+  const image = tokenizer.link(trimmed);
   if (image?.type !== "image" || image.raw !== trimmed) return null;
-  let depth = 1;
-  let ticks = 0;
-  let end = 2;
-  for (; end < trimmed.length && depth; end += 1) {
-    const character = trimmed[end];
-    if (character === "`") {
-      let next = end + 1;
-      while (trimmed[next] === "`") next += 1;
-      const run = next - end;
-      if (!ticks || ticks === run) ticks = ticks ? 0 : run;
-      end = next - 1;
-    } else if (!ticks && character === "\\") end += 1;
-    else if (!ticks && character === "[") depth += 1;
-    else if (!ticks && character === "]") depth -= 1;
-  }
-  if (depth) return null;
-  return { label: unescapeMarkdown(trimmed.slice(2, end - 1)), href: image.href };
+  return { label: unescapeMarkdown(trimmed.slice(2, labelEnd)), href: image.href };
 }
 
 export function markdownToDocument(source: string) {

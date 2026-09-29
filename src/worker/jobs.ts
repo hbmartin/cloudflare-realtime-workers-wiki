@@ -810,6 +810,13 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
     return await hasUnlinkedCapture(env, job.id);
   } catch (lookupError) {
     logger.error(
+      "workflow.capture_import.failed",
+      "workflow",
+      "Capture import failed while its receipt was unavailable.",
+      { jobId: job.id, attempt: job.attempt },
+      error,
+    );
+    logger.error(
       "workflow.capture_lookup.failed",
       "workflow",
       "Capture lookup failed during job recovery.",
@@ -822,6 +829,11 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
       "Capture recovery deferred until its receipt can be checked.",
       { jobId: job.id, attempt: job.attempt },
     );
+    try {
+      return await hasUnlinkedCapture(env, job.id);
+    } catch {
+      // The scheduled pass will retry when D1 can answer authoritatively.
+    }
     // Defer recovery until D1 can distinguish an unlinked receipt from a real
     // import failure. Neither outcome is safe to assume during an outage.
     return "lookup_failed" as const;
@@ -962,10 +974,10 @@ export async function finishPendingJobCleanup(
 
   const stillOwned = cleanupLeaseGuard(env, identity, token, timestamp);
   try {
-    if (options.terminateWorkflow !== false && job.workflow_instance_id && env.WORKFLOW_INLINE !== "true") {
+    if (options.terminateWorkflow !== false && env.WORKFLOW_INLINE !== "true") {
       let terminating = false;
       try {
-        const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
+        const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id ?? job.id);
         const status = await instance.status();
         if (ACTIVE_WORKFLOW_STATUSES.has(status.status)) {
           terminating = true;
@@ -1207,7 +1219,7 @@ export async function resolveJobWorkflowAttempt(
   event: Pick<WorkflowEvent<JobWorkflowParams>, "payload" | "instanceId">,
 ) {
   if (Number.isInteger(event.payload.attempt) && event.payload.attempt! > 0) return event.payload.attempt!;
-  const legacy = await env.DB.prepare(`SELECT attempt FROM jobs WHERE id = ? AND workflow_instance_id = ?`)
+  const legacy = await env.DB.prepare(`SELECT attempt FROM jobs WHERE id = ? AND COALESCE(workflow_instance_id,id) = ?`)
     .bind(event.payload.jobId, event.instanceId)
     .first<{ attempt: number }>();
   return legacy?.attempt ?? null;
@@ -1406,7 +1418,7 @@ export async function recoverQueuedJobs(env: Env) {
             continue;
           }
         }
-        await failJobWithCleanup(env, job, failure, true);
+        await failJobWithCleanup(env, job, failure);
       } catch (error) {
         logger.error(
           "workflow.running_recovery.failed",
