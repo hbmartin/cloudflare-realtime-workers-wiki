@@ -627,11 +627,12 @@ function CollaborativeEditor({
       event.preventDefault();
       event.stopPropagation();
       setPasteChoice(null);
+      onError("");
       editor.focus();
     };
     choice?.addEventListener("keydown", onKeyDown);
     return () => choice?.removeEventListener("keydown", onKeyDown);
-  }, [editor, pasteChoice]);
+  }, [editor, onError, pasteChoice]);
   useEffect(() => {
     const root = editorShellRef.current;
     if (!root) return undefined;
@@ -670,9 +671,31 @@ function CollaborativeEditor({
   const choosePaste = (kind: "link" | "preview" | "embed") => {
     if (!pasteChoice) return;
     const { url, blockId } = pasteChoice;
+    if (!editable || !editor.isEditable) {
+      onError(`This page is read-only. Paste this URL when editing is available: ${url}`);
+      setPasteChoice(null);
+      return;
+    }
     const block = editor.getBlock(blockId);
     if (!block || block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) {
-      onError(`The paragraph changed. Paste this URL again: ${url}`);
+      if (block && JSON.stringify(block.content).includes(url)) {
+        onError(
+          `The paragraph changed and already contains this URL. Paste it again to choose a different format: ${url}`,
+        );
+      } else {
+        const last = editor.document.at(-1);
+        try {
+          if (!last) throw new Error("No block to insert after.");
+          editor.insertBlocks(
+            [{ type: "paragraph", content: [{ type: "link", href: url, content: url }] }] as never,
+            last,
+            "after",
+          );
+          onError(`The paragraph changed, so the URL was added as a link at the end of the page: ${url}`);
+        } catch {
+          onError(`The paragraph changed. Paste this URL again: ${url}`);
+        }
+      }
       setPasteChoice(null);
       editor.focus();
       return;
@@ -687,6 +710,7 @@ function CollaborativeEditor({
       // Store the URL immediately; the bookmark resolves disposable metadata in the background.
       editor.replaceBlocks([block], [{ type: "bookmark", props: { url, title: url } }] as never);
     }
+    onError("");
     setPasteChoice(null);
     editor.focus();
   };
@@ -877,6 +901,7 @@ function CollaborativeEditor({
               type="button"
               onClick={() => {
                 setPasteChoice(null);
+                onError("");
                 editor.focus();
               }}
             >

@@ -266,6 +266,8 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
       const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
         .bind(id, workspaceId)
         .first<CacheRow>();
+      if (current && current.expires_at <= Date.now() && current.refresh_until <= Date.now())
+        throw new HttpError(503, "preview_pending", "Link preview is still being fetched. Try again shortly.");
       if (current)
         return current.refresh_until > now && current.fetched_at <= 0
           ? waitForRefresh(env, workspaceId, id)
@@ -317,7 +319,6 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
   let siteName = url.hostname;
   let imageKey: string | null = null;
   let imageMime: string | null = null;
-  let hasImageMetadata = false;
   let succeeded = false;
   try {
     const signal = AbortSignal.timeout(FETCH_TIMEOUT);
@@ -331,7 +332,6 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     siteName = parsed.siteName || siteName;
     succeeded = true;
     if (parsed.image) {
-      hasImageMetadata = true;
       let stagedKey: string | null = null;
       try {
         const image = await fetchPublic(publicUrl(parsed.image, page.url.href), signal);
@@ -358,10 +358,6 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     }
   } catch {
     // A failed external request is a short-lived plain link card.
-  }
-  if (succeeded && hasImageMetadata && !imageKey && existing?.image_key) {
-    imageKey = existing.image_key;
-    imageMime = existing.image_mime;
   }
   if (!succeeded && existing && existing.fetched_at > 0) {
     title = existing.title;
@@ -393,9 +389,24 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
            AND image_key = ? AND refresh_until = 0)`,
       ).bind(imageKey, id, workspaceId, imageKey),
     );
-  // An RPC failure can arrive after D1 commits. Keep the staged GC entry in that
-  // case; scheduled cleanup skips keys still referenced by a cache row.
-  const saved: D1Result[] = await env.DB.batch(statements);
+  let saved: D1Result[];
+  try {
+    saved = await env.DB.batch(statements);
+  } catch (cause) {
+    // D1 can commit and then lose its RPC response. Read back before discarding R2.
+    let current: CacheRow | null;
+    try {
+      current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
+        .bind(id, workspaceId)
+        .first<CacheRow>();
+    } catch {
+      // The staged key stays reserved for scheduled cleanup when D1 is unreadable.
+      throw cause;
+    }
+    if (current && current.refresh_until === 0 && current.expires_at > Date.now()) return responsePreview(current);
+    if (imageKey && imageKey !== existing?.image_key) await discardImage(env, imageKey);
+    throw cause;
+  }
   if (!saved[1]?.meta.changes) {
     if (imageKey && imageKey !== existing?.image_key) await discardImage(env, imageKey);
     const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")

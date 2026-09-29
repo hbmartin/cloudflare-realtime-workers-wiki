@@ -125,7 +125,7 @@ describe("link previews", () => {
     expect(await env.BUCKET.get(newKey)).toBeTruthy();
   });
 
-  it("keeps the prior image when refreshed metadata has no usable image", async () => {
+  it("removes a stale image when refreshed metadata has no usable image", async () => {
     const fetcher = vi.fn(async (url: string) =>
       url === pageUrl
         ? new Response(`<title>Updated</title><meta property="og:image" content="${imageUrl}">`, {
@@ -147,8 +147,9 @@ describe("link previews", () => {
     });
     const refreshed = await linkPreview(env, "workspace", pageUrl);
     expect(refreshed.title).toBe("New title");
-    expect(refreshed.imageUrl).toBe(first.imageUrl);
-    expect(await env.BUCKET.get(key)).toBeTruthy();
+    expect(refreshed.imageUrl).toBeNull();
+    await pruneLinkPreviews(env);
+    expect(await env.BUCKET.get(key)).toBeNull();
   });
 
   it("does not claim a replacement row using a stale cache snapshot", async () => {
@@ -176,7 +177,7 @@ describe("link previews", () => {
                      (id,workspace_id,canonical_url,title,description,site_name,expires_at,fetched_at,refresh_until)
                      VALUES (?,?,?,?,?,?,?,?,0)`,
                     )
-                    .bind(first.id, "workspace", pageUrl, "Replacement", "", "site", Date.now() + 60_000, Date.now())
+                    .bind(first.id, "workspace", pageUrl, "Replacement", "", "site", 1, Date.now())
                     .run();
                   return prepared.bind(...args).run();
                 },
@@ -187,7 +188,17 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    expect((await linkPreview({ ...env, DB: db as D1Database }, "workspace", pageUrl)).title).toBe("Replacement");
+    await expect(linkPreview({ ...env, DB: db as D1Database }, "workspace", pageUrl)).rejects.toMatchObject({
+      status: 503,
+      code: "preview_pending",
+    });
+    expect(
+      (
+        await env.DB.prepare("SELECT title FROM link_preview_cache WHERE id=?")
+          .bind(first.id)
+          .first<{ title: string }>()
+      )?.title,
+    ).toBe("Replacement");
     expect(fetcher).not.toHaveBeenCalled();
   });
 
@@ -261,7 +272,7 @@ describe("link previews", () => {
     ).toBe(0);
   });
 
-  it("reclaims a staged image after D1 fails before committing", async () => {
+  it("reclaims a staged image when D1 fails and immediate R2 cleanup fails", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) =>
@@ -282,7 +293,19 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    await expect(linkPreview({ ...env, DB: db }, "workspace", pageUrl)).rejects.toThrow("D1 unavailable");
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "delete")
+          return async () => {
+            throw new Error("R2 unavailable");
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(linkPreview({ ...env, DB: db, BUCKET: bucket }, "workspace", pageUrl)).rejects.toThrow(
+      "D1 unavailable",
+    );
     const staged = await env.DB.prepare("SELECT image_key FROM link_preview_image_gc").first<{ image_key: string }>();
     expect(staged).toBeTruthy();
     expect(await env.BUCKET.get(staged!.image_key)).toBeTruthy();
@@ -313,7 +336,8 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    await expect(linkPreview({ ...env, DB: db }, "workspace", pageUrl)).rejects.toThrow("D1 response lost");
+    const preview = await linkPreview({ ...env, DB: db }, "workspace", pageUrl);
+    expect(preview.imageUrl).toBe(`/api/link-previews/${preview.id}/image`);
     const row = await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE workspace_id=?")
       .bind("workspace")
       .first<{ image_key: string }>();

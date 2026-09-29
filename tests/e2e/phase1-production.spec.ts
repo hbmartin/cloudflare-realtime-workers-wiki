@@ -185,9 +185,15 @@ test("does not overwrite a changed paragraph from a stale paste choice", async (
   await paragraph.click();
   await page.keyboard.type("Keep this paragraph");
   await choices.getByRole("button", { name: "Embed" }).click();
-  await expect(paragraph).toContainText("Keep this paragraph");
+  await expect(
+    page.locator('.bn-editor [data-content-type="paragraph"]').filter({ hasText: "Keep this paragraph" }),
+  ).toHaveCount(1);
   await expect(page.locator(".editor-embed")).toHaveCount(0);
-  await expect(page.getByRole("alert")).toContainText(`Paste this URL again: ${embedProviders[0]!.fixture}`);
+  await expect(page.locator('.bn-editor [data-content-type="paragraph"] a').last()).toHaveAttribute(
+    "href",
+    embedProviders[0]!.fixture,
+  );
+  await expect(page.getByRole("alert")).toContainText("added as a link at the end of the page");
 });
 
 test("hides expanded paste actions when bootstrap disables them", async ({ page }) => {
