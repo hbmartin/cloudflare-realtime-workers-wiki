@@ -40,6 +40,7 @@ import {
   offlineDocumentKey,
   pendingKeysOf,
   rememberOfflinePage,
+  storageEpoch,
 } from "./offline-catalog";
 
 export type EditorPageProps = {
@@ -80,14 +81,31 @@ export function EditorPage({
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
   const recoveryKey = `notes:recovery:${member.user.id}:${member.workspace.id}:${page.id}`;
-  const [recovery, setRecovery] = useState<{ key: string; epoch: number } | null>(() => {
+  type RecoveryEntry = { key: string; epoch: number; reason?: "access" | "storage" | "epoch" };
+  const [recovery, setRecovery] = useState<RecoveryEntry[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem(recoveryKey) ?? "null");
+      const saved: unknown = JSON.parse(localStorage.getItem(recoveryKey) ?? "null");
+      const entries = Array.isArray(saved) ? saved : saved ? [saved] : [];
+      return entries.filter(
+        (entry): entry is RecoveryEntry =>
+          entry !== null && typeof entry === "object" && typeof entry.key === "string" && Number.isInteger(entry.epoch),
+      );
     } catch {
-      return null;
+      return [];
     }
   });
-  const [recoveryPreview, setRecoveryPreview] = useState("");
+  const dismissedRecovery = useRef<string[]>([]);
+  useEffect(() => {
+    try {
+      const saved: unknown = JSON.parse(localStorage.getItem(`${recoveryKey}:dismissed`) ?? "[]");
+      dismissedRecovery.current = Array.isArray(saved)
+        ? saved.filter((value): value is string => typeof value === "string")
+        : [];
+    } catch {
+      dismissedRecovery.current = [];
+    }
+  }, [recoveryKey]);
+  const [recoveryPreview, setRecoveryPreview] = useState<{ key: string; text: string } | null>(null);
   const [title, setTitle] = useState(page.title);
   const [titleError, setTitleError] = useState("");
   const [editorError, setEditorError] = useState("");
@@ -139,17 +157,22 @@ export function EditorPage({
   useEffect(() => {
     let active = true;
     const currentStorageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
-    const quarantine = (key = currentStorageKey) => {
+    const quarantine = (key = currentStorageKey, reason: RecoveryEntry["reason"] = "epoch") => {
       const value = {
         key,
-        epoch: Number(key.split(":").at(-2)) || page.contentEpoch,
+        epoch: storageEpoch(key) || page.contentEpoch,
+        reason,
       };
-      const serialized = JSON.stringify(value);
-      if (localStorage.getItem(recoveryKey) !== serialized) localStorage.setItem(recoveryKey, serialized);
-      setRecovery((current) => (current?.key === value.key && current.epoch === value.epoch ? current : value));
+      if (dismissedRecovery.current.includes(key) && reason === "epoch") return;
+      setRecovery((current) => {
+        const next = [...current.filter((entry) => entry.key !== key), value].sort((a, b) => a.epoch - b.epoch);
+        localStorage.setItem(recoveryKey, JSON.stringify(next));
+        return next;
+      });
     };
     let next: CollaborationBundle;
     let catalogFailures = 0;
+    let pendingActive = false;
     const beforeConnect = async () => {
       const accountKey = offlineAccountKey(offlineMember.current);
       let catalogPage;
@@ -165,9 +188,9 @@ export function EditorPage({
         throw error;
       }
       const pendingKeys = catalogPage ? pendingKeysOf(catalogPage) : [];
-      const olderDraft = pendingKeys.find((key) => key !== currentStorageKey);
-      if (olderDraft) quarantine(olderDraft);
-      const hasLocalDraft = pendingKeys.includes(currentStorageKey) || (!catalogPage && next.hasUnsyncedChanges);
+      const olderDrafts = pendingKeys.filter((key) => key !== currentStorageKey);
+      for (const key of olderDrafts) quarantine(key);
+      const hasLocalDraft = pendingKeys.includes(currentStorageKey) || pendingActive || next.hasUnsyncedChanges;
       const controller = new AbortController();
       const deadline = window.setTimeout(() => controller.abort(), 10_000);
       try {
@@ -177,21 +200,21 @@ export function EditorPage({
           return false;
         }
         // A clean copy can rely on the document room's page access check.
-        if (!hasLocalDraft && !olderDraft) return true;
+        if (!hasLocalDraft && !olderDrafts.length) return true;
         const [{ page: currentPage }, { spaces }] = await Promise.all([
           api<{ page: Page }>(`/api/pages/${encodeURIComponent(page.id)}`, { signal: controller.signal }),
           api<{ spaces: Space[] }>("/api/spaces", { signal: controller.signal }),
         ]);
         if (!active) return false;
         if (currentPage.contentEpoch !== page.contentEpoch) {
-          if (hasLocalDraft || olderDraft) quarantine(olderDraft ?? currentStorageKey);
+          if (hasLocalDraft) quarantine(currentStorageKey);
           onPageChanged(currentPage);
           return false;
         }
         const space = spaces.find((item) => item.id === currentPage.spaceId);
         if (!space || (space.effectiveRole === "viewer" && hasLocalDraft)) {
-          if (hasLocalDraft || olderDraft) {
-            quarantine(olderDraft ?? currentStorageKey);
+          if (hasLocalDraft || olderDrafts.length) {
+            if (hasLocalDraft) quarantine(currentStorageKey, "access");
             setAccessQuarantine(true);
           } else {
             onPageUnavailable(page.id);
@@ -202,9 +225,9 @@ export function EditorPage({
       } catch (error) {
         if (error instanceof ApiClientError && [401, 403, 404, 410].includes(error.status)) {
           if (error.status === 401) {
-            if (hasLocalDraft) quarantine();
-          } else if (hasLocalDraft || olderDraft) {
-            quarantine(olderDraft ?? currentStorageKey);
+            if (hasLocalDraft) quarantine(currentStorageKey, "access");
+          } else if (hasLocalDraft || olderDrafts.length) {
+            if (hasLocalDraft) quarantine(currentStorageKey, "access");
             setAccessQuarantine(true);
           } else if (error.status === 403) onAccessDenied(page.id, error);
           else onPageUnavailable(page.id);
@@ -224,7 +247,14 @@ export function EditorPage({
       beforeConnect,
     );
     let pendingWrite = Promise.resolve();
-    let pendingActive = false;
+    const clearCurrentRecovery = () => {
+      setRecovery((current) => {
+        const remaining = current.filter((entry) => entry.key !== currentStorageKey);
+        localStorage.setItem(recoveryKey, JSON.stringify(remaining));
+        return remaining;
+      });
+      setStorageError("");
+    };
     const writePending = (pending: boolean) => {
       if (pending && pendingActive) return;
       pendingActive = pending;
@@ -240,11 +270,21 @@ export function EditorPage({
               false,
             );
           await markOfflinePagePending(offlineAccountKey(currentMember), page.id, currentStorageKey, pending);
+          if (!pending) {
+            await rememberOfflinePage(
+              currentMember,
+              offlineMetadata.current.page,
+              offlineMetadata.current.spaceName,
+              currentMember.role !== "viewer",
+              true,
+            );
+            clearCurrentRecovery();
+          }
         })
         .catch((error) => {
           console.error("Unable to update offline sync state", error);
           if (pending && active) {
-            quarantine();
+            quarantine(currentStorageKey, "storage");
             setStorageError("Offline storage could not record these local changes. Export this copy before leaving.");
           }
         });
@@ -437,58 +477,69 @@ export function EditorPage({
         </div>
       )}
       {storageError && <div className="notice notice-danger">{storageError}</div>}
-      {recovery && (recovery.epoch !== page.contentEpoch || accessQuarantine || storageError) && (
-        <div className="notice recovery-notice">
-          <div>
-            <strong>Offline copy quarantined</strong>
-            <span>
-              {accessQuarantine
-                ? "Current access could not be confirmed for these edits. They were not sent to the server."
-                : `Edits from epoch ${recovery.epoch} were not merged after this page was restored.`}
-            </span>
-          </div>
-          <button
-            className="quiet-button"
-            onClick={async () => {
-              const doc = await loadOfflineCopy(recovery.key);
-              setRecoveryPreview(plainYDoc(doc));
-              doc.destroy();
-            }}
-          >
-            Preview
-          </button>
-          <button
-            className="quiet-button"
-            onClick={() => void exportOfflineCopyMarkdown(recovery.key, page.title, `offline-epoch-${recovery.epoch}`)}
-          >
-            Export Markdown
-          </button>
-          <button
-            className="quiet-button"
-            onClick={async () => {
-              const doc = await loadOfflineCopy(recovery.key);
-              const projection = yXmlFragmentToProsemirrorJSON(doc.getXmlFragment("document-store")) as ProseMirrorJson;
-              await navigator.clipboard.writeText(serializeDocument(projection).markdown);
-              doc.destroy();
-            }}
-          >
-            Copy Markdown
-          </button>
-          {!accessQuarantine && (
+      {recovery
+        .filter((entry) => entry.epoch !== page.contentEpoch || accessQuarantine || storageError)
+        .map((entry) => (
+          <div className="notice recovery-notice" key={entry.key}>
+            <div>
+              <strong>Offline copy quarantined</strong>
+              <span>
+                {entry.reason === "storage" && entry.epoch === page.contentEpoch
+                  ? "Offline storage could not record these edits. Export this copy before leaving."
+                  : entry.reason === "access" || accessQuarantine
+                    ? "Current access could not be confirmed for these edits. They were not sent to the server."
+                    : `Edits from epoch ${entry.epoch} were not merged after this page was restored.`}
+              </span>
+            </div>
             <button
               className="quiet-button"
-              onClick={() => {
-                localStorage.removeItem(recoveryKey);
-                setRecovery(null);
-                setRecoveryPreview("");
+              onClick={async () => {
+                const doc = await loadOfflineCopy(entry.key);
+                setRecoveryPreview({ key: entry.key, text: plainYDoc(doc) });
+                doc.destroy();
               }}
             >
-              Dismiss
+              Preview
             </button>
-          )}
-          {recoveryPreview && <p>{recoveryPreview}</p>}
-        </div>
-      )}
+            <button
+              className="quiet-button"
+              onClick={() => void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`)}
+            >
+              Export Markdown
+            </button>
+            <button
+              className="quiet-button"
+              onClick={async () => {
+                const doc = await loadOfflineCopy(entry.key);
+                const projection = yXmlFragmentToProsemirrorJSON(
+                  doc.getXmlFragment("document-store"),
+                ) as ProseMirrorJson;
+                await navigator.clipboard.writeText(serializeDocument(projection).markdown);
+                doc.destroy();
+              }}
+            >
+              Copy Markdown
+            </button>
+            {entry.reason !== "access" && !accessQuarantine && (
+              <button
+                className="quiet-button"
+                onClick={() => {
+                  dismissedRecovery.current = [...new Set([...dismissedRecovery.current, entry.key])];
+                  localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
+                  setRecovery((current) => {
+                    const next = current.filter((item) => item.key !== entry.key);
+                    localStorage.setItem(recoveryKey, JSON.stringify(next));
+                    return next;
+                  });
+                  setRecoveryPreview(null);
+                }}
+              >
+                Dismiss
+              </button>
+            )}
+            {recoveryPreview?.key === entry.key && <p>{recoveryPreview.text}</p>}
+          </div>
+        ))}
       {taskList && (
         <button className="quiet-button task-detail-link" onClick={() => onSelectPage(taskList.id)}>
           ← {taskList.title} · Task properties

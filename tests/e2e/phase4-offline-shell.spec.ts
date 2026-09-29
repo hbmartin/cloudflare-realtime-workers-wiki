@@ -251,7 +251,7 @@ test("opens two visited documents offline and keeps local edits through refresh"
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
 });
 
-test("reports an offline write failure instead of claiming a local save", async ({ page, context }) => {
+test("retries a failed offline write without claiming a partial save", async ({ page, context }) => {
   await signInOwner(page);
   const previousPage = new URL(page.url()).searchParams.get("page");
   await page.getByRole("button", { name: /Find a page or command/ }).click();
@@ -287,16 +287,23 @@ test("reports an offline write failure instead of claiming a local save", async 
   await expect(page.locator(".offline-document .bn-editor")).toBeVisible();
   await page.evaluate(() => {
     const add = IDBObjectStore.prototype.add;
+    let failOnce = true;
     IDBObjectStore.prototype.add = function (value, key) {
-      if (this.name === "updates" && this.transaction.db.name.startsWith("account:"))
+      if (this.name === "updates" && this.transaction.db.name.startsWith("account:") && failOnce) {
+        failOnce = false;
         throw new DOMException("Storage is full", "QuotaExceededError");
+      }
       return add.call(this, value, key);
     };
   });
   await page.locator(".offline-document .bn-editor").click();
-  await page.keyboard.type(" cannot be persisted");
+  await page.keyboard.type("X");
   await expect(page.getByText("Local save failed. Export this copy before closing it.")).toBeVisible();
   await expect(page.getByText("Saved locally · pending server sync")).toHaveCount(0);
+  await page.keyboard.type("Y");
+  await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
+  await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedXY");
 });
 
 test("shows an online-required state for table and diagram links", async ({ page, context }) => {

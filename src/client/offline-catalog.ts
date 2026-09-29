@@ -38,8 +38,12 @@ export function pendingKeysOf(page: OfflinePage): string[] {
       : [];
 }
 
-function storageEpoch(key: string) {
+export function storageEpoch(key: string) {
   return Number(key.split(":").at(-2)) || 0;
+}
+
+function withStorageKey(keys: string[], key: string) {
+  return [...new Set([...keys, key])].sort((left, right) => storageEpoch(left) - storageEpoch(right));
 }
 
 let connection: Promise<IDBDatabase> | null = null;
@@ -178,7 +182,7 @@ export async function listOfflinePages(accountKey: string): Promise<OfflinePage[
     (page) =>
       page.accountKey === accountKey &&
       page.kind === "document" &&
-      !page.revoked &&
+      (!page.revoked || pendingKeysOf(page).length > 0) &&
       Array.isArray(page.storageKeys) &&
       (page.lastSyncedAt > 0 || pendingKeysOf(page).length > 0),
   );
@@ -252,9 +256,7 @@ export async function rememberOfflinePage(
     const previous = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
     const previousPendingKeys = previous ? pendingKeysOf(previous) : [];
     const currentOrNewer = !previous || page.contentEpoch >= previous.epoch;
-    const storageKeys = [...new Set([...(previous?.storageKeys ?? []), storageKey])].sort(
-      (left, right) => storageEpoch(left) - storageEpoch(right),
-    );
+    const storageKeys = withStorageKey(previous?.storageKeys ?? [], storageKey);
     const entry: OfflinePage = {
       key,
       accountKey,
@@ -292,9 +294,7 @@ export async function markOfflinePagePending(
       const keys = new Set(pendingKeysOf(page));
       if (pendingChanges) keys.add(storageKey);
       else keys.delete(storageKey);
-      const storageKeys = [...new Set([...page.storageKeys, storageKey])].sort(
-        (left, right) => storageEpoch(left) - storageEpoch(right),
-      );
+      const storageKeys = withStorageKey(page.storageKeys, storageKey);
       store.put({
         ...page,
         storageKeys,

@@ -46,7 +46,11 @@ export function OfflineWorkspace({
   const [notice, setNotice] = useState("");
   const selectedId = useRef(selected?.pageId ?? null);
   const reconnectController = useRef<AbortController | null>(null);
-  const selectedReason = selected ? quarantined[selected.pageId] : undefined;
+  const selectedReason = selected?.revoked
+    ? "Access to this copy must be confirmed online. Its unsynced edits remain available for export."
+    : selected
+      ? quarantined[selected.pageId]
+      : undefined;
 
   const discardRevokedCopy = useCallback(
     async (pageId: string) => {
@@ -289,6 +293,10 @@ function OfflineEditor({
   editingEnabled: boolean;
 }) {
   const [copy, setCopy] = useState<{ doc: Y.Doc; persistence: IndexeddbPersistence; provider: YProvider } | null>(null);
+  const flushRef = useRef<(() => Promise<void>) | null>(null);
+  const registerFlush = useCallback((flush: () => Promise<void>) => {
+    flushRef.current = flush;
+  }, []);
   const [error, setError] = useState("");
   useEffect(() => {
     let active = true;
@@ -311,9 +319,15 @@ function OfflineEditor({
     );
     return () => {
       active = false;
-      provider.destroy();
-      void persistence.destroy();
-      doc.destroy();
+      void (flushRef.current?.() ?? Promise.resolve())
+        .catch((cause: unknown) => {
+          console.error("Offline edits could not be saved before closing the editor", cause);
+        })
+        .finally(() => {
+          provider.destroy();
+          void persistence.destroy();
+          doc.destroy();
+        });
     };
   }, [page]);
 
@@ -343,6 +357,7 @@ function OfflineEditor({
           page={page}
           accountKey={accountKey}
           editable={page.canEdit && editingEnabled && !quarantined}
+          registerFlush={registerFlush}
         />
       ) : (
         !error && <p>Opening local document…</p>
@@ -356,11 +371,13 @@ function OfflineBlockEditor({
   page,
   accountKey,
   editable,
+  registerFlush,
 }: {
   copy: { doc: Y.Doc; persistence: IndexeddbPersistence; provider: YProvider };
   page: OfflinePage;
   accountKey: string;
   editable: boolean;
+  registerFlush: (flush: () => Promise<void>) => void;
 }) {
   const storageKey = page.storageKeys.at(-1) ?? "";
   const initialPending = pendingKeysOf(page).includes(storageKey);
@@ -368,60 +385,88 @@ function OfflineBlockEditor({
     initialPending ? "saved" : "ready",
   );
   useEffect(() => {
+    let live = true;
+    void getOfflinePage(accountKey, page.pageId)
+      .then((current) => {
+        if (live && current) setSaveState(pendingKeysOf(current).includes(storageKey) ? "saved" : "ready");
+      })
+      .catch(() => {
+        if (live) setSaveState("failed");
+      });
+    return () => {
+      live = false;
+    };
+  }, [accountKey, page.pageId, storageKey]);
+  useEffect(() => {
     let active = true;
     let generation = 0;
-    let writes = 0;
-    let pendingCommitted = initialPending;
+    const updates: Uint8Array[] = [];
+    let writing: Promise<void> | null = null;
+    let pendingCommitted = false;
     let pendingMark: Promise<void> | null = null;
+    const markPending = () => {
+      if (pendingCommitted) return Promise.resolve();
+      pendingMark ??= markOfflinePagePending(accountKey, page.pageId, storageKey, true)
+        .then(() => {
+          pendingCommitted = true;
+        })
+        .finally(() => {
+          pendingMark = null;
+        });
+      return pendingMark;
+    };
+    const persistUpdates = (): Promise<void> => {
+      if (writing) return writing;
+      let failed = false;
+      writing = (async () => {
+        await markPending();
+        const db = copy.persistence.db;
+        if (!db) throw new Error("Offline document storage is unavailable.");
+        while (updates.length) {
+          const batch = updates.slice();
+          const target = generation;
+          const transaction = db.transaction("updates", "readwrite");
+          transaction.objectStore("updates").add(batch.length === 1 ? batch[0] : Y.mergeUpdates(batch));
+          await new Promise<void>((resolve, reject) => {
+            transaction.addEventListener("complete", () => resolve());
+            transaction.addEventListener("abort", () => reject(transaction.error));
+            transaction.addEventListener("error", () => reject(transaction.error));
+          });
+          updates.splice(0, batch.length);
+          if (active && target === generation) setSaveState("saved");
+        }
+      })()
+        .catch((error: unknown) => {
+          failed = true;
+          if (active) setSaveState("failed");
+          throw error;
+        })
+        .finally(() => {
+          writing = null;
+          if (!failed && updates.length && active) void persistUpdates().catch(() => {});
+        });
+      return writing;
+    };
+    registerFlush(async () => {
+      while (updates.length) await persistUpdates();
+    });
     const updated = (update: Uint8Array, origin: unknown) => {
       if (origin === copy.persistence || origin === copy.provider) return;
       generation += 1;
-      const target = generation;
+      updates.push(update);
       setSaveState("saving");
-      try {
-        const db = copy.persistence.db;
-        if (!db) throw new Error("Offline document storage is unavailable.");
-        // Start the transaction during the Yjs update event. It can complete
-        // after this editor unmounts, including on a quick page switch.
-        const transaction = db.transaction("updates", "readwrite");
-        const store = transaction.objectStore("updates");
-        if (++writes % 500 === 0) {
-          store.clear();
-          store.add(Y.encodeStateAsUpdate(copy.doc));
-        } else store.add(update);
-        const committed = new Promise<void>((resolve, reject) => {
-          transaction.addEventListener("complete", () => resolve());
-          transaction.addEventListener("abort", () => reject(transaction.error));
-          transaction.addEventListener("error", () => reject(transaction.error));
-        });
-        if (!pendingCommitted && !pendingMark) {
-          pendingMark = markOfflinePagePending(accountKey, page.pageId, storageKey, true)
-            .then(() => {
-              pendingCommitted = true;
-            })
-            .finally(() => {
-              pendingMark = null;
-            });
-        }
-        const pending = pendingMark ?? Promise.resolve();
-        void Promise.all([committed, pending]).then(
-          () => {
-            if (active && target === generation) setSaveState("saved");
-          },
-          () => {
-            if (active) setSaveState("failed");
-          },
-        );
-      } catch {
-        if (active) setSaveState("failed");
-      }
+      void persistUpdates().catch(() => {});
     };
     copy.doc.on("update", updated);
     return () => {
       active = false;
       copy.doc.off("update", updated);
+      // OfflineEditor waits for this queue before closing IndexedDB.
     };
-  }, [accountKey, copy, initialPending, page.pageId, storageKey]);
+    // The writer belongs to the account, page and storage epoch even if React
+    // reuses this component with a different copy object.
+    // eslint-disable-next-line react/exhaustive-effect-dependencies
+  }, [accountKey, copy, page.pageId, registerFlush, storageKey]);
   const options = useMemo(
     () =>
       withCollaboration({
