@@ -604,7 +604,7 @@ describe("date reminders", () => {
     await env.DB.prepare(`UPDATE document_projections SET sequence=sequence+1 WHERE page_id=?`)
       .bind(installed.page.id)
       .run();
-    expect((await put("at_time")).status).toBe(409);
+    expect((await put("at_time")).status).toBe(503);
     expect(
       (
         await env.DB.prepare(`SELECT choice_json FROM date_reminders WHERE token_id=?`)

@@ -6487,7 +6487,21 @@ async function publicPageResponse(c: Context<{ Bindings: Env }>, pageId?: string
   if (!key) return c.text("Not found", 404);
   const share = await resolveSharedPage(c.env, key, pageId);
   if (!share) return c.text("Not found", 404);
-  const html = await renderPublicShare(c.env, share, key, new URL(c.req.url).origin);
+  let html: string | null;
+  try {
+    html = await renderPublicShare(c.env, share, key, new URL(c.req.url).origin);
+  } catch (error) {
+    if (error instanceof HttpError && error.code === "share_content_unavailable")
+      return c.html(
+        "<!doctype html><html><body><p>Shared content is temporarily unavailable. Please try again shortly.</p></body></html>",
+        503,
+        {
+          "cache-control": "no-store",
+          "retry-after": "5",
+        },
+      );
+    throw error;
+  }
   if (!html) return c.text("Not found", 404);
   c.executionCtx.waitUntil(
     c.env.DB.prepare(

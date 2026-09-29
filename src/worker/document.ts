@@ -845,7 +845,7 @@ export class Document extends YServer {
     return withDurableObjectContext(this.bindings, request, () => this.onRequestObserved(request));
   }
 
-  private async onRequestObserved(request: Request) {
+  private async onRequestObserved(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
@@ -853,36 +853,49 @@ export class Document extends YServer {
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
       // Most callers use this endpoint as a current-content barrier. Public
       // rendering may explicitly request the last coherent committed copy.
-      try {
-        this.flushPendingUpdates();
-        if (this.compaction) await this.compaction.catch(() => undefined);
-        if (this.metadata.dirty) await this.compact();
-        this.flushPendingUpdates();
-      } catch (error) {
-        logger.error(
-          "document.content_compaction.failed",
-          "document",
-          "Document content could not be read.",
-          { pageId: this.ids.pageId, epoch: this.ids.epoch },
-          error,
-        );
-        return Response.json({ error: "Document content is temporarily unavailable." }, { status: 503 });
+      const allowStale = request.headers.get("x-notes-allow-stale") === "1";
+      this.flushPendingUpdates();
+      if (!allowStale) {
+        try {
+          for (let attempt = 0; attempt < 2 && (this.metadata.dirty || this.compaction); attempt += 1) {
+            if (this.compaction) await this.compaction.catch(() => undefined);
+            this.flushPendingUpdates();
+            if (this.metadata.dirty) await this.compact();
+            this.flushPendingUpdates();
+          }
+        } catch {
+          return Response.json({ error: "Document content is temporarily unavailable." }, { status: 503 });
+        }
       }
       const { pageId, epoch } = this.ids;
       if (this.metadata.dirty || this.compaction) {
-        if (request.headers.get("x-notes-allow-stale") !== "1")
+        if (!allowStale)
           return Response.json(
             { error: "Document content is still changing." },
             { status: 503, headers: { "x-notes-content-retry": "changing" } },
           );
         const table = this.metadata.content_kind === "diagram" ? "diagram_projections" : "document_projections";
-        const row = await this.bindings.DB.prepare(
-          `SELECT sequence,r2_key,content_hash FROM ${table} WHERE page_id=? AND content_epoch=?`,
-        )
-          .bind(pageId, epoch)
-          .first<{ sequence: number; r2_key: string; content_hash: string }>();
-        const stored = row ? await this.bindings.BUCKET.get(row.r2_key) : null;
-        if (!stored) return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
+        let row: { sequence: number; r2_key: string; content_hash: string } | null = null;
+        let stored: R2ObjectBody | null = null;
+        for (let attempt = 0; attempt < 2 && !stored; attempt += 1) {
+          row = await this.bindings.DB.prepare(
+            `SELECT sequence,r2_key,content_hash FROM ${table} WHERE page_id=? AND content_epoch=?`,
+          )
+            .bind(pageId, epoch)
+            .first<{ sequence: number; r2_key: string; content_hash: string }>();
+          stored = row ? await this.bindings.BUCKET.get(row.r2_key) : null;
+        }
+        if (!stored) {
+          // A newly restored room may have a snapshot but no committed projection yet.
+          try {
+            await this.compact();
+            this.flushPendingUpdates();
+          } catch {
+            return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
+          }
+          if (!this.metadata.dirty && !this.compaction) return this.onRequestObserved(request);
+          return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
+        }
         let envelope: { pageId: string; contentEpoch: number; sequence: number };
         try {
           envelope = await stored.json();

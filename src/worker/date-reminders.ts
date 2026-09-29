@@ -116,7 +116,10 @@ export async function putDateReminder(
     try {
       current = await pageDateToken(env, page, tokenId);
     } catch (error) {
-      if (attempt < 2 && error instanceof HttpError && error.code === "content_changing") continue;
+      if (attempt < 2 && error instanceof HttpError && error.code === "content_changing") {
+        await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+        continue;
+      }
       throw error;
     }
     const { token, sequence } = current;
@@ -183,7 +186,7 @@ export async function putDateReminder(
     if (!savedRow) throw new HttpError(503, "reminder_unavailable", "Reminder could not be saved.");
     return reminderJson(savedRow);
   }
-  throw new HttpError(409, "date_token_changed", "This date changed. Reopen the reminder and try again.");
+  throw new HttpError(503, "content_changing", "Page content is still changing. Try again shortly.");
 }
 
 export async function deleteDateReminder(env: Env, member: MemberContext, page: PageRow, tokenId: string) {
