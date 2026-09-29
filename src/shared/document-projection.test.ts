@@ -61,6 +61,32 @@ describe("structured document projection", () => {
     expect(projection.memberMentions[0]!.excerpt).toContain("Roadmap with Ada before launch");
   });
 
+  it("exports date mentions as readable text without private reminder settings", () => {
+    const result = serializeDocument(
+      document({
+        type: "paragraph",
+        content: [
+          { type: "text", text: "Meet " },
+          {
+            type: "dateMention",
+            attrs: {
+              tokenId: "date-1",
+              revision: "rev-1",
+              createdBy: "user-1",
+              kind: "all-day",
+              value: "2026-10-01",
+              timezone: "America/Chicago",
+            },
+          },
+        ],
+      }),
+    );
+    expect(result.plainText).toContain("2026-10-01");
+    expect(result.markdown).toContain("@2026-10-01");
+    expect(result.html).toContain("2026-10-01");
+    expect(JSON.stringify(result)).not.toContain("user-1");
+  });
+
   it("normalizes whitespace without joining separate blocks", () => {
     const projection = projectDocument(
       document(

@@ -1199,6 +1199,58 @@ button.mention-chip:focus-visible {
   font-size: 12px;
   line-height: 1.45;
 }
+.date-mention-wrap {
+  display: inline;
+}
+.date-mention-chip {
+  border: 0;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: #44429b;
+  padding: 1px 5px;
+  font: inherit;
+  cursor: pointer;
+}
+.date-mention-chip:hover,
+.date-mention-chip:focus-visible {
+  background: #d9d7ff;
+}
+.date-mention-picker {
+  position: fixed;
+  margin: 0;
+  z-index: 150;
+  width: min(280px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--paper);
+  padding: 14px;
+  box-shadow: 0 12px 36px #25231f24;
+  color: var(--ink);
+}
+.date-mention-picker label {
+  display: grid;
+  gap: 3px;
+  font-size: 12px;
+}
+.date-mention-picker input,
+.date-mention-picker select {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px;
+  background: var(--paper);
+  color: var(--ink);
+}
+.date-mention-actions {
+  display: flex;
+  gap: 8px;
+}
+.date-mention-actions button {
+  padding: 6px 9px;
+}
 .notice {
   background: #fff7d7;
   color: #675515;

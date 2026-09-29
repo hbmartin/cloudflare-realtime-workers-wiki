@@ -1,4 +1,5 @@
 import type { ProseMirrorJson } from "./types";
+import { validDateMention, type DateMention } from "./date-mentions";
 
 export type { ProseMirrorJson } from "./types";
 
@@ -29,6 +30,21 @@ const EXCERPT_CHARS = 240;
 function stringAttr(node: ProseMirrorJson, name: string) {
   const value = node.attrs?.[name];
   return typeof value === "string" ? value : null;
+}
+
+export function dateMentionFromNode(node: ProseMirrorJson): DateMention | null {
+  if (node.type !== "dateMention") return null;
+  const value = {
+    tokenId: stringAttr(node, "tokenId") ?? "",
+    revision: stringAttr(node, "revision") ?? "",
+    createdBy: stringAttr(node, "createdBy") ?? "",
+    kind: stringAttr(node, "kind"),
+    value: stringAttr(node, "value") ?? "",
+    timezone: stringAttr(node, "timezone") ?? "",
+  };
+  return (value.kind === "all-day" || value.kind === "timed") && validDateMention(value as DateMention)
+    ? (value as DateMention)
+    : null;
 }
 
 export function collectLinkedDiagramIds(
@@ -145,6 +161,7 @@ function markedText(node: ProseMirrorJson, format: "markdown" | "html") {
 function nodeText(node: ProseMirrorJson): string {
   if (typeof node.text === "string") return node.text;
   if (node.type === "mention") return stringAttr(node, "label") ?? "";
+  if (node.type === "dateMention") return dateMentionFromNode(node)?.value ?? stringAttr(node, "value") ?? "Date";
   return (node.content ?? []).map(nodeText).join("");
 }
 
@@ -159,6 +176,12 @@ function serializeInline(node: ProseMirrorJson, format: "markdown" | "html"): st
     const id = stringAttr(node, "entityId");
     if (format === "html") return `<span data-mention-id="${escapeHtml(id ?? "")}">${escapeHtml(label)}</span>`;
     return `@${escapeMarkdownInline(label)}`;
+  }
+  if (node.type === "dateMention") {
+    const date = nodeText(node);
+    return format === "html"
+      ? `<span data-date-mention="true">${escapeHtml(date)}</span>`
+      : `@${escapeMarkdownInline(date)}`;
   }
   if (node.type === "hardBreak") return format === "html" ? "<br>" : "  \n";
   if (node.type === "inlineMath") {
@@ -234,7 +257,7 @@ function serializeMarkdownTableInline(node: ProseMirrorJson): string {
       (node.marks ?? []).some((mark) => mark.type === "code"),
     );
   }
-  if (node.type === "mention" || node.type === "hardBreak" || node.type === "inlineMath") {
+  if (["mention", "dateMention", "hardBreak", "inlineMath"].includes(node.type ?? "")) {
     return escapeUnescapedPipes(serializeInline(node, "markdown"));
   }
   return (node.content ?? []).map(serializeMarkdownTableInline).join("");
@@ -272,7 +295,8 @@ function serializeNode(
     return transparentChildren();
   }
   if (type === "doc" || type === "blockGroup") return serializeSequence(children, format, depth, options);
-  if (type === "text" || type === "mention" || type === "inlineMath") return serializeInline(node, format);
+  if (type === "text" || type === "mention" || type === "dateMention" || type === "inlineMath")
+    return serializeInline(node, format);
   if (type === "paragraph") return format === "html" ? `<p>${inline}</p>` : `${inline}\n\n`;
   if (type === "heading" || /^heading[1-6]$/.test(type)) {
     const level = Math.min(6, Math.max(1, Number(node.attrs?.level ?? type.slice(7) ?? 1)));
@@ -452,6 +476,11 @@ export function projectDocument(root: ProseMirrorJson): DocumentProjection {
       }
     }
 
+    if (node.type === "dateMention") {
+      append(nodeText(node));
+      append(" ");
+    }
+
     if (node.type === "linkedDiagram") {
       const entityId = stringAttr(node, "pageId");
       const label = stringAttr(node, "title") ?? "Linked whiteboard";
@@ -463,7 +492,7 @@ export function projectDocument(root: ProseMirrorJson): DocumentProjection {
     }
 
     for (const child of node.content ?? []) visit(child);
-    if (node.type && !["text", "mention", "linkedDiagram"].includes(node.type)) append(" ");
+    if (node.type && !["text", "mention", "dateMention", "linkedDiagram"].includes(node.type)) append(" ");
   };
 
   visit(root);
