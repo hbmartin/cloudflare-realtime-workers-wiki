@@ -792,6 +792,7 @@ async function resolveAppState(alreadyPurgedAccount?: string): Promise<AppState>
   else
     try {
       pendingPurges = new Set(await purgingOfflineAccounts());
+      await rememberOfflinePurgeVerification("registry", true);
     } catch (error) {
       if (locallySignedOut && locallySignedOut !== alreadyPurgedAccount)
         return {
@@ -799,7 +800,7 @@ async function resolveAppState(alreadyPurgedAccount?: string): Promise<AppState>
           accountKey: locallySignedOut,
           message: apiErrorMessage(error, "Close other NoteFlare tabs, then retry local data removal."),
         };
-      if (alreadyPurgedAccount) await rememberOfflinePurgeVerification(alreadyPurgedAccount, false);
+      await rememberOfflinePurgeVerification("registry", false);
       console.error("Unable to inspect pending local data removal", error);
       pendingPurges = new Set();
     }
