@@ -35,7 +35,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { dateTokens } from "../shared/document-projection";
 import { dateMentionFromProps } from "../shared/date-mentions";
-import { MISSING_GRACE_MS } from "./date-reminders";
+import { MISSING_GRACE_MS, markRemindersMissing } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -560,6 +560,7 @@ async function mutateDocument(
   principal: IntegrationPrincipal,
   operations: unknown[],
   suppressExternalEffects = false,
+  options: { expectedSequence?: number } = {},
 ) {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/api-mutate", {
@@ -569,7 +570,7 @@ async function mutateDocument(
         "x-notes-internal": env.BETTER_AUTH_SECRET,
         ...correlationHeaders(),
       },
-      body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects }),
+      body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects, ...options }),
     }),
   );
   if (response.status === 404) throw new NotionError(404, "object_not_found", "Block not found.");
@@ -1278,32 +1279,15 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   if (!node) throw new NotionError(400, "validation_error", "Block content is required.");
   if ([...dateTokens(container).values()].some((token) => token === null))
     throw new NotionError(400, "validation_error", "Date tokens must be unique within a block.");
-  for (const reminder of pendingMissing) {
-    const missingAt = Date.now();
-    const marked = await c.env.DB.prepare(
-      `UPDATE date_reminders SET missing_since=?,checked_at=?,updated_at=?
-       WHERE id=? AND generation=? AND missing_since IS NULL
-         AND state IN ('active','claimed','delivered')
-         AND EXISTS (SELECT 1 FROM document_projections
-           WHERE page_id=? AND content_epoch=? AND sequence=?)`,
-    )
-      .bind(
-        missingAt,
-        missingAt,
-        missingAt,
-        reminder.id,
-        reminder.generation,
-        located.page.id,
-        located.page.content_epoch,
-        located.sequence,
-      )
-      .run();
-    if (!marked.meta.changes)
-      throw new NotionError(409, "conflict_error", "This date token changed while moving it. Retry.");
-  }
-  const mutated = await mutateDocument(c.env, located.page, principal, [
-    { type: "update_block", internalId: located.internalId, node },
-  ]);
+  await markRemindersMissing(c.env, located.page.id, located.page.content_epoch, located.sequence, pendingMissing);
+  const mutated = await mutateDocument(
+    c.env,
+    located.page,
+    principal,
+    [{ type: "update_block", internalId: located.internalId, node }],
+    false,
+    { expectedSequence: located.sequence },
+  );
   const updated = findDocumentBlock(mutated.document, located.internalId)!;
   return c.json(await blockObject(c.env, located.page, updated, await metadataForPage(c.env, located.page.id)));
 });

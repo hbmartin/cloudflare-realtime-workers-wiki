@@ -6,7 +6,7 @@ import type { DateMention } from "../shared/date-mentions";
 import { dateTokens } from "../shared/document-projection";
 import { flattenDocumentBlocks } from "../shared/notion-blocks";
 import type { Env } from "./env";
-import { processDueDateReminders, reconcileDateRemindersForPage } from "./date-reminders";
+import { markRemindersMissing, processDueDateReminders, reconcileDateRemindersForPage } from "./date-reminders";
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -519,7 +519,7 @@ describe("date reminders", () => {
     ).toBe('"5m_before"');
   });
 
-  it("reports a stale reconciliation snapshot so the sweep can advance", async () => {
+  it("leaves reminders for the next sweep when the projection advances", async () => {
     const installed = await bootstrap();
     const token: DateMention = {
       tokenId: crypto.randomUUID(),
@@ -548,9 +548,58 @@ describe("date reminders", () => {
     await env.DB.prepare(`UPDATE document_projections SET sequence=sequence+1 WHERE page_id=?`)
       .bind(installed.page.id)
       .run();
-    await expect(
-      reconcileDateRemindersForPage(env, installed.page.id, 1, envelope.document, envelope.sequence),
-    ).rejects.toThrow("projection changed");
+    const before = await env.DB.prepare(`SELECT checked_at FROM date_reminders WHERE token_id=?`)
+      .bind(token.tokenId)
+      .first<{ checked_at: number }>();
+    await reconcileDateRemindersForPage(env, installed.page.id, 1, envelope.document, envelope.sequence);
+    const after = await env.DB.prepare(`SELECT checked_at FROM date_reminders WHERE token_id=?`)
+      .bind(token.tokenId)
+      .first<{ checked_at: number }>();
+    expect(after).toEqual(before);
+  });
+
+  it("releases a claimed missing reminder only for the current projection", async () => {
+    const installed = await bootstrap();
+    const token: DateMention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: installed.userId,
+      kind: "timed",
+      value: new Date(Date.now() + 3_600_000).toISOString(),
+      timezone: "UTC",
+    };
+    await addToken(installed.page.id, token);
+    const put = await SELF.fetch(
+      request(installed.cookie, `/api/pages/${installed.page.id}/date-reminders/${token.tokenId}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ revision: token.revision, choice: "at_time" }),
+      }),
+    );
+    expect(put.status).toBe(200);
+    const reminder = (await put.json<{ reminder: { id: string; generation: number } }>()).reminder;
+    const projection = await env.DB.prepare(`SELECT sequence FROM document_projections WHERE page_id=?`)
+      .bind(installed.page.id)
+      .first<{ sequence: number }>();
+    await env.DB.prepare(`UPDATE date_reminders SET state='claimed',claim_id='claim',claimed_at=? WHERE id=?`)
+      .bind(Date.now(), reminder.id)
+      .run();
+    await markRemindersMissing(env, installed.page.id, 1, projection!.sequence, [reminder]);
+    const released = await env.DB.prepare(`SELECT state,claim_id,missing_since FROM date_reminders WHERE id=?`)
+      .bind(reminder.id)
+      .first<{ state: string; claim_id: string | null; missing_since: number | null }>();
+    expect(released?.state).toBe("active");
+    expect(released?.claim_id).toBeNull();
+    expect(released?.missing_since).not.toBeNull();
+    await env.DB.prepare(`UPDATE date_reminders SET missing_since=NULL WHERE id=?`).bind(reminder.id).run();
+    await env.DB.prepare(`UPDATE document_projections SET sequence=sequence+1 WHERE page_id=?`)
+      .bind(installed.page.id)
+      .run();
+    await markRemindersMissing(env, installed.page.id, 1, projection!.sequence, [reminder]);
+    const stale = await env.DB.prepare(`SELECT missing_since FROM date_reminders WHERE id=?`)
+      .bind(reminder.id)
+      .first<{ missing_since: number | null }>();
+    expect(stale?.missing_since).toBeNull();
   });
 
   it("does not deliver when the author loses workspace access before the due scan", async () => {

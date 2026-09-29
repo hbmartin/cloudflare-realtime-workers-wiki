@@ -851,10 +851,14 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        this.flushPendingUpdates();
+        if (!this.compaction && !this.metadata.dirty) break;
+        await this.compact();
+      }
       this.flushPendingUpdates();
-      if (this.compaction) await this.compaction;
-      this.flushPendingUpdates();
-      if (this.metadata.dirty) await this.compact();
+      if (this.compaction || this.metadata.dirty)
+        return Response.json({ error: "Document is still changing." }, { status: 503 });
       const { pageId, epoch } = this.ids;
       if (this.metadata.content_kind === "diagram") {
         const envelope = diagramFromYDoc(this.document, {
@@ -882,7 +886,13 @@ export class Document extends YServer {
       if (this.metadata.content_kind !== "document") {
         return Response.json({ error: "Block mutations are only available for document pages." }, { status: 422 });
       }
-      let body: { actorId?: unknown; operations?: unknown; suppressExternalEffects?: unknown; operationId?: unknown };
+      let body: {
+        actorId?: unknown;
+        operations?: unknown;
+        suppressExternalEffects?: unknown;
+        operationId?: unknown;
+        expectedSequence?: unknown;
+      };
       try {
         body = await request.json();
       } catch {
@@ -900,6 +910,18 @@ export class Document extends YServer {
         return Response.json({ error: "This document version has been retired." }, { status: 410 });
       }
       if (this.metadata.read_only) return Response.json({ error: "This document is read-only." }, { status: 409 });
+      if (body.expectedSequence !== undefined) {
+        this.flushPendingUpdates();
+        if (this.metadata.dirty || this.compaction) await this.compact();
+        this.flushPendingUpdates();
+        if (this.metadata.dirty) await this.compact();
+        if (
+          !Number.isInteger(body.expectedSequence) ||
+          this.metadata.dirty ||
+          this.metadata.snapshot_seq !== body.expectedSequence
+        )
+          return Response.json({ error: "revision_changed" }, { status: 409 });
+      }
       const operationId =
         typeof body.operationId === "string" && /^[A-Za-z0-9:_-]{1,200}$/.test(body.operationId)
           ? body.operationId
@@ -954,6 +976,18 @@ export class Document extends YServer {
         return Response.json({ error: "Document size limit exceeded." }, { status: 413 });
       }
       clone.destroy();
+      this.flushPendingUpdates();
+      if (
+        body.expectedSequence !== undefined &&
+        (this.purged ||
+          this.metadata.retired ||
+          this.metadata.restore_pending ||
+          this.transition ||
+          this.metadata.read_only ||
+          this.metadata.dirty ||
+          this.metadata.snapshot_seq !== body.expectedSequence)
+      )
+        return Response.json({ error: "revision_changed" }, { status: 409 });
       this.pendingAuthorId = body.actorId;
       this.pendingNotifyEdit = false;
       this.document.transact(() => {
@@ -1750,7 +1784,8 @@ export class Document extends YServer {
 
         const results = await this.bindings.DB.batch(statements);
         pageProjected = Boolean(results[0]?.meta.changes);
-        if (pageProjected) this.priorDateBlocks = dateTokenBlocks(json);
+        if (pageProjected && (this.priorDateBlocks || structuredJson.includes('"dateMention"')))
+          this.priorDateBlocks = dateTokenBlocks(json);
         const superseded = supersededProjection?.r2_key;
         if (pageProjected && superseded && superseded !== structuredKey) {
           this.state.waitUntil(
