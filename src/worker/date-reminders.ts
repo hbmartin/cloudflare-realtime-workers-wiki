@@ -29,7 +29,7 @@ type ReminderRow = {
 
 const ACTIVE_SWEEP_INTERVAL = 14 * 60_000;
 const DELIVERED_SWEEP_INTERVAL = 24 * 60 * 60_000;
-export const MISSING_GRACE_MS = 2 * 60_000;
+const MISSING_GRACE_MS = 2 * 60_000;
 export function withinMissingGrace(missingSince: number | null, now: number) {
   return missingSince === null || now - missingSince < MISSING_GRACE_MS;
 }
@@ -328,6 +328,7 @@ async function sweepDateReminders(env: Env) {
   );
   const failures: unknown[] = [];
   for (const row of rows) {
+    let rotate = false;
     try {
       const page = await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id=? AND archived_at IS NULL`)
         .bind(row.page_id)
@@ -350,8 +351,9 @@ async function sweepDateReminders(env: Env) {
         envelope.sequence,
         cutoffs,
       );
-      if (!applied) await rotateSweepRows(env, row.page_id, row.content_epoch, cutoffs);
+      rotate = !applied;
     } catch (error) {
+      rotate = true;
       failures.push(error);
       logger.error(
         "date_reminder.sweep.failed",
@@ -360,8 +362,10 @@ async function sweepDateReminders(env: Env) {
         { pageId: row.page_id, epoch: row.content_epoch },
         error,
       );
-      // Rotate a persistently unavailable room out of this bounded scan so
-      // other pages still receive reconciliation on the next tick.
+    }
+    if (rotate) {
+      // A failed or stale projection gets one full sweep tick of backoff so
+      // it cannot monopolize the bounded scan ahead of healthy pages.
       await rotateSweepRows(env, row.page_id, row.content_epoch, cutoffs).catch((rotateError) => {
         failures.push(rotateError);
         logger.error(
@@ -389,20 +393,13 @@ async function rotateSweepRows(
   epoch: number,
   cutoffs: { active: number; delivered: number },
 ) {
-  const now = Date.now();
+  const nextAttempt = Date.now() + 60_000;
   await env.DB.prepare(
     `UPDATE date_reminders SET checked_at=CASE WHEN state='delivered' THEN ? ELSE ? END
      WHERE page_id=? AND content_epoch=?
        AND ((state IN ('active','claimed') AND checked_at<?) OR (state='delivered' AND checked_at<?))`,
   )
-    .bind(
-      now - DELIVERED_SWEEP_INTERVAL + 60_000,
-      now - ACTIVE_SWEEP_INTERVAL + 60_000,
-      pageId,
-      epoch,
-      cutoffs.active,
-      cutoffs.delivered,
-    )
+    .bind(nextAttempt, nextAttempt, pageId, epoch, cutoffs.active, cutoffs.delivered)
     .run();
 }
 

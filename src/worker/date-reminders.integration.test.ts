@@ -638,7 +638,11 @@ describe("date reminders", () => {
     expect(released?.state).toBe("active");
     expect(released?.claim_id).toBeNull();
     expect(released?.missing_since).not.toBeNull();
-    await env.DB.prepare(`UPDATE date_reminders SET missing_since=NULL WHERE id=?`).bind(reminder.id).run();
+    await env.DB.prepare(
+      `UPDATE date_reminders SET state='claimed',claim_id='retry',claimed_at=?,missing_since=NULL WHERE id=?`,
+    )
+      .bind(Date.now(), reminder.id)
+      .run();
     await env.DB.prepare(`UPDATE document_projections SET sequence=sequence+1 WHERE page_id=?`)
       .bind(installed.page.id)
       .run();
@@ -651,9 +655,11 @@ describe("date reminders", () => {
         projection!.sequence,
       ),
     ).toBe(false);
-    const stale = await env.DB.prepare(`SELECT missing_since FROM date_reminders WHERE id=?`)
+    const stale = await env.DB.prepare(`SELECT state,claim_id,missing_since FROM date_reminders WHERE id=?`)
       .bind(reminder.id)
-      .first<{ missing_since: number | null }>();
+      .first<{ state: string; claim_id: string | null; missing_since: number | null }>();
+    expect(stale?.state).toBe("claimed");
+    expect(stale?.claim_id).toBe("retry");
     expect(stale?.missing_since).toBeNull();
   });
 
