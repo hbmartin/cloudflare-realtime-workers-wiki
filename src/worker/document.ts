@@ -851,10 +851,16 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
+      // A compaction may capture one sequence while new websocket edits arrive.
+      // Keep the response tied to a committed sequence, or ask the caller to retry.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        this.flushPendingUpdates();
+        if (!this.metadata.dirty && !this.compaction) break;
+        await this.compact();
+      }
       this.flushPendingUpdates();
-      if (this.compaction) await this.compaction;
-      if (this.metadata.dirty) await this.compact();
-      this.flushPendingUpdates();
+      if (this.metadata.dirty || this.compaction)
+        return Response.json({ error: "Document content is still changing." }, { status: 503 });
       const { pageId, epoch } = this.ids;
       if (this.metadata.content_kind === "diagram") {
         const envelope = diagramFromYDoc(this.document, {
