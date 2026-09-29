@@ -96,13 +96,26 @@ type AppState =
   | { screen: "unassigned"; message?: string }
   | { screen: "bootstrap" }
   | { screen: "security"; status: SecurityStatus }
-  | { screen: "signin"; message?: string }
+  | { screen: "signin"; message?: string; notice?: string }
   | { screen: "invite"; token: string }
   | { screen: "workspace"; member: ClientMemberContext }
   | { screen: "offline-locked" }
   | { screen: "signout-cleanup"; accountKey: string; message: string }
   | { screen: "signout-review"; accountKey: string; pages: OfflinePage[]; message?: string }
   | { screen: "offline"; account: OfflineAccount; pages: OfflinePage[] };
+
+const OFFLINE_PURGE_WARNING_KEY = "notes:offline-purge-warning";
+const OFFLINE_PURGE_WARNING =
+  "Known offline copies were removed. This browser could not check for other saved copies, so some may remain on this device.";
+
+function offlinePurgeNotice() {
+  return sessionStorage.getItem(OFFLINE_PURGE_WARNING_KEY) ? OFFLINE_PURGE_WARNING : undefined;
+}
+
+function rememberOfflinePurgeVerification(verified: boolean) {
+  if (verified) sessionStorage.removeItem(OFFLINE_PURGE_WARNING_KEY);
+  else sessionStorage.setItem(OFFLINE_PURGE_WARNING_KEY, "1");
+}
 
 type InstallPromptEvent = Event & { prompt: () => Promise<void> };
 
@@ -700,7 +713,8 @@ async function stateAfterUnauthorized(failure: ApiClientError): Promise<AppState
 
 async function authenticatedWorkspace(member: ClientMemberContext): Promise<AppState> {
   const locallySignedOut = localStorage.getItem(LOCAL_SIGNOUT_KEY);
-  if (locallySignedOut) return { screen: "signin" };
+  if (locallySignedOut) return { screen: "signin", notice: offlinePurgeNotice() };
+  sessionStorage.removeItem(OFFLINE_PURGE_WARNING_KEY);
   if (typeof indexedDB !== "undefined") {
     await rememberOfflineAccount(member).catch((error) =>
       console.error("Unable to remember this account for offline use", error),
@@ -719,7 +733,7 @@ async function offlineStateAfterConnectionFailure(cause: unknown): Promise<AppSt
     !isSuccessfulJsonResponseBodyError(cause)
   )
     return null;
-  if (localStorage.getItem(LOCAL_SIGNOUT_KEY)) return { screen: "signin" };
+  if (localStorage.getItem(LOCAL_SIGNOUT_KEY)) return { screen: "signin", notice: offlinePurgeNotice() };
   if (typeof indexedDB === "undefined") return { screen: "offline-locked" };
   const account = await latestOfflineAccount();
   if (!account) return { screen: "offline-locked" };
@@ -747,9 +761,10 @@ async function resolveAppState(): Promise<AppState> {
       pendingPurges = new Set();
     }
   if (locallySignedOut && typeof indexedDB !== "undefined") pendingPurges.add(locallySignedOut);
+  let verifiedPurges = true;
   for (const accountKey of pendingPurges) {
     try {
-      await forgetOfflineAccount(accountKey);
+      verifiedPurges = (await forgetOfflineAccount(accountKey)) && verifiedPurges;
     } catch (error) {
       return {
         screen: "signout-cleanup",
@@ -758,18 +773,19 @@ async function resolveAppState(): Promise<AppState> {
       };
     }
   }
+  if (pendingPurges.size) rememberOfflinePurgeVerification(verifiedPurges);
   const invite = new URLSearchParams(window.location.search).get("invite") || sessionStorage.getItem("pending-invite");
   const install = await api<{ initialized: boolean }>("/api/install");
   if (!install.initialized) return { screen: "bootstrap" };
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state === "signed_out") {
     localStorage.removeItem(LOCAL_SIGNOUT_KEY);
-    return invite ? { screen: "invite", token: invite } : { screen: "signin" };
+    return invite ? { screen: "invite", token: invite } : { screen: "signin", notice: offlinePurgeNotice() };
   }
   if (status.state !== "ready") return { screen: "security", status };
   if (locallySignedOut) {
     const signedOutUserId = locallySignedOut.split("\u0000")[0];
-    if (!status.userId || status.userId === signedOutUserId) return { screen: "signin" };
+    if (!status.userId || status.userId === signedOutUserId) return { screen: "signin", notice: offlinePurgeNotice() };
     localStorage.removeItem(LOCAL_SIGNOUT_KEY);
   }
   let inviteFailure: ApiClientError | null = null;
@@ -835,7 +851,7 @@ export function App() {
           return false;
         });
       try {
-        if (typeof indexedDB !== "undefined") await forgetOfflineAccount(accountKey);
+        if (typeof indexedDB !== "undefined") rememberOfflinePurgeVerification(await forgetOfflineAccount(accountKey));
       } catch (error) {
         showState({
           screen: "signout-cleanup",
@@ -849,7 +865,7 @@ export function App() {
         new Promise<false>((resolve) => window.setTimeout(() => resolve(false), 2_000)),
       ]);
       if (signedOut) localStorage.removeItem(LOCAL_SIGNOUT_KEY);
-      showState({ screen: "signin" });
+      showState({ screen: "signin", notice: offlinePurgeNotice() });
     },
     [showState],
   );
@@ -929,8 +945,8 @@ export function App() {
     async (accountKey: string) => {
       showState({ screen: "loading" });
       try {
-        await forgetOfflineAccount(accountKey);
-        await load();
+        rememberOfflinePurgeVerification(await forgetOfflineAccount(accountKey));
+        showState({ screen: "signin", notice: offlinePurgeNotice() });
       } catch (error) {
         showState({
           screen: "signout-cleanup",
@@ -939,7 +955,7 @@ export function App() {
         });
       }
     },
-    [load, showState],
+    [showState],
   );
 
   useEffect(() => {
@@ -1001,8 +1017,15 @@ export function App() {
             <button
               type="button"
               onClick={() =>
-                void exportPendingOfflinePages(state.pages).catch((error) =>
-                  showState({ ...state, message: apiErrorMessage(error, "Export failed.") }),
+                void exportPendingOfflinePages(state.pages, true).then(
+                  (result) =>
+                    showState({
+                      ...state,
+                      message: result.failed
+                        ? `Exported ${result.exported} readable copies; ${result.failed} could not be read.`
+                        : `Exported ${result.exported} readable copies.`,
+                    }),
+                  (error) => showState({ ...state, message: apiErrorMessage(error, "Export failed.") }),
                 )
               }
             >
@@ -1083,6 +1106,7 @@ export function App() {
           await load();
         }}
         initialError={state.message}
+        initialNotice={state.notice}
       />
     );
   if (state.screen === "offline")
@@ -1278,7 +1302,15 @@ function signInFailure(cause: unknown, fallback: string) {
     : apiErrorMessage(cause, fallback);
 }
 
-function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Promise<void>; initialError?: string }) {
+function SignInScreen({
+  onComplete,
+  initialError = "",
+  initialNotice,
+}: {
+  onComplete: () => Promise<void>;
+  initialError?: string;
+  initialNotice?: string;
+}) {
   const [error, setError] = useState(() => consumeSlackAuthError() || initialError);
   const [busy, setBusy] = useState(false);
   const slackAvailable = useSlackIdentityAvailable();
@@ -1310,6 +1342,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
     >
       <form className="auth-form" onSubmit={submit}>
         <h2>Sign in</h2>
+        {initialNotice && <output>{initialNotice}</output>}
         {slackAvailable && (
           <button
             type="button"

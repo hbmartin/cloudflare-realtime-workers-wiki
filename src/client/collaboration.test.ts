@@ -6,6 +6,7 @@ import {
   createNetworkCollaboration,
   createWorkspaceEvents,
   loadOfflineCopy,
+  waitForOfflinePersistence,
 } from "./collaboration";
 import { LOCAL_SIGNOUT_KEY } from "./offline-catalog";
 
@@ -113,6 +114,19 @@ vi.mock("yjs", () => ({
 }));
 
 describe("collaboration durability barriers", () => {
+  it("bounds a copy load whose IndexedDB open never resolves", async () => {
+    const persistence = {
+      _db: new Promise<IDBDatabase>(() => undefined),
+      whenSynced: new Promise<void>(() => undefined),
+    } as unknown as Parameters<typeof waitForOfflinePersistence>[0];
+    await Promise.all([
+      expect(waitForOfflinePersistence(persistence)).rejects.toThrow(
+        "Offline document storage did not finish loading.",
+      ),
+      vi.advanceTimersByTimeAsync(30_000),
+    ]);
+  });
+
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

@@ -39,15 +39,10 @@ export async function exportPendingOfflinePages(pages: OfflinePage[], bestEffort
     for (const key of keys) {
       if (!key) throw new Error(`The local copy of ${page.title} is unavailable.`);
       try {
-        const doc = await loadOfflineCopy(key);
-        try {
-          const epoch = storageEpoch(key);
-          sections.push(
-            `<!-- Offline document ${page.pageId}, epoch ${epoch} -->\n${offlineCopyMarkdown(doc, page.title)}`,
-          );
-        } finally {
-          doc.destroy();
-        }
+        const epoch = storageEpoch(key);
+        sections.push(
+          `<!-- Offline document ${page.pageId}, epoch ${epoch} -->\n${await offlineCopyMarkdownFromKey(key, page.title)}`,
+        );
       } catch (error) {
         if (!bestEffort) throw error;
         failed += 1;

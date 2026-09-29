@@ -11,6 +11,7 @@ import {
   offlineDocumentKey,
   registerOfflineDocumentKey,
   registerOfflineDocumentKeyFromKey,
+  withOfflineDocumentLock,
 } from "./offline-catalog";
 
 export type CollaborationBundle = {
@@ -176,7 +177,7 @@ export function createCollaboration(
     durability.markChanged();
     barrier.schedule();
   });
-  const ready = waitForOfflinePersistence(indexeddb)
+  const ready = indexeddb.whenSynced
     .then(() => {
       if (!destroyed) {
         // Until the server sync completes, conservatively treat a persisted copy
@@ -382,18 +383,22 @@ export function createNetworkCollaboration(
 
 export async function loadOfflineCopy(key: string) {
   registerOfflineDocumentKeyFromKey(key);
-  if (!(await hasOfflineDocument(key))) throw new Error("This offline document copy is no longer on this device.");
-  const doc = new Y.Doc();
-  const persistence = new IndexeddbPersistence(key, doc);
-  let loaded = false;
-  try {
-    await waitForOfflinePersistence(persistence);
-    loaded = true;
-    return doc;
-  } finally {
-    await persistence.destroy().catch(() => undefined);
-    if (!loaded) doc.destroy();
-  }
+  return withOfflineDocumentLock(key, async () => {
+    registerOfflineDocumentKeyFromKey(key);
+    if (!(await hasOfflineDocument(key))) throw new Error("This offline document copy is no longer on this device.");
+    const doc = new Y.Doc();
+    const persistence = new IndexeddbPersistence(key, doc);
+    let loaded = false;
+    try {
+      await waitForOfflinePersistence(persistence);
+      loaded = true;
+      return doc;
+    } finally {
+      const closing = persistence.destroy().catch(() => undefined);
+      if (loaded) await closing;
+      if (!loaded) doc.destroy();
+    }
+  });
 }
 
 export async function waitForOfflinePersistence(persistence: IndexeddbPersistence) {

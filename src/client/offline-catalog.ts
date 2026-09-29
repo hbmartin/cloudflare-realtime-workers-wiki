@@ -208,6 +208,12 @@ async function withPageLock<T>(key: string, operation: () => Promise<T>): Promis
   return run();
 }
 
+export function withOfflineDocumentLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const match = /^account:([^:]+):([^:]+):([^:]+):\d+:2$/.exec(key);
+  if (!match) return operation();
+  return withPageLock(`${match[1]}\u0000${match[2]}\u0000${match[3]}`, operation);
+}
+
 export function offlineAccountKey(member: { user: { id: string }; workspace: { id: string } }) {
   return `${member.user.id}\u0000${member.workspace.id}`;
 }
@@ -656,41 +662,54 @@ export async function forgetOfflineAccount(accountKey: string) {
   // A retry after a completed purge has no catalog or registry to inspect.
   const completedWithoutEnumeration =
     !indexedDB.databases && !account && !pages.length && registeredDocumentKeys(accountKey).keys === null;
-  const names = completedWithoutEnumeration ? [] : await accountDocumentNames(accountKey, true);
+  const names = completedWithoutEnumeration ? [] : await accountDocumentNames(accountKey, false);
   const keys = new Set(pages.flatMap((page) => page.storageKeys ?? []));
   // Catalog writes and Yjs store creation are separate transactions. Include
   // stores left behind by an interrupted catalog write or a previous purge.
   for (const name of names) if (prefix && name.startsWith(prefix)) keys.add(name);
   for (const key of keys) {
-    await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.deleteDatabase(key);
-      request.addEventListener("success", () => resolve());
-      request.addEventListener("error", () => reject(request.error ?? new Error("Offline document removal failed.")));
-      request.addEventListener("blocked", () =>
-        reject(new Error("Close other NoteFlare tabs to remove offline documents.")),
-      );
-    });
+    await withOfflineDocumentLock(
+      key,
+      () =>
+        new Promise<void>((resolve, reject) => {
+          const request = indexedDB.deleteDatabase(key);
+          request.addEventListener("success", () => resolve());
+          request.addEventListener("error", () =>
+            reject(request.error ?? new Error("Offline document removal failed.")),
+          );
+          request.addEventListener("blocked", () =>
+            reject(new Error("Close other NoteFlare tabs to remove offline documents.")),
+          );
+        }),
+    );
   }
+  let verified = !!indexedDB.databases;
   if (prefix && indexedDB.databases) {
     let remaining: IDBDatabaseInfo[] | null = null;
     try {
       remaining = await indexedDB.databases();
     } catch (error) {
       console.error("Offline document enumeration failed during sign-out", error);
-      throw error;
+      verified = false;
     }
-    if (remaining.some((database) => database.name?.startsWith(prefix)))
+    if (remaining?.some((database) => database.name?.startsWith(prefix)))
       throw new Error("New local document storage appeared during sign-out. Retry removal.");
   }
-  const newlyRegistered = (completedWithoutEnumeration ? [] : await accountDocumentNames(accountKey, true)).filter(
+  const newlyRegistered = (completedWithoutEnumeration ? [] : await accountDocumentNames(accountKey, false)).filter(
     (key) => prefix && key.startsWith(prefix) && !keys.has(key),
   );
   if (newlyRegistered.length) throw new Error("New local document storage appeared during sign-out. Retry removal.");
   if (registryEntries().some((name) => !entryNamesAtStart.has(name)))
     throw new Error("New local document storage appeared during sign-out. Retry removal.");
   if (prefix && indexedDB.databases) {
-    const remaining = await indexedDB.databases();
-    if (remaining.some((database) => database.name?.startsWith(prefix)))
+    let remaining: IDBDatabaseInfo[] | null = null;
+    try {
+      remaining = await indexedDB.databases();
+    } catch (error) {
+      console.error("Offline document enumeration failed during sign-out", error);
+      verified = false;
+    }
+    if (remaining?.some((database) => database.name?.startsWith(prefix)))
       throw new Error("New local document storage appeared during sign-out. Retry removal.");
   }
   const transaction = db.transaction(["accounts", "pages"], "readwrite");
@@ -708,4 +727,5 @@ export async function forgetOfflineAccount(accountKey: string) {
     console.error("Offline document registry could not be cleared", error);
     throw error;
   }
+  return verified;
 }

@@ -1,5 +1,6 @@
 import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
+
 import { ActionMenu, PageTools } from "./WorkspaceUI";
 import { CommentsExtension } from "@blocknote/core/comments";
 import {
@@ -46,6 +47,16 @@ import {
   rememberOfflineAccount,
   storageEpoch,
 } from "./offline-catalog";
+
+const ACCOUNT_CATALOG_WARNING = "The offline page list could not be updated yet.";
+const PENDING_CATALOG_WARNING = "Local changes are saved, but the offline page list could not be updated yet.";
+const SYNCED_CATALOG_WARNING = "Changes are synced, but the offline page list could not be updated yet.";
+
+function recoveryMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message === "This offline document copy is no longer on this device."
+    ? error.message
+    : fallback;
+}
 
 export type EditorPageProps = {
   page: Page;
@@ -110,6 +121,7 @@ export function EditorPage({
         console.error("Unable to persist offline recovery details", error);
       }
       setRecovery(next);
+      if (!next.length) setRecoveryError(null);
     },
     [recoveryKey],
   );
@@ -254,16 +266,14 @@ export function EditorPage({
         try {
           await rememberOfflineAccount(currentMember);
           if (active && !catalogNeedsRepair)
-            setCatalogWarning((warning) =>
-              warning === "The offline page list could not be updated yet." ? null : warning,
-            );
+            setCatalogWarning((warning) => (warning === ACCOUNT_CATALOG_WARNING ? null : warning));
         } catch (error) {
           console.error("Unable to update offline account metadata", error);
           if (active)
             setCatalogWarning((warning) =>
-              warning?.includes("offline page list could not be updated yet")
+              warning === PENDING_CATALOG_WARNING || warning === SYNCED_CATALOG_WARNING
                 ? warning
-                : "The offline page list could not be updated yet.",
+                : ACCOUNT_CATALOG_WARNING,
             );
         }
         if (!active) return false;
@@ -339,6 +349,7 @@ export function EditorPage({
       const current = recoveryRef.current;
       const remaining = current.filter((entry) => entry.key !== currentStorageKey);
       if (remaining.length !== current.length) replaceRecovery(remaining);
+      setRecoveryError(null);
       setStorageError("");
       setCatalogWarning(null);
     };
@@ -396,10 +407,10 @@ export function EditorPage({
           if (pending && active) {
             catalogNeedsRepair = true;
             nextCatalogRepairAt = Date.now() + 5_000;
-            setCatalogWarning("Local changes are saved, but the offline page list could not be updated yet.");
+            setCatalogWarning(PENDING_CATALOG_WARNING);
           } else if (!pending && active && revision === pendingRevision) {
             pendingActive = true;
-            setCatalogWarning("Changes are synced, but the offline page list could not be updated yet.");
+            setCatalogWarning(SYNCED_CATALOG_WARNING);
             if (clearRetryTimer !== undefined) window.clearTimeout(clearRetryTimer);
             clearRetryTimer = window.setTimeout(() => {
               clearRetryTimer = undefined;
@@ -691,7 +702,7 @@ export function EditorPage({
                   }
                 } catch (error) {
                   console.error("Offline copy preview failed", error);
-                  setRecoveryError(error instanceof Error ? error.message : "This offline copy could not be read.");
+                  setRecoveryError(recoveryMessage(error, "This offline copy could not be read."));
                 }
               }}
             >
@@ -704,9 +715,7 @@ export function EditorPage({
                   () => setRecoveryError(null),
                   (error: unknown) => {
                     console.error("Offline copy export failed", error);
-                    setRecoveryError(
-                      error instanceof Error ? error.message : "This offline copy could not be exported.",
-                    );
+                    setRecoveryError(recoveryMessage(error, "This offline copy could not be exported."));
                   },
                 );
               }}
@@ -719,15 +728,21 @@ export function EditorPage({
                 const content = offlineCopyMarkdownFromKey(entry.key, page.title);
                 void content.catch(() => undefined);
                 try {
-                  await navigator.clipboard.write([
-                    new ClipboardItem({
-                      "text/plain": content.then((markdown) => new Blob([markdown], { type: "text/plain" })),
-                    }),
-                  ]);
+                  if (typeof ClipboardItem !== "undefined" && navigator.clipboard.write)
+                    await navigator.clipboard.write([
+                      new ClipboardItem({
+                        "text/plain": content.then((markdown) => new Blob([markdown], { type: "text/plain" })),
+                      }),
+                    ]);
+                  else await navigator.clipboard.writeText(await content);
                   setRecoveryError(null);
                 } catch (error) {
                   console.error("Offline copy clipboard failed", error);
-                  setRecoveryError(error instanceof Error ? error.message : "This offline copy could not be copied.");
+                  const source = await content.then(
+                    () => error,
+                    (loadingError) => loadingError as unknown,
+                  );
+                  setRecoveryError(recoveryMessage(source, "This offline copy could not be copied."));
                 }
               }}
             >
@@ -744,6 +759,7 @@ export function EditorPage({
                     console.error("Unable to update dismissed recovery details", error);
                   }
                   replaceRecovery(recoveryRef.current.filter((item) => item.key !== entry.key));
+                  setRecoveryError(null);
                   setRecoveryPreview(null);
                 }}
               >

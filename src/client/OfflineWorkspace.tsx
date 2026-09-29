@@ -18,7 +18,6 @@ import {
   clearRevokedOfflinePages,
   documentPendingMarker,
   getOfflinePage,
-  hasOfflineDocument,
   listPendingOfflinePages,
   markOfflinePagePending,
   markOfflinePageRevoked,
@@ -304,9 +303,7 @@ export function OfflineWorkspace({
                         pending.filter((page) => page.pageId === selected.pageId).flatMap(pendingKeysOf),
                       );
                       if (!complete) {
-                        for (const key of pendingKeysOf(selected)) {
-                          if (await hasOfflineDocument(key).catch(() => true)) keys.add(key);
-                        }
+                        for (const key of pendingKeysOf(selected)) keys.add(key);
                       }
                       if (!keys.size) {
                         setNotice(
@@ -320,10 +317,13 @@ export function OfflineWorkspace({
                         [{ ...selected, pendingCopyKeys: [...keys] }],
                         true,
                       );
-                      if (!complete || result.failed)
+                      if (!complete || result.failed) {
+                        const failed = result.failed ? ` ${result.failed} could not be read.` : "";
+                        const unlisted = !complete ? " Other older copies may remain." : "";
                         setNotice(
-                          `Exported ${result.exported} readable ${result.exported === 1 ? "copy" : "copies"}. ${result.failed} could not be read; other older copies may remain.`,
+                          `Exported ${result.exported} readable ${result.exported === 1 ? "copy" : "copies"}.${failed}${unlisted}`,
                         );
+                      }
                     })().catch((error) =>
                       setNotice(error instanceof Error ? error.message : "Unable to export local changes."),
                     );
