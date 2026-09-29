@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
 import type { ClientMemberContext } from "../shared/types";
 import { ApiClientError } from "./api";
+import { createCollaboration, OfflineStorageTimeoutError } from "./collaboration";
 import { EditorPage } from "./EditorPage";
 
 const mocks = vi.hoisted(() => {
@@ -24,9 +25,12 @@ const mocks = vi.hoisted(() => {
   return {
     api: vi.fn(),
     destroy: vi.fn(),
+    stop: vi.fn(),
+    storeUpdate: vi.fn(),
     handlers,
     provider,
     ready: Promise.resolve() as Promise<void>,
+    lateReady: Promise.resolve() as Promise<void>,
     slashItems: null as null | ((query: string) => Promise<Array<{ title: string; onItemClick: () => void }>>),
     unsynced: false,
   };
@@ -38,17 +42,28 @@ vi.mock("./api", async (importOriginal) => ({
 }));
 
 vi.mock("./collaboration", () => ({
+  OFFLINE_COPY_MISSING_MESSAGE: "This offline document copy is no longer on this device.",
+  OfflineStorageTimeoutError: class MockOfflineStorageTimeoutError extends Error {
+    constructor() {
+      super("Offline document storage did not finish loading.");
+    }
+  },
   createCollaboration: vi.fn(() => ({
     doc: {
       getMap: vi.fn(() => new Map()),
       getXmlFragment: vi.fn(() => ({})),
+      on: vi.fn(),
+      off: vi.fn(),
     },
     provider: mocks.provider,
+    indexeddb: { _storeUpdate: mocks.storeUpdate, db: null, _dbsize: 0 },
     ready: mocks.ready,
+    lateReady: mocks.lateReady,
     get hasUnsyncedChanges() {
       return mocks.unsynced;
     },
     destroy: mocks.destroy,
+    stop: mocks.stop,
   })),
   loadOfflineCopy: vi.fn(),
   userColor: vi.fn(() => "#2563eb"),
@@ -142,12 +157,14 @@ describe("EditorPage close reconciliation", () => {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(1);
     mocks.api.mockReset();
+    vi.mocked(createCollaboration).mockClear();
     mocks.destroy.mockReset();
     mocks.handlers.clear();
     mocks.provider.connect.mockReset();
     mocks.provider.disconnect.mockReset();
     mocks.provider.on.mockClear();
     mocks.ready = Promise.resolve();
+    mocks.lateReady = Promise.resolve();
     mocks.slashItems = null;
     mocks.unsynced = false;
     Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
@@ -157,6 +174,30 @@ describe("EditorPage close reconciliation", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("keeps the page mounted when local sign-out blocks a new document store", async () => {
+    vi.mocked(createCollaboration).mockImplementationOnce(() => {
+      throw new Error("Local sign-out is removing offline documents.");
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => Promise.resolve());
+    expect(screen.getByLabelText("Page title")).toBeInTheDocument();
+    expect(screen.getByText("Offline")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("Offline storage is unavailable, so editing and collaboration are disabled for this page."),
+    ).not.toHaveLength(0);
   });
 
   it("continues metadata reconciliation after the initial retry budget", async () => {
@@ -213,20 +254,26 @@ describe("EditorPage close reconciliation", () => {
     const connectionClose = mocks.handlers.get("connection-close");
     expect(customMessage).toBeTypeOf("function");
     expect(connectionClose).toBeTypeOf("function");
+    localStorage.setItem(
+      "notes:recovery:user-1:workspace-1:page-1",
+      JSON.stringify([{ key: "account:user-1:workspace-1:page-1:0:2", epoch: 0, reason: "epoch" }]),
+    );
     await act(async () => {
       customMessage!(JSON.stringify({ type: "document-size", bytes: 20_000_000, readOnly: true }));
       connectionClose!(new CloseEvent("close", { code: 4410 }));
       await Promise.resolve();
     });
 
-    expect(localStorage.getItem("notes:recovery:workspace-1:page-1")).toBe(
-      JSON.stringify({ key: "workspace-1:page-1:1:1", epoch: 1 }),
-    );
+    expect(JSON.parse(localStorage.getItem("notes:recovery:user-1:workspace-1:page-1") ?? "null")).toEqual([
+      { key: "account:user-1:workspace-1:page-1:0:2", epoch: 0, reason: "epoch" },
+      { key: "account:user-1:workspace-1:page-1:1:2", epoch: 1, reason: "epoch" },
+    ]);
   });
 
   it("keeps the editor closed when offline storage is unavailable", async () => {
     vi.useRealTimers();
     mocks.ready = Promise.reject(new Error("IndexedDB unavailable"));
+    mocks.lateReady = mocks.ready;
 
     render(
       <EditorPage
@@ -246,6 +293,139 @@ describe("EditorPage close reconciliation", () => {
     ).toBeInTheDocument();
     expect(screen.getByLabelText("Page title")).toHaveAttribute("readonly");
     expect(screen.queryByText("Opening your offline copy…")).not.toBeInTheDocument();
+  });
+
+  it("opens the editor when an offline copy finishes loading after the deadline", async () => {
+    vi.useRealTimers();
+    let finishLoading!: () => void;
+    mocks.ready = Promise.reject(new OfflineStorageTimeoutError());
+    mocks.lateReady = new Promise<void>((resolve) => {
+      finishLoading = resolve;
+    });
+
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    expect(await screen.findByText("Offline storage is still loading.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry loading this copy" })).toBeInTheDocument();
+    await act(async () => finishLoading());
+    await waitFor(() => {
+      expect(screen.queryByText("Offline storage is still loading.")).not.toBeInTheDocument();
+      expect(screen.queryByText("Opening your offline copy…")).not.toBeInTheDocument();
+      expect(mocks.slashItems).toBeTypeOf("function");
+    });
+  });
+
+  it("retries a slow offline copy without reloading the page", async () => {
+    vi.useRealTimers();
+    mocks.ready = Promise.reject(new OfflineStorageTimeoutError());
+    mocks.lateReady = new Promise<void>(() => {});
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Retry loading this copy" }));
+    await waitFor(() => expect(createCollaboration).toHaveBeenCalledTimes(2));
+    expect(screen.getByLabelText("Page title")).toHaveValue("Page");
+  });
+
+  it("keeps a quarantined write available to export after a storage retry and remount", async () => {
+    vi.useRealTimers();
+    const key = "account:user-1:workspace-1:page-1:1:2";
+    localStorage.setItem(
+      "notes:recovery:user-1:workspace-1:page-1",
+      JSON.stringify([{ key, epoch: 1, reason: "storage" }]),
+    );
+    mocks.ready = Promise.reject(new OfflineStorageTimeoutError());
+    mocks.lateReady = new Promise<void>(() => {});
+    const props = {
+      page,
+      member,
+      onPageChanged: vi.fn(),
+      onPageUnavailable: vi.fn(),
+      onAccessDenied: vi.fn(),
+      onSelectPage: vi.fn(),
+      backlinksRevision: 0,
+    };
+    const view = render(<EditorPage {...props} />);
+    expect(await screen.findByRole("button", { name: "Export Markdown" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Page title")).toHaveAttribute("readonly");
+    mocks.ready = Promise.resolve();
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this copy" }));
+    await waitFor(() => expect(createCollaboration).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: "Export Markdown" })).toBeInTheDocument();
+    view.unmount();
+    render(<EditorPage {...props} />);
+    expect(await screen.findByRole("button", { name: "Export Markdown" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Page title")).toHaveAttribute("readonly");
+  });
+
+  it("keeps access quarantine visible when a storage recovery entry already exists", async () => {
+    vi.useRealTimers();
+    mocks.unsynced = true;
+    localStorage.setItem(
+      "notes:recovery:user-1:workspace-1:page-1",
+      JSON.stringify([{ key: "account:user-1:workspace-1:page-1:1:2", epoch: 1, reason: "storage" }]),
+    );
+    mocks.api.mockRejectedValue(new ApiClientError(401, "unauthorized", "Sign in again."));
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => {
+      mocks.handlers.get("connection-close")!(new CloseEvent("close", { code: 4410 }));
+      await Promise.resolve();
+    });
+    expect(await screen.findByText(/Current access could not be confirmed/)).toBeInTheDocument();
+    expect(screen.getByText(/The saved copy may be incomplete/)).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("notes:recovery:user-1:workspace-1:page-1") ?? "null")).toMatchObject([
+      { reason: "access", storageFailed: true },
+    ]);
+    expect(screen.queryByRole("button", { name: "Dismiss" })).not.toBeInTheDocument();
+  });
+
+  it("shows recovery entries written by another tab", async () => {
+    vi.useRealTimers();
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    const key = "notes:recovery:user-1:workspace-1:page-1";
+    localStorage.setItem(
+      key,
+      JSON.stringify([{ key: "account:user-1:workspace-1:page-1:0:2", epoch: 0, reason: "epoch" }]),
+    );
+    fireEvent(window, new StorageEvent("storage", { key }));
+    expect(await screen.findByText(/Edits from epoch 0 were not merged/)).toBeInTheDocument();
   });
 
   it("adds accessible names to comment editors generated by BlockNote", async () => {

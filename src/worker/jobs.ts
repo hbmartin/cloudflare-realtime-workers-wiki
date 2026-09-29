@@ -18,7 +18,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import * as Y from "yjs";
 import { DIAGRAM_EDGES_ROOT, DIAGRAM_META_ROOT, DIAGRAM_NODES_ROOT } from "../shared/diagram";
-import { boundedLogString, PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
+import { boundedLogString, prefixedErrorLogFields, PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import { sha256Hex } from "../shared/import-integrity";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
@@ -809,19 +809,31 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
   try {
     return await hasUnlinkedCapture(env, job.id);
   } catch (lookupError) {
-    logger.error(
-      "workflow.capture_lookup.failed",
-      "workflow",
-      "Capture lookup failed during job recovery.",
-      { jobId: job.id },
-      lookupError,
-    );
-    logger.info(
-      "workflow.capture_import.deferred",
-      "workflow",
-      "Capture recovery deferred until its receipt can be checked.",
-      { jobId: job.id, attempt: job.attempt },
-    );
+    try {
+      const unlinked = await hasUnlinkedCapture(env, job.id);
+      logger.warn(
+        "workflow.capture_lookup.retried",
+        "workflow",
+        "Capture receipt lookup recovered on retry.",
+        { jobId: job.id, attempt: job.attempt },
+        lookupError,
+      );
+      return unlinked;
+    } catch (retryError) {
+      logger.error(
+        "workflow.capture_import.unresolved",
+        "workflow",
+        "Capture import failed while receipt lookup was unavailable.",
+        {
+          jobId: job.id,
+          attempt: job.attempt,
+          ...prefixedErrorLogFields("firstLookup", lookupError),
+          ...prefixedErrorLogFields("retryLookup", retryError),
+        },
+        error,
+      );
+      // The scheduled pass will retry when D1 can answer authoritatively.
+    }
     // Defer recovery until D1 can distinguish an unlinked receipt from a real
     // import failure. Neither outcome is safe to assume during an outage.
     return "lookup_failed" as const;
@@ -962,10 +974,10 @@ export async function finishPendingJobCleanup(
 
   const stillOwned = cleanupLeaseGuard(env, identity, token, timestamp);
   try {
-    if (options.terminateWorkflow !== false && job.workflow_instance_id && env.WORKFLOW_INLINE !== "true") {
+    if (options.terminateWorkflow !== false && env.WORKFLOW_INLINE !== "true") {
       let terminating = false;
       try {
-        const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
+        const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id ?? job.id);
         const status = await instance.status();
         if (ACTIVE_WORKFLOW_STATUSES.has(status.status)) {
           terminating = true;
@@ -1046,7 +1058,7 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown, deferCl
       .bind(errorCode, message, Date.now(), job.id, job.attempt, job.workflow_instance_id ?? job.id)
       .run();
     if (failed.meta.changes) await notifyJobs(env, job.workspace_id);
-    return;
+    return false;
   }
   const captureId = job.type === "import" ? jsonRecord(job.options_json).captureId : null;
   const timestamp = Date.now();
@@ -1064,9 +1076,9 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown, deferCl
         ]
       : []),
   ]);
-  if (!pending?.meta.changes) return;
+  if (!pending?.meta.changes) return false;
   await notifyJobs(env, job.workspace_id);
-  if (deferCleanup) return;
+  if (deferCleanup) return true;
   await finishPendingJobCleanup(env, job, { terminateWorkflow: false }).catch((cleanupError) => {
     logger.error(
       "workflow.failure_cleanup.failed",
@@ -1076,6 +1088,7 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown, deferCl
       cleanupError,
     );
   });
+  return true;
 }
 
 async function updateJob(
@@ -1207,7 +1220,7 @@ export async function resolveJobWorkflowAttempt(
   event: Pick<WorkflowEvent<JobWorkflowParams>, "payload" | "instanceId">,
 ) {
   if (Number.isInteger(event.payload.attempt) && event.payload.attempt! > 0) return event.payload.attempt!;
-  const legacy = await env.DB.prepare(`SELECT attempt FROM jobs WHERE id = ? AND workflow_instance_id = ?`)
+  const legacy = await env.DB.prepare(`SELECT attempt FROM jobs WHERE id = ? AND COALESCE(workflow_instance_id,id) = ?`)
     .bind(event.payload.jobId, event.instanceId)
     .first<{ attempt: number }>();
   return legacy?.attempt ?? null;
@@ -1362,6 +1375,7 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
 
 export async function recoverQueuedJobs(env: Env) {
   const cutoff = Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS;
+  const terminalCleanups: Array<Pick<JobRow, "id" | "attempt">> = [];
   if (env.WORKFLOW_INLINE !== "true") {
     const rotateRunningJob = (job: JobRow) =>
       env.DB.prepare(`UPDATE jobs SET updated_at=? WHERE id=? AND attempt=? AND status='running'
@@ -1406,7 +1420,7 @@ export async function recoverQueuedJobs(env: Env) {
             continue;
           }
         }
-        await failJobWithCleanup(env, job, failure, true);
+        if (await failJobWithCleanup(env, job, failure, true)) terminalCleanups.push(job);
       } catch (error) {
         logger.error(
           "workflow.running_recovery.failed",
@@ -1433,7 +1447,23 @@ export async function recoverQueuedJobs(env: Env) {
   )
     .bind(cutoff)
     .all<Pick<JobRow, "id" | "workflow_instance_id" | "attempt" | "correlation_id">>();
-  for (const job of queued.results) {
+  const cleanTerminal = async (job: Pick<JobRow, "id" | "attempt">) => {
+    try {
+      await finishPendingJobCleanup(env, job, { terminateWorkflow: false });
+    } catch (error) {
+      logger.error(
+        "workflow.pending_cleanup.failed",
+        "workflow",
+        "Pending job cleanup failed.",
+        { jobId: job.id },
+        error,
+      );
+    }
+  };
+  let cleanedTerminal = 0;
+  for (; cleanedTerminal < Math.min(2, terminalCleanups.length); cleanedTerminal += 1)
+    await cleanTerminal(terminalCleanups[cleanedTerminal]!);
+  for (const [index, job] of queued.results.entries()) {
     try {
       await startJobExecution(env, job);
     } catch (error) {
@@ -1453,10 +1483,15 @@ export async function recoverQueuedJobs(env: Env) {
         );
       }
     }
+    if ((index + 1) % 5 === 0 && cleanedTerminal < terminalCleanups.length)
+      await cleanTerminal(terminalCleanups[cleanedTerminal++]!);
   }
+  for (; cleanedTerminal < terminalCleanups.length; cleanedTerminal += 1)
+    await cleanTerminal(terminalCleanups[cleanedTerminal]!);
   const cleanups = await env.DB.prepare(
     `SELECT id, attempt FROM jobs WHERE cleanup_target IS NOT NULL
-      AND status IN (${CLEANUP_JOB_STATUS_SQL}) AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
+      AND status IN (${CLEANUP_JOB_STATUS_SQL}) AND updated_at <= ?
+      ORDER BY updated_at LIMIT 25`,
   )
     .bind(cutoff)
     .all<Pick<JobRow, "id" | "attempt">>();

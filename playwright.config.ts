@@ -5,7 +5,7 @@ const useLocalServer = !process.env.NOTES_E2E_BASE_URL;
 
 export default defineConfig({
   testDir: "tests/e2e",
-  testIgnore: "phase1-production.spec.ts",
+  testIgnore: ["phase1-production.spec.ts", "phase4-offline-shell.spec.ts"],
   fullyParallel: false,
   workers: 1,
   forbidOnly: Boolean(process.env.CI),

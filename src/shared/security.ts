@@ -36,6 +36,7 @@ export function constantTimeEqual(left: string, right: string) {
 export type SecurityState = "signed_out" | "enrollment_required" | "challenge_required" | "recovery_required" | "ready";
 export interface SecurityStatus {
   state: SecurityState;
+  userId?: string;
   totp: boolean;
   passkeys: number;
   codesSaved: boolean;

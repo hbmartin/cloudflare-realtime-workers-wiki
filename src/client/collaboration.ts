@@ -6,6 +6,22 @@ import { parseWorkspaceEvent } from "../shared/validation";
 import { CollaborationDurability } from "./collaboration-durability";
 import { connectionRetryDelay } from "./retry";
 import { reportClientError } from "./telemetry";
+import {
+  hasOfflineDocument,
+  offlineDocumentKey,
+  registerOfflineDocumentKey,
+  registerOfflineDocumentKeyFromKey,
+  withOfflineDocumentLock,
+} from "./offline-catalog";
+
+export const OFFLINE_COPY_MISSING_MESSAGE = "This offline document copy is no longer on this device.";
+export const OFFLINE_STORAGE_TIMEOUT_MESSAGE = "Offline document storage did not finish loading.";
+export class OfflineStorageTimeoutError extends Error {
+  override name = "OfflineStorageTimeoutError";
+  constructor() {
+    super(OFFLINE_STORAGE_TIMEOUT_MESSAGE);
+  }
+}
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -17,7 +33,10 @@ export type CollaborationBundle = {
    * active; failures after destroy are suppressed.
    */
   ready: Promise<void>;
+  /** Settles if an initially slow store finishes after the readiness deadline. */
+  lateReady: Promise<void>;
   readonly hasUnsyncedChanges: boolean;
+  stop: () => void;
   destroy: () => void;
 };
 
@@ -77,9 +96,12 @@ export function createCollaboration(
   pageId: string,
   epoch: number,
   onStatus: (status: "offline" | "connecting" | "connected") => void,
+  userId: string,
+  beforeConnect?: () => Promise<boolean>,
 ): CollaborationBundle {
   const doc = new Y.Doc();
-  const key = `${workspaceId}:${pageId}:${epoch}:1`;
+  const key = offlineDocumentKey(userId, workspaceId, pageId, epoch);
+  registerOfflineDocumentKey(userId, workspaceId, key);
   const indexeddb = new IndexeddbPersistence(key, doc);
   const provider = new YProvider(window.location.host, `${pageId}~${epoch}`, doc, {
     party: "document",
@@ -88,23 +110,43 @@ export function createCollaboration(
   let hiddenTimer: number | undefined;
   let connectionTimer: number | undefined;
   let connectionAttempt = 0;
+  let connecting = false;
   let destroyed = false;
+  let closed = false;
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
   const barrier = createDurabilityBarrier(provider, durability, 1_000);
-  const connect = () => {
+  const reconnectWebSocket = provider["_reconnectWS"].bind(provider);
+  const connect = (socketOnly = false) => {
     if (destroyed) return;
+    if (provider.wsconnected && provider.shouldConnect) {
+      onStatus("connected");
+      return;
+    }
+    if (connecting || (provider.wsconnecting && provider.shouldConnect)) return;
+    connecting = true;
     if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
     connectionTimer = undefined;
-    void provider.connect().then(
-      () => {
+    onStatus("connecting");
+    void (async () => {
+      try {
+        if (beforeConnect && !(await beforeConnect())) {
+          if (destroyed) return;
+          provider.disconnect();
+          onStatus("offline");
+          return;
+        }
+        if (destroyed) return;
+        if (socketOnly && provider.shouldConnect) {
+          if (!provider.bcconnected) provider.connectBc();
+          await reconnectWebSocket();
+        } else await provider.connect();
         if (destroyed) {
           provider.disconnect();
           return;
         }
         connectionAttempt = 0;
-      },
-      (error) => {
+      } catch (error) {
         if (destroyed) return;
         onStatus("offline");
         console.error("Failed to connect document collaboration", error);
@@ -112,8 +154,15 @@ export function createCollaboration(
         if (document.visibilityState !== "hidden") {
           connectionTimer = window.setTimeout(connect, connectionRetryDelay(connectionAttempt++));
         }
-      },
-    );
+      } finally {
+        connecting = false;
+      }
+    })();
+  };
+  // The provider reconnects internally after a socket closes. Route that
+  // path through the same access check as an explicit connection attempt.
+  provider["_reconnectWS"] = async () => {
+    connect(true);
   };
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
@@ -139,18 +188,29 @@ export function createCollaboration(
     durability.markChanged();
     barrier.schedule();
   });
-  const ready = indexeddb.whenSynced
-    .then(() => {
-      if (!destroyed) {
-        // Until the server sync completes, conservatively treat a persisted copy
-        // as recoverable offline work. An epoch rejection happens before sync.
-        if (Y.encodeStateVector(doc).byteLength > 1) durability.markChanged();
-        indexeddbSynced = true;
-        connect();
-      }
-    })
+  const synced = indexeddb.whenSynced.then(() => {
+    if (!destroyed) {
+      // Until the server sync completes, conservatively treat a persisted copy
+      // as recoverable offline work. An epoch rejection happens before sync.
+      if (Y.encodeStateVector(doc).byteLength > 1) durability.markChanged();
+      indexeddbSynced = true;
+      connect();
+    }
+  });
+  void synced.catch(() => undefined);
+  const lateReady = indexeddb["_db"].then(() => synced);
+  void lateReady.catch(() => undefined);
+  const readyAbort = new AbortController();
+  const ready = waitForOfflinePersistence(indexeddb, readyAbort.signal)
+    .then(() => synced)
     .catch((error) => {
       if (destroyed) return;
+      if (error instanceof OfflineStorageTimeoutError) {
+        console.warn("Offline document storage is still loading", error);
+        void reportClientError("client.offline_storage_slow", error);
+        onStatus("offline");
+        throw error;
+      }
       console.error("Failed to load offline document state", error);
       void reportClientError("client.offline_storage_failed", error);
       onStatus("offline");
@@ -174,25 +234,35 @@ export function createCollaboration(
   };
   document.addEventListener("visibilitychange", visibility);
 
+  const stop = () => {
+    if (destroyed) return;
+    destroyed = true;
+    readyAbort.abort();
+    if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
+    barrier.destroy();
+    if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
+    document.removeEventListener("visibilitychange", visibility);
+    provider.off("status", handleStatus);
+    provider.off("sync", handleSync);
+    provider.off("custom-message", handleCustomMessage);
+    provider.awareness.setLocalState(null);
+    provider.destroy();
+  };
+
   return {
     doc,
     indexeddb,
     provider,
     ready,
+    lateReady,
     get hasUnsyncedChanges() {
       return durability.hasUnsyncedChanges;
     },
+    stop,
     destroy() {
-      destroyed = true;
-      if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
-      barrier.destroy();
-      if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
-      document.removeEventListener("visibilitychange", visibility);
-      provider.off("status", handleStatus);
-      provider.off("sync", handleSync);
-      provider.off("custom-message", handleCustomMessage);
-      provider.awareness.setLocalState(null);
-      provider.destroy();
+      stop();
+      if (closed) return;
+      closed = true;
       void indexeddb.destroy().catch((error) => {
         console.error("Failed to close offline document storage", error);
         void reportClientError("client.offline_storage_failed", error);
@@ -336,11 +406,49 @@ export function createNetworkCollaboration(
 }
 
 export async function loadOfflineCopy(key: string) {
-  const doc = new Y.Doc();
-  const persistence = new IndexeddbPersistence(key, doc);
-  await persistence.whenSynced;
-  await persistence.destroy();
-  return doc;
+  registerOfflineDocumentKeyFromKey(key);
+  return withOfflineDocumentLock(key, async () => {
+    registerOfflineDocumentKeyFromKey(key);
+    if (!(await hasOfflineDocument(key))) throw new Error(OFFLINE_COPY_MISSING_MESSAGE);
+    const doc = new Y.Doc();
+    const persistence = new IndexeddbPersistence(key, doc);
+    let loaded = false;
+    try {
+      await waitForOfflinePersistence(persistence);
+      loaded = true;
+      return doc;
+    } finally {
+      const closing = persistence.destroy().catch(() => undefined);
+      if (loaded) await closing;
+      if (!loaded) doc.destroy();
+    }
+  });
+}
+
+export async function waitForOfflinePersistence(persistence: IndexeddbPersistence, signal?: AbortSignal) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let rejectAbort: ((reason: unknown) => void) | undefined;
+  const abort = () => rejectAbort?.(new DOMException("Offline storage load canceled.", "AbortError"));
+  try {
+    await Promise.race([
+      persistence["_db"].then(() => persistence.whenSynced),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new OfflineStorageTimeoutError()), 30_000);
+      }),
+      ...(signal
+        ? [
+            new Promise<never>((_, reject) => {
+              rejectAbort = reject;
+              signal.addEventListener("abort", abort, { once: true });
+              if (signal.aborted) abort();
+            }),
+          ]
+        : []),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
 }
 
 export function createWorkspaceEvents(
