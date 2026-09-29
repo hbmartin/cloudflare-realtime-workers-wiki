@@ -95,11 +95,20 @@ function unescapeMarkdown(value: string, abortOnMarkup = false): string | null {
   return output;
 }
 
-function markdownInline(value: string, issues: ImportIssue[], references: string[], prepared?: Token[]) {
+function markdownInline(
+  value: string,
+  issues: ImportIssue[],
+  references: string[],
+  prepared?: Token[],
+  imageMarkers?: Map<string, DataImage>,
+  recoverDataImages = false,
+) {
   if (!prepared) {
     const plain = unescapeMarkdown(value, true);
     if (plain !== null) return inline(plain);
     if (value.length > 8192) return boundedMarkdownInline(value, issues, references);
+    if (value.includes("data:image/"))
+      return markdownInline(value, issues, references, Lexer.lexInline(value, { gfm: false }), undefined, true);
   }
   const output: ProseMirrorJson[] = [];
   const appendPlain = (text: string, marks: ProseMirrorJson["marks"] = []) => {
@@ -111,7 +120,39 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
     }
     output.push(...inline(text, marks));
   };
-  const append = appendPlain;
+  const append = (text: string, marks: ProseMirrorJson["marks"] = []) => {
+    if (recoverDataImages && !marks.some((mark) => mark.type === "code")) {
+      let start = 0;
+      for (let position = text.indexOf("!["); position >= 0; position = text.indexOf("![", position + 2)) {
+        const image = longDataImage(text, position);
+        if (!image) continue;
+        appendPlain(text.slice(start, position), marks);
+        const label = markdownInline(image.label, issues, references, Lexer.lexInline(image.label, { gfm: false }));
+        for (const node of label)
+          if (node.type === "text") appendPlain(node.text ?? "", [...marks, ...(node.marks ?? [])]);
+        references.push(image.href);
+        issues.push({ code: "image_not_imported", detail: image.href.slice(0, 120) });
+        start = image.end;
+        position = image.end - 2;
+      }
+      appendPlain(text.slice(start), marks);
+      return;
+    }
+    if (!imageMarkers?.size) return appendPlain(text, marks);
+    let start = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      const image = imageMarkers.get(text[index]!);
+      if (!image) continue;
+      appendPlain(text.slice(start, index), marks);
+      const label = markdownInline(image.label, issues, references, Lexer.lexInline(image.label, { gfm: false }));
+      for (const node of label)
+        if (node.type === "text") appendPlain(node.text ?? "", [...marks, ...(node.marks ?? [])]);
+      references.push(image.href);
+      issues.push({ code: "image_not_imported", detail: image.href.slice(0, 120) });
+      start = index + 1;
+    }
+    appendPlain(text.slice(start), marks);
+  };
   // Keep block conversion local, but use an inline lexer for nested
   // delimiters. The resulting tokens still pass through our URL policy.
   const walk = (tokens: Token[], marks: ProseMirrorJson["marks"] = []) => {
@@ -128,15 +169,15 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
         const rawUrl = token.href;
         const url = safeLink(rawUrl);
         if (!url) {
-          issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
           walk(children, marks);
+          issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
         } else if (token.type === "image") {
           references.push(url);
           issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
           walk(children, marks);
         } else {
-          references.push(url);
           walk(children, [...marks, { type: "link", attrs: { href: url } }]);
+          references.push(url);
         }
       } else if (children.length) walk(children, marks);
       else append(token.raw, marks);
@@ -149,13 +190,46 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
 type CodeRange = { start: number; openEnd: number; closeStart: number; end: number };
 type DataImage = { kind: "image"; start: number; end: number; label: string; href: string };
 const DATA_IMAGE_LABEL_LIMIT = 514;
+const IMAGE_MARKER_CANDIDATES = Array.from({ length: 0xffef - 0xa1 + 1 }, (_, index) =>
+  String.fromCharCode(index + 0xa1),
+).filter((character) => /[\p{P}\p{S}]/u.test(character));
+const IMAGE_MARKER_SET = new Set(IMAGE_MARKER_CANDIDATES);
 
 function closingParenWithin(value: string) {
-  let nextClosing = -1;
-  return (index: number) => {
-    if (nextClosing < index) nextClosing = value.indexOf(")", index);
-    return nextClosing >= index && nextClosing < index + 8192;
-  };
+  const candidates = new Map<number, number>();
+  const pending: Array<{ index: number; depth: number }> = [];
+  const closes = new Map<number, number>();
+  let firstPending = 0;
+  let depth = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    while (pending[firstPending] && pending[firstPending]!.index + 8192 <= index) {
+      const old = pending[firstPending++]!;
+      if (candidates.get(old.depth) === old.index) candidates.delete(old.depth);
+    }
+    if (firstPending > 8192) {
+      pending.splice(0, firstPending);
+      firstPending = 0;
+    }
+    if (value[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (value[index] === "(") {
+      depth += 1;
+      if (value[index - 1] === "]" && !trailingEscape(value, index - 1)) {
+        candidates.set(depth, index);
+        pending.push({ index, depth });
+      }
+    } else if (value[index] === ")" && depth) {
+      const opener = candidates.get(depth);
+      if (opener !== undefined) {
+        if (closes.size < 100_000) closes.set(opener, index);
+        candidates.delete(depth);
+      }
+      depth -= 1;
+    }
+  }
+  return (index: number) => closes.has(index);
 }
 
 function inlineSpans(
@@ -234,6 +308,14 @@ function inlineSpans(
     while (runs[runIndex] && runs[runIndex]!.end <= position) runIndex += 1;
     while (destinations[destinationIndex] && destinations[destinationIndex]!.end <= position) destinationIndex += 1;
     const inDestination = destinations[destinationIndex] && destinations[destinationIndex]!.start <= position;
+    if (!inDestination && value[position] === "<" && /^<https?:\/\//i.test(value.slice(position, position + 9))) {
+      let end = position + 1;
+      while (end < value.length && value[end] !== ">" && !/\s/.test(value[end]!)) end += 1;
+      if (value[end] === ">") {
+        position = end;
+        continue;
+      }
+    }
     if (!inDestination && value[position] === "!" && value[position + 1] === "[") {
       const image = longDataImage(value, position);
       if (image) {
@@ -402,6 +484,7 @@ function dataImageLabelEnd(value: string, start: number) {
     )
       candidates.push(position);
   if (!candidates.length) return null;
+  const lastCandidate = candidates.at(-1)!;
   const codes = codeRanges(value.slice(start, limit)) ?? [];
   for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
     const candidate = candidates[candidateIndex]!;
@@ -413,7 +496,7 @@ function dataImageLabelEnd(value: string, start: number) {
         code &&
         index === start + code.start &&
         (start + code.end <= candidate ||
-          (start + code.end < limit && !value.slice(candidate + 2, start + code.end).includes("![")))
+          (lastCandidate > candidate && !value.slice(candidate + 2, start + code.end).includes("![")))
       ) {
         index = start + code.end - 1;
         codeIndex += 1;
@@ -569,37 +652,32 @@ function boundedMarkdownInline(
     append(inline(unescapeMarkdown(value.slice(start))));
     return output;
   }
-  if (!imageMarkers && spans.images.length && spans.images.length <= 6400) {
+  let imageMarkersExhausted = spans.images.length > IMAGE_MARKER_CANDIDATES.length;
+  if (!imageMarkers && spans.images.length && !imageMarkersExhausted) {
     const markers = new Map<string, DataImage>();
-    const usedMarkers = new Set<number>();
-    for (let index = 0; index < value.length; index += 1) {
-      const code = value.charCodeAt(index);
-      if (code >= 0xa1 && /[\p{P}\p{S}]/u.test(value[index]!)) usedMarkers.add(code);
-    }
-    let nextMarker = 0xa1;
+    const usedMarkers = new Set<string>();
+    for (const character of value) if (IMAGE_MARKER_SET.has(character)) usedMarkers.add(character);
+    let nextMarker = 0;
     let cursor = 0;
     let transformed = "";
     for (const image of spans.images) {
-      while (
-        nextMarker <= 0xffef &&
-        (usedMarkers.has(nextMarker) || !/[\p{P}\p{S}]/u.test(String.fromCharCode(nextMarker)))
-      )
-        nextMarker += 1;
-      if (nextMarker > 0xffef) break;
-      const marker = String.fromCharCode(nextMarker++);
+      while (usedMarkers.has(IMAGE_MARKER_CANDIDATES[nextMarker]!)) nextMarker += 1;
+      if (nextMarker >= IMAGE_MARKER_CANDIDATES.length) break;
+      const marker = IMAGE_MARKER_CANDIDATES[nextMarker++]!;
       markers.set(marker, image);
       transformed += value.slice(cursor, image.start) + marker;
       cursor = image.end;
     }
     if (markers.size === spans.images.length)
       return boundedMarkdownInline(transformed + value.slice(cursor), issues, references, markers);
+    imageMarkersExhausted = true;
   }
   const { codes: effectiveCodes } = spans;
   const specials: Array<DataImage | (CodeRange & { kind: "code" })> = [
     ...effectiveCodes
       .filter((range) => range.end - range.start > 8192)
       .map((range) => ({ kind: "code" as const, ...range })),
-    ...spans.images.filter((image) => image.end - image.start > 8192),
+    ...spans.images.filter((image) => imageMarkersExhausted || image.end - image.start > 8192),
   ];
   specials.sort((left, right) => left.start - right.start);
   const appendDense = (section: string) => {
@@ -713,12 +791,12 @@ function boundedMarkdownInline(
       const prefix = section.slice(0, boundary);
       const { tokenizer: prefixTokenizer, lexer: prefixLexer } = markdownLexer();
       if ((prefix.match(/[*_`]/g)?.length ?? 0) > 512) prefixTokenizer.emStrong = () => undefined;
-      append(markdownInline(prefix, issues, references, prefixLexer.inlineTokens(prefix)));
+      append(markdownInline(prefix, issues, references, prefixLexer.inlineTokens(prefix), imageMarkers));
       appendDense(section.slice(boundary));
     } else {
       const { tokenizer, lexer } = markdownLexer();
       if ((section.match(/[*_`]/g)?.length ?? 0) > 512) tokenizer.emStrong = () => undefined;
-      append(markdownInline(section, issues, references, lexer.inlineTokens(section)));
+      append(markdownInline(section, issues, references, lexer.inlineTokens(section), imageMarkers));
     }
     start = cut;
   }
