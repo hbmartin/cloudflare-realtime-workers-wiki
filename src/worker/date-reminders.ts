@@ -351,7 +351,7 @@ async function sweepDateReminders(env: Env) {
         continue;
       }
       const envelope = await roomEnvelope(env, row.page_id, row.content_epoch);
-      const applied = await reconcileDateRemindersForPage(
+      await reconcileDateRemindersForPage(
         env,
         row.page_id,
         row.content_epoch,
@@ -359,18 +359,6 @@ async function sweepDateReminders(env: Env) {
         envelope.sequence,
         cutoffs,
       );
-      if (!applied)
-        await env.DB.prepare(
-          `UPDATE date_reminders SET checked_at=CASE WHEN state='delivered' THEN ? ELSE ? END
-           WHERE page_id=? AND content_epoch=? AND state IN ('active','claimed','delivered')`,
-        )
-          .bind(
-            Date.now() - DELIVERED_SWEEP_INTERVAL + 60_000,
-            Date.now() - ACTIVE_SWEEP_INTERVAL + 60_000,
-            row.page_id,
-            row.content_epoch,
-          )
-          .run();
     } catch (error) {
       failures.push(error);
       logger.error(

@@ -35,7 +35,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { dateTokens } from "../shared/document-projection";
 import { dateMentionFromProps } from "../shared/date-mentions";
-import { MISSING_GRACE_MS, markRemindersMissing } from "./date-reminders";
+import { MISSING_GRACE_MS } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -1220,7 +1220,7 @@ notionApi.patch("/blocks/:blockId", async (c) => {
     return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
   }
   const blockDates = dateTokens(located.block!.node);
-  const pendingMissing: Array<{ id: string; generation: number }> = [];
+  let guardMove = false;
   const suppliedDates = new Map<string, NonNullable<ReturnType<typeof dateMentionFromProps>>>();
   for (const payload of Object.values(input)) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
@@ -1263,11 +1263,8 @@ notionApi.patch("/blocks/:blockId", async (c) => {
         reminder.timezone !== supplied.timezone
       )
         continue;
-      if (reminder.missing_since === null) {
-        reminder.missing_since = Date.now();
-        pendingMissing.push({ id: reminder.id, generation: reminder.generation });
-      }
-      if (reminder.missing_since >= Date.now() - MISSING_GRACE_MS)
+      guardMove = true;
+      if ((reminder.missing_since ?? Date.now()) >= Date.now() - MISSING_GRACE_MS)
         blockDates.set(supplied.tokenId, { ...supplied, revision: crypto.randomUUID() });
     }
   }
@@ -1281,24 +1278,13 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   if (!node) throw new NotionError(400, "validation_error", "Block content is required.");
   if ([...dateTokens(container).values()].some((token) => token === null))
     throw new NotionError(400, "validation_error", "Date tokens must be unique within a block.");
-  if (pendingMissing.length) {
-    const marked = await markRemindersMissing(
-      c.env,
-      located.page.id,
-      located.page.content_epoch,
-      located.sequence,
-      pendingMissing,
-    );
-    if (marked !== pendingMissing.length)
-      throw new NotionError(409, "conflict_error", "This date token changed while moving it. Retry.");
-  }
   const mutated = await mutateDocument(
     c.env,
     located.page,
     principal,
     [{ type: "update_block", internalId: located.internalId, node }],
     false,
-    pendingMissing.length ? { expectedSequence: located.sequence } : {},
+    guardMove ? { expectedSequence: located.sequence } : {},
   );
   const updated = findDocumentBlock(mutated.document, located.internalId)!;
   return c.json(await blockObject(c.env, located.page, updated, await metadataForPage(c.env, located.page.id)));

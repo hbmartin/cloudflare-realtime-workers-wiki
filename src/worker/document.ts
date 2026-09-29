@@ -852,7 +852,11 @@ export class Document extends YServer {
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
       this.flushPendingUpdates();
+      if (this.compaction) await this.compaction;
       if (this.metadata.dirty) await this.compact();
+      this.flushPendingUpdates();
+      if (this.metadata.dirty || this.compaction)
+        return Response.json({ error: "Document is still changing." }, { status: 503 });
       const { pageId, epoch } = this.ids;
       if (this.metadata.content_kind === "diagram") {
         const envelope = diagramFromYDoc(this.document, {
@@ -974,6 +978,7 @@ export class Document extends YServer {
           this.transition ||
           this.metadata.read_only ||
           this.metadata.dirty ||
+          this.compaction ||
           this.metadata.snapshot_seq !== body.expectedSequence)
       )
         return Response.json({ error: "revision_changed" }, { status: 409 });
