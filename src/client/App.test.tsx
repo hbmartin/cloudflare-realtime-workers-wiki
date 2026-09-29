@@ -58,6 +58,7 @@ vi.mock("./retry", async (importOriginal) => ({
 }));
 
 vi.mock("./EditorPage", () => ({
+  clearLiveRecoveryCopies: vi.fn(),
   EditorPage: (props: EditorPageProps) => {
     mocks.editorRender(props);
     return (
