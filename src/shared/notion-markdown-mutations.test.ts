@@ -214,6 +214,30 @@ describe("Notion Markdown block mutations", () => {
     });
   });
 
+  it("deletes selected math without requiring its trailing separator", () => {
+    const { first, second } = fixture();
+    const math = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "math", attrs: { formula: "a+b" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, math, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const mathSpan = projection.spans.find((span) => span.internalId === math.attrs.id)!;
+    const selected = projection.markdown.slice(mathSpan.from, mathSpan.to).trimEnd();
+    const command = parseMarkdownCommand(
+      {
+        type: "update_content",
+        update_content: { content_updates: [{ old_str: selected, new_str: "" }], allow_deleting_content: true },
+      },
+      projection.markdown,
+    );
+    expect(markdownMutations(document, projection, command.edits, true)).toContainEqual({
+      type: "delete_block",
+      internalId: math.attrs.id,
+    });
+  });
+
   it("ignores math text inside a fenced code block while preserving the real formula", () => {
     const { first, second } = fixture();
     const math = {

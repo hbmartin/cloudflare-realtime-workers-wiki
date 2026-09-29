@@ -342,6 +342,40 @@ describe("Notion-compatible API", () => {
         ).json<{ status: string }>()
       ).status,
     ).toBe("failed");
+    await env.DB.prepare(
+      `UPDATE notion_markdown_tasks SET status='running',attempts=10,operation_id='markdown:missing-receipt',
+         error_json=?,lease_token='stale',lease_expires_at=?,next_attempt_at=? WHERE id=?`,
+    )
+      .bind(
+        JSON.stringify({
+          object: "error",
+          status: 503,
+          code: "service_unavailable",
+          message: "Earlier write failure.",
+        }),
+        Date.now() - 1,
+        Date.now() - 1,
+        accepted.id,
+      )
+      .run();
+    await recoverNotionMarkdownTasks(env);
+    expect(
+      await (
+        await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))
+      ).json<{ error: { message: string } }>(),
+    ).toMatchObject({ status: "failed", error: { message: "Earlier write failure." } });
+    await env.DB.prepare(
+      `UPDATE notion_markdown_tasks SET status='running',attempts=10,lease_token='stale',
+         lease_expires_at=?,next_attempt_at=?,expires_at=? WHERE id=?`,
+    )
+      .bind(Date.now() - 1, Date.now() - 1, Date.now() - 8 * 24 * 60 * 60_000, accepted.id)
+      .run();
+    await recoverNotionMarkdownTasks(env);
+    expect(
+      await (
+        await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))
+      ).json<{ error: { message: string } }>(),
+    ).toMatchObject({ status: "failed", error: { message: "Earlier write failure." } });
     const revokeRead = await SELF.fetch(
       authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
         method: "PATCH",

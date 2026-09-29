@@ -249,9 +249,33 @@ function parseGroupPreservingMath(
   const normalizedSource = source.replaceAll(/\r\n?/g, "\n");
   const codeRanges: Array<{ from: number; to: number }> = [];
   let tokenOffset = 0;
-  for (const token of Lexer.lex(normalizedSource, { gfm: true })) {
+  for (const token of new Lexer({ gfm: true }).blockTokens(normalizedSource)) {
     if (token.type === "code") codeRanges.push({ from: tokenOffset, to: tokenOffset + token.raw.length });
     tokenOffset += token.raw.length;
+  }
+  const backtickOpeners = new Map<number, number>();
+  let precedingSlashes = 0;
+  for (let index = 0; index < normalizedSource.length; index += 1) {
+    const character = normalizedSource[index];
+    if (character === "\\") {
+      precedingSlashes += 1;
+      continue;
+    }
+    if (character !== "`" || precedingSlashes % 2 === 1) {
+      precedingSlashes = 0;
+      continue;
+    }
+    precedingSlashes = 0;
+    let end = index + 1;
+    while (normalizedSource[end] === "`") end += 1;
+    const length = end - index;
+    const opener = backtickOpeners.get(length);
+    if (opener === undefined) backtickOpeners.set(length, index);
+    else {
+      codeRanges.push({ from: opener, to: end });
+      backtickOpeners.delete(length);
+    }
+    index = end - 1;
   }
   const blocks: ProseMirrorJson[] = [];
   const rawBlocks: string[] = [];
@@ -266,17 +290,21 @@ function parseGroupPreservingMath(
     rawBlocks.push(...parsed.rawBlocks);
   };
   for (const { block, span } of protectedMath) {
-    const raw = markdown.slice(span.from, span.to).trimEnd();
+    const originalRaw = markdown.slice(span.from, span.to).trimEnd();
+    const raw = originalRaw.replaceAll(/\r\n?/g, "\n");
     let found = normalizedSource.indexOf(raw, cursor);
     while (
       found >= 0 &&
       ((found > 0 && normalizedSource[found - 1] !== "\n") ||
         (found + raw.length < normalizedSource.length && normalizedSource[found + raw.length] !== "\n") ||
-        codeRanges.some((range) => found < range.to && found + raw.length > range.from))
+        codeRanges.some((range) => range.from <= found && range.to >= found + raw.length))
     )
       found = normalizedSource.indexOf(raw, found + 1);
     if (found < 0) {
-      if (allowDeletingContent && edits.some((edit) => edit.from <= span.from && edit.to >= span.to)) {
+      if (
+        allowDeletingContent &&
+        edits.some((edit) => edit.from <= span.from && edit.to >= span.from + originalRaw.length)
+      ) {
         deletedMathIds.push(block.internalId);
         continue;
       }

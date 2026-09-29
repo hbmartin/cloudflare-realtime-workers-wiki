@@ -38,12 +38,14 @@ import {
   completeMarkdownTask,
   createMarkdownTask,
   dueMarkdownTasks,
+  failExpiredMarkdownRecovery,
   failMarkdownTask,
   markdownTaskForIntegration,
   markdownTaskForRequestKey,
   markdownTaskJson,
   pruneMarkdownTasks,
   renewMarkdownTaskLease,
+  RESULT_RETENTION_MS,
   type MarkdownTaskRow,
 } from "./notion-markdown-tasks";
 import type { Env } from "./env";
@@ -1005,6 +1007,7 @@ export async function runNotionMarkdownTask(env: Env, id: string) {
 
 export async function recoverNotionMarkdownTasks(env: Env) {
   if (env.NOTION_MARKDOWN_WRITES_ENABLED === "true") {
+    await failExpiredMarkdownRecovery(env);
     for (let recovered = 0; recovered < 5; recovered += 1) {
       const task = (await claimExhaustedMarkdownTasks(env))[0];
       if (!task) break;
@@ -1016,12 +1019,14 @@ export async function recoverNotionMarkdownTasks(env: Env) {
           await failMarkdownTask(
             env,
             task,
-            {
-              object: "error",
-              status: 503,
-              code: "service_unavailable",
-              message: "The Markdown update could not be completed.",
-            },
+            task.error_json
+              ? JSON.parse(task.error_json)
+              : {
+                  object: "error",
+                  status: 503,
+                  code: "service_unavailable",
+                  message: "The Markdown update could not be completed.",
+                },
             false,
           );
           continue;
@@ -1029,8 +1034,9 @@ export async function recoverNotionMarkdownTasks(env: Env) {
         await completeMarkdownFromReceipt(env, task, principal, page, receipt);
       } catch (error) {
         const retry =
+          !(error instanceof TypeError || error instanceof SyntaxError || error instanceof RangeError) &&
           (!(error instanceof NotionError) || error.status === 503) &&
-          Date.now() <= task.expires_at + 7 * 24 * 60 * 60_000;
+          Date.now() <= task.expires_at + RESULT_RETENTION_MS;
         await failMarkdownTask(
           env,
           task,
