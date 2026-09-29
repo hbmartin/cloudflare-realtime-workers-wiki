@@ -15,12 +15,14 @@ import { useEffectiveColorScheme } from "./ThemeControl";
 import {
   compactDocumentUpdates,
   clearRevokedOfflinePages,
+  documentPendingMarker,
   getOfflinePage,
   listPendingOfflinePages,
   markOfflinePagePending,
   markOfflinePageRevoked,
   pendingKeysOf,
   persistPendingDocumentUpdate,
+  registerOfflineDocumentKeyFromKey,
   type OfflineAccount,
   type OfflinePage,
 } from "./offline-catalog";
@@ -123,7 +125,13 @@ export function OfflineWorkspace({
         flushSync(() => setRecovery("finalizing"));
         const stored = await getOfflinePage(account.key, selected.pageId);
         if (!isCurrent()) return;
-        const hasDraft = stored ? pendingKeysOf(stored).length > 0 : pendingKeysOf(selected).length > 0;
+        const pendingNow = stored ? pendingKeysOf(stored) : [];
+        const missingFromRead = pendingKeysOf(selected).filter((key) => !pendingNow.includes(key));
+        const retainedMarker = await Promise.all(
+          missingFromRead.map((key) => documentPendingMarker(key).catch(() => true)),
+        );
+        if (!isCurrent()) return;
+        const hasDraft = pendingNow.length > 0 || retainedMarker.some(Boolean);
         const space = spaces.find((item) => item.id === page.spaceId);
         if (!space && !hasDraft) {
           await discardRevokedCopy(selected.pageId);
@@ -281,18 +289,39 @@ export function OfflineWorkspace({
                 <button
                   type="button"
                   onClick={() => {
-                    void listPendingOfflinePages(account.key)
-                      .then(async (pending) => {
-                        const copies = pending.filter((page) => page.pageId === selected.pageId);
-                        if (!copies.length) {
-                          setNotice("No unsynced copy is available to export for this page.");
-                          return;
-                        }
-                        await exportPendingOfflinePages(copies);
-                      })
-                      .catch((error) =>
-                        setNotice(error instanceof Error ? error.message : "Unable to export local changes."),
+                    void (async () => {
+                      let complete = true;
+                      let pending: OfflinePage[];
+                      try {
+                        pending = await listPendingOfflinePages(account.key, true);
+                      } catch {
+                        complete = false;
+                        pending = await listPendingOfflinePages(account.key, false);
+                      }
+                      const keys = new Set(
+                        pending.filter((page) => page.pageId === selected.pageId).flatMap(pendingKeysOf),
                       );
+                      if (!complete) {
+                        for (const key of pendingKeysOf(selected)) {
+                          if (await documentPendingMarker(key).catch(() => true)) keys.add(key);
+                        }
+                      }
+                      if (!keys.size) {
+                        setNotice(
+                          complete
+                            ? "No unsynced copy is available to export for this page."
+                            : "Stored copies could not be fully checked. Export this page's visible copy individually.",
+                        );
+                        return;
+                      }
+                      await exportPendingOfflinePages([{ ...selected, pendingCopyKeys: [...keys] }]);
+                      if (!complete)
+                        setNotice(
+                          "Exported the copies found on this device. Other older copies could not be verified.",
+                        );
+                    })().catch((error) =>
+                      setNotice(error instanceof Error ? error.message : "Unable to export local changes."),
+                    );
                   }}
                 >
                   Export all unsynced copies of this page
@@ -337,6 +366,18 @@ function OfflineEditor({
     const doc = new Y.Doc();
     const key = page.storageKeys.at(-1);
     if (!key) return undefined;
+    try {
+      registerOfflineDocumentKeyFromKey(key);
+    } catch (cause) {
+      doc.destroy();
+      console.error("Offline document could not be opened", cause);
+      queueMicrotask(() => {
+        if (active) setError("This document copy could not be read from this device.");
+      });
+      return () => {
+        active = false;
+      };
+    }
     const persistence = new IndexeddbPersistence(key, doc);
     doc.off("update", persistence["_storeUpdate"]);
     const provider = new YProvider(window.location.host, `${page.pageId}~${page.epoch}`, doc, {

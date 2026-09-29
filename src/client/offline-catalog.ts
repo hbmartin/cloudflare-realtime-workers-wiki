@@ -37,6 +37,14 @@ export type OfflinePage = {
 const PENDING_MARKER = "noteflare-pending";
 const DOCUMENT_REGISTRY_PREFIX = "noteflare-document-keys:";
 export const LOCAL_SIGNOUT_KEY = "notes:local-signout";
+const PURGING_ACCOUNT_PREFIX = "noteflare-purging-account:";
+
+function isAccountSigningOut(accountKey: string) {
+  return (
+    localStorage.getItem(LOCAL_SIGNOUT_KEY) === accountKey ||
+    localStorage.getItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`) === "1"
+  );
+}
 
 function documentRegistryEntryPrefix(accountKey: string) {
   return `${DOCUMENT_REGISTRY_PREFIX}${accountKey}\u0000`;
@@ -211,9 +219,19 @@ export function offlineDocumentKey(userId: string, workspaceId: string, pageId: 
 export function registerOfflineDocumentKey(userId: string, workspaceId: string, key: string) {
   if (typeof localStorage === "undefined") return;
   const accountKey = offlineAccountKey({ user: { id: userId }, workspace: { id: workspaceId } });
-  if (localStorage.getItem(LOCAL_SIGNOUT_KEY) === accountKey)
-    throw new Error("Local sign-out is removing offline documents.");
-  localStorage.setItem(`${documentRegistryEntryPrefix(accountKey)}${key}`, "1");
+  if (isAccountSigningOut(accountKey)) throw new Error("Local sign-out is removing offline documents.");
+  try {
+    localStorage.setItem(`${documentRegistryEntryPrefix(accountKey)}${key}`, "1");
+  } catch (error) {
+    if (!indexedDB.databases) throw error;
+    console.error("Offline document registry could not be updated", error);
+  }
+}
+
+export function registerOfflineDocumentKeyFromKey(key: string) {
+  const match = /^account:([^:]+):([^:]+):[^:]+:\d+:2$/.exec(key);
+  if (!match) throw new Error("Offline document key is invalid.");
+  registerOfflineDocumentKey(match[1]!, match[2]!, key);
 }
 
 function accountDocumentPrefix(accountKey: string) {
@@ -310,7 +328,7 @@ function transactionDone(transaction: IDBTransaction) {
 
 export async function rememberOfflineAccount(member: ClientMemberContext) {
   const accountKey = offlineAccountKey(member);
-  if (localStorage.getItem(LOCAL_SIGNOUT_KEY) === accountKey) return undefined;
+  if (isAccountSigningOut(accountKey)) return undefined;
   const db = await openCatalog();
   const transaction = db.transaction("accounts", "readwrite");
   const store = transaction.objectStore("accounts");
@@ -324,13 +342,23 @@ export async function rememberOfflineAccount(member: ClientMemberContext) {
     offlineEditingEnabled: member.features?.offlineEditing === true,
   };
   const existing = await requestResult(store.get(account.key) as IDBRequest<OfflineAccount | undefined>);
-  if (existing?.purging || localStorage.getItem(LOCAL_SIGNOUT_KEY) === accountKey) {
+  if (existing?.purging || isAccountSigningOut(accountKey)) {
     await transactionDone(transaction);
     return existing;
   }
   store.put(account);
   await transactionDone(transaction);
   return account;
+}
+
+export async function ensureOfflineAccount(member: ClientMemberContext) {
+  const db = await openCatalog();
+  const transaction = db.transaction("accounts", "readonly");
+  const existing = await requestResult(
+    transaction.objectStore("accounts").get(offlineAccountKey(member)) as IDBRequest<OfflineAccount | undefined>,
+  );
+  await transactionDone(transaction);
+  return existing ?? rememberOfflineAccount(member);
 }
 
 export async function latestOfflineAccount(): Promise<OfflineAccount | null> {
@@ -587,6 +615,7 @@ export async function clearRevokedOfflinePages(accountKey: string) {
 }
 
 export async function markOfflineAccountPurging(accountKey: string) {
+  localStorage.setItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`, "1");
   const db = await openCatalog();
   const transaction = db.transaction("accounts", "readwrite");
   const store = transaction.objectStore("accounts");
@@ -604,7 +633,14 @@ export async function purgingOfflineAccounts() {
 }
 
 export async function forgetOfflineAccount(accountKey: string) {
+  localStorage.setItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`, "1");
   const prefix = accountDocumentPrefix(accountKey);
+  const entryPrefix = documentRegistryEntryPrefix(accountKey);
+  const registryEntries = () =>
+    Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)).filter(
+      (name): name is string => !!name?.startsWith(entryPrefix),
+    );
+  const entryNamesAtStart = new Set(registryEntries());
   const names = await accountDocumentNames(accountKey, true);
   const db = await openCatalog();
   await markOfflineAccountPurging(accountKey);
@@ -643,14 +679,21 @@ export async function forgetOfflineAccount(accountKey: string) {
   const store = transaction.objectStore("pages");
   for (const page of pages) store.delete(page.key);
   await transactionDone(transaction);
+  if (registryEntries().some((name) => !entryNamesAtStart.has(name)))
+    throw new Error("New local document storage appeared during sign-out. Retry removal.");
+  if (prefix && indexedDB.databases) {
+    const remaining = await indexedDB.databases();
+    if (remaining.some((database) => database.name?.startsWith(prefix)))
+      throw new Error("New local document storage appeared during sign-out. Retry removal.");
+  }
   try {
     localStorage.removeItem(`${DOCUMENT_REGISTRY_PREFIX}${accountKey}`);
-    const entryPrefix = documentRegistryEntryPrefix(accountKey);
-    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
-      const name = localStorage.key(index);
-      if (name?.startsWith(entryPrefix)) localStorage.removeItem(name);
-    }
+    for (const name of entryNamesAtStart) localStorage.removeItem(name);
+    if (registryEntries().length)
+      throw new Error("New local document storage appeared during sign-out. Retry removal.");
+    localStorage.removeItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`);
   } catch (error) {
     console.error("Offline document registry could not be cleared", error);
+    throw error;
   }
 }

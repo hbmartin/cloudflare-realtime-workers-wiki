@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createCollaboration, createNetworkCollaboration, createWorkspaceEvents } from "./collaboration";
+import {
+  createCollaboration,
+  createNetworkCollaboration,
+  createWorkspaceEvents,
+  loadOfflineCopy,
+} from "./collaboration";
 import { LOCAL_SIGNOUT_KEY } from "./offline-catalog";
 
 const mocks = vi.hoisted(() => ({
@@ -157,7 +162,7 @@ describe("collaboration durability barriers", () => {
     second.destroy();
   });
 
-  it("registers each store and blocks new stores while the account is signing out", () => {
+  it("registers each store and blocks new stores and copy readers while the account is signing out", async () => {
     localStorage.clear();
     const first = createCollaboration("workspace", "page", 1, vi.fn(), "user");
     const key = "account:user:workspace:page:1:2";
@@ -166,9 +171,33 @@ describe("collaboration durability barriers", () => {
     expect(() => createCollaboration("workspace", "other", 1, vi.fn(), "user")).toThrow(
       "Local sign-out is removing offline documents.",
     );
+    await expect(loadOfflineCopy(key)).rejects.toThrow("Local sign-out is removing offline documents.");
     expect(mocks.persistenceNames).toEqual([key]);
     first.destroy();
     localStorage.clear();
+  });
+
+  it("keeps online collaboration available when enumeration can replace a full registry", () => {
+    const originalIndexedDb = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+    Object.defineProperty(globalThis, "indexedDB", {
+      configurable: true,
+      value: { databases: vi.fn(async () => []) },
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+      throw new DOMException("Storage full", "QuotaExceededError");
+    });
+    try {
+      const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user");
+      expect(mocks.persistenceNames).toEqual(["account:user:workspace:page:1:2"]);
+      expect(error).toHaveBeenCalled();
+      bundle.destroy();
+    } finally {
+      setItem.mockRestore();
+      error.mockRestore();
+      if (originalIndexedDb) Object.defineProperty(globalThis, "indexedDB", originalIndexedDb);
+      else Reflect.deleteProperty(globalThis, "indexedDB");
+    }
   });
 
   it("bounds diagram durability latency while retaining the quiet-period debounce", async () => {

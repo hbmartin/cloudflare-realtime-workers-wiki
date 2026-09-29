@@ -184,6 +184,7 @@ describe("EditorPage close reconciliation", () => {
     );
     await act(async () => Promise.resolve());
     expect(screen.getByLabelText("Page title")).toBeInTheDocument();
+    expect(screen.getByText("Offline")).toBeInTheDocument();
     expect(
       screen.getAllByText("Offline storage is unavailable, so editing and collaboration are disabled for this page."),
     ).not.toHaveLength(0);

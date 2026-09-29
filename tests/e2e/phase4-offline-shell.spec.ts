@@ -8,6 +8,7 @@ async function catalogContainsPageTitle(page: Page, title: string) {
   return page.evaluate(async (expected) => {
     const opened = indexedDB.open("noteflare-offline-catalog");
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      opened.addEventListener("upgradeneeded", () => opened.transaction?.abort(), { once: true });
       opened.addEventListener("success", () => resolve(opened.result), { once: true });
       opened.addEventListener("error", () => reject(opened.error), { once: true });
       opened.addEventListener("blocked", () => reject(new Error("Catalog is blocked.")), { once: true });

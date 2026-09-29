@@ -6,7 +6,7 @@ import { parseWorkspaceEvent } from "../shared/validation";
 import { CollaborationDurability } from "./collaboration-durability";
 import { connectionRetryDelay } from "./retry";
 import { reportClientError } from "./telemetry";
-import { offlineDocumentKey, registerOfflineDocumentKey } from "./offline-catalog";
+import { offlineDocumentKey, registerOfflineDocumentKey, registerOfflineDocumentKeyFromKey } from "./offline-catalog";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -376,11 +376,18 @@ export function createNetworkCollaboration(
 }
 
 export async function loadOfflineCopy(key: string) {
+  registerOfflineDocumentKeyFromKey(key);
   const doc = new Y.Doc();
   const persistence = new IndexeddbPersistence(key, doc);
-  await persistence.whenSynced;
-  await persistence.destroy();
-  return doc;
+  try {
+    await persistence.whenSynced;
+    return doc;
+  } catch (error) {
+    doc.destroy();
+    throw error;
+  } finally {
+    await persistence.destroy();
+  }
 }
 
 export function createWorkspaceEvents(

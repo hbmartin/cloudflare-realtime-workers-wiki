@@ -36,13 +36,13 @@ import { useEffectiveColorScheme } from "./ThemeControl";
 import {
   compactDocumentUpdates,
   documentPendingMarker,
+  ensureOfflineAccount,
   getOfflinePage,
   markOfflinePagePending,
   offlineAccountKey,
   offlineDocumentKey,
   pendingKeysOf,
   persistPendingDocumentUpdate,
-  rememberOfflineAccount,
   rememberOfflinePage,
   storageEpoch,
 } from "./offline-catalog";
@@ -250,7 +250,10 @@ export function EditorPage({
           return false;
         }
         offlineMember.current = currentMember;
-        await rememberOfflineAccount(currentMember);
+        await ensureOfflineAccount(currentMember).catch((error) => {
+          console.error("Unable to repair offline account metadata", error);
+          if (active) setCatalogWarning("The offline page list could not be updated yet.");
+        });
         if (!active) return false;
         if (catalogNeedsRepair) {
           writePending(true);
@@ -309,8 +312,10 @@ export function EditorPage({
     } catch (error) {
       console.error("Unable to start local document storage", error);
       queueMicrotask(() => {
-        if (active)
+        if (active) {
+          setStatus("offline");
           setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+        }
       });
       return () => {
         active = false;
