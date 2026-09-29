@@ -307,6 +307,7 @@ function parseGroupPreservingMath(
         allowDeletingContent &&
         edits.some((edit) => edit.from <= span.from && edit.to >= span.from + originalRaw.length)
       ) {
+        codeIndex = 0;
         deletedMathIds.push(block.internalId);
         continue;
       }
@@ -387,12 +388,8 @@ export function markdownMutations(
     for (const [index, span] of projection.spans.slice(group.first, group.after).entries()) {
       const marker = projection.markdown.slice(span.from, span.to).trim();
       if (!marker.startsWith('<unknown url="notion://blocks/')) continue;
-      const math = original[index]?.type === "math";
-      const contentEnd = span.from + projection.markdown.slice(span.from, span.to).trimEnd().length;
-      if (
-        !allowDeletingContent ||
-        !group.edits.some((edit) => edit.from <= span.from && edit.to >= (math ? contentEnd : span.to))
-      )
+      if (original[index]?.type === "math") continue;
+      if (!allowDeletingContent || !group.edits.some((edit) => edit.from <= span.from && edit.to >= span.to))
         throw new MarkdownWriteError("A range cannot partially overwrite unknown content.");
     }
     const groupSource = replacementText(projection.markdown, from, to, group.edits);
