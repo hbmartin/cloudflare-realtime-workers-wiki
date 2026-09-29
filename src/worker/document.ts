@@ -253,26 +253,62 @@ function yNode(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {
   return element;
 }
 
-function repairDuplicateDateTokens(document: Y.Doc) {
-  const seen = new Set<string>();
-  const visit = (parent: Y.XmlFragment | Y.XmlElement) => {
+function duplicateDateTokens(document: Y.Doc) {
+  const occurrences = new Map<string, Array<{ node: Y.XmlElement; blockId: string | null }>>();
+  const visit = (parent: Y.XmlFragment | Y.XmlElement, blockId: string | null) => {
     for (const child of parent.toArray()) {
       if (!(child instanceof Y.XmlElement)) continue;
+      const currentBlockId = child.nodeName === "blockContainer" ? String(child.getAttribute("id") ?? "") : blockId;
       if (child.nodeName === "dateMention") {
         const token = dateMentionFromProps(child.getAttributes());
-        if (token) {
-          if (seen.has(token.tokenId)) {
-            child.setAttribute(
-              "payload",
-              JSON.stringify({ ...token, tokenId: crypto.randomUUID(), revision: crypto.randomUUID() }),
-            );
-          } else seen.add(token.tokenId);
-        }
+        if (token)
+          occurrences.set(token.tokenId, [
+            ...(occurrences.get(token.tokenId) ?? []),
+            { node: child, blockId: currentBlockId },
+          ]);
       }
-      visit(child);
+      visit(child, currentBlockId);
     }
   };
-  document.transact(() => visit(document.getXmlFragment("document-store")), "date-token-normalize");
+  visit(document.getXmlFragment("document-store"), null);
+  return [...occurrences].filter(([, matches]) => matches.length > 1);
+}
+
+async function priorDateTokenBlocks(env: Env, pageId: string, epoch: number) {
+  const row = await env.DB.prepare(`SELECT r2_key FROM document_projections WHERE page_id=? AND content_epoch=?`)
+    .bind(pageId, epoch)
+    .first<{ r2_key: string }>();
+  if (!row) return new Map<string, string>();
+  const stored = await env.BUCKET.get(row.r2_key);
+  if (!stored) return new Map<string, string>();
+  const envelope = await stored.json<DocumentContentEnvelope>();
+  if (envelope.pageId !== pageId || envelope.contentEpoch !== epoch || envelope.document.type !== "doc")
+    return new Map<string, string>();
+  const preferred = new Map<string, string>();
+  for (const block of flattenDocumentBlocks(envelope.document))
+    for (const tokenId of dateTokens(block.node).keys()) if (!preferred.has(tokenId)) preferred.set(tokenId, block.id);
+  return preferred;
+}
+
+function repairDuplicateDateTokens(
+  document: Y.Doc,
+  duplicates: ReturnType<typeof duplicateDateTokens>,
+  preferredBlocks: Map<string, string>,
+) {
+  document.transact(() => {
+    for (const [tokenId, matches] of duplicates) {
+      const preserved = matches.find((match) => match.blockId === preferredBlocks.get(tokenId)) ?? matches[0]!;
+      for (const match of matches) {
+        if (match === preserved) continue;
+        const token = dateMentionFromProps(match.node.getAttributes());
+        if (token)
+          match.node.setAttribute(
+            "payload",
+            JSON.stringify({ ...token, tokenId: crypto.randomUUID(), revision: crypto.randomUUID() }),
+          );
+      }
+    }
+  }, "date-token-normalize");
 }
 
 type YBlockParent = Y.XmlFragment | Y.XmlElement;
@@ -1261,7 +1297,23 @@ export class Document extends YServer {
   private async compactOnce(forceVersion = false, suppressExternalEffects = false) {
     if (this.metadata.content_kind === "document") {
       migrateLegacyColumns(this.document);
-      repairDuplicateDateTokens(this.document);
+      const duplicates = duplicateDateTokens(this.document);
+      if (duplicates.length) {
+        const { pageId, epoch } = this.ids;
+        let preferredBlocks = new Map<string, string>();
+        try {
+          preferredBlocks = await priorDateTokenBlocks(this.bindings, pageId, epoch);
+        } catch (error) {
+          logger.warn(
+            "document.date_token_origin.unavailable",
+            "document",
+            "The previous date token location could not be read during duplicate repair.",
+            { pageId, epoch },
+            error,
+          );
+        }
+        repairDuplicateDateTokens(this.document, duplicates, preferredBlocks);
+      }
     }
     this.flushPendingUpdates();
     const { pageId, epoch } = this.ids;

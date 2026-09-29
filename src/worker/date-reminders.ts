@@ -67,8 +67,16 @@ async function roomDocument(env: Env, pageId: string, epoch: number) {
 }
 
 async function pageDateToken(env: Env, page: Pick<PageRow, "id" | "content_epoch">, tokenId: string) {
-  const tokens = dateTokens(await roomDocument(env, page.id, page.content_epoch));
-  return tokens.get(tokenId) ?? null;
+  const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
+    new Request("https://document.internal/content", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
+    }),
+  );
+  if (!response.ok) throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
+  const envelope = await response.json<DocumentContentEnvelope>();
+  if (envelope.pageId !== page.id || envelope.contentEpoch !== page.content_epoch || envelope.document.type !== "doc")
+    throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
+  return { token: dateTokens(envelope.document).get(tokenId) ?? null, sequence: envelope.sequence };
 }
 
 function reminderJson(row: ReminderRow) {
@@ -99,7 +107,7 @@ export async function putDateReminder(
   tokenId: string,
   input: ReminderInput,
 ) {
-  const token = await pageDateToken(env, page, tokenId);
+  const { token, sequence } = await pageDateToken(env, page, tokenId);
   if (!token || token.createdBy !== member.user.id)
     throw new HttpError(404, "date_token_not_found", "Date token not found.");
   if (token.revision !== input.revision)
@@ -108,14 +116,13 @@ export async function putDateReminder(
   if (dueAt === null || dueAt <= Date.now())
     throw new HttpError(422, "reminder_in_past", "Choose a future reminder time.");
   const timestamp = Date.now();
-  const previous = await env.DB.prepare(`SELECT * FROM date_reminders WHERE page_id=? AND token_id=? AND user_id=?`)
-    .bind(page.id, tokenId, member.user.id)
-    .first<ReminderRow>();
   const row = await env.DB.prepare(
     `INSERT INTO date_reminders
       (id,workspace_id,page_id,content_epoch,token_id,user_id,token_revision,timezone,choice_json,
        due_at,generation,state,checked_at,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,1,'active',?,?,?)
+     SELECT ?,?,?,?,?,?,?,?,?,?,1,'active',?,?,?
+       WHERE EXISTS (SELECT 1 FROM document_projections
+         WHERE page_id=? AND content_epoch=? AND sequence=?)
      ON CONFLICT(page_id,token_id,user_id) DO UPDATE SET
        content_epoch=excluded.content_epoch,token_revision=excluded.token_revision,
        timezone=excluded.timezone,choice_json=excluded.choice_json,due_at=excluded.due_at,
@@ -143,55 +150,26 @@ export async function putDateReminder(
       timestamp,
       timestamp,
       timestamp,
+      page.id,
+      page.content_epoch,
+      sequence,
     )
     .first<ReminderRow>();
+  if (!row) {
+    const projection = await env.DB.prepare(
+      `SELECT sequence FROM document_projections WHERE page_id=? AND content_epoch=?`,
+    )
+      .bind(page.id, page.content_epoch)
+      .first<{ sequence: number }>();
+    if (projection?.sequence !== sequence)
+      throw new HttpError(409, "date_token_changed", "This date changed. Reopen the reminder and try again.");
+  }
   const savedRow =
     row ??
     (await env.DB.prepare(`SELECT * FROM date_reminders WHERE page_id=? AND token_id=? AND user_id=?`)
       .bind(page.id, tokenId, member.user.id)
       .first<ReminderRow>());
   if (!savedRow) throw new HttpError(503, "reminder_unavailable", "Reminder could not be saved.");
-  const latestDocument = await roomDocument(env, page.id, page.content_epoch);
-  const latestToken = dateTokens(latestDocument).get(tokenId);
-  if (!latestToken || latestToken.revision !== token.revision || latestToken.createdBy !== member.user.id) {
-    if (row) {
-      if (previous) {
-        await env.DB.prepare(
-          `UPDATE date_reminders SET content_epoch=?,token_revision=?,timezone=?,choice_json=?,due_at=?,
-             generation=?,state=?,claim_id=?,claimed_at=?,delivery_receipt_id=?,missing_since=?,checked_at=?,updated_at=?
-           WHERE id=? AND generation=?`,
-        )
-          .bind(
-            previous.content_epoch,
-            previous.token_revision,
-            previous.timezone,
-            previous.choice_json,
-            previous.due_at,
-            previous.generation,
-            previous.state,
-            previous.claim_id,
-            previous.claimed_at,
-            previous.delivery_receipt_id,
-            previous.missing_since,
-            previous.checked_at,
-            Date.now(),
-            row.id,
-            row.generation,
-          )
-          .run();
-      } else {
-        await env.DB.prepare(`DELETE FROM date_reminders WHERE id=? AND generation=?`)
-          .bind(row.id, row.generation)
-          .run();
-      }
-    }
-    await reconcileDateRemindersForPage(env, page.id, page.content_epoch, latestDocument);
-    const effective = await env.DB.prepare(`SELECT * FROM date_reminders WHERE id=?`)
-      .bind(savedRow.id)
-      .first<ReminderRow>();
-    if (effective?.state === "active" && latestToken?.createdBy === member.user.id) return reminderJson(effective);
-    throw new HttpError(409, "date_token_changed", "This date changed. Reopen the reminder and try again.");
-  }
   return reminderJson(savedRow);
 }
 
@@ -319,14 +297,14 @@ async function sweepDateReminders(env: Env) {
     env.DB.prepare(
       `SELECT page_id,content_epoch,MIN(checked_at) next_check FROM date_reminders
        WHERE state IN ('active','claimed') AND checked_at<?
-       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 20`,
+       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 8`,
     )
       .bind(cutoffs.active)
       .all<{ page_id: string; content_epoch: number }>(),
     env.DB.prepare(
       `SELECT page_id,content_epoch,MIN(checked_at) next_check FROM date_reminders
        WHERE state='delivered' AND checked_at<?
-       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 5`,
+       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 2`,
     )
       .bind(cutoffs.delivered)
       .all<{ page_id: string; content_epoch: number }>(),

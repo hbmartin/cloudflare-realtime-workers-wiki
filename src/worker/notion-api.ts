@@ -35,7 +35,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { dateTokens } from "../shared/document-projection";
 import { dateMentionFromProps } from "../shared/date-mentions";
-import { MISSING_GRACE_MS } from "./date-reminders";
+import { MISSING_GRACE_MS, reconcileDateRemindersForPage } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -544,7 +544,13 @@ async function locatedBlock(env: Env, principal: IntegrationPrincipal, id: strin
   if (!block && !includeTrash) {
     throw new NotionError(404, "object_not_found", "Could not find page or block with the requested ID.");
   }
-  return { page, block, internalId: row.internal_id, metadata: await metadataForPage(env, page.id) };
+  return {
+    page,
+    block,
+    document: envelope.document,
+    internalId: row.internal_id,
+    metadata: await metadataForPage(env, page.id),
+  };
 }
 
 async function mutateDocument(
@@ -566,10 +572,19 @@ async function mutateDocument(
     }),
   );
   if (response.status === 404) throw new NotionError(404, "object_not_found", "Block not found.");
-  if (response.status === 409) throw new NotionError(409, "conflict_error", "The document could not be changed.");
+  if (response.status === 409) {
+    const result = await response.json<{ error?: string }>();
+    throw new NotionError(
+      409,
+      "conflict_error",
+      result.error === "duplicate_date_token"
+        ? "Move the original date token before reusing its ID."
+        : "The document could not be changed.",
+    );
+  }
   if (response.status === 413) throw new NotionError(413, "validation_error", "The mutation exceeds document limits.");
   if (!response.ok) throw new NotionError(400, "validation_error", "The block mutation is invalid.");
-  return response.json<{ document: DocumentContentEnvelope["document"] }>();
+  return response.json<{ document: DocumentContentEnvelope["document"]; sequence: number }>();
 }
 
 async function cleanupStagedPage(env: Env, pageId: string, contentEpoch: number, stageId: string) {
@@ -1197,7 +1212,17 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   const located = await locatedBlock(c.env, principal, c.req.param("blockId"));
   const input = await body(c.req.raw);
   if (input.in_trash === true) {
-    await mutateDocument(c.env, located.page, principal, [{ type: "delete_block", internalId: located.internalId }]);
+    const mutated = await mutateDocument(c.env, located.page, principal, [
+      { type: "delete_block", internalId: located.internalId },
+    ]);
+    if (dateTokens(located.block!.node).size)
+      await reconcileDateRemindersForPage(
+        c.env,
+        located.page.id,
+        located.page.content_epoch,
+        mutated.document,
+        mutated.sequence,
+      );
     return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
   }
   const blockDates = dateTokens(located.block!.node);
@@ -1215,7 +1240,9 @@ notionApi.patch("/blocks/:blockId", async (c) => {
     }
   }
   if (suppliedDates.size) {
-    const liveDates = dateTokens((await liveDocument(c.env, located.page)).document);
+    const liveDates = dateTokens(located.document);
+    if ([...suppliedDates.keys()].some((id) => liveDates.has(id)))
+      throw new NotionError(409, "conflict_error", "Move the original date token before reusing its ID.");
     const rows = await c.env.DB.prepare(
       `SELECT token_id,user_id,token_revision,timezone FROM date_reminders
        WHERE page_id=? AND content_epoch=? AND token_id IN (SELECT value FROM json_each(?))
@@ -1239,6 +1266,12 @@ notionApi.patch("/blocks/:blockId", async (c) => {
       )
         blockDates.set(supplied.tokenId, { ...supplied, revision: crypto.randomUUID() });
     }
+    if ([...suppliedDates.keys()].some((id) => !blockDates.has(id)))
+      throw new NotionError(
+        409,
+        "conflict_error",
+        "This date token is not ready to move. Retry after removing the original.",
+      );
   }
   let container;
   try {
@@ -1253,6 +1286,14 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   const mutated = await mutateDocument(c.env, located.page, principal, [
     { type: "update_block", internalId: located.internalId, node },
   ]);
+  if (blockDates.size)
+    await reconcileDateRemindersForPage(
+      c.env,
+      located.page.id,
+      located.page.content_epoch,
+      mutated.document,
+      mutated.sequence,
+    );
   const updated = findDocumentBlock(mutated.document, located.internalId)!;
   return c.json(await blockObject(c.env, located.page, updated, await metadataForPage(c.env, located.page.id)));
 });
@@ -1261,7 +1302,17 @@ notionApi.delete("/blocks/:blockId", async (c) => {
   const principal = c.get("principal");
   capability(principal, "updateContent");
   const located = await locatedBlock(c.env, principal, c.req.param("blockId"));
-  await mutateDocument(c.env, located.page, principal, [{ type: "delete_block", internalId: located.internalId }]);
+  const mutated = await mutateDocument(c.env, located.page, principal, [
+    { type: "delete_block", internalId: located.internalId },
+  ]);
+  if (dateTokens(located.block!.node).size)
+    await reconcileDateRemindersForPage(
+      c.env,
+      located.page.id,
+      located.page.content_epoch,
+      mutated.document,
+      mutated.sequence,
+    );
   return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
 });
 

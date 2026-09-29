@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import type { DateMention } from "../shared/date-mentions";
 import { dateTokens } from "../shared/document-projection";
+import { flattenDocumentBlocks } from "../shared/notion-blocks";
 import type { Env } from "./env";
 import { processDueDateReminders } from "./date-reminders";
 
@@ -64,6 +65,43 @@ async function addToken(pageId: string, token: DateMention) {
       headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
     }),
   );
+}
+
+async function addStructuredTokenBlock(pageId: string, token: DateMention, atStart = false) {
+  const stub = env.DOCUMENT.getByName(`${pageId}~1`);
+  await stub.fetch(
+    new Request("https://document.internal/content", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }),
+  );
+  const id = crypto.randomUUID();
+  await runInDurableObject(stub, async (instance) => {
+    const document = (instance as unknown as { document: Y.Doc }).document;
+    document.transact(() => {
+      const root = document.getXmlFragment("document-store");
+      let group = root
+        .toArray()
+        .find((child): child is Y.XmlElement => child instanceof Y.XmlElement && child.nodeName === "blockGroup");
+      if (!group) {
+        group = new Y.XmlElement("blockGroup");
+        root.insert(0, [group]);
+      }
+      const container = new Y.XmlElement("blockContainer");
+      container.setAttribute("id", id);
+      const paragraph = new Y.XmlElement("paragraph");
+      const mention = new Y.XmlElement("dateMention");
+      mention.setAttribute("payload", JSON.stringify(token));
+      paragraph.insert(0, [mention]);
+      container.insert(0, [paragraph]);
+      group.insert(atStart ? 0 : group.length, [container]);
+    });
+  });
+  await stub.fetch(
+    new Request("https://document.internal/content", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+    }),
+  );
+  return id;
 }
 
 async function removeTokens(pageId: string) {
@@ -410,7 +448,75 @@ describe("date reminders", () => {
     expect(tokens.size).toBe(2);
     expect(tokens.get(token.tokenId)).toBeTruthy();
     expect(Array.from(tokens.values()).every(Boolean)).toBe(true);
-    expect((await SELF.fetch(request(installed.cookie, path))).status).toBe(200);
+    const retained = await SELF.fetch(request(installed.cookie, path));
+    expect(retained.status).toBe(200);
+    expect((await retained.json<{ reminder: { state: string } | null }>()).reminder?.state).toBe("active");
+  });
+
+  it("keeps the reminder identity on the original block when a copy is inserted above it", async () => {
+    const installed = await bootstrap();
+    const token: DateMention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: installed.userId,
+      kind: "timed",
+      value: new Date(Date.now() + 3_600_000).toISOString(),
+      timezone: "UTC",
+    };
+    const originalId = await addStructuredTokenBlock(installed.page.id, token);
+    const path = `/api/pages/${installed.page.id}/date-reminders/${token.tokenId}`;
+    const saved = await SELF.fetch(
+      request(installed.cookie, path, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ revision: token.revision, choice: "at_time" }),
+      }),
+    );
+    expect(saved.status).toBe(200);
+    await addStructuredTokenBlock(installed.page.id, token, true);
+    const response = await env.DOCUMENT.getByName(`${installed.page.id}~1`).fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    const content = await response.json<{ document: Parameters<typeof dateTokens>[0] }>();
+    const blocks = flattenDocumentBlocks(content.document);
+    expect(dateTokens(blocks.find((block) => block.id === originalId)!.node).get(token.tokenId)).toBeTruthy();
+    expect(blocks.filter((block) => dateTokens(block.node).has(token.tokenId))).toHaveLength(1);
+  });
+
+  it("does not overwrite a reminder when the document projection changes before saving", async () => {
+    const installed = await bootstrap();
+    const token: DateMention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: installed.userId,
+      kind: "timed",
+      value: new Date(Date.now() + 3_600_000).toISOString(),
+      timezone: "UTC",
+    };
+    await addToken(installed.page.id, token);
+    const path = `/api/pages/${installed.page.id}/date-reminders/${token.tokenId}`;
+    const put = (choice: string) =>
+      SELF.fetch(
+        request(installed.cookie, path, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ revision: token.revision, choice }),
+        }),
+      );
+    expect((await put("5m_before")).status).toBe(200);
+    await env.DB.prepare(`UPDATE document_projections SET sequence=sequence+1 WHERE page_id=?`)
+      .bind(installed.page.id)
+      .run();
+    expect((await put("at_time")).status).toBe(409);
+    expect(
+      (
+        await env.DB.prepare(`SELECT choice_json FROM date_reminders WHERE token_id=?`)
+          .bind(token.tokenId)
+          .first<{ choice_json: string }>()
+      )?.choice_json,
+    ).toBe('"5m_before"');
   });
 
   it("does not deliver when the author loses workspace access before the due scan", async () => {
