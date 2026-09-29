@@ -33,7 +33,6 @@ export type OfflinePage = {
 };
 
 const PENDING_MARKER = "noteflare-pending";
-export { PENDING_MARKER };
 
 function openExistingDocument(key: string): Promise<IDBDatabase | null> {
   return new Promise((resolve, reject) => {
@@ -105,6 +104,12 @@ export function persistPendingDocumentUpdate(db: IDBDatabase, update: Uint8Array
   return transactionDone(transaction);
 }
 
+export function setDocumentPendingMarker(db: IDBDatabase): Promise<void> {
+  const transaction = db.transaction("custom", "readwrite");
+  transaction.objectStore("custom").put(true, PENDING_MARKER);
+  return transactionDone(transaction);
+}
+
 /** Compact only updates already loaded into the Y.Doc; concurrent later rows survive. */
 export async function compactDocumentUpdates(persistence: IndexeddbPersistence): Promise<void> {
   await fetchUpdates(persistence);
@@ -115,8 +120,9 @@ export async function compactDocumentUpdates(persistence: IndexeddbPersistence):
   const store = transaction.objectStore("updates");
   store.add(Y.encodeStateAsUpdate(persistence.doc));
   store.delete(IDBKeyRange.upperBound(lastLoaded, true));
+  const count = store.count();
   await transactionDone(transaction);
-  persistence["_dbsize"] = 1;
+  persistence["_dbsize"] = count.result;
 }
 
 export function pendingKeysOf(page: OfflinePage): string[] {
@@ -249,7 +255,7 @@ export async function latestOfflineAccount(): Promise<OfflineAccount | null> {
   );
 }
 
-export async function hasOfflineDocument(key: string): Promise<boolean> {
+async function hasOfflineDocument(key: string): Promise<boolean> {
   const db = await openExistingDocument(key);
   db?.close();
   return Boolean(db);
@@ -297,7 +303,55 @@ async function readAccountPages(accountKey: string, includeMarkers = true): Prom
     transaction.objectStore("pages").index("byAccount").getAll(accountKey) as IDBRequest<OfflinePage[]>,
   );
   await transactionDone(transaction);
-  return includeMarkers ? Promise.all(pages.map(withPendingMarkers)) : pages;
+  if (!includeMarkers) return pages;
+  const marked = await Promise.all(pages.map(withPendingMarkers));
+  const [userId, workspaceId] = accountKey.split("\u0000");
+  if (!userId || !workspaceId || !indexedDB.databases) return marked;
+  const prefix = `account:${userId}:${workspaceId}:`;
+  const knownKeys = new Set(marked.flatMap((page) => page.storageKeys ?? []));
+  const byPage = new Map(marked.map((page) => [page.pageId, page]));
+  for (const database of await indexedDB.databases()) {
+    const name = database.name;
+    if (!name?.startsWith(prefix) || knownKeys.has(name)) continue;
+    const suffix = name.slice(prefix.length);
+    const match = /^([^:]+):(\d+):2$/.exec(suffix);
+    if (!match) continue;
+    let pending = false;
+    try {
+      pending = await documentPendingMarker(name);
+    } catch (error) {
+      console.error("Offline orphan marker could not be read", error);
+      pending = true;
+    }
+    if (!pending) continue;
+    const pageId = match[1]!;
+    const current = byPage.get(pageId);
+    if (current) {
+      current.storageKeys = withStorageKey(current.storageKeys ?? [], name);
+      current.pendingCopyKeys = [...new Set([...pendingKeysOf(current), name])];
+      current.pendingChanges = current.pendingCopyKeys.includes(current.storageKeys.at(-1) ?? "");
+    } else {
+      const recovered: OfflinePage = {
+        key: `${accountKey}\u0000${pageId}`,
+        accountKey,
+        pageId,
+        title: "Recovered local draft",
+        spaceName: "Unknown space",
+        kind: "document",
+        epoch: Number(match[2]),
+        canEdit: false,
+        pendingChanges: true,
+        pendingCopyKeys: [name],
+        revoked: false,
+        lastSyncedAt: 0,
+        storageKeys: [name],
+      };
+      marked.push(recovered);
+      byPage.set(pageId, recovered);
+    }
+    knownKeys.add(name);
+  }
+  return marked;
 }
 
 export async function getOfflinePage(accountKey: string, pageId: string): Promise<OfflinePage | null> {

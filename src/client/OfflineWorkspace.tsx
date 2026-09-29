@@ -44,15 +44,16 @@ export function OfflineWorkspace({
     return requested ? (pages.find((page) => page.pageId === requested) ?? null) : (pages[0] ?? null);
   });
   const [recovery, setRecovery] = useState<RecoveryState>("offline");
-  const [quarantined, setQuarantined] = useState<Record<string, string>>({});
+  const [quarantined, setQuarantined] = useState<
+    Record<string, { kind: "epoch" | "access" | "unknown"; message: string }>
+  >({});
   const [notice, setNotice] = useState("");
   const selectedId = useRef(selected?.pageId ?? null);
   const reconnectController = useRef<AbortController | null>(null);
+  const selectedQuarantine = selected ? quarantined[selected.pageId] : undefined;
   const selectedReason = selected?.revoked
     ? "Access to this copy must be confirmed online. Its unsynced edits remain available for export."
-    : selected
-      ? quarantined[selected.pageId]
-      : undefined;
+    : selectedQuarantine?.message;
 
   const discardRevokedCopy = useCallback(
     async (pageId: string) => {
@@ -60,7 +61,10 @@ export function OfflineWorkspace({
         if (!(await markOfflinePageRevoked(account.key, pageId))) {
           setQuarantined((current) => ({
             ...current,
-            [pageId]: "The server could not confirm access to this edited copy. It remains available for export.",
+            [pageId]: {
+              kind: "unknown",
+              message: "The server could not confirm access to this edited copy. It remains available for export.",
+            },
           }));
           return;
         }
@@ -82,7 +86,10 @@ export function OfflineWorkspace({
         console.error("Unable to remove a revoked offline copy", error);
         setQuarantined((current) => ({
           ...current,
-          [pageId]: "The server could not confirm access to this edited copy. It remains available for export.",
+          [pageId]: {
+            kind: "unknown",
+            message: "The server could not confirm access to this edited copy. It remains available for export.",
+          },
         }));
       } finally {
         if (selectedId.current === pageId || selectedId.current === null) setRecovery("offline");
@@ -116,7 +123,7 @@ export function OfflineWorkspace({
         flushSync(() => setRecovery("finalizing"));
         const stored = await getOfflinePage(account.key, selected.pageId);
         if (!isCurrent()) return;
-        const hasDraft = Boolean(stored && pendingKeysOf(stored).length);
+        const hasDraft = Boolean((stored && pendingKeysOf(stored).length) || pendingKeysOf(selected).length);
         const space = spaces.find((item) => item.id === page.spaceId);
         if (!space && !hasDraft) {
           await discardRevokedCopy(selected.pageId);
@@ -125,7 +132,10 @@ export function OfflineWorkspace({
         if (!space || (hasDraft && space.effectiveRole === "viewer")) {
           setQuarantined((current) => ({
             ...current,
-            [selected.pageId]: "Your access changed. The local copy is preserved for export.",
+            [selected.pageId]: {
+              kind: "access",
+              message: "Your access changed. The local copy is preserved for export.",
+            },
           }));
           setRecovery("offline");
           return;
@@ -133,7 +143,10 @@ export function OfflineWorkspace({
         if (hasDraft && page.contentEpoch !== selected.epoch) {
           setQuarantined((current) => ({
             ...current,
-            [selected.pageId]: "This document's version changed. The local copy is preserved for export.",
+            [selected.pageId]: {
+              kind: "epoch",
+              message: "This document's version changed. The local copy is preserved for export.",
+            },
           }));
           setRecovery("offline");
           return;
@@ -168,7 +181,10 @@ export function OfflineWorkspace({
       if (selected) {
         setQuarantined((current) => ({
           ...current,
-          [selected.pageId]: "The server could not confirm access to this copy. It remains available for export.",
+          [selected.pageId]: {
+            kind: "unknown",
+            message: "The server could not confirm access to this copy. It remains available for export.",
+          },
         }));
       }
       setRecovery("offline");
@@ -202,12 +218,13 @@ export function OfflineWorkspace({
         <button type="button" onClick={() => void reconnect()} disabled={recovery !== "offline"}>
           {recovery !== "offline" ? "Checking access…" : "Reconnect"}
         </button>
-        {selected && selectedReason?.startsWith("This document's version changed") && (
+        {selectedReason && (
           <button
             type="button"
             onClick={() => {
               const next = new URL(window.location.href);
-              next.searchParams.set("page", selected.pageId);
+              if (selectedQuarantine?.kind === "epoch" && selected) next.searchParams.set("page", selected.pageId);
+              else next.searchParams.delete("page");
               window.history.replaceState(null, "", next);
               onRetry();
             }}
@@ -421,7 +438,7 @@ function OfflineBlockEditor({
     let writing: Promise<void> | null = null;
     let pendingCommitted = false;
     let pendingMark: Promise<void> | null = null;
-    let persistedBatches = 0;
+    let persistedBatches = copy.persistence["_dbsize"];
     const markPending = () => {
       if (pendingCommitted) return Promise.resolve();
       pendingMark ??= markOfflinePagePending(accountKey, page.pageId, storageKey, true)
@@ -449,7 +466,7 @@ function OfflineBlockEditor({
           await markPending();
           if (++persistedBatches >= 500) {
             persistedBatches = 0;
-            await compactDocumentUpdates(copy.persistence).catch((error) =>
+            void compactDocumentUpdates(copy.persistence).catch((error) =>
               console.error("Unable to compact offline document storage", error),
             );
           }
@@ -472,9 +489,13 @@ function OfflineBlockEditor({
     });
     const flushOnHide = () => {
       if (!updates.length || !copy.persistence.db) return;
-      void persistPendingDocumentUpdate(copy.persistence.db, Y.mergeUpdates(updates)).catch((error) =>
-        console.error("Offline edits could not be queued during page unload", error),
-      );
+      try {
+        void persistPendingDocumentUpdate(copy.persistence.db, Y.mergeUpdates(updates)).catch((error) =>
+          console.error("Offline edits could not be queued during page unload", error),
+        );
+      } catch (error) {
+        console.error("Offline edits could not be queued during page unload", error);
+      }
     };
     const updated = (update: Uint8Array, origin: unknown) => {
       if (origin === copy.persistence || origin === copy.provider) return;

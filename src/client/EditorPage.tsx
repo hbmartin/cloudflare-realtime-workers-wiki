@@ -43,6 +43,7 @@ import {
   pendingKeysOf,
   persistPendingDocumentUpdate,
   rememberOfflinePage,
+  setDocumentPendingMarker,
   storageEpoch,
 } from "./offline-catalog";
 
@@ -115,14 +116,16 @@ export function EditorPage({
     try {
       const saved: unknown = JSON.parse(localStorage.getItem(`${recoveryKey}:dismissed`) ?? "{}");
       dismissedRecovery.current = Array.isArray(saved)
-        ? Object.fromEntries(saved.filter((key): key is string => typeof key === "string").map((key) => [key, -1]))
+        ? Object.fromEntries(
+            saved.filter((key): key is string => typeof key === "string").map((key) => [key, page.contentEpoch]),
+          )
         : saved && typeof saved === "object"
           ? Object.fromEntries(Object.entries(saved).filter(([key, value]) => key && Number.isInteger(value)))
           : {};
     } catch {
       dismissedRecovery.current = {};
     }
-  }, [recoveryKey]);
+  }, [recoveryKey, page.contentEpoch]);
   const [recoveryPreview, setRecoveryPreview] = useState<{ key: string; text: string } | null>(null);
   const [title, setTitle] = useState(page.title);
   const [titleError, setTitleError] = useState("");
@@ -191,6 +194,7 @@ export function EditorPage({
     let next: CollaborationBundle;
     let catalogFailures = 0;
     let pendingActive = false;
+    let catalogNeedsRepair = false;
     let pendingRevision = 0;
     let storageFailed = false;
     const beforeConnect = async () => {
@@ -211,10 +215,15 @@ export function EditorPage({
         throw error;
       }
       const pendingKeys = catalogPage ? pendingKeysOf(catalogPage) : [];
-      const marker = await documentPendingMarker(currentStorageKey).catch((error) => {
-        console.error("Unable to read offline document marker", error);
-        return true;
-      });
+      const listed = Boolean(catalogPage?.storageKeys?.includes(currentStorageKey));
+      const marker =
+        pendingKeys.includes(currentStorageKey) || listed
+          ? pendingKeys.includes(currentStorageKey)
+          : await documentPendingMarker(currentStorageKey).catch((error) => {
+              console.error("Unable to read offline document marker", error);
+              return true;
+            });
+      catalogNeedsRepair = marker && !listed;
       if (readingRevision === pendingRevision) pendingActive = pendingKeys.includes(currentStorageKey) || marker;
       const olderDrafts = pendingKeys.filter((key) => key !== currentStorageKey);
       for (const key of olderDrafts) quarantine(key);
@@ -227,6 +236,10 @@ export function EditorPage({
         if (currentMember.user.id !== member.user.id || currentMember.workspace.id !== member.workspace.id) {
           window.location.reload();
           return false;
+        }
+        if (catalogNeedsRepair) {
+          writePending(true);
+          await pendingWrite;
         }
         // A clean copy can rely on the document room's page access check.
         if (!hasLocalDraft && !olderDrafts.length) return true;
@@ -285,7 +298,7 @@ export function EditorPage({
     };
     const writePending = (pending: boolean) => {
       if (!pending && storageFailed) return;
-      if (pending && pendingActive) return;
+      if (pending && pendingActive && !catalogNeedsRepair) return;
       if (!pending && !pendingActive) {
         clearCurrentRecovery();
         return;
@@ -308,6 +321,13 @@ export function EditorPage({
             );
           }
           await markOfflinePagePending(offlineAccountKey(currentMember), page.id, currentStorageKey, pending);
+          if (!pending && revision !== pendingRevision && pendingActive) {
+            const db = next.indexeddb.db;
+            if (!db) throw new Error("Offline document storage is unavailable.");
+            await setDocumentPendingMarker(db);
+            return;
+          }
+          if (pending) catalogNeedsRepair = false;
           if (!pending) {
             await rememberOfflinePage(
               currentMember,
@@ -328,6 +348,7 @@ export function EditorPage({
         });
     };
     let persistedUpdates = 0;
+    let seededUpdates = false;
     const failStorage = (error: unknown) => {
       storageFailed = true;
       console.error("Unable to persist local document update", error);
@@ -341,7 +362,7 @@ export function EditorPage({
         next.indexeddb["_storeUpdate"](_update, origin);
         return;
       }
-      if (origin !== next.provider && origin !== next.indexeddb) {
+      if (origin !== next.indexeddb) {
         if (dismissedRecovery.current[currentStorageKey] !== undefined) {
           delete dismissedRecovery.current[currentStorageKey];
           try {
@@ -356,11 +377,15 @@ export function EditorPage({
           const stored = persistPendingDocumentUpdate(db, _update).catch(failStorage);
           pendingWrite = pendingWrite
             .then(() => stored)
-            .then(async () => {
+            .then(() => {
               if (storageFailed) return;
+              if (!seededUpdates) {
+                persistedUpdates = next.indexeddb["_dbsize"];
+                seededUpdates = true;
+              }
               if (++persistedUpdates >= 500) {
                 persistedUpdates = 0;
-                await compactDocumentUpdates(next.indexeddb).catch((error) =>
+                void compactDocumentUpdates(next.indexeddb).catch((error) =>
                   console.error("Unable to compact offline document storage", error),
                 );
               }

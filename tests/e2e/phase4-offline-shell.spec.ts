@@ -317,6 +317,7 @@ test("recovers a saved draft when the catalog pending write fails", async ({ pag
   await page.waitForURL((url) =>
     Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
   );
+  const pageId = new URL(page.url()).searchParams.get("page")!;
   await page.locator(".bn-editor").click();
   await page.keyboard.type("Online seed");
   await expect(page.locator(".bn-editor")).toContainText("Online seed");
@@ -355,8 +356,28 @@ test("recovers a saved draft when the catalog pending write fails", async ({ pag
   await expect(page.getByText("Local save failed. Export this copy before closing it.")).toBeVisible();
   await page.reload();
   await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedZ");
+  await page.evaluate(async (id) => {
+    const opened = indexedDB.open("noteflare-offline-catalog");
+    const db = await new Promise<IDBDatabase>((resolve) =>
+      opened.addEventListener("success", () => resolve(opened.result)),
+    );
+    const transaction = db.transaction("pages", "readwrite");
+    const store = transaction.objectStore("pages");
+    const entries = await new Promise<Array<{ key: string; pageId: string }>>((resolve) => {
+      const request = store.getAll();
+      request.addEventListener("success", () => resolve(request.result));
+    });
+    const entry = entries.find((candidate) => candidate.pageId === id);
+    if (!entry) throw new Error("Expected an offline catalog entry.");
+    store.delete(entry.key);
+    await new Promise<void>((resolve) => transaction.addEventListener("complete", () => resolve()));
+    db.close();
+  }, pageId);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Recovered local draft" })).toBeVisible();
   await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
   await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
+  await expect(page.getByText("Recovered local draft", { exact: true }).last()).toBeVisible();
 });
 
 test("keeps an online editor draft when its catalog write fails", async ({ page, context }) => {
