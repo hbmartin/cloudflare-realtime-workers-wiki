@@ -809,29 +809,16 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
   try {
     return await hasUnlinkedCapture(env, job.id);
   } catch (lookupError) {
-    logger.error(
-      "workflow.capture_import.failed",
-      "workflow",
-      "Capture import failed while its receipt was unavailable.",
-      { jobId: job.id, attempt: job.attempt },
-      error,
-    );
-    logger.error(
-      "workflow.capture_lookup.failed",
-      "workflow",
-      "Capture lookup failed during job recovery.",
-      { jobId: job.id },
-      lookupError,
-    );
-    logger.info(
-      "workflow.capture_import.deferred",
-      "workflow",
-      "Capture recovery deferred until its receipt can be checked.",
-      { jobId: job.id, attempt: job.attempt },
-    );
     try {
       return await hasUnlinkedCapture(env, job.id);
-    } catch {
+    } catch (retryError) {
+      logger.error(
+        "workflow.capture_lookup.failed",
+        "workflow",
+        "Capture lookup failed during job recovery.",
+        { jobId: job.id, attempt: job.attempt },
+        new AggregateError([lookupError, retryError], "Capture receipt lookup failed twice.", { cause: retryError }),
+      );
       // The scheduled pass will retry when D1 can answer authoritatively.
     }
     // Defer recovery until D1 can distinguish an unlinked receipt from a real
@@ -1418,7 +1405,7 @@ export async function recoverQueuedJobs(env: Env) {
             continue;
           }
         }
-        await failJobWithCleanup(env, job, failure);
+        await failJobWithCleanup(env, job, failure, true);
       } catch (error) {
         logger.error(
           "workflow.running_recovery.failed",

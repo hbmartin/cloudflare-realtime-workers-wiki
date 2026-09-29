@@ -269,11 +269,32 @@ describe("import content", () => {
     expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
   });
 
+  it("keeps later and larger data images out of paragraph text", () => {
+    const data = `data:image/png;base64,${"A".repeat(100_000)}`;
+    const parsed = markdownToDocument(`See ![small](small.png) then ![large](${data}) below`);
+    expect(parsed.references).toEqual(["small.png", data]);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("recognizes an image after unmatched code punctuation and an escaped backslash", () => {
+    const data = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const unmatched = markdownToDocument(`Press the \` key. See ![chart](${data}) below`);
+    const escapedBackslash = markdownToDocument(String.raw`See \\![chart](${data}) below`);
+    expect(unmatched.references).toContain(data);
+    expect(escapedBackslash.references).toContain(data);
+    expect(JSON.stringify(unmatched.document)).not.toContain("A".repeat(10_000));
+  });
+
   it("keeps a long data-image example inside code as code", () => {
     const data = `data:image/png;base64,${"A".repeat(10_000)}`;
     const parsed = markdownToDocument(`\`example ![chart](${data})\``);
     expect(parsed.references).toEqual([]);
     expect(parsed.issues.some((issue) => issue.code === "image_not_imported")).toBe(false);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: `example ![chart](${data})`,
+      marks: [{ type: "code" }],
+    });
   });
 
   it("bounds a hostile image label before asking Marked to tokenize it", () => {
@@ -343,6 +364,27 @@ describe("import content", () => {
     });
   });
 
+  it("keeps a link after an unmatched bracket and a long title-bearing link", () => {
+    const ordinary = markdownToDocument(
+      `[0, 1) ${"word ".repeat(1630)}[link text here](https://example.com/x) ${"tail ".repeat(400)}*`,
+    );
+    expect(ordinary.references).toContain("https://example.com/x");
+    const dense = markdownToDocument(`[${"<? ".repeat(1_000)}](doc.md "Design") ${"\\.".repeat(5_000)}`);
+    expect(dense.references).toContain("doc.md");
+  });
+
+  it("keeps an escaped destination after dense markup", () => {
+    const parsed = markdownToDocument(`[${"<? ".repeat(1_000)}](a\\)b) ${"\\.".repeat(5_000)}`);
+    expect(parsed.references).toContain("a)b");
+  });
+
+  it("keeps a link when a dense-section boundary falls inside its destination", () => {
+    const parsed = markdownToDocument(
+      `${"\\.".repeat(100)} [doc](https://x.com/${"\\-".repeat(40)}) tail ${"x ".repeat(4200)}`,
+    );
+    expect(parsed.references).toContain(`https://x.com/${"-".repeat(40)}`);
+  });
+
   it("keeps a link after dense escaped content without lexing the whole paragraph", () => {
     const parsed = markdownToDocument(`${"\\.".repeat(10_000)} [late](late.md)`);
     expect(parsed.references).toContain("late.md");
@@ -363,6 +405,12 @@ describe("import content", () => {
   it("finishes malformed tags and escapes in a long paragraph", () => {
     const parsed = markdownToDocument(`${"<? ".repeat(30_000)} ${"\\.".repeat(30_000)}`);
     expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+  });
+
+  it("bounds memory for a paragraph of backtick delimiters", () => {
+    const parsed = markdownToDocument("` ".repeat(100_001));
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+    expect(parsed.issues.some((issue) => issue.code === "inline_markup_simplified")).toBe(true);
   });
 
   it("finishes a long paragraph without spaces", () => {
