@@ -250,33 +250,32 @@ function parseGroupPreservingMath(
   const codeRanges: Array<{ from: number; to: number }> = [];
   let tokenOffset = 0;
   for (const token of new Lexer({ gfm: true }).blockTokens(normalizedSource)) {
-    if (token.type === "code") codeRanges.push({ from: tokenOffset, to: tokenOffset + token.raw.length });
-    tokenOffset += token.raw.length;
+    const located = normalizedSource.indexOf(token.raw, tokenOffset);
+    if (located < 0) throw new MarkdownWriteError("Markdown block offsets could not be resolved.");
+    tokenOffset = located + token.raw.length;
+    if (token.type === "code") codeRanges.push({ from: located, to: tokenOffset });
+    if (token.type !== "paragraph" && token.type !== "text") continue;
+    let opener: { from: number; length: number } | null = null;
+    for (let index = 0; index < token.raw.length; index += 1) {
+      if (token.raw[index] !== "`") continue;
+      let end = index + 1;
+      while (token.raw[end] === "`") end += 1;
+      const length = end - index;
+      if (opener) {
+        if (opener.length === length) {
+          codeRanges.push({ from: located + opener.from, to: located + end });
+          opener = null;
+        }
+      } else {
+        let slashes = 0;
+        for (let before = index - 1; before >= 0 && token.raw[before] === "\\"; before -= 1) slashes += 1;
+        if (slashes % 2 === 0) opener = { from: index, length };
+      }
+      index = end - 1;
+    }
   }
-  const backtickOpeners = new Map<number, number>();
-  let precedingSlashes = 0;
-  for (let index = 0; index < normalizedSource.length; index += 1) {
-    const character = normalizedSource[index];
-    if (character === "\\") {
-      precedingSlashes += 1;
-      continue;
-    }
-    if (character !== "`" || precedingSlashes % 2 === 1) {
-      precedingSlashes = 0;
-      continue;
-    }
-    precedingSlashes = 0;
-    let end = index + 1;
-    while (normalizedSource[end] === "`") end += 1;
-    const length = end - index;
-    const opener = backtickOpeners.get(length);
-    if (opener === undefined) backtickOpeners.set(length, index);
-    else {
-      codeRanges.push({ from: opener, to: end });
-      backtickOpeners.delete(length);
-    }
-    index = end - 1;
-  }
+  codeRanges.sort((left, right) => left.from - right.from);
+  let codeIndex = 0;
   const blocks: ProseMirrorJson[] = [];
   const rawBlocks: string[] = [];
   const deletedMathIds: string[] = [];
@@ -293,13 +292,16 @@ function parseGroupPreservingMath(
     const originalRaw = markdown.slice(span.from, span.to).trimEnd();
     const raw = originalRaw.replaceAll(/\r\n?/g, "\n");
     let found = normalizedSource.indexOf(raw, cursor);
-    while (
-      found >= 0 &&
-      ((found > 0 && normalizedSource[found - 1] !== "\n") ||
-        (found + raw.length < normalizedSource.length && normalizedSource[found + raw.length] !== "\n") ||
-        codeRanges.some((range) => range.from <= found && range.to >= found + raw.length))
-    )
+    while (found >= 0) {
+      while (codeRanges[codeIndex] && codeRanges[codeIndex]!.to <= found) codeIndex += 1;
+      if (
+        (found === 0 || normalizedSource[found - 1] === "\n") &&
+        (found + raw.length === normalizedSource.length || normalizedSource[found + raw.length] === "\n") &&
+        !(codeRanges[codeIndex] && codeRanges[codeIndex]!.from <= found)
+      )
+        break;
       found = normalizedSource.indexOf(raw, found + 1);
+    }
     if (found < 0) {
       if (
         allowDeletingContent &&
@@ -382,10 +384,15 @@ export function markdownMutations(
         ? group.edits[0]!.from
         : (projection.spans[group.first]?.from ?? projection.markdown.length);
     const to = group.after > group.first ? projection.spans[group.after - 1]!.to : from;
-    for (const span of projection.spans.slice(group.first, group.after)) {
+    for (const [index, span] of projection.spans.slice(group.first, group.after).entries()) {
       const marker = projection.markdown.slice(span.from, span.to).trim();
       if (!marker.startsWith('<unknown url="notion://blocks/')) continue;
-      if (!allowDeletingContent || !group.edits.some((edit) => edit.from <= span.from && edit.to >= span.to))
+      const math = original[index]?.type === "math";
+      const contentEnd = span.from + projection.markdown.slice(span.from, span.to).trimEnd().length;
+      if (
+        !allowDeletingContent ||
+        !group.edits.some((edit) => edit.from <= span.from && edit.to >= (math ? contentEnd : span.to))
+      )
         throw new MarkdownWriteError("A range cannot partially overwrite unknown content.");
     }
     const groupSource = replacementText(projection.markdown, from, to, group.edits);

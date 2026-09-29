@@ -38,7 +38,6 @@ import {
   completeMarkdownTask,
   createMarkdownTask,
   dueMarkdownTasks,
-  failExpiredMarkdownRecovery,
   failMarkdownTask,
   markdownTaskForIntegration,
   markdownTaskForRequestKey,
@@ -1007,7 +1006,6 @@ export async function runNotionMarkdownTask(env: Env, id: string) {
 
 export async function recoverNotionMarkdownTasks(env: Env) {
   if (env.NOTION_MARKDOWN_WRITES_ENABLED === "true") {
-    await failExpiredMarkdownRecovery(env);
     for (let recovered = 0; recovered < 5; recovered += 1) {
       const task = (await claimExhaustedMarkdownTasks(env))[0];
       if (!task) break;
@@ -1034,7 +1032,7 @@ export async function recoverNotionMarkdownTasks(env: Env) {
         await completeMarkdownFromReceipt(env, task, principal, page, receipt);
       } catch (error) {
         const retry =
-          !(error instanceof TypeError || error instanceof SyntaxError || error instanceof RangeError) &&
+          !(error instanceof SyntaxError || error instanceof RangeError) &&
           (!(error instanceof NotionError) || error.status === 503) &&
           Date.now() <= task.expires_at + RESULT_RETENTION_MS;
         await failMarkdownTask(

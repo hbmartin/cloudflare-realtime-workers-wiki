@@ -175,6 +175,26 @@ describe("Notion Markdown block mutations", () => {
     expect(JSON.stringify(operations)).not.toContain(math.attrs.id);
   });
 
+  it("ignores a math-looking code span and keeps math with fenced lines inside its formula", () => {
+    const { first, second } = fixture();
+    const math = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "math", attrs: { formula: "a\n```js\nb\n```" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, math, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const rawMath = projection.markdown.slice(projection.spans[1]!.from, projection.spans[1]!.to).trimEnd();
+    const changed = `Updated first\n\n\`\n${rawMath}\n\`\n\n${rawMath}\n\nSecond\n`;
+    const command = parseMarkdownCommand(
+      { type: "replace_content", replace_content: { new_str: changed } },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false);
+    expect(JSON.stringify(operations)).not.toContain(math.attrs.id);
+    expect(JSON.stringify(operations)).toContain("Updated first");
+  });
+
   it("enforces one markup budget across text separated by preserved math", () => {
     const { first, second } = fixture();
     const math = {

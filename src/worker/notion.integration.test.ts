@@ -319,6 +319,9 @@ describe("Notion-compatible API", () => {
       result: { object: "page_markdown", markdown: "After\n" },
     });
     expect((await client.pages.retrieveMarkdown({ page_id: installed.pageId })).markdown).toBe("After\n");
+    const committedOperation = await env.DB.prepare("SELECT operation_id FROM notion_markdown_tasks WHERE id=?")
+      .bind(accepted.id)
+      .first<{ operation_id: string }>();
     await env.DB.prepare(
       `UPDATE notion_markdown_tasks SET status='running',attempts=10,lease_token='stale',
          lease_expires_at=?,next_attempt_at=?,result_json=NULL WHERE id=?`,
@@ -365,17 +368,23 @@ describe("Notion-compatible API", () => {
       ).json<{ error: { message: string } }>(),
     ).toMatchObject({ status: "failed", error: { message: "Earlier write failure." } });
     await env.DB.prepare(
-      `UPDATE notion_markdown_tasks SET status='running',attempts=10,lease_token='stale',
+      `UPDATE notion_markdown_tasks SET status='running',attempts=10,operation_id=?,lease_token='stale',
          lease_expires_at=?,next_attempt_at=?,expires_at=? WHERE id=?`,
     )
-      .bind(Date.now() - 1, Date.now() - 1, Date.now() - 8 * 24 * 60 * 60_000, accepted.id)
+      .bind(
+        committedOperation!.operation_id,
+        Date.now() - 1,
+        Date.now() - 1,
+        Date.now() - 8 * 24 * 60 * 60_000,
+        accepted.id,
+      )
       .run();
     await recoverNotionMarkdownTasks(env);
     expect(
       await (
         await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))
-      ).json<{ error: { message: string } }>(),
-    ).toMatchObject({ status: "failed", error: { message: "Earlier write failure." } });
+      ).json<{ status: string }>(),
+    ).toMatchObject({ status: "succeeded" });
     const revokeRead = await SELF.fetch(
       authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
         method: "PATCH",

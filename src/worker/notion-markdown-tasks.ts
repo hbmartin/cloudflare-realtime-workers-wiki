@@ -139,7 +139,7 @@ export async function failMarkdownTask(env: Env, row: MarkdownTaskRow, error: un
   )
     .bind(
       retry ? "retrying" : "failed",
-      JSON.stringify(error),
+      row.error_json ?? JSON.stringify(error),
       retry ? now + delay : now,
       now,
       retry ? row.expires_at : now + RESULT_RETENTION_MS,
@@ -167,12 +167,12 @@ export async function claimExhaustedMarkdownTasks(env: Env) {
   const now = Date.now();
   const due = await env.DB.prepare(
     `SELECT id FROM notion_markdown_tasks WHERE status IN ('queued','running','retrying')
-       AND (attempts>=? OR expires_at<=?) AND expires_at>?
+       AND (attempts>=? OR expires_at<=?)
        AND next_attempt_at<=?
        AND (lease_expires_at IS NULL OR lease_expires_at<=?)
      ORDER BY next_attempt_at,id LIMIT 1`,
   )
-    .bind(MAX_MARKDOWN_TASK_ATTEMPTS, now, now - RESULT_RETENTION_MS, now, now)
+    .bind(MAX_MARKDOWN_TASK_ATTEMPTS, now, now, now)
     .all<{ id: string }>();
   const claimed: MarkdownTaskRow[] = [];
   for (const row of due.results) {
@@ -181,50 +181,15 @@ export async function claimExhaustedMarkdownTasks(env: Env) {
       `UPDATE notion_markdown_tasks SET status='running',
          lease_token=?,lease_expires_at=?,next_attempt_at=?,updated_at=?
        WHERE id=? AND status IN ('queued','running','retrying')
-         AND (attempts>=? OR expires_at<=?) AND expires_at>?
+         AND (attempts>=? OR expires_at<=?)
          AND next_attempt_at<=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)
        RETURNING *`,
     )
-      .bind(
-        leaseToken,
-        now + LEASE_MS,
-        now + LEASE_MS,
-        now,
-        row.id,
-        MAX_MARKDOWN_TASK_ATTEMPTS,
-        now,
-        now - RESULT_RETENTION_MS,
-        now,
-        now,
-      )
+      .bind(leaseToken, now + LEASE_MS, now + LEASE_MS, now, row.id, MAX_MARKDOWN_TASK_ATTEMPTS, now, now, now)
       .first<MarkdownTaskRow>();
     if (task) claimed.push(task);
   }
   return claimed;
-}
-
-export async function failExpiredMarkdownRecovery(env: Env) {
-  const now = Date.now();
-  await env.DB.prepare(
-    `UPDATE notion_markdown_tasks SET status='failed',
-       error_json=COALESCE(error_json,?),lease_token=NULL,lease_expires_at=NULL,
-       updated_at=?,expires_at=?
-      WHERE status IN ('queued','running','retrying') AND expires_at<=?
-        AND (lease_expires_at IS NULL OR lease_expires_at<=?)`,
-  )
-    .bind(
-      JSON.stringify({
-        object: "error",
-        status: 503,
-        code: "service_unavailable",
-        message: "The Markdown update could not be completed.",
-      }),
-      now,
-      now + RESULT_RETENTION_MS,
-      now - RESULT_RETENTION_MS,
-      now,
-    )
-    .run();
 }
 
 export async function pruneMarkdownTasks(env: Env) {
