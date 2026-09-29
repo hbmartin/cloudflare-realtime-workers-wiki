@@ -363,6 +363,20 @@ describe("import content", () => {
     expect(parsed.references).toContain("https://example.com/path");
   });
 
+  it("does not treat backticks or destinations inside autolinks as prose markup", () => {
+    const parsed = markdownToDocument(
+      `${"< ".repeat(140)}<https://x.test/a\`b](fake> then \`[hidden](hidden.md)\` [visible](visible.md) ${"x".repeat(9_000)}`,
+    );
+    expect(parsed.references).not.toContain("hidden.md");
+    expect(parsed.references).toContain("visible.md");
+  });
+
+  it("bounds angled destination scans in a long paragraph", () => {
+    const hostile = `[a](${" ".repeat(4000)}x${"<".repeat(4000)})`;
+    const parsed = markdownToDocument(`${hostile.repeat(3)} [later](later.md)`);
+    expect(parsed.references).toContain("later.md");
+  });
+
   it("recovers a long data image nested in an ordinary link", () => {
     const image = `data:image/png;base64,${"A".repeat(9_000)}`;
     const parsed = markdownToDocument(`[before ![chart](${image}) after](page.md)`);
@@ -449,6 +463,13 @@ describe("import content", () => {
     const parsed = markdownToDocument(`See ![a](${data} "first")![b](${data}) below`);
     expect(parsed.references).toEqual([data, data]);
     expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("imports a standalone base64 image above the short-line lexer limit", () => {
+    const data = `data:image/png;base64,${"A".repeat(100_000)}`;
+    const parsed = markdownToDocument(`![large](${data})`);
+    expect(parsed.document.content?.[0]?.content?.[0]?.content?.[0]?.type).toBe("image");
+    expect(parsed.references).toEqual([data]);
   });
 
   it("recognizes a data image with unmatched code punctuation in its label", () => {
