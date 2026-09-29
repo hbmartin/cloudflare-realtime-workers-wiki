@@ -112,8 +112,15 @@ const transientPurgeWarnings = new Set<string>();
 
 function offlinePurgeNotice() {
   try {
-    for (let index = 0; index < localStorage.length; index += 1)
-      if (localStorage.key(index)?.startsWith(OFFLINE_PURGE_WARNING_PREFIX)) return OFFLINE_PURGE_WARNING;
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(OFFLINE_PURGE_WARNING_PREFIX)) continue;
+      if (key.includes("\0")) {
+        localStorage.setItem(`${OFFLINE_PURGE_WARNING_PREFIX}legacy`, "1");
+        localStorage.removeItem(key);
+      }
+      return OFFLINE_PURGE_WARNING;
+    }
   } catch {
     // Storage can be disabled, but the current tab still needs the warning.
   }
@@ -124,10 +131,10 @@ async function rememberOfflinePurgeVerification(accountKey: string, verified: bo
   if (verified) transientPurgeWarnings.delete(accountKey);
   else transientPurgeWarnings.add(accountKey);
   try {
+    if (verified) localStorage.removeItem(`${OFFLINE_PURGE_WARNING_PREFIX}${accountKey}`);
     const key = `${OFFLINE_PURGE_WARNING_PREFIX}${await sha256Hex(accountKey)}`;
     if (verified) {
       localStorage.removeItem(key);
-      localStorage.removeItem(`${OFFLINE_PURGE_WARNING_PREFIX}${accountKey}`);
     } else localStorage.setItem(key, "1");
   } catch {
     // Continue sign-out even when browser storage is disabled.
@@ -961,8 +968,7 @@ export function App() {
       showState({ screen: "loading" });
       try {
         await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
-        if (localStorage.getItem(LOCAL_SIGNOUT_KEY) === accountKey) showState({ screen: "signin" });
-        else await load();
+        await load();
       } catch (error) {
         showState({
           screen: "signout-cleanup",
@@ -1327,7 +1333,8 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
   const [purgeNotice, setPurgeNotice] = useState(offlinePurgeNotice);
   useEffect(() => {
     const onWarningChanged = (event: StorageEvent) => {
-      if (event.key?.startsWith(OFFLINE_PURGE_WARNING_PREFIX)) setPurgeNotice(offlinePurgeNotice());
+      if (event.key === null || event.key.startsWith(OFFLINE_PURGE_WARNING_PREFIX))
+        setPurgeNotice(offlinePurgeNotice());
     };
     window.addEventListener("storage", onWarningChanged);
     return () => window.removeEventListener("storage", onWarningChanged);
@@ -1347,6 +1354,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
       }
       await finishPasswordSignIn();
       await onComplete();
+      setPurgeNotice(offlinePurgeNotice());
     } catch (cause) {
       setError(signInFailure(cause, "Sign in failed."));
     } finally {

@@ -308,15 +308,13 @@ describe("EditorPage close reconciliation", () => {
         backlinksRevision={0}
       />,
     );
-    expect(
-      await screen.findByText("Offline storage is still loading. Reopen this page to retry if it stays here."),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Offline storage is still loading.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reload to retry" })).toBeInTheDocument();
     await act(async () => finishLoading());
     await waitFor(() => {
-      expect(
-        screen.queryByText("Offline storage is still loading. Reopen this page to retry if it stays here."),
-      ).not.toBeInTheDocument();
-      expect(screen.getByLabelText("Page title")).not.toHaveAttribute("readonly");
+      expect(screen.queryByText("Offline storage is still loading.")).not.toBeInTheDocument();
+      expect(screen.queryByText("Opening your offline copy…")).not.toBeInTheDocument();
+      expect(mocks.slashItems).toBeTypeOf("function");
     });
   });
 

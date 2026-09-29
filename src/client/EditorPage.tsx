@@ -35,6 +35,7 @@ import {
 } from "./collaboration";
 import { exportOfflineCopyMarkdown, offlineCopyMarkdownFromKey } from "./offline-export";
 import { createDocumentCloseReconciler } from "./document-connection";
+import { reportClientError } from "./telemetry";
 import { editorBlockFactories, EmbedFeatureContext, safeBookmarkUrl } from "./editor-blocks";
 import { resolveEmbed } from "../shared/embed-providers";
 import { notesCommentSchema, notesSchema } from "./mentions";
@@ -98,8 +99,7 @@ export function EditorPage({
   const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [preparedRecoveryCopy, setPreparedRecoveryCopy] = useState<{ key: string; markdown: string } | null>(null);
-  const recoveryCopyAttempts = useRef(new Map<string, number>());
-  const recoveryCopyErrorOwner = useRef<string | null>(null);
+  const recoveryAction = useRef(0);
   const clipboardItemSupported =
     typeof ClipboardItem !== "undefined" && Boolean(navigator.clipboard && "write" in navigator.clipboard);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
@@ -539,10 +539,12 @@ export function EditorPage({
             await next.lateReady;
             if (!active) return;
             setStorageLoadingSlow(false);
-            setStorageError("");
+            setStorageError(null);
             setBundle(next);
-          } catch {
+          } catch (lateError) {
             if (!active) return;
+            console.error("Failed to load offline document state", lateError);
+            void reportClientError("client.offline_storage_failed", lateError);
             setStorageLoadingSlow(false);
             setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
           }
@@ -565,6 +567,7 @@ export function EditorPage({
           next.destroy();
         });
       setBundle(null);
+      setStorageLoadingSlow(false);
     };
   }, [
     member.role,
@@ -706,7 +709,9 @@ export function EditorPage({
       )}
       {storageError && <div className="notice notice-danger">{storageError}</div>}
       {storageLoadingSlow && (
-        <div className="notice">Offline storage is still loading. Reopen this page to retry if it stays here.</div>
+        <div className="notice">
+          Offline storage is still loading. <button onClick={() => window.location.reload()}>Reload to retry</button>
+        </div>
       )}
       {catalogWarning && <div className="notice">{catalogWarning}</div>}
       {recoveryError && <div className="notice notice-danger">{recoveryError}</div>}
@@ -727,17 +732,23 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={async () => {
+                const attempt = ++recoveryAction.current;
+                const stillCurrent = () =>
+                  recoveryAction.current === attempt &&
+                  recoveryRef.current.some((current) => current.key === entry.key);
                 try {
                   const doc = await loadOfflineCopy(entry.key);
                   try {
-                    setRecoveryPreview({ key: entry.key, text: plainYDoc(doc) });
-                    setRecoveryError(null);
+                    if (stillCurrent()) {
+                      setRecoveryPreview({ key: entry.key, text: plainYDoc(doc) });
+                      setRecoveryError(null);
+                    }
                   } finally {
                     doc.destroy();
                   }
                 } catch (error) {
                   console.error("Offline copy preview failed", error);
-                  setRecoveryError(recoveryMessage(error, "This offline copy could not be read."));
+                  if (stillCurrent()) setRecoveryError(recoveryMessage(error, "This offline copy could not be read."));
                 }
               }}
             >
@@ -746,11 +757,18 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={() => {
+                const attempt = ++recoveryAction.current;
+                const stillCurrent = () =>
+                  recoveryAction.current === attempt &&
+                  recoveryRef.current.some((current) => current.key === entry.key);
                 void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`).then(
-                  () => setRecoveryError(null),
+                  () => {
+                    if (stillCurrent()) setRecoveryError(null);
+                  },
                   (error: unknown) => {
                     console.error("Offline copy export failed", error);
-                    setRecoveryError(recoveryMessage(error, "This offline copy could not be exported."));
+                    if (stillCurrent())
+                      setRecoveryError(recoveryMessage(error, "This offline copy could not be exported."));
                   },
                 );
               }}
@@ -760,14 +778,12 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={async () => {
-                const attempt = (recoveryCopyAttempts.current.get(entry.key) ?? 0) + 1;
-                recoveryCopyAttempts.current.set(entry.key, attempt);
-                recoveryCopyErrorOwner.current = entry.key;
+                const attempt = ++recoveryAction.current;
                 const stillCurrent = () =>
-                  recoveryCopyAttempts.current.get(entry.key) === attempt &&
+                  recoveryAction.current === attempt &&
                   recoveryRef.current.some((current) => current.key === entry.key);
                 const showError = (message: string) => {
-                  if (stillCurrent() && recoveryCopyErrorOwner.current === entry.key) setRecoveryError(message);
+                  if (stillCurrent()) setRecoveryError(message);
                 };
                 if (!clipboardItemSupported) {
                   if (preparedRecoveryCopy?.key !== entry.key) {
@@ -775,7 +791,7 @@ export function EditorPage({
                       const markdown = await offlineCopyMarkdownFromKey(entry.key, page.title);
                       if (!stillCurrent()) return;
                       setPreparedRecoveryCopy({ key: entry.key, markdown });
-                      if (recoveryCopyErrorOwner.current === entry.key) setRecoveryError(null);
+                      setRecoveryError(null);
                     } catch (error) {
                       console.error("Offline copy preparation failed", error);
                       showError(recoveryMessage(error, "This offline copy could not be read."));
@@ -785,7 +801,7 @@ export function EditorPage({
                   try {
                     if (!navigator.clipboard?.writeText) throw new Error("Clipboard is unavailable.");
                     await navigator.clipboard.writeText(preparedRecoveryCopy.markdown);
-                    if (stillCurrent() && recoveryCopyErrorOwner.current === entry.key) setRecoveryError(null);
+                    if (stillCurrent()) setRecoveryError(null);
                   } catch (error) {
                     console.error("Offline copy clipboard failed", error);
                     showError("This offline copy could not be copied.");
@@ -799,12 +815,12 @@ export function EditorPage({
                       "text/plain": content.then((markdown) => new Blob([markdown], { type: "text/plain" })),
                     }),
                   ]);
-                  if (stillCurrent() && recoveryCopyErrorOwner.current === entry.key) setRecoveryError(null);
+                  if (stillCurrent()) setRecoveryError(null);
                 } catch (error) {
                   console.error("Offline copy clipboard failed", error);
                   showError("This offline copy could not be copied.");
                   void content.catch((loadingError) => {
-                    if (stillCurrent() && recoveryCopyErrorOwner.current === entry.key)
+                    if (stillCurrent())
                       setRecoveryError((current) =>
                         current === "This offline copy could not be copied."
                           ? recoveryMessage(loadingError, "This offline copy could not be read.")
@@ -824,8 +840,7 @@ export function EditorPage({
               <button
                 className="quiet-button"
                 onClick={() => {
-                  recoveryCopyAttempts.current.set(entry.key, (recoveryCopyAttempts.current.get(entry.key) ?? 0) + 1);
-                  if (recoveryCopyErrorOwner.current === entry.key) recoveryCopyErrorOwner.current = null;
+                  recoveryAction.current += 1;
                   setPreparedRecoveryCopy((prepared) => (prepared?.key === entry.key ? null : prepared));
                   dismissedRecovery.current[entry.key] = page.contentEpoch;
                   try {

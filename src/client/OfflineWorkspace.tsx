@@ -308,7 +308,7 @@ export function OfflineWorkspace({
                       const keys = new Set(
                         pending.filter((page) => page.pageId === selected.pageId).flatMap(pendingKeysOf),
                       );
-                      if (!complete) {
+                      if (!complete && !pending.some((page) => page.pageId === selected.pageId)) {
                         for (const key of await availablePendingKeys(pendingKeysOf(selected), false)) keys.add(key);
                       }
                       if (!keys.size) {
@@ -454,7 +454,11 @@ function OfflineEditor({
         </button>
       </div>
       {error && <p role="alert">{error}</p>}
-      {loadingSlow && <output>Offline storage is still loading. Reopen this copy to retry if it stays here.</output>}
+      {loadingSlow && (
+        <output>
+          Offline storage is still loading. <button onClick={() => window.location.reload()}>Reload to retry</button>
+        </output>
+      )}
       {copy ? (
         <OfflineBlockEditor
           copy={copy}

@@ -207,8 +207,6 @@ export function createCollaboration(
       if (destroyed) return;
       if (error instanceof OfflineStorageTimeoutError) {
         console.warn("Offline document storage is still loading", error);
-        void reportClientError("client.offline_storage_failed", error);
-        onStatus("offline");
         throw error;
       }
       console.error("Failed to load offline document state", error);
