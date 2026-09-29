@@ -649,7 +649,7 @@ async function mutationReceipt(env: Env, page: IntegrationPage, operationId: str
   return response.json<{ found: true; document: DocumentContentEnvelope["document"]; sequence: number }>();
 }
 
-export async function cleanupStagedPage(env: Env, pageId: string, contentEpoch: number, stageId: string) {
+async function cleanupStagedPage(env: Env, pageId: string, contentEpoch: number, stageId: string) {
   try {
     await env.DOCUMENT.getByName(`${pageId}~${contentEpoch}`).fetch(
       new Request("https://document.internal/purge", {

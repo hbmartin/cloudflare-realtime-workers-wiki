@@ -4,7 +4,7 @@ import { HttpError, sha256 } from "./http";
 import { consumeFixedWindow } from "./rate-limit";
 import { sourceRateLimitKey } from "./source-rate-limit";
 
-export const MCP_SCOPES = ["pages:read", "pages:write", "comments:write"] as const;
+const MCP_SCOPES = ["pages:read", "pages:write", "comments:write"] as const;
 export type McpScope = (typeof MCP_SCOPES)[number];
 const SCOPE_SET = new Set<string>(MCP_SCOPES);
 const CODE_TTL = 5 * 60_000;
@@ -51,7 +51,7 @@ function origin(env: Env) {
   return new URL(env.BETTER_AUTH_URL).origin;
 }
 
-export function mcpResource(env: Env) {
+function mcpResource(env: Env) {
   return `${origin(env)}/mcp`;
 }
 

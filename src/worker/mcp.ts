@@ -28,7 +28,7 @@ const OPERATION_ID = /^[A-Za-z0-9:_-]{1,128}$/;
 const RECEIPT_TTL_MS = 30 * 24 * 60 * 60_000;
 const STAGED_PAGE_TTL_MS = 24 * 60 * 60_000;
 const STAGED_CLEANUP_RETRY_MS = 60_000;
-type BackgroundContext = Pick<ExecutionContext, "waitUntil">;
+export type BackgroundContext = Pick<ExecutionContext, "waitUntil">;
 const TOOL_SCOPES: Record<string, readonly McpScope[]> = {
   search_pages: ["pages:read"],
   fetch_page: ["pages:read"],
