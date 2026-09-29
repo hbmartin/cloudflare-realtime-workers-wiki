@@ -156,12 +156,11 @@ export async function putDateReminder(
   const latestDocument = await roomDocument(env, page.id, page.content_epoch);
   const latestToken = dateTokens(latestDocument).get(tokenId);
   if (!latestToken || latestToken.revision !== token.revision || latestToken.createdBy !== member.user.id) {
-    await env.DB.prepare(
-      `UPDATE date_reminders SET state='canceled',generation=generation+1,claim_id=NULL,claimed_at=NULL,
-           delivery_receipt_id=NULL,updated_at=? WHERE id=? AND generation=? AND state='active'`,
-    )
-      .bind(Date.now(), savedRow.id, savedRow.generation)
-      .run();
+    await reconcileDateRemindersForPage(env, page.id, page.content_epoch, latestDocument);
+    const effective = await env.DB.prepare(`SELECT * FROM date_reminders WHERE id=? AND user_id=?`)
+      .bind(savedRow.id, member.user.id)
+      .first<ReminderRow>();
+    if (latestToken?.createdBy === member.user.id && effective?.state === "active") return reminderJson(effective);
     throw new HttpError(409, "date_token_changed", "This date changed. Reopen the reminder and try again.");
   }
   return reminderJson(savedRow);
@@ -185,13 +184,13 @@ export async function reconcileDateRemindersForPage(
   epoch: number,
   document: ProseMirrorJson,
   sequence?: number,
-  sweepCutoff?: number,
+  sweepCutoff?: { active: number; delivered: number },
 ) {
   const rows = await env.DB.prepare(
     `SELECT * FROM date_reminders WHERE page_id=? AND content_epoch=? AND state IN ('active','claimed','delivered')
-      ${sweepCutoff === undefined ? "" : "AND checked_at<? ORDER BY checked_at LIMIT 25"}`,
+      ${sweepCutoff === undefined ? "" : "AND ((state IN ('active','claimed') AND checked_at<?) OR (state='delivered' AND checked_at<?)) ORDER BY CASE WHEN state='delivered' THEN 1 ELSE 0 END,checked_at LIMIT 25"}`,
   )
-    .bind(pageId, epoch, ...(sweepCutoff === undefined ? [] : [sweepCutoff]))
+    .bind(pageId, epoch, ...(sweepCutoff === undefined ? [] : [sweepCutoff.active, sweepCutoff.delivered]))
     .all<ReminderRow>();
   if (!rows.results.length) return;
   const tokens = dateTokens(document);
@@ -268,13 +267,16 @@ export async function reconcileDateRemindersForPage(
 }
 
 export async function sweepDateReminders(env: Env) {
+  const timestamp = Date.now();
+  const cutoffs = { active: timestamp - 15 * 60_000, delivered: timestamp - 24 * 60 * 60_000 };
   const rows = await env.DB.prepare(
-    `SELECT page_id,content_epoch,MIN(checked_at) oldest_check FROM date_reminders
+    `SELECT page_id,content_epoch,MIN(checked_at) oldest_check,
+       MIN(CASE WHEN state='delivered' THEN 1 ELSE 0 END) priority FROM date_reminders
        WHERE (state IN ('active','claimed') AND checked_at<?)
           OR (state='delivered' AND checked_at<?)
-       GROUP BY page_id,content_epoch ORDER BY oldest_check LIMIT 5`,
+       GROUP BY page_id,content_epoch ORDER BY priority,oldest_check LIMIT 5`,
   )
-    .bind(Date.now() - 15 * 60_000, Date.now() - 24 * 60 * 60_000)
+    .bind(cutoffs.active, cutoffs.delivered)
     .all<{ page_id: string; content_epoch: number }>();
   for (const row of rows.results) {
     try {
@@ -296,7 +298,7 @@ export async function sweepDateReminders(env: Env) {
         row.content_epoch,
         await roomDocument(env, row.page_id, row.content_epoch),
         undefined,
-        Date.now() - 15 * 60_000,
+        cutoffs,
       );
     } catch (error) {
       logger.error(
@@ -306,11 +308,20 @@ export async function sweepDateReminders(env: Env) {
         { pageId: row.page_id, epoch: row.content_epoch },
         error,
       );
+      // Rotate a persistently unavailable room out of this bounded scan so
+      // other pages still receive reconciliation on the next tick.
+      await env.DB.prepare(
+        `UPDATE date_reminders SET checked_at=? WHERE page_id=? AND content_epoch=?
+           AND state IN ('active','claimed','delivered')`,
+      )
+        .bind(Date.now(), row.page_id, row.content_epoch)
+        .run()
+        .catch(() => {});
     }
   }
 }
 
-export async function processDueDateReminders(env: Env) {
+async function deliverDueDateReminders(env: Env) {
   const timestamp = Date.now();
   const due = await env.DB.prepare(
     `SELECT id FROM date_reminders WHERE due_at<=? AND
@@ -319,7 +330,8 @@ export async function processDueDateReminders(env: Env) {
   )
     .bind(timestamp, timestamp - 2 * 60_000)
     .all<{ id: string }>();
-  const retried = new Set<string>();
+  const pageAccess = new Map<string, Promise<{ space_id: string; content_epoch: number } | null>>();
+  const pageDocuments = new Map<string, Promise<ProseMirrorJson>>();
   for (const { id } of due.results) {
     const claimId = crypto.randomUUID();
     const row = await env.DB.prepare(
@@ -331,17 +343,23 @@ export async function processDueDateReminders(env: Env) {
       .first<ReminderRow>();
     if (!row) continue;
     try {
-      const page = await env.DB.prepare(
-        `SELECT p.space_id,p.content_epoch FROM pages p
+      const accessKey = `${row.user_id}:${row.page_id}:${row.content_epoch}`;
+      let access = pageAccess.get(accessKey);
+      if (!access) {
+        access = env.DB.prepare(
+          `SELECT p.space_id,p.content_epoch FROM pages p
           JOIN spaces s ON s.id=p.space_id AND s.workspace_id=p.workspace_id
           JOIN workspace_members wm ON wm.workspace_id=p.workspace_id AND wm.user_id=?
           LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=?
          WHERE p.id=? AND p.workspace_id=? AND p.content_epoch=?
            AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0
            AND (wm.role='owner' OR s.visibility='workspace' OR sm.user_id IS NOT NULL)`,
-      )
-        .bind(row.user_id, row.user_id, row.page_id, row.workspace_id, row.content_epoch)
-        .first<{ space_id: string; content_epoch: number }>();
+        )
+          .bind(row.user_id, row.user_id, row.page_id, row.workspace_id, row.content_epoch)
+          .first<{ space_id: string; content_epoch: number }>();
+        pageAccess.set(accessKey, access);
+      }
+      const page = await access;
       if (!page) {
         await env.DB.prepare(
           `UPDATE date_reminders SET state='canceled',generation=generation+1,claim_id=NULL,
@@ -352,41 +370,26 @@ export async function processDueDateReminders(env: Env) {
           .run();
         continue;
       }
-      const document = await roomDocument(env, row.page_id, row.content_epoch);
+      const documentKey = `${row.page_id}:${row.content_epoch}`;
+      let documentLoad = pageDocuments.get(documentKey);
+      if (!documentLoad) {
+        documentLoad = roomDocument(env, row.page_id, row.content_epoch);
+        pageDocuments.set(documentKey, documentLoad);
+      }
+      const document = await documentLoad;
       const token = dateTokens(document).get(row.token_id);
       const choice = reminderChoice(JSON.parse(row.choice_json));
-      if (
-        !token ||
-        token.createdBy !== row.user_id ||
-        !choice ||
-        token.revision !== row.token_revision ||
-        dateMentionDueAt(token, choice) !== row.due_at
-      ) {
+      if (!token || token.createdBy !== row.user_id || !choice || dateMentionDueAt(token, choice) !== row.due_at) {
         await reconcileDateRemindersForPage(env, row.page_id, row.content_epoch, document);
-        // A revision-only edit can leave this generation due. Release the
-        // claim and inspect it once more during this tick.
-        if (!retried.has(id)) {
-          const reset = await env.DB.prepare(
-            `UPDATE date_reminders SET state='active',claim_id=NULL,claimed_at=NULL,updated_at=?
-             WHERE id=? AND generation=? AND state='claimed' AND claim_id=? AND due_at<=?
-             RETURNING id`,
-          )
-            .bind(timestamp, row.id, row.generation, claimId, timestamp)
-            .first<{ id: string }>();
-          if (reset) {
-            retried.add(id);
-            due.results.push({ id });
-          }
-        }
         continue;
       }
       const receiptId = `${row.id}:${row.generation}`;
       const results = await env.DB.batch([
         env.DB.prepare(
-          `UPDATE date_reminders SET state='delivered',delivery_receipt_id=?,claim_id=NULL,
+          `UPDATE date_reminders SET state='delivered',delivery_receipt_id=?,token_revision=?,claim_id=NULL,
              claimed_at=NULL,checked_at=?,updated_at=?
            WHERE id=? AND generation=? AND state='claimed' AND claim_id=?`,
-        ).bind(receiptId, timestamp, timestamp, row.id, row.generation, claimId),
+        ).bind(receiptId, token.revision, timestamp, timestamp, row.id, row.generation, claimId),
         ...notificationFanoutStatements(env.DB, {
           workspaceId: row.workspace_id,
           spaceId: page.space_id,
@@ -443,5 +446,14 @@ export async function processDueDateReminders(env: Env) {
     lagMs: oldest?.due_at === null || oldest?.due_at === undefined ? 0 : Math.max(0, Date.now() - oldest.due_at),
     backlog: oldest?.count ?? 0,
   });
-  await sweepDateReminders(env);
+}
+
+export async function processDueDateReminders(env: Env) {
+  try {
+    await deliverDueDateReminders(env);
+  } finally {
+    await sweepDateReminders(env).catch((error) =>
+      logger.error("date_reminder.sweep.failed", "scheduler", "Date reminder sweep failed.", {}, error),
+    );
+  }
 }

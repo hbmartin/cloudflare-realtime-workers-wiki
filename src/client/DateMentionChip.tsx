@@ -4,7 +4,12 @@ import { formatDateMention } from "../shared/date-mentions";
 import { DateMentionPicker } from "./DateMentionPicker";
 import { DateReminderPicker } from "./DateReminderPicker";
 
-export const DateMentionContext = createContext<{ pageId: string; userId: string; editable: boolean } | null>(null);
+export const DateMentionContext = createContext<{
+  pageId: string;
+  userId: string;
+  editable: boolean;
+  remindersAllowed: boolean;
+} | null>(null);
 
 export function DateMentionChip({
   value,
@@ -51,7 +56,7 @@ export function DateMentionChip({
           <span aria-hidden="true">▦</span> {label}
         </span>
       )}
-      {context?.userId === value.createdBy && (
+      {context?.remindersAllowed && context.userId === value.createdBy && (
         <button
           ref={reminderButton}
           type="button"
@@ -76,7 +81,7 @@ export function DateMentionChip({
           onClose={closePicker}
         />
       )}
-      {reminderOpen && context?.userId === value.createdBy && (
+      {reminderOpen && context?.remindersAllowed && context.userId === value.createdBy && (
         <DateReminderPicker
           pageId={context.pageId}
           token={value}

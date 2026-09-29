@@ -398,6 +398,7 @@ export function EditorPage({
               panelTarget={panelTarget}
               commentsOpen={commentsVisible}
               pageId={page.id}
+              isTemplate={page.isTemplate}
               commentsRevision={commentsRevision}
               onPageCreated={onPageChanged}
               onError={setEditorError}
@@ -583,6 +584,7 @@ function CollaborativeEditor({
   commentsOpen,
   panelTarget,
   pageId,
+  isTemplate,
   commentsRevision,
   onPageCreated,
   onError,
@@ -593,6 +595,7 @@ function CollaborativeEditor({
   commentsOpen: boolean;
   panelTarget: HTMLDivElement | null;
   pageId: string;
+  isTemplate: boolean;
   commentsRevision: number;
   onPageCreated: (page: Page) => void;
   onError: (message: string) => void;
@@ -605,8 +608,8 @@ function CollaborativeEditor({
   const pasteChoiceRef = useRef<HTMLFieldSetElement>(null);
   const dateTimezoneRef = useRef<{ promise: Promise<string>; expiresAt: number } | null>(null);
   const dateMentionContext = useMemo(
-    () => ({ pageId, userId: member.user.id, editable }),
-    [pageId, member.user.id, editable],
+    () => ({ pageId, userId: member.user.id, editable, remindersAllowed: !isTemplate }),
+    [pageId, member.user.id, editable, isTemplate],
   );
   const commentsPanel = useRef<HTMLDivElement>(null);
   const threadStore = useMemo(
@@ -829,15 +832,14 @@ function CollaborativeEditor({
     const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
     const browserTimezone = validTimezone(detectedTimezone) ? detectedTimezone : "UTC";
     if (!dateTimezoneRef.current || dateTimezoneRef.current.expiresAt < Date.now()) {
-      const promise = api<{ preferences: NotificationPreference[]; configured: boolean }>(
-        "/api/notification-preferences",
-      )
+      let promise!: Promise<string>;
+      promise = api<{ preferences: NotificationPreference[]; configured: boolean }>("/api/notification-preferences")
         .then((data) => {
           const preferred = data.configured ? data.preferences[0]?.timezone : undefined;
           return preferred && validTimezone(preferred) ? preferred : browserTimezone;
         })
         .catch(() => {
-          dateTimezoneRef.current = null;
+          if (dateTimezoneRef.current?.promise === promise) dateTimezoneRef.current = null;
           return browserTimezone;
         });
       dateTimezoneRef.current = { promise, expiresAt: Date.now() + 30_000 };

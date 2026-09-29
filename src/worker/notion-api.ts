@@ -33,6 +33,7 @@ import { sourceRateLimitKey } from "./source-rate-limit";
 import { sweepOutbox } from "./jobs";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
+import { dateTokens } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -1199,12 +1200,14 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   }
   let container;
   try {
-    container = notionInputToBlockContainer({ ...input, id: located.internalId });
+    container = notionInputToBlockContainer({ ...input, id: located.internalId }, 0, dateTokens(located.block!));
   } catch (error) {
     throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid block.");
   }
   const node = container.content?.find((child) => child.type !== "blockGroup");
   if (!node) throw new NotionError(400, "validation_error", "Block content is required.");
+  if ([...dateTokens(container).values()].some((token) => token === null))
+    throw new NotionError(400, "validation_error", "Date tokens must be unique within a block.");
   const mutated = await mutateDocument(c.env, located.page, principal, [
     { type: "update_block", internalId: located.internalId, node },
   ]);

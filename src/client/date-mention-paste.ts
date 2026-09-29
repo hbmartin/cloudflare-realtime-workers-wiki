@@ -52,7 +52,6 @@ export function dateMentionPasteExtension(userId: string) {
   let dragSource: HTMLElement | null = null;
   let preserveDrop = false;
   let cutIds: Set<string> | null = null;
-  let cutAt = 0;
   return createExtension({
     key: "dateMentionPaste",
     prosemirrorPlugins: [
@@ -78,7 +77,6 @@ export function dateMentionPasteExtension(userId: string) {
           handleDOMEvents: {
             cut(view) {
               cutIds = tokenIds(view.state.doc.slice(view.state.selection.from, view.state.selection.to));
-              cutAt = Date.now();
               return false;
             },
             copy() {
@@ -90,7 +88,8 @@ export function dateMentionPasteExtension(userId: string) {
               return false;
             },
             drop(view, event) {
-              preserveDrop = dragSource === view.dom.parentElement && event.dataTransfer?.dropEffect === "move";
+              const copyModifier = /Mac/.test(navigator.platform) ? event.altKey : event.ctrlKey;
+              preserveDrop = dragSource === view.dom.parentElement && Boolean(view.dragging?.move) && !copyModifier;
               dragSource = null;
               return false;
             },
@@ -105,8 +104,7 @@ export function dateMentionPasteExtension(userId: string) {
                 if (mention) existing.add(mention.tokenId);
               }
             });
-            const movedCut =
-              cutIds && Date.now() - cutAt < 15_000 && [...ids].every((id) => cutIds!.has(id) && !existing.has(id));
+            const movedCut = cutIds && [...ids].every((id) => cutIds!.has(id) && !existing.has(id));
             cutIds = null;
             const preserve = preserveDrop || movedCut;
             preserveDrop = false;

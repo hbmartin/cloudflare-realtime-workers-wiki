@@ -1,6 +1,6 @@
 import type { ProseMirrorJson } from "./types";
 import { resolveEmbed } from "./embed-providers";
-import { dateMentionFromProps } from "./date-mentions";
+import { dateMentionFromProps, type DateMention } from "./date-mentions";
 import { dateMentionText } from "./document-projection";
 
 export const NOTION_VERSION = "2026-03-11";
@@ -199,6 +199,7 @@ export function proseMirrorInlineToNotion(nodes: ProseMirrorJson[] = []): Notion
               mention: {
                 type: "date",
                 date: { start: mention.value, time_zone: mention.timezone },
+                noteFlare: { payload: JSON.stringify(mention) },
               },
             }
           : { text: { content, link: null } }),
@@ -226,7 +227,10 @@ function pmMark(type: string, markAttrs?: Record<string, unknown>) {
   return { type, ...(markAttrs ? { attrs: markAttrs } : {}) };
 }
 
-export function notionRichTextToProseMirror(value: unknown): ProseMirrorJson[] {
+export function notionRichTextToProseMirror(
+  value: unknown,
+  existingDates?: ReadonlyMap<string, DateMention | null>,
+): ProseMirrorJson[] {
   if (!Array.isArray(value) || value.length > NOTION_RICH_TEXT_MAX)
     throw new Error("rich_text must be an array of at most 100 items.");
   const output: ProseMirrorJson[] = [];
@@ -256,8 +260,27 @@ export function notionRichTextToProseMirror(value: unknown): ProseMirrorJson[] {
     if (item.type === "mention" || "mention" in item) {
       const mention = record(item.mention);
       if (mention.type === "date") {
-        // External clients cannot assign a live token ID or claim its author.
-        // Preserve the readable value without importing reminder identity.
+        const supplied = dateMentionFromProps(record(mention.noteFlare));
+        const existing = supplied ? existingDates?.get(supplied.tokenId) : null;
+        if (supplied && existing && supplied.createdBy === existing.createdBy) {
+          const unchanged =
+            supplied.kind === existing.kind &&
+            supplied.value === existing.value &&
+            supplied.timezone === existing.timezone;
+          output.push({
+            type: "dateMention",
+            attrs: {
+              payload: JSON.stringify({
+                ...supplied,
+                createdBy: existing.createdBy,
+                revision: unchanged ? existing.revision : crypto.randomUUID(),
+              }),
+            },
+            ...(marks.length ? { marks } : {}),
+          });
+          continue;
+        }
+        // New external content cannot claim a live token ID or its author.
         const fallback = string(item.plain_text, string(record(mention.date).start, "Date"));
         output.push({ type: "text", text: fallback, ...(marks.length ? { marks } : {}) });
         continue;
@@ -458,8 +481,12 @@ function notionPlainText(value: unknown) {
     .join("");
 }
 
-function blockNode(type: string, payload: Record<string, unknown>): ProseMirrorJson {
-  const rich = () => notionRichTextToProseMirror(payload.rich_text ?? []);
+function blockNode(
+  type: string,
+  payload: Record<string, unknown>,
+  existingDates?: ReadonlyMap<string, DateMention | null>,
+): ProseMirrorJson {
+  const rich = () => notionRichTextToProseMirror(payload.rich_text ?? [], existingDates);
   if (/^heading_[1-4]$/.test(type))
     return {
       type: "heading",
@@ -534,13 +561,17 @@ function blockNode(type: string, payload: Record<string, unknown>): ProseMirrorJ
     const cells = Array.isArray(payload.cells) ? payload.cells : [];
     return {
       type: "tableRow",
-      content: cells.map((cell) => ({ type: "tableCell", content: notionRichTextToProseMirror(cell) })),
+      content: cells.map((cell) => ({ type: "tableCell", content: notionRichTextToProseMirror(cell, existingDates) })),
     };
   }
   throw new Error(`Unsupported block type: ${type}`);
 }
 
-export function notionInputToBlockContainer(value: unknown, depth = 0): ProseMirrorJson {
+export function notionInputToBlockContainer(
+  value: unknown,
+  depth = 0,
+  existingDates?: ReadonlyMap<string, DateMention | null>,
+): ProseMirrorJson {
   if (depth > 2) throw new Error("Block nesting exceeds the supported depth.");
   const input = record(value);
   const inferredTypes = Object.keys(input).filter((key) => NOTION_WRITABLE_BLOCK_TYPES.has(key));
@@ -549,7 +580,7 @@ export function notionInputToBlockContainer(value: unknown, depth = 0): ProseMir
   if (!type) throw new Error("Block type is required.");
   const payload = record(input[type]);
   const id = typeof input.id === "string" && input.id ? input.id : crypto.randomUUID();
-  const node = blockNode(type, payload);
+  const node = blockNode(type, payload, existingDates);
   if (node.type === "syncedBlockSource") node.attrs = { ...node.attrs, blockId: id };
   const childrenInput = Array.isArray(payload.children) ? payload.children : [];
   if (node.type === "syncedBlockReference" && childrenInput.length) {
@@ -559,7 +590,7 @@ export function notionInputToBlockContainer(value: unknown, depth = 0): ProseMir
   if (childrenInput.length) {
     if (childrenInput.length > NOTION_PAGE_SIZE_MAX)
       throw new Error("A block may contain at most 100 children per request.");
-    const children = childrenInput.map((child) => notionInputToBlockContainer(child, depth + 1));
+    const children = childrenInput.map((child) => notionInputToBlockContainer(child, depth + 1, existingDates));
     if (
       node.type === "columnList" &&
       children.some((child) => child.content?.find((item) => item.type !== "blockGroup")?.type !== "column")

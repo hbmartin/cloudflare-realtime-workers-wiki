@@ -37,6 +37,7 @@ export function DateReminderPicker({
   onClose: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const focusedInitially = useRef(false);
   const openedRevision = useRef(token.revision);
   const [saved, setSaved] = useState<SavedReminder | null>(null);
   const [choice, setChoice] = useState<ReminderChoice | "custom">("at_time");
@@ -84,7 +85,10 @@ export function DateReminderPicker({
   }, [path, token.timezone]);
 
   useEffect(() => {
-    if (!busy) (dialog.current?.querySelector("select") as HTMLElement | null)?.focus();
+    if (!busy && !focusedInitially.current) {
+      focusedInitially.current = true;
+      (dialog.current?.querySelector("select") as HTMLElement | null)?.focus();
+    }
   }, [busy]);
 
   const reminderChoice = (): ReminderChoice | { absolute: string } | null => {
