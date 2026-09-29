@@ -254,6 +254,10 @@ describe("EditorPage close reconciliation", () => {
     const connectionClose = mocks.handlers.get("connection-close");
     expect(customMessage).toBeTypeOf("function");
     expect(connectionClose).toBeTypeOf("function");
+    localStorage.setItem(
+      "notes:recovery:user-1:workspace-1:page-1",
+      JSON.stringify([{ key: "account:user-1:workspace-1:page-1:0:2", epoch: 0, reason: "epoch" }]),
+    );
     await act(async () => {
       customMessage!(JSON.stringify({ type: "document-size", bytes: 20_000_000, readOnly: true }));
       connectionClose!(new CloseEvent("close", { code: 4410 }));
@@ -261,6 +265,7 @@ describe("EditorPage close reconciliation", () => {
     });
 
     expect(JSON.parse(localStorage.getItem("notes:recovery:user-1:workspace-1:page-1") ?? "null")).toEqual([
+      { key: "account:user-1:workspace-1:page-1:0:2", epoch: 0, reason: "epoch" },
       { key: "account:user-1:workspace-1:page-1:1:2", epoch: 1, reason: "epoch" },
     ]);
   });
