@@ -749,7 +749,9 @@ async function pageMarkdownProjection(
   const ids = new Map([...metadata].map(([internalId, value]) => [internalId, value.id]));
   const commentedPublicIds = new Set(commentBlocks.results.map((row) => row.block_id));
   const protectedBlockIds = new Set(
-    [...metadata].filter(([, value]) => commentedPublicIds.has(value.id)).map(([internalId]) => internalId),
+    [...metadata]
+      .filter(([internalId, value]) => commentedPublicIds.has(internalId) || commentedPublicIds.has(value.id))
+      .map(([internalId]) => internalId),
   );
   const childIds = await publicPageIds(
     env,

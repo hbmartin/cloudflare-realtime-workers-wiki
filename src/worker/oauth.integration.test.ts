@@ -262,9 +262,8 @@ describe("OAuth MCP foundation", () => {
       `${ORIGIN}/oauth/authorize?${form({ ...params, resource: `${ORIGIN}/other` })}`,
       { headers: { cookie }, redirect: "manual" },
     );
-    expect(badAudience.status).toBe(302);
-    expect(new URL(badAudience.headers.get("location")!).searchParams.get("error")).toBe("invalid_target");
-    expect(new URL(badAudience.headers.get("location")!).searchParams.get("iss")).toBe(ORIGIN);
+    expect(badAudience.status).toBe(400);
+    expect(badAudience.headers.get("location")).toBeNull();
     const deny = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
       method: "POST",
       headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },

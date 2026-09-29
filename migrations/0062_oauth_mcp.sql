@@ -75,5 +75,3 @@ CREATE TABLE oauth_operation_receipts (
   PRIMARY KEY (grant_id,operation_id)
 );
 CREATE INDEX idx_oauth_receipts_expiry ON oauth_operation_receipts(expires_at);
-CREATE INDEX idx_oauth_staged_receipt_page ON oauth_operation_receipts(json_extract(result_json,'$.pageId'))
-  WHERE tool_name='create_page' AND json_extract(result_json,'$.status')='staged';

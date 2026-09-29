@@ -43,23 +43,21 @@ function result(value: unknown) {
 
 export async function pruneStagedMcpPages(env: Env) {
   const rows = await env.DB.prepare(
-    `SELECT id,content_epoch,import_job_id FROM pages
+    `SELECT id,content_epoch,import_job_id,updated_at FROM pages
       WHERE (import_job_id GLOB 'mcp:create:*'
         OR (import_job_id GLOB 'mcp:cleanup:*' AND updated_at<?))
-        AND created_at<? ORDER BY created_at LIMIT 10`,
+        AND created_at<? ORDER BY updated_at LIMIT 10`,
   )
     .bind(Date.now() - STAGED_CLEANUP_RETRY_MS, Date.now() - STAGED_PAGE_TTL_MS)
-    .all<{ id: string; content_epoch: number; import_job_id: string }>();
+    .all<{ id: string; content_epoch: number; import_job_id: string; updated_at: number }>();
   for (const row of rows.results) {
     const cleanupId = `mcp:cleanup:${row.id}`;
-    if (row.import_job_id !== cleanupId) {
-      const claimed = await env.DB.prepare(
-        "UPDATE pages SET import_job_id=?,updated_at=? WHERE id=? AND import_job_id=?",
-      )
-        .bind(cleanupId, Date.now(), row.id, row.import_job_id)
-        .run();
-      if (claimed.meta.changes !== 1) continue;
-    }
+    const claimed = await env.DB.prepare(
+      "UPDATE pages SET import_job_id=?,updated_at=? WHERE id=? AND import_job_id=? AND updated_at=?",
+    )
+      .bind(cleanupId, Date.now(), row.id, row.import_job_id, row.updated_at)
+      .run();
+    if (claimed.meta.changes !== 1) continue;
     try {
       const purged = await env.DOCUMENT.getByName(`${row.id}~${row.content_epoch}`).fetch(
         new Request("https://document.internal/purge", {
@@ -79,9 +77,6 @@ export async function pruneStagedMcpPages(env: Env) {
         env.DB.prepare("DELETE FROM pages WHERE id=? AND import_job_id=?").bind(row.id, cleanupId),
       ]);
     } catch (error) {
-      await env.DB.prepare("UPDATE pages SET updated_at=? WHERE id=? AND import_job_id=?")
-        .bind(Date.now(), row.id, cleanupId)
-        .run();
       logger.error(
         "mcp.staged_page.cleanup_failed",
         "mcp",
@@ -89,6 +84,13 @@ export async function pruneStagedMcpPages(env: Env) {
         { pageId: row.id },
         error,
       );
+      try {
+        await env.DB.prepare("UPDATE pages SET updated_at=? WHERE id=? AND import_job_id=?")
+          .bind(Date.now(), row.id, cleanupId)
+          .run();
+      } catch {
+        // Preserve the original purge failure and continue with other staged pages.
+      }
     }
   }
 }
@@ -673,15 +675,17 @@ export async function mcpRequest(request: Request, env: Env, context: Background
   if (request.method !== "POST") return new Response("Method not allowed.", { status: 405 });
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json"))
     return new Response("Expected application/json.", { status: 415 });
-  const sourceRate = await consumeFixedWindow(env, `mcp-source:${await sourceRateLimitKey(request)}`, {
-    window: 60,
-    max: 600,
-  });
-  if (!sourceRate.allowed)
-    return new Response("Too many MCP requests.", {
-      status: 429,
-      headers: { "retry-after": "60", "www-authenticate": mcpBearerChallenge(env) },
-    });
+  const source = await sourceRateLimitKey(request);
+  for (const [binding, retryAfter] of [
+    [env.API_SOURCE_BURST_LIMIT, 10],
+    [env.API_SOURCE_MINUTE_LIMIT, 60],
+  ] as const) {
+    if (binding && !(await binding.limit({ key: source })).success)
+      return new Response("Too many MCP requests.", {
+        status: 429,
+        headers: { "retry-after": String(retryAfter), "www-authenticate": mcpBearerChallenge(env) },
+      });
+  }
   const length = Number(request.headers.get("content-length"));
   if (Number.isFinite(length) && length > MAX_MCP_BODY) return new Response("Request is too large.", { status: 413 });
   const reader = request.clone().body?.getReader();
@@ -719,13 +723,23 @@ export async function mcpRequest(request: Request, env: Env, context: Background
   const required = typeof name === "string" && Object.hasOwn(TOOL_SCOPES, name) ? TOOL_SCOPES[name]! : [];
   const access = await mcpAccess(request, env);
   if (!access) {
+    const unauthorizedRate = await consumeFixedWindow(env, `mcp-unauthorized:${source}`, { window: 60, max: 120 });
+    if (!unauthorizedRate.allowed)
+      return new Response("Too many unauthorized MCP requests.", {
+        status: 429,
+        headers: { "retry-after": String(unauthorizedRate.retryAfter ?? 60) },
+      });
     return new Response("Unauthorized", {
       status: 401,
       headers: { "www-authenticate": mcpBearerChallenge(env, required.join(" ")), "cache-control": "no-store" },
     });
   }
   const rate = await consumeFixedWindow(env, `mcp-grant:${access.grantId}`, { window: 60, max: 120 });
-  if (!rate.allowed) return new Response("Too many MCP requests.", { status: 429, headers: { "retry-after": "60" } });
+  if (!rate.allowed)
+    return new Response("Too many MCP requests.", {
+      status: 429,
+      headers: { "retry-after": String(rate.retryAfter ?? 60) },
+    });
   if (required.some((scope) => !access.scopes.has(scope)))
     return new Response("Insufficient scope", {
       status: 403,
