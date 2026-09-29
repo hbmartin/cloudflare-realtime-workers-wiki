@@ -136,7 +136,9 @@ async function migrateLegacyPurgeWarnings() {
   for (const key of legacy) {
     try {
       const accountKey = key.slice(OFFLINE_PURGE_WARNING_PREFIX.length);
-      localStorage.setItem(`${OFFLINE_PURGE_WARNING_PREFIX}${await sha256Hex(accountKey)}`, "1");
+      const hashed = await sha256Hex(accountKey);
+      if (localStorage.getItem(key) === null) continue;
+      localStorage.setItem(`${OFFLINE_PURGE_WARNING_PREFIX}${hashed}`, "1");
       localStorage.removeItem(key);
     } catch {
       // Retain the original warning if storage cannot be changed.
@@ -783,7 +785,7 @@ async function offlineStateAfterConnectionFailure(cause: unknown): Promise<AppSt
   return { screen: "offline", account, pages: await listOfflinePages(account.key) };
 }
 
-async function resolveAppState(): Promise<AppState> {
+async function resolveAppState(alreadyPurgedAccount?: string): Promise<AppState> {
   const locallySignedOut = localStorage.getItem(LOCAL_SIGNOUT_KEY);
   let pendingPurges: Set<string>;
   if (typeof indexedDB === "undefined") pendingPurges = new Set();
@@ -802,6 +804,7 @@ async function resolveAppState(): Promise<AppState> {
     }
   if (locallySignedOut && typeof indexedDB !== "undefined") pendingPurges.add(locallySignedOut);
   for (const accountKey of pendingPurges) {
+    if (accountKey === alreadyPurgedAccount) continue;
     try {
       await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
     } catch (error) {
@@ -955,37 +958,40 @@ export function App() {
     [commitState],
   );
 
-  const load = useCallback(() => {
-    invalidateUnauthorizedRequests();
-    const transition = ++stateTransition.current;
-    return resolveAppState()
-      .catch(async (cause): Promise<AppState> => {
-        if (cause instanceof ApiClientError && cause.status === 401) {
-          try {
-            const next = await stateAfterUnauthorized(cause);
-            if (next) return next;
-            return await resolveAppState();
-          } catch (statusCause) {
-            return startupError(statusCause, "Unable to open the workspace. Try again.");
+  const load = useCallback(
+    (alreadyPurgedAccount?: string) => {
+      invalidateUnauthorizedRequests();
+      const transition = ++stateTransition.current;
+      return resolveAppState(alreadyPurgedAccount)
+        .catch(async (cause): Promise<AppState> => {
+          if (cause instanceof ApiClientError && cause.status === 401) {
+            try {
+              const next = await stateAfterUnauthorized(cause);
+              if (next) return next;
+              return await resolveAppState(alreadyPurgedAccount);
+            } catch (statusCause) {
+              return startupError(statusCause, "Unable to open the workspace. Try again.");
+            }
           }
-        }
-        try {
-          const offline = await offlineStateAfterConnectionFailure(cause);
-          if (offline) return offline;
-        } catch (storageError) {
-          console.error("Unable to open offline catalog", storageError);
-        }
-        return startupError(cause, "Unable to open the workspace. Try again.");
-      })
-      .then((next) => commitState(transition, next));
-  }, [commitState]);
+          try {
+            const offline = await offlineStateAfterConnectionFailure(cause);
+            if (offline) return offline;
+          } catch (storageError) {
+            console.error("Unable to open offline catalog", storageError);
+          }
+          return startupError(cause, "Unable to open the workspace. Try again.");
+        })
+        .then((next) => commitState(transition, next));
+    },
+    [commitState],
+  );
 
   const retryLocalPurge = useCallback(
     async (accountKey: string) => {
       showState({ screen: "loading" });
       try {
         await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
-        showState({ screen: "signin" });
+        await load(accountKey);
       } catch (error) {
         showState({
           screen: "signout-cleanup",
@@ -994,7 +1000,7 @@ export function App() {
         });
       }
     },
-    [showState],
+    [load, showState],
   );
 
   useEffect(() => {

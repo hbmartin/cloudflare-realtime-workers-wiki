@@ -10,6 +10,7 @@ import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, Un
 import { App, fallbackPageId, useCommittedRef } from "./App";
 import { PAGE_NAVIGATE_EVENT } from "./mentions";
 import { PageLoadEventBuffer } from "./page-state";
+import { sha256Hex } from "../shared/import-integrity";
 
 // Rendering the full workspace under coverage can exceed the default one-second wait on CI.
 configure({ asyncUtilTimeout: 3000 });
@@ -249,6 +250,24 @@ describe("App error handling", () => {
     cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("keeps a legacy cleanup warning visible while moving it to the account hash", async () => {
+    const accountKey = "user\0workspace";
+    const rawKey = `notes:offline-purge-warning:${accountKey}`;
+    localStorage.setItem(rawKey, "1");
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status") return { state: "signed_out" };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+    expect(await screen.findByText(/Some older offline copies may remain/)).toBeInTheDocument();
+    const hashedKey = `notes:offline-purge-warning:${await sha256Hex(accountKey)}`;
+    await waitFor(() => {
+      expect(localStorage.getItem(rawKey)).toBeNull();
+      expect(localStorage.getItem(hashedKey)).toBe("1");
+    });
   });
 
   it("lets an editor move a template to Trash and restore it without a page-tree error", async () => {

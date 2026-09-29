@@ -59,6 +59,7 @@ import {
 const ACCOUNT_CATALOG_WARNING = "The offline page list could not be updated yet.";
 const PENDING_CATALOG_WARNING = "Local changes are saved, but the offline page list could not be updated yet.";
 const SYNCED_CATALOG_WARNING = "Changes are synced, but the offline page list could not be updated yet.";
+const OFFLINE_INIT_ERROR = "Offline storage is unavailable, so editing and collaboration are disabled for this page.";
 
 function recoveryMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message === OFFLINE_COPY_MISSING_MESSAGE ? error.message : fallback;
@@ -108,8 +109,23 @@ export function EditorPage({
   const [storageLoadingSlow, setStorageLoadingSlow] = useState(false);
   const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [recoveryErrors, setRecoveryErrors] = useState<Record<string, string>>({});
   const [preparedRecoveryCopy, setPreparedRecoveryCopy] = useState<{ key: string; markdown: string } | null>(null);
   const recoveryActions = useRef(new Map<string, number>());
+  const recoverySelection = useRef({ key: "", sequence: 0 });
+  const recoveryErrorFor = (entryKey: string, message: string | null) => {
+    setRecoveryErrors((current) => {
+      const next = { ...current };
+      if (message === null) delete next[entryKey];
+      else next[entryKey] = message;
+      return next;
+    });
+  };
+  const selectRecovery = (entryKey: string) => {
+    const sequence = recoverySelection.current.sequence + 1;
+    recoverySelection.current = { key: entryKey, sequence };
+    return () => recoverySelection.current.key === entryKey && recoverySelection.current.sequence === sequence;
+  };
   const clipboardItemSupported =
     typeof ClipboardItem !== "undefined" && Boolean(navigator.clipboard && "write" in navigator.clipboard);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
@@ -254,7 +270,7 @@ export function EditorPage({
       } catch (error) {
         console.error("Unable to read offline document state", error);
         if (++catalogFailures >= 3 && active) {
-          setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+          setStorageError(OFFLINE_INIT_ERROR);
           return false;
         }
         throw error;
@@ -357,7 +373,7 @@ export function EditorPage({
       queueMicrotask(() => {
         if (active) {
           setStatus("offline");
-          setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+          setStorageError(OFFLINE_INIT_ERROR);
         }
       });
       return () => {
@@ -537,22 +553,20 @@ export function EditorPage({
         await next.ready;
         if (active) {
           setStorageLoadingSlow(false);
-          setStorageError(null);
+          setStorageError((current) => (current === OFFLINE_INIT_ERROR ? null : current));
           setBundle(next);
         }
       } catch (error) {
         if (!active) return;
         if (error instanceof OfflineStorageTimeoutError) {
           setStorageLoadingSlow(true);
-          setStatus("offline");
-        } else
-          setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+        } else setStorageError(OFFLINE_INIT_ERROR);
         void (async () => {
           try {
             await next.lateReady;
             if (!active) return;
             setStorageLoadingSlow(false);
-            setStorageError(null);
+            setStorageError((current) => (current === OFFLINE_INIT_ERROR ? null : current));
             setBundle(next);
           } catch (lateError) {
             if (!active) return;
@@ -560,7 +574,7 @@ export function EditorPage({
             if (error instanceof OfflineStorageTimeoutError)
               void reportClientError("client.offline_storage_failed", lateError);
             setStorageLoadingSlow(false);
-            setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+            setStorageError(OFFLINE_INIT_ERROR);
           }
         })();
       }
@@ -582,7 +596,6 @@ export function EditorPage({
         });
       setBundle(null);
       setStorageLoadingSlow(false);
-      setStorageError(null);
     };
   }, [
     member.role,
@@ -730,8 +743,11 @@ export function EditorPage({
             type="button"
             onClick={() => {
               if (titleDirtyRef.current) {
-                setTitleError("Wait for the title to save before reloading.");
-                return;
+                if (!titleError) {
+                  setTitleError("Wait for the title to save before reloading.");
+                  return;
+                }
+                if (!window.confirm("The title has not been saved. Reload and discard it?")) return;
               }
               window.location.reload();
             }}
@@ -755,24 +771,27 @@ export function EditorPage({
                     ? "Current access could not be confirmed for these edits. They were not sent to the server."
                     : `Edits from epoch ${entry.epoch} were not merged after this page was restored.`}
               </span>
+              {recoveryErrors[entry.key] && <span role="alert">{recoveryErrors[entry.key]}</span>}
             </div>
             <button
               className="quiet-button"
               onClick={async () => {
                 const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
+                const stillSelected = selectRecovery(entry.key);
                 try {
                   const doc = await loadOfflineCopy(entry.key);
                   try {
-                    if (stillCurrent()) {
+                    if (stillCurrent() && stillSelected()) {
                       setRecoveryPreview({ key: entry.key, text: plainYDoc(doc) });
-                      setRecoveryError(null);
+                      recoveryErrorFor(entry.key, null);
                     }
                   } finally {
                     doc.destroy();
                   }
                 } catch (error) {
                   console.error("Offline copy preview failed", error);
-                  if (stillCurrent()) setRecoveryError(recoveryMessage(error, "This offline copy could not be read."));
+                  if (stillCurrent())
+                    recoveryErrorFor(entry.key, recoveryMessage(error, "This offline copy could not be read."));
                 }
               }}
             >
@@ -784,12 +803,12 @@ export function EditorPage({
                 const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
                 void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`).then(
                   () => {
-                    if (stillCurrent()) setRecoveryError(null);
+                    if (stillCurrent()) recoveryErrorFor(entry.key, null);
                   },
                   (error: unknown) => {
                     console.error("Offline copy export failed", error);
                     if (stillCurrent())
-                      setRecoveryError(recoveryMessage(error, "This offline copy could not be exported."));
+                      recoveryErrorFor(entry.key, recoveryMessage(error, "This offline copy could not be exported."));
                   },
                 );
               }}
@@ -800,16 +819,17 @@ export function EditorPage({
               className="quiet-button"
               onClick={async () => {
                 const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
+                const stillSelected = selectRecovery(entry.key);
                 const showError = (message: string) => {
-                  if (stillCurrent()) setRecoveryError(message);
+                  if (stillCurrent()) recoveryErrorFor(entry.key, message);
                 };
                 if (!clipboardItemSupported) {
                   if (preparedRecoveryCopy?.key !== entry.key) {
                     try {
                       const markdown = await offlineCopyMarkdownFromKey(entry.key, page.title);
-                      if (!stillCurrent()) return;
+                      if (!stillCurrent() || !stillSelected()) return;
                       setPreparedRecoveryCopy({ key: entry.key, markdown });
-                      setRecoveryError(null);
+                      recoveryErrorFor(entry.key, null);
                     } catch (error) {
                       console.error("Offline copy preparation failed", error);
                       showError(recoveryMessage(error, "This offline copy could not be read."));
@@ -819,7 +839,7 @@ export function EditorPage({
                   try {
                     if (!navigator.clipboard?.writeText) throw new Error("Clipboard is unavailable.");
                     await navigator.clipboard.writeText(preparedRecoveryCopy.markdown);
-                    if (stillCurrent()) setRecoveryError(null);
+                    if (stillCurrent()) recoveryErrorFor(entry.key, null);
                   } catch (error) {
                     console.error("Offline copy clipboard failed", error);
                     showError("This offline copy could not be copied.");
@@ -833,15 +853,18 @@ export function EditorPage({
                       "text/plain": content.then((markdown) => new Blob([markdown], { type: "text/plain" })),
                     }),
                   ]);
-                  if (stillCurrent()) setRecoveryError(null);
+                  if (stillCurrent()) recoveryErrorFor(entry.key, null);
                 } catch (error) {
                   console.error("Offline copy clipboard failed", error);
                   showError("This offline copy could not be copied.");
                   void content.catch((loadingError) => {
                     if (stillCurrent())
-                      setRecoveryError((current) =>
-                        current === "This offline copy could not be copied."
-                          ? recoveryMessage(loadingError, "This offline copy could not be read.")
+                      setRecoveryErrors((current) =>
+                        current[entry.key] === "This offline copy could not be copied."
+                          ? {
+                              ...current,
+                              [entry.key]: recoveryMessage(loadingError, "This offline copy could not be read."),
+                            }
                           : current,
                       );
                   });
@@ -858,7 +881,8 @@ export function EditorPage({
               <button
                 className="quiet-button"
                 onClick={() => {
-                  recoveryActions.current.set(entry.key, (recoveryActions.current.get(entry.key) ?? 0) + 1);
+                  beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
+                  if (recoverySelection.current.key === entry.key) recoverySelection.current.sequence += 1;
                   setPreparedRecoveryCopy((prepared) => (prepared?.key === entry.key ? null : prepared));
                   dismissedRecovery.current[entry.key] = page.contentEpoch;
                   try {
@@ -867,8 +891,8 @@ export function EditorPage({
                     console.error("Unable to update dismissed recovery details", error);
                   }
                   replaceRecovery(recoveryRef.current.filter((item) => item.key !== entry.key));
-                  setRecoveryError(null);
-                  setRecoveryPreview(null);
+                  recoveryErrorFor(entry.key, null);
+                  setRecoveryPreview((preview) => (preview?.key === entry.key ? null : preview));
                 }}
               >
                 Dismiss

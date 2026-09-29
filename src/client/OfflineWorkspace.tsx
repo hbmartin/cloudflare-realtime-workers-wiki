@@ -18,6 +18,7 @@ import {
   offlineCopyMarkdown,
 } from "./offline-export";
 import { useEffectiveColorScheme } from "./ThemeControl";
+import { reportClientError } from "./telemetry";
 import {
   compactDocumentUpdates,
   clearRevokedOfflinePages,
@@ -57,6 +58,7 @@ export function OfflineWorkspace({
     Record<string, { kind: "epoch" | "access" | "unknown"; message: string }>
   >({});
   const [notice, setNotice] = useState("");
+  const [localLoadRetry, setLocalLoadRetry] = useState(0);
   const selectedId = useRef(selected?.pageId ?? null);
   const reconnectController = useRef<AbortController | null>(null);
   const selectedQuarantine = selected ? quarantined[selected.pageId] : undefined;
@@ -336,11 +338,12 @@ export function OfflineWorkspace({
                 </button>
               )}
               <OfflineEditor
-                key={selected.pageId}
+                key={`${selected.pageId}:${localLoadRetry}`}
                 page={selected}
                 accountKey={account.key}
                 quarantined={Boolean(selectedReason)}
                 editingEnabled={account.offlineEditingEnabled && recovery !== "finalizing"}
+                onRetry={() => setLocalLoadRetry((attempt) => attempt + 1)}
               />
             </>
           ) : (
@@ -357,11 +360,13 @@ function OfflineEditor({
   accountKey,
   quarantined,
   editingEnabled,
+  onRetry,
 }: {
   page: OfflinePage;
   accountKey: string;
   quarantined: boolean;
   editingEnabled: boolean;
+  onRetry: () => void;
 }) {
   const [copy, setCopy] = useState<{ doc: Y.Doc; persistence: IndexeddbPersistence; provider: YProvider } | null>(null);
   const flushRef = useRef<(() => Promise<void>) | null>(null);
@@ -400,15 +405,18 @@ function OfflineEditor({
       (cause) => {
         if (!active) return;
         if (!(cause instanceof OfflineStorageTimeoutError)) {
+          void reportClientError("client.offline_storage_failed", cause);
           setError("This document copy could not be read from this device.");
           return;
         }
+        void reportClientError("client.offline_storage_slow", cause);
         setLoadingSlow(true);
         void persistence["_db"]
           .then(() => persistence.whenSynced)
           .then(
-            () => {
+            (lateError: unknown) => {
               if (!active) return;
+              void reportClientError("client.offline_storage_failed", lateError);
               setLoadingSlow(false);
               setCopy({ doc, persistence, provider });
             },
@@ -457,8 +465,8 @@ function OfflineEditor({
       {loadingSlow && (
         <output>
           Offline storage is still loading.{" "}
-          <button type="button" onClick={() => window.location.reload()}>
-            Reload to retry
+          <button type="button" onClick={onRetry}>
+            Retry loading this copy
           </button>
         </output>
       )}
