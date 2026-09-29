@@ -192,11 +192,6 @@ describe("link previews", () => {
     ).toBeNull();
     expect(
       (await env.DB.prepare("SELECT COUNT(*) AS count FROM link_preview_image_gc").first<{ count: number }>())?.count,
-    ).toBe(1);
-    await env.DB.prepare("UPDATE link_preview_image_gc SET queued_at = 1").run();
-    await pruneLinkPreviews(env);
-    expect(
-      (await env.DB.prepare("SELECT COUNT(*) AS count FROM link_preview_image_gc").first<{ count: number }>())?.count,
     ).toBe(0);
   });
 
@@ -240,6 +235,49 @@ describe("link previews", () => {
     await env.DB.prepare("UPDATE link_preview_image_gc SET queued_at = 1").run();
     await pruneLinkPreviews(env);
     expect(await env.BUCKET.get(staged!.image_key)).toBeNull();
+  });
+
+  it("cannot overwrite a newer preview after losing the refresh lease", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url === pageUrl
+          ? new Response(`<title>Older result</title><meta property="og:image" content="${imageUrl}">`, {
+              headers: { "content-type": "text/html" },
+            })
+          : new Response(png, { headers: { "content-type": "image/png" } }),
+      ),
+    );
+    const winnerKey = "link-previews/workspace/newer-winner";
+    let loserKey = "";
+    const db = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            loserKey = (await env.DB.prepare("SELECT image_key FROM link_preview_image_gc").first<{
+              image_key: string;
+            }>())!.image_key;
+            await env.BUCKET.put(winnerKey, png, { httpMetadata: { contentType: "image/png" } });
+            await env.DB.prepare(
+              `UPDATE link_preview_cache SET title='Newer result',image_key=?,image_mime='image/png',
+               fetched_at=?,expires_at=?,refresh_until=0 WHERE workspace_id='workspace'`,
+            )
+              .bind(winnerKey, Date.now(), Date.now() + 60_000)
+              .run();
+            return target.batch(statements);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const preview = await linkPreview({ ...env, DB: db }, "workspace", pageUrl);
+    expect(preview.title).toBe("Newer result");
+    expect(loserKey).toBeTruthy();
+    expect(await env.BUCKET.get(loserKey)).toBeNull();
+    expect(await env.BUCKET.get(winnerKey)).toBeTruthy();
+    expect(
+      await env.DB.prepare("SELECT image_key FROM link_preview_image_gc WHERE image_key=?").bind(loserKey).first(),
+    ).toBeNull();
   });
 
   it("returns one in-progress card for concurrent requests", async () => {
@@ -301,7 +339,39 @@ describe("link previews", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("returns a cache-limit response when R2 cleanup fails at the cap", async () => {
+    await env.DB.prepare(
+      `INSERT INTO link_preview_image_gc (image_key,queued_at)
+       WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<1000)
+       SELECT printf('link-previews/workspace/orphan-%04d',n), 1 FROM seq`,
+    ).run();
+    const fetcher = vi.fn();
+    vi.stubGlobal("fetch", fetcher);
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "delete")
+          return async () => {
+            throw new Error("R2 unavailable");
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(linkPreview({ ...env, BUCKET: bucket }, "workspace", pageUrl)).rejects.toMatchObject({
+      status: 429,
+      code: "preview_cache_full",
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("reclaims expired rows at the cap while counting queued R2 images", async () => {
+    await env.DB.prepare(
+      `INSERT INTO link_preview_cache
+       (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at)
+       WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<100)
+       SELECT printf('other-%04d',n),'other-workspace',printf('https://www.public-preview.org/other/%d',n),
+         'Other','','site',NULL,NULL,0,1 FROM seq`,
+    ).run();
     await env.DB.prepare(
       `INSERT INTO link_preview_cache
        (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at)
@@ -319,6 +389,13 @@ describe("link previews", () => {
         }>()
       )?.count,
     ).toBe(901);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT COUNT(*) AS count FROM link_preview_cache WHERE workspace_id='other-workspace'",
+        ).first<{ count: number }>()
+      )?.count,
+    ).toBe(100);
     await env.DB.prepare(
       `INSERT INTO link_preview_image_gc (image_key,queued_at)
        WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<1000)

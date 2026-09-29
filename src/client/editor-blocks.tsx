@@ -397,7 +397,11 @@ const bookmark = createReactBlockSpec(
           editor.isEditable
             ? (url) =>
                 editor.updateBlock(block, {
-                  props: { url, title: block.props.title === block.props.url ? url : block.props.title, previewId: "" },
+                  props: {
+                    url,
+                    title: block.props.title === block.props.url ? url : block.props.title,
+                    ...(block.props.previewId ? { previewId: "" } : {}),
+                  },
                 })
             : undefined
         }
