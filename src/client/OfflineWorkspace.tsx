@@ -123,7 +123,7 @@ export function OfflineWorkspace({
         flushSync(() => setRecovery("finalizing"));
         const stored = await getOfflinePage(account.key, selected.pageId);
         if (!isCurrent()) return;
-        const hasDraft = Boolean((stored && pendingKeysOf(stored).length) || pendingKeysOf(selected).length);
+        const hasDraft = Boolean(pendingKeysOf(stored ?? selected).length);
         const space = spaces.find((item) => item.id === page.spaceId);
         if (!space && !hasDraft) {
           await discardRevokedCopy(selected.pageId);
@@ -439,6 +439,7 @@ function OfflineBlockEditor({
     let pendingCommitted = false;
     let pendingMark: Promise<void> | null = null;
     let persistedBatches = copy.persistence["_dbsize"];
+    let compacting: Promise<void> | null = null;
     const markPending = () => {
       if (pendingCommitted) return Promise.resolve();
       pendingMark ??= markOfflinePagePending(accountKey, page.pageId, storageKey, true)
@@ -466,9 +467,15 @@ function OfflineBlockEditor({
           await markPending();
           if (++persistedBatches >= 500) {
             persistedBatches = 0;
-            void compactDocumentUpdates(copy.persistence).catch((error) =>
-              console.error("Unable to compact offline document storage", error),
-            );
+            if (!compacting) {
+              const task = compactDocumentUpdates(copy.persistence).catch((error) =>
+                console.error("Unable to compact offline document storage", error),
+              );
+              compacting = task;
+              void task.finally(() => {
+                if (compacting === task) compacting = null;
+              });
+            }
           }
           if (active && target === generation) setSaveState("saved");
         }
@@ -486,6 +493,7 @@ function OfflineBlockEditor({
     };
     registerFlush(async () => {
       while (updates.length) await persistUpdates();
+      if (compacting) await compacting;
     });
     const flushOnHide = () => {
       if (!updates.length || !copy.persistence.db) return;

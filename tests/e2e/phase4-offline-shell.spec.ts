@@ -378,6 +378,12 @@ test("recovers a saved draft when the catalog pending write fails", async ({ pag
   await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
   await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
   await expect(page.getByText("Recovered local draft", { exact: true }).last()).toBeVisible();
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
+  await context.setOffline(false);
+  await page.getByRole("button", { name: "Reconnect" }).click();
+  await expect(page.getByRole("heading", { name: "Available offline" })).toHaveCount(0);
+  await expect(page.locator(".bn-editor")).toContainText("Online seedZ");
 });
 
 test("keeps an online editor draft when its catalog write fails", async ({ page, context }) => {
@@ -437,10 +443,11 @@ test("keeps an online editor draft when its catalog write fails", async ({ page,
   await page.locator(".bn-editor").click();
   await page.keyboard.type("Z");
   await expect(
-    page.getByText("Offline storage could not record these local changes. Export this copy before leaving."),
+    page.getByText("Local changes are saved, but the offline page list could not be updated yet."),
   ).toBeVisible();
+  await page.keyboard.type("Q");
   await page.reload();
-  await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedZ");
+  await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedZQ");
   await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
   await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
 });

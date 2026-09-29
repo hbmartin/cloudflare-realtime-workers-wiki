@@ -30,6 +30,8 @@ export type OfflinePage = {
   revoked?: boolean;
   lastSyncedAt: number;
   storageKeys: string[];
+  /** Set only on recovered reads until the catalog has accepted the storage key. */
+  catalogNeedsRepair?: boolean;
 };
 
 const PENDING_MARKER = "noteflare-pending";
@@ -84,11 +86,12 @@ async function withPendingMarkers(page: OfflinePage): Promise<OfflinePage> {
   return { ...page, pendingCopyKeys: keys, pendingChanges: keys.includes(page.storageKeys?.at(-1) ?? "") };
 }
 
-async function clearDocumentPendingMarker(key: string) {
+async function clearDocumentPendingMarker(key: string, mayClear: () => boolean) {
   const db = await openExistingDocument(key);
   if (!db) return;
   try {
     if (!db.objectStoreNames.contains("custom")) return;
+    if (!mayClear()) return;
     const transaction = db.transaction("custom", "readwrite");
     transaction.objectStore("custom").delete(PENDING_MARKER);
     await transactionDone(transaction);
@@ -100,12 +103,6 @@ async function clearDocumentPendingMarker(key: string) {
 export function persistPendingDocumentUpdate(db: IDBDatabase, update: Uint8Array): Promise<void> {
   const transaction = db.transaction(["updates", "custom"], "readwrite");
   transaction.objectStore("updates").add(update);
-  transaction.objectStore("custom").put(true, PENDING_MARKER);
-  return transactionDone(transaction);
-}
-
-export function setDocumentPendingMarker(db: IDBDatabase): Promise<void> {
-  const transaction = db.transaction("custom", "readwrite");
   transaction.objectStore("custom").put(true, PENDING_MARKER);
   return transactionDone(transaction);
 }
@@ -170,6 +167,17 @@ export function offlineAccountKey(member: Pick<ClientMemberContext, "user" | "wo
 
 export function offlineDocumentKey(userId: string, workspaceId: string, pageId: string, epoch: number) {
   return `account:${userId}:${workspaceId}:${pageId}:${epoch}:2`;
+}
+
+function accountDocumentPrefix(accountKey: string) {
+  const [userId, workspaceId] = accountKey.split("\u0000");
+  return userId && workspaceId ? `account:${userId}:${workspaceId}:` : null;
+}
+
+function parseOfflineDocumentKey(key: string, prefix: string) {
+  if (!key.startsWith(prefix)) return null;
+  const match = /^([^:]+):(\d+):2$/.exec(key.slice(prefix.length));
+  return match ? { pageId: match[1]!, epoch: Number(match[2]) } : null;
 }
 
 function openCatalog() {
@@ -283,7 +291,7 @@ export async function listOfflinePages(accountKey: string): Promise<OfflinePage[
 }
 
 export async function listPendingOfflinePages(accountKey: string): Promise<OfflinePage[]> {
-  const pages = await readAccountPages(accountKey);
+  const pages = await readAccountPages(accountKey, true, true);
   const available = await Promise.all(
     pages.map(async (page) => {
       const keys = pendingKeysOf(page);
@@ -296,7 +304,11 @@ export async function listPendingOfflinePages(accountKey: string): Promise<Offli
   return available.filter((page): page is OfflinePage & { pendingCopyKeys: string[] } => page !== null);
 }
 
-async function readAccountPages(accountKey: string, includeMarkers = true): Promise<OfflinePage[]> {
+async function readAccountPages(
+  accountKey: string,
+  includeMarkers = true,
+  strictEnumeration = false,
+): Promise<OfflinePage[]> {
   const db = await openCatalog();
   const transaction = db.transaction("pages", "readonly");
   const pages = await requestResult(
@@ -305,31 +317,50 @@ async function readAccountPages(accountKey: string, includeMarkers = true): Prom
   await transactionDone(transaction);
   if (!includeMarkers) return pages;
   const marked = await Promise.all(pages.map(withPendingMarkers));
-  const [userId, workspaceId] = accountKey.split("\u0000");
-  if (!userId || !workspaceId || !indexedDB.databases) return marked;
-  const prefix = `account:${userId}:${workspaceId}:`;
+  const prefix = accountDocumentPrefix(accountKey);
+  if (!prefix) return marked;
+  if (!indexedDB.databases) {
+    if (strictEnumeration) throw new Error("This browser cannot verify every saved document before sign-out.");
+    return marked;
+  }
+  let databases: IDBDatabaseInfo[];
+  try {
+    databases = await indexedDB.databases();
+  } catch (error) {
+    if (strictEnumeration) throw error;
+    console.error("Offline document enumeration failed", error);
+    return marked;
+  }
   const knownKeys = new Set(marked.flatMap((page) => page.storageKeys ?? []));
   const byPage = new Map(marked.map((page) => [page.pageId, page]));
-  for (const database of await indexedDB.databases()) {
-    const name = database.name;
-    if (!name?.startsWith(prefix) || knownKeys.has(name)) continue;
-    const suffix = name.slice(prefix.length);
-    const match = /^([^:]+):(\d+):2$/.exec(suffix);
-    if (!match) continue;
-    let pending = false;
-    try {
-      pending = await documentPendingMarker(name);
-    } catch (error) {
-      console.error("Offline orphan marker could not be read", error);
-      pending = true;
-    }
-    if (!pending) continue;
-    const pageId = match[1]!;
+  const discovered = await Promise.all(
+    databases.map(async ({ name }) => {
+      if (!name || knownKeys.has(name)) return null;
+      const parsed = parseOfflineDocumentKey(name, prefix);
+      if (!parsed) return null;
+      try {
+        return (await documentPendingMarker(name)) ? { name, ...parsed } : null;
+      } catch (error) {
+        console.error("Offline orphan marker could not be read", error);
+        return { name, ...parsed };
+      }
+    }),
+  );
+  const changed = new Set<OfflinePage>();
+  for (const orphan of discovered) {
+    if (!orphan) continue;
+    const { name, pageId, epoch } = orphan;
     const current = byPage.get(pageId);
     if (current) {
       current.storageKeys = withStorageKey(current.storageKeys ?? [], name);
       current.pendingCopyKeys = [...new Set([...pendingKeysOf(current), name])];
       current.pendingChanges = current.pendingCopyKeys.includes(current.storageKeys.at(-1) ?? "");
+      if (epoch > current.epoch) {
+        current.epoch = epoch;
+        current.canEdit = false;
+      }
+      current.catalogNeedsRepair = true;
+      changed.add(current);
     } else {
       const recovered: OfflinePage = {
         key: `${accountKey}\u0000${pageId}`,
@@ -338,30 +369,37 @@ async function readAccountPages(accountKey: string, includeMarkers = true): Prom
         title: "Recovered local draft",
         spaceName: "Unknown space",
         kind: "document",
-        epoch: Number(match[2]),
+        epoch,
         canEdit: false,
         pendingChanges: true,
         pendingCopyKeys: [name],
         revoked: false,
         lastSyncedAt: 0,
         storageKeys: [name],
+        catalogNeedsRepair: true,
       };
       marked.push(recovered);
       byPage.set(pageId, recovered);
+      changed.add(recovered);
     }
     knownKeys.add(name);
+  }
+  if (changed.size) {
+    try {
+      const repair = db.transaction("pages", "readwrite");
+      const store = repair.objectStore("pages");
+      for (const page of changed) store.put({ ...page, catalogNeedsRepair: false });
+      await transactionDone(repair);
+      for (const page of changed) page.catalogNeedsRepair = false;
+    } catch (error) {
+      console.error("Recovered document keys could not be added to the catalog", error);
+    }
   }
   return marked;
 }
 
 export async function getOfflinePage(accountKey: string, pageId: string): Promise<OfflinePage | null> {
-  const db = await openCatalog();
-  const transaction = db.transaction("pages", "readonly");
-  const page = await requestResult(
-    transaction.objectStore("pages").get(`${accountKey}\u0000${pageId}`) as IDBRequest<OfflinePage | undefined>,
-  );
-  await transactionDone(transaction);
-  return page ? withPendingMarkers(page) : null;
+  return (await readAccountPages(accountKey)).find((page) => page.pageId === pageId) ?? null;
 }
 
 export async function rememberOfflinePage(
@@ -416,6 +454,7 @@ export async function markOfflinePagePending(
   pageId: string,
   storageKey: string,
   pendingChanges: boolean,
+  mayClearMarker: () => boolean = () => true,
 ) {
   const key = `${accountKey}\u0000${pageId}`;
   return withPageLock(key, async () => {
@@ -436,13 +475,16 @@ export async function markOfflinePagePending(
       });
     }
     await transactionDone(transaction);
-    if (!pendingChanges) await clearDocumentPendingMarker(storageKey);
+    if (!pendingChanges) await clearDocumentPendingMarker(storageKey, mayClearMarker);
+    return Boolean(page);
   });
 }
 
 export async function markOfflinePageRevoked(accountKey: string, pageId: string) {
   const key = `${accountKey}\u0000${pageId}`;
   return withPageLock(key, async () => {
+    const recovered = (await readAccountPages(accountKey, true, true)).find((entry) => entry.pageId === pageId);
+    if (recovered && pendingKeysOf(recovered).length) return false;
     const db = await openCatalog();
     const read = db.transaction("pages", "readonly");
     const page = await requestResult(read.objectStore("pages").get(key) as IDBRequest<OfflinePage | undefined>);
@@ -459,9 +501,9 @@ export async function markOfflinePageRevoked(accountKey: string, pageId: string)
 
 export async function clearRevokedOfflinePages(accountKey: string) {
   const db = await openCatalog();
-  for (const page of (await readAccountPages(accountKey, false)).filter((entry) => entry.revoked)) {
+  for (const page of (await readAccountPages(accountKey, true, true)).filter((entry) => entry.revoked)) {
     await withPageLock(page.key, async () => {
-      const current = await getOfflinePage(accountKey, page.pageId);
+      const current = (await readAccountPages(accountKey, true, true)).find((entry) => entry.pageId === page.pageId);
       if (!current?.revoked || pendingKeysOf(current).length) return;
       for (const key of current.storageKeys) {
         await new Promise<void>((resolve, reject) => {
@@ -500,18 +542,17 @@ export async function purgingOfflineAccounts() {
 }
 
 export async function forgetOfflineAccount(accountKey: string) {
+  const prefix = accountDocumentPrefix(accountKey);
+  if (!prefix || !indexedDB.databases) throw new Error("This browser cannot verify every saved document for removal.");
   const db = await openCatalog();
   await markOfflineAccountPurging(accountKey);
   const pages = await readAccountPages(accountKey, false);
   const keys = new Set(pages.flatMap((page) => page.storageKeys ?? []));
   // Catalog writes and Yjs store creation are separate transactions. Include
   // stores left behind by an interrupted catalog write or a previous purge.
-  const [userId, workspaceId] = accountKey.split("\u0000");
-  if (userId && workspaceId && indexedDB.databases) {
-    const databases = await indexedDB.databases();
-    for (const database of databases) {
-      if (database.name?.startsWith(`account:${userId}:${workspaceId}:`)) keys.add(database.name);
-    }
+  const databases = await indexedDB.databases();
+  for (const database of databases) {
+    if (database.name?.startsWith(prefix)) keys.add(database.name);
   }
   for (const key of keys) {
     await new Promise<void>((resolve, reject) => {
@@ -523,11 +564,9 @@ export async function forgetOfflineAccount(accountKey: string) {
       );
     });
   }
-  if (userId && workspaceId && indexedDB.databases) {
-    const remaining = await indexedDB.databases();
-    if (remaining.some((database) => database.name?.startsWith(`account:${userId}:${workspaceId}:`)))
-      throw new Error("New local document storage appeared during sign-out. Retry removal.");
-  }
+  const remaining = await indexedDB.databases();
+  if (remaining.some((database) => database.name?.startsWith(prefix)))
+    throw new Error("New local document storage appeared during sign-out. Retry removal.");
   const transaction = db.transaction(["accounts", "pages"], "readwrite");
   transaction.objectStore("accounts").delete(accountKey);
   const store = transaction.objectStore("pages");

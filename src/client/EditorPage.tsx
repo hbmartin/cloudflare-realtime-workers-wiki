@@ -42,8 +42,8 @@ import {
   offlineDocumentKey,
   pendingKeysOf,
   persistPendingDocumentUpdate,
+  rememberOfflineAccount,
   rememberOfflinePage,
-  setDocumentPendingMarker,
   storageEpoch,
 } from "./offline-catalog";
 
@@ -78,6 +78,7 @@ export function EditorPage({
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
   const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
+  const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -115,13 +116,17 @@ export function EditorPage({
   useEffect(() => {
     try {
       const saved: unknown = JSON.parse(localStorage.getItem(`${recoveryKey}:dismissed`) ?? "{}");
-      dismissedRecovery.current = Array.isArray(saved)
-        ? Object.fromEntries(
-            saved.filter((key): key is string => typeof key === "string").map((key) => [key, page.contentEpoch]),
-          )
-        : saved && typeof saved === "object"
-          ? Object.fromEntries(Object.entries(saved).filter(([key, value]) => key && Number.isInteger(value)))
-          : {};
+      if (Array.isArray(saved)) {
+        const converted = Object.fromEntries(
+          saved.filter((key): key is string => typeof key === "string").map((key) => [key, page.contentEpoch]),
+        );
+        localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(converted));
+        dismissedRecovery.current = converted;
+      } else
+        dismissedRecovery.current =
+          saved && typeof saved === "object"
+            ? Object.fromEntries(Object.entries(saved).filter(([key, value]) => key && Number.isInteger(value)))
+            : {};
     } catch {
       dismissedRecovery.current = {};
     }
@@ -195,6 +200,7 @@ export function EditorPage({
     let catalogFailures = 0;
     let pendingActive = false;
     let catalogNeedsRepair = false;
+    let nextCatalogRepairAt = 0;
     let pendingRevision = 0;
     let storageFailed = false;
     const beforeConnect = async () => {
@@ -217,18 +223,17 @@ export function EditorPage({
       const pendingKeys = catalogPage ? pendingKeysOf(catalogPage) : [];
       const listed = Boolean(catalogPage?.storageKeys?.includes(currentStorageKey));
       const marker =
-        pendingKeys.includes(currentStorageKey) || listed
-          ? pendingKeys.includes(currentStorageKey)
-          : await documentPendingMarker(currentStorageKey).catch((error) => {
-              console.error("Unable to read offline document marker", error);
-              return true;
-            });
-      catalogNeedsRepair = marker && !listed;
-      if (readingRevision === pendingRevision) pendingActive = pendingKeys.includes(currentStorageKey) || marker;
+        pendingKeys.includes(currentStorageKey) ||
+        (!listed &&
+          (await documentPendingMarker(currentStorageKey).catch((error) => {
+            console.error("Unable to read offline document marker", error);
+            return true;
+          })));
+      catalogNeedsRepair = Boolean(catalogPage?.catalogNeedsRepair) || (marker && !listed);
+      if (readingRevision === pendingRevision) pendingActive = marker;
       const olderDrafts = pendingKeys.filter((key) => key !== currentStorageKey);
       for (const key of olderDrafts) quarantine(key);
-      const hasLocalDraft =
-        pendingKeys.includes(currentStorageKey) || marker || pendingActive || (!catalogPage && next.hasUnsyncedChanges);
+      const hasLocalDraft = marker || pendingActive || (!catalogPage && next.hasUnsyncedChanges);
       const controller = new AbortController();
       const deadline = window.setTimeout(() => controller.abort(), 10_000);
       try {
@@ -298,7 +303,7 @@ export function EditorPage({
     };
     const writePending = (pending: boolean) => {
       if (!pending && storageFailed) return;
-      if (pending && pendingActive && !catalogNeedsRepair) return;
+      if (pending && pendingActive && (!catalogNeedsRepair || Date.now() < nextCatalogRepairAt)) return;
       if (!pending && !pendingActive) {
         clearCurrentRecovery();
         return;
@@ -312,22 +317,29 @@ export function EditorPage({
           if (!pending && storageFailed) return;
           const currentMember = offlineMember.current;
           if (pending) {
-            await rememberOfflinePage(
+            if (catalogNeedsRepair) await rememberOfflineAccount(currentMember);
+            const remembered = await rememberOfflinePage(
               currentMember,
               offlineMetadata.current.page,
               offlineMetadata.current.spaceName,
               currentMember.role !== "viewer",
               false,
             );
+            if (!remembered) throw new Error("Offline catalog is not accepting page updates.");
           }
-          await markOfflinePagePending(offlineAccountKey(currentMember), page.id, currentStorageKey, pending);
-          if (!pending && revision !== pendingRevision && pendingActive) {
-            const db = next.indexeddb.db;
-            if (!db) throw new Error("Offline document storage is unavailable.");
-            await setDocumentPendingMarker(db);
-            return;
+          const recorded = await markOfflinePagePending(
+            offlineAccountKey(currentMember),
+            page.id,
+            currentStorageKey,
+            pending,
+            () => revision === pendingRevision,
+          );
+          if (pending && !recorded) throw new Error("Offline catalog has no page entry.");
+          if (!pending && revision !== pendingRevision) return;
+          if (pending) {
+            catalogNeedsRepair = false;
+            if (active) setCatalogWarning(null);
           }
-          if (pending) catalogNeedsRepair = false;
           if (!pending) {
             await rememberOfflinePage(
               currentMember,
@@ -342,13 +354,15 @@ export function EditorPage({
         .catch((error) => {
           console.error("Unable to update offline sync state", error);
           if (pending && active) {
-            quarantine(currentStorageKey, "storage");
-            setStorageError("Offline storage could not record these local changes. Export this copy before leaving.");
+            catalogNeedsRepair = true;
+            nextCatalogRepairAt = Date.now() + 5_000;
+            setCatalogWarning("Local changes are saved, but the offline page list could not be updated yet.");
           }
         });
     };
     let persistedUpdates = 0;
     let seededUpdates = false;
+    let compacting: Promise<void> | null = null;
     const failStorage = (error: unknown) => {
       storageFailed = true;
       console.error("Unable to persist local document update", error);
@@ -385,9 +399,15 @@ export function EditorPage({
               }
               if (++persistedUpdates >= 500) {
                 persistedUpdates = 0;
-                void compactDocumentUpdates(next.indexeddb).catch((error) =>
-                  console.error("Unable to compact offline document storage", error),
-                );
+                if (!compacting) {
+                  const task = compactDocumentUpdates(next.indexeddb).catch((error) =>
+                    console.error("Unable to compact offline document storage", error),
+                  );
+                  compacting = task;
+                  void task.finally(() => {
+                    if (compacting === task) compacting = null;
+                  });
+                }
               }
             })
             .catch(failStorage);
@@ -441,7 +461,8 @@ export function EditorPage({
       next.provider.off("connection-close", connectionClose);
       next.provider.off("sync", connectionSync);
       next.doc.off("update", documentUpdate);
-      next.destroy();
+      next.provider.disconnect();
+      void Promise.allSettled([pendingWrite, compacting ?? Promise.resolve()]).then(() => next.destroy());
       setBundle(null);
     };
   }, [
@@ -583,6 +604,7 @@ export function EditorPage({
         </div>
       )}
       {storageError && <div className="notice notice-danger">{storageError}</div>}
+      {catalogWarning && <div className="notice">{catalogWarning}</div>}
       {recovery
         .filter((entry) => entry.epoch !== page.contentEpoch || accessQuarantine || storageError)
         .map((entry) => (
