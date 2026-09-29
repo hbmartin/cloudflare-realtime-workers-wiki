@@ -8,6 +8,7 @@ import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
 import { api, ApiClientError } from "./api";
+import { waitForOfflinePersistence } from "./collaboration";
 import { EmbedFeatureContext } from "./editor-blocks";
 import { notesSchema } from "./mentions";
 import { downloadOfflineMarkdown, exportPendingOfflinePages, offlineCopyMarkdown } from "./offline-export";
@@ -17,6 +18,7 @@ import {
   clearRevokedOfflinePages,
   documentPendingMarker,
   getOfflinePage,
+  hasOfflineDocument,
   listPendingOfflinePages,
   markOfflinePagePending,
   markOfflinePageRevoked,
@@ -296,14 +298,20 @@ export function OfflineWorkspace({
                         pending = await listPendingOfflinePages(account.key, true);
                       } catch {
                         complete = false;
-                        pending = await listPendingOfflinePages(account.key, false);
+                        pending = await listPendingOfflinePages(account.key, false).catch(() => []);
                       }
                       const keys = new Set(
                         pending.filter((page) => page.pageId === selected.pageId).flatMap(pendingKeysOf),
                       );
                       if (!complete) {
                         for (const key of pendingKeysOf(selected)) {
-                          if (await documentPendingMarker(key).catch(() => true)) keys.add(key);
+                          if (await hasOfflineDocument(key).catch(() => false)) keys.add(key);
+                        }
+                      }
+                      for (const key of keys) {
+                        if (!(await hasOfflineDocument(key).catch(() => false))) {
+                          keys.delete(key);
+                          complete = false;
                         }
                       }
                       if (!keys.size) {
@@ -384,7 +392,7 @@ function OfflineEditor({
       party: "document",
       connect: false,
     });
-    void persistence.whenSynced.then(
+    void waitForOfflinePersistence(persistence).then(
       () => {
         if (active) setCopy({ doc, persistence, provider });
       },
@@ -400,7 +408,7 @@ function OfflineEditor({
         })
         .finally(() => {
           provider.destroy();
-          void persistence.destroy();
+          void persistence.destroy().catch(() => undefined);
           doc.destroy();
         });
     };

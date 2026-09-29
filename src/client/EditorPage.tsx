@@ -36,7 +36,6 @@ import { useEffectiveColorScheme } from "./ThemeControl";
 import {
   compactDocumentUpdates,
   documentPendingMarker,
-  ensureOfflineAccount,
   getOfflinePage,
   markOfflinePagePending,
   offlineAccountKey,
@@ -44,6 +43,7 @@ import {
   pendingKeysOf,
   persistPendingDocumentUpdate,
   rememberOfflinePage,
+  rememberOfflineAccount,
   storageEpoch,
 } from "./offline-catalog";
 
@@ -250,10 +250,21 @@ export function EditorPage({
           return false;
         }
         offlineMember.current = currentMember;
-        await ensureOfflineAccount(currentMember).catch((error) => {
-          console.error("Unable to repair offline account metadata", error);
-          if (active) setCatalogWarning("The offline page list could not be updated yet.");
-        });
+        try {
+          await rememberOfflineAccount(currentMember);
+          if (active)
+            setCatalogWarning((warning) =>
+              warning === "The offline page list could not be updated yet." ? null : warning,
+            );
+        } catch (error) {
+          console.error("Unable to update offline account metadata", error);
+          if (active)
+            setCatalogWarning((warning) =>
+              warning?.startsWith("Local changes are saved")
+                ? warning
+                : "The offline page list could not be updated yet.",
+            );
+        }
         if (!active) return false;
         if (catalogNeedsRepair) {
           writePending(true);
@@ -668,28 +679,46 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={async () => {
-                const doc = await loadOfflineCopy(entry.key);
-                setRecoveryPreview({ key: entry.key, text: plainYDoc(doc) });
-                doc.destroy();
+                try {
+                  const doc = await loadOfflineCopy(entry.key);
+                  try {
+                    setRecoveryPreview({ key: entry.key, text: plainYDoc(doc) });
+                  } finally {
+                    doc.destroy();
+                  }
+                } catch (error) {
+                  setCatalogWarning(apiErrorMessage(error, "This offline copy could not be read."));
+                }
               }}
             >
               Preview
             </button>
             <button
               className="quiet-button"
-              onClick={() => void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`)}
+              onClick={() =>
+                void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`).catch((error) =>
+                  setCatalogWarning(apiErrorMessage(error, "This offline copy could not be exported.")),
+                )
+              }
             >
               Export Markdown
             </button>
             <button
               className="quiet-button"
               onClick={async () => {
-                const doc = await loadOfflineCopy(entry.key);
-                const projection = yXmlFragmentToProsemirrorJSON(
-                  doc.getXmlFragment("document-store"),
-                ) as ProseMirrorJson;
-                await navigator.clipboard.writeText(serializeDocument(projection).markdown);
-                doc.destroy();
+                try {
+                  const doc = await loadOfflineCopy(entry.key);
+                  try {
+                    const projection = yXmlFragmentToProsemirrorJSON(
+                      doc.getXmlFragment("document-store"),
+                    ) as ProseMirrorJson;
+                    await navigator.clipboard.writeText(serializeDocument(projection).markdown);
+                  } finally {
+                    doc.destroy();
+                  }
+                } catch (error) {
+                  setCatalogWarning(apiErrorMessage(error, "This offline copy could not be copied."));
+                }
               }}
             >
               Copy Markdown

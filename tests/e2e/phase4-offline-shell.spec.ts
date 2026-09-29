@@ -621,6 +621,14 @@ test("can finish offline sign-out when database enumeration is unavailable", asy
   await expect(page.getByText("Enumeration fallback draft")).toBeVisible();
   await page.getByRole("button", { name: "Sign out and delete local copies" }).click();
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+  await context.addInitScript(() => {
+    const original = indexedDB.databases.bind(indexedDB);
+    (window as Window & { restoreDatabases?: () => void }).restoreDatabases = () =>
+      Object.defineProperty(indexedDB, "databases", { value: original, configurable: true });
+    Object.defineProperty(indexedDB, "databases", { value: undefined, configurable: true });
+  });
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
   expect(
     await page.evaluate(async () => {
       (window as Window & { restoreDatabases?: () => void }).restoreDatabases?.();

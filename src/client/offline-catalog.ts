@@ -220,6 +220,7 @@ export function registerOfflineDocumentKey(userId: string, workspaceId: string, 
   if (typeof localStorage === "undefined") return;
   const accountKey = offlineAccountKey({ user: { id: userId }, workspace: { id: workspaceId } });
   if (isAccountSigningOut(accountKey)) throw new Error("Local sign-out is removing offline documents.");
+  if (registeredDocumentKeys(accountKey).keys?.includes(key)) return;
   try {
     localStorage.setItem(`${documentRegistryEntryPrefix(accountKey)}${key}`, "1");
   } catch (error) {
@@ -351,16 +352,6 @@ export async function rememberOfflineAccount(member: ClientMemberContext) {
   return account;
 }
 
-export async function ensureOfflineAccount(member: ClientMemberContext) {
-  const db = await openCatalog();
-  const transaction = db.transaction("accounts", "readonly");
-  const existing = await requestResult(
-    transaction.objectStore("accounts").get(offlineAccountKey(member)) as IDBRequest<OfflineAccount | undefined>,
-  );
-  await transactionDone(transaction);
-  return existing ?? rememberOfflineAccount(member);
-}
-
 export async function latestOfflineAccount(): Promise<OfflineAccount | null> {
   const db = await openCatalog();
   const transaction = db.transaction("accounts", "readonly");
@@ -373,7 +364,7 @@ export async function latestOfflineAccount(): Promise<OfflineAccount | null> {
   );
 }
 
-async function hasOfflineDocument(key: string): Promise<boolean> {
+export async function hasOfflineDocument(key: string): Promise<boolean> {
   const db = await openExistingDocument(key);
   db?.close();
   return Boolean(db);
@@ -615,7 +606,11 @@ export async function clearRevokedOfflinePages(accountKey: string) {
 }
 
 export async function markOfflineAccountPurging(accountKey: string) {
-  localStorage.setItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`, "1");
+  try {
+    localStorage.setItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`, "1");
+  } catch (error) {
+    if (localStorage.getItem(LOCAL_SIGNOUT_KEY) !== accountKey) throw error;
+  }
   const db = await openCatalog();
   const transaction = db.transaction("accounts", "readwrite");
   const store = transaction.objectStore("accounts");
@@ -629,11 +624,16 @@ export async function purgingOfflineAccounts() {
   const transaction = db.transaction("accounts", "readonly");
   const accounts = await requestResult(transaction.objectStore("accounts").getAll() as IDBRequest<OfflineAccount[]>);
   await transactionDone(transaction);
-  return accounts.filter((account) => account.purging).map((account) => account.key);
+  const pending = new Set(accounts.filter((account) => account.purging).map((account) => account.key));
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (key?.startsWith(PURGING_ACCOUNT_PREFIX)) pending.add(key.slice(PURGING_ACCOUNT_PREFIX.length));
+  }
+  return [...pending];
 }
 
 export async function forgetOfflineAccount(accountKey: string) {
-  localStorage.setItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`, "1");
+  await markOfflineAccountPurging(accountKey);
   const prefix = accountDocumentPrefix(accountKey);
   const entryPrefix = documentRegistryEntryPrefix(accountKey);
   const registryEntries = () =>
@@ -641,10 +641,17 @@ export async function forgetOfflineAccount(accountKey: string) {
       (name): name is string => !!name?.startsWith(entryPrefix),
     );
   const entryNamesAtStart = new Set(registryEntries());
-  const names = await accountDocumentNames(accountKey, true);
   const db = await openCatalog();
-  await markOfflineAccountPurging(accountKey);
   const pages = await readAccountPages(accountKey, false);
+  const accountTransaction = db.transaction("accounts", "readonly");
+  const account = await requestResult(
+    accountTransaction.objectStore("accounts").get(accountKey) as IDBRequest<OfflineAccount | undefined>,
+  );
+  await transactionDone(accountTransaction);
+  // A retry after a completed purge has no catalog or registry to inspect.
+  const completedWithoutEnumeration =
+    !indexedDB.databases && !account && !pages.length && registeredDocumentKeys(accountKey).keys === null;
+  const names = completedWithoutEnumeration ? [] : await accountDocumentNames(accountKey, true);
   const keys = new Set(pages.flatMap((page) => page.storageKeys ?? []));
   // Catalog writes and Yjs store creation are separate transactions. Include
   // stores left behind by an interrupted catalog write or a previous purge.
@@ -670,15 +677,10 @@ export async function forgetOfflineAccount(accountKey: string) {
     if (remaining.some((database) => database.name?.startsWith(prefix)))
       throw new Error("New local document storage appeared during sign-out. Retry removal.");
   }
-  const newlyRegistered = (await accountDocumentNames(accountKey, true)).filter(
+  const newlyRegistered = (completedWithoutEnumeration ? [] : await accountDocumentNames(accountKey, true)).filter(
     (key) => prefix && key.startsWith(prefix) && !keys.has(key),
   );
   if (newlyRegistered.length) throw new Error("New local document storage appeared during sign-out. Retry removal.");
-  const transaction = db.transaction(["accounts", "pages"], "readwrite");
-  transaction.objectStore("accounts").delete(accountKey);
-  const store = transaction.objectStore("pages");
-  for (const page of pages) store.delete(page.key);
-  await transactionDone(transaction);
   if (registryEntries().some((name) => !entryNamesAtStart.has(name)))
     throw new Error("New local document storage appeared during sign-out. Retry removal.");
   if (prefix && indexedDB.databases) {
@@ -686,6 +688,11 @@ export async function forgetOfflineAccount(accountKey: string) {
     if (remaining.some((database) => database.name?.startsWith(prefix)))
       throw new Error("New local document storage appeared during sign-out. Retry removal.");
   }
+  const transaction = db.transaction(["accounts", "pages"], "readwrite");
+  transaction.objectStore("accounts").delete(accountKey);
+  const store = transaction.objectStore("pages");
+  for (const page of pages) store.delete(page.key);
+  await transactionDone(transaction);
   try {
     localStorage.removeItem(`${DOCUMENT_REGISTRY_PREFIX}${accountKey}`);
     for (const name of entryNamesAtStart) localStorage.removeItem(name);

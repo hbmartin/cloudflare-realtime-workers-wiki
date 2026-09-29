@@ -380,13 +380,28 @@ export async function loadOfflineCopy(key: string) {
   const doc = new Y.Doc();
   const persistence = new IndexeddbPersistence(key, doc);
   try {
-    await persistence.whenSynced;
+    await waitForOfflinePersistence(persistence);
     return doc;
   } catch (error) {
     doc.destroy();
     throw error;
   } finally {
-    await persistence.destroy();
+    await persistence.destroy().catch(() => undefined);
+  }
+}
+
+export async function waitForOfflinePersistence(persistence: IndexeddbPersistence) {
+  await persistence["_db"];
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      persistence.whenSynced,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("Offline document storage did not finish loading.")), 30_000);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 
