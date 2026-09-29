@@ -86,6 +86,12 @@ class NotionError extends Error {
   }
 }
 
+class UnknownMutationOutcome extends NotionError {
+  constructor() {
+    super(409, "conflict_error", "The mutation outcome is unknown. Fetch the page before retrying.");
+  }
+}
+
 // nosemgrep: worker-hono-construction -- Reviewed Notion subapp covered by the middleware registration policy.
 const notionApi = new Hono<ApiContext>();
 const NOTION_BODY_MAX_BYTES = 500 * 1024;
@@ -583,6 +589,10 @@ async function mutateDocument(
   suppressExternalEffects = false,
   options: { expectedSequence?: number; operationId?: string } = {},
 ) {
+  const unknownOutcome = () =>
+    options.expectedSequence !== undefined && !options.operationId
+      ? new UnknownMutationOutcome()
+      : new NotionError(503, "service_unavailable", "The document is temporarily unavailable.");
   let response: Response;
   try {
     response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
@@ -597,17 +607,12 @@ async function mutateDocument(
       }),
     );
   } catch {
-    throw options.operationId
-      ? new NotionError(503, "service_unavailable", "The document is temporarily unavailable.")
-      : new NotionError(409, "conflict_error", "The mutation outcome is unknown. Fetch the page before retrying.");
+    throw unknownOutcome();
   }
   if (response.status === 404) throw new NotionError(404, "object_not_found", "Block not found.");
   if (response.status === 409) throw new NotionError(409, "conflict_error", "The document could not be changed.");
   if (response.status === 413) throw new NotionError(413, "validation_error", "The mutation exceeds document limits.");
-  if (response.status >= 500)
-    throw options.operationId
-      ? new NotionError(503, "service_unavailable", "The document is temporarily unavailable.")
-      : new NotionError(409, "conflict_error", "The mutation outcome is unknown. Fetch the page before retrying.");
+  if (response.status >= 500) throw unknownOutcome();
   if (!response.ok) throw new NotionError(400, "validation_error", "The block mutation is invalid.");
   return response.json<{ document: DocumentContentEnvelope["document"]; sequence: number }>();
 }
@@ -969,7 +974,7 @@ export async function runNotionMarkdownTask(env: Env, id: string) {
     }
   } catch (error) {
     const terminal = error instanceof NotionError && error.status !== 503;
-    const retry = !terminal && task.attempts < MAX_MARKDOWN_TASK_ATTEMPTS;
+    const retry = !terminal && task.attempts < MAX_MARKDOWN_TASK_ATTEMPTS && task.expires_at > Date.now();
     if (retry)
       logger.warn(
         "notion_api.markdown_task.retry",
@@ -1000,7 +1005,9 @@ export async function runNotionMarkdownTask(env: Env, id: string) {
 
 export async function recoverNotionMarkdownTasks(env: Env) {
   if (env.NOTION_MARKDOWN_WRITES_ENABLED === "true") {
-    for (const task of await claimExhaustedMarkdownTasks(env)) {
+    for (let recovered = 0; recovered < 5; recovered += 1) {
+      const task = (await claimExhaustedMarkdownTasks(env))[0];
+      if (!task) break;
       const stopLease = keepMarkdownTaskLease(env, task);
       try {
         const { principal, page } = await taskPage(env, task);
@@ -1015,14 +1022,12 @@ export async function recoverNotionMarkdownTasks(env: Env) {
               code: "service_unavailable",
               message: "The Markdown update could not be completed.",
             },
-            task.attempts < MAX_MARKDOWN_TASK_ATTEMPTS,
+            false,
           );
           continue;
         }
         await completeMarkdownFromReceipt(env, task, principal, page, receipt);
       } catch (error) {
-        const retry =
-          (!(error instanceof NotionError) || error.status === 503) && task.attempts < MAX_MARKDOWN_TASK_ATTEMPTS;
         await failMarkdownTask(
           env,
           task,
@@ -1032,7 +1037,7 @@ export async function recoverNotionMarkdownTasks(env: Env) {
             code: error instanceof NotionError ? error.code : "service_unavailable",
             message: error instanceof NotionError ? error.message : "The Markdown update could not be completed.",
           },
-          retry,
+          false,
         );
       } finally {
         stopLease();
@@ -1178,7 +1183,13 @@ notionApi.patch("/pages/:pageId/markdown", async (c) => {
       });
       return c.json(pageMarkdownJson(current));
     } catch (error) {
-      if (!(error instanceof NotionError) || error.status !== 409 || attempt === 1) throw error;
+      if (
+        error instanceof UnknownMutationOutcome ||
+        !(error instanceof NotionError) ||
+        error.status !== 409 ||
+        attempt === 1
+      )
+        throw error;
       current = await pageMarkdownProjection(c.env, principal, page, c.req.url);
     }
   }

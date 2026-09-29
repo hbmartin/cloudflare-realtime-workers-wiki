@@ -157,6 +157,52 @@ describe("Notion Markdown block mutations", () => {
     expect(JSON.stringify(operations)).not.toContain(math.attrs.id);
   });
 
+  it("preserves display math when replacement text uses CRLF separators", () => {
+    const { first, second } = fixture();
+    const math = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "math", attrs: { formula: "a+b" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, math, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const changed = projection.markdown.replace("First", "Updated first").replaceAll("\n", "\r\n");
+    const command = parseMarkdownCommand(
+      { type: "replace_content", replace_content: { new_str: changed } },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false);
+    expect(JSON.stringify(operations)).not.toContain(math.attrs.id);
+  });
+
+  it("enforces one markup budget across text separated by preserved math", () => {
+    const { first, second } = fixture();
+    const math = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "math", attrs: { formula: "a+b" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, math, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const changed = `${"!".repeat(2050)}\n\n$$\na+b\n$$\n\n${"!".repeat(2050)}\n`;
+    const command = parseMarkdownCommand(
+      { type: "replace_content", replace_content: { new_str: changed } },
+      projection.markdown,
+    );
+    expect(() => markdownMutations(document, projection, command.edits, true)).toThrow("too many markup delimiters");
+  });
+
+  it("does not carry style from a deleted block onto unrelated replacement content", () => {
+    const { first, document, projection } = fixture();
+    first.content![0]!.attrs = { ...first.content![0]!.attrs, textColor: "red" };
+    const command = parseMarkdownCommand(
+      { type: "replace_content", replace_content: { new_str: "A new paragraph", allow_deleting_content: true } },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, true);
+    expect(JSON.stringify(operations)).not.toContain('"textColor":"red"');
+  });
+
   it("keeps zero-length spacer blocks while replacing surrounding text", () => {
     const { first, second } = fixture();
     const spacer = {

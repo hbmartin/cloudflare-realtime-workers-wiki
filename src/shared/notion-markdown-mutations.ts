@@ -135,7 +135,7 @@ function unchangedPairs(
   return pairs;
 }
 
-function markdownMeaning(node: ProseMirrorJson): string {
+function markdownMeaningNode(node: ProseMirrorJson): unknown {
   const attrs = node.attrs ?? {};
   const meaningAttrs: Record<string, unknown> = {};
   const keys: Record<string, string[]> = {
@@ -149,14 +149,18 @@ function markdownMeaning(node: ProseMirrorJson): string {
     link: ["href"],
   };
   for (const key of keys[node.type ?? ""] ?? []) if (attrs[key] !== undefined) meaningAttrs[key] = attrs[key];
-  const children = (node.content ?? []).map(markdownMeaning);
-  return JSON.stringify({
+  const children = (node.content ?? []).map(markdownMeaningNode);
+  return {
     type: node.type,
     ...(node.text !== undefined ? { text: node.text } : {}),
     ...(Object.keys(meaningAttrs).length ? { attrs: meaningAttrs } : {}),
     ...(node.marks?.length ? { marks: node.marks.map((mark) => JSON.stringify(mark)).toSorted() } : {}),
     ...(children.length ? { children } : {}),
-  });
+  };
+}
+
+function markdownMeaning(node: ProseMirrorJson): string {
+  return JSON.stringify(markdownMeaningNode(node));
 }
 
 function preserveBlockStyle(previous: ProseMirrorJson, next: ProseMirrorJson): ProseMirrorJson {
@@ -236,37 +240,41 @@ function parseGroupPreservingMath(
   originals: Array<{ block: NotionBlock; span: NotionMarkdownProjection["spans"][number] }>,
   markdown: string,
 ) {
-  const protectedMath = originals.filter(
-    ({ block }) => block.type === "math" && String(block.node.attrs?.formula ?? "").includes("\n\n"),
-  );
+  const protectedMath = originals.filter(({ block }) => block.type === "math");
   if (!protectedMath.length) return parseWritableMarkdownWithSource(source);
   if (new TextEncoder().encode(source).length > 128 * 1024)
     throw new MarkdownWriteError("Markdown content exceeds 128 KiB.");
+  const normalizedSource = source.replaceAll("\r\n", "\n");
   const blocks: ProseMirrorJson[] = [];
   const rawBlocks: string[] = [];
   let cursor = 0;
+  let markupDelimiters = 0;
   const append = (segment: string) => {
+    for (const character of segment)
+      if ("<\\[]`*_!".includes(character) && ++markupDelimiters > 4096)
+        throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
     const parsed = parseWritableMarkdownWithSource(segment);
     blocks.push(...parsed.blocks);
+    if (blocks.length > 1000) throw new MarkdownWriteError("Markdown content exceeds 1000 blocks.");
     rawBlocks.push(...parsed.rawBlocks);
   };
   for (const { block, span } of protectedMath) {
-    const raw = markdown.slice(span.from, span.to);
-    let found = source.indexOf(raw, cursor);
+    const raw = markdown.slice(span.from, span.to).trimEnd();
+    let found = normalizedSource.indexOf(raw, cursor);
     while (
       found >= 0 &&
-      ((found > 0 && source[found - 1] !== "\n") ||
-        (found + raw.length < source.length && !raw.endsWith("\n") && source[found + raw.length] !== "\n"))
+      ((found > 0 && normalizedSource[found - 1] !== "\n") ||
+        (found + raw.length < normalizedSource.length && normalizedSource[found + raw.length] !== "\n"))
     )
-      found = source.indexOf(raw, found + 1);
-    if (found < 0) throw new MarkdownWriteError("Math blocks with blank lines must be edited through the block API.");
-    append(source.slice(cursor, found));
+      found = normalizedSource.indexOf(raw, found + 1);
+    if (found < 0) throw new MarkdownWriteError("Math blocks must be edited through the block API.");
+    append(normalizedSource.slice(cursor, found));
     blocks.push(blockContainer(block));
-    rawBlocks.push(raw.trimEnd());
+    rawBlocks.push(raw);
+    if (blocks.length > 1000) throw new MarkdownWriteError("Markdown content exceeds 1000 blocks.");
     cursor = found + raw.length;
   }
-  append(source.slice(cursor));
-  if (blocks.length > 1000) throw new MarkdownWriteError("Markdown content exceeds 1000 blocks.");
+  append(normalizedSource.slice(cursor));
   return { blocks, rawBlocks };
 }
 
@@ -306,6 +314,7 @@ export function markdownMutations(
     ];
   }
   const blocks = documentBlocks(document);
+  const existingIds = new Set(blocks.map((block) => block.internalId));
   if (
     projection.spans.length < blocks.length ||
     projection.spans.slice(0, blocks.length).some((span, index) => span.internalId !== blocks[index]?.internalId)
@@ -368,10 +377,12 @@ export function markdownMutations(
           );
         if (NONEDITABLE_BLOCK_TYPES.has(block.type))
           throw new MarkdownWriteError("This block cannot be changed as Markdown. Use the block API.");
-        let container = canonicalizeMedia(
-          preserveNestedIds(block, preserveBlockStyle(blockContainer(block), replacement[newStart + index]!)),
-          canonicalMediaUrls,
-        );
+        const replacementBlock = replacement[newStart + index]!;
+        const styled =
+          oldEnd - oldStart === 1 && newEnd - newStart === 1
+            ? preserveBlockStyle(blockContainer(block), replacementBlock)
+            : replacementBlock;
+        let container = canonicalizeMedia(preserveNestedIds(block, styled), canonicalMediaUrls);
         if (block.type === "image" && container.content?.[0]?.type === "image") {
           const image = container.content[0];
           if (image.attrs?.url === block.node.attrs?.url)
@@ -402,6 +413,8 @@ export function markdownMutations(
       const added = replacement
         .slice(newStart + retained, newEnd)
         .map((container) => canonicalizeMedia(container, canonicalMediaUrls));
+      if (added.some((container) => existingIds.has(String(container.attrs?.id))))
+        throw new MarkdownWriteError("An existing block cannot be inserted again as Markdown.");
       if (added.length) {
         operations.push({
           type: "append_children",

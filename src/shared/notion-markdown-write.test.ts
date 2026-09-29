@@ -56,6 +56,25 @@ describe("writable Notion Markdown", () => {
     expect(content.map((node) => node.text ?? "").join("")).toBe("Energy: $$E=mc^2$$");
   });
 
+  it("round trips adjacent inline math without treating it as display math", () => {
+    const content = parseWritableMarkdown("Values $a$$b$ end.\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "a" } },
+      { type: "inlineMath", attrs: { formula: "b" } },
+    ]);
+  });
+
+  it("keeps math inside a single emphasis token inside that formatting", () => {
+    const content = parseWritableMarkdown("**Before $x+1$ after**\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "x+1" } },
+    ]);
+    expect(content.filter((node) => node.type === "text").map((node) => node.marks)).toEqual([
+      [{ type: "bold" }],
+      [{ type: "bold" }],
+    ]);
+  });
+
   it("preserves escaped formula characters across inline lexer tokens", () => {
     const content = parseWritableMarkdown("Set $A = \\{1,2\\}$ and $B = \\\\alpha$.\n")[0]!.content![0]!.content!;
     expect(content.filter((node) => node.type === "inlineMath")).toEqual([

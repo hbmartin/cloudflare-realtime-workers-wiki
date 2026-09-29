@@ -33,6 +33,7 @@ function textWithMath(value: string, marks: NonNullable<ProseMirrorJson["marks"]
     if (
       value[index] !== "$" ||
       escaped(index) ||
+      (value[index - 1] === "$" && index > cursor) ||
       !value[index + 1] ||
       value[index + 1] === "$" ||
       /\s/.test(value[index + 1]!)
@@ -43,8 +44,7 @@ function textWithMath(value: string, marks: NonNullable<ProseMirrorJson["marks"]
       if (value[close] === "$" && !escaped(close)) break;
       close += 1;
     }
-    if (close <= index + 1 || value[close] !== "$" || value[close + 1] === "$" || /\s/.test(value[close - 1]!))
-      continue;
+    if (close <= index + 1 || value[close] !== "$" || /\s/.test(value[close - 1]!)) continue;
     if (index > cursor)
       output.push({
         type: "text",
@@ -79,10 +79,12 @@ function splitCrossTokenMath(tokens: Token[]) {
     return slashes % 2 === 1;
   };
   const spans: Array<{ from: number; to: number; formula: string }> = [];
+  let lastClose = -1;
   for (let index = 0; index < source.length; index += 1) {
     if (
       source[index] !== "$" ||
       escaped(index) ||
+      (source[index - 1] === "$" && lastClose !== index - 1) ||
       source[index + 1] === "$" ||
       !source[index + 1] ||
       /\s/.test(source[index + 1]!)
@@ -93,12 +95,14 @@ function splitCrossTokenMath(tokens: Token[]) {
       if (source[close] === "$" && !escaped(close)) break;
       close += 1;
     }
-    if (source[close] !== "$" || close <= index + 1 || source[close + 1] === "$" || /\s/.test(source[close - 1]!))
-      continue;
+    if (source[close] !== "$" || close <= index + 1 || /\s/.test(source[close - 1]!)) continue;
     const overlapping = ranges.filter((range) => range.from < close + 1 && range.to > index);
     if (overlapping.some((range) => ["codespan", "link", "image"].includes(range.type))) continue;
-    if (overlapping.some((range) => range.type !== "text" && range.type !== "escape"))
+    const opening = ranges.find((range) => range.from <= index && index < range.to);
+    const closing = ranges.find((range) => range.from <= close && close < range.to);
+    if (opening !== closing && overlapping.some((range) => range.type !== "text" && range.type !== "escape"))
       spans.push({ from: index, to: close + 1, formula: source.slice(index + 1, close).replaceAll("\\$", "$") });
+    lastClose = close;
     index = close;
   }
   return spans.length ? { source, spans } : null;

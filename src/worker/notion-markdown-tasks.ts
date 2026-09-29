@@ -97,11 +97,12 @@ export async function claimMarkdownTask(env: Env, id: string) {
   const row = await env.DB.prepare(
     `UPDATE notion_markdown_tasks SET status='running',attempts=attempts+1,
        lease_token=?,lease_expires_at=?,updated_at=?
-     WHERE id=? AND status IN ('queued','running','retrying') AND attempts<5 AND next_attempt_at<=?
+     WHERE id=? AND status IN ('queued','running','retrying') AND attempts<? AND expires_at>?
+       AND next_attempt_at<=?
        AND (lease_expires_at IS NULL OR lease_expires_at<=?)
      RETURNING *`,
   )
-    .bind(leaseToken, now + LEASE_MS, now, id, now, now)
+    .bind(leaseToken, now + LEASE_MS, now, id, MAX_MARKDOWN_TASK_ATTEMPTS, now, now, now)
     .first<MarkdownTaskRow>();
   return row;
 }
@@ -141,7 +142,7 @@ export async function failMarkdownTask(env: Env, row: MarkdownTaskRow, error: un
       retry ? null : JSON.stringify(error),
       retry ? now + delay : now,
       now,
-      now + RESULT_RETENTION_MS,
+      retry ? row.expires_at : now + RESULT_RETENTION_MS,
       row.id,
       row.lease_token,
     )
@@ -152,11 +153,12 @@ export async function dueMarkdownTasks(env: Env) {
   const now = Date.now();
   const rows = await env.DB.prepare(
     `SELECT id FROM notion_markdown_tasks
-      WHERE status IN ('queued','running','retrying') AND attempts<5 AND next_attempt_at<=?
+      WHERE status IN ('queued','running','retrying') AND attempts<? AND expires_at>?
+        AND next_attempt_at<=?
         AND (lease_expires_at IS NULL OR lease_expires_at<=?)
       ORDER BY next_attempt_at,id LIMIT 5`,
   )
-    .bind(now, now)
+    .bind(MAX_MARKDOWN_TASK_ATTEMPTS, now, now, now)
     .all<{ id: string }>();
   return rows.results.map((row) => row.id);
 }
@@ -165,23 +167,24 @@ export async function claimExhaustedMarkdownTasks(env: Env) {
   const now = Date.now();
   const due = await env.DB.prepare(
     `SELECT id FROM notion_markdown_tasks WHERE status IN ('queued','running','retrying')
-       AND attempts>=5 AND attempts<? AND next_attempt_at<=?
+       AND (attempts>=? OR expires_at<=?) AND next_attempt_at<=?
        AND (lease_expires_at IS NULL OR lease_expires_at<=?)
-     ORDER BY next_attempt_at,id LIMIT 5`,
+     ORDER BY next_attempt_at,id LIMIT 1`,
   )
-    .bind(MAX_MARKDOWN_TASK_ATTEMPTS, now, now)
+    .bind(MAX_MARKDOWN_TASK_ATTEMPTS, now, now, now)
     .all<{ id: string }>();
   const claimed: MarkdownTaskRow[] = [];
   for (const row of due.results) {
     const leaseToken = crypto.randomUUID();
     const task = await env.DB.prepare(
-      `UPDATE notion_markdown_tasks SET status='running',attempts=attempts+1,
+      `UPDATE notion_markdown_tasks SET status='running',
          lease_token=?,lease_expires_at=?,updated_at=?
-       WHERE id=? AND status IN ('queued','running','retrying') AND attempts>=5 AND attempts<?
+       WHERE id=? AND status IN ('queued','running','retrying')
+         AND (attempts>=? OR expires_at<=?)
          AND next_attempt_at<=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)
        RETURNING *`,
     )
-      .bind(leaseToken, now + LEASE_MS, now, row.id, MAX_MARKDOWN_TASK_ATTEMPTS, now, now)
+      .bind(leaseToken, now + LEASE_MS, now, row.id, MAX_MARKDOWN_TASK_ATTEMPTS, now, now, now)
       .first<MarkdownTaskRow>();
     if (task) claimed.push(task);
   }

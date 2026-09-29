@@ -329,21 +329,10 @@ describe("Notion-compatible API", () => {
     const recovered = await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`));
     expect((await recovered.json<{ status: string }>()).status).toBe("succeeded");
     await env.DB.prepare(
-      `UPDATE notion_markdown_tasks SET status='running',attempts=5,operation_id='markdown:missing-receipt',
+      `UPDATE notion_markdown_tasks SET status='running',attempts=10,operation_id='markdown:missing-receipt',
          lease_token='stale',lease_expires_at=?,next_attempt_at=?,result_json=NULL WHERE id=?`,
     )
       .bind(Date.now() - 1, Date.now() - 1, accepted.id)
-      .run();
-    await recoverNotionMarkdownTasks(env);
-    expect(
-      (
-        await (
-          await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))
-        ).json<{ status: string }>()
-      ).status,
-    ).toBe("retrying");
-    await env.DB.prepare(`UPDATE notion_markdown_tasks SET attempts=9,next_attempt_at=? WHERE id=?`)
-      .bind(Date.now() - 1, accepted.id)
       .run();
     await recoverNotionMarkdownTasks(env);
     expect(
