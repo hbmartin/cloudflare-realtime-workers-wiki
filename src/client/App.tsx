@@ -75,6 +75,7 @@ import {
   latestOfflineAccount,
   listOfflinePages,
   listPendingOfflinePages,
+  LOCAL_SIGNOUT_KEY,
   markOfflineAccountPurging,
   offlineAccountKey,
   purgingOfflineAccounts,
@@ -699,7 +700,7 @@ async function stateAfterUnauthorized(failure: ApiClientError): Promise<AppState
 }
 
 async function authenticatedWorkspace(member: ClientMemberContext): Promise<AppState> {
-  const locallySignedOut = localStorage.getItem("notes:local-signout");
+  const locallySignedOut = localStorage.getItem(LOCAL_SIGNOUT_KEY);
   if (locallySignedOut) return { screen: "signin" };
   if (typeof indexedDB !== "undefined") {
     await rememberOfflineAccount(member).catch((error) =>
@@ -719,7 +720,7 @@ async function offlineStateAfterConnectionFailure(cause: unknown): Promise<AppSt
     !isSuccessfulJsonResponseBodyError(cause)
   )
     return null;
-  if (localStorage.getItem("notes:local-signout")) return { screen: "signin" };
+  if (localStorage.getItem(LOCAL_SIGNOUT_KEY)) return { screen: "signin" };
   if (typeof indexedDB === "undefined") return { screen: "offline-locked" };
   const account = await latestOfflineAccount();
   if (!account) return { screen: "offline-locked" };
@@ -730,7 +731,7 @@ async function offlineStateAfterConnectionFailure(cause: unknown): Promise<AppSt
 }
 
 async function resolveAppState(): Promise<AppState> {
-  const locallySignedOut = localStorage.getItem("notes:local-signout");
+  const locallySignedOut = localStorage.getItem(LOCAL_SIGNOUT_KEY);
   let pendingPurges: Set<string>;
   if (typeof indexedDB === "undefined") pendingPurges = new Set();
   else
@@ -763,14 +764,14 @@ async function resolveAppState(): Promise<AppState> {
   if (!install.initialized) return { screen: "bootstrap" };
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state === "signed_out") {
-    localStorage.removeItem("notes:local-signout");
+    localStorage.removeItem(LOCAL_SIGNOUT_KEY);
     return invite ? { screen: "invite", token: invite } : { screen: "signin" };
   }
   if (status.state !== "ready") return { screen: "security", status };
   if (locallySignedOut) {
     const signedOutUserId = locallySignedOut.split("\u0000")[0];
     if (!status.userId || status.userId === signedOutUserId) return { screen: "signin" };
-    localStorage.removeItem("notes:local-signout");
+    localStorage.removeItem(LOCAL_SIGNOUT_KEY);
   }
   let inviteFailure: ApiClientError | null = null;
   if (invite || status.pendingInvite) {
@@ -820,7 +821,7 @@ export function App() {
   }, []);
   const completeSignOut = useCallback(
     async (accountKey: string) => {
-      localStorage.setItem("notes:local-signout", accountKey);
+      localStorage.setItem(LOCAL_SIGNOUT_KEY, accountKey);
       invalidateUnauthorizedRequests();
       if (typeof indexedDB !== "undefined")
         await markOfflineAccountPurging(accountKey).catch((error) =>
@@ -852,7 +853,7 @@ export function App() {
         serverSignOut,
         new Promise<false>((resolve) => window.setTimeout(() => resolve(false), 2_000)),
       ]);
-      if (signedOut) localStorage.removeItem("notes:local-signout");
+      if (signedOut) localStorage.removeItem(LOCAL_SIGNOUT_KEY);
       showState({ screen: "signin" });
     },
     [showState],
@@ -884,7 +885,7 @@ export function App() {
   );
   useEffect(() => {
     const onLocalSignOut = (event: StorageEvent) => {
-      if (event.key !== "notes:local-signout" || !event.newValue) return;
+      if (event.key !== LOCAL_SIGNOUT_KEY || !event.newValue) return;
       invalidateUnauthorizedRequests();
       showState({ screen: "signin" });
     };
@@ -1261,23 +1262,23 @@ function InviteScreen({ token, onComplete }: { token: string; onComplete: () => 
 }
 
 async function finishPendingServerSignOut() {
-  const accountKey = localStorage.getItem("notes:local-signout");
+  const accountKey = localStorage.getItem(LOCAL_SIGNOUT_KEY);
   if (!accountKey) return;
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state !== "signed_out") {
     if (!status.userId) throw new Error("The signed-in account could not be verified. Try again.");
     if (status.userId !== accountKey.split("\u0000")[0]) {
-      localStorage.removeItem("notes:local-signout");
+      localStorage.removeItem(LOCAL_SIGNOUT_KEY);
       return;
     }
     const result = await authClient.signOut();
     if (result.error) throw new Error(result.error.message || "Finish signing out before using another account.");
   }
-  localStorage.removeItem("notes:local-signout");
+  localStorage.removeItem(LOCAL_SIGNOUT_KEY);
 }
 
 function signInFailure(cause: unknown, fallback: string) {
-  return localStorage.getItem("notes:local-signout")
+  return localStorage.getItem(LOCAL_SIGNOUT_KEY)
     ? "Server sign-out could not be confirmed. Connect and try again."
     : apiErrorMessage(cause, fallback);
 }

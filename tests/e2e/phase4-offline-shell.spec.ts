@@ -1,8 +1,29 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { signInOwner } from "./security-helpers";
 
 test.setTimeout(90_000);
+
+async function catalogContainsPageTitle(page: Page, title: string) {
+  return page.evaluate(async (expected) => {
+    const opened = indexedDB.open("noteflare-offline-catalog");
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      opened.addEventListener("success", () => resolve(opened.result), { once: true });
+      opened.addEventListener("error", () => reject(opened.error), { once: true });
+      opened.addEventListener("blocked", () => reject(new Error("Catalog is blocked.")), { once: true });
+    });
+    try {
+      const request = db.transaction("pages", "readonly").objectStore("pages").getAll();
+      const entries = await new Promise<Array<{ title: string }>>((resolve, reject) => {
+        request.addEventListener("success", () => resolve(request.result), { once: true });
+        request.addEventListener("error", () => reject(request.error), { once: true });
+      });
+      return entries.some((entry) => entry.title === expected);
+    } finally {
+      db.close();
+    }
+  }, title);
+}
 
 test("installed app shell opens offline without caching API responses", async ({ page, context }) => {
   const workerScript = await page.request.get("/sw.js");
@@ -550,22 +571,7 @@ test("warns and offers export before offline sign-out removes pending edits", as
   await page.locator(".bn-editor").click();
   await page.keyboard.type("Online seed");
   await expect(page.locator(".bn-editor")).toContainText("Online seed");
-  await expect
-    .poll(async () =>
-      page.evaluate(async () => {
-        const opened = indexedDB.open("noteflare-offline-catalog");
-        const db = await new Promise<IDBDatabase>((resolve) =>
-          opened.addEventListener("success", () => resolve(opened.result)),
-        );
-        const request = db.transaction("pages", "readonly").objectStore("pages").getAll();
-        const entries = await new Promise<Array<{ title: string }>>((resolve) =>
-          request.addEventListener("success", () => resolve(request.result)),
-        );
-        db.close();
-        return entries.some((entry) => entry.title === "Pending sign-out draft");
-      }),
-    )
-    .toBe(true);
+  await expect.poll(() => catalogContainsPageTitle(page, "Pending sign-out draft")).toBe(true);
 
   await context.setOffline(true);
   await page.reload();
@@ -596,22 +602,7 @@ test("can finish offline sign-out when database enumeration is unavailable", asy
   await page.locator(".bn-editor").click();
   await page.keyboard.type("Cached before sign-out");
   await expect(page.locator(".bn-editor")).toContainText("Cached before sign-out");
-  await expect
-    .poll(async () =>
-      page.evaluate(async () => {
-        const opened = indexedDB.open("noteflare-offline-catalog");
-        const db = await new Promise<IDBDatabase>((resolve) =>
-          opened.addEventListener("success", () => resolve(opened.result)),
-        );
-        const request = db.transaction("pages", "readonly").objectStore("pages").getAll();
-        const entries = await new Promise<Array<{ title: string }>>((resolve) =>
-          request.addEventListener("success", () => resolve(request.result)),
-        );
-        db.close();
-        return entries.some((entry) => entry.title === "Enumeration fallback draft");
-      }),
-    )
-    .toBe(true);
+  await expect.poll(() => catalogContainsPageTitle(page, "Enumeration fallback draft")).toBe(true);
   await context.setOffline(true);
   await page.reload();
   await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
@@ -640,22 +631,30 @@ test("can finish offline sign-out when database enumeration is unavailable", asy
 test("removes document copies despite a corrupt legacy registry when enumeration works", async ({ page }) => {
   await signInOwner(page);
   await expect
-    .poll(() => page.evaluate(() => Object.keys(localStorage).some((key) =>
-      key.startsWith("noteflare-document-keys:") && key.includes("\u0000"),
-    )))
+    .poll(() =>
+      page.evaluate(() =>
+        Object.keys(localStorage).some((key) => key.startsWith("noteflare-document-keys:") && key.includes("\u0000")),
+      ),
+    )
     .toBe(true);
   await page.evaluate(() => {
-    const entry = Object.keys(localStorage).find((key) =>
-      key.startsWith("noteflare-document-keys:") && key.includes("\u0000"),
+    const entry = Object.keys(localStorage).find(
+      (key) => key.startsWith("noteflare-document-keys:") && key.includes("\u0000"),
     )!;
     const accountKey = entry.slice("noteflare-document-keys:".length).split("\u0000").slice(0, 2).join("\u0000");
     localStorage.setItem(`noteflare-document-keys:${accountKey}`, "corrupt legacy entry");
+    localStorage.setItem(`noteflare-document-keys:${accountKey}\u0000unknown-key-format`, "1");
   });
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
-  expect(await page.evaluate(async () =>
-    (await indexedDB.databases()).filter((entry) => entry.name?.startsWith("account:")).length,
-  )).toBe(0);
+  expect(
+    await page.evaluate(
+      async () => (await indexedDB.databases()).filter((entry) => entry.name?.startsWith("account:")).length,
+    ),
+  ).toBe(0);
+  expect(
+    await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith("noteflare-document-keys:"))),
+  ).toEqual([]);
 });
 
 test("retains drafts from both epochs in the sign-out review", async ({ page, context }) => {

@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createCollaboration, createNetworkCollaboration, createWorkspaceEvents } from "./collaboration";
+import { LOCAL_SIGNOUT_KEY } from "./offline-catalog";
 
 const mocks = vi.hoisted(() => ({
   whenSynced: new Promise<void>(() => undefined),
@@ -13,6 +14,7 @@ const mocks = vi.hoisted(() => ({
     shouldConnect: boolean;
     sendMessage: ReturnType<typeof vi.fn>;
     connect: ReturnType<typeof vi.fn>;
+    connectBc: ReturnType<typeof vi.fn>;
     reconnect: ReturnType<typeof vi.fn>;
     _reconnectWS: () => Promise<void>;
     disconnect: ReturnType<typeof vi.fn>;
@@ -49,6 +51,7 @@ vi.mock("y-partyserver/provider", () => ({
     connect = vi.fn(async () => {
       this.shouldConnect = true;
     });
+    connectBc = vi.fn();
     reconnect = vi.fn(async () => undefined);
     _reconnectWS = async () => {
       await this.reconnect();
@@ -111,6 +114,15 @@ describe("collaboration durability barriers", () => {
     mocks.whenSynced = new Promise<void>(() => undefined);
     mocks.providers.length = 0;
     mocks.persistenceNames.length = 0;
+    const stored = new Map<string, string>();
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+        clear: () => stored.clear(),
+        getItem: (key: string) => stored.get(key) ?? null,
+        setItem: (key: string, value: string) => stored.set(key, value),
+      },
+    });
   });
 
   afterEach(() => {
@@ -143,6 +155,20 @@ describe("collaboration durability barriers", () => {
     expect(mocks.persistenceNames).toEqual(["account:user-a:workspace:page:1:2", "account:user-b:workspace:page:1:2"]);
     first.destroy();
     second.destroy();
+  });
+
+  it("registers each store and blocks new stores while the account is signing out", () => {
+    localStorage.clear();
+    const first = createCollaboration("workspace", "page", 1, vi.fn(), "user");
+    const key = "account:user:workspace:page:1:2";
+    expect(localStorage.getItem(`noteflare-document-keys:user\u0000workspace\u0000${key}`)).toBe("1");
+    localStorage.setItem(LOCAL_SIGNOUT_KEY, "user\u0000workspace");
+    expect(() => createCollaboration("workspace", "other", 1, vi.fn(), "user")).toThrow(
+      "Local sign-out is removing offline documents.",
+    );
+    expect(mocks.persistenceNames).toEqual([key]);
+    first.destroy();
+    localStorage.clear();
   });
 
   it("bounds diagram durability latency while retaining the quiet-period debounce", async () => {

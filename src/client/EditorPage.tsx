@@ -42,6 +42,7 @@ import {
   offlineDocumentKey,
   pendingKeysOf,
   persistPendingDocumentUpdate,
+  rememberOfflineAccount,
   rememberOfflinePage,
   storageEpoch,
 } from "./offline-catalog";
@@ -249,6 +250,8 @@ export function EditorPage({
           return false;
         }
         offlineMember.current = currentMember;
+        await rememberOfflineAccount(currentMember);
+        if (!active) return false;
         if (catalogNeedsRepair) {
           writePending(true);
           await pendingWrite;
@@ -294,14 +297,25 @@ export function EditorPage({
         window.clearTimeout(deadline);
       }
     };
-    next = createCollaboration(
-      member.workspace.id,
-      page.id,
-      page.contentEpoch,
-      setStatus,
-      member.user.id,
-      beforeConnect,
-    );
+    try {
+      next = createCollaboration(
+        member.workspace.id,
+        page.id,
+        page.contentEpoch,
+        setStatus,
+        member.user.id,
+        beforeConnect,
+      );
+    } catch (error) {
+      console.error("Unable to start local document storage", error);
+      queueMicrotask(() => {
+        if (active)
+          setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+      });
+      return () => {
+        active = false;
+      };
+    }
     next.doc.off("update", next.indexeddb["_storeUpdate"]);
     const clearCurrentRecovery = () => {
       if (!active) return;

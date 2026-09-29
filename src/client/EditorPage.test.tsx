@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
 import type { ClientMemberContext } from "../shared/types";
 import { ApiClientError } from "./api";
+import { createCollaboration } from "./collaboration";
 import { EditorPage } from "./EditorPage";
 
 const mocks = vi.hoisted(() => {
@@ -163,6 +164,29 @@ describe("EditorPage close reconciliation", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("keeps the page mounted when local sign-out blocks a new document store", async () => {
+    vi.mocked(createCollaboration).mockImplementationOnce(() => {
+      throw new Error("Local sign-out is removing offline documents.");
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => Promise.resolve());
+    expect(screen.getByLabelText("Page title")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("Offline storage is unavailable, so editing and collaboration are disabled for this page."),
+    ).not.toHaveLength(0);
   });
 
   it("continues metadata reconciliation after the initial retry budget", async () => {
